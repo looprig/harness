@@ -1,0 +1,5 @@
+{
+  "error": "foreignloop: transcript unavailable: testdata/transcript/missing.jsonl",
+  "error_type": "TranscriptUnavailableError",
+  "cause": "not_exist"
+}

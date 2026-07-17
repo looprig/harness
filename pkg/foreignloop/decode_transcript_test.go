@@ -1,91 +1,168 @@
 package foreignloop
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/harness/pkg/event"
 )
 
-func textOf(t *testing.T, b content.Block) string {
+type transcriptProjectionGolden struct {
+	Groups           []content.AgenticMessages `json:"groups"`
+	StepDoneMessages []content.AgenticMessages `json:"step_done_messages"`
+	Snapshot         content.AgenticMessages   `json:"snapshot"`
+}
+
+type transcriptErrorGolden struct {
+	Error     string `json:"error"`
+	ErrorType string `json:"error_type"`
+	Cause     string `json:"cause"`
+}
+
+func userMessage(text string) *content.UserMessage {
+	return &content.UserMessage{Message: content.Message{
+		Role:   content.RoleUser,
+		Blocks: []content.Block{&content.TextBlock{Text: text}},
+	}}
+}
+
+func assistantMessage(blocks ...content.Block) *content.AIMessage {
+	return &content.AIMessage{Message: content.Message{
+		Role:   content.RoleAssistant,
+		Blocks: blocks,
+	}}
+}
+
+func transcriptCases() map[string][]content.AgenticMessages {
+	return map[string][]content.AgenticMessages{
+		"happy": {
+			{userMessage("hi there")},
+			{
+				assistantMessage(
+					&content.ThinkingBlock{Thinking: "let me think", Signature: "sig"},
+					&content.TextBlock{Text: "Working"},
+					&content.ToolUseBlock{ID: "toolu_9", Name: "Read", Input: json.RawMessage(`{"path":"/x"}`)},
+				),
+				&content.ToolResultMessage{
+					Message: content.Message{
+						Role:   content.RoleTool,
+						Blocks: []content.Block{&content.TextBlock{Text: "contents"}},
+					},
+					ToolUseID: "toolu_9",
+				},
+			},
+			{assistantMessage(&content.TextBlock{Text: "Done"})},
+		},
+		"empty": nil,
+		"truncated": {
+			{userMessage("hi")},
+			{assistantMessage(&content.TextBlock{Text: "recovered"})},
+		},
+	}
+}
+
+func flattenTranscriptGroups(groups []content.AgenticMessages) content.AgenticMessages {
+	var out content.AgenticMessages
+	for _, group := range groups {
+		out = append(out, group...)
+	}
+	return out
+}
+
+func canonicalJSON(t *testing.T, value any) []byte {
 	t.Helper()
-	tb, ok := b.(*content.TextBlock)
-	if !ok {
-		t.Fatalf("block %#v is not *TextBlock", b)
-	}
-	return tb.Text
-}
-
-func TestDecodeTranscriptTailHappy(t *testing.T) {
-	t.Parallel()
-	got, err := decodeTranscriptTail(filepath.Join("testdata", "transcript", "happy.jsonl"), 0)
+	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
+		t.Fatalf("marshal canonical JSON: %v", err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("groups = %d, want 3 (%v)", len(got), got)
-	}
-	// group 0: the leading user prompt.
-	um, ok := got[0][0].(*content.UserMessage)
-	if !ok || textOf(t, um.Blocks[0]) != "hi there" {
-		t.Fatalf("group0[0] = %#v, want UserMessage 'hi there'", got[0][0])
-	}
-	// group 1: assistant (thinking,text,tool_use) + tool_result.
-	ai, ok := got[1][0].(*content.AIMessage)
-	if !ok || len(ai.Blocks) != 3 {
-		t.Fatalf("group1[0] = %#v, want AIMessage w/ 3 blocks", got[1][0])
-	}
-	if _, ok := ai.Blocks[0].(*content.ThinkingBlock); !ok {
-		t.Errorf("block0 = %#v, want ThinkingBlock", ai.Blocks[0])
-	}
-	if ub, ok := ai.Blocks[2].(*content.ToolUseBlock); !ok || ub.ID != "toolu_9" || ub.Name != "Read" {
-		t.Errorf("block2 = %#v, want ToolUseBlock toolu_9/Read", ai.Blocks[2])
-	}
-	tr, ok := got[1][1].(*content.ToolResultMessage)
-	if !ok || tr.ToolUseID != "toolu_9" || tr.IsError {
-		t.Fatalf("group1[1] = %#v, want ToolResultMessage toolu_9", got[1][1])
-	}
-	if textOf(t, tr.Blocks[0]) != "contents" {
-		t.Errorf("tool result text = %q, want contents", textOf(t, tr.Blocks[0]))
-	}
-	// group 2: final assistant text. Sidechain 'subagent says hi' must be absent.
-	ai2, ok := got[2][0].(*content.AIMessage)
-	if !ok || textOf(t, ai2.Blocks[0]) != "Done" {
-		t.Fatalf("group2[0] = %#v, want AIMessage 'Done'", got[2][0])
-	}
+	return append(data, '\n')
 }
 
-func TestDecodeTranscriptTailTable(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name       string
-		path       string
-		wantGroups int
-		wantErr    bool
-	}{
-		{name: "happy", path: filepath.Join("testdata", "transcript", "happy.jsonl"), wantGroups: 3},
-		{name: "empty file", path: filepath.Join("testdata", "transcript", "empty.jsonl"), wantGroups: 0},
-		{name: "truncated line skipped soft", path: filepath.Join("testdata", "transcript", "truncated.jsonl"), wantGroups: 2},
-		{name: "missing file errors", path: filepath.Join("testdata", "transcript", "nope.jsonl"), wantErr: true},
+func readGolden(t *testing.T, name string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", "transcript", name+".golden.json"))
+	if err != nil {
+		t.Fatalf("read golden %q: %v", name, err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	return data
+}
+
+func TestDecodeTranscriptGoldenProjection(t *testing.T) {
+	t.Parallel()
+	for name, wantGroups := range transcriptCases() {
+		name, wantGroups := name, wantGroups
+		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			got, err := decodeTranscriptTail(tt.path, 0)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			path := filepath.Join("testdata", "transcript", name+".jsonl")
+			gotGroups, err := decodeTranscriptTail(path, 12345)
+			if err != nil {
+				t.Fatalf("decodeTranscriptTail() error = %v", err)
 			}
-			if tt.wantErr {
-				var ue *TranscriptUnavailableError
-				if !errors.As(err, &ue) {
-					t.Fatalf("err = %v, want *TranscriptUnavailableError", err)
+			if !reflect.DeepEqual(gotGroups, wantGroups) {
+				t.Fatalf("decodeTranscriptTail() = %#v, want %#v", gotGroups, wantGroups)
+			}
+
+			var gotSteps []content.AgenticMessages
+			gotSnapshot := (&Loop{}).commitTurn(path, event.TurnIndex(99), nil, func(ev event.Event) {
+				step, ok := ev.(event.StepDone)
+				if !ok {
+					t.Fatalf("commitTurn published %T, want event.StepDone", ev)
 				}
-				return
+				gotSteps = append(gotSteps, step.Messages)
+			})
+			if !reflect.DeepEqual(gotSteps, wantGroups) {
+				t.Errorf("StepDone.Messages = %#v, want %#v", gotSteps, wantGroups)
 			}
-			if len(got) != tt.wantGroups {
-				t.Fatalf("groups = %d, want %d", len(got), tt.wantGroups)
+			wantSnapshot := flattenTranscriptGroups(wantGroups)
+			if !reflect.DeepEqual(gotSnapshot, wantSnapshot) {
+				t.Errorf("committed snapshot = %#v, want %#v", gotSnapshot, wantSnapshot)
+			}
+
+			gotJSON := canonicalJSON(t, transcriptProjectionGolden{
+				Groups:           gotGroups,
+				StepDoneMessages: gotSteps,
+				Snapshot:         gotSnapshot,
+			})
+			if wantJSON := readGolden(t, name); !bytes.Equal(gotJSON, wantJSON) {
+				t.Fatalf("canonical projection differs from %s.golden.json\ngot:\n%s\nwant:\n%s", name, gotJSON, wantJSON)
 			}
 		})
+	}
+}
+
+func TestDecodeTranscriptMissingFileGolden(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join("testdata", "transcript", "missing.jsonl")
+	got, err := decodeTranscriptTail(path, 0)
+	if err == nil {
+		t.Fatal("decodeTranscriptTail() error = nil, want unavailable error")
+	}
+	if got != nil {
+		t.Fatalf("decodeTranscriptTail() groups = %#v, want nil", got)
+	}
+	var unavailable *TranscriptUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("error = %T %v, want *TranscriptUnavailableError", err, err)
+	}
+	if unavailable.Path != path {
+		t.Errorf("TranscriptUnavailableError.Path = %q, want %q", unavailable.Path, path)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("errors.Is(error, os.ErrNotExist) = false: %v", err)
+	}
+
+	gotJSON := canonicalJSON(t, transcriptErrorGolden{
+		Error:     err.Error(),
+		ErrorType: "TranscriptUnavailableError",
+		Cause:     "not_exist",
+	})
+	if wantJSON := readGolden(t, "missing"); !bytes.Equal(gotJSON, wantJSON) {
+		t.Fatalf("canonical missing-file behavior differs\ngot:\n%s\nwant:\n%s", gotJSON, wantJSON)
 	}
 }

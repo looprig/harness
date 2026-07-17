@@ -1,0 +1,170 @@
+{
+  "groups": [
+    [
+      {
+        "role": "user",
+        "blocks": [
+          {
+            "Text": "hi there",
+            "type": "text"
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "role": "assistant",
+        "blocks": [
+          {
+            "Signature": "sig",
+            "Thinking": "let me think",
+            "type": "thinking"
+          },
+          {
+            "Text": "Working",
+            "type": "text"
+          },
+          {
+            "ID": "toolu_9",
+            "Input": {
+              "path": "/x"
+            },
+            "Name": "Read",
+            "type": "tool_use"
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "blocks": [
+          {
+            "Text": "contents",
+            "type": "text"
+          }
+        ],
+        "tool_use_id": "toolu_9"
+      }
+    ],
+    [
+      {
+        "role": "assistant",
+        "blocks": [
+          {
+            "Text": "Done",
+            "type": "text"
+          }
+        ]
+      }
+    ]
+  ],
+  "step_done_messages": [
+    [
+      {
+        "role": "user",
+        "blocks": [
+          {
+            "Text": "hi there",
+            "type": "text"
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "role": "assistant",
+        "blocks": [
+          {
+            "Signature": "sig",
+            "Thinking": "let me think",
+            "type": "thinking"
+          },
+          {
+            "Text": "Working",
+            "type": "text"
+          },
+          {
+            "ID": "toolu_9",
+            "Input": {
+              "path": "/x"
+            },
+            "Name": "Read",
+            "type": "tool_use"
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "blocks": [
+          {
+            "Text": "contents",
+            "type": "text"
+          }
+        ],
+        "tool_use_id": "toolu_9"
+      }
+    ],
+    [
+      {
+        "role": "assistant",
+        "blocks": [
+          {
+            "Text": "Done",
+            "type": "text"
+          }
+        ]
+      }
+    ]
+  ],
+  "snapshot": [
+    {
+      "role": "user",
+      "blocks": [
+        {
+          "Text": "hi there",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "blocks": [
+        {
+          "Signature": "sig",
+          "Thinking": "let me think",
+          "type": "thinking"
+        },
+        {
+          "Text": "Working",
+          "type": "text"
+        },
+        {
+          "ID": "toolu_9",
+          "Input": {
+            "path": "/x"
+          },
+          "Name": "Read",
+          "type": "tool_use"
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "blocks": [
+        {
+          "Text": "contents",
+          "type": "text"
+        }
+      ],
+      "tool_use_id": "toolu_9"
+    },
+    {
+      "role": "assistant",
+      "blocks": [
+        {
+          "Text": "Done",
+          "type": "text"
+        }
+      ]
+    }
+  ]
+}

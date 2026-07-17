@@ -1,0 +1,70 @@
+{
+  "groups": [
+    [
+      {
+        "role": "user",
+        "blocks": [
+          {
+            "Text": "hi",
+            "type": "text"
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "role": "assistant",
+        "blocks": [
+          {
+            "Text": "recovered",
+            "type": "text"
+          }
+        ]
+      }
+    ]
+  ],
+  "step_done_messages": [
+    [
+      {
+        "role": "user",
+        "blocks": [
+          {
+            "Text": "hi",
+            "type": "text"
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "role": "assistant",
+        "blocks": [
+          {
+            "Text": "recovered",
+            "type": "text"
+          }
+        ]
+      }
+    ]
+  ],
+  "snapshot": [
+    {
+      "role": "user",
+      "blocks": [
+        {
+          "Text": "hi",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "blocks": [
+        {
+          "Text": "recovered",
+          "type": "text"
+        }
+      ]
+    }
+  ]
+}
