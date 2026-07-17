@@ -75,7 +75,7 @@ func (e *TurnRejectedError) Error() string {
 type ConfigMismatchError struct{ Persisted, Live event.ConfigFingerprint }
 
 func (e *ConfigMismatchError) Error() string {
-	changed := make([]string, 0, 10)
+	changed := make([]string, 0, 11)
 	if e.Persisted.TopologyRev != e.Live.TopologyRev {
 		changed = append(changed, "topology")
 	}
@@ -105,6 +105,14 @@ func (e *ConfigMismatchError) Error() string {
 	}
 	if e.Persisted.NativePermissionPolicyRev != e.Live.NativePermissionPolicyRev {
 		changed = append(changed, "native permission policy")
+	}
+	// A digest, so it is named and not printed — the same treatment every other
+	// Rev field here gets, and for the same reason: two hex strings tell a reader
+	// nothing they can act on. What they need is which of their configuration
+	// moved, and for this field the answer is "the external capabilities you
+	// attached" — the MCP servers, whose identity the composition root supplied.
+	if e.Persisted.ExternalCapabilityRev != e.Live.ExternalCapabilityRev {
+		changed = append(changed, "external capability")
 	}
 	return "session: restore config mismatch: changed fields: " + strings.Join(changed, ", ") + "; pass WithAllowConfigMismatch to override"
 }
