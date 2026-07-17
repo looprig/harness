@@ -979,16 +979,28 @@ func runLoop(cfg loopConfig, state loopState) {
 	}
 
 	// emitLoopIdle announces the loop's running->idle transition: an Enduring,
-	// non-terminal LoopIdle carrying only the loop's identity (SessionID + LoopID;
-	// TurnID is zero — it is loop-scoped, not turn-scoped). The session quiescence
+	// non-terminal LoopIdle carrying the loop's identity (SessionID + LoopID;
+	// TurnID is zero — it is loop-scoped, not turn-scoped) and the loop's immutable
+	// attribution name. The session quiescence
 	// model removes this loop's {loop, LoopID} activity key on it, so a primary-only
 	// synchronous session reaches SessionIdle exactly when the primary loop parks. It
 	// goes to the session fan-in (for quiescence). It is emitted ONLY on a genuine
 	// running->idle transition: never between chained turns (running->running),
 	// and shutdown-induced idling does not emit it because the actor returns before
 	// reaching the emit point (or has already flipped to SessionStopped at the session).
+	//
+	// AgentName is stamped here from the actor's own resolved config — the same
+	// bound.Name() the session stamps onto this loop's LoopStarted — because a
+	// consumer that keys off the idle boundary (an external tool catalog adopting a
+	// new generation, say) selects loops BY AGENT, and identity alone cannot answer
+	// "which agent parked?" without a LoopStarted join. It is empty for a plain
+	// (unnamed) loop, matching LoopStarted, and Header.AgentName is omitzero — so a
+	// journal written before this stamp existed stays byte-compatible.
 	emitLoopIdle := func() {
-		publish(event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: state.sessionID, LoopID: state.id}}})
+		publish(event.LoopIdle{Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: state.sessionID, LoopID: state.id},
+			AgentName:   config.AgentName,
+		}})
 	}
 
 	ackShutdowns := func(err error) {
