@@ -4,7 +4,7 @@ import (
 	"time"
 
 	"github.com/looprig/harness/internal/sessionruntime"
-	"github.com/looprig/harness/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/security"
@@ -140,7 +140,7 @@ func WithFingerprintFields(fields ConfigFingerprintFields) Option {
 	return singleton(keyConfigFingerprint, func(state *definitionState) { state.fingerprintFields = fields })
 }
 
-func WithForeignBuilders(builder foreignloop.Builder, restored foreignloop.RestoredBuilder) Option {
+func WithForeignBuilders(builder foreign.Builder, restored foreign.RestoredBuilder) Option {
 	return func(state *definitionState) error {
 		if builder == nil || restored == nil {
 			return &DefinitionError{Kind: DefinitionInvalidForeignBuilders}

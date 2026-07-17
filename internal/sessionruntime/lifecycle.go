@@ -6,7 +6,7 @@ import (
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/security"
@@ -284,7 +284,7 @@ func WithLifecycleSnapshotPolicy(policy SnapshotPolicy) LifecycleOption {
 // WithLifecycleForeignBuilders captures the composition-root seams that construct foreign-
 // engine loops (live + restored). Either seam being nil leaves foreign engines unsupported,
 // so both are captured together. Forwarded to both NewSession and RestoreSession as WithForeignBuilders.
-func WithLifecycleForeignBuilders(b foreignloop.Builder, rb foreignloop.RestoredBuilder) LifecycleOption {
+func WithLifecycleForeignBuilders(b foreign.Builder, rb foreign.RestoredBuilder) LifecycleOption {
 	return func(r *Lifecycle) {
 		if b != nil && rb != nil {
 			r.baseOpts = append(r.baseOpts, WithForeignBuilders(b, rb))

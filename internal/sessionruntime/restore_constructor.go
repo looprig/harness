@@ -7,7 +7,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
@@ -69,7 +69,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 			cancel()
 			return &RestoreError{Kind: RestoreForeignBuilderMissing}
 		}
-		backend, err = s.foreignBuildRestored(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, foreignloop.RestoredForeign{ForeignSID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
+		backend, err = s.foreignBuildRestored(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.RestoredForeign{ForeignSID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
 	}
 	if err != nil {
 		cancel()
@@ -763,7 +763,7 @@ func buildRestoredSession(
 		}
 		l, err = s.foreignBuildRestored(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
 			func() (uuid.UUID, error) { return newID() }, factory,
-			foreignloop.RestoredForeign{ForeignSID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
+			foreign.RestoredForeign{ForeignSID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
 	}
 	if err != nil {
 		cancel()

@@ -18,6 +18,16 @@ import (
 	"testing/fstest"
 )
 
+const foreignloopImportPath = "github.com/looprig/harness/pkg/foreignloop"
+
+func isForbiddenForeignloopProductionImport(sourcePath, importPath string) bool {
+	sourcePath = filepath.ToSlash(sourcePath)
+	if strings.HasSuffix(sourcePath, "_test.go") || strings.HasPrefix(sourcePath, "pkg/foreignloop/") {
+		return false
+	}
+	return importPath == foreignloopImportPath || strings.HasPrefix(importPath, foreignloopImportPath+"/")
+}
+
 func validateForeignloopCoverage(tracked []string, manifest io.Reader, root fs.FS) error {
 	sources, err := foreignloopManifestSources(manifest)
 	if err != nil {
@@ -165,6 +175,89 @@ func TestForeignloopCoverageManifestCompleteness(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = manifest.Close() })
 	if err := validateForeignloopCoverage(tracked, manifest, os.DirFS(root)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestForeignloopProductionImportClassifier(t *testing.T) {
+	tests := []struct {
+		name       string
+		sourcePath string
+		importPath string
+		want       bool
+	}{
+		{
+			name:       "production consumer outside concrete package is rejected",
+			sourcePath: "internal/sessionruntime/session.go",
+			importPath: foreignloopImportPath,
+			want:       true,
+		},
+		{
+			name:       "production consumer of concrete subpackage is rejected",
+			sourcePath: "pkg/rig/options.go",
+			importPath: foreignloopImportPath + "/codex",
+			want:       true,
+		},
+		{
+			name:       "tests remain allowed during migration overlap",
+			sourcePath: "internal/sessionruntime/foreign_e2e_test.go",
+			importPath: foreignloopImportPath,
+		},
+		{
+			name:       "concrete package production remains allowed",
+			sourcePath: "pkg/foreignloop/codex/codex.go",
+			importPath: foreignloopImportPath,
+		},
+		{
+			name:       "unrelated production import remains allowed",
+			sourcePath: "pkg/rig/options.go",
+			importPath: "github.com/looprig/harness/pkg/foreign",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isForbiddenForeignloopProductionImport(tt.sourcePath, tt.importPath); got != tt.want {
+				t.Fatalf("isForbiddenForeignloopProductionImport(%q, %q) = %v, want %v", tt.sourcePath, tt.importPath, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestForeignloopProductionImportBoundary(t *testing.T) {
+	root := optionalDependenciesModuleRoot(t)
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if path != root && (entry.Name() == "vendor" || strings.HasPrefix(entry.Name(), ".")) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+		if err != nil {
+			return err
+		}
+		for _, spec := range file.Imports {
+			importPath, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				return err
+			}
+			if isForbiddenForeignloopProductionImport(rel, importPath) {
+				t.Errorf("%s imports concrete foreign loop package %q", filepath.ToSlash(rel), importPath)
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 }
