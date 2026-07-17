@@ -1,6 +1,7 @@
 package loopruntime
 
 import (
+	"bytes"
 	"unicode/utf8"
 
 	"github.com/looprig/core/content"
@@ -178,4 +179,128 @@ func validateNativeStep(
 	}}
 	canonical.Usage = cloneUsage(message.Usage)
 	return canonical, true, nil
+}
+
+// validateTerminalStep applies the reserved-tool fallback contract before the
+// current step can affect usage, tool limits, permissions, execution, durable
+// history, or candidate measurement. Ordinary-only tool batches remain normal
+// continuations. A batch containing the reserved control frame is final only
+// when it is the sole complete call under an authoritative tool_use finish.
+func validateTerminalStep(
+	message *content.AIMessage,
+	calls []content.ToolUseBlock,
+	result *stream.StreamResult,
+) (*content.AIMessage, bool, error) {
+	if result == nil {
+		return nil, false, &inference.StructuredOutputFinishError{Reason: inference.StructuredOutputFinishReasonOther}
+	}
+	if err := validateRawToolFrame(message, calls); err != nil {
+		return nil, false, err
+	}
+
+	terminalCalls := 0
+	for _, call := range calls {
+		if call.Name == inference.StructuredOutputToolName {
+			terminalCalls++
+		}
+	}
+
+	if terminalCalls == 0 {
+		if len(calls) == 0 {
+			return nil, false, terminalOutputRequiredError(result.FinishReason)
+		}
+		if result.FinishReason != stream.FinishReasonToolUse {
+			return nil, false, terminalOutputFinishError(result.FinishReason)
+		}
+		for _, call := range calls {
+			if !validToolCall(call) {
+				return nil, false, &inference.StructuredOutputConflictError{Feature: "incomplete_tool_call"}
+			}
+		}
+		return nil, false, nil
+	}
+
+	if result.FinishReason != stream.FinishReasonToolUse {
+		return nil, false, terminalOutputFinishError(result.FinishReason)
+	}
+	if len(calls) != 1 || terminalCalls != 1 {
+		// Delegate representation classification to the shared extractor. It
+		// rejects duplicate terminal calls, mixed action/control batches, and
+		// semantic text without retaining any raw block content in the error.
+		_, err := inference.StructuredResult(&inference.Response{Message: message, FinishReason: result.FinishReason})
+		if err != nil {
+			return nil, false, err
+		}
+		return nil, false, &inference.StructuredOutputConflictError{Feature: "ambiguous_terminal_output"}
+	}
+	if calls[0].ID == "" || calls[0].Name == "" {
+		return nil, false, &inference.StructuredOutputConflictError{Feature: "incomplete_tool_call"}
+	}
+
+	raw, err := inference.StructuredResult(&inference.Response{Message: message, FinishReason: result.FinishReason})
+	if err != nil {
+		return nil, false, err
+	}
+	canonical := &content.AIMessage{Message: content.Message{
+		Role:   content.RoleAssistant,
+		Blocks: []content.Block{&content.TextBlock{Text: string(raw)}},
+	}}
+	canonical.Usage = cloneUsage(message.Usage)
+	return canonical, true, nil
+}
+
+// validateRawToolFrame verifies the accumulator's materialized message and
+// executable call view describe the same complete tool frames. The stream
+// accumulator normally guarantees this; checking at the interception boundary
+// keeps future block sources and typed-nil values fail-closed before execution.
+func validateRawToolFrame(message *content.AIMessage, calls []content.ToolUseBlock) error {
+	if message == nil || message.Role != content.RoleAssistant {
+		return &inference.StructuredOutputConflictError{Feature: "inconsistent_tool_frame"}
+	}
+	callIndex := 0
+	for _, block := range message.Blocks {
+		switch typed := block.(type) {
+		case *content.TextBlock:
+			if typed == nil {
+				return &inference.StructuredOutputConflictError{Feature: "inconsistent_tool_frame"}
+			}
+		case *content.ThinkingBlock:
+			if typed == nil {
+				return &inference.StructuredOutputConflictError{Feature: "inconsistent_tool_frame"}
+			}
+		case *content.ToolUseBlock:
+			if typed == nil || callIndex >= len(calls) {
+				return &inference.StructuredOutputConflictError{Feature: "inconsistent_tool_frame"}
+			}
+			call := calls[callIndex]
+			if typed.ID != call.ID || typed.Name != call.Name || !bytes.Equal(typed.Input, call.Input) {
+				return &inference.StructuredOutputConflictError{Feature: "inconsistent_tool_frame"}
+			}
+			callIndex++
+		default:
+			return &inference.StructuredOutputConflictError{Feature: "inconsistent_tool_frame"}
+		}
+	}
+	if callIndex != len(calls) {
+		return &inference.StructuredOutputConflictError{Feature: "inconsistent_tool_frame"}
+	}
+	return nil
+}
+
+func terminalOutputRequiredError(reason stream.FinishReason) error {
+	switch reason {
+	case stream.FinishReasonLength, stream.FinishReasonContentFilter:
+		return &inference.StructuredOutputFinishError{Reason: reason}
+	default:
+		return &inference.StructuredOutputConflictError{Feature: "terminal_output_required"}
+	}
+}
+
+func terminalOutputFinishError(reason stream.FinishReason) error {
+	switch reason {
+	case stream.FinishReasonStop, stream.FinishReasonLength, stream.FinishReasonContentFilter:
+		return &inference.StructuredOutputFinishError{Reason: reason}
+	default:
+		return &inference.StructuredOutputFinishError{Reason: inference.StructuredOutputFinishReasonOther}
+	}
 }

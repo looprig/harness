@@ -312,8 +312,25 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// the current-step atomicity boundary: a rejected final leaves prior commits
 		// intact but makes the staged invalid step wholly unobservable.
 		toolUses := st.blocks.ToolUses()
-		if outputPlan.strategy == outputStrategyNative {
+		switch outputPlan.strategy {
+		case outputStrategyNative:
 			canonical, final, outputErr := validateNativeStep(aiMsg, toolUses, res.streamResult)
+			if outputErr != nil {
+				return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
+			}
+			if final {
+				aiMsg = canonical
+				st.msgs[0] = canonical
+				toolUses = nil
+			}
+		case outputStrategyTerminalTool:
+			// runStep sanitizes malformed tool input in the storable AIMessage so
+			// ordinary continuations can always be encoded. Terminal validation must
+			// instead inspect the raw accumulator view; otherwise malformed control
+			// arguments rewritten to {} could be accepted as a final result.
+			rawMessage := st.blocks.AIMessage()
+			rawMessage.Usage = cloneUsage(aiMsg.Usage)
+			canonical, final, outputErr := validateTerminalStep(rawMessage, toolUses, res.streamResult)
 			if outputErr != nil {
 				return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
 			}
