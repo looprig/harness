@@ -190,12 +190,31 @@ func (UnknownRequest) AllowedScopes() []ApprovalScope { return []ApprovalScope{S
 // guarantee hold for a caller outside this package.
 const maxExternalDescriptionBytes = maxPermissionRequestBytes / 8
 
+// maxExternalToolNameBytes bounds the tool name accepted by NewExternalRequest.
+// Without it the "always marshals under the codec cap" guarantee above is false:
+// the description bound alone leaves the name free to carry the record past
+// maxPermissionRequestBytes, journaling a request that then fails closed at
+// restore. It matches the 128-byte name bound the durable
+// event.LoopExternalToolsetChanged validator enforces — a longer name could not
+// be journaled by the toolset record either, so accepting one here would only
+// defer the failure.
+//
+// Unlike the description this REJECTS rather than truncates. A description is
+// prose and survives truncation; a tool name is an IDENTIFIER, and a truncated
+// one names a different tool than the one being approved. Silently rewriting it
+// would make the permission record a lie about what the user authorized.
+const maxExternalToolNameBytes = 128
+
 // ExternalRequestErrorKind classifies a rejected NewExternalRequest argument.
 type ExternalRequestErrorKind string
 
 const (
 	// ExternalToolNameEmpty reports an empty or whitespace-only tool name.
 	ExternalToolNameEmpty ExternalRequestErrorKind = "tool_name_empty"
+	// ExternalToolNameTooLong reports a tool name over maxExternalToolNameBytes.
+	// It fails closed rather than truncating: a truncated identifier names a
+	// different tool than the one being approved.
+	ExternalToolNameTooLong ExternalRequestErrorKind = "tool_name_too_long"
 	// ExternalScopesEmpty reports an empty or nil scope set. A request that
 	// offers no scope is unapprovable, so it fails closed rather than silently
 	// degrading to ScopeOnce.
@@ -246,12 +265,15 @@ type externalRequest struct {
 // the caller — this constructor bounds and normalizes it but cannot tell a safe
 // summary from a leaked secret. scopes are validated and defensively copied.
 //
-// It fails closed on an empty tool name, an empty scope set, or a scope outside
-// the valid set.
+// It fails closed on an empty or over-long tool name, an empty scope set, or a
+// scope outside the valid set.
 func NewExternalRequest(toolName, description string, scopes []ApprovalScope) (PermissionRequest, error) {
 	name := strings.TrimSpace(toolName)
 	if name == "" {
 		return nil, &ExternalRequestError{Kind: ExternalToolNameEmpty}
+	}
+	if len(name) > maxExternalToolNameBytes {
+		return nil, &ExternalRequestError{Kind: ExternalToolNameTooLong}
 	}
 	if len(scopes) == 0 {
 		return nil, &ExternalRequestError{Kind: ExternalScopesEmpty}

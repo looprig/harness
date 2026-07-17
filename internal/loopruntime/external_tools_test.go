@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 )
@@ -31,6 +33,32 @@ func (s *stubTool) InvokableRun(context.Context, string) (*tool.ToolResult, erro
 }
 
 func externalTool(name string) tool.InvokableTool { return &stubTool{name: name, schema: `{"a":1}`} }
+
+// countingTool records how many times it was actually INVOKED, so a test can assert on
+// the execution registry (cfg.tools -> RunBatch) rather than only on the advertised
+// toolset in the inference request. The two are separate halves of a turn's snapshot.
+type countingTool struct {
+	name string
+	mu   sync.Mutex
+	runs int
+}
+
+func (c *countingTool) Info(context.Context) (*tool.ToolInfo, error) {
+	return &tool.ToolInfo{Name: c.name, Desc: "d", Schema: json.RawMessage(`{"a":1}`)}, nil
+}
+
+func (c *countingTool) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
+	c.mu.Lock()
+	c.runs++
+	c.mu.Unlock()
+	return &tool.ToolResult{Content: []content.Block{&content.TextBlock{Text: "ran"}}}, nil
+}
+
+func (c *countingTool) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.runs
+}
 
 func toolIdentity(name string) event.ExternalToolIdentity {
 	return event.ExternalToolIdentity{Name: name, SchemaDigest: mustDigest(name)}
@@ -58,6 +86,12 @@ func declaredToolDefinition(name string) tool.Definition {
 // observable.
 func toolBearingDefinition(t *testing.T, client inference.Client) loop.BoundDefinition {
 	t.Helper()
+	// Auto-approve every call. Without a gate that approves, EVERY tool result is
+	// "permission denied" and any assertion about whether a tool actually RAN is
+	// vacuous — the registry is never even consulted.
+	approve := func(context.Context, tool.Bindings) (loop.PermissionGate, error) {
+		return &fakePermissionGate{checkFn: func(string, string) Effect { return EffectAutoApprove }}, nil
+	}
 	// The SAME definition value must be reused across base and mode: loop.Bind compares
 	// definitions by pointer identity, so two distinct definitions sharing a name are a
 	// duplicate-definition error rather than a cache hit.
@@ -72,11 +106,13 @@ func toolBearingDefinition(t *testing.T, client inference.Client) loop.BoundDefi
 			loop.Mode{Name: "other", Tools: []tool.Definition{declaredToolDefinition("declared_other")}},
 		),
 		loop.WithInitialMode("main"),
+		loop.WithPermissionFactory(approve),
+		loop.WithPolicyRevision("test"),
 	)
 	if err != nil {
 		t.Fatalf("Define: %v", err)
 	}
-	bound, err := d.Bind(context.Background(), tool.Bindings{SessionID: mustID(t), LoopID: mustID(t)})
+	bound, err := d.Bind(context.Background(), tool.Bindings{SessionID: mustID(t), LoopID: mustID(t), SecurityLimit: security.New()})
 	if err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
@@ -168,11 +204,16 @@ func TestReplaceExternalToolsMidTurnKeepsSnapshot(t *testing.T) {
 	t.Parallel()
 	var l *Loop
 	replaced := make(chan command.LoopToolsResult, 1)
+	ext := &countingTool{name: "ext_a"}
 	client := &scriptedLLM{
 		scripts: [][]content.Chunk{
 			// Step 1: call the declared tool, forcing the turn to take a second step.
 			{&content.ToolUseChunk{Index: 0, ID: "id-1", Name: "declared", InputJSON: `{}`}},
-			// Step 2 (same turn): plain text, ending the turn.
+			// Step 2 (SAME turn, after the replacement committed): try to EXECUTE the
+			// newly installed external tool. The running turn's execution registry must
+			// not know it.
+			{&content.ToolUseChunk{Index: 0, ID: "id-2", Name: "ext_a", InputJSON: `{}`}},
+			// Step 3 (same turn): plain text, ending the turn.
 			{textChunk("done")},
 		},
 	}
@@ -182,7 +223,7 @@ func TestReplaceExternalToolsMidTurnKeepsSnapshot(t *testing.T) {
 			ack := make(chan command.LoopToolsResult, 1)
 			l.Commands <- command.ReplaceLoopExternalTools{
 				Header: command.Header{CommandID: mustID(t)}, Source: "mcp", Generation: "g1",
-				Tools:      []tool.InvokableTool{externalTool("ext_a")},
+				Tools:      []tool.InvokableTool{ext},
 				Identities: []event.ExternalToolIdentity{toolIdentity("ext_a")},
 				Ack:        ack,
 			}
@@ -205,10 +246,11 @@ func TestReplaceExternalToolsMidTurnKeepsSnapshot(t *testing.T) {
 	client.mu.Lock()
 	reqs := append([]inference.Request(nil), client.reqs...)
 	client.mu.Unlock()
-	if len(reqs) < 2 {
-		t.Fatalf("want a 2-step turn, got %d requests", len(reqs))
+	if len(reqs) < 3 {
+		t.Fatalf("want a 3-step turn, got %d requests", len(reqs))
 	}
-	for i, req := range reqs[:2] {
+	// The ADVERTISED toolset: every step of the running turn still offers the old set.
+	for i, req := range reqs[:3] {
 		names := make([]string, 0, len(req.Tools))
 		for _, tl := range req.Tools {
 			names = append(names, tl.Name)
@@ -216,6 +258,14 @@ func TestReplaceExternalToolsMidTurnKeepsSnapshot(t *testing.T) {
 		if want := []string{"declared"}; !reflect.DeepEqual(names, want) {
 			t.Fatalf("turn 1 step %d tools = %v, want %v — a running turn must keep its snapshot across steps", i+1, names, want)
 		}
+	}
+
+	// The EXECUTION registry (cfg.tools -> RunBatch) is the other half of the snapshot,
+	// and the half a backing-array aliasing regression would corrupt invisibly to the
+	// request assertions above. Step 2 of the running turn asked to invoke ext_a; the
+	// turn's registry must not have resolved it.
+	if n := ext.count(); n != 0 {
+		t.Fatalf("external tool executed %d times DURING the turn it was installed in; the running turn's execution registry must not have it", n)
 	}
 
 	// The next turn crosses the boundary and picks the replacement up.
@@ -229,6 +279,37 @@ func TestReplaceExternalToolsMidTurnKeepsSnapshot(t *testing.T) {
 	}
 	if want := []string{"declared", "ext_a"}; !reflect.DeepEqual(names, want) {
 		t.Fatalf("post-boundary turn tools = %v, want %v", names, want)
+	}
+}
+
+// TestReplaceExternalToolsNextTurnCanExecuteExternalTool is the positive half of the
+// execution-registry property: once the boundary is crossed the external tool is not
+// merely ADVERTISED, it is actually dispatchable by RunBatch.
+//
+// Mutation check: composing only into the advertised list (leaving cfg.tools.Registry
+// unchanged) would keep the request assertions green but leave this at 0 runs.
+func TestReplaceExternalToolsNextTurnCanExecuteExternalTool(t *testing.T) {
+	t.Parallel()
+	ext := &countingTool{name: "ext_a"}
+	client := &scriptedLLM{
+		scripts: [][]content.Chunk{
+			{&content.ToolUseChunk{Index: 0, ID: "id-1", Name: "ext_a", InputJSON: `{}`}},
+			{textChunk("done")},
+		},
+	}
+	l, rec := newBoundLoop(t, client, toolBearingDefinition(t, client))
+
+	if res := sendReplace(t, l, command.ReplaceLoopExternalTools{
+		Source: "mcp", Generation: "g1",
+		Tools:      []tool.InvokableTool{ext},
+		Identities: []event.ExternalToolIdentity{toolIdentity("ext_a")},
+	}); res.Err != nil {
+		t.Fatalf("replace refused: %v", res.Err)
+	}
+	runOneTurn(t, l, rec, "one")
+
+	if n := ext.count(); n != 1 {
+		t.Fatalf("external tool executed %d times, want 1 — an installed tool must be dispatchable, not just advertised", n)
 	}
 }
 

@@ -376,3 +376,77 @@ func TestExternalRequestDecodeBoundsDescription(t *testing.T) {
 		t.Fatalf("len(Description()) = %d, want %d", len(got.Description()), maxExternalDescriptionBytes)
 	}
 }
+
+// TestExternalRequestToolNameIsBounded closes the gap that made the
+// "always marshals under the codec cap" guarantee false: the description was
+// bounded but the tool name was not, so an MCP server advertising an absurd name
+// could get a >1MiB record JOURNALED that then failed closed at restore.
+//
+// The name is REJECTED, not truncated: a tool name is an identifier, and a
+// truncated one names a different tool than the one being approved.
+//
+// Mutation check: deleting the maxExternalToolNameBytes guard in
+// NewExternalRequest makes the over-long cases return a request instead of a
+// typed error, and TestExternalRequestBoundedInputAlwaysMarshalsUnderCap then
+// journals a record over the codec cap.
+func TestExternalRequestToolNameIsBounded(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		toolName string
+		wantErr  bool
+		wantKind ExternalRequestErrorKind
+	}{
+		{name: "at the bound is accepted", toolName: strings.Repeat("t", maxExternalToolNameBytes)},
+		{name: "one over the bound is rejected", toolName: strings.Repeat("t", maxExternalToolNameBytes+1), wantErr: true, wantKind: ExternalToolNameTooLong},
+		{name: "absurd name is rejected", toolName: strings.Repeat("t", 1<<21), wantErr: true, wantKind: ExternalToolNameTooLong},
+		{name: "empty is still rejected as empty", toolName: "", wantErr: true, wantKind: ExternalToolNameEmpty},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := NewExternalRequest(tt.toolName, "d", []ApprovalScope{ScopeOnce})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("NewExternalRequest() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !tt.wantErr {
+				if got.ToolName() != tt.toolName {
+					t.Fatalf("ToolName() = %q, want the name UNTRUNCATED", got.ToolName())
+				}
+				return
+			}
+			var extErr *ExternalRequestError
+			if !errors.As(err, &extErr) {
+				t.Fatalf("error = %v, want *ExternalRequestError", err)
+			}
+			if extErr.Kind != tt.wantKind {
+				t.Errorf("Kind = %q, want %q", extErr.Kind, tt.wantKind)
+			}
+		})
+	}
+}
+
+// TestExternalRequestBoundedInputAlwaysMarshalsUnderCap is the invariant itself,
+// exercised at BOTH bounds simultaneously — the worst case a caller can now
+// construct. Previously an unbounded name blew past the cap here.
+func TestExternalRequestBoundedInputAlwaysMarshalsUnderCap(t *testing.T) {
+	t.Parallel()
+	// A control char is the JSON-escaping worst case: 1 byte -> \u0001, 6 bytes.
+	// (Deliberately not whitespace — TrimSpace would empty the name.)
+	worstName := strings.Repeat("\x01", maxExternalToolNameBytes)
+	worstDesc := strings.Repeat("\x01", maxExternalDescriptionBytes)
+	got, err := NewExternalRequest(worstName, worstDesc, []ApprovalScope{ScopeOnce, ScopeSession, ScopeWorkspace})
+	if err != nil {
+		t.Fatalf("NewExternalRequest() error = %v", err)
+	}
+	data, err := MarshalPermissionRequest(got)
+	if err != nil {
+		t.Fatalf("MarshalPermissionRequest() error = %v", err)
+	}
+	if len(data) > maxPermissionRequestBytes {
+		t.Fatalf("marshaled len = %d, exceeds codec cap %d — a constructible request must never fail closed at restore", len(data), maxPermissionRequestBytes)
+	}
+	if _, err := UnmarshalPermissionRequest(data); err != nil {
+		t.Fatalf("UnmarshalPermissionRequest() error = %v — the record must survive restore", err)
+	}
+}

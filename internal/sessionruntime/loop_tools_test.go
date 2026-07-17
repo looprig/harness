@@ -10,6 +10,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -266,28 +267,6 @@ func longString(n int) string {
 	return string(b)
 }
 
-// TestReplaceExternalToolsUnsupportedWithoutBindings pins the fail-closed refusal for a
-// loop harness holds no tool bindings for — a FOREIGN loop, whose toolset is owned by the
-// foreign agent. The restore path constructs such a handle with zero bindings, so without
-// this guard a replacement would call Build with a zero-value binding.
-//
-// Mutation check: deleting the h.bindings.LoopID.IsZero() guard makes this return a
-// build/collision error (or attempt a bogus bind) instead of the typed refusal.
-func TestReplaceExternalToolsUnsupportedWithoutBindings(t *testing.T) {
-	t.Parallel()
-	s := newToolSession(t)
-	// A handle with no bindings — the shape attachRestoredLoop produces for a foreign loop.
-	h := &loopHandle{id: s.ActiveLoopID(), owner: s}
-
-	err := h.ReplaceExternalTools(context.Background(), loop.ExternalToolset{
-		Source: "mcp", Generation: "g1", Definitions: []tool.Definition{extDefinition("x")},
-	})
-	var changeErr *loop.ChangeError
-	if !errors.As(err, &changeErr) || changeErr.Kind != loop.ChangeExternalToolsUnsupported {
-		t.Fatalf("err = %v, want ChangeExternalToolsUnsupported", err)
-	}
-}
-
 // TestFoldLoopExternalToolsetInvalidatesContext pins the restore fold against the LIVE
 // commit path. The actor emits LoopExternalToolsetChanged through the same
 // context-mutation path as a mode change (the toolset rides in the inference request, so
@@ -351,5 +330,65 @@ func TestRestoredLoopComesUpWithEmptySlot(t *testing.T) {
 	}
 	if got := foldLoopInference([]event.Event{ev}); got.HasMode || got.HasRuntime {
 		t.Fatalf("external toolset record leaked into the restored inference view: %+v", got)
+	}
+}
+
+// TestReplaceExternalToolsRefusedOnForeignLoop drives a REAL foreign-engine loop, not a
+// hand-built handle. A foreign loop's toolset belongs to the foreign agent and its backend
+// has no ReplaceLoopExternalTools arm, so the command would be dropped and the caller would
+// block on the ack forever. The refusal must therefore be structural, not incidental.
+//
+// The bounded context is a HANG DETECTOR, not the mechanism under test: a correct
+// implementation refuses immediately without ever consulting it. Against the previous
+// h.bindings.LoopID.IsZero() guard this test fails — production builds full bindings for
+// EVERY engine, so that guard never fired and this returned ChangeContextDone (an
+// unbounded hang with a context.Background() caller) instead of the typed refusal.
+func TestReplaceExternalToolsRefusedOnForeignLoop(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	agent := &fakeForeignAgent{transcript: missingTranscript(t), script: foreignScript("result text")}
+	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
+	s, err := newTestSession(ctx, foreignPrimaryCfg(),
+		WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	ctrl, ok := s.LoopController(s.ActiveLoopID())
+	if !ok {
+		t.Fatal("LoopController not found")
+	}
+	installer, ok := ctrl.(loop.ExternalToolInstaller)
+	if !ok {
+		t.Fatal("loop controller does not implement loop.ExternalToolInstaller")
+	}
+
+	// Pin the precondition the old guard got wrong: this loop is foreign AND production
+	// gave its handle real, non-zero bindings.
+	h := s.loops[s.ActiveLoopID()]
+	if h.bound.Engine() == loop.EngineNative {
+		t.Fatal("test setup: want a foreign-engine loop")
+	}
+	if h.bindings.LoopID.IsZero() {
+		t.Fatal("test setup: production is expected to build full bindings for a foreign loop too")
+	}
+
+	bounded, cancelBounded := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelBounded()
+	err = installer.ReplaceExternalTools(bounded, loop.ExternalToolset{
+		Source: "mcp", Generation: "g1", Definitions: []tool.Definition{extDefinition("search")},
+	})
+	var changeErr *loop.ChangeError
+	if !errors.As(err, &changeErr) {
+		t.Fatalf("err = %v, want *loop.ChangeError", err)
+	}
+	if changeErr.Kind == loop.ChangeContextDone {
+		t.Fatal("ReplaceExternalTools blocked on a foreign loop's ack until the deadline — it must refuse structurally, not hang")
+	}
+	if changeErr.Kind != loop.ChangeExternalToolsUnsupported {
+		t.Fatalf("Kind = %v, want ChangeExternalToolsUnsupported", changeErr.Kind)
 	}
 }

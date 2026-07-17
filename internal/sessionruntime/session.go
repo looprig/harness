@@ -498,9 +498,12 @@ type loopHandle struct {
 	bound loop.BoundDefinition
 	// bindings is the EXACT tool.Bindings this loop was bound with, retained so
 	// ReplaceExternalTools builds external tools with the same capabilities (and the same
-	// WorkspaceObservations instance) the declared tools received. It is the zero value for
-	// a foreign loop, whose toolset harness does not own — ReplaceExternalTools refuses
-	// there with ChangeExternalToolsUnsupported.
+	// WorkspaceObservations instance) the declared tools received.
+	//
+	// It is populated for EVERY engine, foreign included: both construction paths build the
+	// full binding set before dispatching on Engine. It is therefore NOT a signal for
+	// whether a loop can host harness tools — use bound.Engine() for that. (A foreign loop
+	// is refused by ReplaceExternalTools on its engine, not on this field.)
 	bindings tool.Bindings
 	backend  loop.Backend
 	parent   loop.Provenance

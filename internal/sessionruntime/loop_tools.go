@@ -53,9 +53,14 @@ func (h *loopHandle) ReplaceExternalTools(ctx context.Context, set loop.External
 	if set.Generation == "" || len(set.Generation) > maxExternalGenerationLen {
 		return &loop.ChangeError{Kind: loop.ChangeInvalidExternalGeneration}
 	}
-	// A foreign loop's toolset belongs to the foreign agent; harness holds no bindings for
-	// it and cannot build tools into it. Fail closed rather than build with a zero binding.
-	if h.bindings.LoopID.IsZero() {
+	// A foreign loop's toolset belongs to the foreign agent, and its backend has no
+	// ReplaceLoopExternalTools arm — the command would be silently dropped and this call
+	// would block on an ack that never arrives. Refuse structurally, on the ENGINE.
+	//
+	// Do NOT test the bindings for emptiness: production builds full tool.Bindings for
+	// every engine, foreign included, so a zero-bindings check never fires. Engine is the
+	// real discriminator, mirroring the compaction guard in Session.Compact.
+	if h.bound == nil || h.bound.Engine() != loop.EngineNative {
 		return &loop.ChangeError{Kind: loop.ChangeExternalToolsUnsupported}
 	}
 	tools, identities, err := h.buildExternalTools(ctx, set)
