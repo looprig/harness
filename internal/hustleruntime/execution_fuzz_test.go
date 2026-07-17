@@ -13,6 +13,7 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/inference"
+	"github.com/looprig/inference/stream"
 )
 
 const runtimeFuzzInputLimit = 64
@@ -119,10 +120,18 @@ func FuzzProviderOutputBoundary(f *testing.F) {
 			if !errors.As(err, &outputErr) {
 				t.Fatalf("extractResult error = %T %v, want OutputError", err, err)
 			}
-			return
-		}
-		if len(result.Output) == 0 || len(result.Output) > int(limit) || !json.Valid(result.Output) {
+		} else if len(result.Output) == 0 || len(result.Output) > int(limit) || !json.Valid(result.Output) {
 			t.Fatalf("accepted output = %q limit=%d, want one nonempty bounded JSON value", result.Output, limit)
+		}
+
+		structured, structuredErr := extractStructuredResult(response, usage, int(limit))
+		if structuredErr != nil {
+			var outputErr *OutputError
+			if !errors.As(structuredErr, &outputErr) || !outputErr.Valid() {
+				t.Fatalf("extractStructuredResult error = %T %v, want valid OutputError", structuredErr, structuredErr)
+			}
+		} else if len(structured.Output) == 0 || len(structured.Output) > int(limit) || !json.Valid(structured.Output) || structured.Output[0] != '{' {
+			t.Fatalf("accepted structured output = %q limit=%d, want one bounded JSON object", structured.Output, limit)
 		}
 	})
 }
@@ -151,7 +160,7 @@ func runtimeFuzzDefinition(t testing.TB, name hustle.Name, limits hustle.Limits)
 func runtimeFuzzResponse(shape uint8, role content.Role, output string, outputTokens uint16, reasoningTokens uint16) *inference.Response {
 	usage := &content.Usage{OutputTokens: content.TokenCount(outputTokens), ReasoningTokens: content.TokenCount(reasoningTokens)}
 	message := &content.AIMessage{Message: content.Message{Role: role}}
-	response := &inference.Response{Message: message, Usage: usage}
+	response := &inference.Response{Message: message, Usage: usage, FinishReason: runtimeFuzzFinish(shape)}
 	if shape&0x80 != 0 {
 		response.Usage = nil
 	}
@@ -197,4 +206,21 @@ func runtimeFuzzResponse(shape uint8, role content.Role, output string, outputTo
 		message.Blocks = []content.Block{block}
 	}
 	return response
+}
+
+func runtimeFuzzFinish(shape uint8) stream.FinishReason {
+	switch shape / 17 % 6 {
+	case 0:
+		return stream.FinishReasonUnknown
+	case 1:
+		return stream.FinishReasonStop
+	case 2:
+		return stream.FinishReasonLength
+	case 3:
+		return stream.FinishReasonContentFilter
+	case 4:
+		return stream.FinishReasonToolUse
+	default:
+		return stream.FinishReason("future")
+	}
 }

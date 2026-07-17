@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/inference"
+	"github.com/looprig/inference/stream"
 )
 
 type runtimeController struct {
@@ -233,7 +234,20 @@ func (r *runtimeController) execute(ctx context.Context, definition hustle.Bound
 		return hustle.Result{}, event.ModelRuntime{}, nil, executionError(name, runID, hustle.StageModelResolution, hustle.ReasonModelResolution, executionCtx, err)
 	}
 	runtime := event.ModelRuntime{Key: binding.Model.Key(), Limits: binding.Model.Limits, Effort: binding.Model.Sampling.Effort}
-	response, err := r.invoke(executionCtx, runID, binding, definition.SystemPrompt(), input)
+	output, _ := definition.OutputSchema()
+	request := inference.Request{
+		Model:  binding.Model.Clone(),
+		System: definition.SystemPrompt(),
+		Messages: content.AgenticMessages{&content.UserMessage{Message: content.Message{
+			Role:   content.RoleUser,
+			Blocks: []content.Block{&content.TextBlock{Text: string(input)}},
+		}}},
+		Output: output,
+	}
+	if err := inference.ValidateRequestFeatures(request); err != nil {
+		return hustle.Result{}, runtime, nil, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: err})
+	}
+	response, err := r.invoke(executionCtx, runID, binding.Client, request)
 	usage, usageErr := responseUsage(response)
 	if err != nil {
 		reason := hustle.ReasonInference
@@ -247,7 +261,12 @@ func (r *runtimeController) execute(ctx context.Context, definition hustle.Bound
 	if usageErr != nil {
 		return hustle.Result{}, runtime, nil, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: usageErr})
 	}
-	result, err := extractResult(response, usage, definition.Limits().OutputBytes)
+	var result hustle.Result
+	if output == nil {
+		result, err = extractResult(response, usage, definition.Limits().OutputBytes)
+	} else {
+		result, err = extractStructuredResult(response, usage, definition.Limits().OutputBytes)
+	}
 	if err != nil {
 		return hustle.Result{}, runtime, usage, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 	}
@@ -289,17 +308,8 @@ type invokeResult struct {
 	err      error
 }
 
-func (r *runtimeController) invoke(ctx context.Context, runID hustle.RunID, binding hustle.InferenceBinding, system string, input json.RawMessage) (*inference.Response, error) {
-	request := inference.Request{
-		Model:  binding.Model.Clone(),
-		System: system,
-		Messages: content.AgenticMessages{&content.UserMessage{Message: content.Message{
-			Role:   content.RoleUser,
-			Blocks: []content.Block{&content.TextBlock{Text: string(input)}},
-		}}},
-	}
+func (r *runtimeController) invoke(ctx context.Context, runID hustle.RunID, client inference.Client, request inference.Request) (*inference.Response, error) {
 	results := make(chan invokeResult, 1)
-	client := binding.Client
 	go func() {
 		defer func() {
 			if recover() != nil {
@@ -345,6 +355,41 @@ func extractResult(response *inference.Response, usage *content.Usage, outputLim
 		return hustle.Result{}, &OutputError{Reason: OutputFailureInvalidJSON}
 	}
 	return hustle.Result{Output: append(json.RawMessage(nil), block.Text...), Usage: usage}, nil
+}
+
+func extractStructuredResult(response *inference.Response, usage *content.Usage, outputLimit int) (hustle.Result, error) {
+	if response != nil && response.FinishReason == stream.FinishReasonToolUse {
+		return hustle.Result{}, &OutputError{Cause: &inference.StructuredOutputFinishError{Reason: stream.FinishReasonToolUse}}
+	}
+	output, err := inference.StructuredResult(response)
+	if err != nil {
+		return hustle.Result{}, &OutputError{Cause: err}
+	}
+	if !nativeStructuredText(response.Message) {
+		return hustle.Result{}, &OutputError{Reason: OutputFailureInvalidShape}
+	}
+	if len(output) > outputLimit {
+		return hustle.Result{}, &OutputError{Reason: OutputFailureTooLarge}
+	}
+	return hustle.Result{Output: output, Usage: usage}, nil
+}
+
+func nativeStructuredText(message *content.AIMessage) bool {
+	if message == nil {
+		return false
+	}
+	text := false
+	for _, block := range message.Blocks {
+		switch typed := block.(type) {
+		case *content.TextBlock:
+			if typed != nil {
+				text = true
+			}
+		case *content.ToolUseBlock:
+			return false
+		}
+	}
+	return text
 }
 
 func responseUsage(response *inference.Response) (*content.Usage, error) {
