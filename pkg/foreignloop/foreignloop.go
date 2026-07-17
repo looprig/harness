@@ -4,9 +4,7 @@ import (
 	"context"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/core/uuid"
-	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/foreign"
 )
 
 // PermissionPosture is the typed, non-interactive permission mode passed to the
@@ -27,13 +25,8 @@ const (
 	SIDLateBound
 )
 
-// EventPublisher is the foreign loop's narrow consumer of the session event
-// fan-in. Defined here (exported) because the native loop's equivalent is
-// unexported; *session.Session satisfies it via PublishEvent.
-type EventPublisher interface {
-	PublishEvent(context.Context, event.Event) error
-	PublishEventChecked(context.Context, event.Event) error
-}
+// EventPublisher is a temporary migration alias for foreign.EventPublisher.
+type EventPublisher = foreign.EventPublisher
 
 // ForeignAgent hides everything agent-specific (argv, system-prompt channel,
 // stream framing, transcript layout). One implementation now: claude.
@@ -87,12 +80,8 @@ type ForeignEvent struct {
 	ErrText       string             // ForeignTerminalError
 }
 
-// Builder is the composition-root seam Session uses to construct a foreign loop.
-// EventPublisher is foreignloop.EventPublisher; returns the Backend and the minted
-// ForeignSID (stamped onto LoopStarted by the caller).
-type Builder func(loopCtx context.Context, sessionID, loopID uuid.UUID,
-	parent loop.Provenance, pub EventPublisher, cfg loop.BoundDefinition,
-	idGen func() (uuid.UUID, error), fac *event.Factory) (loop.Backend, string, error)
+// Builder is a temporary migration alias for foreign.Builder.
+type Builder = foreign.Builder
 
 // Spec is the per-agent foreign wiring resolved at the composition root. It is NOT
 // on loop.BoundDefinition (that would invert the package dependency).
