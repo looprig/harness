@@ -500,8 +500,9 @@ eval mechanism.
 The current OTel GenAI spans, metrics, tools, and content attributes are marked
 development and have changed across semantic-convention releases. Harness must:
 
-1. Pin one OTel semconv Go package revision, initially the revision matching its
-   OTel API dependency.
+1. Pin one OTel semconv Go package revision. The initial implementation uses
+   the already-vendored `semconv/v1.41.0` with OTel Go API v1.44 and must not
+   mix it with the also-vendored `semconv/v1.37.0`.
 2. Centralize every semconv key, metric, and span mapping in `pkg/telemetry`.
 3. Record the schema URL/instrumentation scope revision where supported.
 4. Never mix two GenAI convention revisions in one default emission path.
