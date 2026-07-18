@@ -997,7 +997,8 @@ make root-check
 make build
 make test
 go test -tags integration -race ./...
-go test ./driver/claude -run '^$' -fuzz FuzzDecode -fuzztime=30s
+go test ./driver/claude -run '^$' -fuzz '^FuzzDecodeStreamLine$' -fuzztime=30s
+go test ./driver/claude -run '^$' -fuzz '^FuzzDecodeTranscriptLine$' -fuzztime=30s
 go test ./driver/codex -run '^$' -fuzz FuzzDecodeLine -fuzztime=30s
 make secure
 ```
