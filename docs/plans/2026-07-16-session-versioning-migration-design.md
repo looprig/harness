@@ -244,6 +244,7 @@ to application and role identity; `TopologyRev` to Loop topology;
 `ToolPolicyRev` to the tool entries; `RuntimeSkills` to the runtime-skill
 source mode (an application compatibility field); `AgentAdapter` and
 `PermissionPosture` to the foreign-agent adapter identity and posture;
+`NativePermissionPolicyRev` to the permission-policy posture and digest;
 `WorkspaceRoot` to workspace placement; `ExternalCapabilityRev` to the
 external capability identities. Dropping a fingerprinted field is a
 drift-detection regression and is not permitted.
@@ -318,6 +319,14 @@ canonical encoding. Baseline upgrades never require a decision by themselves:
 only genuine Warn-level field drift found by the accompanying assessment
 does. These are the only exception to "no drift appends no epoch."
 
+One knowable consequence of the legacy window: the legacy fingerprint carries
+permission policy only as a digest (`NativePermissionPolicyRev`) and carries
+no confinement posture at all, so by the digest-only rule any permission
+change against a legacy baseline classifies Warn — including a narrowing.
+The first restore of an old session after a permission tightening will
+therefore demand a decision. This is intended fail-secure behavior, not a
+defect; it ends once the session's full manifest baseline is installed.
+
 ## Drift assessment
 
 Restore produces a structured assessment before constructing live Loops. It
@@ -337,10 +346,13 @@ Direction-sensitive fields (confinement, permissions) classify by direction:
 tightening is Info, broadening is Warn. Direction can only be computed from
 the structured posture forms in the manifest; a change visible only through
 an opaque digest has unknown direction and defaults to Warn (fail-secure).
-Severity is advisory input to
-application policy, not authority granted by the manifest; applications may
-reclassify categories (for example, a deployment may promote model changes to
-Warn).
+
+Severity is advisory input to application policy, not authority granted by
+the manifest; applications may reclassify categories (for example, a
+deployment may promote model changes to Warn). Demoting a Warn category to
+Info is permitted only as an explicit deployment policy — it is equivalent to
+installing a policy that accepts that category, and the resulting adoptions
+are still recorded with `Source: policy`. It must never be a silent default.
 
 **Default policy.** Interactive frontends prompt on Warn and auto-accept Info
 (recording an adoption event either way when anything drifted). The headless
