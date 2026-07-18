@@ -451,7 +451,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 
 func turnInferenceRequest(cfg turnConfig, state turnState, runtimeTail *content.UserMessage, output turnOutputPlan) inference.Request {
 	return output.apply(inference.Request{
-		Model: cfg.model, System: cfg.system,
+		Model: cfg.model.Clone(), System: cfg.system,
 		Messages: requestMessages(cfg.base, state.msgs, runtimeTail),
 	})
 }
@@ -467,7 +467,7 @@ func measureTurnCandidate(
 	if config.measure == nil {
 		return nil, nil
 	}
-	err := config.measure(ctx, request, runtimeRevision, runtimeTail, continuation)
+	err := config.measure(ctx, cloneInferenceRequest(request), runtimeRevision, cloneUserMessage(runtimeTail), continuation)
 	var directive *contextReplacementDirective
 	if errors.As(err, &directive) {
 		return directive, nil

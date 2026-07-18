@@ -1,6 +1,29 @@
 package loopruntime
 
-import "github.com/looprig/core/content"
+import (
+	"github.com/looprig/core/content"
+	"github.com/looprig/inference"
+)
+
+// cloneInferenceRequest gives an external request collaborator independent
+// ownership of every reference-backed field while preserving scalar request
+// intent. The original request remains safe for the current provider call.
+func cloneInferenceRequest(request inference.Request) inference.Request {
+	cloned := request
+	cloned.Model = request.Model.Clone()
+	if request.Messages == nil {
+		cloned.Messages = nil
+	} else {
+		cloned.Messages = cloneMessages(request.Messages)
+	}
+	cloned.Tools = cloneInferenceTools(request.Tools)
+	cloned.Output = cloneOutputSchema(request.Output)
+	if request.Override != nil {
+		override := request.Override.Clone()
+		cloned.Override = &override
+	}
+	return cloned
+}
 
 // cloneMessages gives a conversation graph one owner. It recursively copies
 // messages, blocks, usage, raw JSON, and binary payloads so mutation cannot cross
