@@ -139,7 +139,7 @@ github.com/invopop/jsonschema
 github.com/looprig/core/content
 github.com/looprig/core/content/streamaccumulator
 github.com/looprig/core/uuid
-# github.com/looprig/inference v0.3.1-0.20260717213513-ab32a3979f64 => ../inference
+# github.com/looprig/inference v0.3.1-0.20260718005749-13e4d7f173b3 => ../inference
 ## explicit; go 1.26.4
 github.com/looprig/inference
 github.com/looprig/inference/codec

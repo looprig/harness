@@ -176,7 +176,22 @@ type schemaStringsValue struct {
 
 func (v *schemaStringsValue) UnmarshalJSON(raw []byte) error {
 	v.present = true
-	v.valid = firstJSONByte(raw) == '[' && json.Unmarshal(raw, &v.values) == nil && v.values != nil
+	var members []json.RawMessage
+	if firstJSONByte(raw) != '[' || json.Unmarshal(raw, &members) != nil || members == nil {
+		v.valid = false
+		return nil
+	}
+	v.values = make([]string, 0, len(members))
+	for _, member := range members {
+		var value string
+		if firstJSONByte(member) != '"' || json.Unmarshal(member, &value) != nil {
+			v.values = nil
+			v.valid = false
+			return nil
+		}
+		v.values = append(v.values, value)
+	}
+	v.valid = true
 	return nil
 }
 
