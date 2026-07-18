@@ -20,29 +20,32 @@ release process requires tagged dependencies.
 
 **Files:**
 - Create: `eval/go.mod`
-- Create: `eval/AGENTS.md`
+- Create: `eval/CLAUDE.md`
+- Create symlink: `eval/AGENTS.md` -> `CLAUDE.md`
 - Create: `eval/doc.go`
 - Create: `eval/Makefile`
 - Test: `eval/doc_test.go`
 
 **Step 1: Write the failing package contract test**
 
-Create an external-package test that imports `github.com/looprig/eval`, asserts
-the package is importable, and checks a public `Version` constant equals
-`"eval/v1"`.
+Create an external-package test with a blank import of
+`github.com/looprig/eval` to prove the package is importable. Package and
+wire-format versions belong on serialized envelopes and evaluator descriptors;
+do not add a package-wide `Version` constant.
 
 **Step 2: Run the focused test and verify failure**
 
 Run: `GOWORK=off go test -race .`
 
-Expected: FAIL because the module/package or `Version` does not exist.
+Expected: FAIL because the module/package does not exist.
 
 **Step 3: Add the minimal module and package**
 
 Use module path `github.com/looprig/eval`, Go 1.26, and require
-`github.com/looprig/core`. Add `const Version = "eval/v1"`. Copy the repository
+`github.com/looprig/core`. Copy the repository
 security, strict-typing, `-race`, integration-test, fuzzing, and dependency
-approval rules into `AGENTS.md`; do not copy Harness-specific ownership rules.
+approval rules into `CLAUDE.md`; do not copy Harness-specific ownership rules.
+Expose the same instructions through the `AGENTS.md` symlink.
 
 **Step 4: Add standard verification targets**
 
@@ -109,9 +112,11 @@ evidence ID, or an evidence reference outside the conversation.
 
 **Step 2: Write tests for typed evidence variants**
 
-Cover conversation excerpts, timing, usage, tool operation, HTTP request, DNS,
-process, file, sandbox guarantee, and diagnostic evidence. Assert each variant
-has exactly one payload and sensitive fields use redacted/hash forms.
+Cover only the variants produced in Phase 1: conversation excerpts, timing,
+usage, tool operation, structured-output error, and diagnostic evidence. Assert
+each variant has exactly one payload and sensitive fields use redacted/hash
+forms. Add HTTP, DNS, process, file, and sandbox variants with the adapters that
+first produce and consume them.
 
 **Step 3: Run and verify failure**
 
@@ -227,8 +232,10 @@ Commit: `feat: add evaluator and assessment contracts`
 
 Use fake targets/evaluators to cover success, target error, one evaluator error
 beside one success, timeout, cancellation, duplicate IDs, empty evaluators,
-stable output ordering, and bounded concurrency. Assert input scenarios are not
-mutated and no failure discards completed sibling assessments.
+stable output ordering, bounded concurrency, default one-trial execution, three
+trials, invalid trial counts, and one failed trial beside successful trials.
+Assert input scenarios are not mutated and no failure discards completed sibling
+assessments.
 
 **Step 2: Run and verify failure**
 
@@ -240,7 +247,11 @@ Expected: FAIL.
 
 Add `Suite`, `RunConfig`, `Report`, `SampleReport`, and `Run`. Use a semaphore,
 `context.WithTimeout`, indexed result slots, and explicit stage errors. Default
-to sequential execution; concurrency must be opt-in and bounded.
+to sequential execution and one trial; concurrency must be opt-in and bounded.
+`RunConfig.Trials` expands every scenario into stable `(scenario ID, trial
+index)` samples before target execution. Reports retain the trial index and
+individual result, so MPQT can compute variance without becoming another
+runner. Reject negative or unreasonably large trial counts at preflight.
 
 **Step 4: Verify race behavior and commit**
 
@@ -365,6 +376,8 @@ Commit: `feat: integrate eval reports with go test`
 ### Task 10: Add rubrics and the structured-output judge
 
 **Files:**
+- Modify: `eval/go.mod`
+- Modify: `eval/go.sum`
 - Create: `eval/rubric/rubric.go`
 - Create: `eval/rubric/catalog.go`
 - Create: `eval/judge/schema.go`
@@ -380,6 +393,11 @@ Cover revision, scope, criteria, anchors, invalid score ranges, duplicate
 criteria, and the initial built-ins: answer relevance, groundedness,
 instruction adherence, goal adherence, toxicity, vulgarity, and internet-use
 appropriateness.
+
+Before running the judge tests, add the explicit
+`github.com/looprig/inference` module dependency and the local workspace replace.
+This is the first task that requires inference; the eval root package must remain
+free of inference imports.
 
 **Step 2: Write judge tests with a fake `inference.Client`**
 
@@ -495,6 +513,7 @@ Commit: `feat: add eval reports and baseline comparison`
 - Create: `harness/pkg/evalmigration/eval_integration_test.go`
 - Modify: `harness/go.mod`
 - Modify: `harness/go.sum`
+- Modify: `harness/CLAUDE.md`
 - Do not yet remove: `harness/pkg/eval/**`
 
 **Step 1: Write a build-tagged migration test**
@@ -513,7 +532,8 @@ Expected: FAIL until Harness references the new eval module.
 **Step 3: Add the approved module dependency**
 
 Add `github.com/looprig/eval` and a local replace during workspace development.
-Do not add any unrelated dependency.
+Add `github.com/looprig/eval` to the approved external packages list in
+`CLAUDE.md` (`AGENTS.md` is its symlink). Do not add any unrelated dependency.
 
 **Step 4: Verify old and new paths together**
 
@@ -529,7 +549,7 @@ Commit: `test: prove harness eval migration path`
 
 **Files:**
 - Modify: `eval/README.md`
-- Modify: `eval/AGENTS.md` only if verification discovers a missing rule
+- Modify: `eval/CLAUDE.md` only if verification discovers a missing rule
 
 **Step 1: Add focused usage documentation**
 
@@ -563,8 +583,13 @@ Commit: `docs: document reusable eval framework`
 Write separate plans after Phase 1 contracts have real usage feedback for:
 
 - continuous Harness adapter and `harness/pkg/telemetry`;
+- `SessionIdle` pending-age/abandoned-boundary telemetry and a foreign-primary
+  integration test proving `TurnDone` remains the coverage fallback until the
+  foreign backend emits `LoopIdle`;
 - OpenTelemetry sink;
+- HTTP, DNS, process, file, and sandbox evidence variants with their first
+  producing adapters;
 - sandbox and recording-proxy adapters;
-- suite matrices, repeated trials, caching, and rate-limit helpers;
+- suite matrices, caching, and rate-limit helpers;
 - golden-candidate extraction workflow;
 - removal of `harness/pkg/eval`.

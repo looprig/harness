@@ -427,7 +427,7 @@ func TestSupportAgentQualification(t *testing.T) {
         judge.New(rubric.AnswerRelevanceV1, judgeClient),
     )
 
-    evaltest.RequireProfile(t, report, releaseProfile)
+    evaltest.RequirePass(t, report)
 }
 ```
 
@@ -483,6 +483,17 @@ events at `TurnDone` or `SessionIdle`, queues evaluation outside the active loop
 and never writes to the session journal. Queue saturation, sampling, judge
 failure, and sink failure are observable in eval's own telemetry and cannot
 delay or fail the user turn.
+
+`SessionIdle` is not currently a universal boundary. The extracted foreign-loop
+backend emits `TurnDone` but does not emit `LoopIdle`; therefore a foreign primary
+loop never drives Harness's derived `SessionIdle` edge. A continuous evaluator
+that needs coverage across native and foreign primary loops must configure
+`TurnDone` as its fallback. When `SessionIdle` is configured, the adapter tracks
+the age of each pending active-to-idle boundary and emits its own pending-age and
+abandoned-boundary telemetry on timeout or session stop. It must not silently
+count a boundary that never arrived as a successful evaluation. An integration
+test should re-check this limitation when the foreign-loop lifecycle changes;
+once foreign primary loops emit `LoopIdle`, the fallback remains harmless.
 
 ## Harness telemetry boundary
 
@@ -591,5 +602,8 @@ Migration steps:
 - Missing required evidence produces `unverified`.
 - Harness continuous eval runs asynchronously at turn/session boundaries and
   never changes the journal or active conversation.
+- A foreign primary-loop session uses `TurnDone` for continuous coverage until
+  its backend emits `LoopIdle`; a configured but unreached `SessionIdle`
+  boundary is visible in adapter telemetry.
 - Reports can be rendered in Go tests, serialized, and exported through OTel.
 - Alert policy remains outside the eval module.

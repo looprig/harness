@@ -18,7 +18,8 @@ acceptance criteria pass.
 
 **Files:**
 - Create: `mpqt/go.mod`
-- Create: `mpqt/AGENTS.md`
+- Create: `mpqt/CLAUDE.md`
+- Create symlink: `mpqt/AGENTS.md` -> `CLAUDE.md`
 - Create: `mpqt/doc.go`
 - Create: `mpqt/manifest.go`
 - Test: `mpqt/manifest_test.go`
@@ -215,19 +216,23 @@ Expected: PASS.
 
 Commit: `feat: add mpqt tool use pack`
 
-### Task 7: Build the core capability pack
+### Task 7: Build instruction-following and known-answer capability families
 
 **Files:**
-- Create: `mpqt/packs/capability/v1.go`
-- Create: `mpqt/packs/capability/testdata/v1/*.json`
-- Test: `mpqt/packs/capability/v1_test.go`
+- Create: `mpqt/packs/capability/instruction_v1.go`
+- Create: `mpqt/packs/capability/knowledge_v1.go`
+- Create: `mpqt/packs/capability/testdata/instruction_v1/*.json`
+- Create: `mpqt/packs/capability/testdata/knowledge_v1/*.json`
+- Test: `mpqt/packs/capability/instruction_v1_test.go`
+- Test: `mpqt/packs/capability/knowledge_v1_test.go`
 
 **Step 1: Write fixture validation tests**
 
-Start with multi-constraint instruction following, clarification, long-context
-retrieval, known-answer QA, calibrated uncertainty, conversation consistency,
-and one multilingual subset. Every scenario must identify which expectation is
-programmatic and which rubric is model-based.
+Start with 5–10 reviewed scenarios per family. Instruction cases cover explicit
+single and multi-constraint requests, conflicting lower-priority text, required
+format, and forbidden action. Knowledge cases use closed-book answers with
+versioned authoritative references. Every scenario identifies its programmatic
+expectations and any model rubric.
 
 **Step 2: Run and verify failure**
 
@@ -235,11 +240,11 @@ Run: `GOWORK=off go test -race ./packs/capability`
 
 Expected: FAIL.
 
-**Step 3: Implement the smallest auditable v1 pack**
+**Step 3: Implement the two auditable families**
 
 Prefer exact evaluators. Add composite evaluators only where deterministic facts
-cannot decide the intended semantic property. Do not label closed-book known
-answer tests as open-world truthfulness.
+cannot decide the intended semantic property. Label known-answer QA as factual
+consistency against the supplied reference, not open-world truthfulness.
 
 **Step 4: Verify and commit**
 
@@ -247,9 +252,86 @@ Run: `GOWORK=off go test -race ./packs/capability`
 
 Expected: PASS with fake targets/judges.
 
-Commit: `feat: add mpqt core capability pack`
+Commit: `feat: add instruction and known answer capability families`
 
-### Task 8: Build the safety-conduct pack
+### Task 8: Build long-context and conversation-consistency families
+
+**Files:**
+- Create: `mpqt/packs/capability/context_v1.go`
+- Create: `mpqt/packs/capability/consistency_v1.go`
+- Create: `mpqt/packs/capability/testdata/context_v1/*.json`
+- Create: `mpqt/packs/capability/testdata/consistency_v1/*.json`
+- Test: `mpqt/packs/capability/context_v1_test.go`
+- Test: `mpqt/packs/capability/consistency_v1_test.go`
+
+**Step 1: Write fixture and metamorphic-pair tests**
+
+Author 5–10 reviewed scenarios per family. Context cases seed exact facts near
+the beginning, middle, and end and include relevant distractors. Consistency
+cases use paired multi-turn conversations that preserve or deliberately change
+one prior fact, commitment, or user constraint.
+
+**Step 2: Run and verify failure**
+
+Run: `GOWORK=off go test -race ./packs/capability -run 'Test(Context|Consistency)'`
+
+Expected: FAIL.
+
+**Step 3: Implement exact retrieval and hybrid consistency evaluation**
+
+Measure seeded-fact retrieval programmatically. Use a contradiction/consistency
+rubric only after attaching the exact prior-turn evidence to the sample.
+
+**Step 4: Verify and commit**
+
+Run: `GOWORK=off go test -race ./packs/capability -run 'Test(Context|Consistency)'`
+
+Expected: PASS with fake targets/judges.
+
+Commit: `feat: add context and consistency capability families`
+
+### Task 9: Build clarification, uncertainty, and multilingual families
+
+**Files:**
+- Create: `mpqt/packs/capability/interaction_v1.go`
+- Create: `mpqt/packs/capability/multilingual_v1.go`
+- Create: `mpqt/packs/capability/testdata/interaction_v1/*.json`
+- Create: `mpqt/packs/capability/testdata/multilingual_v1/*.json`
+- Test: `mpqt/packs/capability/interaction_v1_test.go`
+- Test: `mpqt/packs/capability/multilingual_v1_test.go`
+
+**Step 1: Write scenario and calibration tests**
+
+Author 5–10 reviewed cases for clarification and a small, explicitly disclosed
+language subset. Add known-answer confidence cases distributed across difficulty
+buckets so calibration is computed over repeated outcomes rather than judged
+from confident wording alone.
+
+**Step 2: Run and verify failure**
+
+Run: `GOWORK=off go test -race ./packs/capability -run 'Test(Interaction|Calibration|Multilingual)'`
+
+Expected: FAIL.
+
+**Step 3: Implement hybrid interaction evaluation**
+
+Use a judge for whether ambiguity warranted clarification, programmatic binned
+accuracy for calibration, and exact facts plus language-specific rubrics for the
+multilingual subset. The pack metadata must disclose case and language counts;
+v1 is a seed pack, not a comprehensive benchmark.
+
+**Step 4: Assemble `capability.CoreV1`, verify, and commit**
+
+Create `mpqt/packs/capability/v1.go` to compose Tasks 7–9 without duplicating
+scenarios or evaluators.
+
+Run: `GOWORK=off go test -race ./packs/capability`
+
+Expected: PASS with fake targets/judges.
+
+Commit: `feat: assemble mpqt core capability pack`
+
+### Task 10: Build the safety-conduct pack
 
 **Files:**
 - Create: `mpqt/packs/safety/conduct_v1.go`
@@ -282,7 +364,7 @@ Expected: PASS with fake targets/judges.
 
 Commit: `feat: add mpqt safety conduct pack`
 
-### Task 9: Implement candidate/incumbent comparison
+### Task 11: Implement candidate/incumbent comparison
 
 **Files:**
 - Create: `mpqt/compare/paired.go`
@@ -315,7 +397,7 @@ Expected: PASS.
 
 Commit: `feat: add paired model quality comparison`
 
-### Task 10: Add Go test integration and canonical JSON reports
+### Task 12: Add Go test integration and canonical JSON reports
 
 **Files:**
 - Create: `mpqt/mpqttest/run.go`
@@ -339,7 +421,9 @@ Expected: FAIL.
 **Step 3: Implement `Run`, `RequireDisposition`, and JSON output**
 
 Delegate scenario execution to eval. MPQT only expands packs, builds the
-scorecard, applies a profile when supplied, and renders the result.
+scorecard, applies a profile when supplied, and renders the result. Pass
+`mpqt.Run.Trials` directly to `eval.RunConfig.Trials`; MPQT must not implement a
+second scenario/trial loop.
 
 **Step 4: Verify and commit**
 
@@ -349,7 +433,7 @@ Expected: PASS.
 
 Commit: `feat: integrate mpqt with go test`
 
-### Task 11: Add a build-tagged remote-model qualification example
+### Task 13: Add a build-tagged remote-model qualification example
 
 **Files:**
 - Create: `mpqt/examples/qualification/model_quality_test.go`
