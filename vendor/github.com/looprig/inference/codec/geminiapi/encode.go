@@ -10,11 +10,17 @@ import (
 	model "github.com/looprig/inference/model"
 )
 
+const terminalOutputValidationName = "terminal_output"
+
 // BuildGenerateContentRequest converts a provider-neutral inference.Request into a
 // GenerateContentRequest struct. Exported so provider packages can embed or
 // extend the result before marshaling. The effective sampling is Request.Override
 // when non-nil, else Model.Sampling — the same precedence every codec honors.
 func BuildGenerateContentRequest(req inference.Request) (GenerateContentRequest, error) {
+	if err := inference.ValidateRequestFeatures(req); err != nil {
+		return GenerateContentRequest{}, err
+	}
+
 	sampling := req.Model.Sampling
 	if req.Override != nil {
 		sampling = *req.Override
@@ -24,11 +30,29 @@ func BuildGenerateContentRequest(req inference.Request) (GenerateContentRequest,
 	if err != nil {
 		return GenerateContentRequest{}, err
 	}
+	tools, err := buildTools(req.Tools)
+	if err != nil {
+		return GenerateContentRequest{}, err
+	}
 
 	out := GenerateContentRequest{
 		Contents:         contents,
-		Tools:            buildTools(req.Tools),
+		Tools:            tools,
 		GenerationConfig: buildGenerationConfig(sampling, req.Model.Caps),
+	}
+	if req.ToolChoice == inference.ToolChoiceRequired {
+		out.ToolConfig = &toolConfig{FunctionCallingConfig: &functionCallingConfig{Mode: functionCallingModeAny}}
+	}
+	if req.Output != nil {
+		projected, err := projectGeminiSchema(req.Output.Schema)
+		if err != nil {
+			return GenerateContentRequest{}, err
+		}
+		if out.GenerationConfig == nil {
+			out.GenerationConfig = &generationConfig{}
+		}
+		out.GenerationConfig.ResponseMIMEType = responseMIMETypeJSON
+		out.GenerationConfig.ResponseJSONSchema = projected
 	}
 	if len(systemParts) > 0 {
 		out.SystemInstruction = &geminiContent{Parts: systemParts}
@@ -203,20 +227,73 @@ func concatText(blocks []content.Block) string {
 
 // buildTools maps the exposed tools into Gemini's single tool entry holding all
 // functionDeclarations. Returns nil when there are no tools (so the key is
-// omitted).
-func buildTools(tools []inference.Tool) []geminiTool {
+// omitted). The reserved terminal-output tool is the sole declaration whose
+// schema is validated and projected for Gemini's dialect.
+func buildTools(tools []inference.Tool) ([]geminiTool, error) {
 	if len(tools) == 0 {
-		return nil
+		return nil, nil
 	}
 	decls := make([]functionDeclaration, 0, len(tools))
 	for _, t := range tools {
+		parameters := t.Schema
+		if t.Name == inference.StructuredOutputToolName {
+			terminalOutput := inference.OutputSchema{Name: terminalOutputValidationName, Schema: t.Schema, Strict: true}
+			if err := inference.ValidateOutputSchema(terminalOutput); err != nil {
+				return nil, err
+			}
+			projected, err := projectGeminiSchema(t.Schema)
+			if err != nil {
+				return nil, err
+			}
+			parameters = projected
+		}
 		decls = append(decls, functionDeclaration{
 			Name:        t.Name,
 			Description: t.Description,
-			Parameters:  t.Schema,
+			Parameters:  parameters,
 		})
 	}
-	return []geminiTool{{FunctionDeclarations: decls}}
+	return []geminiTool{{FunctionDeclarations: decls}}, nil
+}
+
+// geminiSchemaNode is the serialization-boundary DTO for the already validated
+// portable schema subset. AdditionalProperties is intentionally absent: Gemini's
+// responseJsonSchema dialect rejects that otherwise-required portable keyword.
+type geminiSchemaNode struct {
+	Type        json.RawMessage             `json:"type"`
+	Description json.RawMessage             `json:"description,omitempty"`
+	Properties  *map[string]json.RawMessage `json:"properties,omitempty"`
+	Items       json.RawMessage             `json:"items,omitempty"`
+	Enum        json.RawMessage             `json:"enum,omitempty"`
+	Required    json.RawMessage             `json:"required,omitempty"`
+}
+
+func projectGeminiSchema(schema json.RawMessage) (json.RawMessage, error) {
+	var node geminiSchemaNode
+	if err := json.Unmarshal(schema, &node); err != nil {
+		return nil, &inference.SchemaValidationError{Field: inference.SchemaFieldSchema, ReasonCode: inference.SchemaReasonInvalid}
+	}
+	if node.Properties != nil {
+		for name, property := range *node.Properties {
+			projected, err := projectGeminiSchema(property)
+			if err != nil {
+				return nil, err
+			}
+			(*node.Properties)[name] = projected
+		}
+	}
+	if len(node.Items) > 0 {
+		projected, err := projectGeminiSchema(node.Items)
+		if err != nil {
+			return nil, err
+		}
+		node.Items = projected
+	}
+	projected, err := json.Marshal(node)
+	if err != nil {
+		return nil, &inference.SchemaValidationError{Field: inference.SchemaFieldSchema, ReasonCode: inference.SchemaReasonInvalid}
+	}
+	return projected, nil
 }
 
 // buildGenerationConfig maps effective sampling to Gemini's generationConfig,

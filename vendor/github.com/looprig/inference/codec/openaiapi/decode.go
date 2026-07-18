@@ -43,8 +43,9 @@ func DecodeResponse(body []byte) (*inference.Response, error) {
 			},
 			Usage: messageUsage,
 		},
-		Model: wire.Model,
-		Usage: usage,
+		Model:        wire.Model,
+		Usage:        usage,
+		FinishReason: mapFinishReason(wire.Choices[0].FinishReason),
 	}, nil
 }
 

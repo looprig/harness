@@ -140,6 +140,8 @@ func (c *liveCompactionClient) Invoke(_ context.Context, request inference.Reque
 func (c *liveCompactionClient) Stream(_ context.Context, _ inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	if c.streamStarted != nil {
 		close(c.streamStarted)
+	}
+	if c.streamRelease != nil {
 		<-c.streamRelease
 	}
 	emitted := false
@@ -174,7 +176,7 @@ func TestNativeSessionCompactionReachesRegisteredFocusedHustle(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &liveCompactionClient{invoked: make(chan struct{}, 1)}
-			if !tt.automatic && !tt.idle {
+			if !tt.automatic {
 				client.streamStarted = make(chan struct{})
 				client.streamRelease = make(chan struct{})
 			}
@@ -226,6 +228,12 @@ func TestNativeSessionCompactionReachesRegisteredFocusedHustle(t *testing.T) {
 			}
 			if !tt.automatic {
 				if tt.idle {
+					select {
+					case <-client.streamStarted:
+					case <-time.After(2 * time.Second):
+						t.Fatal("primary inference did not start")
+					}
+					close(client.streamRelease)
 					idleCtx, idleCancel := context.WithTimeout(context.Background(), 5*time.Second)
 					defer idleCancel()
 					if err := session.WaitIdle(idleCtx); err != nil {

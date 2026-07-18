@@ -21,7 +21,9 @@ const (
 	imageSourceBase64 = "base64"
 	imageSourceURL    = "url"
 
-	thinkingTypeAdaptive = "adaptive"
+	thinkingTypeAdaptive   = "adaptive"
+	outputFormatJSONSchema = "json_schema"
+	toolChoiceAny          = "any"
 
 	responseTypeError = "error"
 
@@ -62,6 +64,7 @@ type messagesRequest struct {
 	System        string             `json:"system,omitempty"`
 	Messages      []anthropicMessage `json:"messages"`
 	Tools         []anthropicTool    `json:"tools,omitempty"`
+	ToolChoice    *toolChoice        `json:"tool_choice,omitempty"`
 	MaxTokens     int                `json:"max_tokens"`
 	Temperature   *float64           `json:"temperature,omitempty"`
 	TopP          *float64           `json:"top_p,omitempty"`
@@ -78,10 +81,19 @@ type thinkingConfig struct {
 	Type string `json:"type"`
 }
 
-// outputConfig carries the `effort` knob that governs thinking/overall token
-// spend. Emitted alongside adaptive thinking when Effort is set.
+// outputConfig carries independent effort and structured-output controls.
 type outputConfig struct {
-	Effort string `json:"effort,omitempty"`
+	Effort string        `json:"effort,omitempty"`
+	Format *outputFormat `json:"format,omitempty"`
+}
+
+type outputFormat struct {
+	Type   string          `json:"type"`
+	Schema json.RawMessage `json:"schema"`
+}
+
+type toolChoice struct {
+	Type string `json:"type"`
 }
 
 // anthropicTool is one entry of the `tools` array.
@@ -145,13 +157,14 @@ type imageSource struct {
 // absence is distinguishable from a zeroed count. Error is populated only when
 // Type == "error".
 type messageResponse struct {
-	ID      string           `json:"id"`
-	Type    string           `json:"type"`
-	Role    string           `json:"role"`
-	Model   string           `json:"model"`
-	Content []anthropicBlock `json:"content"`
-	Usage   *messageUsage    `json:"usage"`
-	Error   *anthropicError  `json:"error"`
+	ID         string           `json:"id"`
+	Type       string           `json:"type"`
+	Role       string           `json:"role"`
+	Model      string           `json:"model"`
+	Content    []anthropicBlock `json:"content"`
+	StopReason string           `json:"stop_reason"`
+	Usage      *messageUsage    `json:"usage"`
+	Error      *anthropicError  `json:"error"`
 }
 
 // messageUsage is the `usage` object of a message response.

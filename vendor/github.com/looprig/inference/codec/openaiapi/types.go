@@ -6,22 +6,40 @@ import (
 	"github.com/looprig/inference/internal/usagenorm"
 )
 
+const (
+	responseFormatJSONSchema = "json_schema"
+	toolChoiceRequired       = "required"
+)
+
 // ChatRequest is the OpenAI chat completions wire request. Exported so
 // provider packages can embed it in a typed extension struct (e.g. adding an
 // encrypted-response public key) without round-tripping through map[string]json.RawMessage.
 type ChatRequest struct {
-	Model         string             `json:"model"`
-	Messages      []chatMessage      `json:"messages"`
-	Tools         []chatTool         `json:"tools,omitempty"`
-	Temperature   *float64           `json:"temperature,omitempty"`
-	TopP          *float64           `json:"top_p,omitempty"`
-	MaxTokens     *int               `json:"max_tokens,omitempty"`
-	Stop          []string           `json:"stop,omitempty"`
-	Stream        bool               `json:"stream,omitempty"`
-	StreamOptions *chatStreamOptions `json:"stream_options,omitempty"`
+	Model          string             `json:"model"`
+	Messages       []chatMessage      `json:"messages"`
+	Tools          []chatTool         `json:"tools,omitempty"`
+	ResponseFormat *responseFormat    `json:"response_format,omitempty"`
+	ToolChoice     string             `json:"tool_choice,omitempty"`
+	Temperature    *float64           `json:"temperature,omitempty"`
+	TopP           *float64           `json:"top_p,omitempty"`
+	MaxTokens      *int               `json:"max_tokens,omitempty"`
+	Stop           []string           `json:"stop,omitempty"`
+	Stream         bool               `json:"stream,omitempty"`
+	StreamOptions  *chatStreamOptions `json:"stream_options,omitempty"`
 
 	// o-series reasoning
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+}
+
+type responseFormat struct {
+	Type       string      `json:"type"`
+	JSONSchema *jsonSchema `json:"json_schema"`
+}
+
+type jsonSchema struct {
+	Name   string          `json:"name"`
+	Strict bool            `json:"strict"`
+	Schema json.RawMessage `json:"schema"`
 }
 
 type chatStreamOptions struct {

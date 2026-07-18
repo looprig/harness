@@ -7,6 +7,7 @@ import (
 	"github.com/looprig/inference"
 	failure "github.com/looprig/inference/failure"
 	"github.com/looprig/inference/internal/usagenorm"
+	"github.com/looprig/inference/stream"
 	usage "github.com/looprig/inference/usage"
 )
 
@@ -44,9 +45,17 @@ func DecodeResponse(body []byte) (*inference.Response, error) {
 			},
 			Usage: messageUsage,
 		},
-		Model: wire.ModelVersion,
-		Usage: usage,
+		Model:        wire.ModelVersion,
+		Usage:        usage,
+		FinishReason: responseFinishReason(wire.Candidates[0]),
 	}, nil
+}
+
+func responseFinishReason(candidate candidate) stream.FinishReason {
+	if hasFunctionCall(candidate.Content.Parts) && (candidate.FinishReason == "" || candidate.FinishReason == "STOP") {
+		return stream.FinishReasonToolUse
+	}
+	return mapFinishReason(candidate.FinishReason)
 }
 
 func normalizeUsage(wire *usageMetadata) (*usage.Usage, error) {
