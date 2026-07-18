@@ -133,7 +133,13 @@ This policy is what keeps Phase 2 unbuilt. For every durable record family:
 
 - Fields are only ever **added**, and always optional with a defined default.
   Fields are never removed or repurposed while journals may contain them.
-- Decoders **ignore unknown fields** rather than failing on them.
+- Strict decoding stays. `DisallowUnknownFields` (used today by the journal
+  record, gate payload, and catalog decoders) is a corruption-detection
+  mechanism and is not weakened by this policy. Additive evolution is
+  compatible with it in the direction that matters: a newer binary reading an
+  older journal sees only missing optional fields. The inverse — an older
+  binary tolerating fields written by a newer one — is the deliberate open
+  choice recorded under "Future work"; it is not silently granted here.
 - Renames are handled by dual-read (accept old and new names) for as long as
   old journals exist.
 - An event type is never removed while its state contribution may still be
@@ -207,8 +213,10 @@ The manifest includes:
   digest}` — closing the current names-only gap;
 - optional external capability identities, including MCP server and catalog
   identities;
-- confinement or sandbox posture;
-- permission-policy digests;
+- confinement or sandbox posture in a structured, comparable form (an
+  ordered strictness level or explicit capability set), plus its digest;
+- permission-policy posture in a structured, comparable form (a grant-scope
+  summary), plus the full policy digest;
 - workspace placement identity and trust mode;
 - application-defined, secret-free compatibility fields.
 
@@ -229,10 +237,31 @@ fingerprint accelerates equality checks and content addressing; the manifest
 supplies the detail needed to explain drift. The legacy `ConfigFingerprint`
 struct remains as the read shape for old journals.
 
+The manifest is a strict superset of the legacy fingerprint. Every field the
+legacy `ConfigFingerprint` distinguishes maps to a manifest field: `AgentKind`
+to application and role identity; `TopologyRev` to Loop topology;
+`SystemPromptRev` and `ModelID` to their manifest counterparts;
+`ToolPolicyRev` to the tool entries; `RuntimeSkills` to the runtime-skill
+source mode (an application compatibility field); `AgentAdapter` and
+`PermissionPosture` to the foreign-agent adapter identity and posture;
+`WorkspaceRoot` to workspace placement; `ExternalCapabilityRev` to the
+external capability identities. Dropping a fingerprinted field is a
+drift-detection regression and is not permitted.
+
+Fingerprint equality is a shortcut valid only between manifests of the same
+manifest schema version. Adding a manifest field changes the canonical
+encoding, so a manifest schema bump makes every existing fingerprint differ
+even when behavior is identical. Across schema versions, restore always
+performs the field-level assessment and never treats raw fingerprint
+inequality as drift; the resulting one-time baseline upgrade is recorded as
+described under "Configuration freeze and adoption."
+
 Large manifests may be stored as content-addressed blobs. The journal event
 then carries the manifest digest, schema version, bounded summary, and blob
 reference. Restore must verify the referenced content against the digest
-before using it (a failure there is a digest mismatch, and hard).
+before using it (a failure there is a digest mismatch, and hard). Manifest
+blobs are pinned for the lifetime of the journal that references them; blob
+garbage collection must treat journal references as roots.
 
 ## Configuration freeze and adoption
 
@@ -249,7 +278,9 @@ the Rig configuration needed by a Session:
 Freezing a candidate does not by itself mutate a Session. It becomes the
 Session's adopted baseline at one of these boundaries:
 
-1. **New Session.** `SessionStarted` adopts configuration epoch 1.
+1. **New Session.** `SessionStarted` adopts configuration epoch 1. It gains
+   an optional manifest field under the evolution policy; the legacy
+   fingerprint field remains populated during the deprecation window.
 2. **Accepted restore drift.** `ConfigurationAdopted` commits the next epoch
    before `RestoreDone`.
 3. **Successful journal migration (Phase 2).** `MigrationApplied` commits the
@@ -259,7 +290,8 @@ Session's adopted baseline at one of these boundaries:
    defined safe boundary, initially Session idle with no unresolved operation
    that depends on the replaced configuration.
 
-An ordinary restore with no drift appends no new configuration epoch.
+An ordinary restore with no drift appends no new configuration epoch, with
+one exception: baseline upgrades, below.
 
 The latest committed `SessionStarted` or `ConfigurationAdopted` event is the
 baseline for the next restore:
@@ -275,8 +307,16 @@ ConfigurationAdopted       epoch 3
 
 Legacy journals that carry only `ConfigFingerprint` remain readable. When no
 complete prior manifest exists, drift assessment is limited to the fields the
-legacy fingerprint can distinguish. The first accepted restore under the new
-system installs a complete manifest and establishes a current baseline.
+legacy fingerprint can distinguish.
+
+**Baseline upgrades.** The first restore under the new system — drifted or
+not — appends a one-time baseline-upgrade `ConfigurationAdopted` (decision
+source `policy`, drift summary limited to what the legacy fingerprint could
+distinguish) so a complete manifest baseline is installed. The same mechanism
+records the one-time upgrade when a future manifest schema bump changes the
+canonical encoding. Baseline upgrades never require a decision by themselves:
+only genuine Warn-level field drift found by the accompanying assessment
+does. These are the only exception to "no drift appends no epoch."
 
 ## Drift assessment
 
@@ -294,7 +334,10 @@ what the session can touch?**
 | Warn | Explicit decision required | Workspace root or placement changed; confinement **broadened**; permission policy **broadened**; trust mode changed; agent kind or adapter changed. |
 
 Direction-sensitive fields (confinement, permissions) classify by direction:
-tightening is Info, broadening is Warn. Severity is advisory input to
+tightening is Info, broadening is Warn. Direction can only be computed from
+the structured posture forms in the manifest; a change visible only through
+an opaque digest has unknown direction and defaults to Warn (fail-secure).
+Severity is advisory input to
 application policy, not authority granted by the manifest; applications may
 reclassify categories (for example, a deployment may promote model changes to
 Warn).
@@ -346,11 +389,30 @@ decider that presents the assessment and asks. The Harness owns the typed
 assessment and the durable adoption record; frontends own presentation and the
 final policy choice.
 
+`DecideRestore` runs while the restore lease is held and the lease fence is
+already appended. The context carries the restore deadline; an interactive
+frontend must bound how long a prompt may hold the lease, and a timeout is a
+rejection. A competing restore attempt during the wait fails lease
+acquisition exactly as today.
+
+**Rejection is durably recorded.** When the decider rejects or fails, restore
+appends `RestoreErrored` carrying the typed rejection (as it does for any
+restore failure today), releases the lease, and returns
+`RestoreRejectedError` to the caller. The journal therefore shows that a
+restore was attempted and refused, and under which assessment. No
+`ConfigurationAdopted` is appended; the adoption baseline is unchanged.
+
 Compatibility: `WithAllowConfigMismatch` remains as a deprecated shim that
 installs an accept-everything decider with `Source: policy`, so existing
 callers keep compiling while the durable record still shows what happened.
 `ConfigMismatchError` is superseded by `RestoreRejectedError`, which carries
-the full drift assessment.
+the full drift assessment. The existing agent-name check (`checkAgentName`,
+`AgentNameMismatchError`) folds into the assessment as the agent-kind Warn
+category and is superseded on the same schedule; the single-primer recovery
+path it currently gates follows the restore decision instead of the shared
+boolean. `DecisionSource` on a `RestoreDecision` is limited to
+`user | policy | operator`; the `migration` source appears only on adoption
+events stamped by Harness itself during a Phase 2 migration.
 
 ## Configuration adoption event
 
@@ -602,10 +664,18 @@ data. A changed live MCP catalog is assessed like any other tool change:
 - A table-driven drift-classification matrix covering every category × both
   directions for direction-sensitive fields.
 - Epoch ordering and adoption-baseline selection across multi-epoch journals.
-- Legacy fingerprint-only journals: limited assessment, first-restore manifest
-  installation.
+- Legacy fingerprint-only journals: limited assessment, first-restore
+  baseline-upgrade adoption even with zero drift.
+- Upgrade wave: prior-manifest-schema journals restore with a one-time
+  baseline upgrade and no spurious Warn drift from encoding changes alone.
 - Both default decider paths (all-Info accept, any-Warn reject), the
   interactive decider seam, and the `WithAllowConfigMismatch` shim.
+- Rejection: `RestoreErrored` appended, adoption baseline unchanged, lease
+  released, `RestoreRejectedError` returned.
+- Lease lost during the `ConfigurationAdopted` append: adoption fails and the
+  Session does not come up under the unrecorded configuration.
+- Direction classification from structured postures, including the
+  digest-only-change-defaults-to-Warn rule.
 - `UnsupportedSchemaError` on a future event `v`, and continued fail-closed
   behavior at the frame version.
 
