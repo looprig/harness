@@ -88,3 +88,39 @@ func TestManifestFingerprintDomainSeparation(t *testing.T) {
 		t.Error("empty manifest fingerprint equals bare sha256 of empty string; domain tag missing")
 	}
 }
+
+func TestManifestFromLegacy(t *testing.T) {
+	t.Parallel()
+	legacy := ConfigFingerprint{
+		TopologyRev: "t", AgentKind: "k", ModelID: "m", SystemPromptRev: "s",
+		ToolPolicyRev: "tp", RuntimeSkills: true, WorkspaceRoot: "/r",
+		AgentAdapter: "a", PermissionPosture: "p",
+		NativePermissionPolicyRev: "n", ExternalCapabilityRev: "x",
+	}
+	got := ManifestFromLegacy(legacy)
+	if got.SchemaVersion != 0 {
+		t.Errorf("SchemaVersion = %d, want 0 (legacy projection marker)", got.SchemaVersion)
+	}
+	// Every legacy field must survive the projection (superset requirement).
+	if got.TopologyRev != "t" || got.AgentKind != "k" || got.ModelID != "m" ||
+		got.SystemPromptRev != "s" || !got.RuntimeSkills || got.WorkspaceRoot != "/r" ||
+		got.AgentAdapter != "a" || got.PermissionPosture != "p" ||
+		got.NativePermissionPolicyRev != "n" || got.ExternalCapabilityRev != "x" {
+		t.Errorf("legacy fields dropped in projection: %+v", got)
+	}
+	if got.legacyToolPolicyRev != "tp" {
+		t.Errorf("legacyToolPolicyRev = %q, want %q", got.legacyToolPolicyRev, "tp")
+	}
+}
+
+func TestLegacyToolPolicyRevDerivation(t *testing.T) {
+	t.Parallel()
+	m := ConfigManifest{
+		SchemaVersion: ManifestSchemaVersion,
+		Tools:         []ToolManifestEntry{{Name: "Read"}, {Name: "Bash"}},
+	}
+	// Must reproduce rig's names-only digest: sha256("Bash\nRead").
+	if got, want := m.ToolNamesRev(), hexSHA256Event("Bash\nRead"); got != want {
+		t.Errorf("ToolNamesRev() = %s, want %s", got, want)
+	}
+}

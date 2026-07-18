@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"sort"
+	"strings"
 )
 
 // ManifestSchemaVersion is the current ConfigManifest schema version. Bumping it
@@ -68,6 +69,9 @@ type ConfigManifest struct {
 	// AppFields are application-defined, secret-free compatibility fields.
 	// Canonically encoded in sorted key order.
 	AppFields map[string]string `json:"app_fields,omitzero"`
+	// legacyToolPolicyRev carries a legacy baseline's names-only tool digest
+	// through ManifestFromLegacy. Never persisted, never canonical.
+	legacyToolPolicyRev string `json:"-"`
 }
 
 // Fingerprint is SHA-256 over the canonical encoding: explicit domain,
@@ -118,6 +122,41 @@ func (m ConfigManifest) canonical() []byte {
 		material = appendManifestString(material, m.AppFields[key])
 	}
 	return material
+}
+
+// ManifestFromLegacy projects a legacy ConfigFingerprint into a partial
+// manifest for drift assessment against a live candidate. SchemaVersion 0
+// marks the projection: it is never persisted, never fingerprinted, and
+// limits assessment to the fields the legacy fingerprint can distinguish
+// (tool identity is names-only; permission and confinement are digest-only,
+// so their changes classify Warn).
+func ManifestFromLegacy(f ConfigFingerprint) ConfigManifest {
+	return ConfigManifest{
+		SchemaVersion:             0,
+		AgentKind:                 f.AgentKind,
+		TopologyRev:               f.TopologyRev,
+		ModelID:                   f.ModelID,
+		SystemPromptRev:           f.SystemPromptRev,
+		legacyToolPolicyRev:       f.ToolPolicyRev,
+		RuntimeSkills:             f.RuntimeSkills,
+		WorkspaceRoot:             f.WorkspaceRoot,
+		AgentAdapter:              f.AgentAdapter,
+		PermissionPosture:         f.PermissionPosture,
+		NativePermissionPolicyRev: f.NativePermissionPolicyRev,
+		ExternalCapabilityRev:     f.ExternalCapabilityRev,
+	}
+}
+
+// ToolNamesRev reproduces the legacy names-only tool digest from the manifest's
+// tool entries, so a full manifest can be compared against a legacy baseline.
+// It MUST stay byte-identical to rig's toolPolicyRev (sorted names joined by \n).
+func (m ConfigManifest) ToolNamesRev() string {
+	names := make([]string, 0, len(m.Tools))
+	for _, entry := range m.Tools {
+		names = append(names, entry.Name)
+	}
+	sort.Strings(names)
+	return hexSHA256Event(strings.Join(names, "\n"))
 }
 
 func appendManifestString(material []byte, value string) []byte {
