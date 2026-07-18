@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -160,6 +161,54 @@ type errDecider struct{}
 
 func (errDecider) DecideRestore(context.Context, event.DriftAssessment) (RestoreDecision, error) {
 	return RestoreDecision{}, errors.New("decider boom")
+}
+
+// emptySourceDecider accepts with an INVALID (empty) Source and over-long Message/Actor
+// — the exact shape that, unnormalized, would fail ConfigurationAdopted validation and
+// brick every restore. The constructor must normalize it: empty Source → policy,
+// Message/Actor truncated to the durable caps.
+type emptySourceDecider struct{}
+
+func (emptySourceDecider) DecideRestore(context.Context, event.DriftAssessment) (RestoreDecision, error) {
+	return RestoreDecision{
+		Accept:  true,
+		Message: strings.Repeat("m", event.MaxConfigMessageLen+500),
+		Actor:   strings.Repeat("a", event.MaxConfigActorLen+500),
+	}, nil
+}
+
+// TestRestoreEmptySourceDecisionNormalized: a custom decider returning an accepting
+// decision with an empty Source (and over-long Message/Actor) does NOT brick the restore.
+// The restore SUCCEEDS and the durable ConfigurationAdopted carries Source==policy with a
+// Message/Actor truncated to the durable caps — proving a decider can never produce an
+// adoption that fails validation on every subsequent restore.
+func TestRestoreEmptySourceDecisionNormalized(t *testing.T) {
+	store := newRestoreStore(t)
+	definition := restoreCfg(&stubLLM{}, "model-x", "be helpful")
+	fp := fingerprintFromDefinition(definition)
+
+	orig := buildManifestStream(t, store, fp, baselineManifest(), "agent")
+	handOver(t, orig.lease)
+
+	candidate := baselineManifest()
+	candidate.ModelID = "model-y" // Info drift so the decider is consulted and an adoption is written
+	s, err := restoreTestSession(context.Background(), definition, orig.sessionID, store,
+		WithManifest(candidate), WithRestoreDecider(emptySourceDecider{}))
+	if err != nil {
+		t.Fatalf("Restore (empty-source decision) err = %v, want success (a decider must not brick a restore)", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	adopted := findAdopted(t, replayAllSessionEvents(t, store, orig.sessionID))
+	if adopted.Source != event.DecisionSourcePolicy {
+		t.Errorf("adopted.Source = %q, want %q (empty Source normalized to policy)", adopted.Source, event.DecisionSourcePolicy)
+	}
+	if len(adopted.Message) != event.MaxConfigMessageLen {
+		t.Errorf("adopted.Message len = %d, want %d (truncated to the cap)", len(adopted.Message), event.MaxConfigMessageLen)
+	}
+	if len(adopted.Actor) != event.MaxConfigActorLen {
+		t.Errorf("adopted.Actor len = %d, want %d (truncated to the cap)", len(adopted.Actor), event.MaxConfigActorLen)
+	}
 }
 
 // TestRestoreAcceptsInfoDriftAndAdopts: an Info-level manifest change (different ModelID)
@@ -423,7 +472,7 @@ func TestRestoreAgentNameMismatchIsWarnDrift(t *testing.T) {
 	}
 	foundAgentChange := false
 	for _, change := range rejected.Assessment.Changes {
-		if change.Category == event.DriftAgentKind && change.Field == "agent_name" && change.Severity == event.DriftWarn {
+		if change.Category == event.DriftAgentName && change.Severity == event.DriftWarn {
 			foundAgentChange = true
 		}
 	}
@@ -441,7 +490,7 @@ func TestRestoreAgentNameMismatchIsWarnDrift(t *testing.T) {
 	adopted := findAdopted(t, replayAllSessionEvents(t, store, orig.sessionID))
 	sawAgentDrift := false
 	for _, change := range adopted.Drift {
-		if change.Category == event.DriftAgentKind && change.Field == "agent_name" {
+		if change.Category == event.DriftAgentName {
 			sawAgentDrift = true
 		}
 	}

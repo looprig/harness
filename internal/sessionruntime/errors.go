@@ -44,6 +44,7 @@ const (
 	RestoreJournalFailed                 = sessionapi.RestoreJournalFailed
 	RestoreReplayFailed                  = sessionapi.RestoreReplayFailed
 	RestoreAppendFailed                  = sessionapi.RestoreAppendFailed
+	RestoreAdoptionInvalid               = sessionapi.RestoreAdoptionInvalid
 	RestoreLoopFailed                    = sessionapi.RestoreLoopFailed
 	RestoreContextDone                   = sessionapi.RestoreContextDone
 	RestoreIDGenerationFailed            = sessionapi.RestoreIDGenerationFailed

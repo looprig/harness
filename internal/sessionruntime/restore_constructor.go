@@ -290,9 +290,12 @@ func restoreTopologySession(
 		assessment = event.AssessDrift(baseline.Manifest, candidate)
 		persistedName := roots[topology.ActivePrimer].AgentName
 		if configuredName := activeDefinition.Name(); persistedName != configuredName {
+			// A persisted-vs-configured root-loop NAME difference has its OWN category
+			// (DriftAgentName) — a broader "what does the session answer to" change,
+			// distinct from the agent KIND (DriftAgentKind). Still Warn, so the default
+			// policy decider's severity-keyed behavior is unchanged.
 			assessment.Changes = append(assessment.Changes, event.DriftChange{
-				Category: event.DriftAgentKind,
-				Field:    "agent_name",
+				Category: event.DriftAgentName,
 				Old:      string(persistedName),
 				New:      string(configuredName),
 				Severity: event.DriftWarn,
@@ -304,6 +307,22 @@ func restoreTopologySession(
 		}
 		if !dec.Accept {
 			return recordErrored(&RestoreRejectedError{Assessment: assessment, Source: dec.Source})
+		}
+		// Normalize the ACCEPTING decision so a custom RestoreDecider can never brick a
+		// restore with an invalid durable ConfigurationAdopted (it would fail validation on
+		// EVERY subsequent restore → permanently unrestorable). An accepting decision that
+		// omitted a Source is, by default, a policy decision; an over-long Message/Actor is
+		// TRUNCATED, never rejected — a long audit note must not make the session
+		// unrestorable. Only the accept path builds a durable event; a reject uses dec solely
+		// for RestoreRejectedError.
+		if !dec.Source.Valid() {
+			dec.Source = event.DecisionSourcePolicy
+		}
+		if len(dec.Message) > event.MaxConfigMessageLen {
+			dec.Message = dec.Message[:event.MaxConfigMessageLen]
+		}
+		if len(dec.Actor) > event.MaxConfigActorLen {
+			dec.Actor = dec.Actor[:event.MaxConfigActorLen]
 		}
 		decision = dec
 		// Context is stale iff a real config difference exists — a pure baseline upgrade with
@@ -405,7 +424,7 @@ func restoreTopologySession(
 			Message:             decision.Message,
 		}
 		if err := appendConfigurationAdopted(ctx, j, factory, adopted); err != nil {
-			return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
+			return recordErrored(err)
 		}
 	}
 	if err := appendCompactWaiterRepairs(ctx, j, factory, compactWaiterRepairs); err != nil {
@@ -905,7 +924,9 @@ func appendRestoreEvent(ctx context.Context, j journal.SessionJournal, factory *
 // the lease-checked journal. It is the restore-lifecycle counterpart to appendRestoreEvent
 // for the one event appendRestoreEvent's withRestoreHeader does not handle; a mint or
 // validation failure surfaces as a typed restore error the caller records as a
-// RestoreErrored.
+// RestoreErrored. A build/validation failure and a journal-append failure are named
+// distinctly (RestoreAdoptionInvalid vs RestoreAppendFailed) so a caller can tell a
+// malformed adoption apart from a lost lease or storage error.
 func appendConfigurationAdopted(ctx context.Context, j journal.SessionJournal, factory *event.Factory, adopted event.ConfigurationAdopted) error {
 	hdr, err := factory.Stamp(adopted.EventHeader())
 	if err != nil {
@@ -913,10 +934,10 @@ func appendConfigurationAdopted(ctx context.Context, j journal.SessionJournal, f
 	}
 	adopted.Header = hdr
 	if err := event.ValidateEvent(adopted); err != nil {
-		return err
+		return &RestoreError{Kind: RestoreAdoptionInvalid, Cause: err}
 	}
 	if _, err := j.Append(ctx, journal.NewEventRecord(adopted)); err != nil {
-		return err
+		return &RestoreError{Kind: RestoreAppendFailed, Cause: err}
 	}
 	return nil
 }

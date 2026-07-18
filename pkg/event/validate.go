@@ -66,6 +66,7 @@ const (
 	FieldPostContext      FieldName = "PostContext"
 	FieldCommittedEventID FieldName = "CommittedEventID"
 	FieldSource           FieldName = "Source"
+	FieldActor            FieldName = "Actor"
 	FieldGeneration       FieldName = "Generation"
 	FieldTools            FieldName = "Tools"
 	// FieldIntegrationName names IntegrationStatus.Name. It is not spelled
@@ -243,19 +244,31 @@ func validateEventBody(ev Event) error {
 // the journal, and a legacy (SchemaVersion 0) manifest projection is never
 // persisted.
 const (
-	maxConfigDriftChanges = 256
-	maxConfigMessageLen   = 4096
 	// The manifest is decoded from untrusted journal input, so its collections
 	// are capped defense-in-depth. The caps are generous: they never trip a
 	// legitimate configuration, only an abusive one.
 	maxConfigManifestTools     = 4096
 	maxConfigManifestAppFields = 1024
+	// maxConfigDriftChanges must never reject a drift summary a VALID manifest
+	// comparison can legitimately produce, or a large-but-legitimate change would
+	// brick every restore. A schema-1↔schema-1 assessment can emit one change per
+	// tool (up to maxConfigManifestTools) plus one per app field (up to
+	// maxConfigManifestAppFields) plus the ~dozen scalar-field categories; the +64
+	// covers those scalars with slack. It still bounds a decoded hostile event.
+	maxConfigDriftChanges = maxConfigManifestTools + maxConfigManifestAppFields + 64
+	// MaxConfigMessageLen and MaxConfigActorLen bound the durable, partly
+	// user-authored audit fields. They are exported so the restore constructor can
+	// TRUNCATE a decider's over-long Message/Actor before building the adoption (a
+	// long audit note must never brick a restore); the validator here still rejects
+	// an over-long field on a hand-crafted, decoded journal record.
+	MaxConfigMessageLen = 4096
+	MaxConfigActorLen   = 1024
 )
 
 // validateConfigurationAdopted enforces the config-epoch invariants: epoch 1
 // belongs to SessionStarted so an adoption is always >= 2, the adopted
 // fingerprint is required, the source is one of the four closed DecisionSource
-// values, the drift summary and message are length-capped, and a legacy
+// values, the drift summary, message, and actor are length-capped, and a legacy
 // (SchemaVersion 0) manifest projection is refused.
 func validateConfigurationAdopted(e ConfigurationAdopted) error {
 	const name EventName = "ConfigurationAdopted"
@@ -271,8 +284,11 @@ func validateConfigurationAdopted(e ConfigurationAdopted) error {
 	if len(e.Drift) > maxConfigDriftChanges {
 		return &InvalidEventError{Event: name, Field: FieldDrift, Rule: RuleInvalid}
 	}
-	if len(e.Message) > maxConfigMessageLen {
+	if len(e.Message) > MaxConfigMessageLen {
 		return &InvalidEventError{Event: name, Field: FieldMessage, Rule: RuleInvalid}
+	}
+	if len(e.Actor) > MaxConfigActorLen {
+		return &InvalidEventError{Event: name, Field: FieldActor, Rule: RuleInvalid}
 	}
 	if e.Manifest.SchemaVersion == 0 {
 		return &InvalidEventError{Event: name, Field: FieldManifest, Rule: RuleInvalid}

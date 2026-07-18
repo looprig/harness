@@ -198,10 +198,16 @@ func (e *RestoreDiscoveryError) Error() string {
 type RestoreErrorKind string
 
 const (
-	RestoreLeaseFailed           RestoreErrorKind = "lease_failed"
-	RestoreJournalFailed         RestoreErrorKind = "journal_failed"
-	RestoreReplayFailed          RestoreErrorKind = "replay_failed"
-	RestoreAppendFailed          RestoreErrorKind = "append_failed"
+	RestoreLeaseFailed   RestoreErrorKind = "lease_failed"
+	RestoreJournalFailed RestoreErrorKind = "journal_failed"
+	RestoreReplayFailed  RestoreErrorKind = "replay_failed"
+	RestoreAppendFailed  RestoreErrorKind = "append_failed"
+	// RestoreAdoptionInvalid names the specific failure of building/validating the
+	// durable ConfigurationAdopted (event.ValidateEvent rejected it), distinct from
+	// RestoreAppendFailed (an actual journal Append failure — lost lease, storage
+	// error). It lets a caller tell "the decision produced a malformed adoption"
+	// apart from "the journal write failed".
+	RestoreAdoptionInvalid       RestoreErrorKind = "adoption_invalid"
 	RestoreLoopFailed            RestoreErrorKind = "loop_failed"
 	RestoreContextDone           RestoreErrorKind = "context_done"
 	RestoreIDGenerationFailed    RestoreErrorKind = "id_generation_failed"

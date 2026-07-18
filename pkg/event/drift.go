@@ -26,6 +26,7 @@ const (
 	DriftWorkspace     DriftCategory = "workspace"
 	DriftTrust         DriftCategory = "trust"
 	DriftAgentKind     DriftCategory = "agent_kind"
+	DriftAgentName     DriftCategory = "agent_name"
 	DriftAdapter       DriftCategory = "adapter"
 	DriftRuntimeSkills DriftCategory = "runtime_skills"
 	DriftApp           DriftCategory = "app"

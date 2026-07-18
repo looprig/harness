@@ -6,8 +6,15 @@ import (
 	"github.com/looprig/harness/pkg/event"
 )
 
-// RestoreDecision is an application's answer to a drift assessment. Source and
-// Actor are recorded durably on the resulting ConfigurationAdopted (later task).
+// RestoreDecision is an application's answer to a drift assessment. Source,
+// Actor, and Message are recorded durably on the resulting ConfigurationAdopted.
+//
+// Contract for an ACCEPTING decision (Accept == true): it must carry a valid
+// Source (user | policy | operator — never migration). An empty Source is treated
+// as policy. Actor and Message are BOUNDED audit fields: the restore constructor
+// truncates them (to MaxConfigActorLen / MaxConfigMessageLen bytes) before writing
+// the durable adoption, so an over-long value is silently shortened rather than
+// bricking the restore — never rely on their full length surviving.
 type RestoreDecision struct {
 	Accept  bool
 	Source  event.DecisionSource // user | policy | operator (never migration)
@@ -17,6 +24,12 @@ type RestoreDecision struct {
 
 // RestoreDecider answers a restore drift assessment. It runs while the restore
 // lease is held; ctx carries the restore deadline, and a timeout is a rejection.
+//
+// An ACCEPTING RestoreDecision must honor the RestoreDecision contract above: a
+// valid Source (empty defaults to policy) and bounded Actor/Message (truncated,
+// not rejected). A decider therefore cannot brick a restore with a malformed
+// decision — the constructor normalizes an accepting decision before it becomes a
+// durable ConfigurationAdopted.
 type RestoreDecider interface {
 	DecideRestore(ctx context.Context, assessment event.DriftAssessment) (RestoreDecision, error)
 }
