@@ -446,9 +446,13 @@ func TestRestoreSessionFingerprintFieldsMismatchPolicy(t *testing.T) {
 		_ = restored.Shutdown(context.Background())
 		t.Fatal("mismatched restore returned a session")
 	} else {
-		var mismatch *session.ConfigMismatchError
-		if !errors.As(err, &mismatch) {
-			t.Fatalf("mismatched restore error = %T %v, want ConfigMismatchError", err, err)
+		// A rig configures a schema-1 ConfigManifest, so restore assesses drift and the
+		// fail-secure default decider rejects a Warn (AgentKind) change with a typed
+		// *RestoreRejectedError (the successor to the ConfigMismatchError of the pre-manifest
+		// fingerprint path).
+		var rejected *session.RestoreRejectedError
+		if !errors.As(err, &rejected) {
+			t.Fatalf("mismatched restore error = %T %v, want RestoreRejectedError", err, err)
 		}
 	}
 	restored, err := defineRig("operator-b", true).RestoreSession(context.Background(), id)
@@ -527,9 +531,14 @@ func TestRestoreFingerprintDecisionPrecedesWorkspaceAndBinding(t *testing.T) {
 				_ = restored.Shutdown(context.Background())
 				t.Fatal("denied mismatch returned a session")
 			}
-			var mismatch *session.ConfigMismatchError
-			if !errors.As(restoreErr, &mismatch) {
-				t.Fatalf("restore error = %T %v, want mismatch", restoreErr, restoreErr)
+			// The rig's schema-1 manifest routes restore through drift assessment: a Warn
+			// (WorkspaceRoot) change is rejected by the default decider with a typed
+			// *RestoreRejectedError, and — critically — the decision still precedes workspace
+			// placement and loop binding, so no permission factory ran and no root lease was
+			// acquired.
+			var rejected *session.RestoreRejectedError
+			if !errors.As(restoreErr, &rejected) {
+				t.Fatalf("restore error = %T %v, want RestoreRejectedError", restoreErr, restoreErr)
 			}
 			if binds.Load() != 0 || rootLeases.acquired != 0 {
 				t.Fatalf("denied restore performed side effects: binds=%d root acquires=%d", binds.Load(), rootLeases.acquired)

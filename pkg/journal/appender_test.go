@@ -74,7 +74,7 @@ func TestJournalEventAppenderRoutes(t *testing.T) {
 			if !ok {
 				t.Fatalf("record type = %T, want EventRecord", rec)
 			}
-			if er.Event() != tt.ev {
+			if !reflect.DeepEqual(er.Event(), tt.ev) {
 				t.Errorf("wrapped event = %v, want the appended event", er.Event())
 			}
 		})
@@ -116,7 +116,7 @@ func TestJournalEventAppenderReturnsSeq(t *testing.T) {
 			if len(cat.events) != 1 || len(cat.seqs) != 1 {
 				t.Fatalf("catalog saw %d events / %d seqs, want 1 / 1", len(cat.events), len(cat.seqs))
 			}
-			if cat.events[0] != ev {
+			if !reflect.DeepEqual(cat.events[0], ev) {
 				t.Errorf("catalog event = %v, want the appended event", cat.events[0])
 			}
 			if cat.seqs[0] != tt.wantSeq {
@@ -236,7 +236,7 @@ func TestJournalEventAppenderCatalogHook(t *testing.T) {
 		if len(cat.events) != 1 {
 			t.Fatalf("catalog saw %d events, want 1", len(cat.events))
 		}
-		if cat.events[0] != ev {
+		if !reflect.DeepEqual(cat.events[0], ev) {
 			t.Errorf("catalog event = %v, want the appended event", cat.events[0])
 		}
 	})

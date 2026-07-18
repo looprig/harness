@@ -141,6 +141,24 @@ func WithLimits(l Limits) Option {
 func WithAllowConfigMismatch() Option {
 	return func(s *Session) {
 		s.allowConfigMismatch = true
+		// The deprecated shim also installs the accept-all decider so a manifest-carrying
+		// caller that opts into mismatch accepts Warn drift through the NEW drift-assessed
+		// path too (the legacy path still reads the bool). A later WithRestoreDecider on the
+		// same session overrides this.
+		s.restoreDecider = AcceptAllDecider{}
+	}
+}
+
+// WithRestoreDecider installs the restore-only application policy that answers a
+// configuration-drift assessment (the successor seam to WithAllowConfigMismatch).
+// A nil decider is ignored so a wiring slip cannot null the field — the session
+// then keeps its fail-secure DefaultPolicyDecider{} default. New ignores the
+// decider (only Restore assesses drift); a later task consumes it in the restore path.
+func WithRestoreDecider(decider RestoreDecider) Option {
+	return func(s *Session) {
+		if decider != nil {
+			s.restoreDecider = decider
+		}
 	}
 }
 
@@ -201,6 +219,16 @@ func WithFingerprint(fingerprint event.ConfigFingerprint) Option {
 	return func(s *Session) {
 		copy := fingerprint
 		s.frozenFingerprint = &copy
+	}
+}
+
+// WithManifest installs the rig-assembled ConfigManifest counterpart to the frozen
+// fingerprint. The session stamps it onto the construction-time SessionStarted's
+// additive Manifest field.
+func WithManifest(manifest event.ConfigManifest) Option {
+	return func(s *Session) {
+		copy := manifest
+		s.frozenManifest = &copy
 	}
 }
 

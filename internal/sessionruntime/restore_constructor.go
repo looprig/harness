@@ -126,6 +126,17 @@ func restoreTopologySession(
 		probe.securityLimit = security.New()
 	}
 	allowMismatch := probe.allowConfigMismatch
+	// Default the restore-drift decider to the fail-secure policy when the composition root
+	// injected none via WithRestoreDecider, so the NEW-PATH decision is never a nil-deref.
+	if probe.restoreDecider == nil {
+		probe.restoreDecider = DefaultPolicyDecider{}
+	}
+	// The compatibility path is chosen by whether a LIVE manifest is configured: a
+	// SchemaVersion>=1 candidate (rig sessions) takes the NEW drift-assessed path; a zero
+	// (SchemaVersion 0) candidate — existing tests and non-rig callers — takes the LEGACY
+	// fingerprint path unchanged.
+	candidate := probe.projectManifest()
+	newPath := candidate.SchemaVersion >= 1
 	if probe.fingerprint == nil && probe.frozenFingerprint == nil {
 		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &MissingFingerprintProviderError{}}
 	}
@@ -226,17 +237,29 @@ func restoreTopologySession(
 		probe.securityLimit.Set(securityLevel)
 	}
 
-	persisted, err := firstConfigFingerprint(all)
-	if err != nil {
-		return recordErrored(err)
-	}
-	// A rig supplies a frozen fingerprint, allowing the mismatch decision to happen
-	// immediately after replay and before root acquisition, binding, or reconstruction.
+	// NEW PATH: the drift baseline is the LATEST adopted manifest (or a legacy projection of
+	// the first SessionStarted); LEGACY PATH: the persisted config fingerprint from the first
+	// SessionStarted governs the byte-for-byte-unchanged compatibility check.
+	var baseline adoptedBaseline
+	var persisted event.ConfigFingerprint
 	var frozenContextStale bool
-	if probe.frozenFingerprint != nil {
-		frozenContextStale, err = restoredContextDisposition(persisted, *probe.frozenFingerprint, allowMismatch)
+	if newPath {
+		baseline, err = latestAdoptedBaseline(all)
 		if err != nil {
 			return recordErrored(err)
+		}
+	} else {
+		persisted, err = firstConfigFingerprint(all)
+		if err != nil {
+			return recordErrored(err)
+		}
+		// A rig supplies a frozen fingerprint, allowing the mismatch decision to happen
+		// immediately after replay and before root acquisition, binding, or reconstruction.
+		if probe.frozenFingerprint != nil {
+			frozenContextStale, err = restoredContextDisposition(persisted, *probe.frozenFingerprint, allowMismatch)
+			if err != nil {
+				return recordErrored(err)
+			}
 		}
 	}
 	// (4a) Discover every durable root (zero-Cause LoopStarted) and the ordered starts, and
@@ -246,6 +269,73 @@ func restoreTopologySession(
 	roots, starts, err := discoverRoots(all, topology, allowMismatch)
 	if err != nil {
 		return recordErrored(err)
+	}
+	// NEW-PATH drift decision — placed HERE, right after root discovery and BEFORE workspace
+	// placement (the root lease) and loop binding, so a rejection has ZERO side effects
+	// (mirroring where the frozen-fingerprint mismatch rejects on the legacy path). The
+	// assessment compares the live candidate against the adopted baseline and folds the
+	// root-loop AgentName check in: a persisted-vs-configured name difference broadens what
+	// the session answers to, so it classifies Warn and is seen by the decider. The
+	// configured name is read off the definition (identical to the bound name, but available
+	// before binding). A decider error or a rejection routes through the SAME fail-secure
+	// exit a fingerprint mismatch uses (recordErrored: append RestoreErrored, release the
+	// leases, return the typed error). On accept, an adoption is durably recorded after
+	// RestoreStarted below when the config actually changed or the schema was upgraded.
+	var assessment event.DriftAssessment
+	var decision RestoreDecision
+	newPathStale := false
+	adoptOnAccept := false
+	if newPath {
+		assessment = event.AssessDrift(baseline.Manifest, candidate)
+		persistedName := roots[topology.ActivePrimer].AgentName
+		if configuredName := activeDefinition.Name(); persistedName != configuredName {
+			// A persisted-vs-configured root-loop NAME difference has its OWN category
+			// (DriftAgentName) — a broader "what does the session answer to" change,
+			// distinct from the agent KIND (DriftAgentKind). Still Warn, so the default
+			// policy decider's severity-keyed behavior is unchanged.
+			assessment.Changes = append(assessment.Changes, event.DriftChange{
+				Category: event.DriftAgentName,
+				Old:      string(persistedName),
+				New:      string(configuredName),
+				Severity: event.DriftWarn,
+			})
+		}
+		dec, derr := probe.restoreDecider.DecideRestore(ctx, assessment)
+		if derr != nil {
+			// A decider FAILURE (a returned error or a timeout — a timeout is a rejection)
+			// fails secure AS a rejection, but stays classifiable: RestoreRejectedError
+			// carries the assessment and wraps the cause (Unwrap), so a caller keeps the
+			// structured drift AND can errors.As/errors.Is through to the underlying error
+			// (e.g. context.DeadlineExceeded). Source is left zero — Error() defaults it to
+			// "policy".
+			return recordErrored(&RestoreRejectedError{Assessment: assessment, Cause: derr})
+		}
+		if !dec.Accept {
+			return recordErrored(&RestoreRejectedError{Assessment: assessment, Source: dec.Source})
+		}
+		// Normalize the ACCEPTING decision so a custom RestoreDecider can never brick a
+		// restore with an invalid durable ConfigurationAdopted (it would fail validation on
+		// EVERY subsequent restore → permanently unrestorable). An accepting decision that
+		// omitted a Source is, by default, a policy decision; an over-long Message/Actor is
+		// TRUNCATED, never rejected — a long audit note must not make the session
+		// unrestorable. Only the accept path builds a durable event; a reject uses dec solely
+		// for RestoreRejectedError. A decider-supplied `migration` source is ALSO normalized to
+		// policy: DecisionSourceMigration is Valid() but reserved for Harness itself (a Phase-2
+		// migration) — a RestoreDecider must never stamp a false migration adoption.
+		if !dec.Source.Valid() || dec.Source == event.DecisionSourceMigration {
+			dec.Source = event.DecisionSourcePolicy
+		}
+		if len(dec.Message) > event.MaxConfigMessageLen {
+			dec.Message = dec.Message[:event.MaxConfigMessageLen]
+		}
+		if len(dec.Actor) > event.MaxConfigActorLen {
+			dec.Actor = dec.Actor[:event.MaxConfigActorLen]
+		}
+		decision = dec
+		// Context is stale iff a real config difference exists — a pure baseline upgrade with
+		// no changes keeps the durable context measurement.
+		newPathStale = len(assessment.Changes) > 0
+		adoptOnAccept = len(assessment.Changes) > 0 || assessment.BaselineUpgrade
 	}
 	// Stand up the delegation manager BEFORE binding any loop so each restored loop's
 	// Subagent tool is bound against a parent-scoped controller; it is attached to the
@@ -268,12 +358,24 @@ func restoreTopologySession(
 
 	manager := newDelegationManager(topology)
 	contextDisposition := func(bound loop.BoundDefinition) (bool, error) {
+		if newPath {
+			// The NEW-path decision (above) already assessed drift; context staleness reuses
+			// that result so the fold never re-derives it.
+			return newPathStale, nil
+		}
 		if probe.frozenFingerprint != nil {
 			return frozenContextStale, nil
 		}
 		return restoredContextDisposition(persisted, probe.projectFingerprint(bound), allowMismatch)
 	}
-	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch, contextDisposition, manager, probe.securityLimit, probe.newWorkspaceBinding)
+	// On the NEW path the AgentName difference is decided by the decider (folded into the
+	// assessment above), never hard-failed at bind time, so planLoops must not reject it —
+	// it relaxes the same name check WithAllowConfigMismatch relaxes.
+	planAllowMismatch := allowMismatch
+	if newPath {
+		planAllowMismatch = true
+	}
+	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, planAllowMismatch, contextDisposition, manager, probe.securityLimit, probe.newWorkspaceBinding)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -306,6 +408,31 @@ func restoreTopologySession(
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
 	}); err != nil {
 		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
+	}
+	// Durable adoption (NEW path, on accept, when the configuration actually changed or the
+	// baseline schema was upgraded): appended AFTER RestoreStarted and BEFORE RestoreDone
+	// through the SAME lease-checked journal that appends RestoreStarted, so the session
+	// never comes up under an unrecorded configuration. A failed append aborts the restore
+	// through the same fail-secure exit.
+	if newPath && adoptOnAccept {
+		prevFingerprint := ""
+		if baseline.Manifest.SchemaVersion >= 1 {
+			prevFingerprint = baseline.Manifest.Fingerprint()
+		}
+		adopted := event.ConfigurationAdopted{
+			Header:              event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
+			Epoch:               baseline.Epoch + 1,
+			PreviousFingerprint: prevFingerprint,
+			AdoptedFingerprint:  candidate.Fingerprint(),
+			Manifest:            candidate,
+			Drift:               assessment.Changes,
+			Source:              decision.Source,
+			Actor:               decision.Actor,
+			Message:             decision.Message,
+		}
+		if err := appendConfigurationAdopted(ctx, j, factory, adopted); err != nil {
+			return recordErrored(err)
+		}
 	}
 	if err := appendCompactWaiterRepairs(ctx, j, factory, compactWaiterRepairs); err != nil {
 		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
@@ -795,6 +922,29 @@ func appendRestoreEvent(ctx context.Context, j journal.SessionJournal, factory *
 	}
 	if _, err := j.Append(ctx, journal.NewEventRecord(withRestoreHeader(ev, stamped))); err != nil {
 		return err
+	}
+	return nil
+}
+
+// appendConfigurationAdopted stamps (fresh EventID + CreatedAt, preserving the
+// session-scoped Coordinates) and validates a ConfigurationAdopted, then appends it through
+// the lease-checked journal. It is the restore-lifecycle counterpart to appendRestoreEvent
+// for the one event appendRestoreEvent's withRestoreHeader does not handle; a mint or
+// validation failure surfaces as a typed restore error the caller records as a
+// RestoreErrored. A build/validation failure and a journal-append failure are named
+// distinctly (RestoreAdoptionInvalid vs RestoreAppendFailed) so a caller can tell a
+// malformed adoption apart from a lost lease or storage error.
+func appendConfigurationAdopted(ctx context.Context, j journal.SessionJournal, factory *event.Factory, adopted event.ConfigurationAdopted) error {
+	hdr, err := factory.Stamp(adopted.EventHeader())
+	if err != nil {
+		return &RestoreError{Kind: RestoreIDGenerationFailed, Cause: err}
+	}
+	adopted.Header = hdr
+	if err := event.ValidateEvent(adopted); err != nil {
+		return &RestoreError{Kind: RestoreAdoptionInvalid, Cause: err}
+	}
+	if _, err := j.Append(ctx, journal.NewEventRecord(adopted)); err != nil {
+		return &RestoreError{Kind: RestoreAppendFailed, Cause: err}
 	}
 	return nil
 }

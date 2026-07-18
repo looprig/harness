@@ -229,6 +229,16 @@ func TestHustleBoundAndFrozenTopologyFingerprintEquivalent(t *testing.T) {
 			if boundFingerprint.TopologyRev != frozenFingerprint.TopologyRev {
 				t.Fatalf("bound TopologyRev = %q, frozen = %q", boundFingerprint.TopologyRev, frozenFingerprint.TopologyRev)
 			}
+			// The assembled manifest must route TopologyRev through the SAME
+			// hustle-aware revision the fingerprint uses, so a stamped manifest
+			// and the legacy fingerprint never show phantom topology drift.
+			frozenManifest := frozenManifestWithHustles(
+				ConfigFingerprintFields{}, []loop.Definition{loopDefinition},
+				[]string{"agent"}, "agent", []hustle.Definition{definition}, limits,
+			)
+			if frozenManifest.TopologyRev != frozenFingerprint.TopologyRev {
+				t.Fatalf("manifest TopologyRev = %q, fingerprint = %q", frozenManifest.TopologyRev, frozenFingerprint.TopologyRev)
+			}
 		})
 	}
 }

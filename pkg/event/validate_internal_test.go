@@ -2,6 +2,7 @@ package event
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/looprig/core/uuid"
@@ -75,6 +76,66 @@ func TestValidateEventUnknownType(t *testing.T) {
 	}
 }
 
+// TestConfigurationAdoptedFingerprintMismatchRejected asserts a persisted
+// manifest whose recorded AdoptedFingerprint disagrees with the manifest's own
+// Fingerprint() is rejected with FieldAdoptedFingerprint/RuleInvalid.
+func TestConfigurationAdoptedFingerprintMismatchRejected(t *testing.T) {
+	t.Parallel()
+	manifest := testManifest()
+	ev := ConfigurationAdopted{
+		Header:             fullHeaderSession(),
+		Epoch:              2,
+		AdoptedFingerprint: "does-not-match-the-manifest",
+		Manifest:           manifest,
+		Source:             DecisionSourcePolicy,
+	}
+	err := ValidateEvent(ev)
+	var ve *InvalidEventError
+	if !errors.As(err, &ve) {
+		t.Fatalf("ValidateEvent error = %v (%T), want *InvalidEventError", err, err)
+	}
+	if ve.Field != FieldAdoptedFingerprint {
+		t.Errorf("Field = %q, want %q", ve.Field, FieldAdoptedFingerprint)
+	}
+	if ve.Rule != RuleInvalid {
+		t.Errorf("Rule = %q, want %q", ve.Rule, RuleInvalid)
+	}
+}
+
+// TestConfigurationAdoptedOverLongActorRejected asserts a decoded adoption whose
+// Actor exceeds MaxConfigActorLen is rejected with FieldActor/RuleInvalid. A live
+// decider can't trip this (the restore constructor truncates), but a hand-crafted
+// journal record can, so the validator bounds it defense-in-depth.
+func TestConfigurationAdoptedOverLongActorRejected(t *testing.T) {
+	t.Parallel()
+	manifest := testManifest()
+	ev := ConfigurationAdopted{
+		Header:             fullHeaderSession(),
+		Epoch:              2,
+		AdoptedFingerprint: manifest.Fingerprint(),
+		Manifest:           manifest,
+		Source:             DecisionSourcePolicy,
+		Actor:              strings.Repeat("a", MaxConfigActorLen+1),
+	}
+	err := ValidateEvent(ev)
+	var ve *InvalidEventError
+	if !errors.As(err, &ve) {
+		t.Fatalf("ValidateEvent error = %v (%T), want *InvalidEventError", err, err)
+	}
+	if ve.Field != FieldActor {
+		t.Errorf("Field = %q, want %q", ve.Field, FieldActor)
+	}
+	if ve.Rule != RuleInvalid {
+		t.Errorf("Rule = %q, want %q", ve.Rule, RuleInvalid)
+	}
+
+	// An Actor exactly at the cap is accepted (boundary).
+	ev.Actor = strings.Repeat("a", MaxConfigActorLen)
+	if err := ValidateEvent(ev); err != nil {
+		t.Errorf("ValidateEvent(Actor at cap) = %v, want nil", err)
+	}
+}
+
 // TestClassifyExhaustive asserts classify recognizes EVERY event type in the sealed
 // union (doc.go's guard) — each yields ok==true and a concrete name (never the
 // "Event" unknown-type fallback). It guards against a new event type being added to
@@ -97,6 +158,7 @@ func TestClassifyExhaustive(t *testing.T) {
 		{"RestoreStarted", RestoreStarted{}},
 		{"RestoreDone", RestoreDone{}},
 		{"RestoreErrored", RestoreErrored{}},
+		{"ConfigurationAdopted", ConfigurationAdopted{}},
 		{"WorkspaceCheckpointed", WorkspaceCheckpointed{}},
 		{"WorkspaceRestored", WorkspaceRestored{}},
 		{"ActiveLoopChanged", ActiveLoopChanged{}},

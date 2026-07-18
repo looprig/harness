@@ -1,9 +1,18 @@
 # Session versioning, configuration adoption, and journal migration
 
-**Status:** design accepted 2026-07-17. Phase 1 (configuration manifest,
-drift assessment, adoption) is ready for implementation planning. Phase 2
-(migration framework) is specified but deliberately deferred until a real
-schema break exists.
+**Status:** Phase 1 implemented 2026-07-18 on branch
+`feature/config-adoption-phase1` (see `docs/plans/2026-07-17-config-adoption-phase1.md`).
+Landed: `ConfigManifest` with canonical SHA-256 fingerprint, typed two-tier
+drift assessment, the `RestoreDecider` contract with a fail-secure default
+policy, `ConfigurationAdopted` epochs with baseline upgrades, drift-assessed
+restore against the latest adopted baseline, and a typed `UnsupportedSchemaError`
+on future event schema versions. Deferred within Phase 1: tool input/output
+schema digests remain empty (the restore/frozen path has only tool names, so
+filling them one-sided would cause phantom drift — names-only parity for now);
+the interactive TUI/`serve` deciders (Task 13) live in the sibling
+`looprig/tui` module and are a downstream follow-up. Phase 2 (migration
+framework) remains specified but deliberately deferred until a real schema
+break exists.
 
 **Date:** 2026-07-16, revised 2026-07-17.
 

@@ -140,6 +140,7 @@ func Define(options ...Option) (*Rig, error) {
 		fields.WorkspaceRoot = placementFingerprint(placement, region)
 	}
 	fingerprint := frozenFingerprintWithHustles(fields, state.loops, state.primers, state.activePrimer, state.hustles, state.hustleLimits)
+	manifest := frozenManifestWithHustles(fields, state.loops, state.primers, state.activePrimer, state.hustles, state.hustleLimits)
 	lifecycleOptions := append([]sessionruntime.LifecycleOption(nil), state.lifecycleOptions...)
 	if len(state.hustles) > 0 {
 		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleHustles(
@@ -169,6 +170,7 @@ func Define(options ...Option) (*Rig, error) {
 		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleSnapshotPolicy(internalPolicy))
 	}
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleFingerprint(fingerprint))
+	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleManifest(manifest))
 	primerNames := make([]identity.AgentName, len(state.primers))
 	for i, name := range state.primers {
 		primerNames[i] = identity.AgentName(name)

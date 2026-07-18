@@ -409,6 +409,13 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 			Header: fullHeaderSession(),
 			Config: ConfigFingerprint{AgentKind: "primary", ModelID: "m-1", SystemPromptRev: "abc", ToolPolicyRev: "def", AgentAdapter: "claude", PermissionPosture: "default"},
 		}},
+		// Config and Manifest are BOTH populated during the deprecation window; the
+		// additive Manifest field must survive the durable codec deep-equal.
+		{"SessionStarted with manifest", SessionStarted{
+			Header:   fullHeaderSession(),
+			Config:   ConfigFingerprint{AgentKind: "primary", ModelID: "m-1", SystemPromptRev: "abc", ToolPolicyRev: "def"},
+			Manifest: testManifest(),
+		}},
 		{"SessionActive", SessionActive{Header: fullHeaderSession()}},
 		{"SessionIdle", SessionIdle{Header: fullHeaderSession()}},
 		{"SessionStopped", SessionStopped{Header: fullHeaderSession()}},
@@ -467,6 +474,108 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tt.ev) {
 				t.Errorf("round-trip(%s) mismatch:\n got = %#v\nwant = %#v\nwire: %s", tt.name, got, tt.ev, data)
+			}
+		})
+	}
+}
+
+// TestConfigurationAdoptedRoundTrip proves the config-epoch event survives the
+// durable codec deep-equal, and that it mirrors SessionStarted's Enduring +
+// session-scoped classification. The SessionID rides in the Header (like every
+// other session-scoped event); ConfigurationAdopted carries no standalone
+// SessionID field.
+func TestConfigurationAdoptedRoundTrip(t *testing.T) {
+	t.Parallel()
+	manifest := testManifest()
+	original := ConfigurationAdopted{
+		Header:              fullHeaderSession(),
+		Epoch:               2,
+		PreviousFingerprint: "prev",
+		AdoptedFingerprint:  manifest.Fingerprint(),
+		Manifest:            manifest,
+		Drift:               []DriftChange{{Category: DriftModel, Old: "a", New: "b", Severity: DriftInfo}},
+		Source:              DecisionSourcePolicy,
+		Actor:               "op@host",
+		AppVersion:          "coderig/1.2.3",
+		Message:             "accepted model change",
+	}
+	raw, err := MarshalEvent(original)
+	if err != nil {
+		t.Fatalf("MarshalEvent() error = %v", err)
+	}
+	decoded, err := UnmarshalEvent(raw)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent() error = %v", err)
+	}
+	got, ok := decoded.(ConfigurationAdopted)
+	if !ok {
+		t.Fatalf("decoded type = %T, want ConfigurationAdopted", decoded)
+	}
+	if got.Epoch != 2 || got.Source != DecisionSourcePolicy || len(got.Drift) != 1 {
+		t.Errorf("round trip lost fields: %+v", got)
+	}
+	if !reflect.DeepEqual(got, original) {
+		t.Errorf("round-trip mismatch:\n got = %#v\nwant = %#v\nwire: %s", got, original, raw)
+	}
+	if original.Class() != Enduring {
+		t.Errorf("Class() = %v, want Enduring", original.Class())
+	}
+	if original.Scope() != ScopeSession {
+		t.Errorf("Scope() = %v, want ScopeSession", original.Scope())
+	}
+}
+
+// marshalTestEventEnvelope marshals a simple, already-tested Enduring event
+// (SessionStarted) to its durable wire envelope, so the schema-version test can
+// mutate the "v" key and re-decode.
+func marshalTestEventEnvelope(t *testing.T) []byte {
+	t.Helper()
+	data, err := MarshalEvent(SessionStarted{Header: fullHeaderSession()})
+	if err != nil {
+		t.Fatalf("MarshalEvent(SessionStarted) error = %v", err)
+	}
+	return data
+}
+
+func TestUnmarshalEventSchemaVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(map[string]json.RawMessage)
+		wantErr bool
+	}{
+		{name: "current version decodes", mutate: func(map[string]json.RawMessage) {}},
+		{name: "missing v decodes as version 1", mutate: func(env map[string]json.RawMessage) {
+			delete(env, "v")
+		}},
+		{name: "future version fails typed", mutate: func(env map[string]json.RawMessage) {
+			env["v"] = json.RawMessage(`2`)
+		}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			raw := marshalTestEventEnvelope(t)
+			var envelope map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			tt.mutate(envelope)
+			mutated, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = UnmarshalEvent(mutated)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("UnmarshalEvent() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				var unsupported *UnsupportedSchemaError
+				if !errors.As(err, &unsupported) {
+					t.Fatalf("error type = %T, want *UnsupportedSchemaError", err)
+				}
+				if unsupported.Version != 2 {
+					t.Errorf("Version = %d, want 2", unsupported.Version)
+				}
 			}
 		})
 	}
@@ -720,7 +829,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 39
+const wantEnduringTypes = 40
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -732,6 +841,7 @@ func unionInstances() []Event {
 		HustleStarted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(ModelRuntime{})},
 		HustleCompleted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime())},
 		HustleFailed{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference},
+		ConfigurationAdopted{},
 		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{}, WorkspaceRestored{}, ActiveLoopChanged{},
 		SecurityLimitChanged{},
 		LoopIdle{}, LoopStarted{}, DelegateRequestAccepted{}, LoopInferenceChanged{}, LoopModeChanged{},

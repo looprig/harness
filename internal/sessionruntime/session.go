@@ -161,12 +161,22 @@ type Session struct {
 	// consults it. Default false = fail-secure (a mismatch rejects the restore).
 	allowConfigMismatch bool
 
+	// restoreDecider is the restore-only application policy (set by WithRestoreDecider)
+	// that answers a configuration-drift assessment. It defaults to the fail-secure
+	// DefaultPolicyDecider{} (reject on any Warn) when the composition root supplies
+	// none. A later task consumes it in the restore path; today it is stored only.
+	restoreDecider RestoreDecider
+
 	// fingerprint is required composition wiring supplied by rig and is the single
 	// projection used by both new and restored sessions.
 	fingerprint FingerprintProvider
 	// frozenFingerprint is the rig-resolved compatibility identity used before any
 	// restore-time workspace resolution or loop/tool binding.
 	frozenFingerprint *event.ConfigFingerprint
+	// frozenManifest is the rig-assembled ConfigManifest counterpart to
+	// frozenFingerprint, stamped onto the construction-time SessionStarted's additive
+	// Manifest field. Nil leaves Manifest at its zero value.
+	frozenManifest *event.ConfigManifest
 
 	// injectedSessionID is the externally-minted sessionID the composition root supplies
 	// via WithSessionID, read ONLY by newSession to resolve the journal chicken-and-egg:
@@ -914,6 +924,16 @@ func (s *Session) projectFingerprint(definition loop.BoundDefinition) event.Conf
 	return s.fingerprint(definition)
 }
 
+// projectManifest returns the rig-assembled manifest baseline stamped onto
+// SessionStarted. The zero ConfigManifest stands in when no manifest was supplied
+// (the deprecation-window default), keeping the Manifest field additive.
+func (s *Session) projectManifest() event.ConfigManifest {
+	if s.frozenManifest != nil {
+		return *s.frozenManifest
+	}
+	return event.ConfigManifest{}
+}
+
 func (s *Session) ActiveLoop() loop.Handle {
 	s.loopsMu.RLock()
 	defer s.loopsMu.RUnlock()
@@ -1554,6 +1574,11 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	if s.securityLimit == nil {
 		s.securityLimit = security.New()
 	}
+	// Default the restore-drift decider to the fail-secure policy when the composition
+	// root injected none via WithRestoreDecider, so the stored decider is never nil.
+	if s.restoreDecider == nil {
+		s.restoreDecider = DefaultPolicyDecider{}
+	}
 	// Apply the spawn-cap defaults AFTER the options so an unset (or WithLimits-supplied)
 	// Limits resolves to positive caps before the first NewLoop — a zero or negative
 	// configured value never silently disables the depth/quota backstop.
@@ -1653,7 +1678,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// orderedPrimers placed topology.ActivePrimer first (unconditionally) and prepared was
 	// built in that order, so prepared[0] is always the active primer — no rescan needed.
 	activePrepared := prepared[0]
-	if err := s.hub.PublishEventChecked(sessionCtx, event.SessionStarted{Header: startedHeader, Config: s.projectFingerprint(activePrepared.loop.bound)}); err != nil {
+	if err := s.hub.PublishEventChecked(sessionCtx, event.SessionStarted{Header: startedHeader, Config: s.projectFingerprint(activePrepared.loop.bound), Manifest: s.projectManifest()}); err != nil {
 		return abort(&SessionError{Kind: SessionContextDone, Cause: err})
 	}
 	if s.initialWorkspaceCheckpoint != "" {

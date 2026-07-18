@@ -29,6 +29,7 @@ var (
 	_ Event = RestoreStarted{}
 	_ Event = RestoreDone{}
 	_ Event = RestoreErrored{}
+	_ Event = ConfigurationAdopted{}
 	_ Event = WorkspaceCheckpointed{}
 	_ Event = WorkspaceRestored{}
 	_ Event = ActiveLoopChanged{}

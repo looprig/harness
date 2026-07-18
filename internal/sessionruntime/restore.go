@@ -194,6 +194,49 @@ func firstConfigFingerprint(events []event.Event) (event.ConfigFingerprint, erro
 	return event.ConfigFingerprint{}, &RestoreDiscoveryError{Kind: RestoreNoSessionStarted}
 }
 
+// adoptedBaseline is the restore comparison baseline: the manifest and epoch of
+// the LATEST committed SessionStarted or ConfigurationAdopted. A legacy
+// SessionStarted (no manifest) yields a SchemaVersion-0 projection, which limits
+// drift assessment and forces a baseline upgrade on acceptance (Task 10).
+type adoptedBaseline struct {
+	Manifest event.ConfigManifest
+	Epoch    event.ConfigEpoch
+}
+
+// latestAdoptedBaseline scans the replayed stream for the baseline the next restore
+// assesses drift against: the manifest + epoch of the LATEST committed SessionStarted
+// or ConfigurationAdopted. Only the FIRST SessionStarted seeds epoch 1 (a legacy start
+// without a manifest projects via ManifestFromLegacy at SchemaVersion 0); a later
+// ConfigurationAdopted overrides both manifest and epoch, last-write-wins. A stream with
+// no SessionStarted fails closed with a typed *RestoreDiscoveryError — the same discovery
+// error firstConfigFingerprint returns.
+func latestAdoptedBaseline(events []event.Event) (adoptedBaseline, error) {
+	var baseline adoptedBaseline
+	found := false
+	for _, ev := range events {
+		switch typed := ev.(type) {
+		case event.SessionStarted:
+			if !found { // only the first SessionStarted seeds epoch 1
+				found = true
+				baseline.Epoch = 1
+				if typed.Manifest.SchemaVersion != 0 {
+					baseline.Manifest = typed.Manifest
+				} else {
+					baseline.Manifest = event.ManifestFromLegacy(typed.Config)
+				}
+			}
+		case event.ConfigurationAdopted:
+			found = true
+			baseline.Manifest = typed.Manifest
+			baseline.Epoch = typed.Epoch
+		}
+	}
+	if !found {
+		return adoptedBaseline{}, &RestoreDiscoveryError{Kind: RestoreNoSessionStarted}
+	}
+	return baseline, nil
+}
+
 // findRootLoopStarted locates the session's root LoopStarted: the one whose
 // Cause.Coordinates is zero (a root loop has no spawning loop/turn/step). Restore reads
 // two facts off it — the root loop's stable id (the recovered loop comes up under THIS

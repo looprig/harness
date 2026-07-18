@@ -72,6 +72,13 @@ func (e *TurnRejectedError) Error() string {
 	}
 }
 
+// ConfigMismatchError is the legacy config-drift restore error. For a
+// manifest-carrying session it is superseded by RestoreRejectedError, which
+// carries a typed drift assessment; the legacy fingerprint path (a session with
+// no ConfigManifest configured) still returns it during the deprecation window.
+// Its formal deprecation and removal path is open question 9 in
+// docs/plans/2026-07-16-session-versioning-migration-design.md; it is not marked
+// Deprecated here because internal code still depends on it.
 type ConfigMismatchError struct{ Persisted, Live event.ConfigFingerprint }
 
 func (e *ConfigMismatchError) Error() string {
@@ -121,6 +128,57 @@ func configValueChange(field, persisted, live string) string {
 	return field + " (" + strconv.Quote(persisted) + " -> " + strconv.Quote(live) + ")"
 }
 
+// RestoreRejectedError reports a restore refused by the configured RestoreDecider
+// (or by default policy). It carries the full typed assessment so callers and
+// operators see exactly which fields drifted and how severely. Cause is set only
+// when the rejection was caused by the decider ITSELF failing (a returned error or
+// a timeout — a timeout is a rejection): it stays inspectable via Unwrap so callers
+// can errors.As/errors.Is through to the underlying cause (e.g.
+// context.DeadlineExceeded). A plain policy rejection leaves Cause nil.
+type RestoreRejectedError struct {
+	Assessment event.DriftAssessment
+	Source     event.DecisionSource
+	Cause      error
+}
+
+func (e *RestoreRejectedError) Error() string {
+	warnCategories := make([]string, 0, len(e.Assessment.Changes))
+	infoCount := 0
+	for _, change := range e.Assessment.Changes {
+		switch change.Severity {
+		case event.DriftWarn:
+			warnCategories = append(warnCategories, string(change.Category))
+		default:
+			infoCount++
+		}
+	}
+	source := string(e.Source)
+	if source == "" {
+		source = "policy"
+	}
+	msg := "session: restore rejected by " + source + ": " +
+		strconv.Itoa(len(warnCategories)) + " warn " + pluralize("category", "categories", len(warnCategories))
+	if len(warnCategories) > 0 {
+		msg += " (" + strings.Join(warnCategories, ", ") + ")"
+	}
+	msg += "; " + strconv.Itoa(infoCount) + " info " + pluralize("change", "changes", infoCount)
+	if e.Cause != nil {
+		msg += ": " + e.Cause.Error()
+	}
+	return msg
+}
+
+// Unwrap exposes the underlying decider failure (nil for a plain policy rejection)
+// so errors.As/errors.Is reach it.
+func (e *RestoreRejectedError) Unwrap() error { return e.Cause }
+
+func pluralize(singular, plural string, n int) string {
+	if n == 1 {
+		return singular
+	}
+	return plural
+}
+
 type AgentNameMismatchError struct{ Persisted, Configured identity.AgentName }
 
 func (e *AgentNameMismatchError) Error() string {
@@ -152,10 +210,16 @@ func (e *RestoreDiscoveryError) Error() string {
 type RestoreErrorKind string
 
 const (
-	RestoreLeaseFailed           RestoreErrorKind = "lease_failed"
-	RestoreJournalFailed         RestoreErrorKind = "journal_failed"
-	RestoreReplayFailed          RestoreErrorKind = "replay_failed"
-	RestoreAppendFailed          RestoreErrorKind = "append_failed"
+	RestoreLeaseFailed   RestoreErrorKind = "lease_failed"
+	RestoreJournalFailed RestoreErrorKind = "journal_failed"
+	RestoreReplayFailed  RestoreErrorKind = "replay_failed"
+	RestoreAppendFailed  RestoreErrorKind = "append_failed"
+	// RestoreAdoptionInvalid names the specific failure of building/validating the
+	// durable ConfigurationAdopted (event.ValidateEvent rejected it), distinct from
+	// RestoreAppendFailed (an actual journal Append failure — lost lease, storage
+	// error). It lets a caller tell "the decision produced a malformed adoption"
+	// apart from "the journal write failed".
+	RestoreAdoptionInvalid       RestoreErrorKind = "adoption_invalid"
 	RestoreLoopFailed            RestoreErrorKind = "loop_failed"
 	RestoreContextDone           RestoreErrorKind = "context_done"
 	RestoreIDGenerationFailed    RestoreErrorKind = "id_generation_failed"
