@@ -373,6 +373,11 @@ func TestRunTurnTerminalOutputMalformedLaterFinalRetainsPriorCommittedStep(t *te
 		},
 	}
 	cfg, state, recorder := terminalTurnFixture(t, client, agenticToolSet([]tool.InvokableTool{ordinary}, 1, 1))
+	measureCalls := 0
+	cfg.measure = func(context.Context, inference.Request, string, *content.UserMessage, bool) error {
+		measureCalls++
+		return nil
+	}
 
 	terminal := runTurn(context.Background(), cfg, state)
 	failed, ok := terminal.(event.TurnFailed)
@@ -386,11 +391,32 @@ func TestRunTurnTerminalOutputMalformedLaterFinalRetainsPriorCommittedStep(t *te
 	if strings.Contains(failed.Err.Error(), "secret") {
 		t.Fatalf("error leaked malformed terminal input: %v", failed.Err)
 	}
-	if client.calls != 2 || ordinary.runCount() != 1 {
-		t.Fatalf("stream/tool calls = %d/%d, want 2/1", client.calls, ordinary.runCount())
+	if len(failed.Err.Error()) > 512 {
+		t.Fatalf("malformed terminal error is unbounded: %d bytes", len(failed.Err.Error()))
+	}
+	if client.calls != 2 || measureCalls != 2 || ordinary.runCount() != 1 {
+		t.Fatalf("stream/measure/tool calls = %d/%d/%d, want 2/2/1 (no repair or invalid-final measurement)", client.calls, measureCalls, ordinary.runCount())
 	}
 	if len(recorder.commits) != 1 || len(stepDones(recorder.events())) != 1 || len(recorder.committedMsgs()) != 2 {
 		t.Fatalf("prior committed state = commits %d StepDone %d messages %d, want 1/1/2", len(recorder.commits), len(stepDones(recorder.events())), len(recorder.committedMsgs()))
+	}
+	started, completed, permissionRequested, permissionDecided := 0, 0, 0, 0
+	for _, emitted := range recorder.events() {
+		switch emitted.(type) {
+		case event.ToolCallStarted:
+			started++
+		case event.ToolCallCompleted:
+			completed++
+		case event.PermissionRequested:
+			permissionRequested++
+		case event.PermissionDecided:
+			permissionDecided++
+		case event.UserInputRequested:
+			t.Fatalf("malformed terminal emitted user-input lifecycle event %T", emitted)
+		}
+	}
+	if started != 1 || completed != 1 || permissionRequested != 0 || permissionDecided != 1 {
+		t.Fatalf("tool/gate lifecycle counts = %d/%d/%d/%d, want only prior ordinary call 1/1/0/1", started, completed, permissionRequested, permissionDecided)
 	}
 }
 

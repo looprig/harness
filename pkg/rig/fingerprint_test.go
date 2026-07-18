@@ -564,11 +564,35 @@ func TestLoopOutputPolicyFingerprintAgreementAndDrift(t *testing.T) {
 	if absent.TopologyRev == frozen.TopologyRev {
 		t.Fatal("TopologyRev ignored output policy presence")
 	}
-	changed := output.Clone()
-	changed.Description = "different guidance"
-	drifted := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{define(&changed)}, []string{"agent"}, "agent")
-	if drifted.TopologyRev == frozen.TopologyRev {
-		t.Fatal("TopologyRev ignored output policy drift")
+	if secondAbsent := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{define(nil)}, []string{"agent"}, "agent"); !absent.Equal(secondAbsent) {
+		t.Fatalf("absent output policy is not restore-compatible: %+v / %+v", absent, secondAbsent)
+	}
+	drifts := []struct {
+		name   string
+		mutate func(*inference.OutputSchema)
+	}{
+		{name: "name", mutate: func(value *inference.OutputSchema) { value.Name = "loop_result_v2" }},
+		{name: "description", mutate: func(value *inference.OutputSchema) { value.Description = "different guidance" }},
+		{name: "schema", mutate: func(value *inference.OutputSchema) {
+			value.Schema = json.RawMessage(`{"type":"object","properties":{"verdict":{"type":"boolean"}},"required":["verdict"],"additionalProperties":false}`)
+		}},
+		{name: "strict", mutate: func(value *inference.OutputSchema) { value.Strict = false }},
+	}
+	for _, drift := range drifts {
+		drift := drift
+		t.Run(drift.name, func(t *testing.T) {
+			t.Parallel()
+			changed := output.Clone()
+			drift.mutate(&changed)
+			drifted := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{define(&changed)}, []string{"agent"}, "agent")
+			if drifted.TopologyRev == frozen.TopologyRev {
+				t.Fatalf("TopologyRev ignored output policy %s drift", drift.name)
+			}
+			changedBound := fingerprintWithTopology(bindFingerprintDefinition(define(&changed)), ConfigFingerprintFields{}, []loop.Definition{define(&changed)}, []string{"agent"}, "agent")
+			if !drifted.Equal(changedBound) {
+				t.Fatalf("%s drift frozen fingerprint = %+v, live = %+v", drift.name, drifted, changedBound)
+			}
+		})
 	}
 }
 

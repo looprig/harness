@@ -2,7 +2,9 @@ package rig
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -262,6 +264,30 @@ func TestHustleBoundTopologyFingerprintSensitivity(t *testing.T) {
 				t.Fatalf("bound topology revision unchanged: %q", got)
 			}
 		})
+	}
+}
+
+func TestHustleTopologyFingerprintIncludesStructuredOutputRevision(t *testing.T) {
+	t.Parallel()
+	definition := defineRigHustle(t, defaultRigHustleSpec())
+	descriptor := definition.Descriptor()
+	if descriptor.StructuredOutputRevision != inference.StructuredOutputRevision {
+		t.Fatalf("StructuredOutputRevision = %q, want %q", descriptor.StructuredOutputRevision, inference.StructuredOutputRevision)
+	}
+
+	future := descriptor
+	future.StructuredOutputRevision = "structured-output/future"
+	encoded, err := json.Marshal(future)
+	if err != nil {
+		t.Fatalf("json.Marshal(future descriptor): %v", err)
+	}
+	futurePolicyRevision := fmt.Sprintf("%x", sha256.Sum256(encoded))
+	limits := validHustleLimits()
+	legacy := topologyRevision([]loop.Definition{mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))}, []string{"agent"}, "agent")
+	currentTopology := hexSHA256Bytes(canonicalHustleTopologyMaterial(legacy, []hustleTopologyRow{{Name: definition.Name(), PolicyRevision: definition.PolicyRevision()}}, limits))
+	futureTopology := hexSHA256Bytes(canonicalHustleTopologyMaterial(legacy, []hustleTopologyRow{{Name: definition.Name(), PolicyRevision: futurePolicyRevision}}, limits))
+	if currentTopology == futureTopology {
+		t.Fatal("hustle topology fingerprint ignored StructuredOutputRevision drift")
 	}
 }
 
