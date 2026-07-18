@@ -56,7 +56,7 @@ const (
 )
 
 func (p SnapshotPolicy) internal() checkpointPolicy {
-	return checkpointPolicy{Trigger: p.Trigger, Priority: p.Priority, Timeout: p.Timeout}
+	return checkpointPolicy(p)
 }
 
 type checkedCheckpointPublisher interface {

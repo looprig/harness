@@ -142,6 +142,33 @@ func wsAssertTreesEqual(t *testing.T, want, got string) {
 	}
 }
 
+func TestFixedRootReconcileCreatesNonPublicParentDirectories(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	staging := t.TempDir()
+	rollback := t.TempDir()
+	source := filepath.Join(staging, "nested", "work.txt")
+	if err := os.MkdirAll(filepath.Dir(source), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte("work"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := &reconcile{root: root, staging: staging, rollback: rollback}
+	if err := rec.replace(filepath.Join("nested", "work.txt")); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(root, "nested"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got&0o007 != 0 {
+		t.Fatalf("created parent directory mode = %#o, want no access for other users", got)
+	}
+}
+
 // stampCheckpoint wires an original run (SessionStarted + root LoopStarted) and stamps a
 // WorkspaceCheckpointed for each ref in order through the journal-backed hub — the durable
 // record the restore path reads back. Each ref must already be durable in the shared ws

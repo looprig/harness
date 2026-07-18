@@ -60,7 +60,9 @@ func TestDelegateStatusDoneAliasesCompleted(t *testing.T) {
 	}
 }
 
-type definitionTool struct{ marker byte }
+// Keep the fake non-zero-sized so independently built pointers have distinct
+// identities; a blank field expresses that test requirement without dead state.
+type definitionTool struct{ _ byte }
 
 func (*definitionTool) Info(context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{Name: "custom"}, nil

@@ -263,7 +263,7 @@ func (r *reconcile) replace(rel string) error {
 	} else {
 		r.undo = append(r.undo, func() error { return removeIfExists(dst) })
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
 		return err
 	}
 	return copyFileContents(filepath.Join(r.staging, rel), dst)

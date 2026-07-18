@@ -594,9 +594,9 @@ func TestNewSessionWithSeedCommitsCheckpointBeforeAnyLoopStarts(t *testing.T) {
 		if nextErr != nil {
 			t.Fatal(nextErr)
 		}
-		switch ev.(type) {
+		switch ev := ev.(type) {
 		case event.SessionStarted:
-			persistedConfig = ev.(event.SessionStarted).Config
+			persistedConfig = ev.Config
 			ordered = append(ordered, "session")
 		case event.WorkspaceCheckpointed:
 			ordered = append(ordered, "seed")
