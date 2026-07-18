@@ -90,7 +90,15 @@ func (m ConfigManifest) canonical() []byte {
 	material = appendManifestString(material, m.ModelID)
 	material = appendManifestString(material, m.SystemPromptRev)
 	tools := append([]ToolManifestEntry(nil), m.Tools...)
-	sort.Slice(tools, func(i, j int) bool { return tools[i].Name < tools[j].Name })
+	sort.SliceStable(tools, func(i, j int) bool {
+		if tools[i].Name != tools[j].Name {
+			return tools[i].Name < tools[j].Name
+		}
+		if tools[i].InputSchemaRev != tools[j].InputSchemaRev {
+			return tools[i].InputSchemaRev < tools[j].InputSchemaRev
+		}
+		return tools[i].OutputSchemaRev < tools[j].OutputSchemaRev
+	})
 	material = binary.BigEndian.AppendUint64(material, uint64(len(tools)))
 	for _, entry := range tools {
 		material = appendManifestString(material, entry.Name)

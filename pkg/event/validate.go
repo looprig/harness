@@ -245,6 +245,11 @@ func validateEventBody(ev Event) error {
 const (
 	maxConfigDriftChanges = 256
 	maxConfigMessageLen   = 4096
+	// The manifest is decoded from untrusted journal input, so its collections
+	// are capped defense-in-depth. The caps are generous: they never trip a
+	// legitimate configuration, only an abusive one.
+	maxConfigManifestTools     = 4096
+	maxConfigManifestAppFields = 1024
 )
 
 // validateConfigurationAdopted enforces the config-epoch invariants: epoch 1
@@ -270,6 +275,18 @@ func validateConfigurationAdopted(e ConfigurationAdopted) error {
 		return &InvalidEventError{Event: name, Field: FieldMessage, Rule: RuleInvalid}
 	}
 	if e.Manifest.SchemaVersion == 0 {
+		return &InvalidEventError{Event: name, Field: FieldManifest, Rule: RuleInvalid}
+	}
+	// A persisted manifest's recorded fingerprint must match the manifest itself,
+	// so a durable baseline can never carry a fingerprint that disagrees with the
+	// configuration it describes.
+	if e.Manifest.Fingerprint() != e.AdoptedFingerprint {
+		return &InvalidEventError{Event: name, Field: FieldAdoptedFingerprint, Rule: RuleInvalid}
+	}
+	if len(e.Manifest.Tools) > maxConfigManifestTools {
+		return &InvalidEventError{Event: name, Field: FieldManifest, Rule: RuleInvalid}
+	}
+	if len(e.Manifest.AppFields) > maxConfigManifestAppFields {
 		return &InvalidEventError{Event: name, Field: FieldManifest, Rule: RuleInvalid}
 	}
 	return nil

@@ -130,8 +130,9 @@ func AssessDrift(baseline, candidate ConfigManifest) DriftAssessment {
 
 func assessTools(baseline, candidate ConfigManifest, add func(DriftCategory, string, string, string, DriftSeverity)) {
 	if baseline.SchemaVersion == 0 {
-		if baseline.legacyToolPolicyRev != candidate.ToolNamesRev() {
-			add(DriftTool, "", baseline.legacyToolPolicyRev, candidate.ToolNamesRev(), DriftInfo)
+		candidateNamesRev := candidate.ToolNamesRev()
+		if baseline.legacyToolPolicyRev != candidateNamesRev {
+			add(DriftTool, "", baseline.legacyToolPolicyRev, candidateNamesRev, DriftInfo)
 		}
 		return
 	}

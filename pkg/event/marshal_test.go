@@ -479,12 +479,13 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 // SessionID field.
 func TestConfigurationAdoptedRoundTrip(t *testing.T) {
 	t.Parallel()
+	manifest := testManifest()
 	original := ConfigurationAdopted{
 		Header:              fullHeaderSession(),
 		Epoch:               2,
 		PreviousFingerprint: "prev",
-		AdoptedFingerprint:  "next",
-		Manifest:            testManifest(),
+		AdoptedFingerprint:  manifest.Fingerprint(),
+		Manifest:            manifest,
 		Drift:               []DriftChange{{Category: DriftModel, Old: "a", New: "b", Severity: DriftInfo}},
 		Source:              DecisionSourcePolicy,
 		Actor:               "op@host",

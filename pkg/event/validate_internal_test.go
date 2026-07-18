@@ -75,6 +75,32 @@ func TestValidateEventUnknownType(t *testing.T) {
 	}
 }
 
+// TestConfigurationAdoptedFingerprintMismatchRejected asserts a persisted
+// manifest whose recorded AdoptedFingerprint disagrees with the manifest's own
+// Fingerprint() is rejected with FieldAdoptedFingerprint/RuleInvalid.
+func TestConfigurationAdoptedFingerprintMismatchRejected(t *testing.T) {
+	t.Parallel()
+	manifest := testManifest()
+	ev := ConfigurationAdopted{
+		Header:             fullHeaderSession(),
+		Epoch:              2,
+		AdoptedFingerprint: "does-not-match-the-manifest",
+		Manifest:           manifest,
+		Source:             DecisionSourcePolicy,
+	}
+	err := ValidateEvent(ev)
+	var ve *InvalidEventError
+	if !errors.As(err, &ve) {
+		t.Fatalf("ValidateEvent error = %v (%T), want *InvalidEventError", err, err)
+	}
+	if ve.Field != FieldAdoptedFingerprint {
+		t.Errorf("Field = %q, want %q", ve.Field, FieldAdoptedFingerprint)
+	}
+	if ve.Rule != RuleInvalid {
+		t.Errorf("Rule = %q, want %q", ve.Rule, RuleInvalid)
+	}
+}
+
 // TestClassifyExhaustive asserts classify recognizes EVERY event type in the sealed
 // union (doc.go's guard) — each yields ok==true and a concrete name (never the
 // "Event" unknown-type fallback). It guards against a new event type being added to

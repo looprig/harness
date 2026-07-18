@@ -79,6 +79,18 @@ func TestManifestFingerprintGolden(t *testing.T) {
 	}
 }
 
+// TestManifestFingerprintDuplicateToolOrderIndependent proves the full-tuple tool
+// sort makes duplicate-name entries order-independent: two manifests differing only
+// in the input order of same-named tools must fingerprint identically.
+func TestManifestFingerprintDuplicateToolOrderIndependent(t *testing.T) {
+	t.Parallel()
+	a := ConfigManifest{SchemaVersion: ManifestSchemaVersion, Tools: []ToolManifestEntry{{Name: "A", InputSchemaRev: "x"}, {Name: "A", InputSchemaRev: "y"}}}
+	b := ConfigManifest{SchemaVersion: ManifestSchemaVersion, Tools: []ToolManifestEntry{{Name: "A", InputSchemaRev: "y"}, {Name: "A", InputSchemaRev: "x"}}}
+	if a.Fingerprint() != b.Fingerprint() {
+		t.Error("duplicate-name tool order changed the fingerprint")
+	}
+}
+
 func TestManifestFingerprintDomainSeparation(t *testing.T) {
 	t.Parallel()
 	// Empty manifest must not collide with the empty-string hash: the domain
