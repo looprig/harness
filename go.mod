@@ -34,6 +34,7 @@ require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
 	github.com/looprig/core v0.2.0
+	github.com/looprig/eval v0.1.0
 	github.com/looprig/inference v0.3.1-0.20260718005749-13e4d7f173b3
 	github.com/looprig/storage v0.2.0
 	github.com/mailru/easyjson v0.9.2 // indirect
@@ -74,3 +75,5 @@ replace github.com/looprig/core => ../core
 replace github.com/looprig/storage => ../storage
 
 replace github.com/looprig/inference => ../inference
+
+replace github.com/looprig/eval => ../eval

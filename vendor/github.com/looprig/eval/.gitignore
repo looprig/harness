@@ -1,0 +1,29 @@
+# Binaries
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go build artifacts
+*.test
+*.out
+
+# Environment & secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Git worktrees
+.worktrees/
+
+# Claude Code project settings
+.claude/
