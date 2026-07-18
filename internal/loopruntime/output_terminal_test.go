@@ -38,6 +38,41 @@ func terminalOutputChunk(index int, id, input string) content.Chunk {
 	return toolUseChunk(index, id, inference.StructuredOutputToolName, input)
 }
 
+func TestRunTurnTerminalOutputWithoutIDCommitsWithoutToolLifecycle(t *testing.T) {
+	t.Parallel()
+
+	ordinary := &echoTool{name: "Echo", output: "must not run"}
+	client := &scriptedLLM{
+		scripts: [][]content.Chunk{{terminalOutputChunk(0, "", `{"answer":"ok"}`)}},
+		results: []*stream.StreamResult{{FinishReason: stream.FinishReasonToolUse}},
+	}
+	cfg, state, recorder := terminalTurnFixture(t, client, ToolSet{Registry: []tool.InvokableTool{ordinary}})
+
+	terminal := runTurn(context.Background(), cfg, state)
+	done, ok := terminal.(event.TurnDone)
+	if !ok {
+		t.Fatalf("terminal = %T %v, want TurnDone", terminal, terminal)
+	}
+	assertTerminalOutputMessage(t, done.Message, `{"answer":"ok"}`)
+	if ordinary.runCount() != 0 {
+		t.Fatalf("ordinary tool runs = %d, want 0", ordinary.runCount())
+	}
+	if len(recorder.commits) != 1 || len(stepDones(recorder.events())) != 1 {
+		t.Fatalf("commits/StepDone = %d/%d, want 1/1", len(recorder.commits), len(stepDones(recorder.events())))
+	}
+	for _, message := range recorder.committedMsgs() {
+		if _, ok := message.(*content.ToolResultMessage); ok {
+			t.Fatalf("terminal control frame committed tool result %T", message)
+		}
+	}
+	for _, emitted := range recorder.events() {
+		switch emitted.(type) {
+		case event.ToolCallStarted, event.ToolCallCompleted:
+			t.Fatalf("terminal control frame emitted tool lifecycle event %T", emitted)
+		}
+	}
+}
+
 func TestRunTurnTerminalOutputCommitsCanonicalTextWithoutExecutingControlFrame(t *testing.T) {
 	t.Parallel()
 
@@ -220,8 +255,8 @@ func TestRunTurnTerminalOutputRejectsInvalidBatchAtomically(t *testing.T) {
 			wantFinish: stream.FinishReasonContentFilter,
 		},
 		{
-			name:   "missing terminal id",
-			chunks: []content.Chunk{terminalOutputChunk(0, "", `{"answer":"ok"}`)},
+			name:   "ordinary call missing id",
+			chunks: []content.Chunk{toolUseChunk(0, "", "Echo", `{}`)},
 			finish: stream.FinishReasonToolUse,
 		},
 		{

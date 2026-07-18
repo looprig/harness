@@ -233,7 +233,9 @@ func validateTerminalStep(
 		}
 		return nil, false, &inference.StructuredOutputConflictError{Feature: "ambiguous_terminal_output"}
 	}
-	if calls[0].ID == "" || calls[0].Name == "" {
+	// The reserved terminal frame is intercepted and never paired with a tool
+	// result, so it does not require the provider-generated ID ordinary calls do.
+	if calls[0].Name == "" {
 		return nil, false, &inference.StructuredOutputConflictError{Feature: "incomplete_tool_call"}
 	}
 
