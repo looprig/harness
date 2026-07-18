@@ -114,8 +114,8 @@ inventory below and remain assigned to the tests module.
 | `TestManagedForeignQueueRejectsEntrySixtyFiveBeforeAcceptance` | moved | `backend.TestManagedQueueFIFOAndExactCapacity` |
 | `TestForeignProviderFailureFlushesAcceptedQueueFailedWithoutStartingIt` | moved | `backend.TestProviderFailureFlushesAcceptedQueueWithoutSpawningIt` |
 | `TestUserInputHappyPath` | moved | `backend.TestUserInputPublishesStartedBeforeSpawnAndHistoryBeforeDone` |
-| `TestLateBoundSessionPublishesForeignSessionBound` | moved | `backend.TestLateBoundLockLifecycleAndResume` |
-| `TestLateBoundTurnLockLifecycleOrder` | moved | `backend.TestLateBoundLockLifecycleAndResume` |
+| `TestLateBoundSessionPublishesForeignSessionBound` | moved | `backend.TestLateBoundSessionBoundSequenceHeaderAndResumeParity` |
+| `TestLateBoundTurnLockLifecycleOrder` | moved | `backend.TestLateBoundTurnLockLifecycleOrderMatchesPredecessor` |
 | `TestLateBoundFirstTurnHoldsBoundSIDLock` | moved | `backend.TestLateBoundLockLifecycleAndResume` |
 | `TestLateBoundFirstTurnsUseIndependentTemporaryLocks` | moved | `backend.TestLateBoundFirstTurnsUseIndependentTemporaryLocks` |
 | `TestLateBoundLockTransitionFailurePersistsSID` | moved | `backend.TestLateBoundTransitionFailurePersistsSIDForBusyResume` |
@@ -127,7 +127,7 @@ inventory below and remain assigned to the tests module.
 | `TestLateBoundTerminalOKBeforeInitFailsProtocolAndRetriesStartNew` | moved | `backend.TestLateBoundTerminalBeforeInitRetainsErrorsAndRetriesStartNew/terminal_OK` |
 | `TestLateBoundTerminalErrorBeforeInitPreservesResultAndProtocolErrors` | moved | `backend.TestLateBoundTerminalBeforeInitRetainsErrorsAndRetriesStartNew/terminal_error` |
 | `TestPreboundTerminalWithoutInitSucceeds` | moved | `backend.TestUserInputPublishesStartedBeforeSpawnAndHistoryBeforeDone` |
-| `TestTranscriptLossSoftDegrade` | moved | `backend.TestTypedHistoryFailureUsesFallbackAndPreservesSuccessfulTerminal` |
+| `TestTranscriptLossSoftDegrade` | moved | `backend.TestTypedHistoryFailureUsesFallbackAndPreservesSuccessfulTerminal` and `backend.TestHistoryFallbackWarningParity/missing_transcript_stays_silent` |
 | `TestInterruptDuringTurn` | moved | `backend.TestInterruptLeavesSnapshotUncommittedAfterUnsupportedCommand` |
 | `TestLateBoundInterruptedFirstTurnResumesBoundSession` | moved | `backend.TestLateBoundLockLifecycleAndResume` |
 | `TestDropCommandDuringTurnThenInterrupt` | moved | `backend.TestInterruptLeavesSnapshotUncommittedAfterUnsupportedCommand` |
