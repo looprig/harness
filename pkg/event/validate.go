@@ -70,9 +70,14 @@ const (
 	FieldTools            FieldName = "Tools"
 	// FieldIntegrationName names IntegrationStatus.Name. It is not spelled
 	// "FieldName": that identifier is this file's FieldName TYPE.
-	FieldIntegrationName FieldName = "Name"
-	FieldState           FieldName = "State"
-	FieldDetail          FieldName = "Detail"
+	FieldIntegrationName    FieldName = "Name"
+	FieldState              FieldName = "State"
+	FieldDetail             FieldName = "Detail"
+	FieldEpoch              FieldName = "Epoch"
+	FieldAdoptedFingerprint FieldName = "AdoptedFingerprint"
+	FieldManifest           FieldName = "Manifest"
+	FieldDrift              FieldName = "Drift"
+	FieldMessage            FieldName = "Message"
 	// FieldType names the whole event (not one coordinate) on the fail-secure
 	// unknown-type path, paired with RuleUnknownType.
 	FieldType FieldName = "Type"
@@ -227,6 +232,45 @@ func validateEventBody(ev Event) error {
 		if err := e.Usage.Validate(); err != nil {
 			return &InvalidEventError{Event: "TurnDone", Field: FieldUsage, Rule: RuleInvalid}
 		}
+	case ConfigurationAdopted:
+		return validateConfigurationAdopted(e)
+	}
+	return nil
+}
+
+// Bounds for ConfigurationAdopted's durable, partly user-authored payload: a
+// hostile or buggy decision must not be able to append an unbounded record to
+// the journal, and a legacy (SchemaVersion 0) manifest projection is never
+// persisted.
+const (
+	maxConfigDriftChanges = 256
+	maxConfigMessageLen   = 4096
+)
+
+// validateConfigurationAdopted enforces the config-epoch invariants: epoch 1
+// belongs to SessionStarted so an adoption is always >= 2, the adopted
+// fingerprint is required, the source is one of the four closed DecisionSource
+// values, the drift summary and message are length-capped, and a legacy
+// (SchemaVersion 0) manifest projection is refused.
+func validateConfigurationAdopted(e ConfigurationAdopted) error {
+	const name EventName = "ConfigurationAdopted"
+	if e.Epoch < 2 {
+		return &InvalidEventError{Event: name, Field: FieldEpoch, Rule: RuleInvalid}
+	}
+	if e.AdoptedFingerprint == "" {
+		return &InvalidEventError{Event: name, Field: FieldAdoptedFingerprint, Rule: RuleRequired}
+	}
+	if !e.Source.Valid() {
+		return &InvalidEventError{Event: name, Field: FieldSource, Rule: RuleInvalid}
+	}
+	if len(e.Drift) > maxConfigDriftChanges {
+		return &InvalidEventError{Event: name, Field: FieldDrift, Rule: RuleInvalid}
+	}
+	if len(e.Message) > maxConfigMessageLen {
+		return &InvalidEventError{Event: name, Field: FieldMessage, Rule: RuleInvalid}
+	}
+	if e.Manifest.SchemaVersion == 0 {
+		return &InvalidEventError{Event: name, Field: FieldManifest, Rule: RuleInvalid}
 	}
 	return nil
 }
@@ -522,6 +566,10 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "RestoreDone", sessionProfile(), true
 	case RestoreErrored:
 		return "RestoreErrored", sessionProfile(), true
+	case ConfigurationAdopted:
+		// Session-scoped, same shape as SessionStarted: only SessionID set. The
+		// SessionID rides in the Header; the event carries no standalone field.
+		return "ConfigurationAdopted", sessionProfile(), true
 	case WorkspaceCheckpointed:
 		// Session-scoped: a session-global workspace snapshot appended at quiescence
 		// (same shape as RestoreDone/SessionIdle) — only SessionID set. Ref is an

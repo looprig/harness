@@ -472,6 +472,51 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 	}
 }
 
+// TestConfigurationAdoptedRoundTrip proves the config-epoch event survives the
+// durable codec deep-equal, and that it mirrors SessionStarted's Enduring +
+// session-scoped classification. The SessionID rides in the Header (like every
+// other session-scoped event); ConfigurationAdopted carries no standalone
+// SessionID field.
+func TestConfigurationAdoptedRoundTrip(t *testing.T) {
+	t.Parallel()
+	original := ConfigurationAdopted{
+		Header:              fullHeaderSession(),
+		Epoch:               2,
+		PreviousFingerprint: "prev",
+		AdoptedFingerprint:  "next",
+		Manifest:            testManifest(),
+		Drift:               []DriftChange{{Category: DriftModel, Old: "a", New: "b", Severity: DriftInfo}},
+		Source:              DecisionSourcePolicy,
+		Actor:               "op@host",
+		AppVersion:          "coderig/1.2.3",
+		Message:             "accepted model change",
+	}
+	raw, err := MarshalEvent(original)
+	if err != nil {
+		t.Fatalf("MarshalEvent() error = %v", err)
+	}
+	decoded, err := UnmarshalEvent(raw)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent() error = %v", err)
+	}
+	got, ok := decoded.(ConfigurationAdopted)
+	if !ok {
+		t.Fatalf("decoded type = %T, want ConfigurationAdopted", decoded)
+	}
+	if got.Epoch != 2 || got.Source != DecisionSourcePolicy || len(got.Drift) != 1 {
+		t.Errorf("round trip lost fields: %+v", got)
+	}
+	if !reflect.DeepEqual(got, original) {
+		t.Errorf("round-trip mismatch:\n got = %#v\nwant = %#v\nwire: %s", got, original, raw)
+	}
+	if original.Class() != Enduring {
+		t.Errorf("Class() = %v, want Enduring", original.Class())
+	}
+	if original.Scope() != ScopeSession {
+		t.Errorf("Scope() = %v, want ScopeSession", original.Scope())
+	}
+}
+
 // marshalTestEventEnvelope marshals a simple, already-tested Enduring event
 // (SessionStarted) to its durable wire envelope, so the schema-version test can
 // mutate the "v" key and re-decode.
@@ -776,7 +821,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 39
+const wantEnduringTypes = 40
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -788,6 +833,7 @@ func unionInstances() []Event {
 		HustleStarted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(ModelRuntime{})},
 		HustleCompleted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime())},
 		HustleFailed{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference},
+		ConfigurationAdopted{},
 		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{}, WorkspaceRestored{}, ActiveLoopChanged{},
 		SecurityLimitChanged{},
 		LoopIdle{}, LoopStarted{}, DelegateRequestAccepted{}, LoopInferenceChanged{}, LoopModeChanged{},

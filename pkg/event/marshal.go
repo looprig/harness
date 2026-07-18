@@ -177,6 +177,7 @@ func encodePayload(ev Event) ([]byte, error) {
 	case GateResolved:
 		return marshalGateResolved(e)
 	case SessionStarted, SessionActive, SessionIdle, SessionStopped,
+		ConfigurationAdopted,
 		RestoreStarted, RestoreDone, WorkspaceCheckpointed, WorkspaceRestored,
 		ActiveLoopChanged, SecurityLimitChanged,
 		HustleStarted, HustleCompleted, HustleFailed,
@@ -581,6 +582,8 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[SessionIdle](tag, data)
 	case "SessionStopped":
 		return decodePlain[SessionStopped](tag, data)
+	case "ConfigurationAdopted":
+		return decodePlain[ConfigurationAdopted](tag, data)
 	case "RestoreStarted":
 		return decodePlain[RestoreStarted](tag, data)
 	case "RestoreDone":
