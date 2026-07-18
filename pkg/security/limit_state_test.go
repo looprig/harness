@@ -17,6 +17,19 @@ func TestLimitCurrentDefault(t *testing.T) {
 	}
 }
 
+func TestLimitCurrentFailsSecureOnOutOfDomainAtomicValue(t *testing.T) {
+	t.Parallel()
+
+	s := New()
+	// The public Set path can only store a uint8-backed Level. Exercise the
+	// defensive read boundary directly so a corrupted high byte cannot truncate
+	// into a more-permissive in-domain ordinal.
+	s.current.Store(1<<8 | 7)
+	if got := s.Current(); got != 0 {
+		t.Fatalf("Current() from out-of-domain atomic value = %d, want fail-secure 0", got)
+	}
+}
+
 // TestLimitSet is the table for Set: single sets, last-write-wins (the replay
 // determinism at the unit level), and clamp-to-max (a journaled command can never raise
 // the ordinal above the operator's configured cap). The last Set's return value is the

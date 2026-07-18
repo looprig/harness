@@ -11,7 +11,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
@@ -72,13 +72,13 @@ type fakeForeignBuilder struct {
 	calls       int
 	calledSID   uuid.UUID
 	calledLID   uuid.UUID
-	restoreSeed foreignloop.RestoredForeign
+	restoreSeed foreign.RestoredForeign
 	restoreCall int
 	calledBound loop.BoundDefinition
 }
 
 func (b *fakeForeignBuilder) build(_ context.Context, sessionID, loopID uuid.UUID,
-	_ loop.Provenance, _ foreignloop.EventPublisher, bound loop.BoundDefinition,
+	_ loop.Provenance, _ foreign.EventPublisher, bound loop.BoundDefinition,
 	_ func() (uuid.UUID, error), _ *event.Factory) (loop.Backend, string, error) {
 	b.mu.Lock()
 	b.calls++
@@ -144,8 +144,8 @@ func TestForeignDelegateBuilderReceivesSelectedEffectiveMode(t *testing.T) {
 }
 
 func (b *fakeForeignBuilder) buildRestored(_ context.Context, sessionID, loopID uuid.UUID,
-	_ loop.Provenance, _ foreignloop.EventPublisher, _ loop.BoundDefinition,
-	_ func() (uuid.UUID, error), _ *event.Factory, seed foreignloop.RestoredForeign) (loop.Backend, error) {
+	_ loop.Provenance, _ foreign.EventPublisher, _ loop.BoundDefinition,
+	_ func() (uuid.UUID, error), _ *event.Factory, seed foreign.RestoredForeign) (loop.Backend, error) {
 	b.mu.Lock()
 	b.restoreCall++
 	b.calledSID = sessionID

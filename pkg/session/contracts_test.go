@@ -69,6 +69,49 @@ func forbiddenSessionDeclarations(filename, source string) ([]string, error) {
 	return forbiddenSessionNames(file), nil
 }
 
+// parseProductionGoFiles parses every production Go file in dir without applying
+// the current platform's build constraints, so source guards cover inactive tags.
+func parseProductionGoFiles(dir string, mode parser.Mode) ([]*ast.File, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	files := make([]*ast.File, 0, len(entries))
+	set := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
+			continue
+		}
+		file, err := parser.ParseFile(set, filepath.Join(dir, name), nil, mode)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, file)
+	}
+	return files, nil
+}
+
+func TestSessionBoundaryFileScanIncludesInactiveBuildTags(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inactive.go")
+	source := "//go:build boundary_never\n\npackage session\n\nfunc New() {}\n"
+	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := parseProductionGoFiles(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("parsed production files = %d, want 1 inactive-tag file", len(files))
+	}
+	if got := forbiddenSessionNames(files[0]); len(got) != 1 || got[0] != "New" {
+		t.Fatalf("inactive-tag forbidden declarations = %v, want [New]", got)
+	}
+}
+
 func TestPublicSessionContractsAreInterfaces(t *testing.T) {
 	t.Parallel()
 	var _ interface{ SessionID() uuid.UUID } = session.Session(nil)
@@ -106,13 +149,14 @@ func TestPublicSessionContainsOnlyContractsAndErrors(t *testing.T) {
 		t.Fatal("runtime.Caller failed")
 	}
 	dir := filepath.Dir(file)
-	packages, err := parser.ParseDir(token.NewFileSet(), dir, func(info os.FileInfo) bool {
-		return strings.HasSuffix(info.Name(), ".go") && !strings.HasSuffix(info.Name(), "_test.go")
-	}, 0)
+	files, err := parseProductionGoFiles(dir, 0)
 	if err != nil {
 		t.Fatalf("parse pkg/session: %v", err)
 	}
-	for _, file := range packages["session"].Files {
+	for _, file := range files {
+		if file.Name.Name != "session" {
+			continue
+		}
 		for _, decl := range file.Decls {
 			switch node := decl.(type) {
 			case *ast.FuncDecl:

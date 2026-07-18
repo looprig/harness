@@ -9,10 +9,10 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/harness/internal/runtimecontract"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 )
@@ -136,7 +136,7 @@ func TestLoopCompactionControlBoundaries(t *testing.T) {
 				// Fill the ordinary input queue to its independent capacity. Compact still
 				// enters the control slot; the later interrupted disposition proves it was
 				// not refused by UserInput fullness.
-				for i := 0; i < runtimecontract.ManagedInputQueueCapacity; i++ {
+				for i := 0; i < loop.ManagedInputQueueCapacity; i++ {
 					l.Commands <- command.UserInput{Header: command.Header{CommandID: uuid.UUID{byte(i + 10)}}}
 				}
 				sendCompact(t, l, sessionID, loopID, uuid.UUID{1}, identity.AgencyUser)

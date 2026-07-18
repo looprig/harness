@@ -1,3 +1,0 @@
-{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"hi"},"uuid":"u1"}
-{this is a truncated line
-{"parentUuid":"u1","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"recovered"}]},"uuid":"a1"}

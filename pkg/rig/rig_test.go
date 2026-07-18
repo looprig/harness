@@ -11,7 +11,7 @@ import (
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
@@ -150,10 +150,10 @@ func TestWithSecurityLimitFactoryRejectsNil(t *testing.T) {
 
 func TestDefineRejectsInvalidFinalLifecycleOptions(t *testing.T) {
 	t.Parallel()
-	goodLive := foreignloop.Builder(func(context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreignloop.EventPublisher, loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory) (loop.Backend, string, error) {
+	goodLive := foreign.Builder(func(context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreign.EventPublisher, loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory) (loop.Backend, string, error) {
 		return nil, "", nil
 	})
-	goodRestored := foreignloop.RestoredBuilder(func(context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreignloop.EventPublisher, loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory, foreignloop.RestoredForeign) (loop.Backend, error) {
+	goodRestored := foreign.RestoredBuilder(func(context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreign.EventPublisher, loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory, foreign.RestoredForeign) (loop.Backend, error) {
 		return nil, nil
 	})
 	tests := []struct {
@@ -186,10 +186,10 @@ func TestDefineRejectsEveryDuplicateSingletonOption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	foreignLive := foreignloop.Builder(func(context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreignloop.EventPublisher, loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory) (loop.Backend, string, error) {
+	foreignLive := foreign.Builder(func(context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreign.EventPublisher, loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory) (loop.Backend, string, error) {
 		return nil, "", nil
 	})
-	foreignRestored := foreignloop.RestoredBuilder(func(context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreignloop.EventPublisher, loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory, foreignloop.RestoredForeign) (loop.Backend, error) {
+	foreignRestored := foreign.RestoredBuilder(func(context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreign.EventPublisher, loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory, foreign.RestoredForeign) (loop.Backend, error) {
 		return nil, nil
 	})
 	tests := []struct {

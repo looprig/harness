@@ -13,7 +13,7 @@ import (
 	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/hustle"
@@ -201,8 +201,8 @@ type Session struct {
 	// RestoreForeignBuilderMissing). The session depends only on these narrow function
 	// seams, never on the foreignloop concrete loop (Dependency Inversion): loopruntime.New
 	// itself only ever builds native, and the foreign backend is injected here.
-	foreignBuild         foreignloop.Builder
-	foreignBuildRestored foreignloop.RestoredBuilder
+	foreignBuild         foreign.Builder
+	foreignBuildRestored foreign.RestoredBuilder
 	delegateSubscribe    func(event.EventFilter) (event.Subscription, error)
 	delegateEnqueue      func(context.Context, loop.Backend, command.UserInput) error
 

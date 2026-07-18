@@ -1,4 +1,6 @@
-.PHONY: test fmt fmt-check vendor vendor-scrub vendor-check lint vuln verify secure fuzz
+.PHONY: test fmt fmt-check vendor vendor-scrub vendor-check staticcheck lint vuln verify secure fuzz
+
+GO ?= go
 
 # Module's own package dirs, excluding vendor/ and the nested .worktrees/ modules
 # (go list ./... stops at nested module boundaries and skips vendor).
@@ -50,7 +52,7 @@ vendor-check:
 
 lint: fmt-check vendor-check
 	go vet ./...
-	go tool staticcheck ./...
+	$(MAKE) staticcheck
 	# gosec is NOT module-aware: its ./... is a filesystem walk that descends into
 	# the nested .worktrees/ checkouts (separate modules) and, under -mod=vendor,
 	# reports modules.txt desyncs for those foreign trees. Scope it to THIS module's
@@ -58,6 +60,9 @@ lint: fmt-check vendor-check
 	# staticcheck are module-aware (go list stops at module boundaries), so they need
 	# no scoping.
 	go tool gosec $(GO_DIRS)
+
+staticcheck:
+	@GO="$(GO)" ./scripts/run-staticcheck.sh
 
 vuln:
 	go mod verify

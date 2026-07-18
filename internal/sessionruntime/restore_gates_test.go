@@ -26,6 +26,11 @@ type persistedGateStream struct {
 
 func buildGateRestoreStream(t *testing.T, store *sessionstore.Store, cfg loop.Definition, prepared, opened, resolved bool) persistedGateStream {
 	t.Helper()
+	return buildGateRestoreStreamWithResolver(t, store, cfg, prepared, opened, resolved, gate.ResolverLoop)
+}
+
+func buildGateRestoreStreamWithResolver(t *testing.T, store *sessionstore.Store, cfg loop.Definition, prepared, opened, resolved bool, resolver gate.ResolverKind) persistedGateStream {
+	t.Helper()
 	sessionID := mustSessionID(t)
 	rootLoopID := mustSessionID(t)
 	turnID := mustSessionID(t)
@@ -80,11 +85,14 @@ func buildGateRestoreStream(t *testing.T, store *sessionstore.Store, cfg loop.De
 		Runtime: runtimeFromFingerprint(fingerprintFromDefinition(cfg)),
 	})
 
-	coords := identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID, TurnID: turnID, StepID: stepID}
+	coords := identity.Coordinates{SessionID: sessionID}
+	if resolver == gate.ResolverLoop {
+		coords = identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID, TurnID: turnID, StepID: stepID}
+	}
 	g := gate.Gate{
 		ID:          gateID,
 		Kind:        gate.KindPermission,
-		Resolver:    gate.ResolverLoop,
+		Resolver:    resolver,
 		Blocks:      gate.BlocksToolCall,
 		Effect:      gate.EffectResume,
 		Criticality: gate.GateCritical,
@@ -102,6 +110,18 @@ func buildGateRestoreStream(t *testing.T, store *sessionstore.Store, cfg loop.De
 			},
 		},
 	}
+	if resolver == gate.ResolverSession {
+		g.Kind = gate.KindForm
+		g.Blocks = gate.BlocksSession
+		g.Subject = gate.Subject{}
+		g.Prompt = gate.Prompt{
+			Title: "Provide details",
+			Controls: []gate.Control{
+				{Action: gate.FormActionAccept, Label: "Submit"},
+				{Action: gate.FormActionCancel, Label: "Cancel"},
+			},
+		}
+	}
 	if prepared {
 		preparedEvent := event.GatePrepared{Header: stamp(coords), Gate: g}
 		appendRecord(journal.NewGatePreparedRecord(preparedEvent, gate.OpenPayload{
@@ -113,10 +133,43 @@ func buildGateRestoreStream(t *testing.T, store *sessionstore.Store, cfg loop.De
 		appendEvent(event.GateOpened{Header: stamp(coords), Gate: g})
 	}
 	if resolved {
-		appendEvent(event.GateResolved{Header: stamp(coords), GateID: gateID, Reason: gate.CloseAnswered})
+		appendEvent(event.GateResolved{Header: stamp(coords), GateID: gateID, Resolver: resolver, Reason: gate.CloseAnswered})
 	}
 
 	return persistedGateStream{sessionID: sessionID, rootLoopID: rootLoopID, lease: lease, gateID: gateID}
+}
+
+func TestRestoreUnavailableGateResolutionPreservesResolver(t *testing.T) {
+	for _, resolver := range []gate.ResolverKind{gate.ResolverLoop, gate.ResolverSession} {
+		t.Run(string(resolver), func(t *testing.T) {
+			store := newRestoreStore(t)
+			cfg := restoreCfg(&stubLLM{}, "model-x", "be helpful")
+			orig := buildGateRestoreStreamWithResolver(t, store, cfg, false, true, false, resolver)
+			handOver(t, orig.lease)
+
+			s, err := restoreTestSession(context.Background(), cfg, orig.sessionID, store)
+			if err != nil {
+				t.Fatalf("Restore: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+			var matchedResolver gate.ResolverKind
+			matched := false
+			for _, resolved := range restoredGateResolvedEvents(t, store, orig.sessionID) {
+				if resolved.GateID == orig.gateID && resolved.Reason == gate.CloseRestoreUnavailable {
+					matchedResolver = resolved.Resolver
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				t.Fatalf("missing restore-unavailable GateResolved for gate %s", orig.gateID)
+			}
+			if matchedResolver != resolver {
+				t.Fatalf("GateResolved.Resolver = %q, want opened gate resolver %q", matchedResolver, resolver)
+			}
+		})
+	}
 }
 
 func restoredGateResolvedEvents(t *testing.T, store *sessionstore.Store, sessionID uuid.UUID) []event.GateResolved {

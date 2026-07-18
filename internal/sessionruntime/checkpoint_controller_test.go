@@ -643,7 +643,7 @@ func (c boundaryCoordinator) Acquire(_ context.Context, op tool.WorkspaceOperati
 		panic("unexpected checkpoint permit request")
 	}
 	c.order.add("acquire")
-	return boundaryPermit{order: c.order}, nil
+	return boundaryPermit(c), nil
 }
 func (boundaryCoordinator) Healthy() error { return nil }
 
@@ -680,13 +680,13 @@ func (p *boundaryPublisher) PublishEventChecked(_ context.Context, ev event.Even
 	p.mu.Lock()
 	p.events = append(p.events, ev)
 	p.mu.Unlock()
-	switch ev.(type) {
+	switch ev := ev.(type) {
 	case event.StepDone, event.TurnDone, event.TurnFailed, event.TurnInterrupted, event.SessionIdle:
 		p.order.add("trigger")
 	case event.WorkspaceCheckpointed:
 		p.order.add("checkpoint")
 		if p.checkpointed != nil {
-			p.checkpointed <- ev.(event.WorkspaceCheckpointed)
+			p.checkpointed <- ev
 		}
 	}
 	return nil

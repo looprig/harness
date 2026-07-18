@@ -59,7 +59,13 @@ func NewBounded(max Level) *Limit { return &Limit{max: max, hasMax: true} }
 // Current returns the live limit ordinal (0 = most restrictive). It is safe to call
 // concurrently with Set and is the read the permission checker performs on every Check,
 // so a Set is visible on the very next Check (the clamp takes effect immediately, §8).
-func (s *Limit) Current() Level { return Level(s.current.Load()) }
+func (s *Limit) Current() Level {
+	value := s.current.Load()
+	if value > uint32(^Level(0)) {
+		return 0
+	}
+	return Level(value)
+}
 
 // Clamp returns level reduced to the configured cap (when one is set), WITHOUT storing
 // it — the PURE projection Set applies. The applier uses it to learn the EFFECTIVE

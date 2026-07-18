@@ -9,7 +9,6 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/harness/internal/runtimecontract"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	gatedomain "github.com/looprig/harness/pkg/gate"
@@ -1414,7 +1413,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		switch {
 		case state.status == loopShuttingDown && !bypassReject:
 			rejectSubmit(qi, event.RejectShuttingDown)
-		case len(state.inbox) >= runtimecontract.ManagedInputQueueCapacity && !bypassReject:
+		case len(state.inbox) >= loop.ManagedInputQueueCapacity && !bypassReject:
 			rejectSubmit(qi, event.RejectQueueFull)
 		case state.status == loopRunning || state.status == loopWaitingAdmission || (state.status == loopShuttingDown && bypassReject):
 			// Busy (or a never-rejected SubagentResult while shutting down): accept into
@@ -1459,7 +1458,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		switch {
 		case state.status == loopShuttingDown:
 			reject(event.RejectShuttingDown, nil)
-		case len(state.inbox) >= runtimecontract.ManagedInputQueueCapacity:
+		case len(state.inbox) >= loop.ManagedInputQueueCapacity:
 			reject(event.RejectQueueFull, nil)
 		case state.status == loopRunning || state.status == loopWaitingAdmission:
 			if err := publishAcceptance(c.CommandID); err != nil {

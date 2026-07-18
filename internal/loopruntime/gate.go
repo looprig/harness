@@ -142,11 +142,6 @@ func callIDFromContext(ctx context.Context) (uuid.UUID, bool) {
 	return v, ok
 }
 
-// toolUseIDFromContext reads the active provider tool-use id, false when absent.
-func toolUseIDFromContext(ctx context.Context) (string, bool) {
-	return ToolUseIDFrom(ctx)
-}
-
 // gateRegFromContext reads the gate-registration handle, false when absent.
 func gateRegFromContext(ctx context.Context) (chan<- gateRegistration, bool) {
 	v, ok := ctx.Value(gateRegKey{}).(chan<- gateRegistration)

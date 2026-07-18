@@ -9,7 +9,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/security"
@@ -210,7 +210,7 @@ func WithFingerprint(fingerprint event.ConfigFingerprint) Option {
 // foreign engine never silently resolves to a native loop. The two seams travel
 // together (a live build and a restored build of the same agent), so they are wired as
 // one option; either being nil leaves foreign engines unsupported for that path.
-func WithForeignBuilders(b foreignloop.Builder, rb foreignloop.RestoredBuilder) Option {
+func WithForeignBuilders(b foreign.Builder, rb foreign.RestoredBuilder) Option {
 	return func(s *Session) {
 		s.foreignBuild = b
 		s.foreignBuildRestored = rb

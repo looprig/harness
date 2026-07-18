@@ -1,7 +1,0 @@
-{"type":"file-history-snapshot","messageId":"x","snapshot":{}}
-{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"hi there"},"uuid":"u1","timestamp":"2026-06-26T00:00:00Z"}
-{"parentUuid":"u1","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"let me think","signature":"sig"},{"type":"text","text":"Working"},{"type":"tool_use","id":"toolu_9","name":"Read","input":{"path":"/x"}}],"usage":{"input_tokens":10},"model":"claude","stop_reason":"tool_use"},"uuid":"a1","timestamp":"2026-06-26T00:00:01Z"}
-{"parentUuid":"a1","isSidechain":false,"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_9","content":"contents","is_error":false}]},"toolUseResult":{"stdout":"contents"},"uuid":"u2","timestamp":"2026-06-26T00:00:02Z"}
-{"parentUuid":"u2","isSidechain":true,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"subagent says hi"}]},"uuid":"side1","timestamp":"2026-06-26T00:00:03Z"}
-{"type":"permission-mode","mode":"default"}
-{"parentUuid":"u2","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done"}]},"uuid":"a2","timestamp":"2026-06-26T00:00:04Z"}

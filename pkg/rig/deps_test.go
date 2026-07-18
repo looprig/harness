@@ -159,6 +159,48 @@ func harnessRoot(t *testing.T) string {
 	return filepath.Dir(filepath.Dir(filepath.Dir(file)))
 }
 
+// parseProductionGoPackages parses every production Go file in one package
+// directory without applying the current platform's build constraints. These
+// source-boundary checks intentionally cover inactive platform/tag variants.
+func parseProductionGoPackages(dir string, mode parser.Mode) (map[string][]*ast.File, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	packages := make(map[string][]*ast.File)
+	set := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
+			continue
+		}
+		file, err := parser.ParseFile(set, filepath.Join(dir, name), nil, mode)
+		if err != nil {
+			return nil, err
+		}
+		packages[file.Name.Name] = append(packages[file.Name.Name], file)
+	}
+	return packages, nil
+}
+
+func TestBoundaryPackageFileScanIncludesInactiveBuildTags(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inactive.go")
+	source := "//go:build boundary_never\n\n// Package fixture documents the inactive package.\npackage fixture\n"
+	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	packages, err := parseProductionGoPackages(dir, parser.PackageClauseOnly|parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := packages["fixture"]
+	if len(files) != 1 || files[0].Doc == nil {
+		t.Fatalf("inactive-tag package files = %d with doc %v, want one documented file", len(files), len(files) == 1 && files[0].Doc != nil)
+	}
+}
+
 func TestOnlyRigImportsInternalSessionRuntime(t *testing.T) {
 	root := harnessRoot(t)
 	violations, err := internalSessionRuntimeImportViolations(root)
@@ -194,15 +236,13 @@ func TestInternalSessionRuntimeImportGuardCoversWholeModule(t *testing.T) {
 func TestFinalBoundaryPackagesAreDocumented(t *testing.T) {
 	root := harnessRoot(t)
 	for _, rel := range []string{"pkg/loop", "pkg/session", "pkg/rig", "internal/loopruntime", "internal/sessionruntime"} {
-		packages, err := parser.ParseDir(token.NewFileSet(), filepath.Join(root, filepath.FromSlash(rel)), func(info os.FileInfo) bool {
-			return strings.HasSuffix(info.Name(), ".go") && !strings.HasSuffix(info.Name(), "_test.go")
-		}, parser.PackageClauseOnly|parser.ParseComments)
+		packages, err := parseProductionGoPackages(filepath.Join(root, filepath.FromSlash(rel)), parser.PackageClauseOnly|parser.ParseComments)
 		if err != nil {
 			t.Fatalf("parse %s: %v", rel, err)
 		}
-		for _, pkg := range packages {
+		for _, files := range packages {
 			documented := false
-			for _, file := range pkg.Files {
+			for _, file := range files {
 				if file.Doc != nil && strings.TrimSpace(file.Doc.Text()) != "" {
 					documented = true
 					break
@@ -217,13 +257,11 @@ func TestFinalBoundaryPackagesAreDocumented(t *testing.T) {
 
 func TestInternalSessionRuntimeHasNoSingleLoopCompatibilityConstructors(t *testing.T) {
 	dir := filepath.Join(harnessRoot(t), "internal", "sessionruntime")
-	packages, err := parser.ParseDir(token.NewFileSet(), dir, func(info os.FileInfo) bool {
-		return strings.HasSuffix(info.Name(), ".go") && !strings.HasSuffix(info.Name(), "_test.go")
-	}, 0)
+	packages, err := parseProductionGoPackages(dir, 0)
 	if err != nil {
 		t.Fatalf("parse internal/sessionruntime: %v", err)
 	}
-	for _, file := range packages["sessionruntime"].Files {
+	for _, file := range packages["sessionruntime"] {
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if ok && fn.Recv == nil && (fn.Name.Name == "NewLifecycle" || fn.Name.Name == "Restore") {

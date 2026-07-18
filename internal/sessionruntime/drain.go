@@ -157,21 +157,6 @@ func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid
 	}
 }
 
-// handleEvent applies one event to the two-phase correlation state. It returns
-// done=true with the result (text+err) only on the matched turn's terminal (or a
-// phase-1 rejection); otherwise done=false and the caller keeps draining. turnID,
-// loopID, haveTurn, and lastStep are updated in place across calls.
-func handleEvent(
-	ev event.Event,
-	commandID uuid.UUID,
-	turnID *uuid.UUID,
-	loopID *uuid.UUID,
-	haveTurn *bool,
-	lastStep *string,
-) (text string, done bool, err error) {
-	return handleCorrelatedEvent(ev, commandID, turnID, loopID, haveTurn, lastStep, true)
-}
-
 func handleCorrelatedEvent(
 	ev event.Event,
 	commandID uuid.UUID,
