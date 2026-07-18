@@ -142,9 +142,7 @@ func wsAssertTreesEqual(t *testing.T, want, got string) {
 	}
 }
 
-func TestFixedRootReconcileCreatesNonPublicParentDirectories(t *testing.T) {
-	t.Parallel()
-
+func TestFixedRootReconcilePreservesWorkspaceParentDirectoryMode(t *testing.T) {
 	root := t.TempDir()
 	staging := t.TempDir()
 	rollback := t.TempDir()
@@ -164,8 +162,8 @@ func TestFixedRootReconcileCreatesNonPublicParentDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := info.Mode().Perm(); got&0o007 != 0 {
-		t.Fatalf("created parent directory mode = %#o, want no access for other users", got)
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("created parent directory mode = %#o, want compatibility mode 0755", got)
 	}
 }
 

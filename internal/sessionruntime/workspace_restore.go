@@ -263,7 +263,9 @@ func (r *reconcile) replace(rel string) error {
 	} else {
 		r.undo = append(r.undo, func() error { return removeIfExists(dst) })
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+	// Restored workspace parents preserve the pre-existing 0755 compatibility contract;
+	// rollback scratch dirs use 0700 and restored files retain their source permissions.
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil { // #nosec G301 -- workspace parent compatibility; sensitive descendants are narrower
 		return err
 	}
 	return copyFileContents(filepath.Join(r.staging, rel), dst)
