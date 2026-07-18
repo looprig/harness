@@ -409,6 +409,13 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 			Header: fullHeaderSession(),
 			Config: ConfigFingerprint{AgentKind: "primary", ModelID: "m-1", SystemPromptRev: "abc", ToolPolicyRev: "def", AgentAdapter: "claude", PermissionPosture: "default"},
 		}},
+		// Config and Manifest are BOTH populated during the deprecation window; the
+		// additive Manifest field must survive the durable codec deep-equal.
+		{"SessionStarted with manifest", SessionStarted{
+			Header:   fullHeaderSession(),
+			Config:   ConfigFingerprint{AgentKind: "primary", ModelID: "m-1", SystemPromptRev: "abc", ToolPolicyRev: "def"},
+			Manifest: testManifest(),
+		}},
 		{"SessionActive", SessionActive{Header: fullHeaderSession()}},
 		{"SessionIdle", SessionIdle{Header: fullHeaderSession()}},
 		{"SessionStopped", SessionStopped{Header: fullHeaderSession()}},

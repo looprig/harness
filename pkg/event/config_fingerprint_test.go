@@ -295,3 +295,49 @@ func TestSessionStartedCarriesConfig(t *testing.T) {
 		t.Errorf("round-trip SessionStarted.Config = %+v, want %+v", got.Config, fp)
 	}
 }
+
+// TestSessionStartedManifestIsAdditive proves the new Manifest field is additive:
+// a legacy SessionStarted JSON that predates the field — it carries a "config" key
+// but NO "manifest" key — still decodes, leaving Manifest zero and Config intact.
+// A session persisted before the manifest existed must restore without a decode
+// error or a phantom manifest.
+func TestSessionStartedManifestIsAdditive(t *testing.T) {
+	t.Parallel()
+
+	// A legacy record: only the "config" key exists; there is no "manifest" key.
+	legacyJSON := `{"config":{"agent_kind":"primary","model_id":"claude-test","system_prompt_rev":"abc123","tool_policy_rev":"def456"}}`
+	var got event.SessionStarted
+	if err := json.Unmarshal([]byte(legacyJSON), &got); err != nil {
+		t.Fatalf("json.Unmarshal(legacy SessionStarted): %v", err)
+	}
+	if got.Manifest.SchemaVersion != 0 || len(got.Manifest.Tools) != 0 || got.Manifest.ModelID != "" {
+		t.Errorf("legacy record decoded a non-zero Manifest = %+v, want zero", got.Manifest)
+	}
+	if got.Config.ModelID != "claude-test" || got.Config.ToolPolicyRev != "def456" {
+		t.Errorf("legacy record lost Config = %+v", got.Config)
+	}
+}
+
+// TestSessionStartedCarriesManifest asserts the Manifest field round-trips on the
+// event alongside Config: both are populated during the deprecation window.
+func TestSessionStartedCarriesManifest(t *testing.T) {
+	t.Parallel()
+	ev := event.SessionStarted{
+		Config:   fullFingerprint(),
+		Manifest: event.ConfigManifest{SchemaVersion: event.ManifestSchemaVersion, ModelID: "claude-fable-5", Tools: []event.ToolManifestEntry{{Name: "Bash"}, {Name: "Read"}}},
+	}
+	data, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("json.Marshal(SessionStarted): %v", err)
+	}
+	var got event.SessionStarted
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("json.Unmarshal(SessionStarted): %v", err)
+	}
+	if got.Manifest.Fingerprint() != ev.Manifest.Fingerprint() {
+		t.Errorf("round-trip Manifest fingerprint = %q, want %q", got.Manifest.Fingerprint(), ev.Manifest.Fingerprint())
+	}
+	if !got.Config.Equal(ev.Config) {
+		t.Errorf("round-trip Config = %+v, want %+v", got.Config, ev.Config)
+	}
+}

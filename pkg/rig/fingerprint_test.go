@@ -643,3 +643,104 @@ func TestExternalCapabilityRevReachesBothFingerprintPaths(t *testing.T) {
 		t.Errorf("frozenFingerprint with no external capability = %q, want empty", got)
 	}
 }
+
+// TestManifestMatchesFingerprint is the cross-module conformance guard: the
+// ConfigManifest that rig assembles must agree, field-for-field, with the legacy
+// ConfigFingerprint frozenFingerprint produces from the SAME immutable inputs. The
+// load-bearing assertion is manifest.ToolNamesRev() == legacy.ToolPolicyRev — it
+// proves the manifest's names-only tool digest reproduces rig's toolPolicyRev
+// byte-for-byte, INCLUDING the structurally injected "Subagent" entry for a
+// delegate-capable active loop. A drift here would make every restore compare a
+// manifest that was never stamped.
+func TestManifestMatchesFingerprint(t *testing.T) {
+	t.Parallel()
+
+	// The new (Phase-1) ConfigFingerprintFields members are carried by the manifest
+	// but not by the legacy fingerprint; set them to prove they reach the manifest.
+	fields := ConfigFingerprintFields{
+		AgentKind:                 "coderig:operator",
+		RuntimeSkills:             true,
+		WorkspaceRoot:             "/repo",
+		AdapterID:                 "claude",
+		Posture:                   "default",
+		NativePermissionPolicyRev: "nnnn",
+		ExternalCapabilityRev:     "eeee",
+		WorkspaceTrust:            "trusted",
+		PermissionStrictness:      3,
+		ConfinementRev:            "cccc",
+		ConfinementStrictness:     2,
+		AppFields:                 map[string]string{"a": "1", "b": "2"},
+	}
+
+	// A non-delegate active loop with a produced tool set, plus a delegate-capable
+	// active loop that receives the structural "Subagent" — so the Subagent parity
+	// is actually exercised (mirrors TestFrozenFingerprintIncludesStructurallyInjectedSubagent).
+	filesBundle := tool.NewBundleDefinition("Files", []string{"ReadFile", "WriteFile"}, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{fpTool{name: "ReadFile"}, fpTool{name: "WriteFile"}}, nil
+	})
+	plainAgent := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("model")), loop.WithSystem("sys"), loop.WithTools(filesBundle))
+
+	primer := mustDefine(loop.WithName("primer"), loop.WithInference(&stubLLM{}, validModel("model")), loop.WithSystem("sys"), loop.WithDelegates("delegate"))
+	delegate := mustDefine(loop.WithName("delegate"), loop.WithInference(&stubLLM{}, validModel("delegate-model")))
+
+	tests := []struct {
+		name        string
+		definitions []loop.Definition
+		primers     []string
+		active      string
+	}{
+		{name: "non-delegate active loop", definitions: []loop.Definition{plainAgent}, primers: []string{"agent"}, active: "agent"},
+		{name: "delegate-capable active loop injects Subagent", definitions: []loop.Definition{primer, delegate}, primers: []string{"primer"}, active: "primer"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			legacy := frozenFingerprint(fields, tt.definitions, tt.primers, tt.active)
+			manifest := frozenManifest(fields, tt.definitions, tt.primers, tt.active)
+
+			if manifest.SchemaVersion != event.ManifestSchemaVersion {
+				t.Fatalf("SchemaVersion = %d, want %d", manifest.SchemaVersion, event.ManifestSchemaVersion)
+			}
+			if manifest.AgentKind != legacy.AgentKind ||
+				manifest.ModelID != legacy.ModelID ||
+				manifest.SystemPromptRev != legacy.SystemPromptRev ||
+				manifest.TopologyRev != legacy.TopologyRev ||
+				manifest.ToolNamesRev() != legacy.ToolPolicyRev ||
+				manifest.WorkspaceRoot != legacy.WorkspaceRoot ||
+				manifest.RuntimeSkills != legacy.RuntimeSkills ||
+				manifest.AgentAdapter != legacy.AgentAdapter ||
+				manifest.PermissionPosture != legacy.PermissionPosture ||
+				manifest.NativePermissionPolicyRev != legacy.NativePermissionPolicyRev ||
+				manifest.ExternalCapabilityRev != legacy.ExternalCapabilityRev {
+				t.Errorf("manifest disagrees with legacy fingerprint:\nmanifest=%+v\nlegacy=%+v", manifest, legacy)
+			}
+
+			// The new Phase-1 fields carried only by the manifest.
+			if manifest.WorkspaceTrust != fields.WorkspaceTrust ||
+				manifest.PermissionStrictness != fields.PermissionStrictness ||
+				manifest.ConfinementRev != fields.ConfinementRev ||
+				manifest.ConfinementStrictness != fields.ConfinementStrictness {
+				t.Errorf("manifest dropped a Phase-1 field: %+v", manifest)
+			}
+			if len(manifest.AppFields) != len(fields.AppFields) {
+				t.Errorf("manifest AppFields = %v, want %v", manifest.AppFields, fields.AppFields)
+			}
+			for k, v := range fields.AppFields {
+				if manifest.AppFields[k] != v {
+					t.Errorf("manifest AppFields[%q] = %q, want %q", k, manifest.AppFields[k], v)
+				}
+			}
+
+			// Tool schema digests stay EMPTY in Phase 1 (names-only parity): restore
+			// only has tool NAMES, so stamping schema digests would make every restore
+			// show spurious tool drift.
+			for _, entry := range manifest.Tools {
+				if entry.InputSchemaRev != "" || entry.OutputSchemaRev != "" {
+					t.Errorf("tool %q carries a schema digest %+v, want empty in Phase 1", entry.Name, entry)
+				}
+			}
+		})
+	}
+}

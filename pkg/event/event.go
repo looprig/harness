@@ -236,11 +236,20 @@ type TurnIndex int
 // of the agent configuration the session started under (model/system-prompt/tool
 // policy), stamped at construction so a durable journal can detect a config change
 // on restore.
+//
+// Manifest is the richer, canonical description of the same configuration. During
+// the deprecation window BOTH are populated: Config remains the legacy comparison
+// baseline while Manifest carries the additive fields (workspace trust, permission
+// and confinement strictness, application fields, and per-tool schema identity) that
+// typed drift assessment consumes. It is additive (omitzero): a journal record that
+// predates the field decodes it as the zero ConfigManifest and never spuriously
+// mismatches.
 type SessionStarted struct {
 	enduring
 	sessionScoped
 	Header
-	Config ConfigFingerprint `json:"config,omitzero"`
+	Config   ConfigFingerprint `json:"config,omitzero"`
+	Manifest ConfigManifest    `json:"manifest,omitzero"`
 }
 
 // SessionActive marks the Idle -> Active edge of the session quiescence model.

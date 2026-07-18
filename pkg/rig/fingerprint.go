@@ -35,6 +35,29 @@ type ConfigFingerprintFields struct {
 	// what it attached. The canonical producer is github.com/looprig/mcp's
 	// mcpharness.Manager.ConfigDigest, taken after the Manager has started.
 	ExternalCapabilityRev string
+
+	// The fields below are carried ONLY by the richer event.ConfigManifest; the
+	// legacy event.ConfigFingerprint has no home for them. Each is optional and
+	// zero-safe: a caller that supplies nothing leaves the manifest field empty,
+	// which keeps the manifest additive against a journal that predates it.
+
+	// WorkspaceTrust is an opaque, secret-free label for the workspace's trust
+	// posture (e.g. "trusted"/"untrusted"). Empty means unspecified.
+	WorkspaceTrust string
+	// PermissionStrictness is the ordered native-permission posture level; higher is
+	// stricter. Zero means unknown (drift assessment fails secure). It complements
+	// NativePermissionPolicyRev, which is the digest-only identity.
+	PermissionStrictness event.StrictnessLevel
+	// ConfinementRev is a content digest of the confinement (sandbox) configuration.
+	// Empty means none. Harness compares it, never parses it.
+	ConfinementRev string
+	// ConfinementStrictness is the ordered confinement posture level; higher is
+	// stricter. Zero means unknown.
+	ConfinementStrictness event.StrictnessLevel
+	// AppFields are application-defined, secret-free compatibility fields the
+	// composition root attaches. Canonically encoded in sorted key order by the
+	// manifest. Nil means none.
+	AppFields map[string]string
 }
 
 // FingerprintFrom derives the stable, secret-free behavior fingerprint of a bound loop.
@@ -74,24 +97,8 @@ func fingerprintWithTopologyAndHustles(definition loop.BoundDefinition, fields C
 // immutable definitions and scalar rig fields, so restore can compare it immediately
 // after replay without constructing workspace or loop collaborators.
 func frozenFingerprint(fields ConfigFingerprintFields, definitions []loop.Definition, primers []string, active string) event.ConfigFingerprint {
-	initial := loop.InitialFingerprint{}
-	for _, definition := range definitions {
-		if string(definition.Name()) == active {
-			initial = definition.FingerprintInitial()
-			break
-		}
-	}
-	toolNames := append([]string(nil), initial.ToolNames...)
-	for _, definition := range definitions {
-		if string(definition.Name()) == active && len(definition.Delegates()) > 0 {
-			// Delegate-capable loops receive this built-in structurally at Bind.
-			// Include its stable model-facing name without constructing the tool or
-			// its permission/controller collaborators.
-			toolNames = append(toolNames, "Subagent")
-			break
-		}
-	}
-	sort.Strings(toolNames)
+	initial := frozenInitial(definitions, active)
+	toolNames := frozenToolNames(definitions, active)
 	return event.ConfigFingerprint{
 		TopologyRev:               topologyRevision(definitions, primers, active),
 		AgentKind:                 fields.AgentKind,
@@ -104,6 +111,72 @@ func frozenFingerprint(fields ConfigFingerprintFields, definitions []loop.Defini
 		PermissionPosture:         fields.Posture,
 		NativePermissionPolicyRev: fields.NativePermissionPolicyRev,
 		ExternalCapabilityRev:     fields.ExternalCapabilityRev,
+	}
+}
+
+// frozenInitial resolves the active loop's restore-time InitialFingerprint from the
+// immutable definitions alone. The zero value stands in when no definition matches.
+func frozenInitial(definitions []loop.Definition, active string) loop.InitialFingerprint {
+	for _, definition := range definitions {
+		if string(definition.Name()) == active {
+			return definition.FingerprintInitial()
+		}
+	}
+	return loop.InitialFingerprint{}
+}
+
+// frozenToolNames is the SINGLE source of the restore-time tool-name list shared by
+// frozenFingerprint (its ToolPolicyRev) and frozenManifest (its name-only Tools), so
+// the two can never drift apart. It reads the active loop's produced tool names,
+// appends the literal "Subagent" when the active loop is delegate-capable (that
+// built-in is injected structurally at Bind, without constructing the tool or its
+// collaborators), and returns them sorted. The returned slice is a fresh copy.
+func frozenToolNames(definitions []loop.Definition, active string) []string {
+	initial := frozenInitial(definitions, active)
+	toolNames := append([]string(nil), initial.ToolNames...)
+	for _, definition := range definitions {
+		if string(definition.Name()) == active && len(definition.Delegates()) > 0 {
+			toolNames = append(toolNames, "Subagent")
+			break
+		}
+	}
+	sort.Strings(toolNames)
+	return toolNames
+}
+
+// frozenManifest is the rig-time compatibility projection of the richer
+// event.ConfigManifest, the manifest counterpart to frozenFingerprint. It depends
+// only on immutable definitions and scalar rig fields, so restore can assemble it
+// before constructing workspace or loop collaborators, and it draws every shared
+// field from the SAME source frozenFingerprint uses — so a manifest and the legacy
+// fingerprint of the same session always agree (see TestManifestMatchesFingerprint).
+func frozenManifest(fields ConfigFingerprintFields, definitions []loop.Definition, primers []string, active string) event.ConfigManifest {
+	initial := frozenInitial(definitions, active)
+	toolNames := frozenToolNames(definitions, active)
+	tools := make([]event.ToolManifestEntry, len(toolNames))
+	for index, name := range toolNames {
+		// TODO(phase-1 follow-up): tool schema digests require exposing schemas on
+		// both the live and restore paths; empty for now (names-only parity).
+		tools[index] = event.ToolManifestEntry{Name: name}
+	}
+	return event.ConfigManifest{
+		SchemaVersion:             event.ManifestSchemaVersion,
+		AgentKind:                 fields.AgentKind,
+		TopologyRev:               topologyRevision(definitions, primers, active),
+		ModelID:                   initial.Model.Name,
+		SystemPromptRev:           hexSHA256(initial.EffectiveSystem),
+		Tools:                     tools,
+		RuntimeSkills:             fields.RuntimeSkills,
+		WorkspaceRoot:             fields.WorkspaceRoot,
+		WorkspaceTrust:            fields.WorkspaceTrust,
+		AgentAdapter:              fields.AdapterID,
+		PermissionPosture:         fields.Posture,
+		NativePermissionPolicyRev: fields.NativePermissionPolicyRev,
+		PermissionStrictness:      fields.PermissionStrictness,
+		ConfinementRev:            fields.ConfinementRev,
+		ConfinementStrictness:     fields.ConfinementStrictness,
+		ExternalCapabilityRev:     fields.ExternalCapabilityRev,
+		AppFields:                 fields.AppFields,
 	}
 }
 
