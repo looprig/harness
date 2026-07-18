@@ -188,6 +188,20 @@ func frozenFingerprintWithHustles(fields ConfigFingerprintFields, definitions []
 	return fingerprint
 }
 
+// frozenManifestWithHustles is the manifest counterpart to
+// frozenFingerprintWithHustles: it assembles the plain frozenManifest and, when
+// hustles are present, overrides TopologyRev with the SAME hustle-aware revision the
+// fingerprint uses. Stamping this manifest therefore keeps Manifest.TopologyRev
+// byte-equal to the fingerprint's, so drift assessment never sees phantom topology
+// drift on restore (see TestHustleBoundAndFrozenTopologyFingerprintEquivalent).
+func frozenManifestWithHustles(fields ConfigFingerprintFields, definitions []loop.Definition, primers []string, active string, hustles []hustle.Definition, limits HustleLimits) event.ConfigManifest {
+	manifest := frozenManifest(fields, definitions, primers, active)
+	if len(hustles) > 0 {
+		manifest.TopologyRev = topologyRevisionWithHustles(definitions, primers, active, hustles, limits)
+	}
+	return manifest
+}
+
 func topologyRevisionWithHustles(definitions []loop.Definition, primers []string, active string, hustles []hustle.Definition, limits HustleLimits) string {
 	copyOfLimits := limits
 	return canonicalTopologyRevision(topologyRevisionInput{

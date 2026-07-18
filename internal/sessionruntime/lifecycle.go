@@ -130,6 +130,11 @@ type Lifecycle struct {
 	securityLimitFactory SecurityLimitFactory
 	fingerprint          FingerprintProvider
 	frozenFingerprint    *event.ConfigFingerprint
+	// frozenManifest is the rig-assembled ConfigManifest counterpart to
+	// frozenFingerprint. When set it is stamped onto the construction-time
+	// SessionStarted alongside the legacy fingerprint. Nil leaves the additive
+	// Manifest field at its zero value (the deprecation-window default).
+	frozenManifest *event.ConfigManifest
 
 	// placement is the OPTIONAL managed-workspace placement (exclusive/per-session/shared)
 	// resolved per session by NewSession/RestoreSession. The zero value (PlacementNone) means
@@ -258,6 +263,17 @@ func WithLifecycleFingerprint(fingerprint event.ConfigFingerprint) LifecycleOpti
 	return func(r *Lifecycle) {
 		copy := fingerprint
 		r.frozenFingerprint = &copy
+	}
+}
+
+// WithLifecycleManifest captures the rig-assembled ConfigManifest counterpart to the
+// frozen fingerprint. It is stamped onto the construction-time SessionStarted's
+// additive Manifest field, giving a newly created session a real (SchemaVersion>=1)
+// manifest baseline.
+func WithLifecycleManifest(manifest event.ConfigManifest) LifecycleOption {
+	return func(r *Lifecycle) {
+		copy := manifest
+		r.frozenManifest = &copy
 	}
 }
 
@@ -425,6 +441,9 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	} else {
 		opts = append(opts, WithFingerprintProvider(r.fingerprint))
 	}
+	if r.frozenManifest != nil {
+		opts = append(opts, WithManifest(*r.frozenManifest))
+	}
 	// AMBIGUITY A1: mint a fresh per-session security limit state so concurrent sessions never share one
 	// mutable clamp. A configured factory returning nil fails closed; only an absent factory
 	// selects the session's internal default.
@@ -518,6 +537,9 @@ func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session,
 		opts = append(opts, WithFingerprint(*r.frozenFingerprint))
 	} else {
 		opts = append(opts, WithFingerprintProvider(r.fingerprint))
+	}
+	if r.frozenManifest != nil {
+		opts = append(opts, WithManifest(*r.frozenManifest))
 	}
 	if r.allowConfigMismatch {
 		opts = append(opts, WithAllowConfigMismatch())

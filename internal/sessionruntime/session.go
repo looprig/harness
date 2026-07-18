@@ -167,6 +167,10 @@ type Session struct {
 	// frozenFingerprint is the rig-resolved compatibility identity used before any
 	// restore-time workspace resolution or loop/tool binding.
 	frozenFingerprint *event.ConfigFingerprint
+	// frozenManifest is the rig-assembled ConfigManifest counterpart to
+	// frozenFingerprint, stamped onto the construction-time SessionStarted's additive
+	// Manifest field. Nil leaves Manifest at its zero value.
+	frozenManifest *event.ConfigManifest
 
 	// injectedSessionID is the externally-minted sessionID the composition root supplies
 	// via WithSessionID, read ONLY by newSession to resolve the journal chicken-and-egg:
@@ -914,6 +918,16 @@ func (s *Session) projectFingerprint(definition loop.BoundDefinition) event.Conf
 	return s.fingerprint(definition)
 }
 
+// projectManifest returns the rig-assembled manifest baseline stamped onto
+// SessionStarted. The zero ConfigManifest stands in when no manifest was supplied
+// (the deprecation-window default), keeping the Manifest field additive.
+func (s *Session) projectManifest() event.ConfigManifest {
+	if s.frozenManifest != nil {
+		return *s.frozenManifest
+	}
+	return event.ConfigManifest{}
+}
+
 func (s *Session) ActiveLoop() loop.Handle {
 	s.loopsMu.RLock()
 	defer s.loopsMu.RUnlock()
@@ -1653,7 +1667,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// orderedPrimers placed topology.ActivePrimer first (unconditionally) and prepared was
 	// built in that order, so prepared[0] is always the active primer — no rescan needed.
 	activePrepared := prepared[0]
-	if err := s.hub.PublishEventChecked(sessionCtx, event.SessionStarted{Header: startedHeader, Config: s.projectFingerprint(activePrepared.loop.bound)}); err != nil {
+	if err := s.hub.PublishEventChecked(sessionCtx, event.SessionStarted{Header: startedHeader, Config: s.projectFingerprint(activePrepared.loop.bound), Manifest: s.projectManifest()}); err != nil {
 		return abort(&SessionError{Kind: SessionContextDone, Cause: err})
 	}
 	if s.initialWorkspaceCheckpoint != "" {

@@ -204,6 +204,16 @@ func WithFingerprint(fingerprint event.ConfigFingerprint) Option {
 	}
 }
 
+// WithManifest installs the rig-assembled ConfigManifest counterpart to the frozen
+// fingerprint. The session stamps it onto the construction-time SessionStarted's
+// additive Manifest field.
+func WithManifest(manifest event.ConfigManifest) Option {
+	return func(s *Session) {
+		copy := manifest
+		s.frozenManifest = &copy
+	}
+}
+
 // WithForeignBuilders wires the composition-root seam that constructs foreign-engine
 // loops (live + restored). Without it, a foreign-engine definition fails closed at newLoop
 // (SessionForeignBuilderMissing) and at restore (RestoreForeignBuilderMissing) — a
