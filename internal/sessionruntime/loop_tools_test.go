@@ -12,7 +12,6 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -522,8 +521,9 @@ func TestRestoredLoopComesUpWithEmptySlot(t *testing.T) {
 	}
 }
 
-// TestReplaceExternalToolsRefusedOnForeignLoop drives a REAL foreign-engine loop, not a
-// hand-built handle. A foreign loop's toolset belongs to the foreign agent and its backend
+// TestReplaceExternalToolsRefusedOnForeignLoop drives a foreign-engine loop through the
+// public builder seam, not a hand-built handle. A foreign loop's toolset belongs to the
+// foreign agent and its backend
 // has no ReplaceLoopExternalTools arm, so the command would be dropped and the caller would
 // block on the ack forever. The refusal must therefore be structural, not incidental.
 //
@@ -537,10 +537,10 @@ func TestReplaceExternalToolsRefusedOnForeignLoop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	agent := &fakeForeignAgent{transcript: missingTranscript(t), script: foreignScript("result text")}
-	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
-	s, err := newTestSession(ctx, foreignPrimaryCfg(),
-		WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)))
+	builder := &fakeForeignBuilder{sid: fixedForeignSID, backend: newFakeBackend()}
+	definition := engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("unused")}}, loop.EngineForeignClaude, "sys")
+	s, err := newTestSession(ctx, definition,
+		WithForeignBuilders(builder.build, builder.buildRestored))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

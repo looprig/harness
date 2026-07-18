@@ -1,15 +1,23 @@
 # Foreignloop extraction coverage manifest
 
-This is the checked Phase 0 inventory for extracting `pkg/foreignloop`. Each
-tracked regular file below has exactly one principal final owner. Where one
-current file contains declarations that split across destinations, the note
-records that split explicitly. Tests and fixtures move with the behavior they
-cover; nothing is silently dropped.
+This is the final checked ownership record for the completed removal of
+`pkg/foreignloop`. Each of the 60 files present immediately before Task 18 has a
+principal final owner below, including the five migration/golden files added
+during the extraction overlap. Where one old file contained declarations split
+across destinations, the note records that split explicitly. Tests and fixtures
+moved with the behavior they cover; nothing was silently dropped.
 
-This manifest is temporary migration evidence. Task 18 finalizes it and removes
-the completeness check when Harness deletes `pkg/foreignloop`.
+Task 18 removed the temporary source-completeness check with the old directory
+and replaced it with a permanent all-source import guard. That guard rejects both
+the old concrete package and the extracted module from production files, tests,
+nested directories, and inactive build-tag files.
 
-## Current source ownership
+Final counts: 60 of 60 old files classified and removed from Harness; 53 of 53
+driver-neutral/backend tests classified; 9 of 9 outside importers migrated or
+deleted; and 8 of 8 real session integrations passed in `github.com/looprig/tests`
+before their Harness copies were removed.
+
+## Final source ownership (60 of 60)
 
 | Source file | Final owner | Migration note |
 |---|---|---|
@@ -56,6 +64,7 @@ the completeness check when Harness deletes `pkg/foreignloop`.
 | `pkg/foreignloop/loop_test.go` | `backend` | Port backend construction, actor, queue, interrupt, shutdown, and binding coverage. |
 | `pkg/foreignloop/mapper.go` | `backend` | Port driver-event to Harness-event mapping. |
 | `pkg/foreignloop/mapper_test.go` | `backend` | Port mapper ordering, correlation, and error coverage. |
+| `pkg/foreignloop/migration_export.go` | `delete` | Delete the temporary legacy decoder export after cross-module parity passes. |
 | `pkg/foreignloop/restored.go` | `harness/pkg/foreign` | Move `RestoredForeign` and `RestoredBuilder` to the Harness seam; move restored backend construction and `BuildRestoredWith` to `backend`. |
 | `pkg/foreignloop/restored_test.go` | `backend` | Port restored-state validation, folding, snapshot, and turn-index coverage. |
 | `pkg/foreignloop/snapshot.go` | `backend` | Port defensive snapshot request and clone behavior. |
@@ -63,8 +72,12 @@ the completeness check when Harness deletes `pkg/foreignloop`.
 | `pkg/foreignloop/testdata/stream/garbage.jsonl` | `driver/claude` | Copy as a Claude stream decoder fixture. |
 | `pkg/foreignloop/testdata/stream/happy.jsonl` | `driver/claude` | Copy as a Claude stream decoder fixture. |
 | `pkg/foreignloop/testdata/stream/unknown.jsonl` | `driver/claude` | Copy as a Claude stream decoder fixture. |
+| `pkg/foreignloop/testdata/transcript/empty.golden.json` | `driver/claude` | Retain the permanent empty-history projection golden in the extracted decoder suite. |
 | `pkg/foreignloop/testdata/transcript/empty.jsonl` | `driver/claude` | Copy as a Claude transcript decoder fixture and golden input. |
+| `pkg/foreignloop/testdata/transcript/happy.golden.json` | `driver/claude` | Retain the permanent happy-history projection golden in the extracted decoder suite. |
 | `pkg/foreignloop/testdata/transcript/happy.jsonl` | `driver/claude` | Copy as a Claude transcript decoder fixture and golden input. |
+| `pkg/foreignloop/testdata/transcript/missing.golden.json` | `driver/claude` | Retain the permanent provider-neutral missing-history projection golden in the extracted decoder suite. |
+| `pkg/foreignloop/testdata/transcript/truncated.golden.json` | `driver/claude` | Retain the permanent truncated-history projection golden in the extracted decoder suite. |
 | `pkg/foreignloop/testdata/transcript/truncated.jsonl` | `driver/claude` | Copy as a Claude transcript decoder fixture and golden input. |
 | `pkg/foreignloop/turn.go` | `backend` | Port turn execution, close-before-history commit, and fallback behavior. |
 | `pkg/foreignloop/turn_test.go` | `backend` | Port event ordering, history/transcript fallback, queue, and terminal coverage. |
@@ -170,32 +183,36 @@ The checked typed-error ownership is:
 | `driver/claude` | `ConfigError`, `PathError`, `PlatformError`, `SpawnConfigError`, `WrapError` |
 | `driver/codex` | `ConfigError`, `PlatformError`, `SpawnConfigError` |
 
-`driver/claude.DecodeTranscriptForMigration` remains a temporary migration-tag
-export and is intentionally excluded from the release API; Task 18 deletes it
-after cross-module decoder parity passes.
+`driver/claude.DecodeTranscriptForMigration`, the corresponding legacy Harness
+export, and the tests-module parity test were temporary migration-only artifacts.
+Task 18 deleted all three after decoder parity and all eight public integrations
+passed. The permanent decoder fixtures, projection goldens, unit tests, and fuzz
+targets remain in `driver/claude`.
 
 ## Harness importers outside `pkg/foreignloop`
 
-These are the current Go files outside the old tree that import
-`github.com/looprig/harness/pkg/foreignloop`.
+These are the nine Go importers outside the old tree recorded during migration.
+All nine final dispositions are complete; no file below imports the old package
+or the extracted module from Harness.
 
 | Harness importer | Final owner or action | Migration note |
 |---|---|---|
-| `internal/sessionruntime/command_journal.go` | `harness/pkg/foreign` | Repoint builder seam types to the public Harness package. |
-| `internal/sessionruntime/foreign_e2e_test.go` | `tests` | Port the eight real backend/session scenarios below, then delete the Harness copies. |
-| `internal/sessionruntime/foreign_newloop_test.go` | `harness/pkg/foreign` | Keep Harness builder-selection behavior with seam fakes. |
-| `internal/sessionruntime/lifecycle.go` | `harness/pkg/foreign` | Repoint lifecycle builder types to the public Harness package. |
-| `internal/sessionruntime/loop_tools_test.go` | `harness/pkg/foreign` | Keep `TestReplaceExternalToolsRefusedOnForeignLoop` in Harness using a seam fake. |
-| `internal/sessionruntime/restore_constructor.go` | `harness/pkg/foreign` | Repoint restored value and builder types to the public Harness package. |
-| `internal/sessionruntime/session.go` | `harness/pkg/foreign` | Repoint stored builder fields to the public Harness package. |
-| `pkg/rig/options.go` | `harness/pkg/foreign` | Repoint the public rig option to the public Harness seam. |
-| `pkg/rig/rig_test.go` | `harness/pkg/foreign` | Keep rig option validation with seam builder fakes. |
+| `internal/sessionruntime/command_journal.go` | `harness/pkg/foreign` | Repointed builder seam types to the public Harness package. |
+| `internal/sessionruntime/foreign_e2e_test.go` | `tests` | Ported all eight real backend/session scenarios, proved them through public APIs, then deleted the Harness copies. |
+| `internal/sessionruntime/foreign_newloop_test.go` | `harness/pkg/foreign` | Retained builder selection and missing-builder behavior with seam fakes. |
+| `internal/sessionruntime/lifecycle.go` | `harness/pkg/foreign` | Repointed lifecycle builder types to the public Harness package. |
+| `internal/sessionruntime/loop_tools_test.go` | `harness/pkg/foreign` | Retained `TestReplaceExternalToolsRefusedOnForeignLoop` with a seam fake. |
+| `internal/sessionruntime/restore_constructor.go` | `harness/pkg/foreign` | Repointed restored value and builder types to the public Harness package. |
+| `internal/sessionruntime/session.go` | `harness/pkg/foreign` | Repointed stored builder fields to the public Harness package. |
+| `pkg/rig/options.go` | `harness/pkg/foreign` | Repointed the public rig option to the public Harness seam. |
+| `pkg/rig/rig_test.go` | `harness/pkg/foreign` | Retained rig option validation with seam builder fakes. |
 
 ## Cross-module end-to-end test coverage
 
 The `github.com/looprig/tests` module owns all tests that compose real Harness
-sessions with the extracted backend. The old Harness copies are removed only
-after these replacements pass through public APIs.
+sessions with the extracted backend. Task 18 ran all eight replacements together
+with `-tags integration -race`; they passed before the old Harness copies were
+removed.
 
 | Existing Harness test | Tests-module replacement |
 |---|---|
