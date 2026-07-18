@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/sessionstore"
+	"github.com/looprig/storage"
+	"github.com/looprig/storage/memstore"
 )
 
 // --- new-path (drift-assessed restore) fixtures -------------------------------------
@@ -486,5 +489,224 @@ func TestRestoreEpochMonotonic(t *testing.T) {
 	}
 	if newest.PreviousFingerprint != manifest3.Fingerprint() {
 		t.Errorf("newest.PreviousFingerprint = %q, want epoch-3 fingerprint", newest.PreviousFingerprint)
+	}
+}
+
+// TestRestoreMultiEpochBaselineSelection pins the core behavioral change of the feature:
+// the drift baseline is the LATEST adopted manifest, never the first SessionStarted. The
+// committed history is SessionStarted(epoch-1 baseline) + ConfigurationAdopted(epoch 2) +
+// ConfigurationAdopted(epoch 3); epoch 3's manifest EQUALS the live candidate while the
+// epoch-1 SessionStarted manifest does NOT. Restore therefore assesses ZERO drift against the
+// epoch-3 baseline, succeeds, and appends NO new ConfigurationAdopted. If restore wrongly
+// baselined off the SessionStarted manifest it would see an Info (ModelID) change and adopt a
+// fourth epoch — so a still-exactly-2 count is the proof.
+func TestRestoreMultiEpochBaselineSelection(t *testing.T) {
+	store := newRestoreStore(t)
+	definition := restoreCfg(&stubLLM{}, "model-x", "be helpful")
+	fp := fingerprintFromDefinition(definition)
+
+	base := baselineManifest() // epoch-1 SessionStarted baseline (ModelID "model-x")
+	manifest2 := baselineManifest()
+	manifest2.ModelID = "model-2"
+	manifest3 := baselineManifest()
+	manifest3.ModelID = "model-3" // the LATEST adopted manifest
+
+	h, sessionID, _, lease, _ := newManifestHub(t, store, fp, base, "agent")
+	publishAdopted(t, h, 0x02, adoptedEvent(sessionID, 2, manifest2, base.Fingerprint()))
+	publishAdopted(t, h, 0x03, adoptedEvent(sessionID, 3, manifest3, manifest2.Fingerprint()))
+	handOver(t, lease)
+
+	// The live candidate MATCHES the epoch-3 baseline exactly (model-3) but differs from the
+	// epoch-1 SessionStarted manifest (model-x).
+	candidate := baselineManifest()
+	candidate.ModelID = "model-3"
+	s, err := restoreTestSession(context.Background(), definition, sessionID, store,
+		WithManifest(candidate))
+	if err != nil {
+		t.Fatalf("Restore (multi-epoch, candidate == latest baseline): %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	events := replayAllSessionEvents(t, store, sessionID)
+	if got := countAdopted(events); got != 2 {
+		t.Errorf("want exactly 2 ConfigurationAdopted (baseline is epoch-3 latest, zero drift), got %d", got)
+	}
+	assertTail(t, restoreEventTail(t, store, sessionID, mustRootLoopID(t, events)),
+		[]event.Event{event.RestoreStarted{}, event.RestoreDone{}})
+}
+
+// mustRootLoopID returns the LoopID of the single root (zero-Cause) LoopStarted in a replayed
+// stream — the loop coordinate restoreEventTail narrows on.
+func mustRootLoopID(t *testing.T, events []event.Event) uuid.UUID {
+	t.Helper()
+	for _, ev := range events {
+		if started, ok := ev.(event.LoopStarted); ok && started.Cause.Coordinates == (identity.Coordinates{}) {
+			return started.LoopID
+		}
+	}
+	t.Fatal("no root LoopStarted in replayed stream")
+	return uuid.UUID{}
+}
+
+// --- lease-loss simulation for the restore adoption append -------------------------------
+//
+// The restore path acquires its OWN single-writer lease internally (store.AcquireLease), so a
+// test cannot hand it a pre-lost lease. The reusable primitive is the journal's fast-path
+// lease guard: sessionJournal.Append refuses with *journal.JournalLeaseLostError once the
+// lease's Lost channel is closed (see sessionstore TestAppendAfterLeaseLost). We drive that
+// same guard mid-restore by wrapping the backend the restore Store is opened over:
+// leaseCapturingLeaser records every lease it grants, and leaseLosingLedger closes the most
+// recently granted lease's Lost channel after a configured number of committed ledger
+// appends. Restore's ledger appends, in order, are the opening LeaseFence (#1) and
+// RestoreStarted (#2); the very next journal Append is the ConfigurationAdopted adoption.
+// Losing the lease right after RestoreStarted commits (loseAfter == 2) makes the adoption
+// append the FIRST append refused — precisely the append Task 10's appendConfigurationAdopted
+// routes through the lease-checked journal.
+
+// controllableLease wraps a storage.Lease, substituting a Lost channel the test closes to
+// simulate an ownership takeover independent of the real backend.
+type controllableLease struct {
+	inner storage.Lease
+	lost  chan struct{}
+	once  sync.Once
+}
+
+func (l *controllableLease) Epoch() uint64         { return l.inner.Epoch() }
+func (l *controllableLease) Lost() <-chan struct{} { return l.lost }
+
+func (l *controllableLease) Release(ctx context.Context) error {
+	l.lose()
+	return l.inner.Release(ctx)
+}
+
+func (l *controllableLease) lose() { l.once.Do(func() { close(l.lost) }) }
+
+// leaseCapturingLeaser wraps a storage.Leaser, wrapping each granted lease in a
+// controllableLease and recording the most recent one so the ledger can lose it.
+type leaseCapturingLeaser struct {
+	inner storage.Leaser
+	mu    sync.Mutex
+	last  *controllableLease
+}
+
+func (le *leaseCapturingLeaser) Acquire(ctx context.Context, name string) (storage.Lease, error) {
+	inner, err := le.inner.Acquire(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	l := &controllableLease{inner: inner, lost: make(chan struct{})}
+	le.mu.Lock()
+	le.last = l
+	le.mu.Unlock()
+	return l, nil
+}
+
+func (le *leaseCapturingLeaser) loseCurrent() {
+	le.mu.Lock()
+	l := le.last
+	le.mu.Unlock()
+	if l != nil {
+		l.lose()
+	}
+}
+
+// leaseLosingLedger wraps a storage.Ledger and, once loseAfter appends have committed, closes
+// the leaser's current lease — simulating a mid-restore ownership takeover so the NEXT journal
+// Append (the adoption) is refused with a lease-lost error.
+type leaseLosingLedger struct {
+	inner     storage.Ledger
+	leaser    *leaseCapturingLeaser
+	loseAfter int
+	mu        sync.Mutex
+	appends   int
+}
+
+func (lg *leaseLosingLedger) Append(ctx context.Context, name string, expected uint64, payload []byte) error {
+	if err := lg.inner.Append(ctx, name, expected, payload); err != nil {
+		return err
+	}
+	lg.mu.Lock()
+	lg.appends++
+	trigger := lg.appends == lg.loseAfter
+	lg.mu.Unlock()
+	if trigger {
+		lg.leaser.loseCurrent()
+	}
+	return nil
+}
+
+func (lg *leaseLosingLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
+	return lg.inner.Read(ctx, name, from)
+}
+
+func (lg *leaseLosingLedger) Tip(ctx context.Context, name string) (uint64, error) {
+	return lg.inner.Tip(ctx, name)
+}
+
+func (lg *leaseLosingLedger) Delete(ctx context.Context, name string) error {
+	return lg.inner.Delete(ctx, name)
+}
+
+// TestRestoreAdoptionLeaseLost: a manifest-carrying session restored with an Info-level drift
+// (so an adoption WOULD be appended) but with the session writer lease forced to move right
+// after RestoreStarted commits. The adoption append — the next journal Append — must be
+// refused under the lost lease, aborting the restore: no live session, the failure observable
+// as a wrapped *journal.JournalLeaseLostError, and neither a ConfigurationAdopted nor a
+// RestoreDone committed (the session never comes up under the unrecorded configuration).
+func TestRestoreAdoptionLeaseLost(t *testing.T) {
+	backend := memstore.New()
+	origStore, err := sessionstore.Open(backend)
+	if err != nil {
+		t.Fatalf("sessionstore.Open(orig): %v", err)
+	}
+	definition := restoreCfg(&stubLLM{}, "model-x", "be helpful")
+	fp := fingerprintFromDefinition(definition)
+
+	orig := buildManifestStream(t, origStore, fp, baselineManifest(), "agent")
+	handOver(t, orig.lease)
+
+	// Wrap the SAME underlying backend for the restore Store so it reads the persisted stream
+	// yet loses its lease after the opening fence + RestoreStarted, before the adoption append.
+	leaser := &leaseCapturingLeaser{inner: backend.Leaser}
+	ledger := &leaseLosingLedger{inner: backend.Ledger, leaser: leaser, loseAfter: 2}
+	wrapped, err := storage.NewComposite(ledger, leaser, backend.KV, backend.Blobs)
+	if err != nil {
+		t.Fatalf("storage.NewComposite: %v", err)
+	}
+	restoreStore, err := sessionstore.Open(wrapped)
+	if err != nil {
+		t.Fatalf("sessionstore.Open(restore): %v", err)
+	}
+
+	candidate := baselineManifest()
+	candidate.ModelID = "model-y" // Info drift → an adoption WOULD be appended
+	s, err := restoreTestSession(context.Background(), definition, orig.sessionID, restoreStore,
+		WithManifest(candidate))
+	if s != nil {
+		t.Fatalf("Restore returned a non-nil Session after the adoption append lost the lease")
+	}
+	var lost *journal.JournalLeaseLostError
+	if !errors.As(err, &lost) {
+		t.Fatalf("Restore err = %v, want a wrapped *journal.JournalLeaseLostError", err)
+	}
+
+	// The session never came up under the unrecorded configuration: no ConfigurationAdopted
+	// and no RestoreDone committed to the durable stream. RestoreStarted DID commit (the lease
+	// was lost only afterwards), proving the adoption is the append the lost lease refused.
+	events := replayAllSessionEvents(t, restoreStore, orig.sessionID)
+	if countAdopted(events) != 0 {
+		t.Errorf("want no committed ConfigurationAdopted after a lost-lease adoption append, got %d", countAdopted(events))
+	}
+	sawStarted := false
+	for _, ev := range events {
+		switch ev.(type) {
+		case event.RestoreStarted:
+			sawStarted = true
+		case event.RestoreDone:
+			t.Error("RestoreDone committed despite the adoption append failing under a lost lease")
+		}
+	}
+	if !sawStarted {
+		t.Error("RestoreStarted was not committed; the lease was lost too early to exercise the adoption append")
 	}
 }
