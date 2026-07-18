@@ -1556,6 +1556,177 @@ versions."
 
 ---
 
+### Task 13: TUI restore decider and drift presentation (sibling module)
+
+**Repo boundary:** this task lands in the `github.com/looprig/tui` module, NOT
+in harness. It depends on Tasks 8–10 being merged and tagged so tui can import
+the `RestoreDecider` seam, `event.DriftAssessment`, and the drift types. If tui
+is not checked out alongside harness, execute this task in a separate session
+against that module after harness Phase 1 is released. Explore the tui module
+first (`grep -rn "RestoreSession\|WithRestoreDecider\|rig\." <tui-root>`) to
+find where the app composes the Rig and where session lifecycle surfaces — the
+exact files below are named by role, confirm them before coding.
+
+**Files (in the tui module):**
+- Create: `<tui>/internal/restore/decider.go` (the `RestoreDecider` impl)
+- Create: `<tui>/internal/restore/driftview.go` (the presentation model)
+- Modify: the Rig composition site — add `rig.WithRestoreDecider(...)`
+- Test: alongside each new file
+
+**Step 1: Write the failing decider test**
+
+```go
+func TestTUIDeciderAcceptsInfoWithoutPrompt(t *testing.T) {
+	// Info-only assessment must NOT block on the UI — auto-accept, Source user,
+	// and surface an informational notice rather than a modal confirm.
+	ui := newFakeUI(t) // records ConfirmDrift/Notify calls; never blocks
+	d := NewDecider(ui)
+	assessment := event.DriftAssessment{Changes: []event.DriftChange{
+		{Category: event.DriftModel, Severity: event.DriftInfo},
+	}}
+	decision, err := d.DecideRestore(context.Background(), assessment)
+	if err != nil || !decision.Accept {
+		t.Fatalf("info drift = (%+v, %v), want auto-accept", decision, err)
+	}
+	if ui.confirmCalls != 0 {
+		t.Errorf("ConfirmDrift called %d times for info-only drift, want 0", ui.confirmCalls)
+	}
+	if ui.notifyCalls != 1 {
+		t.Errorf("Notify called %d times, want 1 (info notice)", ui.notifyCalls)
+	}
+}
+
+func TestTUIDeciderPromptsOnWarn(t *testing.T) {
+	tests := []struct {
+		name       string
+		confirm    bool
+		wantAccept bool
+	}{
+		{name: "user confirms warn", confirm: true, wantAccept: true},
+		{name: "user declines warn", confirm: false, wantAccept: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ui := newFakeUI(t)
+			ui.confirmResult = tt.confirm
+			d := NewDecider(ui)
+			assessment := event.DriftAssessment{Changes: []event.DriftChange{
+				{Category: event.DriftWorkspace, Old: "/a", New: "/b", Severity: event.DriftWarn},
+			}}
+			decision, err := d.DecideRestore(context.Background(), assessment)
+			if err != nil {
+				t.Fatalf("DecideRestore() error = %v", err)
+			}
+			if decision.Accept != tt.wantAccept {
+				t.Errorf("Accept = %v, want %v", decision.Accept, tt.wantAccept)
+			}
+			if tt.wantAccept && decision.Source != event.DecisionSourceUser {
+				t.Errorf("Source = %s, want user", decision.Source)
+			}
+			if ui.confirmCalls != 1 {
+				t.Errorf("ConfirmDrift called %d times, want 1", ui.confirmCalls)
+			}
+		})
+	}
+}
+
+func TestTUIDeciderTimeoutIsRejection(t *testing.T) {
+	// A walked-away-from prompt must not hold the restore lease forever: a
+	// cancelled/expired ctx resolves to a rejection, never a hang.
+	ui := newBlockingUI(t) // ConfirmDrift blocks until ctx is done
+	d := NewDecider(ui)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assessment := event.DriftAssessment{Changes: []event.DriftChange{
+		{Category: event.DriftPermission, Severity: event.DriftWarn},
+	}}
+	decision, err := d.DecideRestore(ctx, assessment)
+	if err == nil && decision.Accept {
+		t.Fatal("cancelled prompt accepted the restore; want rejection or ctx error")
+	}
+}
+```
+
+**Step 2: Run to verify failure**
+
+Run (in the tui module): `go test -race ./internal/restore/ -v`
+Expected: FAIL — `NewDecider` undefined.
+
+**Step 3: Implement**
+
+```go
+// Package restore adapts harness's RestoreDecider seam to the interactive TUI.
+package restore
+
+import (
+	"context"
+
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/session"
+)
+
+// UI is the narrow presentation surface the decider needs. Defining it here
+// (not depending on the whole App) keeps the decider testable with a fake and
+// honors interface-segregation: the decider needs exactly confirm + notify.
+type UI interface {
+	// ConfirmDrift renders the Warn changes and blocks for a user answer,
+	// honoring ctx (a cancelled/expired ctx must return promptly). The returned
+	// note is an optional user-authored message recorded on adoption.
+	ConfirmDrift(ctx context.Context, warns []event.DriftChange) (accept bool, note string, err error)
+	// Notify surfaces accepted informational drift without blocking.
+	Notify(changes []event.DriftChange)
+}
+
+// Decider is the TUI's RestoreDecider: auto-accept + notify on info-only drift,
+// interactive confirm on any Warn, timeout/cancel resolves to rejection.
+type Decider struct{ ui UI }
+
+func NewDecider(ui UI) Decider { return Decider{ui: ui} }
+
+func (d Decider) DecideRestore(ctx context.Context, a event.DriftAssessment) (session.RestoreDecision, error) {
+	warns := make([]event.DriftChange, 0, len(a.Changes))
+	infos := make([]event.DriftChange, 0, len(a.Changes))
+	for _, change := range a.Changes {
+		if change.Severity == event.DriftWarn {
+			warns = append(warns, change)
+		} else {
+			infos = append(infos, change)
+		}
+	}
+	if len(warns) == 0 {
+		if len(infos) > 0 {
+			d.ui.Notify(infos)
+		}
+		return session.RestoreDecision{Accept: true, Source: event.DecisionSourceUser}, nil
+	}
+	accept, note, err := d.ui.ConfirmDrift(ctx, warns)
+	if err != nil {
+		return session.RestoreDecision{}, err
+	}
+	return session.RestoreDecision{Accept: accept, Source: event.DecisionSourceUser, Message: note}, nil
+}
+```
+
+`driftview.go` renders `warns` into the module's existing view idiom (a
+Bubble Tea model or whatever `ConfirmDrift` drives) — categories, old→new
+identities, and a severity marker per row. Follow the module's existing modal
+pattern; do not invent a new rendering stack.
+
+**Step 4: Wire it and run**
+
+At the Rig composition site, add `rig.WithRestoreDecider(restore.NewDecider(app.ui))`.
+Run (in the tui module): `go test -race ./...`
+Expected: PASS.
+
+**Step 5: Commit** (in the tui module)
+
+```bash
+git add internal/restore/ <composition-file>
+git commit -m "feat(restore): interactive TUI decider for configuration drift"
+```
+
+---
+
 ## Deliberately out of scope (do not build)
 
 - The Phase 2 migration framework (`pkg/migration`, `Migrator`, migration
@@ -1564,7 +1735,7 @@ versions."
   in Task 6 keep the event bounded.
 - Tool input/output schema digests if `tool.InvokableTool.Info()` does not
   already expose schemas (Task 7 note) — file a follow-up instead.
-- Interactive deciders for the TUI/serve — they implement `RestoreDecider`
-  downstream; only the seam ships here.
+- The `serve`/headless HTTP decider — it implements `RestoreDecider` the same
+  way Task 13 does for the TUI, but in its own module; not planned here.
 - Removing `ConfigMismatchError`, `checkFingerprint`, or the
   `WithAllowConfigMismatch` option — deprecate, don't delete.
