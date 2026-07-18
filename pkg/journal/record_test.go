@@ -56,7 +56,7 @@ func TestEventRecordIDAndPayload(t *testing.T) {
 				t.Errorf("IdempotencyID() = %q, want %q", got, tt.wantID)
 			}
 			// The wrapped event is recoverable for the serializer's MarshalEvent.
-			if rec.Event() != tt.ev {
+			if !reflect.DeepEqual(rec.Event(), tt.ev) {
 				t.Errorf("Event() did not return the wrapped event")
 			}
 			var _ JournalRecord = rec // EventRecord satisfies the sealed sum.
