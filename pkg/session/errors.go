@@ -72,7 +72,13 @@ func (e *TurnRejectedError) Error() string {
 	}
 }
 
-// Deprecated: superseded by RestoreRejectedError.
+// ConfigMismatchError is the legacy config-drift restore error. For a
+// manifest-carrying session it is superseded by RestoreRejectedError, which
+// carries a typed drift assessment; the legacy fingerprint path (a session with
+// no ConfigManifest configured) still returns it during the deprecation window.
+// Its formal deprecation and removal path is open question 9 in
+// docs/plans/2026-07-16-session-versioning-migration-design.md; it is not marked
+// Deprecated here because internal code still depends on it.
 type ConfigMismatchError struct{ Persisted, Live event.ConfigFingerprint }
 
 func (e *ConfigMismatchError) Error() string {
