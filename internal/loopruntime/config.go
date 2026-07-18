@@ -58,6 +58,9 @@ func resolveMode(bound loop.BoundDefinition, modeName loop.ModeName) (runtimeCon
 		AgentName: bound.Name(), Engine: bound.Engine(), RuntimeContext: bound.RuntimeContext(),
 		Tools: ToolSet{Permission: bound.Permission(), Registry: mode.Tools, Middlewares: bound.Middlewares(), MaxToolIterations: limits.Iterations, MaxToolCallsPerTurn: limits.Calls, MaxParallelToolCalls: limits.Parallel},
 	}
+	if output, configured := bound.OutputSchema(); configured {
+		resolved.Output = cloneOutputSchema(output)
+	}
 	if capability, configured := bound.CounterCapability(); configured {
 		resolved.ContextCounter = bound.ContextCounter()
 		resolved.CounterCapability = capability
@@ -108,6 +111,11 @@ type runtimeConfig struct {
 	// Permission/Registry/Middlewares are left as the composition root set them
 	// (nil is valid).
 	Tools ToolSet
+
+	// Output is the loop-wide final-output policy. It is cloned while resolving
+	// the bound definition and again into each turn so request assembly never
+	// aliases a public accessor or a concurrently changing effective mode.
+	Output *inference.OutputSchema
 
 	// RuntimeContext, when non-nil, yields the volatile per-turn context blocks
 	// (date/cwd/git) the loop appends at the TAIL of each turn's request — AFTER the

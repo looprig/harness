@@ -1,6 +1,7 @@
 package hustle
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,8 +18,10 @@ import (
 )
 
 const (
-	maxPayloadBytes    = 16 * 1024 * 1024
-	reservedNamePrefix = "_looprig."
+	maxPayloadBytes                  = 16 * 1024 * 1024
+	maxOutputSchemaNameBytes         = 64
+	maxStructuredOutputRevisionBytes = 128
+	reservedNamePrefix               = "_looprig."
 )
 
 // Name is the stable registration name of one hustle definition.
@@ -88,6 +91,11 @@ type DefinitionDescriptor struct {
 	NamedModelPolicyRevision string
 	PromptRevision           string
 	PromptSHA256             [sha256.Size]byte
+	OutputSchemaName         string `json:",omitzero"`
+	// OutputSchemaSHA256 covers Description, compact Schema JSON, and Strict.
+	// It is a behavioral digest; no raw output policy crosses this boundary.
+	OutputSchemaSHA256       [sha256.Size]byte `json:",omitzero"`
+	StructuredOutputRevision string            `json:",omitzero"`
 	PolicyRevision           string
 	TimeoutNanos             int64
 	Limits                   Limits
@@ -120,6 +128,9 @@ func (d DefinitionDescriptor) Validate() error {
 	if strings.TrimSpace(d.PolicyRevision) == "" {
 		return &DefinitionError{Kind: DefinitionInvalidPolicyRevision, Field: "policy_revision"}
 	}
+	if err := validateDescriptorOutput(d); err != nil {
+		return err
+	}
 	if d.ModelSource == ModelSourceNamed {
 		if err := d.NamedModelKey.Validate(); err != nil {
 			return &DefinitionError{Kind: DefinitionInvalidModel, Field: "named_model_key", Cause: err}
@@ -135,6 +146,45 @@ func (d DefinitionDescriptor) Validate() error {
 	return nil
 }
 
+func validateDescriptorOutput(descriptor DefinitionDescriptor) error {
+	zeroDigest := [sha256.Size]byte{}
+	hasOutput := descriptor.OutputSchemaName != "" || descriptor.OutputSchemaSHA256 != zeroDigest || descriptor.StructuredOutputRevision != ""
+	if !hasOutput {
+		return nil
+	}
+	if !validOutputSchemaName(descriptor.OutputSchemaName) {
+		return &DefinitionError{Kind: DefinitionInvalidOutputSchema, Field: "output_schema_name"}
+	}
+	if descriptor.OutputSchemaSHA256 == zeroDigest {
+		return &DefinitionError{Kind: DefinitionInvalidOutputSchema, Field: "output_schema_sha256"}
+	}
+	if strings.TrimSpace(descriptor.StructuredOutputRevision) == "" || len(descriptor.StructuredOutputRevision) > maxStructuredOutputRevisionBytes {
+		return &DefinitionError{Kind: DefinitionInvalidOutputSchema, Field: "structured_output_revision"}
+	}
+	return nil
+}
+
+func validOutputSchemaName(name string) bool {
+	if name == "" || len(name) > maxOutputSchemaNameBytes || name == inference.StructuredOutputToolName {
+		return false
+	}
+	for index := range len(name) {
+		value := name[index]
+		letter := value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
+		if index == 0 {
+			if !letter && value != '_' {
+				return false
+			}
+			continue
+		}
+		digit := value >= '0' && value <= '9'
+		if !letter && !digit && value != '_' && value != '-' {
+			return false
+		}
+	}
+	return true
+}
+
 // Option contributes one immutable definition property.
 type Option func(*definitionOptions) error
 
@@ -147,6 +197,7 @@ type definitionState struct {
 	timeout      time.Duration
 	systemPrompt string
 	named        InferenceBinding
+	output       *inference.OutputSchema
 }
 
 type definitionOptions struct {
@@ -159,6 +210,7 @@ type definitionOptions struct {
 	systemPrompt   string
 	promptRevision string
 	policyRevision string
+	output         *inference.OutputSchema
 	seen           map[string]struct{}
 }
 
@@ -260,6 +312,21 @@ func WithPolicyRevision(revision string) Option {
 	}
 }
 
+// WithOutputSchema freezes one optional provider-neutral structured-output
+// policy. The option owns a clone immediately so caller mutations made before
+// Define cannot alter the definition.
+func WithOutputSchema(output inference.OutputSchema) Option {
+	frozen := output.Clone()
+	return func(options *definitionOptions) error {
+		if err := options.singleton("output_schema"); err != nil {
+			return err
+		}
+		clone := frozen.Clone()
+		options.output = &clone
+		return nil
+	}
+}
+
 // Define validates and freezes one text-only hustle definition.
 func Define(opts ...Option) (Definition, error) {
 	resolved := &definitionOptions{seen: make(map[string]struct{})}
@@ -309,6 +376,11 @@ func validateDefinitionOptions(options *definitionOptions) error {
 	}
 	if strings.TrimSpace(options.policyRevision) == "" {
 		return &DefinitionError{Kind: DefinitionInvalidPolicyRevision, Field: "policy_revision"}
+	}
+	if options.output != nil {
+		if err := inference.ValidateOutputSchema(*options.output); err != nil {
+			return &DefinitionError{Kind: DefinitionInvalidOutputSchema, Field: "output_schema", Cause: err}
+		}
 	}
 	return nil
 }
@@ -374,6 +446,18 @@ func freezeDefinition(options *definitionOptions) (Definition, error) {
 		PromptRevision: options.promptRevision, PromptSHA256: sha256.Sum256([]byte(options.systemPrompt)),
 		PolicyRevision: options.policyRevision, TimeoutNanos: int64(options.timeout), Limits: options.limits,
 	}
+	var output *inference.OutputSchema
+	if options.output != nil {
+		clone := options.output.Clone()
+		output = &clone
+		outputDigest, err := digestOutputPolicy(clone)
+		if err != nil {
+			return Definition{}, err
+		}
+		descriptor.OutputSchemaName = clone.Name
+		descriptor.OutputSchemaSHA256 = outputDigest
+		descriptor.StructuredOutputRevision = inference.StructuredOutputRevision
+	}
 	if options.modelSource == ModelSourceNamed {
 		descriptor.NamedModelKey = named.Model.Key()
 		descriptor.NamedModelPolicyRevision = namedRevision
@@ -387,8 +471,34 @@ func freezeDefinition(options *definitionOptions) (Definition, error) {
 	}
 	return Definition{state: &definitionState{
 		descriptor: descriptor, policyDigest: policyDigest, timeout: options.timeout,
-		systemPrompt: options.systemPrompt, named: named,
+		systemPrompt: options.systemPrompt, named: named, output: output,
 	}}, nil
+}
+
+// digestOutputPolicy hashes the deterministic, secret-free identity of every
+// model-facing output-policy field except Name, which is carried separately in
+// the descriptor. Schema JSON is compacted first, so insignificant whitespace
+// cannot create policy drift. Description and Strict are included because both
+// affect provider behavior; only their digest crosses the durable boundary.
+func digestOutputPolicy(output inference.OutputSchema) ([sha256.Size]byte, error) {
+	var compactSchema bytes.Buffer
+	if err := json.Compact(&compactSchema, output.Schema); err != nil {
+		return [sha256.Size]byte{}, &RevisionError{Cause: err}
+	}
+	projection := struct {
+		Description string          `json:"description"`
+		Schema      json.RawMessage `json:"schema"`
+		Strict      bool            `json:"strict"`
+	}{
+		Description: output.Description,
+		Schema:      compactSchema.Bytes(),
+		Strict:      output.Strict,
+	}
+	encoded, err := json.Marshal(projection)
+	if err != nil {
+		return [sha256.Size]byte{}, &RevisionError{Cause: err}
+	}
+	return sha256.Sum256(encoded), nil
 }
 
 func digestModelPolicy(model model.Model) (string, error) {
@@ -480,6 +590,7 @@ type BoundDefinition interface {
 	Descriptor() DefinitionDescriptor
 	ResolveInference(context.Context, uuid.UUID) (InferenceBinding, error)
 	SystemPrompt() string
+	OutputSchema() (*inference.OutputSchema, bool)
 	boundDefinition()
 }
 
@@ -495,6 +606,15 @@ func (b *boundDefinitionState) Limits() Limits                   { return b.defi
 func (b *boundDefinitionState) Descriptor() DefinitionDescriptor { return b.definition.Descriptor() }
 func (b *boundDefinitionState) SystemPrompt() string             { return b.definition.state.systemPrompt }
 func (*boundDefinitionState) boundDefinition()                   {}
+
+// OutputSchema returns a fresh clone of the immutable structured-output policy.
+func (b *boundDefinitionState) OutputSchema() (*inference.OutputSchema, bool) {
+	if b.definition.state.output == nil {
+		return nil, false
+	}
+	clone := b.definition.state.output.Clone()
+	return &clone, true
+}
 
 // ResolveInference returns a fresh model clone. Current-loop definitions call
 // their exact UUID resolver on every invocation and never fall back.

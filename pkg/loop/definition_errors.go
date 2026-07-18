@@ -36,6 +36,8 @@ const (
 	DefinitionInvalidContextObservation  DefinitionErrorKind = "invalid_context_observation"
 	DefinitionInvalidCompaction          DefinitionErrorKind = "invalid_compaction"
 	DefinitionInvalidModeBinding         DefinitionErrorKind = "invalid_mode_binding"
+	DefinitionInvalidOutputSchema        DefinitionErrorKind = "invalid_output_schema"
+	DefinitionReservedToolName           DefinitionErrorKind = "reserved_tool_name"
 )
 
 // DefinitionError reports an invalid immutable definition.

@@ -28,6 +28,7 @@ type Model struct {
 //
 // Rules:
 //   - Name must be non-empty.
+//   - StructuredOutputWithTools requires both Tools and StructuredOutput.
 //   - Known context limits must not contradict the shared context window.
 //   - An empty BaseURL is allowed — it is a wildcard bound by the client at the trust
 //     boundary, not a claim.
@@ -39,6 +40,12 @@ type Model struct {
 func (m Model) Validate() error {
 	if m.Name == "" {
 		return &ValidationError{Field: "Name", Reason: "model name must not be empty"}
+	}
+	if m.Caps.StructuredOutputWithTools && (!m.Caps.Tools || !m.Caps.StructuredOutput) {
+		return &ValidationError{
+			Field:  "Caps.StructuredOutputWithTools",
+			Reason: "requires both Tools and StructuredOutput",
+		}
 	}
 	if err := m.Limits.Validate(); err != nil {
 		return err
@@ -133,6 +140,21 @@ func WithImages() ModelOption { return func(m *Model) { m.Caps.AcceptsImages = t
 
 // WithThinking marks the model as supporting extended thinking.
 func WithThinking() ModelOption { return func(m *Model) { m.Caps.Thinking = true } }
+
+// WithStructuredOutput marks the model as supporting native structured output.
+func WithStructuredOutput() ModelOption {
+	return func(m *Model) { m.Caps.StructuredOutput = true }
+}
+
+// WithStructuredOutputWithTools marks the model as supporting native structured output
+// in requests that also expose tools, including both prerequisite capabilities.
+func WithStructuredOutputWithTools() ModelOption {
+	return func(m *Model) {
+		m.Caps.Tools = true
+		m.Caps.StructuredOutput = true
+		m.Caps.StructuredOutputWithTools = true
+	}
+}
 
 // WithSampling sets the model's default sampling. The argument is deep-copied so
 // the Model never aliases the caller's pointer/slice state.

@@ -1,10 +1,13 @@
 package hustle
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -97,6 +100,20 @@ func validCurrentOptions() []Option {
 	}
 }
 
+func validOutputSchema() inference.OutputSchema {
+	return inference.OutputSchema{
+		Name:        "classifier_result",
+		Description: "SECRET output guidance",
+		Schema: json.RawMessage(`{
+			"type":"object",
+			"properties":{"verdict":{"type":"string","enum":["allow","deny"]}},
+			"required":["verdict"],
+			"additionalProperties":false
+		}`),
+		Strict: true,
+	}
+}
+
 func TestDefineValidDefinitions(t *testing.T) {
 	t.Parallel()
 	client := &testClient{identity: "named"}
@@ -167,6 +184,8 @@ func TestDefineValidation(t *testing.T) {
 		{name: "model source collision", opts: append(validNamedOptions(client, model), WithCurrentLoopModel()), kind: DefinitionDuplicateOption},
 		{name: "duplicate system prompt", opts: append(validNamedOptions(client, model), WithSystemPrompt("other", "prompt-v2")), kind: DefinitionDuplicateOption},
 		{name: "duplicate policy revision", opts: append(validNamedOptions(client, model), WithPolicyRevision("other")), kind: DefinitionDuplicateOption},
+		{name: "duplicate output schema", opts: append(append(validNamedOptions(client, model), WithOutputSchema(validOutputSchema())), WithOutputSchema(validOutputSchema())), kind: DefinitionDuplicateOption},
+		{name: "invalid output schema", opts: append(validNamedOptions(client, model), WithOutputSchema(inference.OutputSchema{Name: "invalid", Schema: json.RawMessage(`{"type":"array"}`)})), kind: DefinitionInvalidOutputSchema},
 		{name: "blank name", opts: replaceOption(validNamedOptions(client, model), 0, WithName(" \t")), kind: DefinitionMissingName},
 		{name: "reserved name", opts: replaceOption(validNamedOptions(client, model), 0, WithName("_looprig.internal")), kind: DefinitionReservedName},
 		{name: "long name accepted", opts: replaceOption(validNamedOptions(client, model), 0, WithName(Name(strings.Repeat("n", 129))))},
@@ -220,6 +239,167 @@ func TestDefineValidation(t *testing.T) {
 				t.Fatalf("Define() error field/cause = (%q,%v), want (%q,nil)", definitionErr.Field, definitionErr.Cause, tt.field)
 			}
 		})
+	}
+}
+
+func TestOutputSchemaOptionIsImmutable(t *testing.T) {
+	t.Parallel()
+	input := validOutputSchema()
+	want := input.Clone()
+	option := WithOutputSchema(input)
+	input.Name = "mutated"
+	input.Description = "mutated"
+	input.Schema[0] = '['
+	input.Strict = false
+
+	definition, err := Define(append(validCurrentOptions(), option)...)
+	if err != nil {
+		t.Fatalf("Define() error = %v", err)
+	}
+	bound, err := definition.Bind(context.Background(), Bindings{Models: &testResolver{}})
+	if err != nil {
+		t.Fatalf("Bind() error = %v", err)
+	}
+	first, ok := bound.OutputSchema()
+	if !ok || first == nil {
+		t.Fatal("OutputSchema() = absent, want configured output")
+	}
+	if first.Name != want.Name || first.Description != want.Description || first.Strict != want.Strict || !bytes.Equal(first.Schema, want.Schema) {
+		t.Fatalf("OutputSchema() = %#v, want frozen %#v", first, want)
+	}
+	first.Name = "accessor-mutated"
+	first.Description = "accessor-mutated"
+	first.Schema[0] = '['
+	first.Strict = false
+	second, ok := bound.OutputSchema()
+	if !ok || second == nil || second.Name != want.Name || second.Description != want.Description || second.Strict != want.Strict || !bytes.Equal(second.Schema, want.Schema) {
+		t.Fatalf("second OutputSchema() = %#v, want independent clone %#v", second, want)
+	}
+
+	other, err := Define(append(validCurrentOptions(), option)...)
+	if err != nil {
+		t.Fatalf("Define(reused option) error = %v", err)
+	}
+	otherBound, err := other.Bind(context.Background(), Bindings{Models: &testResolver{}})
+	if err != nil {
+		t.Fatalf("Bind(reused option) error = %v", err)
+	}
+	third, ok := otherBound.OutputSchema()
+	if !ok || third == nil || !bytes.Equal(third.Schema, want.Schema) {
+		t.Fatalf("reused option OutputSchema() = %#v, want frozen %#v", third, want)
+	}
+}
+
+func TestOutputSchemaAbsentPreservesLegacyIdentity(t *testing.T) {
+	t.Parallel()
+	definition, err := Define(validCurrentOptions()...)
+	if err != nil {
+		t.Fatalf("Define() error = %v", err)
+	}
+	bound, err := definition.Bind(context.Background(), Bindings{Models: &testResolver{}})
+	if err != nil {
+		t.Fatalf("Bind() error = %v", err)
+	}
+	if output, ok := bound.OutputSchema(); ok || output != nil {
+		t.Fatalf("OutputSchema() = (%#v,%v), want (nil,false)", output, ok)
+	}
+	encoded, err := json.Marshal(definition.Descriptor())
+	if err != nil {
+		t.Fatalf("json.Marshal(Descriptor()) error = %v", err)
+	}
+	for _, key := range []string{"OutputSchemaName", "OutputSchemaSHA256", "StructuredOutputRevision"} {
+		if bytes.Contains(encoded, []byte(key)) {
+			t.Fatalf("absent output changed legacy descriptor JSON with %q: %s", key, encoded)
+		}
+	}
+}
+
+func TestOutputSchemaValidationErrorDoesNotRetainSchema(t *testing.T) {
+	t.Parallel()
+	const secret = "raw-schema-secret"
+	output := inference.OutputSchema{
+		Name:   "classifier_result",
+		Schema: json.RawMessage(`{"type":"object","properties":{},"required":[],"additionalProperties":false,"` + secret + `":true}`),
+	}
+	_, err := Define(append(validCurrentOptions(), WithOutputSchema(output))...)
+	var definitionErr *DefinitionError
+	if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionInvalidOutputSchema || definitionErr.Field != "output_schema" {
+		t.Fatalf("Define() error = %T %v, want invalid output schema DefinitionError", err, err)
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(fmt.Sprint(definitionErr.Cause), secret) {
+		t.Fatalf("validation error retained raw schema: %v / %v", err, definitionErr.Cause)
+	}
+}
+
+func TestOutputSchemaDescriptorIdentity(t *testing.T) {
+	t.Parallel()
+	baseOutput := validOutputSchema()
+	define := func(t *testing.T, output inference.OutputSchema) Definition {
+		t.Helper()
+		definition, err := Define(append(validCurrentOptions(), WithOutputSchema(output))...)
+		if err != nil {
+			t.Fatalf("Define() error = %v", err)
+		}
+		return definition
+	}
+	base := define(t, baseOutput)
+	descriptor := base.Descriptor()
+	if descriptor.OutputSchemaName != baseOutput.Name || descriptor.StructuredOutputRevision != inference.StructuredOutputRevision {
+		t.Fatalf("output descriptor identity = (%q,%q), want (%q,%q)", descriptor.OutputSchemaName, descriptor.StructuredOutputRevision, baseOutput.Name, inference.StructuredOutputRevision)
+	}
+	if descriptor.OutputSchemaSHA256 == ([sha256.Size]byte{}) {
+		t.Fatal("OutputSchemaSHA256 is zero")
+	}
+	wantOutputDigest := sha256.Sum256([]byte(`{"description":"SECRET output guidance","schema":{"type":"object","properties":{"verdict":{"type":"string","enum":["allow","deny"]}},"required":["verdict"],"additionalProperties":false},"strict":true}`))
+	if descriptor.OutputSchemaSHA256 != wantOutputDigest {
+		t.Fatalf("OutputSchemaSHA256 = %x, want canonical behavioral digest %x", descriptor.OutputSchemaSHA256, wantOutputDigest)
+	}
+	encoded, err := json.Marshal(descriptor)
+	if err != nil {
+		t.Fatalf("json.Marshal(Descriptor()) error = %v", err)
+	}
+	for _, secret := range []string{string(baseOutput.Schema), baseOutput.Description, "SECRET"} {
+		if bytes.Contains(encoded, []byte(secret)) {
+			t.Fatalf("descriptor leaked output policy %q: %s", secret, encoded)
+		}
+	}
+
+	whitespace := baseOutput.Clone()
+	whitespace.Schema = json.RawMessage(`{"type":"object","properties":{"verdict":{"type":"string","enum":["allow","deny"]}},"required":["verdict"],"additionalProperties":false}`)
+	if got := define(t, whitespace); got.PolicyRevision() != base.PolicyRevision() || got.Descriptor().OutputSchemaSHA256 != descriptor.OutputSchemaSHA256 {
+		t.Fatal("insignificant schema whitespace changed output identity")
+	}
+	changedName := baseOutput.Clone()
+	changedName.Name = "classifier_result_v2"
+	changedSchema := baseOutput.Clone()
+	changedSchema.Schema = json.RawMessage(`{"type":"object","properties":{"verdict":{"type":"boolean"}},"required":["verdict"],"additionalProperties":false}`)
+	changedDescription := baseOutput.Clone()
+	changedDescription.Description = "different guidance"
+	changedStrict := baseOutput.Clone()
+	changedStrict.Strict = false
+	for _, testCase := range []struct {
+		name   string
+		output inference.OutputSchema
+	}{
+		{name: "name", output: changedName},
+		{name: "schema", output: changedSchema},
+		{name: "description", output: changedDescription},
+		{name: "strict", output: changedStrict},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := define(t, testCase.output).PolicyRevision(); got == base.PolicyRevision() {
+				t.Fatalf("PolicyRevision() unchanged: %q", got)
+			}
+		})
+	}
+	revisedDescriptor := descriptor
+	revisedDescriptor.StructuredOutputRevision = "structured-output/v2"
+	revisedDigest, err := digestDescriptorPolicy(revisedDescriptor)
+	if err != nil {
+		t.Fatalf("digestDescriptorPolicy(revised) error = %v", err)
+	}
+	if revisedDigest == base.PolicyRevision() {
+		t.Fatalf("structured output revision drift retained policy revision %q", revisedDigest)
 	}
 }
 
@@ -587,7 +767,7 @@ func assertSecretFreeDescriptor(t *testing.T, definition Definition) {
 			t.Fatalf("descriptor or policy leaked %q: %s / %s", secret, encoded, definition.PolicyRevision())
 		}
 	}
-	wantFields := []string{"Name", "Participation", "ModelSource", "NamedModelKey", "NamedModelPolicyRevision", "PromptRevision", "PromptSHA256", "PolicyRevision", "TimeoutNanos", "Limits"}
+	wantFields := []string{"Name", "Participation", "ModelSource", "NamedModelKey", "NamedModelPolicyRevision", "PromptRevision", "PromptSHA256", "OutputSchemaName", "OutputSchemaSHA256", "StructuredOutputRevision", "PolicyRevision", "TimeoutNanos", "Limits"}
 	typeOf := reflect.TypeOf(descriptor)
 	if typeOf.NumField() != len(wantFields) {
 		t.Fatalf("DefinitionDescriptor has %d fields, want exactly %d", typeOf.NumField(), len(wantFields))

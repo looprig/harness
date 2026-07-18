@@ -14,6 +14,10 @@ import (
 // struct. Exported so provider packages can embed or extend the result before
 // marshaling (e.g. a provider extension adds an encrypted-response public-key field).
 func BuildChatRequest(req inference.Request, stream bool) (ChatRequest, error) {
+	if err := inference.ValidateRequestFeatures(req); err != nil {
+		return ChatRequest{}, err
+	}
+
 	// Effective sampling: a non-nil per-call Override wins over Model.Sampling.
 	sampling := req.Model.Sampling
 	if req.Override != nil {
@@ -57,6 +61,19 @@ func BuildChatRequest(req inference.Request, stream bool) (ChatRequest, error) {
 				Parameters:  t.Schema,
 			},
 		})
+	}
+	if req.Output != nil {
+		cr.ResponseFormat = &responseFormat{
+			Type: responseFormatJSONSchema,
+			JSONSchema: &jsonSchema{
+				Name:   req.Output.Name,
+				Strict: req.Output.Strict,
+				Schema: req.Output.Schema,
+			},
+		}
+	}
+	if req.ToolChoice == inference.ToolChoiceRequired {
+		cr.ToolChoice = toolChoiceRequired
 	}
 
 	return cr, nil

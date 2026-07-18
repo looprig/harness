@@ -10,6 +10,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 // mustUUID mints a UUID for tests or fails the test (crypto/rand should never
@@ -289,4 +290,43 @@ func TestRunStep(t *testing.T) {
 			t.Errorf("raw executable Input = %q, want %q (unsanitized)", string(raw[0].Input), `{not valid json`)
 		}
 	})
+}
+
+func TestRunStepRetainsIndependentTerminalResult(t *testing.T) {
+	t.Parallel()
+
+	sourceUsage := &content.Usage{InputTokens: 3, OutputTokens: 5}
+	client := &scriptedLLM{
+		scripts: [][]content.Chunk{{textChunk(`{"answer":"ok"}`)}},
+		results: []*stream.StreamResult{{
+			Usage:        sourceUsage,
+			Model:        "provider-model",
+			FinishReason: stream.FinishReasonStop,
+		}},
+	}
+	res := runStep(context.Background(), stepConfig{
+		req: inference.Request{Model: testModel()}, client: client, emit: func(event.Event) {},
+	}, 5, newTestStep(t, 0))
+
+	if res.terminal != nil {
+		t.Fatalf("terminal = %v, want nil", res.terminal)
+	}
+	if res.streamResult == nil {
+		t.Fatal("streamResult = nil, want authoritative terminal metadata")
+	}
+	if res.streamResult.Model != "provider-model" || res.streamResult.FinishReason != stream.FinishReasonStop {
+		t.Fatalf("streamResult = %#v, want provider-model/stop", res.streamResult)
+	}
+	ai := res.state.msgs[0].(*content.AIMessage)
+	if res.streamResult.Usage == nil || ai.Usage == nil {
+		t.Fatalf("usage missing: result=%v message=%v", res.streamResult.Usage, ai.Usage)
+	}
+	if res.streamResult.Usage == sourceUsage || ai.Usage == sourceUsage || ai.Usage == res.streamResult.Usage {
+		t.Fatal("terminal, message, and producer usage pointers must be independently owned")
+	}
+	sourceUsage.InputTokens = 99
+	res.streamResult.Usage.OutputTokens = 77
+	if ai.Usage.InputTokens != 3 || ai.Usage.OutputTokens != 5 {
+		t.Fatalf("message usage aliased terminal sources: %+v", *ai.Usage)
+	}
 }

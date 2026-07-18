@@ -13,6 +13,9 @@ import (
 const (
 	roleUser  = "user"
 	roleModel = "model"
+
+	responseMIMETypeJSON   = "application/json"
+	functionCallingModeAny = "ANY"
 )
 
 // GenerateContentRequest is the Gemini generateContent / streamGenerateContent
@@ -25,6 +28,7 @@ type GenerateContentRequest struct {
 	Contents          []geminiContent   `json:"contents"`
 	SystemInstruction *geminiContent    `json:"systemInstruction,omitempty"`
 	Tools             []geminiTool      `json:"tools,omitempty"`
+	ToolConfig        *toolConfig       `json:"toolConfig,omitempty"`
 	GenerationConfig  *generationConfig `json:"generationConfig,omitempty"`
 }
 
@@ -102,11 +106,21 @@ type functionDeclaration struct {
 // Field names are camelCase per the Gemini wire (topP, maxOutputTokens,
 // stopSequences), unlike the OpenAI snake_case dialect.
 type generationConfig struct {
-	Temperature     *float64        `json:"temperature,omitempty"`
-	TopP            *float64        `json:"topP,omitempty"`
-	MaxOutputTokens *int            `json:"maxOutputTokens,omitempty"`
-	StopSequences   []string        `json:"stopSequences,omitempty"`
-	ThinkingConfig  *thinkingConfig `json:"thinkingConfig,omitempty"`
+	Temperature        *float64        `json:"temperature,omitempty"`
+	TopP               *float64        `json:"topP,omitempty"`
+	MaxOutputTokens    *int            `json:"maxOutputTokens,omitempty"`
+	StopSequences      []string        `json:"stopSequences,omitempty"`
+	ThinkingConfig     *thinkingConfig `json:"thinkingConfig,omitempty"`
+	ResponseMIMEType   string          `json:"responseMimeType,omitempty"`
+	ResponseJSONSchema json.RawMessage `json:"responseJsonSchema,omitempty"`
+}
+
+type toolConfig struct {
+	FunctionCallingConfig *functionCallingConfig `json:"functionCallingConfig,omitempty"`
+}
+
+type functionCallingConfig struct {
+	Mode string `json:"mode"`
 }
 
 // thinkingConfig controls Gemini 2.5+ extended thinking. ThinkingBudget is a

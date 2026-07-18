@@ -16,6 +16,9 @@ import (
 // Request.System becomes the top-level `system` field; any SystemMessage in the
 // thread is folded into it (Anthropic has no in-thread system role).
 func EncodeRequest(req inference.Request, stream bool) ([]byte, error) {
+	if err := inference.ValidateRequestFeatures(req); err != nil {
+		return nil, err
+	}
 	r, err := buildMessagesRequest(req, stream)
 	if err != nil {
 		return nil, err
@@ -82,6 +85,9 @@ func buildMessagesRequest(req inference.Request, stream bool) (messagesRequest, 
 			InputSchema: schemaOrDefault(t.Schema),
 		})
 	}
+	if req.ToolChoice == inference.ToolChoiceRequired {
+		r.ToolChoice = &toolChoice{Type: toolChoiceAny}
+	}
 
 	// effort → thinking, gated by the model's advertised Thinking capability. A
 	// non-none Effort enables adaptive thinking and maps the level to
@@ -92,6 +98,15 @@ func buildMessagesRequest(req inference.Request, stream bool) (messagesRequest, 
 			r.Thinking = &thinkingConfig{Type: thinkingTypeAdaptive}
 			r.OutputConfig = &outputConfig{Effort: ev}
 			thinkingEnabled = true
+		}
+	}
+	if req.Output != nil {
+		if r.OutputConfig == nil {
+			r.OutputConfig = &outputConfig{}
+		}
+		r.OutputConfig.Format = &outputFormat{
+			Type:   outputFormatJSONSchema,
+			Schema: req.Output.Schema,
 		}
 	}
 

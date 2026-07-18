@@ -1218,6 +1218,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			model:                   state.effective.model,
 			system:                  state.effective.system,
 			tools:                   state.effective.tools,
+			output:                  cloneOutputSchema(config.Output),
 			client:                  config.Client,
 			gateReg:                 gateReg,
 			idGen:                   config.idGen,

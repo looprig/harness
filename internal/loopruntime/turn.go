@@ -94,6 +94,7 @@ type turnConfig struct {
 	model   model.Model
 	system  string
 	tools   ToolSet
+	output  *inference.OutputSchema
 	client  inference.Client
 	gateReg chan<- gateRegistration
 	idGen   idGenerator
@@ -220,6 +221,10 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 	}
 	identity := turnIdentity{sessionID: ts.sessionID, loopID: ts.loopID, turnID: ts.id}
 	defs := toolDefs(ctx, cfg.tools.Registry)
+	outputPlan, err := resolveTurnOutput(cfg.model, cfg.output, defs)
+	if err != nil {
+		return event.TurnFailed{TurnIndex: ts.index, Err: err}
+	}
 
 	// Consult the runtime-context provider ONCE per turn, here on the turn goroutine
 	// (never the actor — the provider may run git, which must not stall the serialized
@@ -240,7 +245,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// model sees fresh date/cwd/git at the very end of the input every step. The
 		// tail is transient: it is part of the REQUEST only, never of ts.msgs/base, so
 		// committed history never grows with it and the cached System prompt is untouched.
-		req := turnInferenceRequest(cfg, ts, runtimeTail, defs)
+		req := turnInferenceRequest(cfg, ts, runtimeTail, outputPlan)
 		if candidateMeasured {
 			candidateMeasured = false
 		} else {
@@ -251,7 +256,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 				if cfg.afterContextReplacement != nil {
 					cfg.afterContextReplacement()
 				}
-				req = turnInferenceRequest(cfg, ts, runtimeTail, defs)
+				req = turnInferenceRequest(cfg, ts, runtimeTail, outputPlan)
 			}
 		}
 
@@ -280,6 +285,18 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// runStep owns the LLM cycle: stream → exactly one AIMessage into st.msgs[0].
 		res := runStepWithAdmission(ctx, stepConfig{req: req, client: cfg.client, emit: cfg.emit}, ts.index, st, releaseAdmission)
 		if res.terminal != nil {
+			// A clean native stream with no semantic blocks is still an output-stage
+			// result: finish metadata takes precedence (length/filter/tool_use), while
+			// stop/unknown are classified by the shared extractor as empty structured
+			// output. Legacy turns retain their historical EmptyResponseError.
+			if outputPlan.strategy == outputStrategyNative && res.streamResult != nil {
+				empty := res.state.blocks.AIMessage()
+				empty.Usage = cloneUsage(res.streamResult.Usage)
+				_, _, outputErr := validateNativeStep(empty, res.state.blocks.ToolUses(), res.streamResult)
+				if outputErr != nil {
+					return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
+				}
+			}
 			// The in-flight step never completed: discard it (it was never added to
 			// ts.msgs and never committed) and return the terminal. Committed steps
 			// stay in loopState.msgs.
@@ -287,14 +304,48 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		}
 		st = res.state
 		aiMsg := st.msgs[0].(*content.AIMessage)
+
+		// Raw executable tool-use view (unsanitized Input) for this step. Native
+		// structured output validates finish metadata and the final representation
+		// here, before usage accounting, staged-message append, tool execution,
+		// StepDone commit, candidate measurement, or TurnDone publication. This is
+		// the current-step atomicity boundary: a rejected final leaves prior commits
+		// intact but makes the staged invalid step wholly unobservable.
+		toolUses := st.blocks.ToolUses()
+		switch outputPlan.strategy {
+		case outputStrategyNative:
+			canonical, final, outputErr := validateNativeStep(aiMsg, toolUses, res.streamResult)
+			if outputErr != nil {
+				return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
+			}
+			if final {
+				aiMsg = canonical
+				st.msgs[0] = canonical
+				toolUses = nil
+			}
+		case outputStrategyTerminalTool:
+			// runStep sanitizes malformed tool input in the storable AIMessage so
+			// ordinary continuations can always be encoded. Terminal validation must
+			// instead inspect the raw accumulator view; otherwise malformed control
+			// arguments rewritten to {} could be accepted as a final result.
+			rawMessage := st.blocks.AIMessage()
+			rawMessage.Usage = cloneUsage(aiMsg.Usage)
+			canonical, final, outputErr := validateTerminalStep(rawMessage, toolUses, res.streamResult)
+			if outputErr != nil {
+				return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
+			}
+			if final {
+				aiMsg = canonical
+				st.msgs[0] = canonical
+				toolUses = nil
+			}
+		}
+
 		turnUsage, usageErr := addTurnUsage(ts.usage, aiMsg.Usage)
 		if usageErr != nil {
 			return event.TurnFailed{TurnIndex: ts.index, Err: usageErr}
 		}
 		ts.usage = turnUsage
-
-		// Raw executable tool-use view (unsanitized Input) for this step.
-		toolUses := st.blocks.ToolUses()
 
 		// Text-only completion ALWAYS wins, regardless of iteration count: the runaway
 		// cap is only checked when the model wants ANOTHER tool batch. The step's group
@@ -306,7 +357,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 				// actor committed/emitted this final step: treat as interrupt.
 				return event.TurnInterrupted{TurnIndex: ts.index}
 			}
-			candidate := turnInferenceRequest(cfg, ts, runtimeTail, defs)
+			candidate := turnInferenceRequest(cfg, ts, runtimeTail, outputPlan)
 			if _, measureErr := measureTurnCandidate(ctx, cfg, candidate, runtimeRevision, runtimeTail, false); measureErr != nil {
 				return measureTurnFailure(ctx, ts.index, measureErr)
 			}
@@ -366,7 +417,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			// already committed stay in loopState.msgs.
 			return event.TurnInterrupted{TurnIndex: ts.index}
 		}
-		candidate := turnInferenceRequest(cfg, ts, runtimeTail, defs)
+		candidate := turnInferenceRequest(cfg, ts, runtimeTail, outputPlan)
 		directive, measureErr := measureTurnCandidate(ctx, cfg, candidate, runtimeRevision, runtimeTail, true)
 		if measureErr != nil {
 			return measureTurnFailure(ctx, ts.index, measureErr)
@@ -398,11 +449,11 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 	}
 }
 
-func turnInferenceRequest(cfg turnConfig, state turnState, runtimeTail *content.UserMessage, definitions []inference.Tool) inference.Request {
-	return inference.Request{
-		Model: cfg.model, System: cfg.system,
-		Messages: requestMessages(cfg.base, state.msgs, runtimeTail), Tools: definitions,
-	}
+func turnInferenceRequest(cfg turnConfig, state turnState, runtimeTail *content.UserMessage, output turnOutputPlan) inference.Request {
+	return output.apply(inference.Request{
+		Model: cfg.model.Clone(), System: cfg.system,
+		Messages: requestMessages(cfg.base, state.msgs, runtimeTail),
+	})
 }
 
 func measureTurnCandidate(
@@ -416,7 +467,7 @@ func measureTurnCandidate(
 	if config.measure == nil {
 		return nil, nil
 	}
-	err := config.measure(ctx, request, runtimeRevision, runtimeTail, continuation)
+	err := config.measure(ctx, cloneInferenceRequest(request), runtimeRevision, cloneUserMessage(runtimeTail), continuation)
 	var directive *contextReplacementDirective
 	if errors.As(err, &directive) {
 		return directive, nil

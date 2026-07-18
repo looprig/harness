@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/inference"
+	"github.com/looprig/inference/stream"
 )
 
 const runtimeFuzzInputLimit = 64
@@ -90,7 +92,10 @@ func FuzzProviderOutputBoundary(f *testing.F) {
 		{shape: 3, role: string(content.RoleAssistant)},
 		{shape: 4, role: string(content.RoleAssistant)},
 		{shape: 5, role: string(content.RoleAssistant)},
+		{shape: 5, role: string(content.RoleAssistant), output: []byte(`{"ok":true}`), limit: 10},
+		{shape: 5, role: string(content.RoleAssistant), output: []byte(`{"ok":true}`), limit: 11},
 		{shape: 6, role: string(content.RoleAssistant), output: []byte(`{"ok":true}`), limit: 11, outputTokens: 2, reasoningTokens: 1},
+		{shape: 6, role: string(content.RoleAssistant), output: []byte(`     {}     `), limit: 2},
 		{shape: 6, role: string(content.RoleAssistant), output: []byte(`{} {}`), limit: 64},
 		{shape: 7, role: string(content.RoleAssistant), output: []byte(`{}`), limit: 64},
 		{shape: 8, role: string(content.RoleAssistant)},
@@ -119,10 +124,18 @@ func FuzzProviderOutputBoundary(f *testing.F) {
 			if !errors.As(err, &outputErr) {
 				t.Fatalf("extractResult error = %T %v, want OutputError", err, err)
 			}
-			return
-		}
-		if len(result.Output) == 0 || len(result.Output) > int(limit) || !json.Valid(result.Output) {
+		} else if len(result.Output) == 0 || len(result.Output) > int(limit) || !json.Valid(result.Output) {
 			t.Fatalf("accepted output = %q limit=%d, want one nonempty bounded JSON value", result.Output, limit)
+		}
+
+		structured, structuredErr := extractStructuredResult(response, usage, int(limit))
+		if structuredErr != nil {
+			var outputErr *OutputError
+			if !errors.As(structuredErr, &outputErr) || !outputErr.Valid() {
+				t.Fatalf("extractStructuredResult error = %T %v, want valid OutputError", structuredErr, structuredErr)
+			}
+		} else if rawLength, valid := runtimeFuzzSemanticTextLength(response.Message); !valid || rawLength > int(limit) || len(structured.Output) == 0 || !json.Valid(structured.Output) || structured.Output[0] != '{' {
+			t.Fatalf("accepted structured output = %q limit=%d, want one bounded JSON object", structured.Output, limit)
 		}
 	})
 }
@@ -151,7 +164,7 @@ func runtimeFuzzDefinition(t testing.TB, name hustle.Name, limits hustle.Limits)
 func runtimeFuzzResponse(shape uint8, role content.Role, output string, outputTokens uint16, reasoningTokens uint16) *inference.Response {
 	usage := &content.Usage{OutputTokens: content.TokenCount(outputTokens), ReasoningTokens: content.TokenCount(reasoningTokens)}
 	message := &content.AIMessage{Message: content.Message{Role: role}}
-	response := &inference.Response{Message: message, Usage: usage}
+	response := &inference.Response{Message: message, Usage: usage, FinishReason: runtimeFuzzFinish(shape)}
 	if shape&0x80 != 0 {
 		response.Usage = nil
 	}
@@ -168,7 +181,8 @@ func runtimeFuzzResponse(shape uint8, role content.Role, output string, outputTo
 		var block *content.TextBlock
 		message.Blocks = []content.Block{block}
 	case 5:
-		message.Blocks = []content.Block{&content.TextBlock{Text: output}, &content.TextBlock{Text: output}}
+		middle := len(output) / 2
+		message.Blocks = []content.Block{&content.TextBlock{Text: output[:middle]}, &content.TextBlock{Text: output[middle:]}}
 	case 6:
 		message.Blocks = []content.Block{&content.TextBlock{Text: output}}
 	case 7:
@@ -197,4 +211,46 @@ func runtimeFuzzResponse(shape uint8, role content.Role, output string, outputTo
 		message.Blocks = []content.Block{block}
 	}
 	return response
+}
+
+func runtimeFuzzSemanticTextLength(message *content.AIMessage) (int, bool) {
+	if message == nil || message.Role != content.RoleAssistant {
+		return 0, false
+	}
+	total := 0
+	textSeen := false
+	for _, block := range message.Blocks {
+		switch typed := block.(type) {
+		case *content.TextBlock:
+			if typed == nil || len(typed.Text) > math.MaxInt-total {
+				return 0, false
+			}
+			total += len(typed.Text)
+			textSeen = true
+		case *content.ThinkingBlock:
+			if typed == nil {
+				return 0, false
+			}
+		default:
+			return 0, false
+		}
+	}
+	return total, textSeen
+}
+
+func runtimeFuzzFinish(shape uint8) stream.FinishReason {
+	switch shape / 17 % 6 {
+	case 0:
+		return stream.FinishReasonUnknown
+	case 1:
+		return stream.FinishReasonStop
+	case 2:
+		return stream.FinishReasonLength
+	case 3:
+		return stream.FinishReasonContentFilter
+	case 4:
+		return stream.FinishReasonToolUse
+	default:
+		return stream.FinishReason("future")
+	}
 }
