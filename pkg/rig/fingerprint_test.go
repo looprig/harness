@@ -467,6 +467,45 @@ func TestFrozenFingerprintUsesProducedToolNamesWithoutBinding(t *testing.T) {
 	}
 }
 
+// TestFrozenManifestAppFieldsIsolated proves the frozen manifest OWNS its AppFields map: a
+// caller mutating the original map after freezing must not change the manifest's fields or
+// its Fingerprint (the manifest is embedded in SessionStarted and read during restore, so an
+// alias would corrupt stored fingerprints and can data-race the restore reader). It also
+// proves nil-ness is preserved: a nil input AppFields yields a nil manifest AppFields (not an
+// empty map), which keeps reflect.DeepEqual and omitzero round-trip equality intact.
+func TestFrozenManifestAppFieldsIsolated(t *testing.T) {
+	t.Parallel()
+
+	definition := fpConfig("model", "be helpful", "Read")
+
+	// Non-nil AppFields: freeze, then mutate the ORIGINAL and assert the manifest is unmoved.
+	original := map[string]string{"team": "core", "tier": "gold"}
+	fields := ConfigFingerprintFields{AppFields: original}
+	manifest := frozenManifest(fields, []loop.Definition{definition}, []string{"agent"}, "agent")
+	frozenPrint := manifest.Fingerprint()
+
+	original["tier"] = "bronze" // mutate an existing key
+	original["team"] = "rogue"  // mutate another existing key
+	original["extra"] = "new"   // add a key
+	delete(original, "extra")   // and remove it again
+
+	if manifest.AppFields["tier"] != "gold" || manifest.AppFields["team"] != "core" {
+		t.Fatalf("manifest AppFields aliased caller map: got %v, want {team:core tier:gold}", manifest.AppFields)
+	}
+	if len(manifest.AppFields) != 2 {
+		t.Fatalf("manifest AppFields len = %d, want 2 (owned copy unaffected by caller mutation)", len(manifest.AppFields))
+	}
+	if got := manifest.Fingerprint(); got != frozenPrint {
+		t.Fatalf("Fingerprint changed after caller mutated its map: got %q, want %q", got, frozenPrint)
+	}
+
+	// Nil AppFields must stay nil (never become an empty map).
+	nilManifest := frozenManifest(ConfigFingerprintFields{AppFields: nil}, []loop.Definition{definition}, []string{"agent"}, "agent")
+	if nilManifest.AppFields != nil {
+		t.Fatalf("nil input AppFields produced non-nil manifest AppFields %v, want nil (nil-ness preserved)", nilManifest.AppFields)
+	}
+}
+
 func TestFrozenFingerprintNormalizesProducedToolNames(t *testing.T) {
 	t.Parallel()
 

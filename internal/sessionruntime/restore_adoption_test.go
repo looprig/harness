@@ -156,11 +156,25 @@ func firstIndexOf(events []event.Event, want event.Event) int {
 	return -1
 }
 
-// errDecider is a RestoreDecider that always fails, proving a decider error rejects.
+// errDeciderSentinel is the fixed error errDecider returns, so a test can assert it is
+// reachable through RestoreRejectedError.Unwrap via errors.Is/errors.As.
+var errDeciderSentinel = errors.New("decider boom")
+
+// errDecider is a RestoreDecider that always fails, proving a decider error fails secure
+// AS a classifiable rejection carrying the assessment and wrapping the cause.
 type errDecider struct{}
 
 func (errDecider) DecideRestore(context.Context, event.DriftAssessment) (RestoreDecision, error) {
-	return RestoreDecision{}, errors.New("decider boom")
+	return RestoreDecision{}, errDeciderSentinel
+}
+
+// migrationSourceDecider ACCEPTS but stamps the reserved `migration` source — which only
+// Harness may use. The constructor must normalize it to policy rather than write a false
+// migration adoption.
+type migrationSourceDecider struct{}
+
+func (migrationSourceDecider) DecideRestore(context.Context, event.DriftAssessment) (RestoreDecision, error) {
+	return RestoreDecision{Accept: true, Source: event.DecisionSourceMigration}, nil
 }
 
 // emptySourceDecider accepts with an INVALID (empty) Source and over-long Message/Actor
@@ -416,8 +430,10 @@ func TestRestoreShimAcceptsWarn(t *testing.T) {
 	}
 }
 
-// TestRestoreDeciderErrorRejects: a decider returning a non-nil error fails the restore,
-// records a RestoreErrored, and appends no adoption.
+// TestRestoreDeciderErrorRejects: a decider returning a non-nil error fails the restore
+// SECURE — records a RestoreErrored, appends no adoption — while staying classifiable: the
+// returned error errors.As to *RestoreRejectedError (carrying the assessment), and the
+// underlying decider error is reachable via Unwrap (errors.Is/errors.As).
 func TestRestoreDeciderErrorRejects(t *testing.T) {
 	store := newRestoreStore(t)
 	definition := restoreCfg(&stubLLM{}, "model-x", "be helpful")
@@ -437,6 +453,19 @@ func TestRestoreDeciderErrorRejects(t *testing.T) {
 		t.Fatal("Restore err = nil, want a decider error")
 	}
 
+	// The decider error fails secure AS a classifiable rejection carrying the assessment.
+	var rejected *RestoreRejectedError
+	if !errors.As(err, &rejected) {
+		t.Fatalf("Restore err = %v, want *RestoreRejectedError", err)
+	}
+	if len(rejected.Assessment.Changes) == 0 {
+		t.Errorf("RestoreRejectedError carries no assessment changes, want the Info drift folded in")
+	}
+	// The underlying decider error stays reachable through Unwrap.
+	if !errors.Is(err, errDeciderSentinel) {
+		t.Errorf("errors.Is(err, errDeciderSentinel) = false, want the cause reachable via Unwrap")
+	}
+
 	events := replayAllSessionEvents(t, store, orig.sessionID)
 	if countAdopted(events) != 0 {
 		t.Errorf("want no ConfigurationAdopted after a decider error, got %d", countAdopted(events))
@@ -444,6 +473,36 @@ func TestRestoreDeciderErrorRejects(t *testing.T) {
 	tail := restoreEventTail(t, store, orig.sessionID, orig.rootLoopID)
 	if !lastIs(tail, event.RestoreErrored{}) {
 		t.Errorf("restore-event tail does not end with RestoreErrored: %v", tailTypes(tail))
+	}
+}
+
+// TestRestoreMigrationSourceNormalizedToPolicy: a custom decider that ACCEPTS but stamps the
+// reserved `migration` source must not produce a false migration adoption. The restore
+// SUCCEEDS and the durable ConfigurationAdopted carries Source==policy (migration is reserved
+// for Harness itself).
+func TestRestoreMigrationSourceNormalizedToPolicy(t *testing.T) {
+	store := newRestoreStore(t)
+	definition := restoreCfg(&stubLLM{}, "model-x", "be helpful")
+	fp := fingerprintFromDefinition(definition)
+
+	orig := buildManifestStream(t, store, fp, baselineManifest(), "agent")
+	handOver(t, orig.lease)
+
+	candidate := baselineManifest()
+	candidate.ModelID = "model-y" // Info drift so the decider is consulted and an adoption is written
+	s, err := restoreTestSession(context.Background(), definition, orig.sessionID, store,
+		WithManifest(candidate), WithRestoreDecider(migrationSourceDecider{}))
+	if err != nil {
+		t.Fatalf("Restore (migration source) err = %v, want success (migration normalized to policy)", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	adopted := findAdopted(t, replayAllSessionEvents(t, store, orig.sessionID))
+	if adopted.Source != event.DecisionSourcePolicy {
+		t.Errorf("adopted.Source = %q, want %q (reserved migration source normalized to policy)", adopted.Source, event.DecisionSourcePolicy)
+	}
+	if adopted.Source == event.DecisionSourceMigration {
+		t.Errorf("adopted.Source = migration, want it NEVER stamped by a decider")
 	}
 }
 

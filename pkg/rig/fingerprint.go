@@ -159,6 +159,19 @@ func frozenManifest(fields ConfigFingerprintFields, definitions []loop.Definitio
 		// both the live and restore paths; empty for now (names-only parity).
 		tools[index] = event.ToolManifestEntry{Name: name}
 	}
+	// Own the AppFields map: the manifest is embedded in SessionStarted and read during
+	// restore, so it must not alias the caller's map (a later mutation would change stored
+	// fingerprints and can data-race the restore reader). Preserve nil-ness — a nil input
+	// stays nil, never an empty map: reflect.DeepEqual(nil, empty) is false and the
+	// `omitzero` JSON tag serializes nil as absent but empty as `{}`, so allocating an empty
+	// map where nil was expected would break round-trip/DeepEqual equality.
+	var appFields map[string]string
+	if fields.AppFields != nil {
+		appFields = make(map[string]string, len(fields.AppFields))
+		for k, v := range fields.AppFields {
+			appFields[k] = v
+		}
+	}
 	return event.ConfigManifest{
 		SchemaVersion:             event.ManifestSchemaVersion,
 		AgentKind:                 fields.AgentKind,
@@ -176,7 +189,7 @@ func frozenManifest(fields ConfigFingerprintFields, definitions []loop.Definitio
 		ConfinementRev:            fields.ConfinementRev,
 		ConfinementStrictness:     fields.ConfinementStrictness,
 		ExternalCapabilityRev:     fields.ExternalCapabilityRev,
-		AppFields:                 fields.AppFields,
+		AppFields:                 appFields,
 	}
 }
 

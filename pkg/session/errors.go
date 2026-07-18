@@ -130,10 +130,15 @@ func configValueChange(field, persisted, live string) string {
 
 // RestoreRejectedError reports a restore refused by the configured RestoreDecider
 // (or by default policy). It carries the full typed assessment so callers and
-// operators see exactly which fields drifted and how severely.
+// operators see exactly which fields drifted and how severely. Cause is set only
+// when the rejection was caused by the decider ITSELF failing (a returned error or
+// a timeout — a timeout is a rejection): it stays inspectable via Unwrap so callers
+// can errors.As/errors.Is through to the underlying cause (e.g.
+// context.DeadlineExceeded). A plain policy rejection leaves Cause nil.
 type RestoreRejectedError struct {
 	Assessment event.DriftAssessment
 	Source     event.DecisionSource
+	Cause      error
 }
 
 func (e *RestoreRejectedError) Error() string {
@@ -157,8 +162,15 @@ func (e *RestoreRejectedError) Error() string {
 		msg += " (" + strings.Join(warnCategories, ", ") + ")"
 	}
 	msg += "; " + strconv.Itoa(infoCount) + " info " + pluralize("change", "changes", infoCount)
+	if e.Cause != nil {
+		msg += ": " + e.Cause.Error()
+	}
 	return msg
 }
+
+// Unwrap exposes the underlying decider failure (nil for a plain policy rejection)
+// so errors.As/errors.Is reach it.
+func (e *RestoreRejectedError) Unwrap() error { return e.Cause }
 
 func pluralize(singular, plural string, n int) string {
 	if n == 1 {

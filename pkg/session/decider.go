@@ -9,15 +9,18 @@ import (
 // RestoreDecision is an application's answer to a drift assessment. Source,
 // Actor, and Message are recorded durably on the resulting ConfigurationAdopted.
 //
-// Contract for an ACCEPTING decision (Accept == true): it must carry a valid
-// Source (user | policy | operator — never migration). An empty Source is treated
-// as policy. Actor and Message are BOUNDED audit fields: the restore constructor
-// truncates them (to MaxConfigActorLen / MaxConfigMessageLen bytes) before writing
-// the durable adoption, so an over-long value is silently shortened rather than
-// bricking the restore — never rely on their full length surviving.
+// Contract for an ACCEPTING decision (Accept == true): the valid decider Sources
+// are user | policy | operator. `migration` is RESERVED for Harness itself (a
+// Phase-2 migration) and must never be stamped by a decider. An empty OR migration
+// Source on accept is normalized to policy by the restore constructor, so a decider
+// can neither omit a source nor forge a migration adoption. Actor and Message are
+// BOUNDED audit fields: the restore constructor truncates them (to MaxConfigActorLen
+// / MaxConfigMessageLen bytes) before writing the durable adoption, so an over-long
+// value is silently shortened rather than bricking the restore — never rely on their
+// full length surviving.
 type RestoreDecision struct {
 	Accept  bool
-	Source  event.DecisionSource // user | policy | operator (never migration)
+	Source  event.DecisionSource // user | policy | operator (migration reserved for Harness)
 	Actor   string
 	Message string
 }

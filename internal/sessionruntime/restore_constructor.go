@@ -2,7 +2,6 @@ package sessionruntime
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/looprig/core/uuid"
@@ -303,7 +302,13 @@ func restoreTopologySession(
 		}
 		dec, derr := probe.restoreDecider.DecideRestore(ctx, assessment)
 		if derr != nil {
-			return recordErrored(fmt.Errorf("sessionruntime: restore decider: %w", derr))
+			// A decider FAILURE (a returned error or a timeout — a timeout is a rejection)
+			// fails secure AS a rejection, but stays classifiable: RestoreRejectedError
+			// carries the assessment and wraps the cause (Unwrap), so a caller keeps the
+			// structured drift AND can errors.As/errors.Is through to the underlying error
+			// (e.g. context.DeadlineExceeded). Source is left zero — Error() defaults it to
+			// "policy".
+			return recordErrored(&RestoreRejectedError{Assessment: assessment, Cause: derr})
 		}
 		if !dec.Accept {
 			return recordErrored(&RestoreRejectedError{Assessment: assessment, Source: dec.Source})
@@ -314,8 +319,10 @@ func restoreTopologySession(
 		// omitted a Source is, by default, a policy decision; an over-long Message/Actor is
 		// TRUNCATED, never rejected — a long audit note must not make the session
 		// unrestorable. Only the accept path builds a durable event; a reject uses dec solely
-		// for RestoreRejectedError.
-		if !dec.Source.Valid() {
+		// for RestoreRejectedError. A decider-supplied `migration` source is ALSO normalized to
+		// policy: DecisionSourceMigration is Valid() but reserved for Harness itself (a Phase-2
+		// migration) — a RestoreDecider must never stamp a false migration adoption.
+		if !dec.Source.Valid() || dec.Source == event.DecisionSourceMigration {
 			dec.Source = event.DecisionSourcePolicy
 		}
 		if len(dec.Message) > event.MaxConfigMessageLen {
