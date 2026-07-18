@@ -472,6 +472,62 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 	}
 }
 
+// marshalTestEventEnvelope marshals a simple, already-tested Enduring event
+// (SessionStarted) to its durable wire envelope, so the schema-version test can
+// mutate the "v" key and re-decode.
+func marshalTestEventEnvelope(t *testing.T) []byte {
+	t.Helper()
+	data, err := MarshalEvent(SessionStarted{Header: fullHeaderSession()})
+	if err != nil {
+		t.Fatalf("MarshalEvent(SessionStarted) error = %v", err)
+	}
+	return data
+}
+
+func TestUnmarshalEventSchemaVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(map[string]json.RawMessage)
+		wantErr bool
+	}{
+		{name: "current version decodes", mutate: func(map[string]json.RawMessage) {}},
+		{name: "missing v decodes as version 1", mutate: func(env map[string]json.RawMessage) {
+			delete(env, "v")
+		}},
+		{name: "future version fails typed", mutate: func(env map[string]json.RawMessage) {
+			env["v"] = json.RawMessage(`2`)
+		}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			raw := marshalTestEventEnvelope(t)
+			var envelope map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			tt.mutate(envelope)
+			mutated, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = UnmarshalEvent(mutated)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("UnmarshalEvent() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				var unsupported *UnsupportedSchemaError
+				if !errors.As(err, &unsupported) {
+					t.Fatalf("error type = %T, want *UnsupportedSchemaError", err)
+				}
+				if unsupported.Version != 2 {
+					t.Errorf("Version = %d, want 2", unsupported.Version)
+				}
+			}
+		})
+	}
+}
+
 // TestMarshalWorkspaceCheckpointedWire proves the WorkspaceCheckpointed envelope
 // carries the stable "type" discriminator (== its classify name) and the "ref"
 // payload key with the opaque ref value verbatim — the resume token's pointer to
