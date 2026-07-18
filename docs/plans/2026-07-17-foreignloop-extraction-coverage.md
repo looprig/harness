@@ -69,6 +69,95 @@ the completeness check when Harness deletes `pkg/foreignloop`.
 | `pkg/foreignloop/turn.go` | `backend` | Port turn execution, close-before-history commit, and fallback behavior. |
 | `pkg/foreignloop/turn_test.go` | `backend` | Port event ordering, history/transcript fallback, queue, and terminal coverage. |
 
+## Checked backend behavior-test classification
+
+Task 14 classifies every test in the old driver-neutral/backend files. The count
+is 53 of 53 classified: 53 moved to the extracted module (some into consolidated
+table tests), zero retained in Harness, zero assigned to the tests module, and
+zero intentionally deleted. The eight Harness session integrations are a separate
+inventory below and remain assigned to the tests module.
+
+| Old Harness test | Classification | Extracted replacement or rationale |
+|---|---|---|
+| `TestPostureZeroAndForeignTurnShape` | moved | `driver.TestPermissionPostureValues` and `driver.TestTurnRetainsEveryField` |
+| `TestForeignLockPath` | moved | `backend.TestForeignLockPath` |
+| `TestTemporaryForeignLockNamespaceDoesNotCollideWithDurableSID` | moved | `backend.TestTemporaryForeignLockNamespaceDoesNotCollideWithDurableSID` |
+| `TestProcessAlive` | moved | `backend.TestProcessAlive` |
+| `TestAcquireForeignLock` | moved | `backend.TestAcquireForeignLock` |
+| `TestForeignLockBusyTurnFailed` | moved | `backend.TestBusyAndStaleDurableLocksAtActorBoundary/busy_holder_fails_before_spawn` |
+| `TestForeignLockStaleProceeds` | moved | `backend.TestBusyAndStaleDurableLocksAtActorBoundary/stale_holder_is_reclaimed_and_released` |
+| `TestForeignLockReleaseIdempotent` | moved | `backend.TestForeignLockReleaseIdempotent` |
+| `TestBackendInterface` | moved | `backend.TestBackendInterfaceAndConstruction` |
+| `TestNewValidation` | moved | `backend_test.TestBuildWithEagerlyValidatesConfig` and `backend.TestNewRuntimeWiringAndInstructionsOnlyParity` |
+| `TestValidateWiringAcceptsInstructionsOnlyPrompt` | moved | `backend.TestNewRuntimeWiringAndInstructionsOnlyParity` |
+| `TestNewLateBoundSpecReturnsEmptyInitialSID` | moved | `backend.TestNewLateBoundDoesNotMintSID` |
+| `TestNewRejectsUnknownSIDMode` | moved | `backend_test.TestBuildWithEagerlyValidatesConfig/unknown_sid_mode` |
+| `TestShutdownClosesDone` | moved | `backend.TestBackendInterfaceAndConstruction` (its checked `shutdown` helper asserts ack and `Done`) |
+| `TestManagedAcceptanceMintFailureReturnsExactErrorAndStartsNoForeignWork` | moved | `backend.TestManagedAcceptanceMintFailurePreservesExactErrorAndStartsNoWork` |
+| `TestManagedAcceptanceAppendFailureReturnsExactErrorAndStartsNoForeignWork` | moved | `backend.TestManagedAcceptanceAppendFailurePreservesExactErrorAndStartsNoWork` |
+| `TestSnapshotFreshLoop` | moved | `backend.TestSnapshotFreshLoop` |
+| `TestInterruptWhileIdle` | moved | `backend.TestInterruptWhileIdleAndSnapshotAfterExit` |
+| `TestSnapshotAfterExit` | moved | `backend.TestInterruptWhileIdleAndSnapshotAfterExit` |
+| `TestMapperToEvents` | moved | `backend.TestMapperToEvents` |
+| `TestMapperCorrelation` | moved | `backend.TestMapperCorrelation` |
+| `TestNewRestoredValidation` | moved | `backend.TestRestoreConstructionValidation` |
+| `TestNewRestoredSeedSnapshot` | moved | `backend.TestBuildRestoredWithStartsRestoredActor` |
+| `TestNewRestoredMarksForeignSIDBound` | moved | `backend.TestRestoreConstructionSeedsActorState` |
+| `TestNewRestoredResumesSession` | moved | `backend.TestRestoredActorResumesSIDAndAppendsAfterSeed` |
+| `TestBuildRestoredWith` | moved | `backend.TestBuildRestoredWithRejectsMissingForeignSessionID` and `backend.TestBuildRestoredWithStartsRestoredActor` |
+| `TestForeignTurnUsesEffectiveSystemPrompt` | moved | `backend.TestEffectiveSystemPromptParity` |
+| `TestManagedFollowUpsQueueFIFOWhileForeignTurnActive` | moved | `backend.TestManagedQueueRunsAllAcceptedInputsFIFO` |
+| `TestCancelDelegateRequestRemovesOnlyQueuedForeignRequest` | moved | `backend.TestCancelQueuedRequestPreservesOthers` |
+| `TestCancelDelegateRequestInterruptsActiveForeignRequestButPreservesNext` | moved | `backend.TestTargetedCancelActivePreservesNextQueuedInput` |
+| `TestInterruptFlushesAcceptedForeignFollowUps` | moved | `backend.TestInterruptFlushesAcceptedQueueWithoutSpawningIt` |
+| `TestShutdownFlushesAcceptedForeignFollowUps` | moved | `backend.TestShutdownFlushesAcceptedQueue` |
+| `TestManagedForeignQueueRejectsEntrySixtyFiveBeforeAcceptance` | moved | `backend.TestManagedQueueFIFOAndExactCapacity` |
+| `TestForeignProviderFailureFlushesAcceptedQueueFailedWithoutStartingIt` | moved | `backend.TestProviderFailureFlushesAcceptedQueueWithoutSpawningIt` |
+| `TestUserInputHappyPath` | moved | `backend.TestUserInputPublishesStartedBeforeSpawnAndHistoryBeforeDone` |
+| `TestLateBoundSessionPublishesForeignSessionBound` | moved | `backend.TestLateBoundLockLifecycleAndResume` |
+| `TestLateBoundTurnLockLifecycleOrder` | moved | `backend.TestLateBoundLockLifecycleAndResume` |
+| `TestLateBoundFirstTurnHoldsBoundSIDLock` | moved | `backend.TestLateBoundLockLifecycleAndResume` |
+| `TestLateBoundFirstTurnsUseIndependentTemporaryLocks` | moved | `backend.TestLateBoundFirstTurnsUseIndependentTemporaryLocks` |
+| `TestLateBoundLockTransitionFailurePersistsSID` | moved | `backend.TestLateBoundTransitionFailurePersistsSIDForBusyResume` |
+| `TestSpawnFailureTurnFailed` | moved | `backend.TestSpawnProtocolInterruptAndShutdown/spawn` |
+| `TestCloseErrorFailsTurn` | moved | `backend.TestCloseErrorsFailSuccessfulTerminalAndRetainType` |
+| `TestTerminalAndCloseErrorsRetainBothTypedCauses` | moved | `backend.TestTurnEventOrderingAndDriverErrorIdentity` |
+| `TestEOFWithoutForeignTerminalFailsTurn` | moved | `backend.TestSpawnProtocolInterruptAndShutdown/protocol` |
+| `TestLateBoundFailureBeforeInitRetriesStartNew` | moved | `backend.TestLateBoundPreInitFailureRetriesStartNew` |
+| `TestLateBoundTerminalOKBeforeInitFailsProtocolAndRetriesStartNew` | moved | `backend.TestLateBoundTerminalBeforeInitRetainsErrorsAndRetriesStartNew/terminal_OK` |
+| `TestLateBoundTerminalErrorBeforeInitPreservesResultAndProtocolErrors` | moved | `backend.TestLateBoundTerminalBeforeInitRetainsErrorsAndRetriesStartNew/terminal_error` |
+| `TestPreboundTerminalWithoutInitSucceeds` | moved | `backend.TestUserInputPublishesStartedBeforeSpawnAndHistoryBeforeDone` |
+| `TestTranscriptLossSoftDegrade` | moved | `backend.TestTypedHistoryFailureUsesFallbackAndPreservesSuccessfulTerminal` |
+| `TestInterruptDuringTurn` | moved | `backend.TestInterruptLeavesSnapshotUncommittedAfterUnsupportedCommand` |
+| `TestLateBoundInterruptedFirstTurnResumesBoundSession` | moved | `backend.TestLateBoundLockLifecycleAndResume` |
+| `TestDropCommandDuringTurnThenInterrupt` | moved | `backend.TestInterruptLeavesSnapshotUncommittedAfterUnsupportedCommand` |
+| `TestShutdownDuringTurn` | moved | `backend.TestSpawnProtocolInterruptAndShutdown/shutdown` |
+
+## Checked public API and error ownership
+
+The extracted module's boundary tests compare these exact top-level symbol sets
+against production Go files across build tags. Receiver methods required by
+`loop.Backend` (`CommandSink`, `DoneChan`, and `Snapshot`) remain on `backend.Loop`
+and are tested through the interface contract.
+
+| Package | Exact public top-level symbols |
+|---|---|
+| `driver` | `Agent`, `DecodeError`, `Event`, `ExitError`, `History`, `HistoryError`, `Kind`, `KindInit`, `KindTextDelta`, `KindThinkingDelta`, `KindToolUse`, `KindToolResult`, `KindStepComplete`, `KindTerminalOK`, `KindTerminalError`, `PermissionPosture`, `PostureDefault`, `PostureAcceptEdits`, `SpawnError`, `Stream`, `Turn` |
+| `backend` | `BuildRestoredWith`, `BuildWith`, `Config`, `ConfigError`, `ForeignProtocolError`, `ForeignResultError`, `ForeignSessionBusyError`, `LockError`, `Loop`, `New`, `SIDLateBound`, `SIDMode`, `SIDPrebound`, `SnapshotContextDone`, `SnapshotError`, `SnapshotErrorReason`, `SnapshotLoopExited` |
+
+The checked typed-error ownership is:
+
+| Owner | Exported error types |
+|---|---|
+| `driver` | `DecodeError`, `ExitError`, `HistoryError`, `SpawnError` |
+| `backend` | `ConfigError`, `ForeignProtocolError`, `ForeignResultError`, `ForeignSessionBusyError`, `LockError`, `SnapshotError` |
+| `driver/claude` | `ConfigError`, `PathError`, `PlatformError`, `SpawnConfigError`, `WrapError` |
+| `driver/codex` | `ConfigError`, `PlatformError`, `SpawnConfigError` |
+
+`driver/claude.DecodeTranscriptForMigration` remains a temporary migration-tag
+export and is intentionally excluded from the release API; Task 18 deletes it
+after cross-module decoder parity passes.
+
 ## Harness importers outside `pkg/foreignloop`
 
 These are the current Go files outside the old tree that import
