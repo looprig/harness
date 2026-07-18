@@ -1,6 +1,7 @@
 package sessionruntime
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -353,6 +354,104 @@ func TestOpenTurnCoordsCoupledToOpenTurnInvariant(t *testing.T) {
 			}
 			if gotIdx != tt.wantTurnIdx {
 				t.Errorf("openTurnCoords TurnIndex = %d, want %d", gotIdx, tt.wantTurnIdx)
+			}
+		})
+	}
+}
+
+// sessionScopedHeader builds a minimal valid session-scoped Header (SessionID set,
+// LoopID/TurnID/StepID zero) — the shape SessionStarted/ConfigurationAdopted carry.
+// A fresh EventID keeps direct-constructed events distinguishable.
+func sessionScopedHeader(t *testing.T) event.Header {
+	t.Helper()
+	sid := mustSessionID(t)
+	eid, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	return event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid},
+		EventID:     eid,
+	}
+}
+
+// sessionStartedWithManifest builds a SessionStarted carrying BOTH a real
+// SchemaVersion-current manifest AND a populated legacy Config fingerprint, so the
+// scanner's manifest-present path (epoch 1) has data on both projections.
+func sessionStartedWithManifest(t *testing.T) event.SessionStarted {
+	t.Helper()
+	legacy := event.ConfigFingerprint{ModelID: "model-x", SystemPromptRev: "sys-rev", TopologyRev: "topo-rev"}
+	manifest := event.ManifestFromLegacy(legacy)
+	manifest.SchemaVersion = event.ManifestSchemaVersion
+	return event.SessionStarted{Header: sessionScopedHeader(t), Config: legacy, Manifest: manifest}
+}
+
+// sessionStartedLegacyOnly builds a pre-feature SessionStarted: a populated legacy
+// Config and a ZERO (SchemaVersion 0) Manifest, so the scanner must project via
+// ManifestFromLegacy and yield a SchemaVersion-0 baseline.
+func sessionStartedLegacyOnly(t *testing.T) event.SessionStarted {
+	t.Helper()
+	legacy := event.ConfigFingerprint{ModelID: "legacy-model", SystemPromptRev: "legacy-sys"}
+	return event.SessionStarted{Header: sessionScopedHeader(t), Config: legacy}
+}
+
+// configurationAdopted builds a ConfigurationAdopted at epoch with a
+// SchemaVersion-current manifest, distinguished by ModelID (derived from epoch) so
+// successive adoptions differ and "latest wins" is observable.
+func configurationAdopted(t *testing.T, epoch event.ConfigEpoch) event.ConfigurationAdopted {
+	t.Helper()
+	manifest := event.ConfigManifest{
+		SchemaVersion: event.ManifestSchemaVersion,
+		ModelID:       fmt.Sprintf("model-epoch-%d", epoch),
+	}
+	return event.ConfigurationAdopted{
+		Header:             sessionScopedHeader(t),
+		Epoch:              epoch,
+		AdoptedFingerprint: manifest.Fingerprint(),
+		Manifest:           manifest,
+		Source:             event.DecisionSourceUser,
+	}
+}
+
+func TestLatestAdoptedBaseline(t *testing.T) {
+	tests := []struct {
+		name       string
+		events     []event.Event
+		wantEpoch  event.ConfigEpoch
+		wantLegacy bool
+		wantErr    bool
+	}{
+		{name: "no session started fails closed", wantErr: true},
+		{name: "session started with manifest is epoch 1",
+			events:    []event.Event{sessionStartedWithManifest(t)},
+			wantEpoch: 1},
+		{name: "legacy session started yields legacy projection",
+			events:     []event.Event{sessionStartedLegacyOnly(t)},
+			wantEpoch:  1,
+			wantLegacy: true},
+		{name: "latest adoption wins",
+			events: []event.Event{
+				sessionStartedWithManifest(t),
+				configurationAdopted(t, 2),
+				configurationAdopted(t, 3),
+			},
+			wantEpoch: 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			baseline, err := latestAdoptedBaseline(tt.events)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("latestAdoptedBaseline() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if baseline.Epoch != tt.wantEpoch {
+				t.Errorf("Epoch = %d, want %d", baseline.Epoch, tt.wantEpoch)
+			}
+			if got := baseline.Manifest.SchemaVersion == 0; got != tt.wantLegacy {
+				t.Errorf("legacy projection = %v, want %v", got, tt.wantLegacy)
 			}
 		})
 	}
