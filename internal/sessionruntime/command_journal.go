@@ -141,6 +141,11 @@ func WithLimits(l Limits) Option {
 func WithAllowConfigMismatch() Option {
 	return func(s *Session) {
 		s.allowConfigMismatch = true
+		// The deprecated shim also installs the accept-all decider so a manifest-carrying
+		// caller that opts into mismatch accepts Warn drift through the NEW drift-assessed
+		// path too (the legacy path still reads the bool). A later WithRestoreDecider on the
+		// same session overrides this.
+		s.restoreDecider = AcceptAllDecider{}
 	}
 }
 
