@@ -24,8 +24,17 @@ import (
 // integration host's end of a gate, not an operator's view of a session — and it
 // is listed here rather than folded into SessionController for the reasons on the
 // type itself.
+//
+// The RestoreDecider family is the restore-drift decision contract: the
+// RestoreDecider interface, its RestoreDecision return vocabulary, and the two
+// stateless fail-secure default policies (DefaultPolicyDecider / AcceptAllDecider)
+// an application selects between. They are contract vocabulary, not session
+// construction (which stays forbidden), so they belong on the contract boundary
+// beside the error types.
 var publicSessionContracts = map[string]bool{
 	"Session": true, "SessionController": true, "GateHost": true,
+	"RestoreDecider": true, "RestoreDecision": true,
+	"DefaultPolicyDecider": true, "AcceptAllDecider": true,
 }
 
 var forbiddenSessionSurface = map[string]bool{

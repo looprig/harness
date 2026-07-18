@@ -120,6 +120,13 @@ type Lifecycle struct {
 	// serve.Rig interface minimalism, so it is fixed for the Lifecycle's whole lifetime.
 	allowConfigMismatch bool
 
+	// restoreDecider is the NewTopologyLifecycle-time application policy forwarded to
+	// RestoreSession ONLY (as WithRestoreDecider): it answers a configuration-drift
+	// assessment. NewSession never reads it. Nil leaves the restored session on its
+	// fail-secure DefaultPolicyDecider{} default. Classified NewTopologyLifecycle-time
+	// for the same serve.Rig interface-minimalism reason as allowConfigMismatch.
+	restoreDecider RestoreDecider
+
 	// security limitFactory mints a FRESH *security.Limit per NewSession/RestoreSession. Reusing one
 	// Lifecycle across concurrent sessions must never reuse mutable security limit state. The
 	// Lifecycle therefore mints a per-session state here and injects it via WithSecurityLimit so
@@ -323,6 +330,18 @@ func WithLifecycleGateCaps(caps GateCaps) LifecycleOption {
 func WithLifecycleAllowConfigMismatch() LifecycleOption {
 	return func(r *Lifecycle) {
 		r.allowConfigMismatch = true
+	}
+}
+
+// WithLifecycleRestoreDecider captures the restore-only application policy that answers a
+// configuration-drift assessment (the successor seam to WithLifecycleAllowConfigMismatch).
+// A nil decider is ignored, leaving RestoreSession on the fail-secure DefaultPolicyDecider{}
+// default. NewSession ignores it; only RestoreSession forwards it (as WithRestoreDecider).
+func WithLifecycleRestoreDecider(decider RestoreDecider) LifecycleOption {
+	return func(r *Lifecycle) {
+		if decider != nil {
+			r.restoreDecider = decider
+		}
 	}
 }
 
@@ -543,6 +562,9 @@ func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session,
 	}
 	if r.allowConfigMismatch {
 		opts = append(opts, WithAllowConfigMismatch())
+	}
+	if r.restoreDecider != nil {
+		opts = append(opts, WithRestoreDecider(r.restoreDecider))
 	}
 	// AMBIGUITY A1: mint a fresh per-session security limit on restore too (WithSecurityLimit applies to
 	// RestoreSession, which re-seeds the injected state from the folded SecurityLimitChanged

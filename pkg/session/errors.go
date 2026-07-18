@@ -72,6 +72,7 @@ func (e *TurnRejectedError) Error() string {
 	}
 }
 
+// Deprecated: superseded by RestoreRejectedError.
 type ConfigMismatchError struct{ Persisted, Live event.ConfigFingerprint }
 
 func (e *ConfigMismatchError) Error() string {
@@ -119,6 +120,45 @@ func (e *ConfigMismatchError) Error() string {
 
 func configValueChange(field, persisted, live string) string {
 	return field + " (" + strconv.Quote(persisted) + " -> " + strconv.Quote(live) + ")"
+}
+
+// RestoreRejectedError reports a restore refused by the configured RestoreDecider
+// (or by default policy). It carries the full typed assessment so callers and
+// operators see exactly which fields drifted and how severely.
+type RestoreRejectedError struct {
+	Assessment event.DriftAssessment
+	Source     event.DecisionSource
+}
+
+func (e *RestoreRejectedError) Error() string {
+	warnCategories := make([]string, 0, len(e.Assessment.Changes))
+	infoCount := 0
+	for _, change := range e.Assessment.Changes {
+		switch change.Severity {
+		case event.DriftWarn:
+			warnCategories = append(warnCategories, string(change.Category))
+		default:
+			infoCount++
+		}
+	}
+	source := string(e.Source)
+	if source == "" {
+		source = "policy"
+	}
+	msg := "session: restore rejected by " + source + ": " +
+		strconv.Itoa(len(warnCategories)) + " warn " + pluralize("category", "categories", len(warnCategories))
+	if len(warnCategories) > 0 {
+		msg += " (" + strings.Join(warnCategories, ", ") + ")"
+	}
+	msg += "; " + strconv.Itoa(infoCount) + " info " + pluralize("change", "changes", infoCount)
+	return msg
+}
+
+func pluralize(singular, plural string, n int) string {
+	if n == 1 {
+		return singular
+	}
+	return plural
 }
 
 type AgentNameMismatchError struct{ Persisted, Configured identity.AgentName }

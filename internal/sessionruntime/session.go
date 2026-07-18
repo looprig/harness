@@ -161,6 +161,12 @@ type Session struct {
 	// consults it. Default false = fail-secure (a mismatch rejects the restore).
 	allowConfigMismatch bool
 
+	// restoreDecider is the restore-only application policy (set by WithRestoreDecider)
+	// that answers a configuration-drift assessment. It defaults to the fail-secure
+	// DefaultPolicyDecider{} (reject on any Warn) when the composition root supplies
+	// none. A later task consumes it in the restore path; today it is stored only.
+	restoreDecider RestoreDecider
+
 	// fingerprint is required composition wiring supplied by rig and is the single
 	// projection used by both new and restored sessions.
 	fingerprint FingerprintProvider
@@ -1567,6 +1573,11 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// until a SetSecurityLimit command changes it.
 	if s.securityLimit == nil {
 		s.securityLimit = security.New()
+	}
+	// Default the restore-drift decider to the fail-secure policy when the composition
+	// root injected none via WithRestoreDecider, so the stored decider is never nil.
+	if s.restoreDecider == nil {
+		s.restoreDecider = DefaultPolicyDecider{}
 	}
 	// Apply the spawn-cap defaults AFTER the options so an unset (or WithLimits-supplied)
 	// Limits resolves to positive caps before the first NewLoop — a zero or negative

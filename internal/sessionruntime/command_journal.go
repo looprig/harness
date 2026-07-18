@@ -144,6 +144,19 @@ func WithAllowConfigMismatch() Option {
 	}
 }
 
+// WithRestoreDecider installs the restore-only application policy that answers a
+// configuration-drift assessment (the successor seam to WithAllowConfigMismatch).
+// A nil decider is ignored so a wiring slip cannot null the field — the session
+// then keeps its fail-secure DefaultPolicyDecider{} default. New ignores the
+// decider (only Restore assesses drift); a later task consumes it in the restore path.
+func WithRestoreDecider(decider RestoreDecider) Option {
+	return func(s *Session) {
+		if decider != nil {
+			s.restoreDecider = decider
+		}
+	}
+}
+
 // WithInterruptReleasePolicy installs the pluggable admission-barrier release policy (the
 // Dependency-Inversion seam of the interrupt machinery). After an interrupt cancels a running
 // turn, the session holds the interrupt-pending marks until the policy's AwaitRelease returns,

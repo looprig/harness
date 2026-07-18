@@ -8,6 +8,7 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/security"
+	"github.com/looprig/harness/pkg/session"
 	"github.com/looprig/harness/pkg/sessionstore"
 )
 
@@ -26,6 +27,7 @@ const (
 	keyForeignBuilder       singletonKey = "foreign_builders"
 	keyGateCaps             singletonKey = "gate_caps"
 	keyAllowConfigMismatch  singletonKey = "allow_config_mismatch"
+	keyRestoreDecider       singletonKey = "restore_decider"
 	keySecurityLimitFactory singletonKey = "ceiling_factory"
 	keySnapshots            singletonKey = "snapshots"
 	keyOffloadGC            singletonKey = "offload_gc"
@@ -160,6 +162,21 @@ func WithGateCaps(caps GateCaps) Option {
 
 func WithAllowConfigMismatch() Option {
 	return singletonCompile(keyAllowConfigMismatch, sessionruntime.WithLifecycleAllowConfigMismatch())
+}
+
+// WithRestoreDecider installs the application policy that decides whether a
+// configuration-drifted restore proceeds. It is the successor to
+// WithAllowConfigMismatch: rather than a blanket override, the decider inspects the
+// typed drift assessment and accepts or rejects. Omitting it leaves restore on the
+// fail-secure session.DefaultPolicyDecider (reject on any Warn). A nil decider is
+// rejected at definition time so the option cannot silently disarm the default.
+func WithRestoreDecider(decider session.RestoreDecider) Option {
+	return func(state *definitionState) error {
+		if decider == nil {
+			return &DefinitionError{Kind: DefinitionInvalidRestoreDecider}
+		}
+		return singletonCompile(keyRestoreDecider, sessionruntime.WithLifecycleRestoreDecider(decider))(state)
+	}
 }
 
 func WithSecurityLimitFactory(factory SecurityLimitFactory) Option {
