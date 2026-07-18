@@ -72,23 +72,24 @@ the completeness check when Harness deletes `pkg/foreignloop`.
 ## Checked backend behavior-test classification
 
 Task 14 classifies every test in the old driver-neutral/backend files. The count
-is 53 of 53 classified: 53 moved to the extracted module (some into consolidated
+is 53 of 53 classified: 52 moved to the extracted module (some into consolidated
 table tests), zero retained in Harness, zero assigned to the tests module, and
-zero intentionally deleted. The eight Harness session integrations are a separate
+one implementation-detail test intentionally deleted with the kernel-lock
+rationale recorded below. The eight Harness session integrations are a separate
 inventory below and remain assigned to the tests module.
 
 | Old Harness test | Classification | Extracted replacement or rationale |
 |---|---|---|
 | `TestPostureZeroAndForeignTurnShape` | moved | `driver.TestPermissionPostureValues` and `driver.TestTurnRetainsEveryField` |
-| `TestForeignLockPath` | moved | `backend.TestForeignLockPath` |
+| `TestForeignLockPath` | moved | `backend.TestForeignLockPath`, `backend.TestForeignLockPathContainsHashedOpaqueIdentifiers`, and `backend.TestForeignLockOpaqueIdentifierCannotCreateOutsideRoot`; the path remains deterministic and workspace-scoped, while the complete opaque SID is now hashed into one immediate lock-root child instead of entering a filename or path. |
 | `TestTemporaryForeignLockNamespaceDoesNotCollideWithDurableSID` | moved | `backend.TestTemporaryForeignLockNamespaceDoesNotCollideWithDurableSID` |
-| `TestProcessAlive` | moved | `backend.TestProcessAlive` |
-| `TestAcquireForeignLock` | moved | `backend.TestAcquireForeignLock` |
+| `TestProcessAlive` | intentionally deleted | PID liveness inference was an unsafe implementation detail of unlink/recreate ownership. Kernel `flock` now releases ownership atomically when the descriptor closes or the process exits; `backend.TestForeignLockCrashIsNaturallyReclaimable` proves the observable crash-reclaim invariant without a PID probe race. |
+| `TestAcquireForeignLock` | moved | `backend.TestAcquireForeignLock`, `backend.TestForeignLockOnlyOneConcurrentOwner`, `backend.TestForeignLockCrashIsNaturallyReclaimable`, and `backend.TestForeignLockRejectsSymlinkAndHardlinkFiles` prove atomic acquisition, busy classification, concurrency, crash reclaim, and no-follow/owner-only file validation. |
 | `TestForeignLockBusyTurnFailed` | moved | `backend.TestBusyAndStaleDurableLocksAtActorBoundary/busy_holder_fails_before_spawn` |
-| `TestForeignLockStaleProceeds` | moved | `backend.TestBusyAndStaleDurableLocksAtActorBoundary/stale_holder_is_reclaimed_and_released` |
-| `TestForeignLockReleaseIdempotent` | moved | `backend.TestForeignLockReleaseIdempotent` |
+| `TestForeignLockStaleProceeds` | moved | `backend.TestBusyAndStaleDurableLocksAtActorBoundary/unlocked_metadata_is_reclaimed_and_kernel_lock_released` and `backend.TestForeignLockCrashIsNaturallyReclaimable`; stale text metadata no longer owns the lock, while a crashed descriptor is naturally reclaimable. |
+| `TestForeignLockReleaseIdempotent` | moved | `backend.TestForeignLockReleaseIdempotent` and `backend.TestForeignLockOldReleaseCannotAffectSuccessor`; release is idempotent, preserves the stable inode, and an obsolete owner cannot unlink or unlock its successor. |
 | `TestBackendInterface` | moved | `backend.TestBackendInterfaceAndConstruction` |
-| `TestNewValidation` | moved | `backend_test.TestBuildWithEagerlyValidatesConfig` and `backend.TestNewRuntimeWiringAndInstructionsOnlyParity` |
+| `TestNewValidation` | moved | `backend_test.TestBuildWithEagerlyValidatesConfig`, `backend_test.TestBuildWithRejectsTypedNilAgent`, and `backend.TestNewRuntimeWiringAndInstructionsOnlyParity`; nil and typed-nil dependencies both fail closed before actor or process work starts. |
 | `TestValidateWiringAcceptsInstructionsOnlyPrompt` | moved | `backend.TestNewRuntimeWiringAndInstructionsOnlyParity` |
 | `TestNewLateBoundSpecReturnsEmptyInitialSID` | moved | `backend.TestNewLateBoundDoesNotMintSID` |
 | `TestNewRejectsUnknownSIDMode` | moved | `backend_test.TestBuildWithEagerlyValidatesConfig/unknown_sid_mode` |
@@ -100,8 +101,8 @@ inventory below and remain assigned to the tests module.
 | `TestSnapshotAfterExit` | moved | `backend.TestInterruptWhileIdleAndSnapshotAfterExit` |
 | `TestMapperToEvents` | moved | `backend.TestMapperToEvents` |
 | `TestMapperCorrelation` | moved | `backend.TestMapperCorrelation` |
-| `TestNewRestoredValidation` | moved | `backend.TestRestoreConstructionValidation` |
-| `TestNewRestoredSeedSnapshot` | moved | `backend.TestBuildRestoredWithStartsRestoredActor` |
+| `TestNewRestoredValidation` | moved | `backend.TestRestoreConstructionValidation` and `backend.TestBuildRestoredWithRejectsTypedNilPublisher` |
+| `TestNewRestoredSeedSnapshot` | moved | `backend.TestBuildRestoredWithStartsRestoredActor`, `backend.TestRestoreConstructionDeepClonesSeed`, `backend.TestSnapshotDeepClonesActorStateAndOtherSnapshots`, `backend.TestSnapshotMutationDoesNotRaceActorState`, and `backend.TestDeepClonePreservesNilAndEmptyShape` prove the restored value and every returned snapshot are recursively defensive, including nested blocks, bytes, JSON, usage, and nil/empty shape. |
 | `TestNewRestoredMarksForeignSIDBound` | moved | `backend.TestRestoreConstructionSeedsActorState` |
 | `TestNewRestoredResumesSession` | moved | `backend.TestRestoredActorResumesSIDAndAppendsAfterSeed` |
 | `TestBuildRestoredWith` | moved | `backend.TestBuildRestoredWithRejectsMissingForeignSessionID` and `backend.TestBuildRestoredWithStartsRestoredActor` |
@@ -132,6 +133,21 @@ inventory below and remain assigned to the tests module.
 | `TestLateBoundInterruptedFirstTurnResumesBoundSession` | moved | `backend.TestLateBoundLockLifecycleAndResume` |
 | `TestDropCommandDuringTurnThenInterrupt` | moved | `backend.TestInterruptLeavesSnapshotUncommittedAfterUnsupportedCommand` |
 | `TestShutdownDuringTurn` | moved | `backend.TestSpawnProtocolInterruptAndShutdown/shutdown` |
+
+### Lock, snapshot, and composition hardening rationale
+
+These quality fixes preserve the old observable busy, crash-reclaim, release,
+restore, and snapshot contracts while removing unsafe implementation details.
+They are not durable schema or event changes.
+
+| Concern | Design rationale | Checked evidence |
+|---|---|---|
+| Path containment and opaque foreign SIDs | Durable and temporary lock names use separate namespaces plus complete hashes of the cleaned workspace and opaque identifier. Neither untrusted value can create a separator, escape the owner-only lock root, expose the SID, or grow the filename. Existing deterministic/same-input and distinct-input behavior remains. | `TestForeignLockPath`, `TestForeignLockPathContainsHashedOpaqueIdentifiers`, `TestForeignLockOpaqueIdentifierCannotCreateOutsideRoot`, `TestTemporaryForeignLockNamespaceDoesNotCollideWithDurableSID`, and `TestForeignLockRejectsSymlinkAndHardlinkFiles` |
+| Atomic ownership, concurrency, and crash reclaim | Darwin/Linux use a non-blocking kernel `flock` on an owner-owned, no-follow regular file opened relative to a verified directory descriptor. Exactly one contender owns the lock; the kernel releases a crashed process's descriptor without trusting stale PID-file liveness. PID text remains diagnostic only. | `TestAcquireForeignLock`, `TestForeignLockOnlyOneConcurrentOwner`, `TestForeignLockCrashIsNaturallyReclaimable`, and `TestBusyAndStaleDurableLocksAtActorBoundary` |
+| Persistent inode instead of unlink/recreate | Normal release unlocks and closes but never unlinks the stable lock inode. `sync.Once` makes repeated or concurrent release harmless, and an old owner cannot remove or unlock a successor's ownership. This deliberately replaces the predecessor's unsafe unlink/recreate implementation while preserving idempotent release and subsequent acquisition. | `TestForeignLockReleaseIdempotent` and `TestForeignLockOldReleaseCannotAffectSuccessor` |
+| Unsupported platforms fail closed | Native lock ownership is supported only on macOS and Linux excluding Android/iOS. Every other build selects `lock_unsupported.go`, whose acquisition returns a typed `LockError` wrapping the unsupported-platform cause before spawning an agent; there is no lock-free fallback. | Cross-platform compile checks select the unsupported implementation; the exact public/error-set guard confirms no new public platform escape hatch or error class. |
+| Deep defensive snapshot scope | Restore input and each `Snapshot` result recursively clone every current Core conversation and block variant, nested tool-result content, mutable bytes/JSON, and usage values while preserving nil versus non-nil empty slices. Unknown future variants fail closed instead of silently aliasing actor state. | `TestRestoreConstructionDeepClonesSeed`, `TestDeepClonePreservesNilAndEmptyShape`, `TestSnapshotDeepClonesActorStateAndOtherSnapshots`, and race-enabled `TestSnapshotMutationDoesNotRaceActorState` |
+| Typed-nil composition dependencies | Interface values containing nil agent or publisher pointers are rejected as required-field `ConfigError` values before builder construction, actor startup, or method dispatch. Concrete non-nil value implementations remain valid. | `backend_test.TestBuildWithRejectsTypedNilAgent` and `backend.TestBuildRestoredWithRejectsTypedNilPublisher` |
 
 ## Checked public API and error ownership
 
