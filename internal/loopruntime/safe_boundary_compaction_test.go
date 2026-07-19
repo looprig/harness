@@ -74,6 +74,7 @@ type gatedExecutorCompactor struct {
 	summary *content.UserMessage
 	started chan struct{}
 	release chan struct{}
+	err     error
 }
 
 type lateSuccessExecutorCompactor struct {
@@ -101,6 +102,9 @@ func (c *gatedExecutorCompactor) CompactAndFinalize(ctx context.Context, input l
 	case <-c.release:
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+	if c.err != nil {
+		return finalizer(ctx, CompactionOutcome{Err: c.err})
 	}
 	return finalizer(ctx, CompactionOutcome{Value: &loop.CompactionOutput{
 		Basis: input.Basis, Model: input.Model, RequestFingerprint: input.RequestFingerprint,
@@ -138,14 +142,6 @@ type gatedIdleContextCounter struct {
 	once       sync.Once
 }
 
-type idleMutationContextCounter struct {
-	mu         sync.Mutex
-	capability contextcount.CounterCapability
-	calls      int
-	idleStart  chan struct{}
-	idleExit   chan struct{}
-}
-
 type preparationContextTool struct {
 	started chan struct{}
 	exited  chan struct{}
@@ -160,30 +156,6 @@ func (t *preparationContextTool) Info(ctx context.Context) (*tool.ToolInfo, erro
 
 func (*preparationContextTool) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
 	panic("preparation context tool must not run")
-}
-
-func (c *idleMutationContextCounter) CountContext(ctx context.Context, request inference.Request) (contextcount.ContextCount, error) {
-	c.mu.Lock()
-	c.calls++
-	call := c.calls
-	c.mu.Unlock()
-	if call == 1 {
-		close(c.idleStart)
-		<-ctx.Done()
-		close(c.idleExit)
-		return contextcount.ContextCount{}, ctx.Err()
-	}
-	return contextcount.ContextCount{Model: request.Model.Key(), InputTokens: 25, Quality: c.capability.Quality}, nil
-}
-
-func (c *idleMutationContextCounter) CounterCapability() contextcount.CounterCapability {
-	return c.capability
-}
-
-func (c *idleMutationContextCounter) callCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.calls
 }
 
 type idleCandidateRecordingSink struct {
@@ -454,6 +426,97 @@ func TestIdleManualCompactionBuildsStableBaseCandidate(t *testing.T) {
 	}
 }
 
+func TestLoopIdleCompactionQueuesInputUntilTerminal(t *testing.T) {
+	tests := []struct {
+		name          string
+		inputKind     string
+		compactionErr error
+		wantTerminal  event.EventName
+	}{
+		{name: "interactive input waits for commit", inputKind: "interactive", wantTerminal: "CompactionCommitted"},
+		{name: "managed no-fold input waits for commit", inputKind: "no-fold", wantTerminal: "CompactionCommitted"},
+		{name: "subagent hand-back waits for commit", inputKind: "subagent-result", wantTerminal: "CompactionCommitted"},
+		{name: "interactive input resumes after rejection", inputKind: "interactive", compactionErr: errors.New("compaction unavailable"), wantTerminal: "CompactionRejected"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compactor := &gatedExecutorCompactor{
+				summary: validFinalizationSummary(),
+				started: make(chan struct{}),
+				release: make(chan struct{}),
+				err:     tt.compactionErr,
+			}
+			counter := &sequenceContextCounter{
+				capability: contextTestCapability(contextcount.CountQualityExactLocal),
+				counts:     []content.TokenCount{40, 20},
+			}
+			actor, recorder, _ := newRestoredIdleCompactionActor(t, counter, counter.capability, compactor)
+			actor.Commands <- command.Compact{
+				Header:      command.Header{CommandID: uuid.UUID{0xa1}, Agency: identity.AgencyUser, CreatedAt: time.Now()},
+				Coordinates: identity.Coordinates{SessionID: uuid.UUID{0x91}, LoopID: uuid.UUID{0x92}},
+			}
+			select {
+			case <-compactor.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("idle compaction did not reach its executor")
+			}
+
+			inputID := uuid.UUID{0xa2}
+			switch tt.inputKind {
+			case "interactive":
+				actor.Commands <- command.UserInput{Header: command.Header{CommandID: inputID, Agency: identity.AgencyUser}, Blocks: textBlocks("wait for compact")}
+			case "no-fold":
+				accepted := make(chan error, 1)
+				actor.Commands <- command.UserInput{
+					Header: command.Header{CommandID: inputID, Agency: identity.AgencyMachine, CreatedAt: time.Now()},
+					Blocks: textBlocks("wait for compact"), NoFold: true, TargetLoopID: uuid.UUID{0x92}, Accepted: accepted,
+				}
+				select {
+				case err := <-accepted:
+					if err != nil {
+						t.Fatalf("managed input acceptance error = %v", err)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("managed input acceptance did not resolve")
+				}
+			case "subagent-result":
+				actor.Commands <- command.SubagentResult{
+					Header:      command.Header{CommandID: inputID, Cause: identity.Cause{Coordinates: identity.Coordinates{LoopID: uuid.UUID{0xa3}}}},
+					Coordinates: identity.Coordinates{LoopID: uuid.UUID{0x92}}, Blocks: textBlocks("wait for compact"),
+				}
+			default:
+				t.Fatalf("unknown input kind %q", tt.inputKind)
+			}
+			if queued := awaitReply(t, recorder, inputID); reflect.TypeOf(queued) != reflect.TypeOf(event.InputQueued{}) {
+				t.Fatalf("input outcome during compaction = %T, want event.InputQueued", queued)
+			}
+			for _, published := range recorder.events() {
+				if started, ok := published.(event.TurnStarted); ok && started.Cause.CommandID == inputID {
+					t.Fatal("queued input started before compaction reached a durable terminal")
+				}
+			}
+
+			close(compactor.release)
+			blockUntilEvents(t, recorder, func(events []event.Event) bool {
+				terminal := false
+				for _, published := range events {
+					switch value := published.(type) {
+					case event.CompactionCommitted:
+						terminal = tt.wantTerminal == "CompactionCommitted"
+					case event.CompactionRejected:
+						terminal = tt.wantTerminal == "CompactionRejected"
+					case event.TurnStarted:
+						if value.Cause.CommandID == inputID {
+							return terminal
+						}
+					}
+				}
+				return false
+			})
+		})
+	}
+}
+
 func TestIdleManualCompactionPreCountFailureRejectsWithoutStarting(t *testing.T) {
 	tests := []struct {
 		name string
@@ -613,28 +676,16 @@ func TestIdleManualCompactionInterruptsPreCountWithoutStarting(t *testing.T) {
 	}
 }
 
-func TestIdleCompactionReservationBecomesStaleBeforeNewTurnMeasurement(t *testing.T) {
-	tests := []struct{ name string }{{name: "restored idle snapshot rejects before next primary request"}}
+func TestIdleCompactionPreparationQueuesNewTurnBeforeMeasurement(t *testing.T) {
+	tests := []struct{ name string }{{name: "restored idle snapshot remains stable while new input waits"}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
 			recorder := &recordingPublisher{}
 			capability := contextTestCapability(contextcount.CountQualityExactLocal)
-			counter := &idleMutationContextCounter{capability: capability, idleStart: make(chan struct{}), idleExit: make(chan struct{})}
-			primarySawStale := make(chan bool, 1)
-			client := &scriptedLLM{scripts: [][]content.Chunk{{textChunk("next response")}}, onStreamN: map[int]func(){0: func() {
-				sawTerminal, sawWaiter := false, false
-				for _, published := range recorder.events() {
-					switch value := published.(type) {
-					case event.CompactionRejected:
-						sawTerminal = value.RejectReason == event.CompactRejectStaleBasis
-					case event.CompactWaiterRejected:
-						sawWaiter = value.Reason == event.CompactRejectStaleBasis
-					}
-				}
-				primarySawStale <- sawTerminal && sawWaiter && counter.callCount() == 2
-			}}}
+			counter := &gatedIdleContextCounter{capability: capability, started: make(chan struct{}), release: make(chan struct{})}
+			client := &scriptedLLM{scripts: [][]content.Chunk{{textChunk("next response")}}}
 			compactor := &echoExecutorCompactor{summary: validFinalizationSummary()}
 			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 				Compactor: compactor, Counter: counter, CounterCapability: capability,
@@ -657,28 +708,36 @@ func TestIdleCompactionReservationBecomesStaleBeforeNewTurnMeasurement(t *testin
 			}
 			sendCompact(t, actor, uuid.UUID{0xb1}, uuid.UUID{0xb2}, uuid.UUID{0xb3}, identity.AgencyUser)
 			select {
-			case <-counter.idleStart:
+			case <-counter.started:
 			case <-time.After(2 * time.Second):
 				t.Fatal("idle count did not start")
 			}
-			startTurn(t, actor, recorder, textBlocks("new input"))
+			inputID := uuid.UUID{0xb4}
+			actor.Commands <- command.UserInput{Header: command.Header{CommandID: inputID, Agency: identity.AgencyUser}, Blocks: textBlocks("new input")}
+			if queued := awaitReply(t, recorder, inputID); reflect.TypeOf(queued) != reflect.TypeOf(event.InputQueued{}) {
+				t.Fatalf("input outcome during idle preparation = %T, want event.InputQueued", queued)
+			}
+			close(counter.release)
+			blockUntilEvents(t, recorder, func(events []event.Event) bool {
+				committed := false
+				for _, published := range events {
+					switch value := published.(type) {
+					case event.CompactionCommitted:
+						committed = true
+					case event.TurnStarted:
+						if value.Cause.CommandID == inputID {
+							return committed
+						}
+					}
+				}
+				return false
+			})
 			terminal := drainToTerminal(t, recorder)
 			if _, ok := terminal.(event.TurnDone); !ok {
-				t.Fatalf("terminal = %T %+v, want TurnDone after stale snapshot rejection", terminal, terminal)
+				t.Fatalf("terminal = %T %+v, want TurnDone after queued input starts", terminal, terminal)
 			}
-			if saw := <-primarySawStale; !saw {
-				t.Fatal("primary inference started before stale terminal and waiter rejection")
-			}
-			select {
-			case <-counter.idleExit:
-			case <-time.After(2 * time.Second):
-				t.Fatal("stale idle count worker did not exit")
-			}
-			if got := counter.callCount(); got != 3 {
-				t.Fatalf("count calls = %d, want idle snapshot plus pre-inference and terminal remeasurements", got)
-			}
-			if got := compactor.callCount(); got != 0 {
-				t.Fatalf("compactor calls = %d, want 0", got)
+			if got := compactor.callCount(); got != 1 {
+				t.Fatalf("compactor calls = %d, want 1 stable idle compaction", got)
 			}
 		})
 	}

@@ -209,6 +209,15 @@ func newCompactionControl(waiterCapacity int) *compactionControl {
 	return &compactionControl{waiterCapacity: waiterCapacity}
 }
 
+// blocksInput reports whether this loop has an unresolved compaction obligation.
+// Pending and in-progress attempts both freeze the existing actor-owned input
+// inbox: no queued message may start or fold until a durable compaction terminal
+// clears the slot. Compaction is orthogonal to loopStatus, which continues to
+// describe whether a turn goroutine exists.
+func (c *compactionControl) blocksInput() bool {
+	return c != nil && c.pending != nil
+}
+
 func (c *compactionControl) admit(request command.Compact, idGen idGenerator) (compactionAdmission, error) {
 	if err := command.ValidateCommand(request); err != nil {
 		return compactionAdmission{}, err

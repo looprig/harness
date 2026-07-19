@@ -635,6 +635,12 @@ func runLoop(cfg loopConfig, state loopState) {
 	admissions := cfg.admissions
 	requestCancelActive := false
 	compactions := newCompactionControl(compactionControlWaiterCapacity)
+	var requestStartAdmission func() bool
+	resumeQueuedAfterCompaction := func() {
+		if state.status == loopIdle && !compactions.blocksInput() && requestStartAdmission != nil {
+			requestStartAdmission()
+		}
+	}
 	var idleCompaction *idleCompactionPreparation
 	compactionFinalizations := newCompactionFinalizer(compactionFinalizerConfig{
 		Publisher: cfg.events, Factory: cfg.eventFactory, SessionID: state.sessionID, LoopID: state.id,
@@ -825,6 +831,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				reportCompactionFailure(waiters, err)
 				return false
 			}
+			resumeQueuedAfterCompaction()
 			return true
 		}
 		attempt := disposition.Attempt
@@ -871,6 +878,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			return false
 		}
 		compactions.complete(attempt.AttemptID)
+		resumeQueuedAfterCompaction()
 		return false
 	}
 
@@ -948,6 +956,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		if rejected, ok := terminal.(event.CompactionRejected); ok && rejected.Reason == event.CompactionReasonAutomatic {
 			state.contextTracker.exhaustAutomatic(rejected.Basis, rejected.Reason, true)
 		}
+		resumeQueuedAfterCompaction()
 	}
 
 	awaitIdleCompaction := func(attemptID event.CompactAttemptID) {
@@ -1383,8 +1392,6 @@ func runLoop(cfg loopConfig, state loopState) {
 		})
 	}
 
-	var requestStartAdmission func() bool
-
 	// decideSubmit resolves a UserInput/SubagentResult against the actor's OWN live
 	// state (race-free), PUBLISHING the typed outcome event rather than replying a
 	// command.Disposition. Every submit may queue behind a running turn: a busy loop
@@ -1415,7 +1422,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			rejectSubmit(qi, event.RejectShuttingDown)
 		case len(state.inbox) >= loop.ManagedInputQueueCapacity && !bypassReject:
 			rejectSubmit(qi, event.RejectQueueFull)
-		case state.status == loopRunning || state.status == loopWaitingAdmission || (state.status == loopShuttingDown && bypassReject):
+		case state.status == loopRunning || state.status == loopWaitingAdmission || compactions.blocksInput() || (state.status == loopShuttingDown && bypassReject):
 			// Busy (or a never-rejected SubagentResult while shutting down): accept into
 			// the inbox (ordered) and publish InputQueued (Ephemeral). The submit resolves
 			// on the fan-in. A SubagentResult queued during shutdown is later returned via
@@ -1460,7 +1467,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			reject(event.RejectShuttingDown, nil)
 		case len(state.inbox) >= loop.ManagedInputQueueCapacity:
 			reject(event.RejectQueueFull, nil)
-		case state.status == loopRunning || state.status == loopWaitingAdmission:
+		case state.status == loopRunning || state.status == loopWaitingAdmission || compactions.blocksInput():
 			if err := publishAcceptance(c.CommandID); err != nil {
 				c.Accepted <- err
 				return
@@ -1547,7 +1554,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	}
 
 	requestStartAdmission = func() bool {
-		if len(state.inbox) == 0 || state.status == loopShuttingDown || state.status == loopWaitingAdmission {
+		if len(state.inbox) == 0 || state.status == loopShuttingDown || state.status == loopWaitingAdmission || compactions.blocksInput() {
 			return false
 		}
 		admission, ok := cfg.events.(executionAdmission)
@@ -1595,6 +1602,9 @@ func runLoop(cfg loopConfig, state loopState) {
 	// TurnFoldedInto resolves it) or via returnQueuedInbox (an abnormal terminal), so the
 	// inbox-exit invariant — every removed entry is resolved exactly once — still holds.
 	drainInbox := func() []queuedInput {
+		if compactions.blocksInput() {
+			return nil
+		}
 		// Fold only the LEADING run of foldable entries; stop at the first non-folding
 		// entry (a delegate follow-up). A noFold entry — and everything queued behind it
 		// — must start its OWN distinct turn rather than fold into the running turn, so it
@@ -2243,11 +2253,13 @@ func runLoop(cfg loopConfig, state loopState) {
 				if stampErr != nil {
 					reportCompactionFailure(pending.WaiterCommandIDs, stampErr)
 					compactions.abort(pending.AttemptID)
+					resumeQueuedAfterCompaction()
 					continue
 				}
 				if validateErr := event.ValidateEvent(measured); validateErr != nil {
 					reportCompactionFailure(pending.WaiterCommandIDs, validateErr)
 					compactions.abort(pending.AttemptID)
+					resumeQueuedAfterCompaction()
 					continue
 				}
 				if publishErr := cfg.events.PublishEventChecked(ctx, measured); publishErr != nil {
@@ -2490,6 +2502,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				disposition: disposition, replacement: turnReplacement,
 				continuationError: outcome.result.ContinuationError, rejectReason: rejection.RejectReason, retry: retry,
 			}
+			resumeQueuedAfterCompaction()
 
 		case result := <-admissions:
 			state.cancelAdmission = nil
