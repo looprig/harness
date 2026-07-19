@@ -6,7 +6,7 @@ approved design is already linked.
 
 ## Context and knowledge
 
-- [ ] **Automatic context compaction** — design per-loop token accounting, trigger
+- [x] **Automatic context compaction** — design per-loop token accounting, trigger
   thresholds, summary construction, durable compaction boundaries, prompt-cache behavior,
   and restore semantics. Write this as a separate, thoughtful design spec.
 - [ ] **Scoped repository instructions (`AGENTS.md`)** — define discovery from workspace
@@ -18,7 +18,7 @@ approved design is already linked.
 
 ## Tools and extensibility
 
-- [ ] **MCP support** — add loop-scoped MCP server configuration, tool discovery,
+- [x] **MCP support** — add loop-scoped MCP server configuration, tool discovery,
   authentication boundaries, approval policy, elicitation, cancellation, result-size
   limits, and durable audit events.
 - [ ] **Execution hooks** — implement the approved
