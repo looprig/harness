@@ -53,13 +53,37 @@ type Resolution struct {
 	Grants   []string `json:"-"`
 }
 
+// ApprovalPrompt is the single combined user-facing approval for one prepared
+// request: the request being decided, every unmet gated requirement, and every
+// reusable candidate displayed for persistence. It never carries tokens.
+type ApprovalPrompt struct {
+	Request    tool.Request
+	Unmet      []tool.Requirement
+	Candidates []tool.RuleCandidate
+}
+
+// Approver resolves one combined approval prompt to exactly one of the three
+// approval actions. It is consulted at most once per authorized call, only by
+// an interactively constructed evaluator, and any error fails closed.
+type Approver interface {
+	RequestApproval(ctx context.Context, prompt ApprovalPrompt) (ApprovalAction, error)
+}
+
 // Evaluator combines structural access, durable rules, approval persistence,
 // and post-decision grant issuance without importing an enforcement package.
+//
+// Construction explicitly selects interactive or headless interaction:
+// NewInteractiveEvaluator requires both an approver and a durable rule writer
+// so all three approval actions are honest, while NewHeadlessEvaluator accepts
+// neither, never prompts, and resolves an unmet gated requirement as a typed
+// approval-required denial.
 type Evaluator struct {
-	access  AccessBindings
-	matcher RuleMatcher
-	writer  RuleWriter
-	issuer  GrantIssuer
+	access      AccessBindings
+	matcher     RuleMatcher
+	writer      RuleWriter
+	issuer      GrantIssuer
+	approver    Approver
+	interactive bool
 }
 
 // EvaluationErrorKind classifies a fail-closed evaluation dependency failure.
@@ -69,6 +93,9 @@ const (
 	EvaluationRuleMatchFailed         EvaluationErrorKind = "rule_match_failed"
 	EvaluationDenied                  EvaluationErrorKind = "denied"
 	EvaluationActionInvalid           EvaluationErrorKind = "action_invalid"
+	EvaluationApproverMissing         EvaluationErrorKind = "approver_missing"
+	EvaluationApprovalRequired        EvaluationErrorKind = "approval_required"
+	EvaluationApprovalFailed          EvaluationErrorKind = "approval_failed"
 	EvaluationWriterMissing           EvaluationErrorKind = "writer_missing"
 	EvaluationWriteFailed             EvaluationErrorKind = "write_failed"
 	EvaluationIssuerMissing           EvaluationErrorKind = "issuer_missing"
@@ -89,10 +116,38 @@ func (e *EvaluationError) Error() string {
 
 func (e *EvaluationError) Unwrap() error { return e.Cause }
 
-// NewEvaluator validates access routing, rejects an unsupported grant ABI, and
-// binds the optional rule, writer, and grant services. Nil services remain
-// fail-closed at the point their capability is needed.
-func NewEvaluator(bindings []AccessBinding, matcher RuleMatcher, writer RuleWriter, issuer GrantIssuer) (*Evaluator, error) {
+// NewInteractiveEvaluator constructs an interactive evaluator. Interactive
+// construction requires both an approver and a durable rule writer so all
+// three approval actions (Approve, Approve always for this workspace, Deny)
+// are honest; a missing approver or writer fails construction.
+func NewInteractiveEvaluator(bindings []AccessBinding, matcher RuleMatcher, approver Approver, writer RuleWriter, issuer GrantIssuer) (*Evaluator, error) {
+	if approver == nil {
+		return nil, &EvaluationError{Kind: EvaluationApproverMissing, Cause: fmt.Errorf("interactive construction requires an approver")}
+	}
+	if writer == nil {
+		return nil, &EvaluationError{Kind: EvaluationWriterMissing, Cause: fmt.Errorf("interactive construction requires a durable rule writer")}
+	}
+	evaluator, err := newEvaluator(bindings, matcher, writer, issuer)
+	if err != nil {
+		return nil, err
+	}
+	evaluator.approver = approver
+	evaluator.interactive = true
+	return evaluator, nil
+}
+
+// NewHeadlessEvaluator constructs a headless evaluator. Headless construction
+// accepts no approver and no rule writer, never prompts, and exposes no
+// interactive actions: a gated requirement with no compatible saved rule
+// resolves to a typed approval-required denial.
+func NewHeadlessEvaluator(bindings []AccessBinding, matcher RuleMatcher, issuer GrantIssuer) (*Evaluator, error) {
+	return newEvaluator(bindings, matcher, nil, issuer)
+}
+
+// newEvaluator validates access routing, rejects an unsupported grant ABI, and
+// binds the optional rule and grant services. Nil services remain fail-closed
+// at the point their capability is needed.
+func newEvaluator(bindings []AccessBinding, matcher RuleMatcher, writer RuleWriter, issuer GrantIssuer) (*Evaluator, error) {
 	access, err := NewAccessBindings(bindings)
 	if err != nil {
 		return nil, err
@@ -106,6 +161,51 @@ func NewEvaluator(bindings []AccessBinding, matcher RuleMatcher, writer RuleWrit
 		}
 	}
 	return &Evaluator{access: access, matcher: matcher, writer: writer, issuer: issuer}, nil
+}
+
+// Interactive reports whether this evaluator was interactively constructed.
+func (e *Evaluator) Interactive() bool { return e.interactive }
+
+// Authorize runs one complete prepared request through the combined gate: it
+// evaluates once, opens at most one approval (interactive construction only,
+// and only when gated requirements remain unmet), resolves the chosen action,
+// and mints fresh execution-bound grants for the approved call.
+//
+// A configured or stored deny, and an interactive Deny action, return an
+// unapproved Resolution with no error and mint nothing. A headless evaluator
+// with unmet requirements returns a typed approval-required denial. Any
+// dependency or approver failure is a fail-closed error.
+func (e *Evaluator) Authorize(ctx context.Context, request tool.Request) (Resolution, error) {
+	evaluation, err := e.Evaluate(ctx, request)
+	if err != nil {
+		return Resolution{}, err
+	}
+	if len(evaluation.Denied) != 0 {
+		return Resolution{}, nil
+	}
+	if len(evaluation.Unmet) == 0 {
+		return e.Resolve(ctx, evaluation, ApprovalApprove)
+	}
+	if !e.interactive {
+		return Resolution{}, &EvaluationError{
+			Kind:        EvaluationApprovalRequired,
+			Requirement: evaluation.Unmet[0].Kind,
+			Cause:       fmt.Errorf("headless gate cannot prompt for %d unmet requirement(s)", len(evaluation.Unmet)),
+		}
+	}
+	prompt := ApprovalPrompt{
+		Request:    evaluation.request.Clone(),
+		Unmet:      cloneRequirements(evaluation.Unmet),
+		Candidates: cloneCandidates(evaluation.Candidates),
+	}
+	action, err := e.approver.RequestApproval(ctx, prompt)
+	if err != nil {
+		return Resolution{}, &EvaluationError{Kind: EvaluationApprovalFailed, Requirement: evaluation.Unmet[0].Kind, Cause: err}
+	}
+	if action == ApprovalDeny {
+		return Resolution{}, nil
+	}
+	return e.Resolve(ctx, evaluation, action)
 }
 
 // Evaluate resolves every access state, then every stored deny, then every
@@ -195,11 +295,15 @@ func (e *Evaluator) Resolve(ctx context.Context, evaluation Evaluation, action A
 	case ApprovalApprove:
 		// Once approval is intentionally ephemeral: nothing is persisted.
 	case ApprovalApproveAlwaysWorkspace:
-		if e.writer == nil {
-			return Resolution{}, &EvaluationError{Kind: EvaluationWriterMissing, Cause: fmt.Errorf("workspace rule writer is not configured")}
-		}
-		if err := e.writer.WriteRules(ctx, cloneCandidates(evaluation.candidates)); err != nil {
-			return Resolution{}, &EvaluationError{Kind: EvaluationWriteFailed, Cause: err}
+		// An empty displayed-candidate batch is a no-op: there is nothing to
+		// persist, so persistence can neither be attempted nor block execution.
+		if len(evaluation.candidates) != 0 {
+			if e.writer == nil {
+				return Resolution{}, &EvaluationError{Kind: EvaluationWriterMissing, Cause: fmt.Errorf("workspace rule writer is not configured")}
+			}
+			if err := e.writer.WriteRules(ctx, cloneCandidates(evaluation.candidates)); err != nil {
+				return Resolution{}, &EvaluationError{Kind: EvaluationWriteFailed, Cause: err}
+			}
 		}
 	default:
 		return Resolution{}, &EvaluationError{Kind: EvaluationActionInvalid, Cause: fmt.Errorf("unknown action %q", action)}
@@ -242,6 +346,17 @@ func (e *Evaluator) Resolve(ctx context.Context, evaluation Evaluation, action A
 		grants = append(grants, token)
 	}
 	return Resolution{Approved: true, Grants: grants}, nil
+}
+
+func cloneRequirements(requirements []tool.Requirement) []tool.Requirement {
+	if requirements == nil {
+		return nil
+	}
+	out := make([]tool.Requirement, len(requirements))
+	for i, requirement := range requirements {
+		out[i] = requirement.Clone()
+	}
+	return out
 }
 
 func cloneCandidates(candidates []tool.RuleCandidate) []tool.RuleCandidate {

@@ -3,6 +3,7 @@ package loopruntime
 import "github.com/looprig/harness/pkg/loop"
 
 type (
+	AccessGate             = loop.AccessGate
 	Effect                 = loop.Effect
 	ToolPolicy             = loop.ToolPolicy
 	ReadGuard              = loop.ReadGuard
@@ -33,11 +34,12 @@ const (
 )
 
 var (
-	WithProvenance         = loop.WithProvenance
-	ProvenanceFrom         = loop.ProvenanceFrom
-	WithToolUseID          = loop.WithToolUseID
-	ToolUseIDFrom          = loop.ToolUseIDFrom
-	WithPrepared           = loop.WithPrepared
-	PreparedFromContext    = loop.PreparedFromContext
-	WithUserInputRequester = loop.WithUserInputRequester
+	WithProvenance          = loop.WithProvenance
+	ProvenanceFrom          = loop.ProvenanceFrom
+	WithToolUseID           = loop.WithToolUseID
+	ToolUseIDFrom           = loop.ToolUseIDFrom
+	WithPreparedCall        = loop.WithPreparedCall
+	PreparedCallFromContext = loop.PreparedCallFromContext
+	WithUserInputRequester  = loop.WithUserInputRequester
+	WithApprovalRequester   = loop.WithApprovalRequester
 )

@@ -13,6 +13,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	gatedomain "github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
@@ -251,6 +252,10 @@ func (e *echoTool) Info(ctx context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{Name: e.name, Desc: "echoes", Schema: json.RawMessage(`{"type":"object"}`)}, nil
 }
 
+func (*echoTool) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{}, nil, nil
+}
+
 func (e *echoTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
 	e.mu.Lock()
 	e.runs++
@@ -278,6 +283,10 @@ func (a *askUserTool) Info(ctx context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{Name: a.name, Desc: "asks", Schema: json.RawMessage(`{"type":"object"}`)}, nil
 }
 
+func (*askUserTool) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{}, nil, nil
+}
+
 func (a *askUserTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
 	ans, err := RequestUserInput(ctx, a.question, a.choices)
 	if err != nil {
@@ -301,6 +310,10 @@ type provenanceTool struct {
 
 func (p *provenanceTool) Info(ctx context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{Name: p.name, Desc: "records provenance", Schema: json.RawMessage(`{"type":"object"}`)}, nil
+}
+
+func (*provenanceTool) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{}, nil, nil
 }
 
 func (p *provenanceTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
@@ -340,7 +353,7 @@ func countToolUseInHistory(msgs content.AgenticMessages) (toolUse, toolMsg int) 
 
 func agenticToolSet(reg []tool.InvokableTool, maxIters, maxCalls int) ToolSet {
 	return resolveToolSetCaps(ToolSet{
-		Permission:           autoApproveGate{},
+		Access:               autoApproveGate{},
 		Registry:             reg,
 		MaxToolIterations:    maxIters,
 		MaxToolCallsPerTurn:  maxCalls,
@@ -569,14 +582,12 @@ func TestRunTurnAgentic(t *testing.T) {
 	t.Run("gate PermissionRequested carries the tool step's StepID", func(t *testing.T) {
 		t.Parallel()
 		tl := &fakeRunTool{name: "T", output: "ok"}
-		pt := promptTool{fakeRunTool: tl}
-		tl.promptFn = func(string) (tool.PermissionRequest, error) {
-			return tool.UnknownRequest{Tool: "T", Summary: "do"}, nil
+		tl.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+			return commandRequest(executionID, "git status", false), nil, nil
 		}
-		gate := &fakePermissionGate{checkFn: func(string, string) Effect { return EffectAsk }}
 		ts := resolveToolSetCaps(ToolSet{
-			Permission:           gate,
-			Registry:             []tool.InvokableTool{pt},
+			Access:               interactiveEvaluator(t, gatedomain.AccessGated, &recordingRuleWriter{}, &recordingIssuer{}),
+			Registry:             []tool.InvokableTool{tl},
 			MaxToolIterations:    25,
 			MaxToolCallsPerTurn:  100,
 			MaxParallelToolCalls: 4,
@@ -629,7 +640,7 @@ func TestRunTurnAgentic(t *testing.T) {
 		// end-to-end (the same path RequestUserInput tests cover at the unit level).
 		ask := &askUserTool{name: "Ask", question: "favorite color?", choices: []string{"red", "blue"}}
 		ts := resolveToolSetCaps(ToolSet{
-			Permission:           autoApproveGate{},
+			Access:               autoApproveGate{},
 			Registry:             []tool.InvokableTool{ask},
 			MaxToolIterations:    25,
 			MaxToolCallsPerTurn:  100,
@@ -1043,7 +1054,7 @@ func TestRunTurnInjectsProvenance(t *testing.T) {
 func TestRunTurn(t *testing.T) {
 	t.Parallel()
 	input := []content.Block{&content.TextBlock{Text: "hi"}}
-	emptyTS := func() ToolSet { return resolveToolSetCaps(ToolSet{Permission: autoApproveGate{}}) }
+	emptyTS := func() ToolSet { return resolveToolSetCaps(ToolSet{Access: autoApproveGate{}}) }
 
 	t.Run("success commits one step group and returns TurnDone", func(t *testing.T) {
 		t.Parallel()

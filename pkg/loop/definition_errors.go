@@ -16,6 +16,7 @@ const (
 	DefinitionInvalidDrainTimeout        DefinitionErrorKind = "invalid_drain_timeout"
 	DefinitionInvalidMiddleware          DefinitionErrorKind = "invalid_middleware"
 	DefinitionInvalidPermission          DefinitionErrorKind = "invalid_permission_factory"
+	DefinitionInvalidAccessGate          DefinitionErrorKind = "invalid_access_gate"
 	DefinitionInvalidEngine              DefinitionErrorKind = "invalid_engine"
 	DefinitionInvalidRuntimeContext      DefinitionErrorKind = "invalid_runtime_context"
 	DefinitionInvalidDelegate            DefinitionErrorKind = "invalid_delegate"

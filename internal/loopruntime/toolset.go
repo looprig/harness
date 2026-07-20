@@ -5,9 +5,11 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 )
 
-// ToolSet is the actor-private resolved tool bundle.
+// ToolSet is the actor-private resolved tool bundle. Access is the combined
+// prepared-access decision gate; a nil Access denies every tool call (fail
+// closed) rather than running ungated.
 type ToolSet struct {
-	Permission  loop.PermissionGate
+	Access      loop.AccessGate
 	Registry    []tool.InvokableTool
 	Middlewares []tool.ToolMiddleware
 

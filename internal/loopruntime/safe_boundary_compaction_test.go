@@ -154,6 +154,10 @@ func (t *preparationContextTool) Info(ctx context.Context) (*tool.ToolInfo, erro
 	return nil, ctx.Err()
 }
 
+func (*preparationContextTool) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{}, nil, nil
+}
+
 func (*preparationContextTool) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
 	panic("preparation context tool must not run")
 }

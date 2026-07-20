@@ -87,8 +87,39 @@ func (TokenArtifact) preparedArtifact() {}
 // the artifact to BOTH the permission decision (via BuildRequest) and execution
 // (via the per-call ctx). A Prepare error is fail-secure: the call is not executed
 // and no gate is opened.
+//
+// Deprecated: the runner no longer probes this capability; CallPreparer is the
+// single preparation step and returns the artifact alongside the typed
+// Request. The interface remains only until Task 2.3 removes the old wires.
 type Preparer interface {
 	Prepare(ctx context.Context, callID uuid.UUID, argsJSON string) (PreparedArtifact, error)
+}
+
+// CallPreparer is the tool-owned preparation boundary: decode and validate the
+// untrusted argsJSON, normalize commands/URLs/paths, resolve canonical resource
+// identities, and produce the typed access Request for this call plus an
+// optional opaque per-call artifact the tool reads back at execution time.
+//
+// The runner mints executionID once per call and invokes PrepareCall exactly
+// once, before any permission evaluation; invalid input fails here and never
+// reaches the gate. A pure tool returns an empty Request (no requirements). A
+// tool that does NOT implement CallPreparer is treated as an unprepared
+// effectful tool and fails closed: the call is never evaluated or executed.
+type CallPreparer interface {
+	PrepareCall(ctx context.Context, executionID uuid.UUID, argsJSON string) (Request, PreparedArtifact, error)
+}
+
+// PreparedCall is the prepared execution contract for one tool call: the
+// minted execution ID, the validated typed Request, the tool's opaque per-call
+// artifact, and — after the combined gate resolves — the fresh execution-bound
+// grant tokens issued for THIS call. Tokens travel only here, never in an
+// ambient grant context, a prompt, a journal, or an audit record. The Grants
+// slice is owned by the runner; readers must not mutate it.
+type PreparedCall struct {
+	ExecutionID uuid.UUID
+	Request     Request
+	Artifact    PreparedArtifact
+	Grants      []string
 }
 
 // PermissionPrompter is implemented by tools whose execution may require user
@@ -97,6 +128,10 @@ type Preparer interface {
 // args cannot be parsed into a request. prepared is the per-call artifact a
 // Preparer tool produced for THIS call (nil for non-Preparer tools, which ignore
 // it — behavior identical).
+//
+// Deprecated: the runner no longer consults this capability; the typed
+// CallPreparer request is the only permission input. The type remains only for
+// the durable permission wires that Task 2.3 replaces.
 type PermissionPrompter interface {
 	BuildRequest(argsJSON string, prepared PreparedArtifact) (PermissionRequest, error)
 }

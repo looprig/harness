@@ -45,6 +45,7 @@ type definitionState struct {
 	system              string
 	tools               []tool.Definition
 	permissionFactory   PermissionFactory
+	accessGate          AccessGate
 	middlewares         []tool.ToolMiddleware
 	limits              ToolLimits
 	engine              Engine
@@ -125,6 +126,9 @@ func Define(opts ...Option) (Definition, error) {
 	if _, configured := resolved.seen["permission_factory"]; configured && nilLike(resolved.permissionFactory) {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidPermission, Field: "permission_factory"}
 	}
+	if _, configured := resolved.seen["access_gate"]; configured && nilLike(resolved.accessGate) {
+		return Definition{}, &DefinitionError{Kind: DefinitionInvalidAccessGate, Field: "access_gate"}
+	}
 	if resolved.engine != EngineNative && resolved.engine != EngineForeignClaude && resolved.engine != EngineForeignCodex {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidEngine, Field: "engine"}
 	}
@@ -135,8 +139,9 @@ func Define(opts ...Option) (Definition, error) {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidPolicyRevision, Field: "policy_revision"}
 	}
 	_, permissionConfigured := resolved.seen["permission_factory"]
+	_, accessConfigured := resolved.seen["access_gate"]
 	_, runtimeConfigured := resolved.seen["runtime_context"]
-	if (permissionConfigured || runtimeConfigured || len(resolved.middlewares) > 0) && strings.TrimSpace(resolved.policyRevision) == "" {
+	if (permissionConfigured || accessConfigured || runtimeConfigured || len(resolved.middlewares) > 0) && strings.TrimSpace(resolved.policyRevision) == "" {
 		return Definition{}, &DefinitionError{Kind: DefinitionMissingPolicyRevision, Field: "policy_revision"}
 	}
 	if resolved.delegation.Style != DelegationSyncOnly && resolved.delegation.Style != DelegationManaged {
@@ -638,6 +643,7 @@ type BoundDefinition interface {
 	Mode(ModeName) (BoundMode, bool)
 	InitialMode() ModeName
 	Permission() PermissionGate
+	Access() AccessGate
 	Middlewares() []tool.ToolMiddleware
 	DrainTimeout() time.Duration
 	RuntimeContext() RuntimeContextProvider
@@ -667,6 +673,7 @@ func (b *boundDefinitionState) Engine() Engine              { return b.definitio
 func (b *boundDefinitionState) Client() inference.Client    { return b.definition.client }
 func (b *boundDefinitionState) InitialMode() ModeName       { return b.definition.initialMode }
 func (b *boundDefinitionState) Permission() PermissionGate  { return b.permission }
+func (b *boundDefinitionState) Access() AccessGate          { return b.definition.accessGate }
 func (b *boundDefinitionState) DrainTimeout() time.Duration { return b.definition.drainTimeout }
 func (b *boundDefinitionState) RuntimeContext() RuntimeContextProvider {
 	return b.definition.runtimeContext
@@ -908,6 +915,20 @@ func WithPermissionFactory(factory PermissionFactory) Option {
 			return err
 		}
 		o.permissionFactory = factory
+		return nil
+	}
+}
+
+// WithAccessGate installs the combined prepared-access decision gate for every
+// tool call this loop runs. Without one, every tool call fails closed: the
+// runner denies unauthorized execution rather than running ungated. The gate is
+// an opaque policy collaborator, so configuring it requires WithPolicyRevision.
+func WithAccessGate(access AccessGate) Option {
+	return func(o *definitionOptions) error {
+		if err := o.singleton("access_gate"); err != nil {
+			return err
+		}
+		o.accessGate = access
 		return nil
 	}
 }

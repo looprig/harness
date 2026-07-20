@@ -5,8 +5,22 @@ import (
 	"encoding/json"
 	"strconv"
 
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/tool"
 )
+
+// AccessGate is the runner's view of the combined three-state access decision
+// for one prepared request. It is satisfied by *gate.Evaluator (interactive or
+// headless construction) or by a consumer-provided equivalent.
+//
+// Authorize evaluates the complete typed request once, opens at most one
+// combined approval (interactive construction only), and returns the fresh
+// execution-bound grant tokens for the approved call. An unapproved Resolution
+// with a nil error is a policy or user denial; any error is fail-closed. An
+// implementation must be safe for concurrent calls.
+type AccessGate interface {
+	Authorize(ctx context.Context, request tool.Request) (gate.Resolution, error)
+}
 
 // PermissionFactory creates the permission gate private to one bound loop. It may
 // be called concurrently for separate Bind calls and must synchronize captured state.

@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	gatedomain "github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -82,6 +83,14 @@ func newToolSession(t *testing.T) *Session {
 	return s
 }
 
+// allowAllAccessGate approves every prepared request without grants — the
+// session-test stand-in for a configured combined access gate.
+type allowAllAccessGate struct{}
+
+func (allowAllAccessGate) Authorize(context.Context, tool.Request) (gatedomain.Resolution, error) {
+	return gatedomain.Resolution{Approved: true}, nil
+}
+
 // countingExtTool is an external tool that records how often it actually ran.
 type countingExtTool struct {
 	name string
@@ -91,6 +100,10 @@ type countingExtTool struct {
 
 func (c *countingExtTool) Info(context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{Name: c.name, Desc: "d", Schema: json.RawMessage(`{"type":"object"}`)}, nil
+}
+
+func (*countingExtTool) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{}, nil, nil
 }
 
 func (c *countingExtTool) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
@@ -206,9 +219,7 @@ func TestRestoredRootLoopBindsExternalTools(t *testing.T) {
 			loop.WithSystem("be helpful"),
 			loop.WithDrainTimeout(200*time.Millisecond),
 			loop.WithPolicyRevision("test"),
-			loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) {
-				return newLivePermissionGate(loop.EffectAutoApprove), nil
-			}),
+			loop.WithAccessGate(allowAllAccessGate{}),
 		)
 	}
 

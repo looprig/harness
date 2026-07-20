@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
@@ -26,6 +27,10 @@ type stubTool struct {
 
 func (s *stubTool) Info(context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{Name: s.name, Desc: "d", Schema: json.RawMessage(s.schema)}, nil
+}
+
+func (*stubTool) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{}, nil, nil
 }
 
 func (s *stubTool) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
@@ -45,6 +50,10 @@ type countingTool struct {
 
 func (c *countingTool) Info(context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{Name: c.name, Desc: "d", Schema: json.RawMessage(`{"a":1}`)}, nil
+}
+
+func (*countingTool) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{}, nil, nil
 }
 
 func (c *countingTool) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
@@ -86,12 +95,10 @@ func declaredToolDefinition(name string) tool.Definition {
 // observable.
 func toolBearingDefinition(t *testing.T, client inference.Client) loop.BoundDefinition {
 	t.Helper()
-	// Auto-approve every call. Without a gate that approves, EVERY tool result is
-	// "permission denied" and any assertion about whether a tool actually RAN is
-	// vacuous — the registry is never even consulted.
-	approve := func(context.Context, tool.Bindings) (loop.PermissionGate, error) {
-		return &fakePermissionGate{checkFn: func(string, string) Effect { return EffectAutoApprove }}, nil
-	}
+	// Auto-approve every call (WithAccessGate(autoApproveGate{}) below). Without a
+	// gate that approves, EVERY tool result is "permission denied" and any
+	// assertion about whether a tool actually RAN is vacuous — the registry is
+	// never even consulted.
 	// The SAME definition value must be reused across base and mode: loop.Bind compares
 	// definitions by pointer identity, so two distinct definitions sharing a name are a
 	// duplicate-definition error rather than a cache hit.
@@ -106,7 +113,7 @@ func toolBearingDefinition(t *testing.T, client inference.Client) loop.BoundDefi
 			loop.Mode{Name: "other", Tools: []tool.Definition{declaredToolDefinition("declared_other")}},
 		),
 		loop.WithInitialMode("main"),
-		loop.WithPermissionFactory(approve),
+		loop.WithAccessGate(autoApproveGate{}),
 		loop.WithPolicyRevision("test"),
 	)
 	if err != nil {

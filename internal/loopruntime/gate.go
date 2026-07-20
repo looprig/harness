@@ -129,13 +129,6 @@ func withGateReg(ctx context.Context, gateReg chan<- gateRegistration) context.C
 	return context.WithValue(ctx, gateRegKey{}, gateReg)
 }
 
-// WithPrepared returns a child ctx carrying the per-call PreparedArtifact a
-// Preparer tool produced for THIS call. The runner injects it per tool call; the
-// producing tool's InvokableRun reads it back via PreparedFromContext. It is nil
-// for non-Preparer tools, which never look. It is the symmetric write side of the
-// exported PreparedFromContext read side (mirroring WithProvenance/ProvenanceFrom),
-// so a Preparer tool defined in another package can be exercised in isolation
-// without driving the whole runner.
 // callIDFromContext reads the active ToolExecutionID, false when absent.
 func callIDFromContext(ctx context.Context) (uuid.UUID, bool) {
 	v, ok := ctx.Value(callIDKey{}).(uuid.UUID)
@@ -156,13 +149,6 @@ func EmitFromContext(ctx context.Context) (func(event.Event), bool) {
 	v, ok := ctx.Value(emitKey{}).(func(event.Event))
 	return v, ok
 }
-
-// PreparedFromContext returns the per-call PreparedArtifact the runner injected
-// for THIS call, and false when none is present (a non-Preparer tool, or the tool
-// run outside a turn). It is the sanctioned way for a Preparer tool's InvokableRun
-// to read back the artifact its own Prepare produced, without depending on loop
-// internals. A nil artifact (a Preparer that returned nil, no error) reports ok
-// false — there is nothing to read.
 
 // GateContextMissing identifies which injected ctx value RequestUserInput could
 // not find. It is a fail-secure signal: a tool that calls RequestUserInput outside

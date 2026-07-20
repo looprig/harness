@@ -618,8 +618,8 @@ func TestSubagentAuditSummary(t *testing.T) {
 	}
 }
 
-// TestSubagentCapabilities pins the capability surface: Subagent is an InvokableTool
-// and Auditable, deliberately NOT a PermissionPrompter (AutoApprove) and NOT a
+// TestSubagentCapabilities pins the capability surface: Subagent is an
+// InvokableTool, Auditable, and a pure CallPreparer, deliberately NOT a
 // WriteTarget.
 func TestSubagentCapabilities(t *testing.T) {
 	t.Parallel()
@@ -630,8 +630,8 @@ func TestSubagentCapabilities(t *testing.T) {
 	if _, ok := s.(tool.Auditable); !ok {
 		t.Error("Subagent is not Auditable")
 	}
-	if _, ok := s.(tool.PermissionPrompter); ok {
-		t.Error("Subagent must NOT be a PermissionPrompter")
+	if _, ok := s.(tool.CallPreparer); !ok {
+		t.Error("Subagent must implement the mandatory CallPreparer capability")
 	}
 	if _, ok := s.(tool.WriteTarget); ok {
 		t.Error("Subagent must NOT be a WriteTarget")
@@ -672,4 +672,26 @@ func FuzzSubagentArgs(f *testing.F) {
 			t.Fatal("InvokableRun() returned a nil result")
 		}
 	})
+}
+
+// TestSubagentPrepareCallIsPure: the Subagent tool implements the mandatory
+// preparation capability with a pure empty request (its historical AutoApprove
+// posture): no requirements, no grant binding, no artifact.
+func TestSubagentPrepareCallIsPure(t *testing.T) {
+	var _ tool.CallPreparer = (*SubagentTool)(nil)
+	st := &SubagentTool{}
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	request, artifact, err := st.PrepareCall(context.Background(), id, `{"action":"start"}`)
+	if err != nil {
+		t.Fatalf("PrepareCall() error = %v", err)
+	}
+	if len(request.Requirements) != 0 || request.ExecutionID != "" {
+		t.Errorf("PrepareCall() request = %+v, want a pure empty request", request)
+	}
+	if artifact != nil {
+		t.Errorf("PrepareCall() artifact = %#v, want nil", artifact)
+	}
 }

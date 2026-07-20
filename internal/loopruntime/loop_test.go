@@ -1130,6 +1130,10 @@ func (b *blockingTool) Info(ctx context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{Name: "Block", Desc: "blocks", Schema: json.RawMessage(`{"type":"object"}`)}, nil
 }
 
+func (*blockingTool) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{}, nil, nil
+}
+
 func (b *blockingTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
 	b.onceStop.Do(func() { close(b.started) })
 	select {

@@ -13,6 +13,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	gatedomain "github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -41,10 +42,17 @@ const (
 	// still sees a paired error result.
 	errIDGenFailure = "error: internal: could not generate call id"
 	// errPreparePrefix is the fail-secure tool-result prefix for a call whose
-	// Preparer.Prepare failed: the call is NOT executed and NO gate is opened (a
-	// failed per-call artifact can't safely gate or run the call), but the model
-	// still sees a paired error result.
+	// CallPreparer.PrepareCall failed or returned an invalid request: the call is
+	// NOT executed and NO gate is opened (a failed preparation can't safely gate
+	// or run the call), but the model still sees a paired error result.
 	errPreparePrefix = "error: tool preparation failed: "
+	// errToolUnprepared is the fail-closed tool-result for an effectful tool that
+	// implements no preparation step. Without a typed prepared request the gate
+	// has nothing truthful to decide, so the call is never evaluated or executed.
+	errToolUnprepared = "error: permission denied: tool has no call preparation"
+	// errPrepareBinding is the fail-closed tool-result for a prepared request
+	// bound to a different execution ID than the one the runner minted.
+	errPrepareBinding = "error: tool preparation failed: request is not bound to this execution"
 )
 
 // ResultPreview caps. ResultPreview may hold a slice of tool output, so it is
@@ -77,19 +85,16 @@ type resolved struct {
 	t       tool.InvokableTool // nil for an unknown tool
 	summary string             // ToolCallStarted.Summary (redacted)
 
-	// prepared is the per-call artifact a Preparer tool produced for THIS call,
-	// computed ONCE in newResolved (after the callID is minted + args validated)
-	// and threaded to BOTH the permission decision (buildRequest) and execution
-	// (the per-call ctx in runOne). nil for non-Preparer tools.
-	prepared tool.PreparedArtifact
+	// prepared is the per-call prepared execution contract: the minted execution
+	// ID, the typed access Request and opaque artifact CallPreparer.PrepareCall
+	// produced ONCE in newResolved, and — after resolveAccess — the fresh grant
+	// tokens the combined gate issued for THIS call. Tokens travel only inside
+	// this contract, never in an ambient grant context.
+	prepared tool.PreparedCall
 
-	// grants are the opaque escalation grant TOKENS an ApproveToolCall carried
-	// (its AcceptedGrants). applyDecision records them here; runOne nests them onto
-	// the per-call ctx via tool.WithGrants so the FIRST spawn's InvokableRun reads
-	// them back (pre-ask escalation with no run-fail-rerun). nil when the approval
-	// carried no grants (the common case). The tokens stay opaque — harness only
-	// carries them from the approval to execution and to Grant.
-	grants []string
+	// prompted records that resolveAccess opened an interactive gate for this
+	// call (so the non-gated PermissionDecided audit is not emitted twice).
+	prompted bool
 
 	// failed marks a pre-execution failure (unknown tool, invalid args,
 	// permission denied, WriteTarget error). Its result is fixed before any
@@ -139,20 +144,21 @@ func RunBatch(
 		rs[i] = newResolved(ctx, c, ts, idGen)
 	}
 
-	// Sequential permission resolution, in call order, BEFORE any execution, so a
-	// session grant on call N is visible to call N+1's Check. A ctx cancel during a
-	// gate wait tears the whole batch down: return what we have (runTurn's rollback
-	// discards a cancelled batch's results).
+	// Sequential access resolution, in call order, BEFORE any execution, so a
+	// workspace rule persisted by call N's Approve-always is visible to call
+	// N+1's evaluation. A ctx cancel during a gate wait tears the whole batch
+	// down: return what we have (runTurn's rollback discards a cancelled batch's
+	// results).
 	for _, r := range rs {
 		if r.failed || r.t == nil {
 			continue
 		}
-		if err := resolvePermission(ctx, r, ts, gateReg, safeEmit); err != nil {
+		if err := resolveAccess(ctx, r, ts, gateReg, safeEmit); err != nil {
 			if ctx.Err() != nil {
 				return collectResults(rs)
 			}
-			// A non-ctx error means denied / interrupted gate; resolvePermission has
-			// already marked r.failed.
+			// A non-ctx error is fail-closed: resolveAccess has already marked
+			// r.failed (denied), so the call is never executed.
 		}
 	}
 
@@ -236,22 +242,43 @@ func newResolved(ctx context.Context, c content.ToolUseBlock, ts ToolSet, idGen 
 		return r
 	}
 
-	// If the tool is a Preparer, compute its per-call artifact ONCE here — after the
-	// callID is minted, the tool resolved, and args validated — bound to the call by
-	// callID. The artifact is threaded to BOTH the permission decision (buildRequest)
-	// and execution (the per-call ctx). A Prepare error is fail-secure: the call is
-	// marked failed (so it is NOT executed and NO gate is opened) and the error is
-	// surfaced as a model-visible tool-result, not swallowed.
-	if p, ok := r.t.(tool.Preparer); ok {
-		prepared, err := p.Prepare(ctx, r.callID, r.argsstr)
-		if err != nil {
-			slog.Warn("loop: tool Prepare failed; failing call fail-secure (not executed, no gate)",
-				"tool", c.Name, "error", err)
-			r.fail(errPreparePrefix + err.Error())
-			return r
-		}
-		r.prepared = prepared
+	// Preparation happens ONCE here — after the callID is minted, the tool
+	// resolved, and args validated — bound to the call by the minted execution
+	// ID. The tool decodes/normalizes its own arguments and returns the typed
+	// access Request plus its opaque per-call artifact; both are threaded to the
+	// permission evaluation and to execution via the prepared execution
+	// contract. An effectful tool WITHOUT a preparation step fails closed: the
+	// gate has nothing truthful to decide, so the call is never evaluated or
+	// executed. A PrepareCall error, an invalid request, or a request bound to a
+	// different execution ID is equally fail-secure (not executed, no gate),
+	// surfaced as a model-visible tool-result rather than swallowed.
+	preparer, ok := r.t.(tool.CallPreparer)
+	if !ok {
+		slog.Warn("loop: tool has no call preparation; failing call fail-closed (not evaluated, not executed)",
+			"tool", c.Name)
+		r.fail(errToolUnprepared)
+		return r
 	}
+	request, artifact, err := preparer.PrepareCall(ctx, r.callID, r.argsstr)
+	if err != nil {
+		slog.Warn("loop: tool PrepareCall failed; failing call fail-secure (not executed, no gate)",
+			"tool", c.Name, "error", err)
+		r.fail(errPreparePrefix + err.Error())
+		return r
+	}
+	if err := tool.ValidateRequest(request); err != nil {
+		slog.Warn("loop: tool prepared an invalid request; failing call fail-secure (not executed, no gate)",
+			"tool", c.Name, "error", err)
+		r.fail(errPreparePrefix + err.Error())
+		return r
+	}
+	if request.ExecutionID != "" && request.ExecutionID != r.callID.String() {
+		slog.Warn("loop: prepared request bound to a different execution id; failing call fail-secure",
+			"tool", c.Name)
+		r.fail(errPrepareBinding)
+		return r
+	}
+	r.prepared = tool.PreparedCall{ExecutionID: r.callID, Request: request, Artifact: artifact}
 
 	if wt, ok := r.t.(tool.WriteTarget); ok {
 		key, has, err := wt.WriteTarget(r.argsstr)
@@ -299,64 +326,67 @@ func summaryOf(t tool.InvokableTool, name, argsJSON string) string {
 	return name
 }
 
-// resolvePermission resolves the permission Effect for one (resolvable) call. On
-// EffectAsk it opens a gatePermission gate (ctx-aware register → ack → emit →
-// block), validates the reply's ToolExecutionID, persists a non-ScopeOnce grant
-// (best-effort — a Grant error never fails the call), and marks r.failed on deny.
-// A returned non-nil error is either ctx.Err() (batch torn down) or a gate
-// interruption; in both cases r is left in a safe state (failed or to-be-discarded).
-func resolvePermission(
+// resolveAccess runs one (resolvable) call's prepared request through the
+// combined access gate exactly once. The gate evaluates every requirement,
+// opens at most ONE interactive approval (routed back through this runner's
+// per-call approval capability, so the register→ack→emit→block gate plumbing is
+// reused), resolves the chosen action, and issues fresh execution-bound grant
+// tokens, which are recorded on the prepared execution contract for runOne.
+//
+// Fail-closed everywhere: no gate wired, an unapproved resolution, or any
+// evaluator/approver error all mark the call permission-denied and it is never
+// executed. A returned non-nil error is either ctx.Err() (batch torn down) or a
+// fail-closed denial already recorded on r.
+func resolveAccess(
 	ctx context.Context,
 	r *resolved,
 	ts ToolSet,
 	gateReg chan<- gateRegistration,
 	emit func(event.Event),
 ) error {
-	if ts.Permission == nil {
-		// No gate wired → fail-secure: deny rather than fall through.
+	if ts.Access == nil {
+		// No access gate wired → fail-secure: deny rather than fall through.
+		emitAccessDecided(r, event.PermissionEffectDeny, "access_gate_missing", emit)
 		r.fail(errPermissionDenied)
 		return nil
 	}
 
-	decision := checkPermissionDecision(ctx, r, ts)
-	switch decision.Effect {
-	case EffectAutoApprove:
-		emitPermissionDecided(r, decision, event.PermissionEffectApprove, emit)
-		applyApprovedGrants(ctx, r, ts)
-		return nil
-	case EffectDeny:
-		emitPermissionDecided(r, decision, event.PermissionEffectDeny, emit)
-		r.fail(errPermissionDenied)
-		return nil
-	default: // EffectAsk (the fail-secure zero value)
-		return askPermission(ctx, r, ts, gateReg, emit)
-	}
-}
-
-func checkPermissionDecision(ctx context.Context, r *resolved, ts ToolSet) PermissionDecision {
-	if dc, ok := ts.Permission.(interface {
-		CheckDecision(context.Context, tool.InvokableTool, string, string) PermissionDecision
-	}); ok {
-		return dc.CheckDecision(ctx, r.t, r.block.Name, r.argsstr)
-	}
-	return PermissionDecision{Effect: ts.Permission.Check(ctx, r.t, r.block.Name, r.argsstr)}
-}
-
-func emitPermissionDecided(
-	r *resolved,
-	decision PermissionDecision,
-	effect event.PermissionDecisionEffect,
-	emit func(event.Event),
-) {
-	reason := decision.Reason
-	if reason == "" {
-		switch effect {
-		case event.PermissionEffectApprove:
-			reason = "auto_approve"
-		case event.PermissionEffectDeny:
-			reason = "auto_deny"
+	// Install the per-call approval capability so an INTERACTIVE evaluator can
+	// open its (single) combined gate through this loop's gate machinery. A
+	// headless evaluator never reads it.
+	actx := WithApprovalRequester(ctx, approvalRequesterFor(r, gateReg, emit))
+	resolution, err := ts.Access.Authorize(actx, r.prepared.Request)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
+		slog.Warn("loop: access authorization failed; failing call fail-closed (not executed)",
+			"tool", r.block.Name, "error", err)
+		if !r.prompted {
+			emitAccessDecided(r, event.PermissionEffectDeny, "access_error", emit)
+		}
+		r.fail(errPermissionDenied)
+		return err
 	}
+	if !resolution.Approved {
+		if !r.prompted {
+			emitAccessDecided(r, event.PermissionEffectDeny, "access_denied", emit)
+		}
+		r.fail(errPermissionDenied)
+		return nil
+	}
+	if !r.prompted {
+		emitAccessDecided(r, event.PermissionEffectApprove, "access_evaluated", emit)
+	}
+	// Fresh grants issued for THIS call travel on the prepared execution
+	// contract (never an ambient ctx carrier, never a durable record).
+	r.prepared.Grants = resolution.Grants
+	return nil
+}
+
+// emitAccessDecided emits the redacted non-gated decision audit (an interactive
+// prompt path emits PermissionRequested instead).
+func emitAccessDecided(r *resolved, effect event.PermissionDecisionEffect, reason string, emit func(event.Event)) {
 	emit(event.PermissionDecided{
 		ToolExecutionID: r.callID,
 		Effect:          effect,
@@ -366,131 +396,107 @@ func emitPermissionDecided(
 	})
 }
 
-// applyApprovedGrants probes the gate for the OPTIONAL ApprovedGrants re-mint method
-// (SPEC §9.3 session/workspace-scope escalation). When Check auto-approved a call via a
-// delta-bearing grant record, the gate re-mints FRESH single-mint tokens for THIS call;
-// recording them on r.grants makes runOne nest them on the spawn ctx via
-// tool.WithGrants — the SAME seam a pre-ask approval's AcceptedGrants uses. A gate
-// without the method, or a call with no delta-bearing match (the gate returns no
-// tokens), leaves r.grants nil, so the common auto-approve path is unchanged. The
-// method is asserted structurally (no new interface in the shared package): only the
-// concrete checker in tools/ implements it. ctx is threaded so the gate's re-mint keeps
-// the call's trace context on this security path.
-func applyApprovedGrants(ctx context.Context, r *resolved, ts ToolSet) {
-	ag, ok := ts.Permission.(interface {
-		ApprovedGrants(ctx context.Context, toolName, argsJSON string) []string
-	})
-	if !ok {
-		return
-	}
-	if grants := ag.ApprovedGrants(ctx, r.block.Name, r.argsstr); len(grants) > 0 {
-		r.grants = grants
-	}
-}
-
-// askPermission opens a permission gate and blocks for the user's decision,
-// mirroring RequestUserInput's ctx-aware register→ack→emit→block pattern.
-func askPermission(
-	ctx context.Context,
+// approvalRequesterFor builds the per-call approval capability an interactive
+// evaluator invokes at most once: it opens ONE combined permission gate
+// (ctx-aware register → ack → emit → block, mirroring RequestUserInput),
+// validates the reply's routing, and maps the durable command wire to the
+// exact approval action.
+func approvalRequesterFor(
 	r *resolved,
-	ts ToolSet,
 	gateReg chan<- gateRegistration,
 	emit func(event.Event),
-) error {
-	req := buildRequest(r.t, r.block.Name, r.summary, r.argsstr, r.prepared)
+) loop.ApprovalRequestFunc {
+	return func(ctx context.Context, prompt gatedomain.ApprovalPrompt) (gatedomain.ApprovalAction, error) {
+		r.prompted = true
+		req := bridgePermissionRequest(r.block.Name, r.summary, prompt)
 
-	// reply is buffered(1) (runner is the sole reader, so the actor's routed send
-	// never blocks). ack carries the session-minted GateID or the prepare/activate error.
-	reply := make(chan command.Command, 1)
-	ack := make(chan gateInstallAck, 1)
-	g := stampGateSubjectProvenance(ctx, permissionGate(r.callID, req))
-	payload := gatedomain.PermissionPayload{Request: req}
+		// reply is buffered(1) (runner is the sole reader, so the actor's routed
+		// send never blocks). ack carries the session-minted GateID or the
+		// prepare/activate error.
+		reply := make(chan command.Command, 1)
+		ack := make(chan gateInstallAck, 1)
+		g := stampGateSubjectProvenance(ctx, permissionGate(r.callID, req))
+		payload := gatedomain.PermissionPayload{Request: req}
 
-	select {
-	case gateReg <- gateRegistration{gate: g, payload: payload, callID: r.callID, reply: reply, kind: gatePermission, ack: ack}:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	var installed gateInstallAck
-	select {
-	case installed = <-ack:
-		if installed.err != nil {
-			return installed.err
+		select {
+		case gateReg <- gateRegistration{gate: g, payload: payload, callID: r.callID, reply: reply, kind: gatePermission, ack: ack}:
+		case <-ctx.Done():
+			return "", ctx.Err()
 		}
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	// Install-before-emit: only now is the gate guaranteed installed, so the
-	// matching Approve/Deny cannot be dropped on a race.
-	emit(event.PermissionRequested{ToolExecutionID: r.callID, Request: req})
-
-	select {
-	case cmd := <-reply:
-		switch c := cmd.(type) {
-		case command.ApproveToolCall:
-			if !c.GateRoute.GateID.IsZero() && c.GateRoute.GateID != installed.gateID {
-				return &GateReplyMismatchError{ToolExecutionID: r.callID}
+		var installed gateInstallAck
+		select {
+		case installed = <-ack:
+			if installed.err != nil {
+				return "", installed.err
 			}
-		case command.DenyToolCall:
-			if !c.GateRoute.GateID.IsZero() && c.GateRoute.GateID != installed.gateID {
-				return &GateReplyMismatchError{ToolExecutionID: r.callID}
-			}
+		case <-ctx.Done():
+			return "", ctx.Err()
 		}
-		return applyDecision(ctx, r, ts, cmd)
-	case <-ctx.Done():
-		return ctx.Err()
+
+		// Install-before-emit: only now is the gate guaranteed installed, so the
+		// matching Approve/Deny cannot be dropped on a race.
+		emit(event.PermissionRequested{ToolExecutionID: r.callID, Request: req})
+
+		select {
+		case cmd := <-reply:
+			return approvalActionFromCommand(cmd, r.callID, installed.gateID)
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
 	}
 }
 
-// applyDecision applies an Approve/Deny reply to r. runLoop already matched by
-// ToolExecutionID + kind; the ToolExecutionID is re-validated as cheap defence in depth. A non-once
-// approval persists via Grant — a Grant error NEVER fails the call (the user
-// approved THIS call; Grant is best-effort persistence for future calls).
-func applyDecision(ctx context.Context, r *resolved, ts ToolSet, cmd command.Command) error {
+// approvalActionFromCommand maps a routed gate reply to the exact approval
+// action. runLoop already matched by ToolExecutionID + kind; the routing is
+// re-validated as cheap defence in depth. The durable command wire still
+// carries the legacy scope field (Task 2.3 replaces it): ScopeOnce maps to
+// Approve, ScopeWorkspace to Approve always for this workspace, and everything
+// else — including the retired session scope and any unexpected command — is
+// fail-closed Deny. AcceptedGrants on the wire are deliberately ignored: the
+// evaluator issues FRESH grants after the decision.
+func approvalActionFromCommand(cmd command.Command, callID uuid.UUID, gateID gatedomain.ID) (gatedomain.ApprovalAction, error) {
 	switch c := cmd.(type) {
 	case command.ApproveToolCall:
-		if c.GateToolExecutionID() != r.callID {
-			// Defence in depth: a mismatched ToolExecutionID is fail-secure → deny.
-			r.fail(errPermissionDenied)
-			return nil
+		if !c.GateRoute.GateID.IsZero() && c.GateRoute.GateID != gateID {
+			return "", &GateReplyMismatchError{ToolExecutionID: callID}
 		}
-		// Pre-ask grant flow (SPEC §9.3): the operator's approval carries the
-		// accepted escalation grant TOKENS. Record them on resolved so runOne places
-		// them on the FIRST spawn's per-call ctx (the escalation is applied without a
-		// run-fail-rerun). For a non-Once scope, hand Grant a grant-BEARING ctx so it
-		// can MAC-verify the tokens and persist the grant DELTAS (never the tokens).
-		r.grants = c.AcceptedGrants
-		if c.Scope != tool.ScopeOnce {
-			grantCtx := tool.WithGrants(ctx, c.AcceptedGrants)
-			if err := ts.Permission.Grant(grantCtx, r.block.Name, r.argsstr, c.Scope); err != nil {
-				slog.Warn("loop: permission grant did not persist; proceeding with approved call",
-					"tool", r.block.Name, "scope", c.Scope, "error", err)
-			}
+		if c.GateToolExecutionID() != callID {
+			return gatedomain.ApprovalDeny, nil
 		}
-		return nil
+		switch c.Scope {
+		case tool.ScopeOnce:
+			return gatedomain.ApprovalApprove, nil
+		case tool.ScopeWorkspace:
+			return gatedomain.ApprovalApproveAlwaysWorkspace, nil
+		default:
+			return gatedomain.ApprovalDeny, nil
+		}
 	case command.DenyToolCall:
-		r.fail(errPermissionDenied)
-		return nil
+		if !c.GateRoute.GateID.IsZero() && c.GateRoute.GateID != gateID {
+			return "", &GateReplyMismatchError{ToolExecutionID: callID}
+		}
+		return gatedomain.ApprovalDeny, nil
 	default:
 		// Unexpected command kind on a permission gate — fail-secure.
-		r.fail(errPermissionDenied)
-		return nil
+		return gatedomain.ApprovalDeny, nil
 	}
 }
 
-// buildRequest derives the approval-prompt request: via PermissionPrompter when
-// the tool implements it (falling back to UnknownRequest if BuildRequest errors),
-// else an UnknownRequest carrying the redacted summary (never raw args). prepared
-// is the per-call Preparer artifact for this call (nil for non-Preparer tools,
-// which ignore it).
-func buildRequest(t tool.InvokableTool, name, summary, argsJSON string, prepared tool.PreparedArtifact) tool.PermissionRequest {
-	if p, ok := t.(tool.PermissionPrompter); ok {
-		if req, err := p.BuildRequest(argsJSON, prepared); err == nil && req != nil {
-			return req
+// bridgePermissionRequest projects the combined approval prompt onto the
+// legacy sealed PermissionRequest wire (whose durable codec Task 2.3
+// replaces): the redacted summary plus every unmet capability description —
+// never raw args, never tokens.
+func bridgePermissionRequest(name, summary string, prompt gatedomain.ApprovalPrompt) tool.PermissionRequest {
+	var sb strings.Builder
+	sb.WriteString(summary)
+	if len(prompt.Unmet) > 0 {
+		sb.WriteString("\n\nCapabilities:")
+		for _, requirement := range prompt.Unmet {
+			sb.WriteString("\n- ")
+			sb.WriteString(requirement.Description)
 		}
 	}
-	return tool.UnknownRequest{Tool: name, Summary: summary}
+	return tool.UnknownRequest{Tool: name, Summary: sb.String()}
 }
 
 // execute runs the executable calls: the serial batch (Sequential()==true) drains
@@ -573,15 +579,8 @@ func runOne(
 	gateReg chan<- gateRegistration,
 	emit func(event.Event),
 ) (res result) {
-	ctx2 := WithPrepared(withGateReg(withEmit(withToolUseID(withCallID(ctx, r.callID), r.block.ID), emit), gateReg), r.prepared)
+	ctx2 := WithPreparedCall(withGateReg(withEmit(withToolUseID(withCallID(ctx, r.callID), r.block.ID), emit), gateReg), r.prepared)
 	ctx2 = WithUserInputRequester(ctx2, RequestUserInput)
-	// Nest any pre-ask escalation grants onto the per-call ctx so the tool's
-	// InvokableRun reads them via tool.GrantsFromContext (feeding the merge with the
-	// tool's own arg-borne grants). Only when present, so a grant-free call's ctx is
-	// untouched.
-	if len(r.grants) > 0 {
-		ctx2 = tool.WithGrants(ctx2, r.grants)
-	}
 
 	defer func() {
 		if rec := recover(); rec != nil {

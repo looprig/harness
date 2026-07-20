@@ -225,6 +225,15 @@ func (s *SubagentTool) Info(context.Context) (*tool.ToolInfo, error) {
 // sensitive context and never reach the audit event.
 func (s *SubagentTool) AuditSummary(string) string { return "Subagent" }
 
+// PrepareCall implements the mandatory tool preparation capability with a pure
+// empty request: delegation needs no OS capability, resource grant, or durable
+// rule, so the combined gate auto-allows it (the tool's historical AutoApprove
+// posture). Argument validation stays in InvokableRun, whose failures are
+// model-visible tool-result strings.
+func (s *SubagentTool) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{}, nil, nil
+}
+
 // InvokableRun parses the untrusted envelope, validates it at the boundary, translates
 // it into a tool.DelegateRequest, and forwards it to the parent-scoped controller.
 // Every failure is a tool-result error STRING; it never returns a Go error.
@@ -459,5 +468,6 @@ func statusLabel(status tool.DelegateStatusValue) string {
 // deliberately NOT a PermissionPrompter (AutoApprove) and NOT a WriteTarget.
 var (
 	_ tool.InvokableTool = (*SubagentTool)(nil)
+	_ tool.CallPreparer  = (*SubagentTool)(nil)
 	_ tool.Auditable     = (*SubagentTool)(nil)
 )

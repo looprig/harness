@@ -14,6 +14,8 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	gatedomain "github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -22,26 +24,31 @@ import (
 // ---------------------------------------------------------------------------
 
 // fakeRunTool is the minimal configurable InvokableTool for runner tests: it
-// implements ONLY BaseTool + InvokableTool, NONE of the optional capability
-// interfaces. Capabilities are added by the embedding wrapper types below
-// (sequentialTool, auditTool, promptTool, writeKeyTool), so each test opts into
-// exactly the capabilities it needs — exactly as the runner probes via type
-// assertion. It records concurrency and ordering so tests can assert
-// serialization/parallelism, and can be made to panic, error, or return empty.
+// implements BaseTool + InvokableTool + the now-mandatory CallPreparer (a tool
+// without a preparation step fails closed; unpreparedRunTool covers that case).
+// Its default preparation is a pure empty request; prepareFn overrides it.
+// Other optional capabilities are added by the embedding wrapper types below
+// (sequentialTool, auditTool, writeKeyTool), so each test opts into exactly the
+// capabilities it needs — exactly as the runner probes via type assertion. It
+// records concurrency and ordering so tests can assert serialization/
+// parallelism, and can be made to panic, error, or return empty.
 type fakeRunTool struct {
 	name string
 
 	// run hooks
-	panicMsg string        // non-empty → panic with this message
-	runErr   error         // non-nil → InvokableRun returns (nil, runErr)
-	empty    bool          // true → return a ToolResult with no Content
-	output   string        // text content of the result on success
-	delay    time.Duration // sleep inside run to widen the concurrency window
+	panicMsg string                    // non-empty → panic with this message
+	runErr   error                     // non-nil → InvokableRun returns (nil, runErr)
+	empty    bool                      // true → return a ToolResult with no Content
+	output   string                    // text content of the result on success
+	delay    time.Duration             // sleep inside run to widen the concurrency window
+	onRun    func(ctx context.Context) // observation hook invoked at the start of InvokableRun
+
+	// prepareFn overrides the default pure (empty-request) preparation.
+	prepareFn func(executionID uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error)
 
 	// capability config consumed by the wrapper types (not by fakeRunTool itself).
 	sequential bool
 	auditFn    func(argsJSON string) string
-	promptFn   func(argsJSON string) (tool.PermissionRequest, error)
 	writeFn    func(argsJSON string) (string, bool, error)
 
 	// observed state
@@ -57,7 +64,17 @@ func (f *fakeRunTool) Info(ctx context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{Name: f.name}, nil
 }
 
+func (f *fakeRunTool) PrepareCall(_ context.Context, executionID uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error) {
+	if f.prepareFn != nil {
+		return f.prepareFn(executionID, argsJSON)
+	}
+	return tool.Request{}, nil, nil
+}
+
 func (f *fakeRunTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+	if f.onRun != nil {
+		f.onRun(ctx)
+	}
 	atomic.AddInt32(&f.totalRuns, 1)
 	cur := atomic.AddInt32(&f.live, 1)
 	for {
@@ -105,13 +122,6 @@ type auditTool struct{ *fakeRunTool }
 
 func (a auditTool) AuditSummary(argsJSON string) string { return a.fakeRunTool.auditFn(argsJSON) }
 
-// promptTool adds the PermissionPrompter capability.
-type promptTool struct{ *fakeRunTool }
-
-func (p promptTool) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
-	return p.fakeRunTool.promptFn(argsJSON)
-}
-
 // writeKeyTool adds the WriteTarget capability.
 type writeKeyTool struct{ *fakeRunTool }
 
@@ -119,62 +129,30 @@ func (w writeKeyTool) WriteTarget(argsJSON string) (string, bool, error) {
 	return w.fakeRunTool.writeFn(argsJSON)
 }
 
-// Compile-time assertions that fakeRunTool implements ONLY the base interface and
-// the wrappers each add exactly one optional capability.
+// Compile-time assertions that fakeRunTool implements the base interface + the
+// mandatory preparation capability, and the wrappers each add exactly one
+// optional capability.
 var (
-	_ tool.InvokableTool      = (*fakeRunTool)(nil)
-	_ tool.Sequential         = sequentialTool{}
-	_ tool.Auditable          = auditTool{}
-	_ tool.PermissionPrompter = promptTool{}
-	_ tool.WriteTarget        = writeKeyTool{}
+	_ tool.InvokableTool = (*fakeRunTool)(nil)
+	_ tool.CallPreparer  = (*fakeRunTool)(nil)
+	_ tool.Sequential    = sequentialTool{}
+	_ tool.Auditable     = auditTool{}
+	_ tool.WriteTarget   = writeKeyTool{}
 )
 
-// fakePermissionGate is a configurable PermissionGate. checkFn returns the Effect
-// per call; grantErr (if set) makes Grant fail. It records grant calls.
-type fakePermissionGate struct {
-	checkFn  func(name, argsJSON string) Effect
-	grantErr error
-
-	mu         sync.Mutex
-	grants     []grantRecord
-	checkCalls []string
-	granted    map[string]bool // name → granted (for session-grant visibility)
-}
-
-type grantRecord struct {
-	name      string
-	args      string
-	scope     tool.ApprovalScope
-	ctxGrants []string // grants tool.WithGrants placed on the ctx handed to Grant
-}
-
-func (g *fakePermissionGate) Check(ctx context.Context, t tool.InvokableTool, name, argsJSON string) Effect {
-	g.mu.Lock()
-	g.checkCalls = append(g.checkCalls, name)
-	g.mu.Unlock()
-	return g.checkFn(name, argsJSON)
-}
-
-func (g *fakePermissionGate) Grant(ctx context.Context, name, argsJSON string, scope tool.ApprovalScope) error {
-	g.mu.Lock()
-	g.grants = append(g.grants, grantRecord{name: name, args: argsJSON, scope: scope, ctxGrants: tool.GrantsFromContext(ctx)})
-	if g.granted == nil {
-		g.granted = map[string]bool{}
-	}
-	g.granted[name] = true
-	g.mu.Unlock()
-	return g.grantErr
-}
-
-// autoApproveGate approves everything (the common case for tests that don't
-// exercise permission).
+// autoApproveGate is an AccessGate that approves everything without grants
+// (the common case for tests that don't exercise access).
 type autoApproveGate struct{}
 
-func (autoApproveGate) Check(ctx context.Context, t tool.InvokableTool, name, argsJSON string) Effect {
-	return EffectAutoApprove
+func (autoApproveGate) Authorize(context.Context, tool.Request) (gatedomain.Resolution, error) {
+	return gatedomain.Resolution{Approved: true}, nil
 }
-func (autoApproveGate) Grant(ctx context.Context, name, argsJSON string, scope tool.ApprovalScope) error {
-	return nil
+
+// denyAllGate is an AccessGate that denies everything (a configured deny).
+type denyAllGate struct{}
+
+func (denyAllGate) Authorize(context.Context, tool.Request) (gatedomain.Resolution, error) {
+	return gatedomain.Resolution{}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -250,7 +228,7 @@ func TestRunBatch_UnknownTool(t *testing.T) {
 	t.Parallel()
 	good := &fakeRunTool{name: "Good", output: "did it"}
 	ts := ToolSet{
-		Permission:           autoApproveGate{},
+		Access:               autoApproveGate{},
 		Registry:             []tool.InvokableTool{good},
 		MaxParallelToolCalls: 4,
 	}
@@ -285,7 +263,7 @@ func TestRunBatch_ResultOrderMatchesCalls(t *testing.T) {
 	t.Parallel()
 	a := &fakeRunTool{name: "A", output: "ra"}
 	b := &fakeRunTool{name: "B", output: "rb"}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{a, b}, MaxParallelToolCalls: 4}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{a, b}, MaxParallelToolCalls: 4}
 	emit, _ := collectEmit()
 	calls := []content.ToolUseBlock{call(t, "B", `{}`), call(t, "A", `{}`)}
 	results := runBatchNoGate(context.Background(), calls, ts, emit)
@@ -313,7 +291,7 @@ func TestRunBatch_ToolExecutionIDBindsToProviderToolUseID(t *testing.T) {
 	a := &fakeRunTool{name: "A", output: "ra"}
 	b := &fakeRunTool{name: "B", output: "rb"}
 	c := &fakeRunTool{name: "C", output: "rc"}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{a, b, c}, MaxParallelToolCalls: 4}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{a, b, c}, MaxParallelToolCalls: 4}
 	emit, _ := collectEmit()
 	calls := []content.ToolUseBlock{call(t, "A", `{}`), call(t, "B", `{}`), call(t, "C", `{}`)}
 	results := runBatchNoGate(context.Background(), calls, ts, emit)
@@ -351,7 +329,7 @@ func TestRunBatch_ToolExecutionIDBindsToProviderToolUseID(t *testing.T) {
 func TestRunBatch_InvalidJSONArgs(t *testing.T) {
 	t.Parallel()
 	good := &fakeRunTool{name: "Good", output: "ok"}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{good}, MaxParallelToolCalls: 4}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{good}, MaxParallelToolCalls: 4}
 	emit, getEvents := collectEmit()
 	calls := []content.ToolUseBlock{call(t, "Good", `{not json`)}
 	results := runBatchNoGate(context.Background(), calls, ts, emit)
@@ -374,7 +352,7 @@ func TestRunBatch_SequentialDrainsFirst(t *testing.T) {
 	seqInner := &fakeRunTool{name: "Seq", sequential: true, output: "s", delay: 30 * time.Millisecond}
 	seq := sequentialTool{seqInner}
 	par := &fakeRunTool{name: "Par", output: "p", delay: 5 * time.Millisecond}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{seq, par}, MaxParallelToolCalls: 4}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{seq, par}, MaxParallelToolCalls: 4}
 	emit, _ := collectEmit()
 	calls := []content.ToolUseBlock{call(t, "Par", `{}`), call(t, "Seq", `{}`), call(t, "Par", `{}`)}
 	runBatchNoGate(context.Background(), calls, ts, emit)
@@ -392,34 +370,55 @@ func TestRunBatch_SequentialDrainsFirst(t *testing.T) {
 	}
 }
 
-// TestRunBatch_SessionGrantVisibility: a gate that asks for call 1 then (after a
-// Grant) auto-approves call 2 — call 2 must not be prompted.
-func TestRunBatch_SessionGrantVisibility(t *testing.T) {
+// writerBackedMatcher satisfies a gated requirement when a matching allow
+// candidate was previously persisted through its recordingRuleWriter — the
+// minimal durable-rule store for sequential-visibility tests.
+type writerBackedMatcher struct{ writer *recordingRuleWriter }
+
+func (writerBackedMatcher) MatchesDeny(context.Context, tool.Requirement) (bool, error) {
+	return false, nil
+}
+
+func (m writerBackedMatcher) MatchesAllow(_ context.Context, requirement tool.Requirement) (bool, error) {
+	for _, batch := range m.writer.batches() {
+		for _, candidate := range batch {
+			if candidate.Kind == requirement.Kind && candidate.GrantTarget == requirement.GrantTarget {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// TestRunBatch_WorkspaceRuleVisibleToLaterCall: an Approve-always on call 1
+// persists the displayed candidate, and the SEQUENTIAL access resolution makes
+// that rule satisfy call 2 without a second prompt.
+func TestRunBatch_WorkspaceRuleVisibleToLaterCall(t *testing.T) {
 	t.Parallel()
 	tl := &fakeRunTool{name: "T", output: "ok"}
-	pt := promptTool{fakeRunTool: tl}
-	tl.promptFn = func(argsJSON string) (tool.PermissionRequest, error) {
-		return tool.UnknownRequest{Tool: "T", Summary: "do"}, nil
+	tl.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status", false), nil, nil
 	}
-	gate := &fakePermissionGate{}
-	gate.checkFn = func(name, argsJSON string) Effect {
-		gate.mu.Lock()
-		granted := gate.granted["T"]
-		gate.mu.Unlock()
-		if granted {
-			return EffectAutoApprove
-		}
-		return EffectAsk
+	writer := &recordingRuleWriter{}
+	evaluator, err := gatedomain.NewInteractiveEvaluator(
+		accessBindings(gatedomain.AccessGated),
+		writerBackedMatcher{writer: writer},
+		loop.GateApprover(),
+		writer,
+		&recordingIssuer{},
+	)
+	if err != nil {
+		t.Fatalf("NewInteractiveEvaluator() error = %v", err)
 	}
-	ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{pt}, MaxParallelToolCalls: 4}
+	ts := ToolSet{Access: evaluator, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
 	emit, getEvents := collectEmit()
 
 	gateReg := make(chan gateRegistration)
-	// Fake actor: approve the single permission gate with ScopeSession.
+	// Fake actor: approve the single permission gate for the whole workspace.
 	go func() {
 		reg := <-gateReg
 		close(reg.ack)
-		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeSession}
+		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeWorkspace}
 	}()
 
 	calls := []content.ToolUseBlock{call(t, "T", `{"n":1}`), call(t, "T", `{"n":2}`)}
@@ -436,13 +435,10 @@ func TestRunBatch_SessionGrantVisibility(t *testing.T) {
 		}
 	}
 	if nPerm != 1 {
-		t.Errorf("PermissionRequested count = %d, want 1 (call 2 must be auto-approved by the session grant)", nPerm)
+		t.Errorf("PermissionRequested count = %d, want 1 (call 2 must be satisfied by the persisted rule)", nPerm)
 	}
-	gate.mu.Lock()
-	nGrants := len(gate.grants)
-	gate.mu.Unlock()
-	if nGrants != 1 || gate.grants[0].scope != tool.ScopeSession {
-		t.Errorf("grants = %+v, want 1 ScopeSession", gate.grants)
+	if len(writer.batches()) != 1 {
+		t.Errorf("writer batches = %d, want 1 (one atomic Approve-always persistence)", len(writer.batches()))
 	}
 }
 
@@ -451,7 +447,7 @@ func TestRunBatch_SessionGrantVisibility(t *testing.T) {
 func TestRunBatch_MaxParallelCap(t *testing.T) {
 	t.Parallel()
 	tl := &fakeRunTool{name: "P", output: "ok", delay: 20 * time.Millisecond}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 2}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 2}
 	emit, _ := collectEmit()
 	var calls []content.ToolUseBlock
 	for i := 0; i < 6; i++ {
@@ -481,7 +477,7 @@ func TestRunBatch_SameWriteTargetSerializes(t *testing.T) {
 		}
 		return a.Path, true, nil
 	}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{wt}, MaxParallelToolCalls: 8}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{wt}, MaxParallelToolCalls: 8}
 	emit, _ := collectEmit()
 	// Two calls to /same, two to different paths.
 	calls := []content.ToolUseBlock{
@@ -499,7 +495,7 @@ func TestRunBatch_SameWriteTargetSerializes(t *testing.T) {
 	tl2 := &fakeRunTool{name: "W", output: "ok", delay: 25 * time.Millisecond}
 	wt2 := writeKeyTool{fakeRunTool: tl2}
 	tl2.writeFn = tl.writeFn
-	ts2 := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{wt2}, MaxParallelToolCalls: 8}
+	ts2 := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{wt2}, MaxParallelToolCalls: 8}
 	calls2 := []content.ToolUseBlock{
 		call(t, "W", `{"path":"/a"}`),
 		call(t, "W", `{"path":"/b"}`),
@@ -519,7 +515,7 @@ func TestRunBatch_WriteTargetError(t *testing.T) {
 	tl.writeFn = func(argsJSON string) (string, bool, error) {
 		return "", false, errors.New("bad target")
 	}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{wt}, MaxParallelToolCalls: 4}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{wt}, MaxParallelToolCalls: 4}
 	emit, getEvents := collectEmit()
 	calls := []content.ToolUseBlock{call(t, "W", `{}`)}
 	results := runBatchNoGate(context.Background(), calls, ts, emit)
@@ -541,7 +537,7 @@ func TestRunBatch_PanicRecovered(t *testing.T) {
 	t.Parallel()
 	boom := &fakeRunTool{name: "Boom", panicMsg: "kaboom"}
 	ok := &fakeRunTool{name: "OK", output: "fine"}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{boom, ok}, MaxParallelToolCalls: 4}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{boom, ok}, MaxParallelToolCalls: 4}
 	emit, _ := collectEmit()
 	calls := []content.ToolUseBlock{call(t, "Boom", `{}`), call(t, "OK", `{}`)}
 	results := runBatchNoGate(context.Background(), calls, ts, emit)
@@ -561,7 +557,7 @@ func TestRunBatch_SummaryHasNoSecret(t *testing.T) {
 	inner := &fakeRunTool{name: "Audit", output: "ok"}
 	inner.auditFn = func(argsJSON string) string { return "Audit /safe/path" }
 	tl := auditTool{inner}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
 	emit, getEvents := collectEmit()
 	calls := []content.ToolUseBlock{call(t, "Audit", `{"token":"`+secret+`"}`)}
 	runBatchNoGate(context.Background(), calls, ts, emit)
@@ -595,7 +591,7 @@ func TestRunBatch_AuditToleratesInvalidJSON(t *testing.T) {
 		return "Audit summary"
 	}
 	tl := auditTool{inner}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
 	emit, getEvents := collectEmit()
 	calls := []content.ToolUseBlock{call(t, "Audit", `{bad`)}
 	runBatchNoGate(context.Background(), calls, ts, emit)
@@ -616,7 +612,7 @@ func TestRunBatch_AllStartedBeforeAnyCompleted(t *testing.T) {
 	t.Parallel()
 	tl := &fakeRunTool{name: "P", output: "ok", delay: 5 * time.Millisecond}
 	unknown := "Ghost"
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 2}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 2}
 	emit, getEvents := collectEmit()
 	var calls []content.ToolUseBlock
 	for i := 0; i < 5; i++ {
@@ -648,7 +644,7 @@ func TestRunBatch_FailureVisibility(t *testing.T) {
 		{
 			name: "unknown tool",
 			setup: func(t *testing.T) (ToolSet, content.ToolUseBlock, chan gateRegistration) {
-				ts := ToolSet{Permission: autoApproveGate{}, Registry: nil, MaxParallelToolCalls: 2}
+				ts := ToolSet{Access: autoApproveGate{}, Registry: nil, MaxParallelToolCalls: 2}
 				return ts, call(t, "Nope", `{}`), make(chan gateRegistration)
 			},
 			wantInErr: "unknown tool",
@@ -657,17 +653,16 @@ func TestRunBatch_FailureVisibility(t *testing.T) {
 			name: "invalid json args",
 			setup: func(t *testing.T) (ToolSet, content.ToolUseBlock, chan gateRegistration) {
 				tl := &fakeRunTool{name: "T", output: "ok"}
-				ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 2}
+				ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 2}
 				return ts, call(t, "T", `{bad`), make(chan gateRegistration)
 			},
 			wantInErr: "invalid tool arguments",
 		},
 		{
-			name: "permission denied via Check",
+			name: "permission denied via access evaluation",
 			setup: func(t *testing.T) (ToolSet, content.ToolUseBlock, chan gateRegistration) {
 				tl := &fakeRunTool{name: "T", output: "ok"}
-				gate := &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectDeny }}
-				ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 2}
+				ts := ToolSet{Access: denyAllGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 2}
 				return ts, call(t, "T", `{}`), make(chan gateRegistration)
 			},
 			wantInErr: "permission denied",
@@ -676,12 +671,14 @@ func TestRunBatch_FailureVisibility(t *testing.T) {
 			name: "permission denied via gate Deny",
 			setup: func(t *testing.T) (ToolSet, content.ToolUseBlock, chan gateRegistration) {
 				tl := &fakeRunTool{name: "T", output: "ok"}
-				pt := promptTool{fakeRunTool: tl}
-				tl.promptFn = func(string) (tool.PermissionRequest, error) {
-					return tool.UnknownRequest{Tool: "T", Summary: "x"}, nil
+				tl.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+					return commandRequest(executionID, "git status", false), nil, nil
 				}
-				gate := &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectAsk }}
-				ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{pt}, MaxParallelToolCalls: 2}
+				ts := ToolSet{
+					Access:               interactiveEvaluator(t, gatedomain.AccessGated, &recordingRuleWriter{}, &recordingIssuer{}),
+					Registry:             []tool.InvokableTool{tl},
+					MaxParallelToolCalls: 2,
+				}
 				gateReg := make(chan gateRegistration)
 				go func() {
 					reg := <-gateReg
@@ -693,12 +690,20 @@ func TestRunBatch_FailureVisibility(t *testing.T) {
 			wantInErr: "permission denied",
 		},
 		{
+			name: "unprepared tool",
+			setup: func(t *testing.T) (ToolSet, content.ToolUseBlock, chan gateRegistration) {
+				ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{unpreparedRunTool{name: "T"}}, MaxParallelToolCalls: 2}
+				return ts, call(t, "T", `{}`), make(chan gateRegistration)
+			},
+			wantInErr: "tool has no call preparation",
+		},
+		{
 			name: "WriteTarget error",
 			setup: func(t *testing.T) (ToolSet, content.ToolUseBlock, chan gateRegistration) {
 				tl := &fakeRunTool{name: "W", output: "ok"}
 				wt := writeKeyTool{fakeRunTool: tl}
 				tl.writeFn = func(string) (string, bool, error) { return "", false, errors.New("bad target") }
-				ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{wt}, MaxParallelToolCalls: 2}
+				ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{wt}, MaxParallelToolCalls: 2}
 				return ts, call(t, "W", `{}`), make(chan gateRegistration)
 			},
 			// Assert the specific WriteTarget-failure message (prefix + cause), not
@@ -783,9 +788,9 @@ func TestRunBatch_IDGenFailure(t *testing.T) {
 
 			tl := &fakeRunTool{name: "T", output: "ran"}
 			// A gate that records whether it is ever consulted: a failed-mint call
-			// must never reach Check (no gate opened for a call with no ToolExecutionID).
-			gate := &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectAutoApprove }}
-			ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
+			// must never reach Authorize (no gate opened for a call with no ToolExecutionID).
+			gate := &countingAccessGate{resolution: gatedomain.Resolution{Approved: true}}
+			ts := ToolSet{Access: gate, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
 
 			emit, getEvents := collectEmit()
 
@@ -832,14 +837,11 @@ func TestRunBatch_IDGenFailure(t *testing.T) {
 				t.Errorf("tool ran %d times, want %d (failed-mint calls must not execute)", got, tt.wantRuns)
 			}
 
-			// No gate (Check) consulted for a failed-mint call: Check is only reached
-			// by executable calls, so the consult count equals the number of working
-			// calls.
-			gate.mu.Lock()
-			nChecks := len(gate.checkCalls)
-			gate.mu.Unlock()
-			if want := tt.nCalls - len(tt.failMints); nChecks != want {
-				t.Errorf("Check consulted %d times, want %d (no gate for failed-mint call)", nChecks, want)
+			// No access authorization for a failed-mint call: Authorize is only
+			// reached by executable calls, so the consult count equals the number
+			// of working calls.
+			if nChecks, want := len(gate.authorized()), tt.nCalls-len(tt.failMints); nChecks != want {
+				t.Errorf("Authorize consulted %d times, want %d (no gate for failed-mint call)", nChecks, want)
 			}
 
 			// Every requested call still gets exactly one Started + one Completed.
@@ -856,12 +858,12 @@ func TestRunBatch_PermissionDecisionAuditAutoApproveAndDeny(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		effect     Effect
+		access     loop.AccessGate
 		wantEffect event.PermissionDecisionEffect
 		wantError  bool
 	}{
-		{name: "auto approve", effect: EffectAutoApprove, wantEffect: event.PermissionEffectApprove},
-		{name: "auto deny", effect: EffectDeny, wantEffect: event.PermissionEffectDeny, wantError: true},
+		{name: "auto approve", access: autoApproveGate{}, wantEffect: event.PermissionEffectApprove},
+		{name: "auto deny", access: denyAllGate{}, wantEffect: event.PermissionEffectDeny, wantError: true},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -872,8 +874,8 @@ func TestRunBatch_PermissionDecisionAuditAutoApproveAndDeny(t *testing.T) {
 				return "T redacted"
 			}}
 			ts := ToolSet{
-				Permission: &fakePermissionGate{checkFn: func(name, args string) Effect { return tt.effect }},
-				Registry:   []tool.InvokableTool{auditTool{tl}},
+				Access:   tt.access,
+				Registry: []tool.InvokableTool{auditTool{tl}},
 			}
 			emit, getEvents := collectEmit()
 
@@ -914,12 +916,13 @@ func TestRunBatch_PermissionDecisionAuditAutoApproveAndDeny(t *testing.T) {
 func TestRunBatch_PermissionDecisionAuditSkipsGatedAsk(t *testing.T) {
 	t.Parallel()
 
-	tl := &fakeRunTool{name: "T", output: "ran", promptFn: func(argsJSON string) (tool.PermissionRequest, error) {
-		return tool.UnknownRequest{Tool: "T", Summary: "redacted"}, nil
-	}}
+	tl := &fakeRunTool{name: "T", output: "ran"}
+	tl.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status", false), nil, nil
+	}
 	ts := ToolSet{
-		Permission: &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectAsk }},
-		Registry:   []tool.InvokableTool{promptTool{tl}},
+		Access:   interactiveEvaluator(t, gatedomain.AccessGated, &recordingRuleWriter{}, &recordingIssuer{}),
+		Registry: []tool.InvokableTool{tl},
 	}
 	emit, getEvents := collectEmit()
 	gateReg := make(chan gateRegistration)
@@ -958,7 +961,7 @@ func TestRunBatch_ResultPreviewCapped(t *testing.T) {
 	big := strings.Repeat("x", previewMaxBytes*2)
 	tl := &fakeRunTool{name: "Big", output: big}
 	small := &fakeRunTool{name: "Small", output: "tiny"}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{tl, small}, MaxParallelToolCalls: 4}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{tl, small}, MaxParallelToolCalls: 4}
 	emit, getEvents := collectEmit()
 	calls := []content.ToolUseBlock{call(t, "Big", `{}`), call(t, "Small", `{}`)}
 	RunBatch(context.Background(), calls, ts, make(chan gateRegistration), uuid.New, emit)
@@ -993,7 +996,7 @@ func TestRunBatch_PreviewLineCap(t *testing.T) {
 		sb.WriteString("line\n")
 	}
 	tl := &fakeRunTool{name: "Lines", output: sb.String()}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
 	emit, getEvents := collectEmit()
 	RunBatch(context.Background(), []content.ToolUseBlock{call(t, "Lines", `{}`)}, ts, make(chan gateRegistration), uuid.New, emit)
 	var preview string
@@ -1011,20 +1014,21 @@ func TestRunBatch_PreviewLineCap(t *testing.T) {
 	}
 }
 
-// TestRunBatch_GrantErrorStillExecutes: a Grant failure must not fail the call —
-// it still executes (the user approved it); Grant error is only logged.
-func TestRunBatch_GrantErrorStillExecutes(t *testing.T) {
+// TestRunBatch_WriterErrorFailsClosed: an Approve-always whose atomic rule
+// persistence fails BLOCKS execution (the spec makes persistence failure a
+// fail-closed condition, never a best-effort log line).
+func TestRunBatch_WriterErrorFailsClosed(t *testing.T) {
 	t.Parallel()
 	tl := &fakeRunTool{name: "T", output: "executed"}
-	pt := promptTool{fakeRunTool: tl}
-	tl.promptFn = func(string) (tool.PermissionRequest, error) {
-		return tool.UnknownRequest{Tool: "T", Summary: "x"}, nil
+	tl.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status", false), nil, nil
 	}
-	gate := &fakePermissionGate{
-		checkFn:  func(name, args string) Effect { return EffectAsk },
-		grantErr: errors.New("disk full"),
+	writer := &recordingRuleWriter{err: errors.New("disk full")}
+	ts := ToolSet{
+		Access:               interactiveEvaluator(t, gatedomain.AccessGated, writer, &recordingIssuer{}),
+		Registry:             []tool.InvokableTool{tl},
+		MaxParallelToolCalls: 4,
 	}
-	ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{pt}, MaxParallelToolCalls: 4}
 	emit, _ := collectEmit()
 	gateReg := make(chan gateRegistration)
 	go func() {
@@ -1033,214 +1037,11 @@ func TestRunBatch_GrantErrorStillExecutes(t *testing.T) {
 		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeWorkspace}
 	}()
 	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
-	if results[0].IsError {
-		t.Errorf("result = %+v, want success despite Grant error", results[0])
+	if !results[0].IsError || !strings.Contains(resultText(results[0]), "permission denied") {
+		t.Errorf("result = %+v / %q, want fail-closed denial on persistence failure", results[0], resultText(results[0]))
 	}
-	if !strings.Contains(resultText(results[0]), "executed") {
-		t.Errorf("result text = %q, want execution to have happened", resultText(results[0]))
-	}
-	if atomic.LoadInt32(&tl.totalRuns) != 1 {
-		t.Errorf("tool ran %d times, want 1", tl.totalRuns)
-	}
-}
-
-// TestRunBatch_ScopeOnceNoGrant: approving with ScopeOnce must not call Grant.
-func TestRunBatch_ScopeOnceNoGrant(t *testing.T) {
-	t.Parallel()
-	tl := &fakeRunTool{name: "T", output: "ok"}
-	pt := promptTool{fakeRunTool: tl}
-	tl.promptFn = func(string) (tool.PermissionRequest, error) {
-		return tool.UnknownRequest{Tool: "T", Summary: "x"}, nil
-	}
-	gate := &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectAsk }}
-	ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{pt}, MaxParallelToolCalls: 4}
-	emit, _ := collectEmit()
-	gateReg := make(chan gateRegistration)
-	go func() {
-		reg := <-gateReg
-		close(reg.ack)
-		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeOnce}
-	}()
-	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
-	if results[0].IsError {
-		t.Fatalf("result = %+v, want success", results[0])
-	}
-	gate.mu.Lock()
-	nGrants := len(gate.grants)
-	gate.mu.Unlock()
-	if nGrants != 0 {
-		t.Errorf("Grant called %d times for ScopeOnce, want 0", nGrants)
-	}
-}
-
-// grantProbeTool records the escalation grants the runner placed on the per-call
-// ctx (tool.GrantsFromContext) at InvokableRun time, so a test can assert the
-// pre-ask approval's accepted grants reached the FIRST spawn's ctx.
-type grantProbeTool struct {
-	name    string
-	mu      sync.Mutex
-	seen    []string
-	sawCall bool
-}
-
-func (g *grantProbeTool) Info(ctx context.Context) (*tool.ToolInfo, error) {
-	return &tool.ToolInfo{Name: g.name}, nil
-}
-func (g *grantProbeTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
-	g.mu.Lock()
-	g.seen = tool.GrantsFromContext(ctx)
-	g.sawCall = true
-	g.mu.Unlock()
-	return tool.TextResult("ran"), nil
-}
-func (g *grantProbeTool) grants() []string {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.seen
-}
-
-// approveWithGrants drives a single permission gate, replying with an
-// ApproveToolCall carrying the given AcceptedGrants at the given scope.
-func approveWithGrants(gateReg chan gateRegistration, scope tool.ApprovalScope, grants []string) {
-	go func() {
-		reg := <-gateReg
-		close(reg.ack)
-		reg.reply <- command.ApproveToolCall{
-			GateRoute:      command.GateRoute{ToolExecutionID: reg.callID},
-			Scope:          scope,
-			AcceptedGrants: grants,
-		}
-	}()
-}
-
-// TestRunBatch_PreAskGrantsReachFirstSpawnCtx: an ApproveToolCall carrying
-// AcceptedGrants places those opaque tokens on the FIRST spawn's per-call ctx (so
-// tool.GrantsFromContext returns them at InvokableRun — the pre-ask escalation is
-// applied without a run-fail-rerun), AND, for a non-Once scope, Grant is handed a
-// grant-bearing ctx so it can derive+persist the deltas.
-func TestRunBatch_PreAskGrantsReachFirstSpawnCtx(t *testing.T) {
-	t.Parallel()
-	probe := &grantProbeTool{name: "T"}
-	gate := &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectAsk }}
-	ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{probe}, MaxParallelToolCalls: 4}
-	emit, _ := collectEmit()
-	gateReg := make(chan gateRegistration)
-	approveWithGrants(gateReg, tool.ScopeWorkspace, []string{"tok"})
-
-	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
-	if results[0].IsError {
-		t.Fatalf("result = %+v, want success", results[0])
-	}
-	if got := probe.grants(); len(got) != 1 || got[0] != "tok" {
-		t.Errorf("per-call ctx grants = %#v, want [\"tok\"]", got)
-	}
-	// The grant-bearing ctx reached Grant so it can persist the deltas.
-	gate.mu.Lock()
-	defer gate.mu.Unlock()
-	if len(gate.grants) != 1 {
-		t.Fatalf("Grant called %d times, want 1", len(gate.grants))
-	}
-	if g := gate.grants[0].ctxGrants; len(g) != 1 || g[0] != "tok" {
-		t.Errorf("Grant received ctx grants = %#v, want [\"tok\"]", g)
-	}
-}
-
-// TestRunBatch_PreAskGrantsOnceNoPersist: a Once-scope approval carrying
-// AcceptedGrants still delivers the grants to the per-call ctx (the single spawn is
-// escalated), but Grant is NOT called (Once persists nothing).
-func TestRunBatch_PreAskGrantsOnceNoPersist(t *testing.T) {
-	t.Parallel()
-	probe := &grantProbeTool{name: "T"}
-	gate := &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectAsk }}
-	ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{probe}, MaxParallelToolCalls: 4}
-	emit, _ := collectEmit()
-	gateReg := make(chan gateRegistration)
-	approveWithGrants(gateReg, tool.ScopeOnce, []string{"tok"})
-
-	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
-	if results[0].IsError {
-		t.Fatalf("result = %+v, want success", results[0])
-	}
-	if got := probe.grants(); len(got) != 1 || got[0] != "tok" {
-		t.Errorf("per-call ctx grants = %#v, want [\"tok\"] even for Once scope", got)
-	}
-	gate.mu.Lock()
-	defer gate.mu.Unlock()
-	if len(gate.grants) != 0 {
-		t.Errorf("Grant called %d times for ScopeOnce, want 0", len(gate.grants))
-	}
-}
-
-// TestRunBatch_NoGrantsCtxClean: a grant-free approval leaves the per-call ctx with
-// no grants (GrantsFromContext returns nil) — the pre-ask path is purely additive.
-func TestRunBatch_NoGrantsCtxClean(t *testing.T) {
-	t.Parallel()
-	probe := &grantProbeTool{name: "T"}
-	gate := &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectAsk }}
-	ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{probe}, MaxParallelToolCalls: 4}
-	emit, _ := collectEmit()
-	gateReg := make(chan gateRegistration)
-	approveWithGrants(gateReg, tool.ScopeWorkspace, nil)
-
-	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
-	if results[0].IsError {
-		t.Fatalf("result = %+v, want success", results[0])
-	}
-	if got := probe.grants(); got != nil {
-		t.Errorf("per-call ctx grants = %#v, want nil for a grant-free approval", got)
-	}
-}
-
-// autoApproveRemintGate is an EffectAutoApprove gate that ALSO implements the optional
-// ApprovedGrants re-mint method the runner probes by type assertion (SPEC §9.3
-// session-scope escalation). remint is the set of freshly-minted tokens it returns.
-type autoApproveRemintGate struct{ remint []string }
-
-func (autoApproveRemintGate) Check(context.Context, tool.InvokableTool, string, string) Effect {
-	return EffectAutoApprove
-}
-func (autoApproveRemintGate) Grant(context.Context, string, string, tool.ApprovalScope) error {
-	return nil
-}
-func (g autoApproveRemintGate) ApprovedGrants(_ context.Context, toolName, argsJSON string) []string {
-	return g.remint
-}
-
-// TestRunBatch_AutoApproveRemintReachesSpawnCtx: when Check auto-approves (no Ask
-// gate) and the gate re-mints tokens via the optional ApprovedGrants method, those
-// fresh tokens land on the spawn's per-call ctx (GrantsFromContext), so a session-
-// scope repeat escalation carries LIVE tokens without a prompt.
-func TestRunBatch_AutoApproveRemintReachesSpawnCtx(t *testing.T) {
-	t.Parallel()
-	probe := &grantProbeTool{name: "T"}
-	gate := autoApproveRemintGate{remint: []string{"remint-tok"}}
-	ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{probe}, MaxParallelToolCalls: 4}
-	emit, _ := collectEmit()
-
-	results := runBatchNoGate(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, emit)
-	if results[0].IsError {
-		t.Fatalf("result = %+v, want success", results[0])
-	}
-	if got := probe.grants(); len(got) != 1 || got[0] != "remint-tok" {
-		t.Errorf("per-call ctx grants = %#v, want [\"remint-tok\"] (re-minted on auto-approve)", got)
-	}
-}
-
-// TestRunBatch_AutoApproveNoRemintMethodCtxClean: a plain EffectAutoApprove gate that
-// does NOT implement ApprovedGrants leaves the spawn ctx grant-free (the probe is
-// purely additive — the common auto-approve path is unchanged).
-func TestRunBatch_AutoApproveNoRemintMethodCtxClean(t *testing.T) {
-	t.Parallel()
-	probe := &grantProbeTool{name: "T"}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{probe}, MaxParallelToolCalls: 4}
-	emit, _ := collectEmit()
-
-	results := runBatchNoGate(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, emit)
-	if results[0].IsError {
-		t.Fatalf("result = %+v, want success", results[0])
-	}
-	if got := probe.grants(); got != nil {
-		t.Errorf("per-call ctx grants = %#v, want nil (gate has no ApprovedGrants)", got)
+	if atomic.LoadInt32(&tl.totalRuns) != 0 {
+		t.Errorf("tool ran %d times, want 0", tl.totalRuns)
 	}
 }
 
@@ -1264,7 +1065,7 @@ func TestRunBatch_MiddlewareOutermostFirst(t *testing.T) {
 		}
 	}
 	ts := ToolSet{
-		Permission:           autoApproveGate{},
+		Access:               autoApproveGate{},
 		Registry:             []tool.InvokableTool{tl},
 		Middlewares:          []tool.ToolMiddleware{mw("outer"), mw("inner")},
 		MaxParallelToolCalls: 4,
@@ -1289,7 +1090,7 @@ func TestRunBatch_MiddlewareOutermostFirst(t *testing.T) {
 func TestRunBatch_EmptyResultInjected(t *testing.T) {
 	t.Parallel()
 	tl := &fakeRunTool{name: "E", empty: true}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
 	emit, _ := collectEmit()
 	results := runBatchNoGate(context.Background(), []content.ToolUseBlock{call(t, "E", `{}`)}, ts, emit)
 	if !results[0].IsError || !strings.Contains(resultText(results[0]), "empty result") {
@@ -1302,7 +1103,7 @@ func TestRunBatch_EmptyResultInjected(t *testing.T) {
 func TestRunBatch_ToolErrorBecomesResult(t *testing.T) {
 	t.Parallel()
 	tl := &fakeRunTool{name: "Err", runErr: errors.New("boom inside")}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
 	emit, _ := collectEmit()
 	results := runBatchNoGate(context.Background(), []content.ToolUseBlock{call(t, "Err", `{}`)}, ts, emit)
 	if !results[0].IsError || !strings.Contains(resultText(results[0]), "boom inside") {
@@ -1316,7 +1117,7 @@ func TestRunBatch_ToolErrorBecomesResult(t *testing.T) {
 func TestRunBatch_CtxInjectedPerCall(t *testing.T) {
 	t.Parallel()
 	asker := &ctxProbeTool{name: "Ask"}
-	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{asker}, MaxParallelToolCalls: 4}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{asker}, MaxParallelToolCalls: 4}
 	emit, getEvents := collectEmit()
 	gateReg := make(chan gateRegistration)
 	go func() {
@@ -1349,6 +1150,9 @@ type ctxProbeTool struct{ name string }
 func (c *ctxProbeTool) Info(ctx context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{Name: c.name}, nil
 }
+func (c *ctxProbeTool) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{}, nil, nil
+}
 func (c *ctxProbeTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
 	ans, err := RequestUserInput(ctx, "color?", []string{"green"})
 	if err != nil {
@@ -1362,12 +1166,14 @@ func (c *ctxProbeTool) InvokableRun(ctx context.Context, argsJSON string) (*tool
 func TestRunBatch_CtxCancelDuringGate(t *testing.T) {
 	t.Parallel()
 	tl := &fakeRunTool{name: "T", output: "ok"}
-	pt := promptTool{fakeRunTool: tl}
-	tl.promptFn = func(string) (tool.PermissionRequest, error) {
-		return tool.UnknownRequest{Tool: "T", Summary: "x"}, nil
+	tl.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status", false), nil, nil
 	}
-	gate := &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectAsk }}
-	ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{pt}, MaxParallelToolCalls: 4}
+	ts := ToolSet{
+		Access:               interactiveEvaluator(t, gatedomain.AccessGated, &recordingRuleWriter{}, &recordingIssuer{}),
+		Registry:             []tool.InvokableTool{tl},
+		MaxParallelToolCalls: 4,
+	}
 	emit, _ := collectEmit()
 	ctx, cancel := context.WithCancel(context.Background())
 	gateReg := make(chan gateRegistration)

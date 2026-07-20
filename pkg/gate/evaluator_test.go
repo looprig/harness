@@ -136,10 +136,10 @@ func TestGrantABIVersionPinned(t *testing.T) {
 }
 
 func TestNewEvaluatorRejectsUnsupportedGrantVersion(t *testing.T) {
-	_, err := NewEvaluator(nil, nil, nil, &stubGrantIssuer{version: 2})
+	_, err := newEvaluatorForTest(nil, nil, nil, &stubGrantIssuer{version: 2})
 	var evalErr *EvaluationError
 	if !errors.As(err, &evalErr) || evalErr.Kind != EvaluationGrantVersionUnsupported {
-		t.Fatalf("NewEvaluator(v2 issuer) error = %v, want grant_version_unsupported", err)
+		t.Fatalf("newEvaluatorForTest(v2 issuer) error = %v, want grant_version_unsupported", err)
 	}
 }
 
@@ -181,12 +181,12 @@ func TestEvaluatorAppliesAccessDenyBeforeStoredRules(t *testing.T) {
 	command := &stubAccessSource{version: CurrentAccessVersion, access: AccessGated}
 	network := &stubAccessSource{version: CurrentAccessVersion, access: AccessDeny}
 	matcher := &stubRuleMatcher{allows: map[string]bool{"command.execute": true, "network": true}}
-	evaluator, err := NewEvaluator([]AccessBinding{
+	evaluator, err := newEvaluatorForTest([]AccessBinding{
 		{Kind: "command.execute", Source: command},
 		{Kind: "network", Source: network},
 	}, matcher, nil, nil)
 	if err != nil {
-		t.Fatalf("NewEvaluator() error = %v", err)
+		t.Fatalf("newEvaluatorForTest() error = %v", err)
 	}
 
 	result, err := evaluator.Evaluate(context.Background(), validCombinedRequest())
@@ -202,11 +202,11 @@ func TestEvaluatorAppliesAccessDenyBeforeStoredRules(t *testing.T) {
 }
 
 func TestEvaluatorFailsClosedOnAccessRoutingError(t *testing.T) {
-	evaluator, err := NewEvaluator([]AccessBinding{
+	evaluator, err := newEvaluatorForTest([]AccessBinding{
 		{Kind: "command.execute", Source: &stubAccessSource{version: CurrentAccessVersion, access: AccessGated}},
 	}, nil, nil, nil)
 	if err != nil {
-		t.Fatalf("NewEvaluator() error = %v", err)
+		t.Fatalf("newEvaluatorForTest() error = %v", err)
 	}
 
 	// The combined request contains a network requirement with no bound source.
@@ -224,12 +224,12 @@ func TestEvaluatorChecksEveryStoredDenyBeforeAnyAllow(t *testing.T) {
 		denies: map[string]bool{"network": true},
 		allows: map[string]bool{"command.execute": true, "network": true},
 	}
-	evaluator, err := NewEvaluator([]AccessBinding{
+	evaluator, err := newEvaluatorForTest([]AccessBinding{
 		{Kind: "command.execute", Source: command},
 		{Kind: "network", Source: network},
 	}, matcher, nil, nil)
 	if err != nil {
-		t.Fatalf("NewEvaluator() error = %v", err)
+		t.Fatalf("newEvaluatorForTest() error = %v", err)
 	}
 
 	result, err := evaluator.Evaluate(context.Background(), validCombinedRequest())
@@ -249,12 +249,12 @@ func TestEvaluatorReturnsOneCombinedUnmetSet(t *testing.T) {
 	command := &stubAccessSource{version: CurrentAccessVersion, access: AccessGated}
 	network := &stubAccessSource{version: CurrentAccessVersion, access: AccessGated}
 	matcher := &stubRuleMatcher{}
-	evaluator, err := NewEvaluator([]AccessBinding{
+	evaluator, err := newEvaluatorForTest([]AccessBinding{
 		{Kind: "command.execute", Source: command},
 		{Kind: "network", Source: network},
 	}, matcher, nil, nil)
 	if err != nil {
-		t.Fatalf("NewEvaluator() error = %v", err)
+		t.Fatalf("newEvaluatorForTest() error = %v", err)
 	}
 
 	result, err := evaluator.Evaluate(context.Background(), validCombinedRequest())
@@ -277,12 +277,12 @@ func TestEvaluatorPartialSavedAllowLeavesOnlyUnmetCapability(t *testing.T) {
 	command := &stubAccessSource{version: CurrentAccessVersion, access: AccessGated}
 	network := &stubAccessSource{version: CurrentAccessVersion, access: AccessGated}
 	matcher := &stubRuleMatcher{allows: map[string]bool{"command.execute": true}}
-	evaluator, err := NewEvaluator([]AccessBinding{
+	evaluator, err := newEvaluatorForTest([]AccessBinding{
 		{Kind: "command.execute", Source: command},
 		{Kind: "network", Source: network},
 	}, matcher, nil, nil)
 	if err != nil {
-		t.Fatalf("NewEvaluator() error = %v", err)
+		t.Fatalf("newEvaluatorForTest() error = %v", err)
 	}
 
 	result, err := evaluator.Evaluate(context.Background(), validCombinedRequest())
@@ -302,7 +302,7 @@ func TestResolveApproveWritesNothingAndMintsExactGrants(t *testing.T) {
 	network := &stubAccessSource{version: CurrentAccessVersion, access: AccessGated}
 	writer := &stubRuleWriter{}
 	issuer := &stubGrantIssuer{tokens: []string{"secret-command-token", "secret-network-token"}}
-	evaluator, err := NewEvaluator([]AccessBinding{
+	evaluator, err := newEvaluatorForTest([]AccessBinding{
 		{Kind: "command.execute", Source: command},
 		{Kind: "network", Source: network},
 	}, &stubRuleMatcher{}, writer, issuer)
@@ -339,7 +339,7 @@ func TestResolveSavedFamilyAllowStillMintsExactCommandGrant(t *testing.T) {
 	// exact normalized command target, not the matched rule.
 	matcher := &stubRuleMatcher{allows: map[string]bool{"command.execute": true, "network": true}}
 	issuer := &stubGrantIssuer{}
-	evaluator, err := NewEvaluator([]AccessBinding{
+	evaluator, err := newEvaluatorForTest([]AccessBinding{
 		{Kind: "command.execute", Source: &stubAccessSource{version: CurrentAccessVersion, access: AccessGated}},
 		{Kind: "network", Source: &stubAccessSource{version: CurrentAccessVersion, access: AccessGated}},
 	}, matcher, nil, issuer)
@@ -407,7 +407,7 @@ func TestResolveApproveAlwaysPersistenceFailureMintsNoGrants(t *testing.T) {
 }
 
 func TestResolveFailsClosedWithoutConfiguredWriterOrIssuer(t *testing.T) {
-	evaluator, err := NewEvaluator([]AccessBinding{
+	evaluator, err := newEvaluatorForTest([]AccessBinding{
 		{Kind: "command.execute", Source: &stubAccessSource{version: CurrentAccessVersion, access: AccessGated}},
 		{Kind: "network", Source: &stubAccessSource{version: CurrentAccessVersion, access: AccessGated}},
 	}, &stubRuleMatcher{}, nil, nil)
@@ -436,7 +436,7 @@ func TestResolveFailsClosedWithoutConfiguredWriterOrIssuer(t *testing.T) {
 
 func TestResolveDeniedEvaluationRejectsApprovalAndMintsNothing(t *testing.T) {
 	issuer := &stubGrantIssuer{}
-	evaluator, err := NewEvaluator([]AccessBinding{
+	evaluator, err := newEvaluatorForTest([]AccessBinding{
 		{Kind: "command.execute", Source: &stubAccessSource{version: CurrentAccessVersion, access: AccessGated}},
 		{Kind: "network", Source: &stubAccessSource{version: CurrentAccessVersion, access: AccessDeny}},
 	}, &stubRuleMatcher{}, &stubRuleWriter{}, issuer)
@@ -479,7 +479,7 @@ func (i *orderedGrantIssuer) IssueGrant(context.Context, string, string, string,
 
 func newCombinedEvaluator(t *testing.T, writer RuleWriter, issuer GrantIssuer) *Evaluator {
 	t.Helper()
-	evaluator, err := NewEvaluator([]AccessBinding{
+	evaluator, err := newEvaluatorForTest([]AccessBinding{
 		{Kind: "command.execute", Source: &stubAccessSource{version: CurrentAccessVersion, access: AccessGated}},
 		{Kind: "network", Source: &stubAccessSource{version: CurrentAccessVersion, access: AccessGated}},
 	}, &stubRuleMatcher{}, writer, issuer)
@@ -487,4 +487,15 @@ func newCombinedEvaluator(t *testing.T, writer RuleWriter, issuer GrantIssuer) *
 		t.Fatal(err)
 	}
 	return evaluator
+}
+
+// newEvaluatorForTest preserves the pre-interaction constructor shape for the
+// evaluation tests: a nil writer builds a headless evaluator, a non-nil writer
+// an interactive one with a stub approver (the interaction seam itself is
+// covered in interaction_test.go).
+func newEvaluatorForTest(bindings []AccessBinding, matcher RuleMatcher, writer RuleWriter, issuer GrantIssuer) (*Evaluator, error) {
+	if writer == nil {
+		return NewHeadlessEvaluator(bindings, matcher, issuer)
+	}
+	return NewInteractiveEvaluator(bindings, matcher, &stubApprover{action: ApprovalApprove}, writer, issuer)
 }

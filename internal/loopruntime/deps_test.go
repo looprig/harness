@@ -198,7 +198,7 @@ func TestNewAppliesToolSetDefaults(t *testing.T) {
 // ToolSet field types reference internal/tool (layering check).
 var (
 	_ = ToolSet{
-		Permission:  PermissionGate(nil),
+		Access:      AccessGate(nil),
 		Registry:    []tool.InvokableTool(nil),
 		Middlewares: []tool.ToolMiddleware(nil),
 	}

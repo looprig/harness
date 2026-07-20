@@ -56,7 +56,7 @@ func resolveMode(bound loop.BoundDefinition, modeName loop.ModeName) (runtimeCon
 	resolved := runtimeConfig{
 		Client: bound.Client(), Model: model, System: loop.EffectiveSystem(bound.System(), mode.Instructions), DrainTimeout: bound.DrainTimeout(),
 		AgentName: bound.Name(), Engine: bound.Engine(), RuntimeContext: bound.RuntimeContext(),
-		Tools: ToolSet{Permission: bound.Permission(), Registry: mode.Tools, Middlewares: bound.Middlewares(), MaxToolIterations: limits.Iterations, MaxToolCallsPerTurn: limits.Calls, MaxParallelToolCalls: limits.Parallel},
+		Tools: ToolSet{Access: bound.Access(), Registry: mode.Tools, Middlewares: bound.Middlewares(), MaxToolIterations: limits.Iterations, MaxToolCallsPerTurn: limits.Calls, MaxParallelToolCalls: limits.Parallel},
 	}
 	if output, configured := bound.OutputSchema(); configured {
 		resolved.Output = cloneOutputSchema(output)
@@ -108,8 +108,8 @@ type runtimeConfig struct {
 
 	// Tools is the runner's view of the tool subsystem (the consumer surface in
 	// deps.go). Its runaway-guard caps are defaulted by New when zero;
-	// Permission/Registry/Middlewares are left as the composition root set them
-	// (nil is valid).
+	// Access/Registry/Middlewares are left as the composition root set them
+	// (a nil Access denies every tool call, fail closed).
 	Tools ToolSet
 
 	// Output is the loop-wide final-output policy. It is cloned while resolving
