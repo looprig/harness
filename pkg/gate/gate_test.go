@@ -2,6 +2,7 @@ package gate
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -263,5 +264,46 @@ func TestGateIDJSONRoundTrip(t *testing.T) {
 	}
 	if roundTrip.ID != ID(id) {
 		t.Fatalf("roundTrip.ID = %s, want %s", roundTrip.ID, id)
+	}
+}
+
+func TestDecodeApprovalActionAcceptsExactlyThreeActions(t *testing.T) {
+	tests := []struct {
+		data string
+		want ApprovalAction
+	}{
+		{data: `{"action":"Approve"}`, want: ApprovalApprove},
+		{data: `{"action":"Approve always for this workspace"}`, want: ApprovalApproveAlwaysWorkspace},
+		{data: `{"action":"Deny"}`, want: ApprovalDeny},
+	}
+	for _, tt := range tests {
+		action, err := DecodeApprovalAction([]byte(tt.data))
+		if err != nil {
+			t.Fatalf("DecodeApprovalAction(%s) error = %v", tt.data, err)
+		}
+		if action != tt.want {
+			t.Fatalf("DecodeApprovalAction(%s) = %q, want %q", tt.data, action, tt.want)
+		}
+	}
+}
+
+func TestDecodeApprovalActionRejectsMalformedAndNonExactInput(t *testing.T) {
+	tests := []string{
+		`{"action":"approve"}`,
+		`{"action":"Approve always"}`,
+		`{"action":""}`,
+		`{"action":"Approve","action":"Deny"}`,
+		`{"action":"Approve","scope":"workspace"}`,
+		`{"action":"Approve"}{}`,
+		`null`,
+		`[]`,
+		`not json`,
+	}
+	for _, data := range tests {
+		_, err := DecodeApprovalAction([]byte(data))
+		var decodeErr *ApprovalActionDecodeError
+		if !errors.As(err, &decodeErr) {
+			t.Fatalf("DecodeApprovalAction(%q) error = %T %v, want *ApprovalActionDecodeError", data, err, err)
+		}
 	}
 }

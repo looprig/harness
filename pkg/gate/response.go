@@ -1,6 +1,52 @@
 package gate
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+)
+
+// ApprovalAction is one of the three exact user-facing permission decisions.
+type ApprovalAction string
+
+const (
+	ApprovalApprove                ApprovalAction = "Approve"
+	ApprovalApproveAlwaysWorkspace ApprovalAction = "Approve always for this workspace"
+	ApprovalDeny                   ApprovalAction = "Deny"
+)
+
+// ApprovalActionDecodeError wraps malformed JSON or a non-exact action.
+type ApprovalActionDecodeError struct{ Cause error }
+
+func (e *ApprovalActionDecodeError) Error() string {
+	return "gate: decode approval action: " + e.Cause.Error()
+}
+
+func (e *ApprovalActionDecodeError) Unwrap() error { return e.Cause }
+
+type approvalActionData struct {
+	Action ApprovalAction `json:"action"`
+}
+
+// DecodeApprovalAction strictly decodes one of the three exact approval
+// actions. Unknown fields, duplicate keys, trailing JSON, and null fail closed.
+func DecodeApprovalAction(data []byte) (ApprovalAction, error) {
+	if isExplicitJSONNull(data) {
+		return "", &ApprovalActionDecodeError{Cause: errNullPayloadData}
+	}
+	if err := rejectDuplicateJSONFields(data); err != nil {
+		return "", &ApprovalActionDecodeError{Cause: err}
+	}
+	var raw approvalActionData
+	if err := decodeStrict(data, &raw); err != nil {
+		return "", &ApprovalActionDecodeError{Cause: err}
+	}
+	switch raw.Action {
+	case ApprovalApprove, ApprovalApproveAlwaysWorkspace, ApprovalDeny:
+		return raw.Action, nil
+	default:
+		return "", &ApprovalActionDecodeError{Cause: errors.New("unknown approval action")}
+	}
+}
 
 // ResponseSourceKind identifies who produced a gate response.
 type ResponseSourceKind string

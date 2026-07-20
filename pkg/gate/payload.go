@@ -144,6 +144,13 @@ func (e *PayloadDecodeError) Error() string {
 }
 func (e *PayloadDecodeError) Unwrap() error { return e.Cause }
 
+// RequestDecodeError wraps malformed request JSON or a decoded request that
+// violates the prepared request invariants.
+type RequestDecodeError struct{ Cause error }
+
+func (e *RequestDecodeError) Error() string { return "gate: decode request: " + e.Cause.Error() }
+func (e *RequestDecodeError) Unwrap() error { return e.Cause }
+
 type payloadWrapper struct {
 	Kind payloadKind     `json:"kind"`
 	Data json.RawMessage `json:"data"`
@@ -152,6 +159,90 @@ type payloadWrapper struct {
 type openPayloadData struct {
 	GateID  ID              `json:"gate_id,omitzero"`
 	Payload json.RawMessage `json:"payload"`
+}
+
+// DecodeRequest strictly decodes and validates an untrusted prepared request.
+// Unknown fields, duplicate object keys, trailing JSON, null, and invariant
+// violations all fail closed with RequestDecodeError.
+func DecodeRequest(data []byte) (tool.Request, error) {
+	if isExplicitJSONNull(data) {
+		return tool.Request{}, &RequestDecodeError{Cause: errNullPayloadData}
+	}
+	if err := rejectDuplicateJSONFields(data); err != nil {
+		return tool.Request{}, &RequestDecodeError{Cause: err}
+	}
+	var request tool.Request
+	if err := decodeStrict(data, &request); err != nil {
+		return tool.Request{}, &RequestDecodeError{Cause: err}
+	}
+	if err := tool.ValidateRequest(request); err != nil {
+		return tool.Request{}, &RequestDecodeError{Cause: err}
+	}
+	return request, nil
+}
+
+// maxScanJSONDepth bounds the duplicate-field scanner's recursion on untrusted
+// input. It matches the nesting limit encoding/json enforces during Decode, so
+// the scanner can never be driven deeper than the decode that follows it.
+const maxScanJSONDepth = 10000
+
+func rejectDuplicateJSONFields(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := scanJSONValue(decoder, 0); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+func scanJSONValue(decoder *json.Decoder, depth int) error {
+	if depth > maxScanJSONDepth {
+		return errors.New("JSON nesting exceeds depth limit")
+	}
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("object key is not a string")
+			}
+			if _, exists := seen[key]; exists {
+				return fmt.Errorf("duplicate JSON field %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := scanJSONValue(decoder, depth+1); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for decoder.More() {
+			if err := scanJSONValue(decoder, depth+1); err != nil {
+				return err
+			}
+		}
+	default:
+		return errors.New("unexpected JSON delimiter")
+	}
+	_, err = decoder.Token()
+	return err
 }
 
 // openURLPayloadData is the DURABLE form of an OpenURLPayload. It deliberately

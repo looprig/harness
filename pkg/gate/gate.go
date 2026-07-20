@@ -1,4 +1,17 @@
-// Package gate defines the durable domain envelope for human and policy gates.
+// Package gate defines the durable domain envelope for human and policy gates
+// and the generic three-state access evaluator.
+//
+// The evaluator routes each normalized requirement kind to exactly one
+// structural AccessSource, applies deny-before-allow precedence across
+// configured access and stored rules, and combines every unmet gated
+// capability into one approval carrying exactly the Approve, Approve always
+// for this workspace, and Deny actions.
+//
+// Boundaries are deliberate: this package never imports an enforcement
+// package such as sandbox (access, rule, and grant seams are structural,
+// built-in-typed interfaces), never parses raw tool arguments (tools prepare
+// typed requests; see pkg/tool), and never defines a permission-file format
+// (durable rule matching and persistence are consumer-provided).
 package gate
 
 import "github.com/looprig/core/uuid"

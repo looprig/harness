@@ -58,6 +58,18 @@ type Control struct {
 	Label  string `json:"label,omitempty"`
 }
 
+// ApprovalControls returns the exact, complete control set of a combined
+// access-approval prompt. An interactive gate offers exactly these three
+// actions; there is no session scope, user-global scope, persistent-deny
+// action, or second capability prompt.
+func ApprovalControls() []Control {
+	return []Control{
+		{Action: string(ApprovalApprove), Label: string(ApprovalApprove)},
+		{Action: string(ApprovalApproveAlwaysWorkspace), Label: string(ApprovalApproveAlwaysWorkspace)},
+		{Action: string(ApprovalDeny), Label: string(ApprovalDeny)},
+	}
+}
+
 // Field describes one structured input in a prompt schema.
 type Field struct {
 	Name     string          `json:"name,omitempty"`
