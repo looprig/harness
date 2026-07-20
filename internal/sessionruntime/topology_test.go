@@ -151,10 +151,10 @@ func TestRestoreTopologyAcquiresLeaseBeforeBinding(t *testing.T) {
 		d, err := loop.Define(
 			loop.WithName(name), loop.WithInference(&stubLLM{}, validModel("model")),
 			loop.WithPolicyRevision("lease-test"),
-			loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) {
+			loop.WithTools(tool.NewDefinition(string(name)+"-probe", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 				binds.Add(1)
-				return permissionGateStub{}, nil
-			}),
+				return []tool.InvokableTool{&extStubTool{name: string(name) + "-probe"}}, nil
+			})),
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -193,12 +193,12 @@ func TestRestoreTopologyBindFailureHasNoRestoreDone(t *testing.T) {
 	define := func(name identity.AgentName) loop.Definition {
 		d, err := loop.Define(
 			loop.WithName(name), loop.WithInference(&stubLLM{}, validModel("model")), loop.WithPolicyRevision("bind-test"),
-			loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) {
+			loop.WithTools(tool.NewDefinition(string(name)+"-probe", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 				if fail.Load() && name == "builder" {
 					return nil, errFault
 				}
-				return permissionGateStub{}, nil
-			}),
+				return []tool.InvokableTool{&extStubTool{name: string(name) + "-probe"}}, nil
+			})),
 		)
 		if err != nil {
 			t.Fatal(err)

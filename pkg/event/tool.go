@@ -16,19 +16,20 @@ const (
 )
 
 // PermissionRequested is emitted when a tool call needs interactive approval.
-// The per-turn stream (TUI) renders Request.Description() — which can hold a Bash
-// command, a file-diff preview, or a URL — so it gets the full Request.
+// The per-turn stream (TUI) renders the typed prepared Request — the summary
+// plus the displayed unmet requirement and candidate descriptions. The wire
+// carries the same typed request through the strict request decoder; it never
+// carries grant tokens or raw tool arguments (tool.Request has neither).
 type PermissionRequested struct {
 	enduring
 	loopScoped
 	Header
 	ToolExecutionID uuid.UUID `json:"tool_execution_id,omitzero"`
-	// Request is a sealed interface (tool.PermissionRequest) with no generic JSON
-	// codec or type discriminator, so a journal cannot round-trip it (the common
-	// non-nil case would marshal to lossy, un-keyed PascalCase). It is excluded from
-	// serialization entirely — like TokenDelta.Chunk and TurnFailed.Err — and stays
-	// an in-memory-only field for the TUI to render.
-	Request tool.PermissionRequest `json:"-"`
+	// Request is validated at the durable boundary (tool.ValidateRequest on
+	// marshal, the strict gate.DecodeRequest on unmarshal), so a malformed or
+	// token-bearing record can neither be journaled nor restored. It is
+	// projected by the marshaler rather than serialized directly.
+	Request tool.Request `json:"-"`
 }
 
 // PermissionDecided is emitted for a non-gated permission decision. Subject and

@@ -14,7 +14,6 @@ import (
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
-	"github.com/looprig/harness/pkg/tool"
 )
 
 type persistedGateStream struct {
@@ -126,7 +125,7 @@ func buildGateRestoreStreamWithResolver(t *testing.T, store *sessionstore.Store,
 		preparedEvent := event.GatePrepared{Header: stamp(coords), Gate: g}
 		appendRecord(journal.NewGatePreparedRecord(preparedEvent, gate.OpenPayload{
 			GateID:  gateID,
-			Payload: gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}},
+			Payload: gate.PermissionPayload{Request: typedGateRequest()},
 		}))
 	}
 	if opened {
@@ -262,7 +261,7 @@ func TestRestoreWiresGateAppenderForNewGates(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
-	gateID, err := s.PrepareGateOpen(context.Background(), orig.rootLoopID, permissionGate(), gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}})
+	gateID, err := s.PrepareGateOpen(context.Background(), orig.rootLoopID, permissionGate(), gate.PermissionPayload{Request: typedGateRequest()})
 	if err != nil {
 		t.Fatalf("PrepareGateOpen: %v", err)
 	}

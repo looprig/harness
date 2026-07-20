@@ -11,7 +11,6 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
 )
@@ -118,7 +117,7 @@ func TestEventBodyJSONKeysAreStableSnakeCase(t *testing.T) {
 			event: PermissionRequested{
 				Header:          hdr,
 				ToolExecutionID: seededUUID(0x77),
-				Request:         tool.BashRequest{Command: "rm -rf /"},
+				Request:         gateWireRequest(),
 			},
 			wantKeys:   []string{"tool_execution_id"},
 			absentKeys: []string{"request", "Request"},
@@ -435,8 +434,6 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"WorkspaceCheckpointed empty ref", WorkspaceCheckpointed{Header: checkpointHeader(), Consistency: SnapshotQuiescent, Trigger: SnapshotTriggerManual}},
 		{"WorkspaceRestored", WorkspaceRestored{Header: fullHeaderSession(), Ref: "v1:sha256:restored"}},
 		{"ActiveLoopChanged", ActiveLoopChanged{Header: fullHeaderSession(), PreviousLoopID: seededUUID(0x20), ActiveLoopID: seededUUID(0x21)}},
-		{"SecurityLimitChanged", SecurityLimitChanged{Header: fullHeaderSession(), Level: 2}},
-		{"SecurityLimitChanged zero", SecurityLimitChanged{Header: fullHeaderSession()}},
 		// RestoreErrored.Err handled in the dedicated err-projection test below.
 		{"LoopIdle", LoopIdle{Header: fullHeaderLoop()}},
 		{"LoopStarted", LoopStarted{Header: fullHeaderLoop(), Runtime: sampleRuntime()}},
@@ -761,66 +758,34 @@ func assertErrFixedPoint(t *testing.T, ev Event, getErr func(Event) error) {
 }
 
 // TestMarshalEventPermissionRequestedFullRequest proves PermissionRequested
-// round-trips with its FULL Request (header-only would panic on TUI replay): the
-// reconstructed event's tool_execution_id matches and the Request's accessor
-// contract (ToolName/Description/AllowedScopes) survives.
+// round-trips with its FULL typed Request (header-only would lose the prompt on
+// TUI replay): the reconstructed event's tool_execution_id matches and the
+// typed request survives intact through the strict decoder.
 func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name string
-		req  tool.PermissionRequest
-	}{
-		{"bash", tool.BashRequest{Command: "rm -rf /tmp/x"}},
-		{"file write", tool.FileWriteRequest{Path: "/etc/passwd"}},
-		{"fetch", tool.FetchRequest{Method: "GET", URL: "https://example.com"}},
-		{"web search", tool.WebSearchRequest{Query: "how to escape a sandbox"}},
-		{"unknown", tool.UnknownRequest{Tool: "Mystery", Summary: "redacted"}},
-		{"skill load", tool.SkillLoadRequest{
-			RelPath: ".skills/lint/SKILL.md",
-			Agent:   identity.AgentName("explorer"),
-			Size:    2048,
-			SHA256:  "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface0",
-		}},
+	ev := PermissionRequested{Header: fullHeader(), ToolExecutionID: seededUUID(0x77), Request: gateWireRequest()}
+	data, err := MarshalEvent(ev)
+	if err != nil {
+		t.Fatalf("MarshalEvent error = %v", err)
 	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			ev := PermissionRequested{Header: fullHeader(), ToolExecutionID: seededUUID(0x77), Request: tt.req}
-			data, err := MarshalEvent(ev)
-			if err != nil {
-				t.Fatalf("MarshalEvent error = %v", err)
-			}
-			got, err := UnmarshalEvent(data)
-			if err != nil {
-				t.Fatalf("UnmarshalEvent error = %v\nwire: %s", err, data)
-			}
-			pr, ok := got.(PermissionRequested)
-			if !ok {
-				t.Fatalf("UnmarshalEvent returned %T, want PermissionRequested", got)
-			}
-			if pr.ToolExecutionID != ev.ToolExecutionID {
-				t.Errorf("ToolExecutionID = %v, want %v", pr.ToolExecutionID, ev.ToolExecutionID)
-			}
-			if pr.Request == nil {
-				t.Fatalf("restored Request is nil; the full request must survive")
-			}
-			if pr.Request.ToolName() != tt.req.ToolName() {
-				t.Errorf("ToolName() = %q, want %q", pr.Request.ToolName(), tt.req.ToolName())
-			}
-			if pr.Request.Description() != tt.req.Description() {
-				t.Errorf("Description() = %q, want %q", pr.Request.Description(), tt.req.Description())
-			}
-			if !reflect.DeepEqual(pr.Request.AllowedScopes(), tt.req.AllowedScopes()) {
-				t.Errorf("AllowedScopes() = %v, want %v", pr.Request.AllowedScopes(), tt.req.AllowedScopes())
-			}
-			// The non-Request header fields must also survive intact.
-			if !reflect.DeepEqual(pr.EventHeader(), ev.EventHeader()) {
-				t.Errorf("header mismatch: got %#v, want %#v", pr.EventHeader(), ev.EventHeader())
-			}
-		})
+	got, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent error = %v\nwire: %s", err, data)
+	}
+	pr, ok := got.(PermissionRequested)
+	if !ok {
+		t.Fatalf("UnmarshalEvent returned %T, want PermissionRequested", got)
+	}
+	if pr.ToolExecutionID != ev.ToolExecutionID {
+		t.Errorf("ToolExecutionID = %v, want %v", pr.ToolExecutionID, ev.ToolExecutionID)
+	}
+	if !reflect.DeepEqual(pr.Request, ev.Request) {
+		t.Errorf("restored Request = %#v, want %#v", pr.Request, ev.Request)
+	}
+	// The non-Request header fields must also survive intact.
+	if !reflect.DeepEqual(pr.EventHeader(), ev.EventHeader()) {
+		t.Errorf("header mismatch: got %#v, want %#v", pr.EventHeader(), ev.EventHeader())
 	}
 }
 
@@ -829,7 +794,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 40
+const wantEnduringTypes = 39
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -843,7 +808,6 @@ func unionInstances() []Event {
 		HustleFailed{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference},
 		ConfigurationAdopted{},
 		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{}, WorkspaceRestored{}, ActiveLoopChanged{},
-		SecurityLimitChanged{},
 		LoopIdle{}, LoopStarted{}, DelegateRequestAccepted{}, LoopInferenceChanged{}, LoopModeChanged{},
 		LoopExternalToolsetChanged{}, ForeignSessionBound{},
 		CompactionStarted{}, CompactionCommitted{}, CompactionRejected{}, CompactWaiterResolved{}, CompactWaiterRejected{},
@@ -987,8 +951,7 @@ func FuzzDecodeEvent(f *testing.F) {
 		StepDone{Header: fullHeader(), Messages: sampleMessages()},
 		TurnDone{Header: fullHeaderTurn(), Message: aiMsg("done")},
 		TurnFailed{Header: fullHeaderTurn(), Err: &ToolLimitError{}},
-		PermissionRequested{Header: fullHeader(), ToolExecutionID: seededUUID(0x77), Request: tool.BashRequest{Command: "ls"}},
-		PermissionRequested{Header: fullHeader(), ToolExecutionID: seededUUID(0x78), Request: tool.SkillLoadRequest{RelPath: ".skills/x/SKILL.md", Agent: identity.AgentName("explorer"), Size: 10, SHA256: "abc"}},
+		PermissionRequested{Header: fullHeader(), ToolExecutionID: seededUUID(0x77), Request: gateWireRequest()},
 		PermissionDecided{Header: fullHeader(), ToolExecutionID: seededUUID(0x79), Effect: PermissionEffectApprove, Reason: "hard_approve", Subject: "ReadFile", Audit: "ReadFile README.md"},
 		TurnInterrupted{Header: fullHeaderTurn()},
 	}
@@ -1035,9 +998,6 @@ func isTypedDecodeError(err error) bool {
 		blockDecode  *content.BlockDecodeError
 		blockLimit   *content.BlockLimitError
 		unknownBlock *content.UnknownBlockTypeError
-		reqDecode    *tool.PermissionRequestDecodeError
-		reqLimit     *tool.PermissionRequestLimitError
-		reqUnknown   *tool.UnknownPermissionRequestError
 	)
 	return errors.As(err, &unknownEvent) ||
 		errors.As(err, &decode) ||
@@ -1045,10 +1005,7 @@ func isTypedDecodeError(err error) bool {
 		errors.As(err, &invalid) ||
 		errors.As(err, &blockDecode) ||
 		errors.As(err, &blockLimit) ||
-		errors.As(err, &unknownBlock) ||
-		errors.As(err, &reqDecode) ||
-		errors.As(err, &reqLimit) ||
-		errors.As(err, &reqUnknown)
+		errors.As(err, &unknownBlock)
 }
 
 // fullHeaderSession / fullHeaderLoop / fullHeaderTurn project fullHeader onto each

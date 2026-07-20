@@ -2,7 +2,6 @@ package event
 
 import (
 	"github.com/looprig/harness/pkg/gate"
-	"github.com/looprig/harness/pkg/tool"
 )
 
 // GatePrepared is the private/internal prepared projection inside a
@@ -28,14 +27,12 @@ type GateOpened struct {
 	Gate gate.Gate `json:"gate,omitzero"`
 }
 
-// GateResolved is the SINGLE atomic close-with-answer record. Decision fields
-// (Action, ApprovalScope) stay in the clear; Reason is the close reason; per-kind
-// Audit is redaction-aware (grant descriptions, not tokens). A non-answer close
-// (abandon/owner) sets Reason with Action="".
-//
-// The approval-scope field is named ApprovalScope (not Scope) because the embedded
-// loopScoped mixin promotes a Scope() method — a field named Scope would shadow
-// that method and fail to satisfy the Event interface.
+// GateResolved is the SINGLE atomic close-with-answer record. The decision
+// Action stays in the clear (for a permission gate it is one of the three
+// exact gate.ApprovalAction strings); Reason is the close reason; per-kind
+// Audit is redaction-aware (requirement and candidate descriptions, never
+// grant tokens, never raw tool arguments). A non-answer close (abandon/owner)
+// sets Reason with Action="".
 type GateResolved struct {
 	enduring
 	loopScoped
@@ -49,13 +46,11 @@ type GateResolved struct {
 	// from a loop-owned one (full step profile). It is additive and omitempty: an old
 	// record written before this field existed decodes with an empty Resolver and is
 	// validated under the strict loop-owned profile, matching every gate record that
-	// could ever restore before this change. It is named Resolver (a plain field, not
-	// a promoted method) — unlike ApprovalScope, no mixin promotes a Resolver() method.
-	Resolver      gate.ResolverKind   `json:"resolver,omitempty"`
-	Reason        gate.CloseReason    `json:"reason,omitempty"`
-	Action        string              `json:"action,omitempty"`
-	ApprovalScope tool.ApprovalScope  `json:"scope,omitzero"`
-	Source        gate.ResponseSource `json:"source,omitzero"`
+	// could ever restore before this change.
+	Resolver gate.ResolverKind   `json:"resolver,omitempty"`
+	Reason   gate.CloseReason    `json:"reason,omitempty"`
+	Action   string              `json:"action,omitempty"`
+	Source   gate.ResponseSource `json:"source,omitzero"`
 	// Audit is a sealed interface (gate.ResponseAudit) with no general JSON codec,
 	// so it is excluded from direct serialization — like PermissionRequested.Request
 	// — and projected through gate.MarshalResponseAudit by the marshaler.

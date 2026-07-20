@@ -31,7 +31,7 @@ func TestToolEventsSatisfyEvent(t *testing.T) {
 	}{
 		{
 			name:       "PermissionRequested",
-			ev:         event.PermissionRequested{ToolExecutionID: callID, Request: tool.BashRequest{Command: "rm -rf /"}},
+			ev:         event.PermissionRequested{ToolExecutionID: callID, Request: tool.Request{ToolName: "Bash", Summary: "rm -rf /"}},
 			wantCallID: callID,
 			getCallID:  func(e event.Event) uuid.UUID { return e.(event.PermissionRequested).ToolExecutionID },
 		},
@@ -55,7 +55,7 @@ func TestToolEventsSatisfyEvent(t *testing.T) {
 		},
 		{
 			name:       "PermissionRequested zero ToolExecutionID is boundary",
-			ev:         event.PermissionRequested{Request: tool.UnknownRequest{Tool: "X"}},
+			ev:         event.PermissionRequested{Request: tool.Request{ToolName: "X"}},
 			wantCallID: uuid.UUID{},
 			getCallID:  func(e event.Event) uuid.UUID { return e.(event.PermissionRequested).ToolExecutionID },
 		},

@@ -89,7 +89,7 @@ var (
 )
 
 // approveActor spawns a fake actor that acks then approves the first gate
-// (ScopeOnce). It returns the gateReg channel to wire into RunBatch. The actor
+// (once-approval action). It returns the gateReg channel to wire into RunBatch. The actor
 // goroutine exits after one gate, so a fail-secure scenario (no gate opened)
 // leaves it harmlessly parked on the receive until the test ends.
 func approveActor() chan gateRegistration {
@@ -102,7 +102,7 @@ func approveActor() chan gateRegistration {
 		close(reg.ack)
 		reg.reply <- command.ApproveToolCall{
 			GateRoute: command.GateRoute{ToolExecutionID: reg.callID},
-			Scope:     tool.ScopeOnce,
+			Action:    gatedomain.ApprovalApprove,
 		}
 	}()
 	return gateReg

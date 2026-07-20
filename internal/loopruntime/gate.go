@@ -2,6 +2,7 @@ package loopruntime
 
 import (
 	"context"
+	"strings"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
@@ -272,7 +273,11 @@ func stampGateSubjectProvenance(ctx context.Context, g gatedomain.Gate) gatedoma
 	return g
 }
 
-func permissionGate(callID uuid.UUID, req tool.PermissionRequest) gatedomain.Gate {
+// permissionGate builds the public envelope for ONE combined permission gate:
+// the prompt renders the redacted summary plus every displayed unmet capability
+// and reusable candidate description, and the controls are the exact three
+// approval actions. It never renders raw tool arguments or token material.
+func permissionGate(callID uuid.UUID, displayed tool.Request) gatedomain.Gate {
 	return gatedomain.Gate{
 		Kind:     gatedomain.KindPermission,
 		Resolver: gatedomain.ResolverLoop,
@@ -281,22 +286,42 @@ func permissionGate(callID uuid.UUID, req tool.PermissionRequest) gatedomain.Gat
 		Subject:  gatedomain.Subject{ToolExecutionID: callID},
 		Prompt: gatedomain.Prompt{
 			Title: "Approve tool call",
-			Body:  req.Description(),
+			Body:  renderApprovalBody(displayed),
 			Controls: []gatedomain.Control{
-				{Action: "approve", Label: "Approve"},
-				{Action: "deny", Label: "Deny"},
+				{Action: string(gatedomain.ApprovalApprove), Label: "Approve"},
+				{Action: string(gatedomain.ApprovalApproveAlwaysWorkspace), Label: "Approve always for this workspace"},
+				{Action: string(gatedomain.ApprovalDeny), Label: "Deny"},
 			},
-			Schema: gatedomain.PromptSchema{Fields: []gatedomain.Field{
-				{
-					Name:     "scope",
-					Label:    "Scope",
-					Kind:     gatedomain.FieldSelect,
-					Required: true,
-					Options:  approvalScopeOptions(req.AllowedScopes()),
-				},
-			}},
 		},
 	}
+}
+
+// renderApprovalBody projects the displayed typed request onto the prompt body:
+// the redacted summary, the unmet capability descriptions, and — because
+// "Approve always for this workspace" persists them — the exact reusable rule
+// candidates on offer. Descriptions only; never raw args, never tokens.
+func renderApprovalBody(displayed tool.Request) string {
+	var sb strings.Builder
+	sb.WriteString(displayed.Summary)
+	if len(displayed.Requirements) > 0 {
+		sb.WriteString("\n\nCapabilities:")
+		for _, requirement := range displayed.Requirements {
+			sb.WriteString("\n- ")
+			sb.WriteString(requirement.Description)
+		}
+	}
+	candidates := false
+	for _, requirement := range displayed.Requirements {
+		for _, candidate := range requirement.Candidates {
+			if !candidates {
+				sb.WriteString("\n\nApprove always saves:")
+				candidates = true
+			}
+			sb.WriteString("\n- ")
+			sb.WriteString(candidate.Description)
+		}
+	}
+	return sb.String()
 }
 
 func askUserGate(callID uuid.UUID, question string, choices []string) gatedomain.Gate {
@@ -314,31 +339,6 @@ func askUserGate(callID uuid.UUID, question string, choices []string) gatedomain
 			},
 			Schema: gatedomain.PromptSchema{Fields: askUserFields(choices)},
 		},
-	}
-}
-
-func approvalScopeOptions(scopes []tool.ApprovalScope) []gatedomain.Option {
-	out := make([]gatedomain.Option, 0, len(scopes))
-	for _, scope := range scopes {
-		value, ok := tool.ApprovalScopeValue(scope)
-		if !ok {
-			continue
-		}
-		out = append(out, gatedomain.Option{Value: value, Label: approvalScopeLabel(scope)})
-	}
-	return out
-}
-
-func approvalScopeLabel(scope tool.ApprovalScope) string {
-	switch scope {
-	case tool.ScopeOnce:
-		return "Once"
-	case tool.ScopeSession:
-		return "Session"
-	case tool.ScopeWorkspace:
-		return "Workspace"
-	default:
-		return "Unknown"
 	}
 }
 

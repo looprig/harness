@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/harness/pkg/tool"
 )
 
 func TestPayloadRoundTrip(t *testing.T) {
@@ -21,7 +20,7 @@ func TestPayloadRoundTrip(t *testing.T) {
 	}{
 		{
 			name:    "permission",
-			payload: PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}},
+			payload: PermissionPayload{Request: typedPermissionRequest()},
 		},
 		{
 			name:    "ask user",
@@ -126,10 +125,10 @@ func TestPayloadExplicitNullDataFailsClosed(t *testing.T) {
 	}
 }
 
-func TestPermissionPayloadUsesToolCodec(t *testing.T) {
+func TestPermissionPayloadWireIsTypedRequest(t *testing.T) {
 	t.Parallel()
 
-	data, err := MarshalPayload(PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}})
+	data, err := MarshalPayload(PermissionPayload{Request: typedPermissionRequest()})
 	if err != nil {
 		t.Fatalf("MarshalPayload() error = %v", err)
 	}
@@ -145,13 +144,13 @@ func TestPermissionPayloadUsesToolCodec(t *testing.T) {
 		t.Fatalf("wrapper.Kind = %q, want permission", wrapper.Kind)
 	}
 	var nested struct {
-		Type string `json:"type"`
+		ToolName string `json:"tool_name"`
 	}
 	if err := json.Unmarshal(wrapper.Data, &nested); err != nil {
 		t.Fatalf("json.Unmarshal nested permission data: %v", err)
 	}
-	if nested.Type != "bash" {
-		t.Fatalf("nested permission type = %q, want bash", nested.Type)
+	if nested.ToolName != "Bash" {
+		t.Fatalf("nested tool_name = %q, want Bash", nested.ToolName)
 	}
 
 	got, err := UnmarshalPayload(data)
@@ -162,8 +161,8 @@ func TestPermissionPayloadUsesToolCodec(t *testing.T) {
 	if !ok {
 		t.Fatalf("payload type = %T, want PermissionPayload", got)
 	}
-	if _, ok := permission.Request.(tool.BashRequest); !ok {
-		t.Fatalf("permission.Request type = %T, want tool.BashRequest", permission.Request)
+	if permission.Request.ToolName != "Bash" {
+		t.Fatalf("permission.Request.ToolName = %q, want Bash", permission.Request.ToolName)
 	}
 }
 
@@ -175,8 +174,11 @@ func TestResponseAuditRoundTrip(t *testing.T) {
 		audit ResponseAudit
 	}{
 		{
-			name:  "permission",
-			audit: PermissionAudit{AcceptedGrantDescriptions: []string{"allow network egress for: git push", "allow write to /out"}},
+			name: "permission",
+			audit: PermissionAudit{
+				RequirementDescriptions: []string{"execute command", "network egress"},
+				CandidateDescriptions:   []string{"git push family"},
+			},
 		},
 		{
 			name:  "ask user",
@@ -217,7 +219,7 @@ func TestResponseAuditDoesNotStoreGrantTokens(t *testing.T) {
 
 	const fakeToken = "grant-token-secret-123"
 	data, err := MarshalResponseAudit(PermissionAudit{
-		AcceptedGrantDescriptions: []string{"allow network egress for: git push"},
+		RequirementDescriptions: []string{"allow network egress for: git push"},
 	})
 	if err != nil {
 		t.Fatalf("MarshalResponseAudit() error = %v", err)

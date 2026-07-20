@@ -135,9 +135,6 @@ func setHeader(t *testing.T, ev event.Event, hdr event.Header) event.Event {
 	case event.WorkspaceRestored:
 		e.Header = hdr
 		return e
-	case event.SecurityLimitChanged:
-		e.Header = hdr
-		return e
 	default:
 		t.Fatalf("setHeader: unexpected event %T", ev)
 		return nil

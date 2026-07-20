@@ -18,26 +18,22 @@ func (capableTool) InvokableRun(ctx context.Context, argsJSON string) (*ToolResu
 }
 func (capableTool) Sequential() bool                    { return true }
 func (capableTool) AuditSummary(argsJSON string) string { return "summary" }
-func (capableTool) BuildRequest(argsJSON string, _ PreparedArtifact) (PermissionRequest, error) {
-	return UnknownRequest{Tool: "capable", Summary: "does a thing"}, nil
-}
 func (capableTool) WriteTarget(argsJSON string) (string, bool, error) {
 	return "/tmp/x", true, nil
 }
-func (capableTool) Prepare(ctx context.Context, callID uuid.UUID, argsJSON string) (PreparedArtifact, error) {
-	return TokenArtifact{Token: callID.String()}, nil
+func (capableTool) PrepareCall(ctx context.Context, executionID uuid.UUID, argsJSON string) (Request, PreparedArtifact, error) {
+	return Request{}, TokenArtifact{Token: executionID.String()}, nil
 }
 
 // Compile-time assertions: a tool implementing each optional capability is
 // assignable to that interface.
 var (
-	_ InvokableTool      = capableTool{}
-	_ Sequential         = capableTool{}
-	_ Auditable          = capableTool{}
-	_ PermissionPrompter = capableTool{}
-	_ WriteTarget        = capableTool{}
-	_ Preparer           = capableTool{}
-	_ PreparedArtifact   = TokenArtifact{}
+	_ InvokableTool    = capableTool{}
+	_ Sequential       = capableTool{}
+	_ Auditable        = capableTool{}
+	_ WriteTarget      = capableTool{}
+	_ CallPreparer     = capableTool{}
+	_ PreparedArtifact = TokenArtifact{}
 )
 
 // TestCapabilityInterfaces verifies, via type assertion (the runner's real
@@ -68,14 +64,11 @@ func TestCapabilityInterfaces(t *testing.T) {
 			if _, ok := tt.tool.(Auditable); ok != tt.wantOptionals {
 				t.Errorf("Auditable assertion = %v, want %v", ok, tt.wantOptionals)
 			}
-			if _, ok := tt.tool.(PermissionPrompter); ok != tt.wantOptionals {
-				t.Errorf("PermissionPrompter assertion = %v, want %v", ok, tt.wantOptionals)
-			}
 			if _, ok := tt.tool.(WriteTarget); ok != tt.wantOptionals {
 				t.Errorf("WriteTarget assertion = %v, want %v", ok, tt.wantOptionals)
 			}
-			if _, ok := tt.tool.(Preparer); ok != tt.wantOptionals {
-				t.Errorf("Preparer assertion = %v, want %v", ok, tt.wantOptionals)
+			if _, ok := tt.tool.(CallPreparer); ok != tt.wantOptionals {
+				t.Errorf("CallPreparer assertion = %v, want %v", ok, tt.wantOptionals)
 			}
 		})
 	}

@@ -1157,7 +1157,7 @@ func TestGateCommandsSendCorrectCommand(t *testing.T) {
 			name:    "approve",
 			gate:    permissionGate(),
 			payload: bashPayload(),
-			respond: func(gateID gate.ID) gate.GateResponse { return userApprove(gateID, "session") },
+			respond: func(gateID gate.ID) gate.GateResponse { return userApprove(gateID, gate.ApprovalApprove) },
 			verify: func(t *testing.T, cmd command.Command, callID uuid.UUID) {
 				c, ok := cmd.(command.ApproveToolCall)
 				if !ok {
@@ -1166,8 +1166,8 @@ func TestGateCommandsSendCorrectCommand(t *testing.T) {
 				if c.ToolExecutionID != callID {
 					t.Errorf("ToolExecutionID = %v, want %v", c.ToolExecutionID, callID)
 				}
-				if c.Scope != tool.ScopeSession {
-					t.Errorf("Scope = %v, want %v", c.Scope, tool.ScopeSession)
+				if c.Action != gate.ApprovalApprove {
+					t.Errorf("Action = %q, want %q", c.Action, gate.ApprovalApprove)
 				}
 				if c.CommandHeader().CommandID.IsZero() {
 					t.Error("Header.ID is zero, want a fresh non-zero id")
@@ -1256,7 +1256,7 @@ func TestGateCommandsFreshHeaderIDPerCall(t *testing.T) {
 		payload gate.Payload
 		respond func(gateID gate.ID) gate.GateResponse
 	}{
-		{name: "approve", gate: permissionGate(), payload: bashPayload(), respond: func(gateID gate.ID) gate.GateResponse { return userApprove(gateID, "once") }},
+		{name: "approve", gate: permissionGate(), payload: bashPayload(), respond: func(gateID gate.ID) gate.GateResponse { return userApprove(gateID, gate.ApprovalApprove) }},
 		{name: "deny", gate: permissionGate(), payload: bashPayload(), respond: userDeny},
 		{name: "answer", gate: askUserGate(), payload: askUserPayload(), respond: func(gateID gate.ID) gate.GateResponse { return userAnswer(gateID, "x") }},
 	}
@@ -1393,7 +1393,7 @@ func TestGateCommandsIDGenerationFailure(t *testing.T) {
 		payload gate.Payload
 		respond func(gateID gate.ID) gate.GateResponse
 	}{
-		{name: "approve", gate: permissionGate(), payload: bashPayload(), respond: func(gateID gate.ID) gate.GateResponse { return userApprove(gateID, "once") }},
+		{name: "approve", gate: permissionGate(), payload: bashPayload(), respond: func(gateID gate.ID) gate.GateResponse { return userApprove(gateID, gate.ApprovalApprove) }},
 		{name: "deny", gate: permissionGate(), payload: bashPayload(), respond: userDeny},
 		{name: "answer", gate: askUserGate(), payload: askUserPayload(), respond: func(gateID gate.ID) gate.GateResponse { return userAnswer(gateID, "x") }},
 	}
@@ -1472,7 +1472,7 @@ func TestGateReplyRoutesToTargetLoopNeverSibling(t *testing.T) {
 			name:    "approve",
 			gate:    permissionGate(),
 			payload: bashPayload(),
-			respond: func(gateID gate.ID) gate.GateResponse { return userApprove(gateID, "session") },
+			respond: func(gateID gate.ID) gate.GateResponse { return userApprove(gateID, gate.ApprovalApprove) },
 			verify: func(t *testing.T, cmd command.Command, wantLoop, callID uuid.UUID) {
 				c, ok := cmd.(command.ApproveToolCall)
 				if !ok {
@@ -1484,8 +1484,8 @@ func TestGateReplyRoutesToTargetLoopNeverSibling(t *testing.T) {
 				if c.GateRoute.ToolExecutionID != callID {
 					t.Errorf("GateRoute.ToolExecutionID = %v, want %v", c.GateRoute.ToolExecutionID, callID)
 				}
-				if c.Scope != tool.ScopeSession {
-					t.Errorf("Scope = %v, want %v", c.Scope, tool.ScopeSession)
+				if c.Action != gate.ApprovalApprove {
+					t.Errorf("Action = %q, want %q", c.Action, gate.ApprovalApprove)
 				}
 			},
 		},
@@ -1575,7 +1575,7 @@ func TestGateReplyToNonPrimaryLoop(t *testing.T) {
 	callID := mustUUID()
 	gateID := activateOn(t, s, loopB, callID, permissionGate(), bashPayload())
 
-	if err := s.RespondGate(context.Background(), userApprove(gateID, "once")); err != nil {
+	if err := s.RespondGate(context.Background(), userApprove(gateID, gate.ApprovalApprove)); err != nil {
 		t.Fatalf("RespondGate returned %v, want nil", err)
 	}
 

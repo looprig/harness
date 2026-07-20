@@ -21,7 +21,6 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/session"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
@@ -141,82 +140,6 @@ func lifecycleStore(t *testing.T) (*sessionstore.Store, *lifecycleRecordingLease
 		t.Fatal(err)
 	}
 	return store, leaser
-}
-
-func TestNewSessionRejectsNilSecurityLimitFromFactoryAndCleansUp(t *testing.T) {
-	store, leases := lifecycleStore(t)
-	rootBackend := memstore.New()
-	rootLeases := &lifecycleRecordingLeaser{inner: rootBackend.Leaser}
-	workspace, err := workspacestore.Open(rootBackend.Blobs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	definition, err := loop.Define(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("model")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	r, err := Define(
-		WithLoops(definition),
-		WithPrimers("agent"),
-		WithSessionStore(store),
-		WithSecurityLimitFactory(func() *security.Limit { return nil }),
-		WithExclusiveWorkspace(workspace, t.TempDir(), rootLeases),
-		WithSnapshots(SnapshotPolicy{Trigger: SnapshotManual}),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := r.NewSession(context.Background())
-	if s != nil {
-		t.Fatal("NewSession returned partial session")
-	}
-	var target *LifecycleError
-	if !errors.As(err, &target) || target.Kind != LifecycleSecurityLimitFailed {
-		t.Fatalf("NewSession error = %T %v, want securityLimit stage", err, err)
-	}
-	if !leases.balanced() {
-		t.Fatalf("lease counts = acquired %d released %d", leases.acquired, leases.released)
-	}
-	if rootLeases.acquired != 0 {
-		t.Fatalf("root lease acquisitions = %d, want 0 after securityLimit-stage failure", rootLeases.acquired)
-	}
-}
-
-func TestRestoreSessionRejectsNilSecurityLimitFromFactoryBeforeAdmission(t *testing.T) {
-	store, leases := lifecycleStore(t)
-	original := lifecycleRig(t, store)
-	s, err := original.NewSession(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := s.SessionID()
-	if err := s.Shutdown(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	restoringDefinition, err := loop.Define(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("model")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	restoring, err := Define(
-		WithLoops(restoringDefinition), WithPrimers("agent"), WithSessionStore(store),
-		WithSecurityLimitFactory(func() *security.Limit { return nil }),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	restored, err := restoring.RestoreSession(context.Background(), id)
-	if restored != nil {
-		_ = restored.Shutdown(context.Background())
-		t.Fatal("RestoreSession returned partial session")
-	}
-	var target *LifecycleError
-	if !errors.As(err, &target) || target.Kind != LifecycleSecurityLimitFailed {
-		t.Fatalf("RestoreSession error = %T %v, want securityLimit stage", err, err)
-	}
-	if !leases.balanced() {
-		t.Fatalf("lease counts = acquired %d released %d", leases.acquired, leases.released)
-	}
 }
 
 func TestNewSessionFailureStagesReleaseAcquiredResourcesInReverse(t *testing.T) {
@@ -400,7 +323,10 @@ func TestRigForwardsDelegationAndGateCaps(t *testing.T) {
 			Kind: gate.KindPermission, Resolver: gate.ResolverLoop, Blocks: gate.BlocksToolCall, Effect: gate.EffectResume,
 			Subject: gate.Subject{TurnID: turnID, StepID: stepID},
 		}
-		payload := gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}}
+		payload := gate.PermissionPayload{Request: tool.Request{
+			ToolName: "Bash", Summary: "echo ok",
+			Requirements: []tool.Requirement{{Kind: "tool.invoke", Scope: "Bash", Match: "echo ok", Description: "run: echo ok"}},
+		}}
 		if _, err := preparer.PrepareGateOpen(context.Background(), controller.ActiveLoop().ID(), envelope, payload); err != nil {
 			t.Fatalf("first gate: %v", err)
 		}
@@ -476,10 +402,10 @@ func TestRestoreFingerprintDecisionPrecedesWorkspaceAndBinding(t *testing.T) {
 			definition, err := loop.Define(
 				loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("model")),
 				loop.WithPolicyRevision("permission-v1"),
-				loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) {
+				loop.WithTools(tool.NewDefinition("bind-probe", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 					binds.Add(1)
-					return lifecyclePermissionGate{}, nil
-				}),
+					return []tool.InvokableTool{fpTool{name: "bind-probe"}}, nil
+				})),
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -545,16 +471,6 @@ func TestRestoreFingerprintDecisionPrecedesWorkspaceAndBinding(t *testing.T) {
 			}
 		})
 	}
-}
-
-type lifecyclePermissionGate struct{}
-
-func (lifecyclePermissionGate) Check(context.Context, tool.InvokableTool, string, string) loop.Effect {
-	return loop.EffectAsk
-}
-
-func (lifecyclePermissionGate) Grant(context.Context, string, string, tool.ApprovalScope) error {
-	return nil
 }
 
 func TestNewSessionWithSeedCommitsCheckpointBeforeAnyLoopStarts(t *testing.T) {
@@ -1041,10 +957,10 @@ func TestRestoreAcceptsLegacyBoundFingerprintForFilesAndInjectedSubagent(t *test
 		loop.WithTools(fileDefinitions...),
 		loop.WithDelegates("delegate"),
 		loop.WithPolicyRevision("legacy-files-delegate"),
-		loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) {
+		loop.WithTools(tool.NewDefinition("bind-probe", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 			permissionBinds.Add(1)
-			return lifecyclePermissionGate{}, nil
-		}),
+			return []tool.InvokableTool{fpTool{name: "bind-probe"}}, nil
+		})),
 	)
 	if err != nil {
 		t.Fatal(err)

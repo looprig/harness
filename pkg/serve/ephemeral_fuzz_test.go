@@ -10,7 +10,6 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/tool"
 )
 
 // FuzzEphemeralFrameDecode fuzzes the SSE wire-envelope decode path — the CLIENT's
@@ -136,9 +135,6 @@ func isTypedEventError(err error) bool {
 		blockDecode  *content.BlockDecodeError
 		blockLimit   *content.BlockLimitError
 		unknownBlock *content.UnknownBlockTypeError
-		reqDecode    *tool.PermissionRequestDecodeError
-		reqLimit     *tool.PermissionRequestLimitError
-		reqUnknown   *tool.UnknownPermissionRequestError
 	)
 	return errors.As(err, &unknownEvent) ||
 		errors.As(err, &decode) ||
@@ -147,10 +143,7 @@ func isTypedEventError(err error) bool {
 		errors.As(err, &unknownRole) ||
 		errors.As(err, &blockDecode) ||
 		errors.As(err, &blockLimit) ||
-		errors.As(err, &unknownBlock) ||
-		errors.As(err, &reqDecode) ||
-		errors.As(err, &reqLimit) ||
-		errors.As(err, &reqUnknown)
+		errors.As(err, &unknownBlock)
 }
 
 // fixtureDataPayload reads a golden .sse fixture and returns the JSON body after the

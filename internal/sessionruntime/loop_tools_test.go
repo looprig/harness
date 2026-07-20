@@ -263,7 +263,7 @@ func TestRestoredRootLoopBindsExternalTools(t *testing.T) {
 		t.Errorf("external Bindings.LoopID = %v, want the restored root %v", got.LoopID, orig.rootLoopID)
 	}
 	// Delegate is the requirement this definition declared, so Build's attenuation carries
-	// it through. (SecurityLimit/Workspace are deliberately NOT asserted: attenuateBindings
+	// it through. (Workspace is deliberately NOT asserted: attenuateBindings
 	// passes a factory only SessionID, LoopID, and what it declared.)
 	if got.Delegate == nil {
 		t.Error("external Bindings.Delegate is nil: the restored root was bound without its scoped controller")

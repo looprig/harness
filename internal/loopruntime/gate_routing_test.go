@@ -3,6 +3,7 @@ package loopruntime
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,25 +62,42 @@ func newLoopWithGateRegistrar(t *testing.T, registrar *gateRegistrarPublisher) (
 	return l, cancel
 }
 
-func TestPermissionGateUsesStableStringScopeOptions(t *testing.T) {
+// TestPermissionGateOffersExactApprovalActions proves the permission gate's
+// public envelope offers exactly the three approval actions and renders the
+// displayed request's descriptions (never raw args, never tokens).
+func TestPermissionGateOffersExactApprovalActions(t *testing.T) {
 	t.Parallel()
-	g := permissionGate(newCallID(t), tool.BashRequest{Command: "echo ok"})
-	fields := g.Prompt.Schema.Fields
-	if len(fields) != 1 || fields[0].Name != "scope" {
-		t.Fatalf("permission gate fields = %#v, want one scope field", fields)
+	displayed := tool.Request{
+		ToolName: "Bash",
+		Summary:  "echo ok",
+		Requirements: []tool.Requirement{{
+			Kind: "command.execute", Match: "echo ok", Description: "execute command",
+			Candidates: []tool.RuleCandidate{{Kind: "command.execute", Match: "Bash(echo:*)", Description: "echo family"}},
+		}},
 	}
+	g := permissionGate(newCallID(t), displayed)
 	var got []string
-	for _, opt := range fields[0].Options {
-		got = append(got, opt.Value)
+	for _, control := range g.Prompt.Controls {
+		got = append(got, control.Action)
 	}
-	want := []string{"once", "session", "workspace"}
+	want := []string{
+		string(gatedomain.ApprovalApprove),
+		string(gatedomain.ApprovalApproveAlwaysWorkspace),
+		string(gatedomain.ApprovalDeny),
+	}
 	if len(got) != len(want) {
-		t.Fatalf("scope options = %v, want %v", got, want)
+		t.Fatalf("controls = %v, want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("scope options = %v, want %v", got, want)
+			t.Fatalf("controls = %v, want %v", got, want)
 		}
+	}
+	if len(g.Prompt.Schema.Fields) != 0 {
+		t.Fatalf("permission gate schema fields = %#v, want none (no scope selector)", g.Prompt.Schema.Fields)
+	}
+	if !strings.Contains(g.Prompt.Body, "execute command") || !strings.Contains(g.Prompt.Body, "echo family") {
+		t.Fatalf("prompt body = %q, want capability + candidate descriptions", g.Prompt.Body)
 	}
 }
 

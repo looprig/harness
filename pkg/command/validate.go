@@ -1,6 +1,9 @@
 package command
 
-import "github.com/looprig/harness/pkg/identity"
+import (
+	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/identity"
+)
 
 // Rule is the human-readable invariant a CommandValidationError records, so the
 // caller learns WHY a field is wrong, not just which.
@@ -21,7 +24,6 @@ const (
 	CommandApproveToolCall   CommandName = "ApproveToolCall"
 	CommandDenyToolCall      CommandName = "DenyToolCall"
 	CommandProvideUserInput  CommandName = "ProvideUserInput"
-	CommandSetSecurityLimit  CommandName = "SetSecurityLimit"
 	CommandCompact           CommandName = "Compact"
 	CommandUnknown           CommandName = "Command"
 
@@ -32,6 +34,7 @@ const (
 	FieldTargetLoopID    CommandField = "TargetLoopID"
 	FieldToolExecutionID CommandField = "ToolExecutionID"
 	FieldAgency          CommandField = "Agency"
+	FieldAction          CommandField = "Action"
 )
 
 // CommandValidationError reports that a command violates the ID fill matrix: Field
@@ -78,7 +81,10 @@ func ValidateCommand(cmd Command) error {
 	case Compact:
 		return validateCompact(c)
 	case ApproveToolCall:
-		return validateGateRoute(CommandApproveToolCall, c.GateRoute)
+		if err := validateGateRoute(CommandApproveToolCall, c.GateRoute); err != nil {
+			return err
+		}
+		return validateApproveAction(c.Action)
 	case DenyToolCall:
 		return validateGateRoute(CommandDenyToolCall, c.GateRoute)
 	case ProvideUserInput:
@@ -140,6 +146,19 @@ func validateCancelDelegateRequest(c CancelDelegateRequest) error {
 	return nil
 }
 
+// validateApproveAction requires exactly one of the two approve actions.
+// gate.ApprovalDeny travels on DenyToolCall, so it is rejected here alongside
+// unknown and empty actions — fail-secure: a record that does not name a valid
+// approval can never decode into one.
+func validateApproveAction(action gate.ApprovalAction) error {
+	switch action {
+	case gate.ApprovalApprove, gate.ApprovalApproveAlwaysWorkspace:
+		return nil
+	default:
+		return &CommandValidationError{Command: CommandApproveToolCall, Field: FieldAction, Rule: RuleInvalid}
+	}
+}
+
 // validateGateRoute requires a gate reply's GateRoute to carry a non-zero LoopID
 // (dispatch target) and ToolExecutionID (the gate match key).
 func validateGateRoute(name CommandName, r GateRoute) error {
@@ -169,8 +188,6 @@ func commandName(cmd Command) CommandName {
 		return CommandDenyToolCall
 	case ProvideUserInput:
 		return CommandProvideUserInput
-	case SetSecurityLimit:
-		return CommandSetSecurityLimit
 	case Compact:
 		return CommandCompact
 	case Interrupt:

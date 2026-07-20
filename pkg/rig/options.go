@@ -7,7 +7,6 @@ import (
 	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/session"
 	"github.com/looprig/harness/pkg/sessionstore"
 )
@@ -21,17 +20,16 @@ type Option func(*definitionState) error
 type singletonKey string
 
 const (
-	keyActivePrimer         singletonKey = "active_primer"
-	keyDelegationLimits     singletonKey = "delegation_limits"
-	keyConfigFingerprint    singletonKey = "config_fingerprint"
-	keyForeignBuilder       singletonKey = "foreign_builders"
-	keyGateCaps             singletonKey = "gate_caps"
-	keyAllowConfigMismatch  singletonKey = "allow_config_mismatch"
-	keyRestoreDecider       singletonKey = "restore_decider"
-	keySecurityLimitFactory singletonKey = "ceiling_factory"
-	keySnapshots            singletonKey = "snapshots"
-	keyOffloadGC            singletonKey = "offload_gc"
-	keyHustleLimits         singletonKey = "hustle_limits"
+	keyActivePrimer        singletonKey = "active_primer"
+	keyDelegationLimits    singletonKey = "delegation_limits"
+	keyConfigFingerprint   singletonKey = "config_fingerprint"
+	keyForeignBuilder      singletonKey = "foreign_builders"
+	keyGateCaps            singletonKey = "gate_caps"
+	keyAllowConfigMismatch singletonKey = "allow_config_mismatch"
+	keyRestoreDecider      singletonKey = "restore_decider"
+	keySnapshots           singletonKey = "snapshots"
+	keyOffloadGC           singletonKey = "offload_gc"
+	keyHustleLimits        singletonKey = "hustle_limits"
 )
 
 // MaxHustleQueued is the largest configured waiting capacity for either hustle
@@ -59,11 +57,6 @@ type HustleLimits struct {
 	FinalizationTimeout  time.Duration
 	WorkerDrainTimeout   time.Duration
 }
-
-// SecurityLimitFactory mints a fresh security limit state for each session. A rig may
-// invoke it concurrently for separate sessions, so captured mutable state must be
-// concurrency-safe.
-type SecurityLimitFactory func() *security.Limit
 
 func WithLoops(definitions ...loop.Definition) Option {
 	copyOf := append([]loop.Definition(nil), definitions...)
@@ -176,20 +169,6 @@ func WithRestoreDecider(decider session.RestoreDecider) Option {
 			return &DefinitionError{Kind: DefinitionInvalidRestoreDecider}
 		}
 		return singletonCompile(keyRestoreDecider, sessionruntime.WithLifecycleRestoreDecider(decider))(state)
-	}
-}
-
-func WithSecurityLimitFactory(factory SecurityLimitFactory) Option {
-	return func(state *definitionState) error {
-		if factory == nil {
-			return &DefinitionError{Kind: DefinitionInvalidSecurityLimitFactory}
-		}
-		if state.seen[keySecurityLimitFactory] {
-			return &DefinitionError{Kind: DefinitionDuplicateOption, Name: string(keySecurityLimitFactory)}
-		}
-		state.seen[keySecurityLimitFactory] = true
-		state.lifecycleOptions = append(state.lifecycleOptions, sessionruntime.WithLifecycleSecurityLimitFactory(sessionruntime.SecurityLimitFactory(factory)))
-		return nil
 	}
 }
 

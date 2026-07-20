@@ -69,7 +69,7 @@ type Sequential interface {
 // runner. Sealed via an unexported marker so only deliberate types satisfy it (no
 // bare any): a type in another package cannot supply the unexported method, so it
 // cannot masquerade as a PreparedArtifact. Concrete artifacts therefore live in
-// this package alongside the seal (mirroring PermissionRequest).
+// this package alongside the seal.
 type PreparedArtifact interface{ preparedArtifact() }
 
 // TokenArtifact is the minimal concrete PreparedArtifact: it carries a single
@@ -80,20 +80,6 @@ type PreparedArtifact interface{ preparedArtifact() }
 type TokenArtifact struct{ Token string }
 
 func (TokenArtifact) preparedArtifact() {}
-
-// Preparer is the optional capability: compute a per-call artifact ONCE (e.g. a
-// TOCTOU-safe snapshot + hash), bound to the call by ToolExecutionID. The runner
-// invokes Prepare right after minting the callID (and validating args) and threads
-// the artifact to BOTH the permission decision (via BuildRequest) and execution
-// (via the per-call ctx). A Prepare error is fail-secure: the call is not executed
-// and no gate is opened.
-//
-// Deprecated: the runner no longer probes this capability; CallPreparer is the
-// single preparation step and returns the artifact alongside the typed
-// Request. The interface remains only until Task 2.3 removes the old wires.
-type Preparer interface {
-	Prepare(ctx context.Context, callID uuid.UUID, argsJSON string) (PreparedArtifact, error)
-}
 
 // CallPreparer is the tool-owned preparation boundary: decode and validate the
 // untrusted argsJSON, normalize commands/URLs/paths, resolve canonical resource
@@ -120,20 +106,6 @@ type PreparedCall struct {
 	Request     Request
 	Artifact    PreparedArtifact
 	Grants      []string
-}
-
-// PermissionPrompter is implemented by tools whose execution may require user
-// approval. BuildRequest derives a sealed PermissionRequest from the
-// (untrusted) argsJSON for the approval prompt; it returns an error when the
-// args cannot be parsed into a request. prepared is the per-call artifact a
-// Preparer tool produced for THIS call (nil for non-Preparer tools, which ignore
-// it — behavior identical).
-//
-// Deprecated: the runner no longer consults this capability; the typed
-// CallPreparer request is the only permission input. The type remains only for
-// the durable permission wires that Task 2.3 replaces.
-type PermissionPrompter interface {
-	BuildRequest(argsJSON string, prepared PreparedArtifact) (PermissionRequest, error)
 }
 
 // Auditable is implemented by tools that can emit a redacted, length-capped
@@ -187,7 +159,3 @@ type ArgvRunner interface {
 type GrantedRunner interface {
 	RunCommandWithGrants(ctx context.Context, dir, command string, grants []string) (output []byte, exitCode int, err error)
 }
-
-// PermissionRequest (the sealed approval-prompt contract returned by
-// PermissionPrompter.BuildRequest) and ApprovalScope are declared in
-// permission_request.go alongside their concrete implementers.

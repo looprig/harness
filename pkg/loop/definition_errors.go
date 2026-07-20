@@ -15,7 +15,6 @@ const (
 	DefinitionInvalidToolLimits          DefinitionErrorKind = "invalid_tool_limits"
 	DefinitionInvalidDrainTimeout        DefinitionErrorKind = "invalid_drain_timeout"
 	DefinitionInvalidMiddleware          DefinitionErrorKind = "invalid_middleware"
-	DefinitionInvalidPermission          DefinitionErrorKind = "invalid_permission_factory"
 	DefinitionInvalidAccessGate          DefinitionErrorKind = "invalid_access_gate"
 	DefinitionInvalidEngine              DefinitionErrorKind = "invalid_engine"
 	DefinitionInvalidRuntimeContext      DefinitionErrorKind = "invalid_runtime_context"
@@ -74,8 +73,7 @@ const (
 	BindDuplicateDefinitionName BindErrorKind = "duplicate_definition_name"
 	BindDuplicateToolName       BindErrorKind = "duplicate_tool_name"
 	BindInvalidToolInfo         BindErrorKind = "invalid_tool_info"
-	BindInvalidPermission       BindErrorKind = "invalid_permission"
-	BindInvalidSecurityLimit    BindErrorKind = "invalid_ceiling"
+	BindInvalidAccessGate       BindErrorKind = "invalid_access_gate"
 	BindInvalidSessionID        BindErrorKind = "invalid_session_id"
 	BindInvalidLoopID           BindErrorKind = "invalid_loop_id"
 )

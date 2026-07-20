@@ -418,7 +418,7 @@ func TestRunBatch_WorkspaceRuleVisibleToLaterCall(t *testing.T) {
 	go func() {
 		reg := <-gateReg
 		close(reg.ack)
-		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeWorkspace}
+		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Action: gatedomain.ApprovalApproveAlwaysWorkspace}
 	}()
 
 	calls := []content.ToolUseBlock{call(t, "T", `{"n":1}`), call(t, "T", `{"n":2}`)}
@@ -929,7 +929,7 @@ func TestRunBatch_PermissionDecisionAuditSkipsGatedAsk(t *testing.T) {
 	go func() {
 		reg := <-gateReg
 		close(reg.ack)
-		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeOnce}
+		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Action: gatedomain.ApprovalApprove}
 	}()
 
 	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
@@ -1034,7 +1034,7 @@ func TestRunBatch_WriterErrorFailsClosed(t *testing.T) {
 	go func() {
 		reg := <-gateReg
 		close(reg.ack)
-		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeWorkspace}
+		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Action: gatedomain.ApprovalApproveAlwaysWorkspace}
 	}()
 	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
 	if !results[0].IsError || !strings.Contains(resultText(results[0]), "permission denied") {

@@ -1,6 +1,7 @@
 package sessionruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,6 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
-	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/tool"
 )
@@ -237,8 +237,9 @@ func permissionGate() gate.Gate {
 			Title: "Approve tool call",
 			Body:  "echo ok",
 			Controls: []gate.Control{
-				{Action: "approve", Label: "Approve"},
-				{Action: "deny", Label: "Deny"},
+				{Action: string(gate.ApprovalApprove), Label: "Approve"},
+				{Action: string(gate.ApprovalApproveAlwaysWorkspace), Label: "Approve always for this workspace"},
+				{Action: string(gate.ApprovalDeny), Label: "Deny"},
 			},
 		},
 	}
@@ -250,7 +251,7 @@ func permissionGate() gate.Gate {
 func TestGatePrepareAppendsPrivateRecordAndCreatesPreparing(t *testing.T) {
 	t.Parallel()
 	s, app, loopID, _ := gateSession(t)
-	payload := gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}}
+	payload := bashPayload()
 
 	gateID, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), payload)
 	if err != nil {
@@ -311,7 +312,7 @@ func TestGateActivateAppendsOpenedAndFlipsToOpen(t *testing.T) {
 	t.Parallel()
 	s, app, loopID, _ := gateSession(t)
 
-	gateID, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}})
+	gateID, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), bashPayload())
 	if err != nil {
 		t.Fatalf("PrepareGateOpen() error = %v", err)
 	}
@@ -441,7 +442,7 @@ func TestGateClosePreparingRemovesWithoutPublicResolve(t *testing.T) {
 func TestGateCloseOpenAppendsOwnerClosedAndRemoves(t *testing.T) {
 	t.Parallel()
 	s, app, loopID, cmds := gateSession(t)
-	gateID := prepareAndActivate(t, s, loopID, gate.PermissionPayload{})
+	gateID := prepareAndActivate(t, s, loopID, bashPayload())
 
 	if err := s.CloseGate(context.Background(), gateID, gate.CloseOwnerClosed); err != nil {
 		t.Fatalf("CloseGate() error = %v", err)
@@ -465,7 +466,7 @@ func TestGateCloseOpenAppendsOwnerClosedAndRemoves(t *testing.T) {
 func TestGateCloseAppendFailureLeavesOpen(t *testing.T) {
 	t.Parallel()
 	s, app, loopID, _ := gateSession(t)
-	gateID := prepareAndActivate(t, s, loopID, gate.PermissionPayload{})
+	gateID := prepareAndActivate(t, s, loopID, bashPayload())
 	app.resolveErr = errors.New("journal wedge")
 
 	err := s.CloseGate(context.Background(), gateID, gate.CloseAbandoned)
@@ -539,7 +540,7 @@ func TestGatePolicyPermissionDefaultDeny(t *testing.T) {
 	if entry.gate.ResponsePolicy.Timeout != 5*time.Minute {
 		t.Fatalf("default timeout = %v, want 5m", entry.gate.ResponsePolicy.Timeout)
 	}
-	if entry.gate.ResponsePolicy.OnTimeout != gate.PolicyRespond || entry.gate.ResponsePolicy.Response.Action != "deny" {
+	if entry.gate.ResponsePolicy.OnTimeout != gate.PolicyRespond || entry.gate.ResponsePolicy.Response.Action != string(gate.ApprovalDeny) {
 		t.Fatalf("default policy = %+v, want respond deny", entry.gate.ResponsePolicy)
 	}
 }
@@ -551,7 +552,7 @@ func TestGatePolicyRespondSubmitsThroughRespondGate(t *testing.T) {
 	g.ResponsePolicy = gate.ResponsePolicy{
 		Timeout:   10 * time.Millisecond,
 		OnTimeout: gate.PolicyRespond,
-		Response:  gate.ResponseTemplate{Action: "deny"},
+		Response:  gate.ResponseTemplate{Action: string(gate.ApprovalDeny)},
 	}
 	gateID, err := s.PrepareGateOpen(context.Background(), loopID, g, gate.PermissionPayload{})
 	if err != nil {
@@ -589,7 +590,7 @@ func TestGatePolicyRespondLosesToEarlierHumanResponse(t *testing.T) {
 	g.ResponsePolicy = gate.ResponsePolicy{
 		Timeout:   50 * time.Millisecond,
 		OnTimeout: gate.PolicyRespond,
-		Response:  gate.ResponseTemplate{Action: "deny"},
+		Response:  gate.ResponseTemplate{Action: string(gate.ApprovalDeny)},
 	}
 	gateID, err := s.PrepareGateOpen(context.Background(), loopID, g, gate.PermissionPayload{})
 	if err != nil {
@@ -598,7 +599,7 @@ func TestGatePolicyRespondLosesToEarlierHumanResponse(t *testing.T) {
 	if err := s.ActivateGate(context.Background(), gateID, gate.Route{GateID: gateID, LoopID: loopID, ToolExecutionID: mustUUID()}); err != nil {
 		t.Fatalf("ActivateGate() error = %v", err)
 	}
-	if err := s.RespondGate(context.Background(), gate.GateResponse{GateID: gateID, Action: "deny", Source: gate.ResponseSource{Kind: gate.ResponseFromUser}}); err != nil {
+	if err := s.RespondGate(context.Background(), userDeny(gateID)); err != nil {
 		t.Fatalf("RespondGate() error = %v", err)
 	}
 	recvCommand(t, cmds)
@@ -662,7 +663,7 @@ func TestGatePolicyTimeoutCapRejectsBeforeAppend(t *testing.T) {
 	g.ResponsePolicy = gate.ResponsePolicy{
 		Timeout:   2 * time.Second,
 		OnTimeout: gate.PolicyRespond,
-		Response:  gate.ResponseTemplate{Action: "deny"},
+		Response:  gate.ResponseTemplate{Action: string(gate.ApprovalDeny)},
 	}
 
 	_, err := s.PrepareGateOpen(context.Background(), loopID, g, gate.PermissionPayload{})
@@ -806,11 +807,38 @@ func askUserGate() gate.Gate {
 	}
 }
 
-// bashPayload is a permission payload carrying a Bash request that offers the
-// persistable scopes, the representative payload for approve/deny RespondGate
-// tests (a permission approve requires a non-nil Request).
+// typedGateRequest is the representative displayed typed request for the
+// permission RespondGate tests: one command-backed requirement carrying one
+// reusable candidate.
+func typedGateRequest() tool.Request {
+	return tool.Request{
+		ToolName:           "Bash",
+		Summary:            "git push",
+		ExecutionID:        "exec-1",
+		Command:            "git push",
+		WorkingDirectory:   "/workspace",
+		ExpiresAtUnixMilli: 1,
+		Requirements: []tool.Requirement{{
+			Kind:        tool.CapabilityCommandExecute,
+			Match:       "git push",
+			Description: "execute command",
+			GrantClass:  tool.GrantClassCommandStart,
+			GrantTarget: "git push",
+			Candidates: []tool.RuleCandidate{{
+				Kind:        tool.CapabilityCommandExecute,
+				Match:       "Bash(git push:*)",
+				Description: "git push family",
+				GrantClass:  tool.GrantClassCommandStart,
+				GrantTarget: "git push",
+			}},
+		}},
+	}
+}
+
+// bashPayload is the representative permission payload for approve/deny
+// RespondGate tests: the displayed typed request.
 func bashPayload() gate.Payload {
-	return gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}}
+	return gate.PermissionPayload{Request: typedGateRequest()}
 }
 
 // askUserPayload is the payload for an ask-user gate.
@@ -843,14 +871,12 @@ func mustJSON(v string) json.RawMessage {
 }
 
 // userApprove/userDeny/userAnswer build the human GateResponse for each gate
-// kind, mirroring what the removed Approve/Deny/ProvideUserInput trio used to
-// send: a user-sourced approve at the given scope, a user-sourced deny, and a
-// user-sourced ask-user answer.
-func userApprove(gateID gate.ID, scope string) gate.GateResponse {
+// kind: a user-sourced approval carrying one of the exact approve actions, a
+// user-sourced deny, and a user-sourced ask-user answer.
+func userApprove(gateID gate.ID, action gate.ApprovalAction) gate.GateResponse {
 	return gate.GateResponse{
 		GateID: gateID,
-		Action: "approve",
-		Values: map[string]json.RawMessage{"scope": mustJSON(scope)},
+		Action: string(action),
 		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
 	}
 }
@@ -858,7 +884,7 @@ func userApprove(gateID gate.ID, scope string) gate.GateResponse {
 func userDeny(gateID gate.ID) gate.GateResponse {
 	return gate.GateResponse{
 		GateID: gateID,
-		Action: "deny",
+		Action: string(gate.ApprovalDeny),
 		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
 	}
 }
@@ -904,28 +930,15 @@ func gateSessionTwoLoops(t *testing.T) (s *Session, loopA, loopB uuid.UUID, cmds
 	return s, loopA, loopB, cmdsA, cmdsB
 }
 
-// TestRespondGateApproveDispatchesCommand proves a human approve response claims
-// the open gate, appends GateResolved, and dispatches an ApproveToolCall command
-// with the extracted scope and accepted_grants.
-func TestRespondGateApproveDispatchesCommand(t *testing.T) {
+// TestRespondGateApproveOnceDispatchesCommand proves the once-approval action
+// claims the open gate, appends GateResolved carrying the exact action and a
+// descriptions-only audit, and dispatches an ApproveToolCall with that action.
+func TestRespondGateApproveOnceDispatchesCommand(t *testing.T) {
 	t.Parallel()
 	s, app, loopID, cmds := gateSession(t)
-	payload := gate.PermissionPayload{Request: tool.BashRequest{
-		Command: "echo ok",
-		Grants:  []tool.GrantDisplay{{Token: "t1", Description: "network egress"}, {Token: "t2", Description: "write to /out"}},
-	}}
-	gateID := prepareAndActivate(t, s, loopID, payload)
+	gateID := prepareAndActivate(t, s, loopID, bashPayload())
 
-	resp := gate.GateResponse{
-		GateID: gateID,
-		Action: "approve",
-		Values: map[string]json.RawMessage{
-			"scope":           json.RawMessage(`"session"`),
-			"accepted_grants": json.RawMessage(`["t1","t2"]`),
-		},
-		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
-	}
-	if err := s.RespondGate(context.Background(), resp); err != nil {
+	if err := s.RespondGate(context.Background(), userApprove(gateID, gate.ApprovalApprove)); err != nil {
 		t.Fatalf("RespondGate() error = %v", err)
 	}
 
@@ -934,47 +947,128 @@ func TestRespondGateApproveDispatchesCommand(t *testing.T) {
 	if !ok {
 		t.Fatalf("dispatched command = %T, want ApproveToolCall", cmd)
 	}
-	if approve.Scope != tool.ScopeSession {
-		t.Errorf("Scope = %d, want %d (ScopeSession)", approve.Scope, tool.ScopeSession)
-	}
-	if len(approve.AcceptedGrants) != 2 || approve.AcceptedGrants[0] != "t1" || approve.AcceptedGrants[1] != "t2" {
-		t.Errorf("AcceptedGrants = %v, want [t1 t2]", approve.AcceptedGrants)
+	if approve.Action != gate.ApprovalApprove {
+		t.Errorf("Action = %q, want %q", approve.Action, gate.ApprovalApprove)
 	}
 
 	if len(app.resolved) != 1 {
-		t.Errorf("appender recorded %d resolved events, want 1", len(app.resolved))
+		t.Fatalf("appender recorded %d resolved events, want 1", len(app.resolved))
 	}
 	if app.resolved[0].Reason != gate.CloseAnswered {
 		t.Errorf("resolved reason = %q, want %q", app.resolved[0].Reason, gate.CloseAnswered)
 	}
-	if app.resolved[0].ApprovalScope != tool.ScopeSession {
-		t.Errorf("resolved approval scope = %d, want %d (ScopeSession)", app.resolved[0].ApprovalScope, tool.ScopeSession)
+	if app.resolved[0].Action != string(gate.ApprovalApprove) {
+		t.Errorf("resolved action = %q, want %q", app.resolved[0].Action, gate.ApprovalApprove)
+	}
+	audit, ok := app.resolved[0].Audit.(gate.PermissionAudit)
+	if !ok {
+		t.Fatalf("resolved audit = %T, want gate.PermissionAudit", app.resolved[0].Audit)
+	}
+	if len(audit.RequirementDescriptions) != 1 || audit.RequirementDescriptions[0] != "execute command" {
+		t.Errorf("RequirementDescriptions = %v, want [execute command]", audit.RequirementDescriptions)
+	}
+	if len(audit.CandidateDescriptions) != 0 {
+		t.Errorf("CandidateDescriptions = %v, want none for a once approval", audit.CandidateDescriptions)
 	}
 }
 
-func TestRespondGateApproveRequiresScope(t *testing.T) {
+// TestRespondGateApproveAlwaysDispatchesCommand proves the workspace approval
+// action reaches the loop as ApproveToolCall{ApprovalApproveAlwaysWorkspace}
+// and durably records the displayed candidate descriptions.
+func TestRespondGateApproveAlwaysDispatchesCommand(t *testing.T) {
 	t.Parallel()
-	s, _, loopID, cmds := gateSession(t)
-	payload := gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}}
-	gateID := prepareAndActivate(t, s, loopID, payload)
+	s, app, loopID, cmds := gateSession(t)
+	gateID := prepareAndActivate(t, s, loopID, bashPayload())
 
-	err := s.RespondGate(context.Background(), gate.GateResponse{
-		GateID: gateID,
-		Action: "approve",
-		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
-	})
-	if err == nil {
-		t.Fatal("RespondGate() error = nil, want missing scope validation failure")
-	}
-	var ge *GateError
-	if !errors.As(err, &ge) || ge.Kind != GateActionInvalid {
-		t.Fatalf("RespondGate() error = %v, want *GateError{GateActionInvalid}", err)
+	if err := s.RespondGate(context.Background(), userApprove(gateID, gate.ApprovalApproveAlwaysWorkspace)); err != nil {
+		t.Fatalf("RespondGate() error = %v", err)
 	}
 
-	select {
-	case c := <-cmds:
-		t.Errorf("missing scope dispatched a command %T, want none", c)
-	default:
+	cmd := recvCommand(t, cmds)
+	approve, ok := cmd.(command.ApproveToolCall)
+	if !ok {
+		t.Fatalf("dispatched command = %T, want ApproveToolCall", cmd)
+	}
+	if approve.Action != gate.ApprovalApproveAlwaysWorkspace {
+		t.Errorf("Action = %q, want %q", approve.Action, gate.ApprovalApproveAlwaysWorkspace)
+	}
+	if len(app.resolved) != 1 {
+		t.Fatalf("appender recorded %d resolved events, want 1", len(app.resolved))
+	}
+	audit, ok := app.resolved[0].Audit.(gate.PermissionAudit)
+	if !ok {
+		t.Fatalf("resolved audit = %T, want gate.PermissionAudit", app.resolved[0].Audit)
+	}
+	if len(audit.CandidateDescriptions) != 1 || audit.CandidateDescriptions[0] != "git push family" {
+		t.Errorf("CandidateDescriptions = %v, want the displayed candidate description", audit.CandidateDescriptions)
+	}
+}
+
+// TestRespondGateRejectsLegacyOrUnknownActions proves the session route fails
+// secure on anything but the three exact actions — including the retired
+// lowercase wire actions and a session-scope spelling.
+func TestRespondGateRejectsLegacyOrUnknownActions(t *testing.T) {
+	t.Parallel()
+	for _, action := range []string{"approve", "deny", "", "Approve always for this session", "APPROVE"} {
+		action := action
+		t.Run("action "+action, func(t *testing.T) {
+			t.Parallel()
+			s, app, loopID, cmds := gateSession(t)
+			gateID := prepareAndActivate(t, s, loopID, bashPayload())
+			err := s.RespondGate(context.Background(), gate.GateResponse{
+				GateID: gateID,
+				Action: action,
+				Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+			})
+			var ge *GateError
+			if !errors.As(err, &ge) || ge.Kind != GateActionInvalid {
+				t.Fatalf("RespondGate(%q) error = %v, want *GateError{GateActionInvalid}", action, err)
+			}
+			if len(app.resolved) != 0 {
+				t.Errorf("appender recorded %d resolved events, want 0", len(app.resolved))
+			}
+			select {
+			case c := <-cmds:
+				t.Errorf("invalid action dispatched a command %T, want none", c)
+			default:
+			}
+		})
+	}
+}
+
+// TestRespondGateApproveIgnoresSmuggledValues proves the response Values carry
+// no authority: smuggled scope/grant keys change neither the dispatched command
+// nor the durable audit, and no token material reaches the resolved record.
+func TestRespondGateApproveIgnoresSmuggledValues(t *testing.T) {
+	t.Parallel()
+	s, app, loopID, cmds := gateSession(t)
+	gateID := prepareAndActivate(t, s, loopID, bashPayload())
+
+	resp := userApprove(gateID, gate.ApprovalApprove)
+	resp.Values = map[string]json.RawMessage{
+		"scope":           mustJSON("workspace"),
+		"accepted_grants": json.RawMessage(`["smuggled-token"]`),
+	}
+	if err := s.RespondGate(context.Background(), resp); err != nil {
+		t.Fatalf("RespondGate() error = %v", err)
+	}
+	cmd := recvCommand(t, cmds)
+	approve, ok := cmd.(command.ApproveToolCall)
+	if !ok {
+		t.Fatalf("dispatched command = %T, want ApproveToolCall", cmd)
+	}
+	if approve.Action != gate.ApprovalApprove {
+		t.Errorf("Action = %q, want %q (values must carry no authority)", approve.Action, gate.ApprovalApprove)
+	}
+	if len(app.resolved) != 1 {
+		t.Fatalf("appender recorded %d resolved events, want 1", len(app.resolved))
+	}
+	wire, err := event.MarshalEvent(app.resolved[0])
+	if err != nil {
+		t.Fatalf("MarshalEvent(resolved) error = %v", err)
+	}
+	if bytes.Contains(wire, []byte("smuggled-token")) || bytes.Contains(wire, []byte("accepted_grants")) {
+		t.Errorf("resolved wire carries smuggled token material: %s", wire)
 	}
 }
 
@@ -983,13 +1077,9 @@ func TestRespondGateApproveRequiresScope(t *testing.T) {
 func TestRespondGateDenyDispatchesCommand(t *testing.T) {
 	t.Parallel()
 	s, _, loopID, cmds := gateSession(t)
-	gateID := prepareAndActivate(t, s, loopID, gate.PermissionPayload{})
+	gateID := prepareAndActivate(t, s, loopID, bashPayload())
 
-	if err := s.RespondGate(context.Background(), gate.GateResponse{
-		GateID: gateID,
-		Action: "deny",
-		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
-	}); err != nil {
+	if err := s.RespondGate(context.Background(), userDeny(gateID)); err != nil {
 		t.Fatalf("RespondGate() error = %v", err)
 	}
 
@@ -1004,14 +1094,14 @@ func TestRespondGateDenyDispatchesCommand(t *testing.T) {
 func TestRespondGateDuplicateIsStale(t *testing.T) {
 	t.Parallel()
 	s, _, loopID, cmds := gateSession(t)
-	gateID := prepareAndActivate(t, s, loopID, gate.PermissionPayload{})
+	gateID := prepareAndActivate(t, s, loopID, bashPayload())
 
-	if err := s.RespondGate(context.Background(), gate.GateResponse{GateID: gateID, Action: "deny"}); err != nil {
+	if err := s.RespondGate(context.Background(), userDeny(gateID)); err != nil {
 		t.Fatalf("RespondGate() #1 error = %v", err)
 	}
 	recvCommand(t, cmds)
 
-	err := s.RespondGate(context.Background(), gate.GateResponse{GateID: gateID, Action: "deny"})
+	err := s.RespondGate(context.Background(), userDeny(gateID))
 	if err == nil {
 		t.Fatal("RespondGate() #2 error = nil, want stale")
 	}
@@ -1034,9 +1124,9 @@ func TestRespondGateAppendFailureLeavesGateAnswerable(t *testing.T) {
 	t.Parallel()
 	s, app, loopID, cmds := gateSession(t)
 	app.resolveErr = errors.New("journal wedge")
-	gateID := prepareAndActivate(t, s, loopID, gate.PermissionPayload{})
+	gateID := prepareAndActivate(t, s, loopID, bashPayload())
 
-	err := s.RespondGate(context.Background(), gate.GateResponse{GateID: gateID, Action: "deny"})
+	err := s.RespondGate(context.Background(), userDeny(gateID))
 	if err == nil {
 		t.Fatal("RespondGate() error = nil, want append failure")
 	}
@@ -1060,117 +1150,16 @@ func TestRespondGateAppendFailureLeavesGateAnswerable(t *testing.T) {
 	}
 }
 
-// TestRespondGateValidatesAcceptedGrants proves a permission approve with
-// accepted_grants not in the request's GrantDisplay.Token values is rejected.
-func TestRespondGateValidatesAcceptedGrants(t *testing.T) {
-	t.Parallel()
-	s, _, loopID, cmds := gateSession(t)
-	payload := gate.PermissionPayload{Request: tool.BashRequest{
-		Command: "echo ok",
-		Grants:  []tool.GrantDisplay{{Token: "real-token", Description: "network egress"}},
-	}}
-	gateID := prepareAndActivate(t, s, loopID, payload)
-
-	err := s.RespondGate(context.Background(), gate.GateResponse{
-		GateID: gateID,
-		Action: "approve",
-		Values: map[string]json.RawMessage{
-			"scope":           json.RawMessage(`"once"`),
-			"accepted_grants": json.RawMessage(`["fabricated-token"]`),
-		},
-		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
-	})
-	if err == nil {
-		t.Fatal("RespondGate() error = nil, want grant validation failure")
-	}
-	var ge *GateError
-	if !errors.As(err, &ge) || ge.Kind != GateActionInvalid {
-		t.Fatalf("RespondGate() error = %v, want *GateError{GateActionInvalid}", err)
-	}
-
-	select {
-	case c := <-cmds:
-		t.Errorf("invalid grants dispatched a command %T, want none", c)
-	default:
-	}
-}
-
-// TestRespondGateRejectsScopeOutsidePermissionRequest proves approve fails
-// secure when the response asks for a scope the PermissionRequest did not offer.
-func TestRespondGateRejectsScopeOutsidePermissionRequest(t *testing.T) {
-	t.Parallel()
-	s, app, loopID, cmds := gateSession(t)
-	payload := gate.PermissionPayload{Request: tool.UnknownRequest{
-		Tool:    "Mystery",
-		Summary: "redacted call",
-	}}
-	gateID := prepareAndActivate(t, s, loopID, payload)
-
-	err := s.RespondGate(context.Background(), gate.GateResponse{
-		GateID: gateID,
-		Action: "approve",
-		Values: map[string]json.RawMessage{
-			"scope": json.RawMessage(`"session"`),
-		},
-		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
-	})
-	if err == nil {
-		t.Fatal("RespondGate() error = nil, want scope validation failure")
-	}
-	var ge *GateError
-	if !errors.As(err, &ge) || ge.Kind != GateActionInvalid {
-		t.Fatalf("RespondGate() error = %v, want *GateError{GateActionInvalid}", err)
-	}
-	if len(app.resolved) != 0 {
-		t.Errorf("appender recorded %d resolved events, want 0", len(app.resolved))
-	}
-
-	select {
-	case c := <-cmds:
-		t.Errorf("invalid scope dispatched a command %T, want none", c)
-	default:
-	}
-}
-
-func TestBuildGateResolvedUsesValidatedApprovalScope(t *testing.T) {
-	t.Parallel()
-	s, _, loopID, _ := gateSession(t)
-	entry := gateEntry{
-		coordinates: identity.Coordinates{
-			SessionID: s.SessionID(),
-			LoopID:    loopID,
-			TurnID:    mustUUID(),
-			StepID:    mustUUID(),
-		},
-	}
-	gateID := gate.ID(mustUUID())
-	validatedScope := tool.ScopeSession
-
-	resolved, err := s.buildGateResolved(entry, gate.GateResponse{
-		GateID: gateID,
-		Action: "approve",
-		Values: map[string]json.RawMessage{
-			"scope": json.RawMessage(`"invalid raw scope"`),
-		},
-	}, gate.PermissionAudit{}, &validatedScope)
-	if err != nil {
-		t.Fatalf("buildGateResolved() error = %v", err)
-	}
-	if resolved.ApprovalScope != tool.ScopeSession {
-		t.Fatalf("ApprovalScope = %d, want %d (ScopeSession)", resolved.ApprovalScope, tool.ScopeSession)
-	}
-}
-
 // TestRespondGateReturnsNilAfterDurableAppendWhenDispatchFails proves a
 // post-append route lookup failure does not make a durably accepted response look
 // rejected to the caller.
 func TestRespondGateReturnsNilAfterDurableAppendWhenDispatchFails(t *testing.T) {
 	t.Parallel()
 	s, app, loopID, cmds := gateSession(t)
-	gateID := prepareAndActivate(t, s, loopID, gate.PermissionPayload{})
+	gateID := prepareAndActivate(t, s, loopID, bashPayload())
 	delete(s.loops, loopID)
 
-	if err := s.RespondGate(context.Background(), gate.GateResponse{GateID: gateID, Action: "deny"}); err != nil {
+	if err := s.RespondGate(context.Background(), userDeny(gateID)); err != nil {
 		t.Fatalf("RespondGate() error = %v, want nil after durable append", err)
 	}
 	if len(app.resolved) != 1 {
@@ -1193,10 +1182,7 @@ func TestRespondGateUnknownGateFailsSecure(t *testing.T) {
 	t.Parallel()
 	s, app, _, _ := gateSession(t)
 
-	err := s.RespondGate(context.Background(), gate.GateResponse{
-		GateID: gate.ID(mustUUID()),
-		Action: "deny",
-	})
+	err := s.RespondGate(context.Background(), userDeny(gate.ID(mustUUID())))
 	if err == nil {
 		t.Fatal("RespondGate() error = nil, want not-found")
 	}
@@ -1219,7 +1205,7 @@ func TestRespondGatePreparingGateFailsSecure(t *testing.T) {
 		t.Fatalf("PrepareGateOpen() error = %v", err)
 	}
 
-	err = s.RespondGate(context.Background(), gate.GateResponse{GateID: gateID, Action: "deny"})
+	err = s.RespondGate(context.Background(), userDeny(gateID))
 	if err == nil {
 		t.Fatal("RespondGate() error = nil, want not-ready")
 	}
@@ -1234,7 +1220,7 @@ func TestRespondGatePreparingGateFailsSecure(t *testing.T) {
 func TestRespondGateInvalidActionFailsSecure(t *testing.T) {
 	t.Parallel()
 	s, _, loopID, cmds := gateSession(t)
-	gateID := prepareAndActivate(t, s, loopID, gate.PermissionPayload{})
+	gateID := prepareAndActivate(t, s, loopID, bashPayload())
 
 	err := s.RespondGate(context.Background(), gate.GateResponse{
 		GateID: gateID,

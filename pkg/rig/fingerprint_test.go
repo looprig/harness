@@ -425,10 +425,10 @@ func TestFrozenFingerprintRetainsFullInitialFieldsWithoutBinding(t *testing.T) {
 		loop.WithModes(loop.Mode{Name: "build", Model: validModel("selected"), Instructions: "build instructions"}),
 		loop.WithInitialMode("build"),
 		loop.WithPolicyRevision("policy-v1"),
-		loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) {
+		loop.WithTools(tool.NewDefinition("bind-probe", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 			binds.Add(1)
-			return lifecyclePermissionGate{}, nil
-		}),
+			return []tool.InvokableTool{fpTool{name: "bind-probe"}}, nil
+		})),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -443,7 +443,7 @@ func TestFrozenFingerprintRetainsFullInitialFieldsWithoutBinding(t *testing.T) {
 	if want := hexSHA256("base system\n\nbuild instructions"); fingerprint.SystemPromptRev != want {
 		t.Fatalf("SystemPromptRev = %q, want %q", fingerprint.SystemPromptRev, want)
 	}
-	if want := hexSHA256("Read"); fingerprint.ToolPolicyRev != want {
+	if want := hexSHA256("Read\nbind-probe"); fingerprint.ToolPolicyRev != want {
 		t.Fatalf("ToolPolicyRev = %q, want %q", fingerprint.ToolPolicyRev, want)
 	}
 }

@@ -9,7 +9,6 @@ import (
 	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
@@ -56,8 +55,6 @@ const (
 	// NewSessionAppenderFailed: a checked journal appender (event/command/gate) could not be
 	// constructed over the opened journal.
 	NewSessionAppenderFailed NewSessionErrorKind = "appender_failed"
-	// NewSessionSecurityLimitFailed: the configured factory returned no per-session security.
-	NewSessionSecurityLimitFailed NewSessionErrorKind = "ceiling_failed"
 	// NewSessionRuntimeFailed: NewSession refused to build the live session over the wired dependencies.
 	NewSessionRuntimeFailed NewSessionErrorKind = "session_failed"
 )
@@ -81,12 +78,6 @@ func (e *NewSessionError) Error() string {
 }
 
 func (e *NewSessionError) Unwrap() error { return e.Cause }
-
-// NilSecurityLimitError reports a per-session security limit factory that violated its contract.
-// Silently minting the default would hide broken security-policy wiring.
-type NilSecurityLimitError struct{}
-
-func (*NilSecurityLimitError) Error() string { return "session: security limit factory returned nil" }
 
 // Lifecycle binds a design-time loop topology and durable backend into an immutable,
 // reusable factory for live sessions. NewTopologyLifecycle captures the caller-facing
@@ -127,16 +118,8 @@ type Lifecycle struct {
 	// for the same serve.Rig interface-minimalism reason as allowConfigMismatch.
 	restoreDecider RestoreDecider
 
-	// security limitFactory mints a FRESH *security.Limit per NewSession/RestoreSession. Reusing one
-	// Lifecycle across concurrent sessions must never reuse mutable security limit state. The
-	// Lifecycle therefore mints a per-session state here and injects it via WithSecurityLimit so
-	// the session's security limit source is isolated. Every loop PermissionFactory receives this
-	// exact live source through tool.Bindings, so native permission checkers can select
-	// postures on each Check. When the factory is nil the Lifecycle falls
-	// back to today's behavior — the session default-mints its own internal security limit state.
-	securityLimitFactory SecurityLimitFactory
-	fingerprint          FingerprintProvider
-	frozenFingerprint    *event.ConfigFingerprint
+	fingerprint       FingerprintProvider
+	frozenFingerprint *event.ConfigFingerprint
 	// frozenManifest is the rig-assembled ConfigManifest counterpart to
 	// frozenFingerprint. When set it is stamped onto the construction-time
 	// SessionStarted alongside the legacy fingerprint. Nil leaves the additive
@@ -237,11 +220,6 @@ func WithLifecyclePlacement(p WorkspacePlacement) LifecycleOption {
 	}
 }
 
-// SecurityLimitFactory mints a fresh security limit state. The Lifecycle calls it once per
-// NewSession/RestoreSession so each session gets its own independent clamp (AMBIGUITY A1 on
-// Lifecycle.security limitFactory). It is a named type per the codebase's prefer-named-types rule.
-type SecurityLimitFactory func() *security.Limit
-
 // LifecycleOption configures a Lifecycle at NewTopologyLifecycle time. Every caller-facing knob is captured
 // here (the runtime NewSession/RestoreSession take none), mirroring flow's LifecycleOption model. A
 // nil/zero argument is ignored (the default is kept), mirroring the session options' own
@@ -341,18 +319,6 @@ func WithLifecycleRestoreDecider(decider RestoreDecider) LifecycleOption {
 	return func(r *Lifecycle) {
 		if decider != nil {
 			r.restoreDecider = decider
-		}
-	}
-}
-
-// WithLifecycleSecurityLimitFactory captures the factory the Lifecycle calls to mint a FRESH
-// *security.Limit for each NewSession/RestoreSession. A nil factory is ignored (the session default-mints
-// its own internal state). See AMBIGUITY A1 on Lifecycle.security limitFactory for why the security limit
-// must be per-session and what the Lifecycle deliberately leaves to the composition root.
-func WithLifecycleSecurityLimitFactory(factory SecurityLimitFactory) LifecycleOption {
-	return func(r *Lifecycle) {
-		if factory != nil {
-			r.securityLimitFactory = factory
 		}
 	}
 }
@@ -466,14 +432,6 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	// AMBIGUITY A1: mint a fresh per-session security limit state so concurrent sessions never share one
 	// mutable clamp. A configured factory returning nil fails closed; only an absent factory
 	// selects the session's internal default.
-	if r.securityLimitFactory != nil {
-		state := r.securityLimitFactory()
-		if state == nil {
-			releaseLease(lease)
-			return nil, &NewSessionError{Kind: NewSessionSecurityLimitFailed, Cause: &NilSecurityLimitError{}}
-		}
-		opts = append(opts, WithSecurityLimit(state))
-	}
 
 	// Resolve the managed-workspace placement (design §"Placement details"). The session
 	// lease is already held (above), so the exclusive root lease is acquired AFTER it, as
@@ -565,16 +523,6 @@ func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session,
 	}
 	if r.restoreDecider != nil {
 		opts = append(opts, WithRestoreDecider(r.restoreDecider))
-	}
-	// AMBIGUITY A1: mint a fresh per-session security limit on restore too (WithSecurityLimit applies to
-	// RestoreSession, which re-seeds the injected state from the folded SecurityLimitChanged
-	// events), so a restored session gets its own clamp just like a fresh NewSession.
-	if r.securityLimitFactory != nil {
-		state := r.securityLimitFactory()
-		if state == nil {
-			return nil, &NilSecurityLimitError{}
-		}
-		opts = append(opts, WithSecurityLimit(state))
 	}
 	if r.placement.Configured() {
 		opts = append(opts, withPlacementSpec(r.placement))

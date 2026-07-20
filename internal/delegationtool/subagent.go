@@ -465,7 +465,8 @@ func statusLabel(status tool.DelegateStatusValue) string {
 }
 
 // compile-time assertions: SubagentTool is an InvokableTool and Auditable. It is
-// deliberately NOT a PermissionPrompter (AutoApprove) and NOT a WriteTarget.
+// deliberately NOT a WriteTarget, and its preparation yields an empty request
+// (delegation is auto-approved; the child's own gate governs its tools).
 var (
 	_ tool.InvokableTool = (*SubagentTool)(nil)
 	_ tool.CallPreparer  = (*SubagentTool)(nil)

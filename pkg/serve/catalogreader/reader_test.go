@@ -362,7 +362,7 @@ func TestReaderReadJournal(t *testing.T) {
 		stepH := event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: loop, TurnID: fixedUUID(0x70), StepID: fixedUUID(0x71)}, EventID: fixedUUID(0x72)}
 		g := gate.Gate{ID: gate.ID(fixedUUID(0x73)), Kind: gate.KindPermission, Resolver: gate.ResolverLoop}
 		prepared := event.GatePrepared{Header: stepH, Gate: g}
-		openPayload := gate.OpenPayload{GateID: g.ID, Payload: gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}}}
+		openPayload := gate.OpenPayload{GateID: g.ID, Payload: gate.PermissionPayload{Request: tool.Request{ToolName: "Bash", Summary: "echo ok", Requirements: []tool.Requirement{{Kind: "tool.invoke", Scope: "Bash", Match: "echo ok", Description: "run: echo ok"}}}}}
 
 		recs := []journal.JournalRecord{
 			journal.NewEventRecord(sessionStarted(sid)),                  // seq 2 (after opening fence at 1)

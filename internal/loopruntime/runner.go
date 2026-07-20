@@ -408,15 +408,15 @@ func approvalRequesterFor(
 ) loop.ApprovalRequestFunc {
 	return func(ctx context.Context, prompt gatedomain.ApprovalPrompt) (gatedomain.ApprovalAction, error) {
 		r.prompted = true
-		req := bridgePermissionRequest(r.block.Name, r.summary, prompt)
+		displayed := displayedRequest(prompt)
 
 		// reply is buffered(1) (runner is the sole reader, so the actor's routed
 		// send never blocks). ack carries the session-minted GateID or the
 		// prepare/activate error.
 		reply := make(chan command.Command, 1)
 		ack := make(chan gateInstallAck, 1)
-		g := stampGateSubjectProvenance(ctx, permissionGate(r.callID, req))
-		payload := gatedomain.PermissionPayload{Request: req}
+		g := stampGateSubjectProvenance(ctx, permissionGate(r.callID, displayed))
+		payload := gatedomain.PermissionPayload{Request: displayed}
 
 		select {
 		case gateReg <- gateRegistration{gate: g, payload: payload, callID: r.callID, reply: reply, kind: gatePermission, ack: ack}:
@@ -435,7 +435,7 @@ func approvalRequesterFor(
 
 		// Install-before-emit: only now is the gate guaranteed installed, so the
 		// matching Approve/Deny cannot be dropped on a race.
-		emit(event.PermissionRequested{ToolExecutionID: r.callID, Request: req})
+		emit(event.PermissionRequested{ToolExecutionID: r.callID, Request: displayed})
 
 		select {
 		case cmd := <-reply:
@@ -448,12 +448,9 @@ func approvalRequesterFor(
 
 // approvalActionFromCommand maps a routed gate reply to the exact approval
 // action. runLoop already matched by ToolExecutionID + kind; the routing is
-// re-validated as cheap defence in depth. The durable command wire still
-// carries the legacy scope field (Task 2.3 replaces it): ScopeOnce maps to
-// Approve, ScopeWorkspace to Approve always for this workspace, and everything
-// else — including the retired session scope and any unexpected command — is
-// fail-closed Deny. AcceptedGrants on the wire are deliberately ignored: the
-// evaluator issues FRESH grants after the decision.
+// re-validated as cheap defence in depth. ApproveToolCall carries exactly one
+// of the two approve actions (the codec validates that); anything else —
+// including an unexpected command kind — is fail-closed Deny.
 func approvalActionFromCommand(cmd command.Command, callID uuid.UUID, gateID gatedomain.ID) (gatedomain.ApprovalAction, error) {
 	switch c := cmd.(type) {
 	case command.ApproveToolCall:
@@ -463,11 +460,9 @@ func approvalActionFromCommand(cmd command.Command, callID uuid.UUID, gateID gat
 		if c.GateToolExecutionID() != callID {
 			return gatedomain.ApprovalDeny, nil
 		}
-		switch c.Scope {
-		case tool.ScopeOnce:
-			return gatedomain.ApprovalApprove, nil
-		case tool.ScopeWorkspace:
-			return gatedomain.ApprovalApproveAlwaysWorkspace, nil
+		switch c.Action {
+		case gatedomain.ApprovalApprove, gatedomain.ApprovalApproveAlwaysWorkspace:
+			return c.Action, nil
 		default:
 			return gatedomain.ApprovalDeny, nil
 		}
@@ -482,21 +477,14 @@ func approvalActionFromCommand(cmd command.Command, callID uuid.UUID, gateID gat
 	}
 }
 
-// bridgePermissionRequest projects the combined approval prompt onto the
-// legacy sealed PermissionRequest wire (whose durable codec Task 2.3
-// replaces): the redacted summary plus every unmet capability description —
-// never raw args, never tokens.
-func bridgePermissionRequest(name, summary string, prompt gatedomain.ApprovalPrompt) tool.PermissionRequest {
-	var sb strings.Builder
-	sb.WriteString(summary)
-	if len(prompt.Unmet) > 0 {
-		sb.WriteString("\n\nCapabilities:")
-		for _, requirement := range prompt.Unmet {
-			sb.WriteString("\n- ")
-			sb.WriteString(requirement.Description)
-		}
-	}
-	return tool.UnknownRequest{Tool: name, Summary: sb.String()}
+// displayedRequest narrows the prompt's typed request to exactly what the
+// approval displays and the journal records: the unmet requirements (each
+// carrying its reusable candidates) under the original execution binding. It
+// never contains raw args, and tool.Request has no token field to leak.
+func displayedRequest(prompt gatedomain.ApprovalPrompt) tool.Request {
+	displayed := prompt.Request.Clone()
+	displayed.Requirements = prompt.Unmet
+	return displayed
 }
 
 // execute runs the executable calls: the serial batch (Sequential()==true) drains

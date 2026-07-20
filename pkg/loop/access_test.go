@@ -130,3 +130,86 @@ func TestGateApproverRoutesToInstalledRequester(t *testing.T) {
 		t.Fatalf("routed prompt = %+v, want the caller's prompt", got)
 	}
 }
+
+// TestOverrideBoundAccessReplacesGate proves the binding-time per-loop gate
+// override: the overridden view resolves the injected gate, the original bound
+// view keeps its own definition gate, and a nil override is rejected.
+func TestOverrideBoundAccessReplacesGate(t *testing.T) {
+	t.Parallel()
+	own := &fakeAccessGate{}
+	other := &fakeAccessGate{}
+	d, err := Define(
+		WithName("agent"),
+		WithInference(&fakeLLM{}, testModel()),
+		WithAccessGate(own),
+		WithPolicyRevision("rev-1"),
+	)
+	if err != nil {
+		t.Fatalf("Define() error = %v", err)
+	}
+	bound, err := d.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind() error = %v", err)
+	}
+
+	overridden, err := OverrideBoundAccess(bound, other)
+	if err != nil {
+		t.Fatalf("OverrideBoundAccess() error = %v", err)
+	}
+	if overridden.Access() != AccessGate(other) {
+		t.Fatalf("overridden Access() = %v, want the override gate", overridden.Access())
+	}
+	if bound.Access() != AccessGate(own) {
+		t.Fatalf("original Access() = %v, want the definition's own gate (override must not leak back)", bound.Access())
+	}
+
+	if _, err := OverrideBoundAccess(bound, nil); err == nil {
+		t.Fatal("OverrideBoundAccess(nil) error = nil, want rejection")
+	}
+}
+
+// TestBoundAccessInheritsOwnDefinitionGate pins the subagent inheritance rule:
+// binding a definition WITHOUT an override resolves that definition's OWN gate
+// — two definitions bound in the same session never share or escalate to each
+// other's gates, and a definition without a gate stays gateless (the runner
+// fails closed on it).
+func TestBoundAccessInheritsOwnDefinitionGate(t *testing.T) {
+	t.Parallel()
+	parentGate := &fakeAccessGate{}
+	childGate := &fakeAccessGate{}
+	parent, err := Define(WithName("parent"), WithInference(&fakeLLM{}, testModel()), WithAccessGate(parentGate), WithPolicyRevision("rev-1"))
+	if err != nil {
+		t.Fatalf("Define(parent) error = %v", err)
+	}
+	child, err := Define(WithName("child"), WithInference(&fakeLLM{}, testModel()), WithAccessGate(childGate), WithPolicyRevision("rev-1"))
+	if err != nil {
+		t.Fatalf("Define(child) error = %v", err)
+	}
+	gateless, err := Define(WithName("gateless"), WithInference(&fakeLLM{}, testModel()))
+	if err != nil {
+		t.Fatalf("Define(gateless) error = %v", err)
+	}
+
+	parentBound, err := parent.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind(parent) error = %v", err)
+	}
+	childBound, err := child.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind(child) error = %v", err)
+	}
+	gatelessBound, err := gateless.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind(gateless) error = %v", err)
+	}
+
+	if childBound.Access() != AccessGate(childGate) {
+		t.Fatalf("child Access() = %v, want the child's own gate", childBound.Access())
+	}
+	if parentBound.Access() != AccessGate(parentGate) {
+		t.Fatalf("parent Access() = %v, want the parent's own gate", parentBound.Access())
+	}
+	if gatelessBound.Access() != nil {
+		t.Fatalf("gateless Access() = %v, want nil (runner fails closed)", gatelessBound.Access())
+	}
+}

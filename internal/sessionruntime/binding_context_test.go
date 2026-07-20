@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/looprig/core/content"
+
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -20,16 +21,20 @@ type bindingCapture struct {
 	factoryErr error
 }
 
-func (c *bindingCapture) factory(ctx context.Context, bindings tool.Bindings) (loop.PermissionGate, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.calls++
-	c.ctx = ctx
-	c.bindings = bindings
-	if c.factoryErr != nil {
-		return nil, c.factoryErr
-	}
-	return permissionGateStub{}, nil
+// definition returns a tool.Definition whose Build captures the Bind context
+// and bindings, replacing the retired permission-factory capture seam.
+func (c *bindingCapture) definition() tool.Definition {
+	return tool.NewDefinition("binding-capture", 0, func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.calls++
+		c.ctx = ctx
+		c.bindings = bindings
+		if c.factoryErr != nil {
+			return nil, c.factoryErr
+		}
+		return []tool.InvokableTool{&extStubTool{name: "binding-capture"}}, nil
+	})
 }
 
 func (c *bindingCapture) snapshot() (int, context.Context, tool.Bindings) {
@@ -38,19 +43,10 @@ func (c *bindingCapture) snapshot() (int, context.Context, tool.Bindings) {
 	return c.calls, c.ctx, c.bindings
 }
 
-type permissionGateStub struct{}
-
-func (permissionGateStub) Check(context.Context, tool.InvokableTool, string, string) loop.Effect {
-	return loop.EffectAsk
-}
-func (permissionGateStub) Grant(context.Context, string, string, tool.ApprovalScope) error {
-	return nil
-}
-
 func capturedDefinition(c *bindingCapture, system string, engine loop.Engine) loop.Definition {
 	return mustDefine(
-		loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("model-x")),
-		loop.WithSystem(system), loop.WithEngine(engine), loop.WithPolicyRevision("test"), loop.WithPermissionFactory(c.factory),
+		loop.WithName("agent"), loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, validModel("model-x")),
+		loop.WithSystem(system), loop.WithEngine(engine), loop.WithPolicyRevision("test"), loop.WithTools(c.definition()),
 	)
 }
 
@@ -122,7 +118,7 @@ func TestNewBindFailureCancelsOwnedSessionContext(t *testing.T) {
 
 func TestRestorePrimaryBindsOnceWithTransferredSessionContext(t *testing.T) {
 	store := newRestoreStore(t)
-	originalDef := restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "system")
+	originalDef := capturedDefinition(&bindingCapture{}, "system", loop.EngineNative)
 	orig := buildOriginalRun(t, store, fingerprintFromDefinition(originalDef), originalDef, 1)
 	handOver(t, orig.lease)
 
@@ -149,7 +145,7 @@ func TestRestorePrimaryBindsOnceWithTransferredSessionContext(t *testing.T) {
 
 func TestRestoreFailureCancelsBoundSessionContext(t *testing.T) {
 	store := newRestoreStore(t)
-	originalDef := restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "system")
+	originalDef := capturedDefinition(&bindingCapture{}, "system", loop.EngineNative)
 	orig := buildOriginalRun(t, store, fingerprintFromDefinition(originalDef), originalDef, 1)
 	handOver(t, orig.lease)
 
@@ -168,7 +164,7 @@ func TestRestoreFailureCancelsBoundSessionContext(t *testing.T) {
 
 func TestRestoreBindFailureCancelsOwnedSessionContext(t *testing.T) {
 	store := newRestoreStore(t)
-	originalDef := restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "system")
+	originalDef := capturedDefinition(&bindingCapture{}, "system", loop.EngineNative)
 	orig := buildOriginalRun(t, store, fingerprintFromDefinition(originalDef), originalDef, 1)
 	handOver(t, orig.lease)
 

@@ -8,6 +8,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 )
 
@@ -64,7 +65,7 @@ func TestSessionStampsAgency(t *testing.T) {
 			setup: func(t *testing.T) (*Session, chan command.Command, func(s *Session)) {
 				s, _, loopID, cmds := gateSession(t)
 				gateID := activateOn(t, s, loopID, mustUUID(), permissionGate(), bashPayload())
-				return s, cmds, func(s *Session) { _ = s.RespondGate(context.Background(), userApprove(gateID, "session")) }
+				return s, cmds, func(s *Session) { _ = s.RespondGate(context.Background(), userApprove(gateID, gate.ApprovalApprove)) }
 			},
 			wantAgency: identity.AgencyUser,
 		},

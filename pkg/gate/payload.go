@@ -38,9 +38,14 @@ type OpenPayload struct {
 	Payload Payload `json:"payload,omitempty"`
 }
 
-// PermissionPayload carries a sealed tool permission request.
+// PermissionPayload carries the typed prepared access request a permission
+// gate decides — the request narrowed to what the approval prompt displayed.
+// It is validated at BOTH codec boundaries (tool.ValidateRequest on marshal,
+// the strict DecodeRequest on unmarshal), so a malformed or token-bearing
+// record can neither be journaled nor restored. It never carries grant tokens:
+// tool.Request has no token field, and unknown wire keys are rejected.
 type PermissionPayload struct {
-	Request tool.PermissionRequest `json:"request,omitempty"`
+	Request tool.Request `json:"request,omitzero"`
 }
 
 // AskUserPayload carries an explicit question and optional fixed choices.
@@ -354,11 +359,10 @@ func marshalPayloadData(kind payloadKind, payload Payload) (json.RawMessage, err
 		return marshalPayloadJSON(kind, openPayloadData{GateID: v.GateID, Payload: nested})
 	case payloadKindPermission:
 		v := permissionPayloadValue(payload)
-		data, err := tool.MarshalPermissionRequest(v.Request)
-		if err != nil {
+		if err := tool.ValidateRequest(v.Request); err != nil {
 			return nil, &PayloadEncodeError{Kind: string(kind), Cause: err}
 		}
-		return data, nil
+		return marshalPayloadJSON(kind, v.Request)
 	case payloadKindAskUser:
 		return marshalPayloadJSON(kind, askUserPayloadValue(payload))
 	case payloadKindResumeInput:
@@ -401,7 +405,9 @@ func unmarshalPayloadData(kind payloadKind, data json.RawMessage) (Payload, erro
 		}
 		return OpenPayload{GateID: raw.GateID, Payload: nested}, nil
 	case payloadKindPermission:
-		request, err := tool.UnmarshalPermissionRequest(data)
+		// Restore is an untrusted boundary: the strict request decoder rejects
+		// unknown fields, duplicate keys, and invariant violations fail-closed.
+		request, err := DecodeRequest(data)
 		if err != nil {
 			return nil, &PayloadDecodeError{Kind: string(kind), Cause: err}
 		}

@@ -14,7 +14,6 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
@@ -37,14 +36,13 @@ func TestDefineValidation(t *testing.T) {
 		{name: "negative limits", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolLimits(ToolLimits{Calls: -1})}, kind: DefinitionInvalidToolLimits},
 		{name: "negative drain", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithDrainTimeout(-time.Second)}, kind: DefinitionInvalidDrainTimeout},
 		{name: "nil middleware", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolMiddlewares(nil)}, kind: DefinitionInvalidMiddleware},
-		{name: "nil permission factory", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithPermissionFactory(nil)}, kind: DefinitionInvalidPermission},
 		{name: "invalid engine", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithEngine(Engine(99))}, kind: DefinitionInvalidEngine},
 		{name: "nil runtime context", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithRuntimeContext(nil)}, kind: DefinitionInvalidRuntimeContext},
 		{name: "typed nil runtime context", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithRuntimeContext((*nilRuntimeContext)(nil))}, kind: DefinitionInvalidRuntimeContext},
 		{name: "empty delegate", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithDelegates("")}, kind: DefinitionInvalidDelegate},
 		{name: "invalid delegation", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithDelegation(Delegation{Style: DelegationStyle(99)})}, kind: DefinitionInvalidDelegation},
 		{name: "empty policy revision", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithPolicyRevision("")}, kind: DefinitionInvalidPolicyRevision},
-		{name: "opaque permission lacks revision", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithPermissionFactory(func(context.Context, tool.Bindings) (PermissionGate, error) { return permissionGateStub{}, nil })}, kind: DefinitionMissingPolicyRevision},
+		{name: "opaque access gate lacks revision (validation table)", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithAccessGate(&fakeAccessGate{})}, kind: DefinitionMissingPolicyRevision},
 		{name: "opaque middleware lacks revision", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolMiddlewares(func(ctx context.Context, inv tool.InvokableTool, args string, next tool.ToolExecuteFunc) (*tool.ToolResult, error) {
 			return next(ctx, args)
 		})}, kind: DefinitionMissingPolicyRevision},
@@ -124,11 +122,7 @@ func TestDefinitionBindValidatesIDsBeforeFactories(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			var permissionCalls atomic.Int32
-			d := mustDefinition(t, WithPolicyRevision("test"), WithPermissionFactory(func(context.Context, tool.Bindings) (PermissionGate, error) {
-				permissionCalls.Add(1)
-				return permissionGateStub{}, nil
-			}))
+			d := mustDefinition(t, WithPolicyRevision("test"), WithAccessGate(&fakeAccessGate{}))
 			_, err := d.Bind(context.Background(), tt.bindings)
 			var bindErr *BindError
 			if !errors.As(err, &bindErr) || bindErr.Kind != tt.kind {
@@ -137,9 +131,6 @@ func TestDefinitionBindValidatesIDsBeforeFactories(t *testing.T) {
 			var bindingsErr *tool.InvalidBindingsError
 			if !errors.As(err, &bindingsErr) {
 				t.Fatalf("Bind error cause = %T %v, want *tool.InvalidBindingsError", err, err)
-			}
-			if permissionCalls.Load() != 0 {
-				t.Fatalf("permission factory called %d times before ID validation", permissionCalls.Load())
 			}
 		})
 	}
@@ -264,121 +255,6 @@ func TestDefinitionBindFailures(t *testing.T) {
 				t.Fatalf("Bind error = %T %v, want *BindError kind %q", err, err, tt.kind)
 			}
 		})
-	}
-}
-
-func TestDefinitionPermissionFactory(t *testing.T) {
-	t.Parallel()
-	var calls atomic.Int32
-	factory := func(_ context.Context, bindings tool.Bindings) (PermissionGate, error) {
-		calls.Add(1)
-		if bindings.Workspace != nil {
-			bindings.Workspace.Root = "mutated"
-		}
-		return permissionGateStub{}, nil
-	}
-	d := mustDefinition(t, WithPolicyRevision("test"), WithPermissionFactory(factory))
-	bindings := validToolBindings(t)
-	bindings.Workspace = &tool.WorkspaceBinding{Root: "original"}
-	b, err := d.Bind(context.Background(), bindings)
-	if err != nil {
-		t.Fatalf("Bind: %v", err)
-	}
-	if calls.Load() != 1 || b.Permission() == nil {
-		t.Fatalf("factory calls = %d permission = %v", calls.Load(), b.Permission())
-	}
-	if bindings.Workspace.Root != "original" {
-		t.Fatal("permission factory mutated caller bindings")
-	}
-
-	nilFactory := func(context.Context, tool.Bindings) (PermissionGate, error) { return (*nilPermissionGate)(nil), nil }
-	d = mustDefinition(t, WithPolicyRevision("test"), WithPermissionFactory(nilFactory))
-	_, err = d.Bind(context.Background(), validToolBindings(t))
-	var bindErr *BindError
-	if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidPermission {
-		t.Fatalf("typed nil permission error = %T %v", err, err)
-	}
-}
-
-func TestDefinitionPermissionFactoryRequiresAndReceivesSecurityLimit(t *testing.T) {
-	t.Parallel()
-	source := security.New()
-	var received security.LimitSource
-	d := mustDefinition(t, WithPolicyRevision("securityLimit"), WithPermissionFactory(func(_ context.Context, bindings tool.Bindings) (PermissionGate, error) {
-		received = bindings.SecurityLimit
-		return permissionGateStub{}, nil
-	}))
-	bindings := validToolBindings(t)
-	bindings.SecurityLimit = source
-	if _, err := d.Bind(context.Background(), bindings); err != nil {
-		t.Fatal(err)
-	}
-	if received != source {
-		t.Fatalf("factory securityLimit = %p, want exact source %p", received, source)
-	}
-	bindings.SecurityLimit = nil
-	_, err := d.Bind(context.Background(), bindings)
-	var bindErr *BindError
-	if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidSecurityLimit {
-		t.Fatalf("missing securityLimit error = %v, want BindInvalidSecurityLimit", err)
-	}
-	var typedNil *security.Limit
-	bindings.SecurityLimit = typedNil
-	_, err = d.Bind(context.Background(), bindings)
-	if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidSecurityLimit {
-		t.Fatalf("typed-nil securityLimit error = %v, want BindInvalidSecurityLimit", err)
-	}
-}
-
-type fixedPermissionGate struct {
-	effect   Effect
-	grantErr error
-}
-
-func (g *fixedPermissionGate) Check(context.Context, tool.InvokableTool, string, string) Effect {
-	return g.effect
-}
-func (g *fixedPermissionGate) Grant(context.Context, string, string, tool.ApprovalScope) error {
-	return g.grantErr
-}
-
-func TestAttenuateBoundPermissionMostRestrictiveAndLive(t *testing.T) {
-	t.Parallel()
-	child := &fixedPermissionGate{effect: EffectAutoApprove}
-	parent := &fixedPermissionGate{effect: EffectAsk}
-	d := mustDefinition(t, WithPolicyRevision("permissions"), WithPermissionFactory(func(context.Context, tool.Bindings) (PermissionGate, error) {
-		return child, nil
-	}))
-	bound, err := d.Bind(context.Background(), validToolBindings(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	attenuated := AttenuateBoundPermission(bound, parent)
-	if got := attenuated.Permission().Check(context.Background(), nil, "Bash", `{}`); got != EffectAsk {
-		t.Fatalf("AutoApprove child + Ask parent = %v, want Ask", got)
-	}
-	parent.effect = EffectDeny
-	if got := attenuated.Permission().Check(context.Background(), nil, "Bash", `{}`); got != EffectDeny {
-		t.Fatalf("live Deny parent = %v, want Deny", got)
-	}
-	parent.effect = EffectAutoApprove
-	child.effect = EffectAsk
-	if got := attenuated.Permission().Check(context.Background(), nil, "Bash", `{}`); got != EffectAsk {
-		t.Fatalf("Ask child + AutoApprove parent = %v, want Ask", got)
-	}
-	child.effect = Effect(255)
-	if got := attenuated.Permission().Check(context.Background(), nil, "Bash", `{}`); got != EffectDeny {
-		t.Fatalf("invalid child effect = %v, want fail-secure Deny", got)
-	}
-	child.effect = EffectAsk
-
-	sentinel := errors.New("parent grant")
-	parent.grantErr = sentinel
-	if err := attenuated.Permission().Grant(context.Background(), "Bash", `{}`, tool.ScopeSession); !errors.Is(err, sentinel) {
-		t.Fatalf("Grant error = %v, want original parent error", err)
-	}
-	if got := AttenuateBoundPermission(bound, nil).Permission(); got != nil {
-		t.Fatalf("nil parent permission = %T, want fail-secure nil", got)
 	}
 }
 
@@ -757,7 +633,7 @@ func assertReservedToolDefinitionError(t *testing.T, err error) {
 
 func validToolBindings(t *testing.T) tool.Bindings {
 	t.Helper()
-	return tool.Bindings{SessionID: mustUUID(t), LoopID: mustUUID(t), SecurityLimit: security.New()}
+	return tool.Bindings{SessionID: mustUUID(t), LoopID: mustUUID(t)}
 }
 
 func testToolDefinition(name string, builds *atomic.Int32, toolNames []string) tool.Definition {
@@ -804,15 +680,6 @@ func (*nilInferenceClient) Invoke(context.Context, inference.Request) (*inferenc
 }
 func (*nilInferenceClient) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	return nil, nil
-}
-
-type nilPermissionGate struct{}
-
-func (*nilPermissionGate) Check(context.Context, tool.InvokableTool, string, string) Effect {
-	return EffectAsk
-}
-func (*nilPermissionGate) Grant(context.Context, string, string, tool.ApprovalScope) error {
-	return nil
 }
 
 type nilRuntimeContext struct{}

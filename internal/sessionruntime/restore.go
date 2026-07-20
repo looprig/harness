@@ -10,7 +10,6 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/security"
 	model "github.com/looprig/inference/model"
 )
 
@@ -312,24 +311,6 @@ func effectiveCurrentWorkspace(events []event.Event) (string, bool) {
 		}
 	}
 	return ref, ok
-}
-
-// lastSecurityLimit returns the ordinal of the LAST SecurityLimitChanged event in the
-// replay — the live security security limit to re-seed on resume (last write wins) — and false if
-// the session never changed its security limit (it then resumes at the fail-secure most-restrictive
-// default). SecurityLimitChanged is session-scoped, so it is present in the unnarrowed
-// discovery drain; scanning to the end picks the newest (a change appends a fresh event,
-// never replacing the prior one). It mirrors effectiveCurrentWorkspace — a single-purpose
-// discovery scanner — so the restore constructor stays a straight-line assembly and
-// foldLoop stays pure.
-func lastSecurityLimit(events []event.Event) (security.Level, bool) {
-	level, ok := security.Level(0), false
-	for _, ev := range events {
-		if sc, isSC := ev.(event.SecurityLimitChanged); isSC {
-			level, ok = sc.Level, true // keep scanning; the LAST one wins
-		}
-	}
-	return level, ok
 }
 
 // restoredInference is the fold of one loop's selected mode and latest resolved

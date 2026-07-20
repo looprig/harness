@@ -24,9 +24,14 @@ type ResponseAudit interface {
 	responseAudit()
 }
 
-// PermissionAudit stores human-readable grant descriptions accepted by a response.
+// PermissionAudit is the durable, redacted record of a permission approval:
+// the bounded display DESCRIPTIONS of the requirements the user approved and —
+// for a workspace approval — of the reusable rule candidates that were
+// displayed for persistence. It never carries grant tokens, token material, or
+// raw tool arguments; descriptions are the only permitted content.
 type PermissionAudit struct {
-	AcceptedGrantDescriptions []string `json:"accepted_grant_descriptions,omitempty"`
+	RequirementDescriptions []string `json:"requirement_descriptions,omitempty"`
+	CandidateDescriptions   []string `json:"candidate_descriptions,omitempty"`
 }
 
 // AskUserAudit stores a redacted preview of a user answer.

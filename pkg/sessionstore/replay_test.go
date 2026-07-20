@@ -765,17 +765,16 @@ func buildGateFixture(t *testing.T) fixture {
 	prepared := event.GatePrepared{Header: stepH, Gate: g}
 	openPayload := gate.OpenPayload{
 		GateID:  gateID,
-		Payload: gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}},
+		Payload: gate.PermissionPayload{Request: tool.Request{ToolName: "Bash", Summary: "echo ok", Requirements: []tool.Requirement{{Kind: "tool.invoke", Scope: "Bash", Match: "echo ok", Description: "run: echo ok"}}}},
 	}
 	opened := event.GateOpened{Header: stepH, Gate: g}
 	resolved := event.GateResolved{
-		Header:        stepH,
-		GateID:        gateID,
-		Reason:        gate.CloseAnswered,
-		Action:        "approve",
-		ApprovalScope: tool.ScopeSession,
-		Source:        gate.ResponseSource{Kind: gate.ResponseFromUser},
-		Audit:         gate.PermissionAudit{AcceptedGrantDescriptions: []string{"network egress"}},
+		Header: stepH,
+		GateID: gateID,
+		Reason: gate.CloseAnswered,
+		Action: "approve",
+		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+		Audit:  gate.PermissionAudit{RequirementDescriptions: []string{"network egress"}},
 	}
 
 	want := []journal.JournalRecord{

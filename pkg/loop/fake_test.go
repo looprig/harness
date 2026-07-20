@@ -6,7 +6,6 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
 	stream "github.com/looprig/inference/stream"
@@ -28,16 +27,6 @@ func mustUUID(t interface {
 		t.Fatalf("uuid.New: %v", err)
 	}
 	return id
-}
-
-type permissionGateStub struct{}
-
-func (permissionGateStub) Check(context.Context, tool.InvokableTool, string, string) Effect {
-	return EffectAsk
-}
-
-func (permissionGateStub) Grant(context.Context, string, string, tool.ApprovalScope) error {
-	return nil
 }
 
 func (*fakeLLM) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {

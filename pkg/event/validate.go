@@ -614,13 +614,8 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "ActiveLoopChanged", sessionProfile(), true
 	case IntegrationStatus:
 		// Session-scoped: an integration is a session-global resource, not a
-		// loop's. Same shape as SecurityLimitChanged — only SessionID set.
+		// loop's. Same shape as WorkspaceCheckpointed — only SessionID set.
 		return "IntegrationStatus", sessionProfile(), true
-	case SecurityLimitChanged:
-		// Session-scoped: a session-global ceiling clamp appended when the operator
-		// changes it (same shape as WorkspaceCheckpointed) — only SessionID set. Level is
-		// an opaque ordinal the validator never constrains.
-		return "SecurityLimitChanged", sessionProfile(), true
 	case HustleStarted:
 		return "HustleStarted", sessionProfile(), true
 	case HustleCompleted:

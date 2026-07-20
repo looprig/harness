@@ -13,7 +13,6 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
@@ -122,9 +121,6 @@ func restoreTopologySession(
 	if constructionAbortTimeout <= 0 {
 		constructionAbortTimeout = defaultConstructionAbortTimeout
 	}
-	if probe.securityLimit == nil {
-		probe.securityLimit = security.New()
-	}
 	allowMismatch := probe.allowConfigMismatch
 	// Default the restore-drift decider to the fail-secure policy when the composition root
 	// injected none via WithRestoreDecider, so the NEW-PATH decision is never a nil-deref.
@@ -231,10 +227,6 @@ func restoreTopologySession(
 	compactWaiterRepairs, repairErr := planCompactWaiterRepairs(all)
 	if repairErr != nil {
 		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: repairErr})
-	}
-	securityLevel, hasSecurityLimit := lastSecurityLimit(all)
-	if hasSecurityLimit {
-		probe.securityLimit.Set(securityLevel)
 	}
 
 	// NEW PATH: the drift baseline is the LATEST adopted manifest (or a legacy projection of
@@ -375,7 +367,7 @@ func restoreTopologySession(
 	if newPath {
 		planAllowMismatch = true
 	}
-	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, planAllowMismatch, contextDisposition, manager, probe.securityLimit, probe.newWorkspaceBinding)
+	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, planAllowMismatch, contextDisposition, manager, probe.newWorkspaceBinding)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -394,10 +386,6 @@ func restoreTopologySession(
 	// session-scoped. Consumed at the pre-RestoreDone seam below.
 	wsRef, hasWorkspacePointer := effectiveCurrentWorkspace(all)
 
-	// The last durable security limit ordinal to re-seed on resume (if the session ever
-	// changed it) — folded from the SAME unnarrowed discovery drain (SecurityLimitChanged
-	// is session-scoped), last write wins. Absent means the session resumes at the fail-
-	// secure most-restrictive default. Seeded into the restored session below.
 	// Gate recovery folds the same record replay so private GatePreparedRecord payloads are
 	// visible. Unsupported or payload-less open gates are durably closed below, after
 	// RestoreStarted, before RestoreDone makes the restored session reachable.
@@ -505,7 +493,7 @@ func restoreTopologySession(
 	// re-acquire without waiting out the TTL. We append WithLeaseRelease AFTER the caller's
 	// opts so the restore owns the lease lifecycle (a caller cannot accidentally override
 	// the releaser with a stale one).
-	leaseOpts := append(append([]Option(nil), opts...), WithSecurityLimit(probe.securityLimit), WithLeaseRelease(lease.Release))
+	leaseOpts := append(append([]Option(nil), opts...), WithLeaseRelease(lease.Release))
 	if resolved != nil {
 		// Hand the restored session the coordinator + exclusive root-lease release so its
 		// Shutdown releases the root lease before the session lease (LIFO), and so its loops'
@@ -521,7 +509,7 @@ func restoreTopologySession(
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
 	foreignSID := findForeignSID(rootEvents)
-	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, activePlan.bindings, sessionID, rootLoopID, foreignSID, spawnedCount, securityLevel, hasSecurityLimit, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
+	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, activePlan.bindings, sessionID, rootLoopID, foreignSID, spawnedCount, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		if constructionCleanupOwned(err) {
 			return nil, err
@@ -646,9 +634,8 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 // unknown (subagents of a single-definition run). It is the single Bind of each loop,
 // performed inside the restore lease. It returns the ordered plans and the active plan, or a
 // typed error the caller records as a RestoreErrored.
-func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, securityLimitSource security.LimitSource, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
+func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
 	plans := make([]loopPlan, 0, len(starts))
-	boundByLoop := make(map[uuid.UUID]loop.BoundDefinition, len(starts))
 	activeIndex := -1
 	for _, started := range starts {
 		definition, ok := topology.definition(started.AgentName)
@@ -666,7 +653,7 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 			// invents a missing definition here).
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: started.AgentName}}
 		}
-		bindings := tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, SecurityLimit: securityLimitSource, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)}
+		bindings := tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)}
 		bound, bindErr := definition.Bind(sessionCtx, bindings)
 		if bindErr != nil {
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: bindErr}
@@ -674,15 +661,10 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		if nameErr := checkAgentName(started.AgentName, bound.Name(), allowMismatch); nameErr != nil {
 			return nil, loopPlan{}, nameErr
 		}
-		if parentID := started.Cause.Coordinates.LoopID; !parentID.IsZero() {
-			parentBound := boundByLoop[parentID]
-			var parentPermission loop.PermissionGate
-			if parentBound != nil {
-				parentPermission = parentBound.Permission()
-			}
-			bound = loop.AttenuateBoundPermission(bound, parentPermission)
-		}
-		boundByLoop[started.LoopID] = bound
+		// A restored subagent keeps its OWN definition's access gate: authority
+		// differences between loops are expressed by the consumer configuring
+		// different gates per definition (or OverrideBoundAccess at a binding
+		// seam), never by harness-side attenuation against the parent.
 		loopEvents := eventsFromRecords(allRecords, started.LoopID)
 		plans = append(plans, loopPlan{started: started, bound: bound, bindings: bindings, events: loopEvents})
 		if started.LoopID == roots[topology.ActivePrimer].LoopID {
@@ -761,8 +743,6 @@ func buildRestoredSession(
 	sessionID, rootLoopID uuid.UUID,
 	foreignSID string,
 	spawnedCount int,
-	securityLevel security.Level,
-	hasSecurityLimit bool,
 	folded foldResult,
 	ri restoredInference,
 	restoredGates map[gate.ID]gateEntry,
@@ -818,17 +798,6 @@ func buildRestoredSession(
 		return abort(&RestoreError{Kind: RestoreJournalFailed, Cause: err})
 	}
 	s.gateAppender = gateAppender
-	// Default-mint the security limit source (unless WithSecurityLimit injected the shared one),
-	// then re-seed it from the folded SecurityLimitChanged events so the recovered session
-	// — and any checker sharing this source — comes up under the security limit it crashed at (last
-	// write wins). No lock is needed: the session is not yet reachable. An absent security limit
-	// (never changed) leaves the fail-secure most-restrictive default.
-	if s.securityLimit == nil {
-		s.securityLimit = security.New()
-	}
-	if hasSecurityLimit {
-		s.securityLimit.Set(securityLevel)
-	}
 	// Resolve the spawn-cap defaults AFTER the options, mirroring newSession, so a restore
 	// (with or without WithLimits) has positive depth/quota caps from the first NewLoop.
 	s.limits = s.limits.withDefaults()
@@ -899,7 +868,7 @@ func buildRestoredSession(
 	}
 	liveMode, liveModel := liveViewFor(cfg, ri)
 	// bindings is activePlan.bindings — the EXACT tool.Bindings cfg was bound with in
-	// planLoops (same SecurityLimit source, the same WorkspaceBinding instance, and this
+	// planLoops (the same WorkspaceBinding instance and this
 	// loop's scoped delegate controller). Retaining it here is what lets a later
 	// ReplaceExternalTools build its tools with the capabilities the declared tools got,
 	// exactly as the live path (session.go) and attachRestoredLoop do for every other loop.

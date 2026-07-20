@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,7 +13,6 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/storage/memstore"
 )
@@ -139,15 +136,6 @@ func TestWithSessionStoreRejectsTypedNil(t *testing.T) {
 	}
 }
 
-func TestWithSecurityLimitFactoryRejectsNil(t *testing.T) {
-	t.Parallel()
-	_, err := Define(WithSecurityLimitFactory(nil))
-	var target *DefinitionError
-	if !errors.As(err, &target) || target.Kind != DefinitionInvalidSecurityLimitFactory {
-		t.Fatalf("Define() error = %T %v, want invalid-securityLimit-factory DefinitionError", err, err)
-	}
-}
-
 func TestDefineRejectsInvalidFinalLifecycleOptions(t *testing.T) {
 	t.Parallel()
 	goodLive := foreign.Builder(func(context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreign.EventPublisher, loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory) (loop.Backend, string, error) {
@@ -203,7 +191,6 @@ func TestDefineRejectsEveryDuplicateSingletonOption(t *testing.T) {
 		{name: "foreign builders", opt: WithForeignBuilders(foreignLive, foreignRestored)},
 		{name: "gate caps", opt: WithGateCaps(GateCaps{})},
 		{name: "allow config mismatch", opt: WithAllowConfigMismatch()},
-		{name: "security limit factory", opt: WithSecurityLimitFactory(func() *security.Limit { return security.New() })},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -248,55 +235,6 @@ func TestDefineFreezesAdditiveOptionInputs(t *testing.T) {
 	defer func() { _ = s.Shutdown(context.Background()) }()
 	if got := s.ActiveLoop().Model().Name; got != "planner" {
 		t.Fatalf("active model = %q, want frozen planner definition", got)
-	}
-}
-
-func TestSecurityLimitFactoryInvokedPerConcurrentSession(t *testing.T) {
-	t.Parallel()
-	definition, err := loop.Define(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("model")))
-	if err != nil {
-		t.Fatalf("loop.Define: %v", err)
-	}
-	store, err := sessionstore.Open(memstore.New())
-	if err != nil {
-		t.Fatalf("sessionstore.Open: %v", err)
-	}
-	var calls atomic.Int32
-	r, err := Define(
-		WithLoops(definition),
-		WithPrimers("agent"),
-		WithSessionStore(store),
-		WithSecurityLimitFactory(func() *security.Limit {
-			calls.Add(1)
-			return security.New()
-		}),
-	)
-	if err != nil {
-		t.Fatalf("Define: %v", err)
-	}
-	const sessions = 8
-	errorsCh := make(chan error, sessions)
-	var group sync.WaitGroup
-	for range sessions {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			controller, err := r.NewSession(context.Background())
-			if err == nil {
-				err = controller.Shutdown(context.Background())
-			}
-			errorsCh <- err
-		}()
-	}
-	group.Wait()
-	close(errorsCh)
-	for err := range errorsCh {
-		if err != nil {
-			t.Fatalf("concurrent NewSession: %v", err)
-		}
-	}
-	if got := calls.Load(); got != sessions {
-		t.Fatalf("security limit factory calls = %d, want %d", got, sessions)
 	}
 }
 

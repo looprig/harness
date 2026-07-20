@@ -336,14 +336,12 @@ func TestRunBatch_GrantsTravelInPreparedCall(t *testing.T) {
 	tl := &fakeRunTool{name: "T", output: "ok"}
 	var mu sync.Mutex
 	var gotGrants []string
-	var ambient []string
 	tl.onRun = func(ctx context.Context) {
 		mu.Lock()
 		defer mu.Unlock()
 		if prepared, ok := PreparedCallFromContext(ctx); ok {
 			gotGrants = prepared.Grants
 		}
-		ambient = tool.GrantsFromContext(ctx)
 	}
 	access := &countingAccessGate{resolution: gatedomain.Resolution{Approved: true, Grants: []string{"tok-1", "tok-2"}}}
 	ts := ToolSet{Access: access, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 2}
@@ -358,9 +356,6 @@ func TestRunBatch_GrantsTravelInPreparedCall(t *testing.T) {
 	defer mu.Unlock()
 	if len(gotGrants) != 2 || gotGrants[0] != "tok-1" || gotGrants[1] != "tok-2" {
 		t.Errorf("PreparedCall.Grants = %v, want the issued tokens", gotGrants)
-	}
-	if ambient != nil {
-		t.Errorf("ambient GrantsFromContext = %v, want nil (tokens travel only in the prepared contract)", ambient)
 	}
 }
 
@@ -427,7 +422,7 @@ func TestRunBatch_InteractiveGateOpensOnceApproveOnce(t *testing.T) {
 		for reg := range gateReg {
 			registrations++
 			reg.ack <- gateInstallAck{gateID: reg.gate.Subject.ToolExecutionID}
-			reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeOnce}
+			reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Action: gatedomain.ApprovalApprove}
 		}
 	}()
 
@@ -464,9 +459,9 @@ func TestRunBatch_InteractiveGateOpensOnceApproveOnce(t *testing.T) {
 	}
 }
 
-// A workspace-scope approval maps to Approve-always: the displayed candidates
-// persist atomically before grants are minted.
-func TestRunBatch_WorkspaceScopePersistsCandidates(t *testing.T) {
+// An approve-always action persists the displayed candidates atomically before
+// grants are minted.
+func TestRunBatch_ApproveAlwaysPersistsCandidates(t *testing.T) {
 	t.Parallel()
 	tl := &fakeRunTool{name: "T", output: "ok"}
 	tl.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
@@ -485,7 +480,7 @@ func TestRunBatch_WorkspaceScopePersistsCandidates(t *testing.T) {
 	go func() {
 		reg := <-gateReg
 		reg.ack <- gateInstallAck{}
-		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeWorkspace}
+		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Action: gatedomain.ApprovalApproveAlwaysWorkspace}
 	}()
 
 	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
@@ -502,8 +497,8 @@ func TestRunBatch_WorkspaceScopePersistsCandidates(t *testing.T) {
 	}
 }
 
-// The retired session scope fails closed: it maps to no new approval action.
-func TestRunBatch_SessionScopeFailsClosed(t *testing.T) {
+// An unknown or legacy approval action on the reply wire fails closed.
+func TestRunBatch_UnknownApprovalActionFailsClosed(t *testing.T) {
 	t.Parallel()
 	tl := &fakeRunTool{name: "T", output: "ok"}
 	tl.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
@@ -520,7 +515,7 @@ func TestRunBatch_SessionScopeFailsClosed(t *testing.T) {
 	go func() {
 		reg := <-gateReg
 		reg.ack <- gateInstallAck{}
-		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeSession}
+		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Action: "Approve always for this session"}
 	}()
 
 	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)

@@ -10,7 +10,6 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -83,7 +82,6 @@ type SessionController interface {
 	Session
 	SetActiveLoop(context.Context, uuid.UUID) error
 	LoopController(uuid.UUID) (loop.Controller, bool)
-	SetSecurityLimit(context.Context, security.Level) error
 	CheckpointWorkspace(context.Context) (workspacestore.Ref, error)
 	RestoreWorkspace(context.Context, workspacestore.Ref) error
 	Shutdown(context.Context) error

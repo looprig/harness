@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
@@ -376,7 +377,7 @@ func TestGateRepliesAppendCommandRecord(t *testing.T) {
 			name: "approve",
 			call: func(t *testing.T, s *Session, loopID uuid.UUID) error {
 				gateID := activateOn(t, s, loopID, mustUUID(), permissionGate(), bashPayload())
-				return s.RespondGate(context.Background(), userApprove(gateID, "session"))
+				return s.RespondGate(context.Background(), userApprove(gateID, gate.ApprovalApprove))
 			},
 			wantCmd: func(c command.Command) bool { _, ok := c.(command.ApproveToolCall); return ok },
 		},
@@ -544,7 +545,7 @@ func TestCommandAppendIsAuditOnly(t *testing.T) {
 				s.cmdAppender = app
 				s.now = pinnedClock(ts)
 				gateID := activateOn(t, s, loopID, mustUUID(), permissionGate(), bashPayload())
-				return s, cmds, func() error { return s.RespondGate(context.Background(), userApprove(gateID, "once")) }
+				return s, cmds, func() error { return s.RespondGate(context.Background(), userApprove(gateID, gate.ApprovalApprove)) }
 			},
 			wantType: func(c command.Command) bool { _, ok := c.(command.ApproveToolCall); return ok },
 		},

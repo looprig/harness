@@ -93,8 +93,6 @@ func classifyCommand(cmd Command) (CommandName, bool) {
 		return CommandDenyToolCall, true
 	case ProvideUserInput:
 		return CommandProvideUserInput, true
-	case SetSecurityLimit:
-		return CommandSetSecurityLimit, true
 	case CancelQueuedInput:
 		return CommandCancelQueuedInput, true
 	case CancelDelegateRequest:
@@ -142,7 +140,7 @@ func encodePayload(name CommandName, cmd Command) ([]byte, error) {
 	case SubagentResult:
 		return marshalSubagentResult(c)
 	case ApproveToolCall, DenyToolCall, ProvideUserInput, CancelQueuedInput, CancelDelegateRequest,
-		SetSecurityLimit, Interrupt, Shutdown, Compact:
+		Interrupt, Shutdown, Compact:
 		// Every field round-trips through encoding/json directly: header + scalars/
 		// strings/ids (uuid.UUID has its own text codec) + embedded Coordinates/
 		// GateRoute. The two block-bearing commands (UserInput/SubagentResult) are
@@ -285,10 +283,6 @@ func decodePayload(tag CommandName, data []byte) (Command, error) {
 		return decodePlain[DenyToolCall](tag, data)
 	case CommandProvideUserInput:
 		return decodePlain[ProvideUserInput](tag, data)
-	case CommandSetSecurityLimit:
-		return decodePlain[SetSecurityLimit](tag, data)
-	case CommandName("SetSecurityCeiling"):
-		return decodePlain[SetSecurityLimit](tag, data)
 	case CommandCancelQueuedInput:
 		return decodePlain[CancelQueuedInput](tag, data)
 	case CommandCancelDelegateRequest:

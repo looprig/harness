@@ -140,7 +140,7 @@ func TestJournalRecordSumIsSealed(t *testing.T) {
 				},
 				Gate: gate.Gate{ID: gate.ID(fixedUUID(0x70)), Kind: gate.KindPermission},
 			},
-			gate.OpenPayload{GateID: gate.ID(fixedUUID(0x70)), Payload: gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}}},
+			gate.OpenPayload{GateID: gate.ID(fixedUUID(0x70)), Payload: gate.PermissionPayload{Request: tool.Request{ToolName: "Bash", Summary: "echo ok", Requirements: []tool.Requirement{{Kind: "tool.invoke", Scope: "Bash", Match: "echo ok", Description: "run: echo ok"}}}}},
 		),
 	}
 	for i, r := range recs {
@@ -170,7 +170,7 @@ func TestGatePreparedRecordIDAndPayload(t *testing.T) {
 	}
 	payload := gate.OpenPayload{
 		GateID:  gate.ID(fixedUUID(0x70)),
-		Payload: gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}},
+		Payload: gate.PermissionPayload{Request: tool.Request{ToolName: "Bash", Summary: "echo ok", Requirements: []tool.Requirement{{Kind: "tool.invoke", Scope: "Bash", Match: "echo ok", Description: "run: echo ok"}}}},
 	}
 	rec := NewGatePreparedRecord(prepared, payload)
 	if got := rec.IdempotencyID(); got != evID.String() {
@@ -214,7 +214,7 @@ func TestGatePreparedRecordCodecRoundTrip(t *testing.T) {
 			name: "permission payload",
 			payload: gate.OpenPayload{
 				GateID:  gate.ID(fixedUUID(0x70)),
-				Payload: gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}},
+				Payload: gate.PermissionPayload{Request: tool.Request{ToolName: "Bash", Summary: "echo ok", Requirements: []tool.Requirement{{Kind: "tool.invoke", Scope: "Bash", Match: "echo ok", Description: "run: echo ok"}}}},
 			},
 		},
 		{

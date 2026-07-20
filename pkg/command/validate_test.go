@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 )
 
@@ -31,7 +32,7 @@ func TestValidateCommandValid(t *testing.T) {
 		{"SubagentResult", command.SubagentResult{Header: hdr, Coordinates: identity.Coordinates{LoopID: loop}}},
 		{"CancelQueuedInput", command.CancelQueuedInput{Header: hdr, Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop}, TargetCommandID: target}},
 		{"CancelDelegateRequest", command.CancelDelegateRequest{Header: hdr, Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop}, TargetCommandID: target}},
-		{"ApproveToolCall", command.ApproveToolCall{Header: hdr, GateRoute: route}},
+		{"ApproveToolCall", command.ApproveToolCall{Header: hdr, GateRoute: route, Action: gate.ApprovalApprove}},
 		{"DenyToolCall", command.DenyToolCall{Header: hdr, GateRoute: route}},
 		{"ProvideUserInput", command.ProvideUserInput{Header: hdr, GateRoute: route, Answer: "x"}},
 		{"Interrupt (session-wide, only CommandID)", command.Interrupt{Header: hdr}},

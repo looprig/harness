@@ -19,7 +19,6 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 	model "github.com/looprig/inference/model"
@@ -261,17 +260,6 @@ type Session struct {
 	snapshotPolicy      *checkpointPolicy
 	checkpoints         *checkpointController
 	checkpointAdmission *checkpointAdmissionGate
-
-	// security limit is the session's live SECURITY LIMIT ordinal source (SPEC §8/§10.2): the
-	// clamp SetSecurityLimit mutates and SecurityLimitSource exposes. It is default-minted at
-	// construction (New/Restore) so it is NEVER nil for a constructed session; the
-	// composition root overrides it via WithSecurityLimit with the SAME *security.Limit it wires
-	// into the permission checker (tools.WithSecurityLimitPostures), so a security limit change is
-	// visible to the checker on the next Check. On restore it is re-seeded from the folded
-	// SecurityLimitChanged events (last write wins). Concurrency-safe (atomic) — a
-	// checker reads Current on a loop goroutine while SetSecurityLimit applies on the
-	// dispatch goroutine.
-	securityLimit *security.Limit
 
 	// gatesMu protects gates and the per-entry state transitions. The gate
 	// directory is session-owned (the session is the source of truth for which
@@ -710,8 +698,7 @@ func (s *Session) observeBestEffortCheckpointError(err error) {
 // failed) or nil. After emitting a mode/inference change event, the actor calls it: because
 // the hub raises the fault INLINE (synchronously on the same actor goroutine, via
 // ReportFault) when the append fails, a non-nil result here means the change event did not
-// persist, so the actor declines to apply the change (fail-secure, no partial apply). It is
-// the loop-scoped counterpart to SetSecurityLimit's own post-emit fault check.
+// persist, so the actor declines to apply the change (fail-secure, no partial apply).
 func (s *Session) FaultErr() error {
 	return s.faultIfFaulted()
 }
@@ -1195,23 +1182,17 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			release()
 			return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
 		}
-		bindings = tool.Bindings{SessionID: s.sessionID, LoopID: loopID, SecurityLimit: s.securityLimitState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)}
+		bindings = tool.Bindings{SessionID: s.sessionID, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)}
 		bound, err = cfg.Bind(s.sessionCtx, bindings)
 		if err != nil {
 			release()
 			return uuid.UUID{}, err
 		}
 	}
-	if counts {
-		s.loopsMu.RLock()
-		parentHandle := s.loops[parent.LoopID]
-		s.loopsMu.RUnlock()
-		var parentPermission loop.PermissionGate
-		if parentHandle != nil && parentHandle.bound != nil {
-			parentPermission = parentHandle.bound.Permission()
-		}
-		bound = loop.AttenuateBoundPermission(bound, parentPermission)
-	}
+	// A spawned subagent keeps its OWN definition's access gate — never the
+	// parent's. Authority differences between loops are expressed by the
+	// consumer configuring different gates per definition (or OverrideBoundAccess
+	// at a binding seam); harness performs no cross-loop attenuation.
 	var eventTarget loopEventPublisher = s
 	if admission != nil {
 		admission.sub, err = s.subscribeLoop(loopID)
@@ -1567,13 +1548,6 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	if s.fingerprint == nil && s.frozenFingerprint == nil {
 		return abort(&MissingFingerprintProviderError{})
 	}
-	// Default-mint the security limit source when the composition root did not inject
-	// one via WithSecurityLimit, so SetSecurityLimit/SecurityLimitSource are always safe (never a
-	// nil-deref). A fresh session starts at the fail-secure most-restrictive ordinal (0)
-	// until a SetSecurityLimit command changes it.
-	if s.securityLimit == nil {
-		s.securityLimit = security.New()
-	}
 	// Default the restore-drift decider to the fail-secure policy when the composition
 	// root injected none via WithRestoreDecider, so the stored decider is never nil.
 	if s.restoreDecider == nil {
@@ -1655,7 +1629,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		if mintErr != nil {
 			return abort(&SessionError{Kind: SessionLoopIDGenerationFailed, Cause: mintErr})
 		}
-		bindings := tool.Bindings{SessionID: id, LoopID: loopID, SecurityLimit: s.securityLimitState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)}
+		bindings := tool.Bindings{SessionID: id, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)}
 		bound, bindErr := definition.Bind(sessionCtx, bindings)
 		if bindErr != nil {
 			return abort(bindErr)

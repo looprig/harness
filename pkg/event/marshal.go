@@ -179,7 +179,7 @@ func encodePayload(ev Event) ([]byte, error) {
 	case SessionStarted, SessionActive, SessionIdle, SessionStopped,
 		ConfigurationAdopted,
 		RestoreStarted, RestoreDone, WorkspaceCheckpointed, WorkspaceRestored,
-		ActiveLoopChanged, SecurityLimitChanged,
+		ActiveLoopChanged,
 		HustleStarted, HustleCompleted, HustleFailed,
 		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged,
 		LoopExternalToolsetChanged, ContextMeasured,
@@ -238,9 +238,11 @@ func marshalStepDone(e StepDone) ([]byte, error) {
 	return out, nil
 }
 
-// permissionRequestedWire is PermissionRequested's wire form: the Request sealed
-// interface is persisted IN FULL via tool.MarshalPermissionRequest (header-only
-// would panic on TUI replay), pre-encoded into a sibling "request" key.
+// permissionRequestedWire is PermissionRequested's wire form: the typed
+// prepared Request is validated (tool.ValidateRequest) and pre-encoded into a
+// sibling "request" key; the decoder routes it through the strict
+// gate.DecodeRequest, so a malformed or legacy sealed-request record fails
+// closed at the untrusted restore boundary.
 type permissionRequestedWire struct {
 	Header
 	ToolExecutionID uuid.UUID       `json:"tool_execution_id,omitzero"`
@@ -248,13 +250,12 @@ type permissionRequestedWire struct {
 }
 
 func marshalPermissionRequested(e PermissionRequested) ([]byte, error) {
-	var req json.RawMessage
-	if e.Request != nil {
-		r, err := tool.MarshalPermissionRequest(e.Request)
-		if err != nil {
-			return nil, &EventEncodeError{Type: "PermissionRequested", Cause: err}
-		}
-		req = r
+	if err := tool.ValidateRequest(e.Request); err != nil {
+		return nil, &EventEncodeError{Type: "PermissionRequested", Cause: err}
+	}
+	req, err := json.Marshal(e.Request)
+	if err != nil {
+		return nil, &EventEncodeError{Type: "PermissionRequested", Cause: err}
 	}
 	out, err := json.Marshal(permissionRequestedWire{
 		Header:          e.Header,
@@ -596,10 +597,6 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[WorkspaceRestored](tag, data)
 	case "ActiveLoopChanged":
 		return decodePlain[ActiveLoopChanged](tag, data)
-	case "SecurityLimitChanged":
-		return decodePlain[SecurityLimitChanged](tag, data)
-	case "SecurityCeilingChanged":
-		return decodePlain[SecurityLimitChanged](tag, data)
 	case "HustleStarted":
 		return decodePlain[HustleStarted](tag, data)
 	case "HustleCompleted":
@@ -768,7 +765,7 @@ func decodePermissionRequested(data []byte) (Event, error) {
 	}
 	ev := PermissionRequested{Header: w.Header, ToolExecutionID: w.ToolExecutionID}
 	if len(w.Request) > 0 {
-		req, err := tool.UnmarshalPermissionRequest(w.Request)
+		req, err := gate.DecodeRequest(w.Request)
 		if err != nil {
 			return nil, &EventDecodeError{Type: "PermissionRequested", Cause: err}
 		}
@@ -807,13 +804,12 @@ func decodeRestoreErrored(data []byte) (Event, error) {
 // serializes to an absent key.
 type gateResolvedWire struct {
 	Header
-	GateID        gate.ID             `json:"gate_id,omitzero"`
-	Resolver      gate.ResolverKind   `json:"resolver,omitempty"`
-	Reason        gate.CloseReason    `json:"reason,omitempty"`
-	Action        string              `json:"action,omitempty"`
-	ApprovalScope tool.ApprovalScope  `json:"scope,omitzero"`
-	Source        gate.ResponseSource `json:"source,omitzero"`
-	Audit         json.RawMessage     `json:"audit,omitempty"`
+	GateID   gate.ID             `json:"gate_id,omitzero"`
+	Resolver gate.ResolverKind   `json:"resolver,omitempty"`
+	Reason   gate.CloseReason    `json:"reason,omitempty"`
+	Action   string              `json:"action,omitempty"`
+	Source   gate.ResponseSource `json:"source,omitzero"`
+	Audit    json.RawMessage     `json:"audit,omitempty"`
 }
 
 func marshalGateResolved(e GateResolved) ([]byte, error) {
@@ -826,14 +822,13 @@ func marshalGateResolved(e GateResolved) ([]byte, error) {
 		auditJSON = a
 	}
 	out, err := json.Marshal(gateResolvedWire{
-		Header:        e.Header,
-		GateID:        e.GateID,
-		Resolver:      e.Resolver,
-		Reason:        e.Reason,
-		Action:        e.Action,
-		ApprovalScope: e.ApprovalScope,
-		Source:        e.Source,
-		Audit:         auditJSON,
+		Header:   e.Header,
+		GateID:   e.GateID,
+		Resolver: e.Resolver,
+		Reason:   e.Reason,
+		Action:   e.Action,
+		Source:   e.Source,
+		Audit:    auditJSON,
 	})
 	if err != nil {
 		return nil, &EventEncodeError{Type: "GateResolved", Cause: err}
@@ -847,13 +842,12 @@ func decodeGateResolved(data []byte) (Event, error) {
 		return nil, &EventDecodeError{Type: "GateResolved", Cause: err}
 	}
 	ev := GateResolved{
-		Header:        w.Header,
-		GateID:        w.GateID,
-		Resolver:      w.Resolver,
-		Reason:        w.Reason,
-		Action:        w.Action,
-		ApprovalScope: w.ApprovalScope,
-		Source:        w.Source,
+		Header:   w.Header,
+		GateID:   w.GateID,
+		Resolver: w.Resolver,
+		Reason:   w.Reason,
+		Action:   w.Action,
+		Source:   w.Source,
 	}
 	if len(w.Audit) > 0 {
 		audit, err := gate.UnmarshalResponseAudit(w.Audit)

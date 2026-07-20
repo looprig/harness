@@ -12,7 +12,6 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/harness/pkg/tool"
 )
 
 // formSchema is the representative form request used across this file: one field
@@ -514,7 +513,7 @@ func TestAwaitGateAnswerOnALoopOwnedGateFailsClosed(t *testing.T) {
 	t.Parallel()
 	s, _, loopID, _ := gateSession(t)
 	id, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(),
-		gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}})
+		gate.PermissionPayload{Request: typedGateRequest()})
 	if err != nil {
 		t.Fatalf("PrepareGateOpen() error = %v", err)
 	}

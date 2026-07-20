@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/harness/pkg/security"
 )
 
 // Requirements is the set of runtime capabilities a Definition needs before it
@@ -191,11 +190,8 @@ type WorkspaceBinding struct {
 type Bindings struct {
 	SessionID uuid.UUID
 	LoopID    uuid.UUID
-	// SecurityLimit is the exact live session-scoped ordinal source. Permission factories
-	// read it on every check through consumer-defined posture tables.
-	SecurityLimit security.LimitSource
-	Workspace     *WorkspaceBinding
-	Delegate      DelegateController
+	Workspace *WorkspaceBinding
+	Delegate  DelegateController
 	// ExtraTools are additional tool definitions the LOOP appends to every mode's
 	// toolset at Bind, beyond the definition's own WithTools. The composition root uses
 	// it to inject a derived, definition-scoped tool (the delegation Subagent tool) into

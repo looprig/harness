@@ -580,7 +580,7 @@ func (s *Session) resolveGatePolicy(g gate.Gate) (gate.ResponsePolicy, error) {
 	if policy.Timeout == 0 && policy.OnTimeout == "" && g.Kind == gate.KindPermission {
 		policy.Timeout = 5 * time.Minute
 		policy.OnTimeout = gate.PolicyRespond
-		policy.Response = gate.ResponseTemplate{Action: "deny"}
+		policy.Response = gate.ResponseTemplate{Action: string(gate.ApprovalDeny)}
 	}
 	if s.gateCaps.MaxTimeout > 0 && policy.Timeout > s.gateCaps.MaxTimeout {
 		return gate.ResponsePolicy{}, &GateError{GateID: g.ID, Kind: GateCapacity}
@@ -696,7 +696,7 @@ func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) e
 	s.gates[response.GateID] = entry
 	s.gatesMu.Unlock()
 
-	resolved, err := s.buildGateResolved(entry, response, translated.audit, translated.approvalScope)
+	resolved, err := s.buildGateResolved(entry, response, translated.audit)
 	if err != nil {
 		s.revertClaiming(response.GateID)
 		return err
@@ -746,14 +746,14 @@ func validateGateAction(g gate.Gate, action string) bool {
 	return false
 }
 
-// buildGateResolved stamps and builds the GateResolved event from the response,
-// resolved audit, and already-validated approval scope.
-func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse, audit gate.ResponseAudit, approvalScope *tool.ApprovalScope) (event.GateResolved, error) {
+// buildGateResolved stamps and builds the GateResolved event from the response
+// and the resolved (already-redacted) audit.
+func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse, audit gate.ResponseAudit) (event.GateResolved, error) {
 	stamped, err := s.factory.Stamp(event.Header{Coordinates: entry.coordinates})
 	if err != nil {
 		return event.GateResolved{}, &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
 	}
-	resolved := event.GateResolved{
+	return event.GateResolved{
 		Header:   stamped,
 		GateID:   response.GateID,
 		Resolver: entry.gate.Resolver,
@@ -761,11 +761,7 @@ func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse,
 		Action:   response.Action,
 		Source:   response.Source,
 		Audit:    audit,
-	}
-	if approvalScope != nil {
-		resolved.ApprovalScope = *approvalScope
-	}
-	return resolved, nil
+	}, nil
 }
 
 func (s *Session) buildGateClosed(entry gateEntry, id gate.ID, reason gate.CloseReason) (event.GateResolved, error) {
@@ -804,10 +800,9 @@ func (s *Session) dispatchGateCommand(entry gateEntry, cmd command.Command) erro
 // interface because they are delivered through different seams and only the cmd
 // has a loop to fail to find.
 type translatedGateResponse struct {
-	cmd           command.Command
-	answer        *gate.Answer
-	audit         gate.ResponseAudit
-	approvalScope *tool.ApprovalScope
+	cmd    command.Command
+	answer *gate.Answer
+	audit  gate.ResponseAudit
 }
 
 // translateGateResponse validates the payload-specific parts of the response and
@@ -935,26 +930,53 @@ func formPayloadFromGatePayload(payload gate.Payload) (gate.FormPayload, bool) {
 	}
 }
 
-// translatePermissionResponse builds an ApproveToolCall or DenyToolCall from a
-// permission gate response. For approve, it extracts scope and accepted_grants
-// from Values and validates the grants against the payload's request.
+// translatePermissionResponse maps a permission gate response to the exact
+// approval action and its command. The action string must be one of the three
+// exact gate.ApprovalAction values (ParseApprovalAction is the same single
+// validation source the strict wire decoder uses); anything else fails secure.
+// Approve actions travel on ApproveToolCall, Deny on DenyToolCall. The durable
+// audit stores the payload request's requirement descriptions and — for a
+// workspace approval, which persists them — the displayed candidate
+// descriptions. Descriptions only: no tokens, no raw arguments, and the
+// response carries no values to smuggle either.
 func (s *Session) translatePermissionResponse(hdr command.Header, route command.GateRoute, payload gate.Payload, response gate.GateResponse) (translatedGateResponse, error) {
-	switch response.Action {
-	case "approve":
-		scope, grants, audit, err := validatePermissionApprove(payload, response)
-		if err != nil {
-			return translatedGateResponse{}, err
-		}
+	action, ok := gate.ParseApprovalAction(response.Action)
+	if !ok {
+		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+	permPayload, ok := permissionPayloadFromGatePayload(payload)
+	if !ok {
+		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+	switch action {
+	case gate.ApprovalApprove, gate.ApprovalApproveAlwaysWorkspace:
 		return translatedGateResponse{
-			cmd:           command.ApproveToolCall{Header: hdr, GateRoute: route, Scope: scope, AcceptedGrants: grants},
-			audit:         audit,
-			approvalScope: &scope,
+			cmd:   command.ApproveToolCall{Header: hdr, GateRoute: route, Action: action},
+			audit: permissionAuditFor(permPayload.Request, action),
 		}, nil
-	case "deny":
+	case gate.ApprovalDeny:
 		return translatedGateResponse{cmd: command.DenyToolCall{Header: hdr, GateRoute: route}}, nil
 	default:
 		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
 	}
+}
+
+// permissionAuditFor builds the redacted durable audit for an approval: the
+// displayed requirement descriptions always, and the displayed reusable
+// candidate descriptions only for the workspace approval that persists them.
+func permissionAuditFor(displayed tool.Request, action gate.ApprovalAction) gate.PermissionAudit {
+	audit := gate.PermissionAudit{}
+	for _, requirement := range displayed.Requirements {
+		audit.RequirementDescriptions = append(audit.RequirementDescriptions, requirement.Description)
+	}
+	if action == gate.ApprovalApproveAlwaysWorkspace {
+		for _, requirement := range displayed.Requirements {
+			for _, candidate := range requirement.Candidates {
+				audit.CandidateDescriptions = append(audit.CandidateDescriptions, candidate.Description)
+			}
+		}
+	}
+	return audit
 }
 
 // translateAskUserResponse builds a ProvideUserInput from an ask-user gate
@@ -976,58 +998,6 @@ func (s *Session) translateAskUserResponse(hdr command.Header, route command.Gat
 	}, nil
 }
 
-// validatePermissionApprove extracts scope and accepted_grants from the response
-// Values, validates the scope against the payload request's AllowedScopes,
-// validates Bash grant tokens against the request's Grants, and builds the
-// PermissionAudit from the accepted grant descriptions (not tokens). A scope the
-// request did not offer or an accepted grant not in the request's Grants fails
-// secure.
-func validatePermissionApprove(payload gate.Payload, response gate.GateResponse) (tool.ApprovalScope, []string, gate.ResponseAudit, error) {
-	rawScope, ok := response.Values["scope"]
-	if !ok {
-		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
-	}
-	var scopeValue string
-	if err := json.Unmarshal(rawScope, &scopeValue); err != nil {
-		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
-	}
-	scope, ok := tool.ParseApprovalScopeValue(scopeValue)
-	if !ok {
-		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
-	}
-	permPayload, ok := permissionPayloadFromGatePayload(payload)
-	if !ok || permPayload.Request == nil {
-		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
-	}
-	if !approvalScopeAllowed(scope, permPayload.Request.AllowedScopes()) {
-		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
-	}
-
-	var grants []string
-	if raw, ok := response.Values["accepted_grants"]; ok {
-		if err := json.Unmarshal(raw, &grants); err != nil {
-			return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
-		}
-	}
-	bashReq, ok := permPayload.Request.(tool.BashRequest)
-	if !ok {
-		return scope, grants, gate.PermissionAudit{}, nil
-	}
-	validTokens := make(map[string]string, len(bashReq.Grants))
-	for _, g := range bashReq.Grants {
-		validTokens[g.Token] = g.Description
-	}
-	descs := make([]string, 0, len(grants))
-	for _, t := range grants {
-		desc, exists := validTokens[t]
-		if !exists {
-			return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
-		}
-		descs = append(descs, desc)
-	}
-	return scope, grants, gate.PermissionAudit{AcceptedGrantDescriptions: descs}, nil
-}
-
 func permissionPayloadFromGatePayload(payload gate.Payload) (gate.PermissionPayload, bool) {
 	switch v := payload.(type) {
 	case gate.PermissionPayload:
@@ -1040,13 +1010,4 @@ func permissionPayloadFromGatePayload(payload gate.Payload) (gate.PermissionPayl
 	default:
 		return gate.PermissionPayload{}, false
 	}
-}
-
-func approvalScopeAllowed(scope tool.ApprovalScope, allowed []tool.ApprovalScope) bool {
-	for _, candidate := range allowed {
-		if scope == candidate {
-			return true
-		}
-	}
-	return false
 }

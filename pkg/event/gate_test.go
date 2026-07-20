@@ -8,7 +8,6 @@ import (
 
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/tool"
 )
 
 // sampleGate builds a representative permission gate for the round-trip table.
@@ -57,13 +56,12 @@ func TestGateEventRoundTrip(t *testing.T) {
 		{
 			name: "GateResolved with permission audit",
 			ev: GateResolved{
-				Header:        fullHeader(),
-				GateID:        gate.ID(seededUUID(0x70)),
-				Reason:        gate.CloseAnswered,
-				Action:        "approve",
-				ApprovalScope: tool.ScopeSession,
-				Source:        gate.ResponseSource{Kind: gate.ResponseFromUser, Reason: "human"},
-				Audit:         gate.PermissionAudit{AcceptedGrantDescriptions: []string{"network egress"}},
+				Header: fullHeader(),
+				GateID: gate.ID(seededUUID(0x70)),
+				Reason: gate.CloseAnswered,
+				Action: string(gate.ApprovalApprove),
+				Source: gate.ResponseSource{Kind: gate.ResponseFromUser, Reason: "human"},
+				Audit:  gate.PermissionAudit{RequirementDescriptions: []string{"network egress"}},
 			},
 		},
 		{
@@ -264,13 +262,12 @@ func TestGateOpenedCarriesNoPrivatePayload(t *testing.T) {
 func TestGateResolvedReMarshalFixedPoint(t *testing.T) {
 	t.Parallel()
 	ev := GateResolved{
-		Header:        fullHeader(),
-		GateID:        gate.ID(seededUUID(0x70)),
-		Reason:        gate.CloseAnswered,
-		Action:        "approve",
-		ApprovalScope: tool.ScopeWorkspace,
-		Source:        gate.ResponseSource{Kind: gate.ResponseFromPolicy, Reason: "timeout"},
-		Audit:         gate.PermissionAudit{AcceptedGrantDescriptions: []string{"write to /out", "network egress"}},
+		Header: fullHeader(),
+		GateID: gate.ID(seededUUID(0x70)),
+		Reason: gate.CloseAnswered,
+		Action: string(gate.ApprovalApproveAlwaysWorkspace),
+		Source: gate.ResponseSource{Kind: gate.ResponseFromPolicy, Reason: "timeout"},
+		Audit:  gate.PermissionAudit{RequirementDescriptions: []string{"write to /out", "network egress"}, CandidateDescriptions: []string{"git push family"}},
 	}
 	data1, err := MarshalEvent(ev)
 	if err != nil {

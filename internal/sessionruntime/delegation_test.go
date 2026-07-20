@@ -16,42 +16,11 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
 	stream "github.com/looprig/inference/stream"
 )
-
-type livePermissionGate struct{ effect atomic.Uint32 }
-
-type securityLimitPermissionGate struct{ source security.LimitSource }
-
-type securityLimitCapture struct {
-	mu      sync.Mutex
-	sources []security.LimitSource
-}
-
-func (c *securityLimitCapture) add(source security.LimitSource) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.sources = append(c.sources, source)
-}
-func (c *securityLimitCapture) snapshot() []security.LimitSource {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]security.LimitSource(nil), c.sources...)
-}
-
-func (g securityLimitPermissionGate) Check(context.Context, tool.InvokableTool, string, string) loop.Effect {
-	if g.source.Current() == 1 {
-		return loop.EffectAutoApprove
-	}
-	return loop.EffectAsk
-}
-func (securityLimitPermissionGate) Grant(context.Context, string, string, tool.ApprovalScope) error {
-	return nil
-}
 
 type failChildStartAppender struct {
 	enabled atomic.Bool
@@ -75,18 +44,6 @@ func (a *failChildStartAppender) AppendEvent(_ context.Context, ev event.Event) 
 		return 0, a.err
 	}
 	return 1, nil
-}
-
-func newLivePermissionGate(effect loop.Effect) *livePermissionGate {
-	g := &livePermissionGate{}
-	g.effect.Store(uint32(effect))
-	return g
-}
-func (g *livePermissionGate) Check(context.Context, tool.InvokableTool, string, string) loop.Effect {
-	return loop.Effect(g.effect.Load())
-}
-func (*livePermissionGate) Grant(context.Context, string, string, tool.ApprovalScope) error {
-	return nil
 }
 
 // delegation_test.go drives the parent-scoped tool.DelegateController end-to-end against
@@ -874,143 +831,6 @@ func TestDelegateStatusReportsWaitTrueChildRunning(t *testing.T) {
 	cancel()
 	<-done
 	t.Fatal("child was never registered")
-}
-
-func TestDelegateChildPermissionIsAttenuatedByLiveParent(t *testing.T) {
-	t.Parallel()
-	parentGate := newLivePermissionGate(loop.EffectAsk)
-	childGate := newLivePermissionGate(loop.EffectAutoApprove)
-	parent := mustDefine(
-		loop.WithName("parent"),
-		loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("parent")}}, validModel("parent")),
-		loop.WithDelegates("child"), loop.WithDelegation(loop.Delegation{Style: loop.DelegationManaged}),
-		loop.WithPolicyRevision("parent-permission"),
-		loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) { return parentGate, nil }),
-	)
-	child := mustDefine(
-		loop.WithName("child"),
-		loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("done")}}, validModel("child")),
-		loop.WithPolicyRevision("child-permission"),
-		loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) { return childGate, nil }),
-	)
-	s := newDelegationSession(t, parent, nil, child)
-	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.loopsMu.RLock()
-	permission := s.loops[res.DelegateID].bound.Permission()
-	s.loopsMu.RUnlock()
-	if got := permission.Check(context.Background(), nil, "Bash", `{}`); got != loop.EffectAsk {
-		t.Fatalf("permissive child under Ask parent = %v, want Ask", got)
-	}
-	parentGate.effect.Store(uint32(loop.EffectDeny))
-	if got := permission.Check(context.Background(), nil, "Bash", `{}`); got != loop.EffectDeny {
-		t.Fatalf("live parent tightening = %v, want Deny", got)
-	}
-}
-
-func TestDelegatePermissionFactoriesShareLiveSessionSecurityLimit(t *testing.T) {
-	t.Parallel()
-	var parentSource, childSource security.LimitSource
-	parent := mustDefine(
-		loop.WithName("parent"), loop.WithInference(&stubLLM{}, validModel("parent")),
-		loop.WithDelegates("child"), loop.WithDelegation(loop.Delegation{Style: loop.DelegationManaged}),
-		loop.WithPolicyRevision("parent-securityLimit"),
-		loop.WithPermissionFactory(func(_ context.Context, bindings tool.Bindings) (loop.PermissionGate, error) {
-			parentSource = bindings.SecurityLimit
-			return securityLimitPermissionGate{source: bindings.SecurityLimit}, nil
-		}),
-	)
-	child := mustDefine(
-		loop.WithName("child"), loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("done")}}, validModel("child")),
-		loop.WithPolicyRevision("child-securityLimit"),
-		loop.WithPermissionFactory(func(_ context.Context, bindings tool.Bindings) (loop.PermissionGate, error) {
-			childSource = bindings.SecurityLimit
-			return securityLimitPermissionGate{source: bindings.SecurityLimit}, nil
-		}),
-	)
-	s := newDelegationSession(t, parent, nil, child)
-	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if parentSource == nil || parentSource != childSource || parentSource != s.SecurityLimitSource() {
-		t.Fatalf("security limit sources parent=%p child=%p session=%p, want exact same source", parentSource, childSource, s.SecurityLimitSource())
-	}
-	s.loopsMu.RLock()
-	permission := s.loops[res.DelegateID].bound.Permission()
-	s.loopsMu.RUnlock()
-	if got := permission.Check(context.Background(), nil, "Bash", `{}`); got != loop.EffectAsk {
-		t.Fatalf("level0 = %v, want Ask", got)
-	}
-	if err := s.SetSecurityLimit(context.Background(), 1); err != nil {
-		t.Fatal(err)
-	}
-	if got := permission.Check(context.Background(), nil, "Bash", `{}`); got != loop.EffectAutoApprove {
-		t.Fatalf("level1 = %v, want AutoApprove", got)
-	}
-}
-
-func TestPermissionSecurityLimitIsSharedOnRestoreAndIsolatedAcrossSessions(t *testing.T) {
-	t.Parallel()
-	parents, children := &securityLimitCapture{}, &securityLimitCapture{}
-	parent := mustDefine(
-		loop.WithName("parent"), loop.WithInference(&stubLLM{}, validModel("parent")), loop.WithDelegates("child"),
-		loop.WithDelegation(loop.Delegation{Style: loop.DelegationManaged}), loop.WithPolicyRevision("p-securityLimit"),
-		loop.WithPermissionFactory(func(_ context.Context, b tool.Bindings) (loop.PermissionGate, error) {
-			parents.add(b.SecurityLimit)
-			return securityLimitPermissionGate{b.SecurityLimit}, nil
-		}),
-	)
-	child := mustDefine(
-		loop.WithName("child"), loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("done")}}, validModel("child")), loop.WithPolicyRevision("c-securityLimit"),
-		loop.WithPermissionFactory(func(_ context.Context, b tool.Bindings) (loop.PermissionGate, error) {
-			children.add(b.SecurityLimit)
-			return securityLimitPermissionGate{b.SecurityLimit}, nil
-		}),
-	)
-	store := newRestoreStore(t)
-	topo := Topology{Definitions: []loop.Definition{parent, child}, Primers: []identity.AgentName{"parent"}, ActivePrimer: "parent"}
-	lc, err := NewTopologyLifecycle(topo, store, WithLifecycleFingerprintProvider(testFingerprintProvider))
-	if err != nil {
-		t.Fatal(err)
-	}
-	original, err := lc.NewSession(context.Background(), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctrl := original.delegation.controllerFor(original.ActiveLoopID(), parent)
-	if _, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true}); err != nil {
-		t.Fatal(err)
-	}
-	if err := original.SetSecurityLimit(context.Background(), 1); err != nil {
-		t.Fatal(err)
-	}
-	sid := original.SessionID()
-	if err := original.Shutdown(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	restored, err := lc.RestoreSession(context.Background(), sid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = restored.Shutdown(context.Background()) }()
-	p, c := parents.snapshot(), children.snapshot()
-	if len(p) != 2 || len(c) != 2 || p[0] != c[0] || p[1] != c[1] || p[0] == p[1] || p[1] != restored.SecurityLimitSource() || p[1].Current() != 1 {
-		t.Fatalf("sources parent=%v child=%v restored=%p level=%d", p, c, restored.SecurityLimitSource(), restored.SecurityLimitSource().Current())
-	}
-	separate, err := lc.NewSession(context.Background(), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = separate.Shutdown(context.Background()) }()
-	p = parents.snapshot()
-	if len(p) != 3 || p[2] == p[0] || p[2] == p[1] || p[2] != separate.SecurityLimitSource() {
-		t.Fatalf("separate session reused securityLimit: %v", p)
-	}
 }
 
 func TestDelegateStartSetupFailuresLeaveNoChildQuotaOrDurablePhantom(t *testing.T) {

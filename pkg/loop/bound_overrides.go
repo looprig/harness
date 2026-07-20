@@ -1,11 +1,5 @@
 package loop
 
-import (
-	"context"
-
-	"github.com/looprig/harness/pkg/tool"
-)
-
 // SelectBoundMode returns a private bound view whose default accessors resolve the
 // selected effective mode. It retains every declared mode for later trusted changes.
 func SelectBoundMode(bound BoundDefinition, mode ModeName) (BoundDefinition, error) {
@@ -23,70 +17,27 @@ func SelectBoundMode(bound BoundDefinition, mode ModeName) (BoundDefinition, err
 	return &clone, nil
 }
 
-// AttenuateBoundPermission returns a private bound view whose permission decision is
-// never more permissive than either the child's own gate or its live parent gate.
-// A nil parent is the runtime's fail-secure no-gate state and therefore remains nil.
-func AttenuateBoundPermission(bound BoundDefinition, parent PermissionGate) BoundDefinition {
+// OverrideBoundAccess returns a private bound view whose Access() resolves the
+// given gate instead of the definition's own. It is the binding-time seam a
+// composition root uses to give ONE bound loop a different combined access gate
+// (for example a restricted evaluator for a reviewer role) without mutating the
+// immutable definition.
+//
+// Authority differences between loops are expressed by the CONSUMER passing
+// different evaluators — there is no harness-side attenuation, and a bound loop
+// without an override always resolves its own definition's gate, never another
+// loop's. A nil gate is rejected: overriding to "no gate" would silently turn a
+// gated loop into a fail-closed-only loop through a side door; configure the
+// definition without WithAccessGate instead.
+func OverrideBoundAccess(bound BoundDefinition, access AccessGate) (BoundDefinition, error) {
 	state, ok := bound.(*boundDefinitionState)
 	if !ok || state == nil {
-		return bound
+		return nil, &BindError{Kind: BindInvalidDefinition, Index: -1}
+	}
+	if nilLike(access) {
+		return nil, &BindError{Kind: BindInvalidAccessGate, Index: -1}
 	}
 	clone := *state
-	if parent == nil || state.permission == nil {
-		clone.permission = nil
-	} else {
-		clone.permission = &attenuatedPermissionGate{parent: parent, child: state.permission}
-	}
-	return &clone
-}
-
-type attenuatedPermissionGate struct {
-	parent PermissionGate
-	child  PermissionGate
-}
-
-func (g *attenuatedPermissionGate) Check(ctx context.Context, t tool.InvokableTool, name, args string) Effect {
-	return restrictiveEffect(g.parent.Check(ctx, t, name, args), g.child.Check(ctx, t, name, args))
-}
-
-func (g *attenuatedPermissionGate) CheckDecision(ctx context.Context, t tool.InvokableTool, name, args string) PermissionDecision {
-	parent := permissionDecision(ctx, g.parent, t, name, args)
-	child := permissionDecision(ctx, g.child, t, name, args)
-	if restrictiveEffect(parent.Effect, child.Effect) == parent.Effect {
-		return parent
-	}
-	return child
-}
-
-func (g *attenuatedPermissionGate) Grant(ctx context.Context, name, args string, scope tool.ApprovalScope) error {
-	if err := g.parent.Grant(ctx, name, args, scope); err != nil {
-		return err
-	}
-	return g.child.Grant(ctx, name, args, scope)
-}
-
-func permissionDecision(ctx context.Context, gate PermissionGate, t tool.InvokableTool, name, args string) PermissionDecision {
-	if decisionGate, ok := gate.(interface {
-		CheckDecision(context.Context, tool.InvokableTool, string, string) PermissionDecision
-	}); ok {
-		return decisionGate.CheckDecision(ctx, t, name, args)
-	}
-	return PermissionDecision{Effect: gate.Check(ctx, t, name, args)}
-}
-
-func restrictiveEffect(left, right Effect) Effect {
-	if !knownEffect(left) || !knownEffect(right) {
-		return EffectDeny
-	}
-	if left == EffectDeny || right == EffectDeny {
-		return EffectDeny
-	}
-	if left == EffectAsk || right == EffectAsk {
-		return EffectAsk
-	}
-	return EffectAutoApprove
-}
-
-func knownEffect(effect Effect) bool {
-	return effect == EffectAutoApprove || effect == EffectAsk || effect == EffectDeny
+	clone.accessOverride = access
+	return &clone, nil
 }

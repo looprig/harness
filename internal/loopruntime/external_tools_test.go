@@ -14,7 +14,6 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 )
@@ -119,7 +118,7 @@ func toolBearingDefinition(t *testing.T, client inference.Client) loop.BoundDefi
 	if err != nil {
 		t.Fatalf("Define: %v", err)
 	}
-	bound, err := d.Bind(context.Background(), tool.Bindings{SessionID: mustID(t), LoopID: mustID(t), SecurityLimit: security.New()})
+	bound, err := d.Bind(context.Background(), tool.Bindings{SessionID: mustID(t), LoopID: mustID(t)})
 	if err != nil {
 		t.Fatalf("Bind: %v", err)
 	}

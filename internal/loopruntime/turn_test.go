@@ -602,7 +602,7 @@ func TestRunTurnAgentic(t *testing.T) {
 		go func() {
 			reg := <-gateReg
 			close(reg.ack)
-			reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeOnce}
+			reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Action: gatedomain.ApprovalApprove}
 		}()
 
 		cfg, st, rec := newTurnFixture(input, nil, ts, client, gateReg)

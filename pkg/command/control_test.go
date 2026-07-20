@@ -5,7 +5,7 @@ import (
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
-	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/harness/pkg/gate"
 )
 
 // gateRouter is the narrow accessor runLoop uses to route a control command to
@@ -42,7 +42,7 @@ func TestControlCommandsSatisfyContracts(t *testing.T) {
 	}{
 		{
 			name:       "ApproveToolCall set fields",
-			cmd:        command.ApproveToolCall{Header: command.Header{CommandID: headerID}, GateRoute: command.GateRoute{ToolExecutionID: callID}, Scope: tool.ScopeSession},
+			cmd:        command.ApproveToolCall{Header: command.Header{CommandID: headerID}, GateRoute: command.GateRoute{ToolExecutionID: callID}, Action: gate.ApprovalApprove},
 			wantHeader: headerID,
 			wantCallID: callID,
 		},
@@ -92,25 +92,25 @@ func TestControlCommandsSatisfyContracts(t *testing.T) {
 	}
 }
 
-// TestApproveScopeRoundTrips asserts ApproveToolCall preserves the granted scope
-// (the only field runLoop consults beyond the ToolExecutionID), across every scope value.
-func TestApproveScopeRoundTrips(t *testing.T) {
+// TestApproveActionPreserved asserts ApproveToolCall preserves the approval
+// action (the only field runLoop consults beyond the ToolExecutionID), across
+// both approve actions.
+func TestApproveActionPreserved(t *testing.T) {
 	t.Parallel()
-	scopes := []struct {
-		name  string
-		scope tool.ApprovalScope
+	actions := []struct {
+		name   string
+		action gate.ApprovalAction
 	}{
-		{"once", tool.ScopeOnce},
-		{"session", tool.ScopeSession},
-		{"workspace", tool.ScopeWorkspace},
+		{"approve once", gate.ApprovalApprove},
+		{"approve always for this workspace", gate.ApprovalApproveAlwaysWorkspace},
 	}
-	for _, sc := range scopes {
-		sc := sc
-		t.Run(sc.name, func(t *testing.T) {
+	for _, tc := range actions {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			cmd := command.ApproveToolCall{Scope: sc.scope}
-			if cmd.Scope != sc.scope {
-				t.Errorf("Scope = %v, want %v", cmd.Scope, sc.scope)
+			cmd := command.ApproveToolCall{Action: tc.action}
+			if cmd.Action != tc.action {
+				t.Errorf("Action = %v, want %v", cmd.Action, tc.action)
 			}
 		})
 	}

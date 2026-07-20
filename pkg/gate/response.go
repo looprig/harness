@@ -40,11 +40,22 @@ func DecodeApprovalAction(data []byte) (ApprovalAction, error) {
 	if err := decodeStrict(data, &raw); err != nil {
 		return "", &ApprovalActionDecodeError{Cause: err}
 	}
-	switch raw.Action {
-	case ApprovalApprove, ApprovalApproveAlwaysWorkspace, ApprovalDeny:
-		return raw.Action, nil
-	default:
+	action, ok := ParseApprovalAction(string(raw.Action))
+	if !ok {
 		return "", &ApprovalActionDecodeError{Cause: errors.New("unknown approval action")}
+	}
+	return action, nil
+}
+
+// ParseApprovalAction returns the exact approval action named by s. It is the
+// single validation source shared by DecodeApprovalAction and the session gate
+// route; anything but the three exact actions fails closed.
+func ParseApprovalAction(s string) (ApprovalAction, bool) {
+	switch ApprovalAction(s) {
+	case ApprovalApprove, ApprovalApproveAlwaysWorkspace, ApprovalDeny:
+		return ApprovalAction(s), true
+	default:
+		return "", false
 	}
 }
 

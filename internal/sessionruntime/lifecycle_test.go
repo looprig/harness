@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,7 +14,6 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/sessionstore"
 )
 
@@ -156,21 +154,19 @@ func TestNewTopologyLifecycleRequiresFingerprintProvider(t *testing.T) {
 // TestLifecycleRun covers NewSession's happy path and every error branch in table form: a pre-
 // cancelled ctx (NewSessionContextDone), a failing Leaser (NewSessionLeaseFailed), and a session-
 // construction failure (NewSessionRuntimeFailed) — the last also proving the acquired lease is
-// released, not leaked. The happy rows assert a non-zero id, a live session whose
-// SubscribeEvents works, and (with a security limit factory) that the factory is minted per run.
+// released, not leaked. The happy rows assert a non-zero id and a live session whose
+// SubscribeEvents works.
 func TestLifecycleRun(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name              string
-		badClient         bool                // NewTopologyLifecycle with a nil-Client definition → NewSession fails
-		withSecurityLimit bool                // wire a counting security limit factory
-		cancelCtx         bool                // pass a pre-cancelled context to NewSession
-		failLease         bool                // the store's Leaser fails Acquire
-		wantKind          NewSessionErrorKind // zero value => success expected
-		wantBalanced      bool                // assert the recording leaser released every lease it acquired
+		name         string
+		badClient    bool                // NewTopologyLifecycle with a nil-Client definition → NewSession fails
+		cancelCtx    bool                // pass a pre-cancelled context to NewSession
+		failLease    bool                // the store's Leaser fails Acquire
+		wantKind     NewSessionErrorKind // zero value => success expected
+		wantBalanced bool                // assert the recording leaser released every lease it acquired
 	}{
 		{name: "happy path"},
-		{name: "happy path with security limit factory", withSecurityLimit: true},
 		{name: "pre-cancelled ctx", cancelCtx: true, wantKind: NewSessionContextDone},
 		{name: "lease acquire fails", failLease: true, wantKind: NewSessionLeaseFailed, wantBalanced: true},
 		{name: "session construction failure releases lease", badClient: true, wantKind: NewSessionRuntimeFailed, wantBalanced: true},
@@ -196,15 +192,7 @@ func TestLifecycleRun(t *testing.T) {
 				runCfg = badClientCfg()
 			}
 
-			var mints int64
-			var copts []LifecycleOption
-			if tt.withSecurityLimit {
-				copts = append(copts, WithLifecycleSecurityLimitFactory(func() *security.Limit {
-					atomic.AddInt64(&mints, 1)
-					return security.New()
-				}))
-			}
-			r, err := newTestLifecycle(runCfg, store, copts...)
+			r, err := newTestLifecycle(runCfg, store)
 			if err != nil {
 				t.Fatalf("NewTopologyLifecycle: %v", err)
 			}
@@ -254,11 +242,6 @@ func TestLifecycleRun(t *testing.T) {
 				t.Fatalf("SubscribeEvents: %v", err)
 			}
 			_ = sub.Close()
-			if tt.withSecurityLimit {
-				if got := atomic.LoadInt64(&mints); got != 1 {
-					t.Errorf("security limit factory minted %d times, want 1 (once per NewSession)", got)
-				}
-			}
 		})
 	}
 }
