@@ -76,7 +76,7 @@ Harness defines runner and access-gate contracts but does not implement a shell 
 - Tools own preparation: each tool decodes and validates its own untrusted arguments, normalizes commands/URLs/paths, and produces the typed `tool.Request` (`tool.CallPreparer`). Durable rule matching and persistence are consumer-provided behind `gate.RuleMatcher`/`gate.RuleWriter`.
 - The sandbox module owns access profiles and OS enforcement, satisfies the structural `gate.AccessSource`/`gate.GrantIssuer` seams without importing harness, and never opens an interactive gate itself.
 
-The optional `github.com/looprig/tools` module owns Bash, and `github.com/looprig/confinement` owns its reusable sandbox wiring.
+The optional `github.com/looprig/tools` module owns Bash and the other standard tool implementations. Consumers assemble sandbox profiles and executors directly; there is no confinement bridge.
 
 **File paths** — Always call `filepath.Clean` and verify the result stays within the expected root before opening files from user-supplied paths.
 

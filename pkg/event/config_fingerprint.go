@@ -51,12 +51,12 @@ type ConfigFingerprint struct {
 	// under (e.g. "default", "acceptEdits"). Empty for a native session. A change in
 	// posture is a behavior change that must not resume unnoticed.
 	PermissionPosture string `json:"permission_posture,omitzero"`
-	// NativePermissionPolicyRev is a content digest (hex sha256) of the NATIVE
-	// permission configuration (allowlist + hard-deny lists + MaxReadBytes + the
-	// headless mode bits), computed by tools.PolicyFingerprint at the composition
-	// root and injected. Empty for a foreign session (which uses PermissionPosture)
-	// or a caller that does not inject it. A change is a behavior change that must
-	// not resume unnoticed.
+	// NativePermissionPolicyRev is an opaque content digest (hex sha256) of the
+	// NATIVE permission and access configuration, computed and injected by the
+	// composition root (e.g. over the selected access profiles and rule policy).
+	// Harness only compares it. Empty for a foreign session (which uses
+	// PermissionPosture) or a caller that does not inject it. A change is a
+	// behavior change that must not resume unnoticed.
 	NativePermissionPolicyRev string `json:"native_permission_policy_rev,omitzero"`
 	// ExternalCapabilityRev is a content digest over the identity of the EXTERNAL
 	// capabilities an application attached to this session — tools, prompts and
