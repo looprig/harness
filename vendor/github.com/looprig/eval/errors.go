@@ -190,6 +190,20 @@ func (e *NilEvaluatorError) Error() string {
 	return "eval: evaluator must not be nil"
 }
 
+// DuplicateEvaluatorNameError reports that Run was given two evaluators sharing
+// the same Descriptor.Name. Within a single run an evaluator name must identify
+// exactly one evaluator (one revision): the report keys a sample's assessments
+// and cross-report comparison keys its cases by evaluator name, so two evaluators
+// under one name would collide — an identical pair corrupts the sample's
+// assessment set, and a same-name/different-revision pair silently loses one
+// revision's identity. It is rejected at preflight before any execution. The
+// offending name is caller-supplied and withheld from the message.
+type DuplicateEvaluatorNameError struct{}
+
+func (e *DuplicateEvaluatorNameError) Error() string {
+	return "eval: duplicate evaluator name in run"
+}
+
 // TargetError reports that a sample's target stage failed: the target returned
 // an error, timed out, was cancelled, or produced an observation that did not
 // validate. It is a stage error, never a failed quality assessment. The wrapped
@@ -210,6 +224,49 @@ func (e *TargetError) Error() string {
 func (e *TargetError) Unwrap() error {
 	return e.Cause
 }
+
+// ReportValidationError reports that a Report failed a report-level invariant
+// (identity, timestamp ordering, trial index, sample or evaluator uniqueness,
+// summary consistency, or observed-target consistency). Reason is drawn only
+// from the fixed vocabulary below, so no untrusted content — in particular a
+// data-supplied scenario ID — is ever embedded; only the class of failure is
+// reported.
+type ReportValidationError struct {
+	// Reason is one of the reportReason* constants.
+	Reason string
+}
+
+func (e *ReportValidationError) Error() string {
+	return "eval: invalid report: " + e.Reason
+}
+
+const (
+	reportReasonEmptyID            = "id must not be empty"
+	reportReasonIDTooLong          = "id exceeds the length bound"
+	reportReasonIDInvalidUTF8      = "report id must be valid UTF-8"
+	reportReasonEndBeforeStart     = "ended_at is before started_at"
+	reportReasonEmptyScenarioID    = "sample scenario id must not be empty"
+	reportReasonNegativeTrial      = "sample trial index must not be negative"
+	reportReasonDuplicateSample    = "duplicate sample identity (scenario id and trial index)"
+	reportReasonDuplicateEvaluator = "duplicate evaluator name within a sample"
+	reportReasonSummaryMismatch    = "summary is inconsistent with the samples"
+	reportReasonProvenanceMismatch = "provenance is inconsistent with the report body"
+	reportReasonMissingTarget      = "successful sample requires an observed target revision"
+	reportReasonUnexpectedTarget   = "target revision requires a successful sample"
+
+	reportReasonTargetErrorWithAssessments = "sample with a target error must not carry assessments"
+
+	// reportReasonEvaluatorRevisionDrift rejects an evaluator name that appears
+	// with more than one revision anywhere across the report's samples. Within a
+	// single report a name must map to exactly one revision — comparison keys a
+	// case by evaluator name, so a name identifying two revisions is ambiguous.
+	reportReasonEvaluatorRevisionDrift = "evaluator name maps to more than one revision across the report"
+
+	// reportReasonDuplicateProvenanceEvaluator rejects two provenance entries that
+	// share an evaluator name. Provenance records one identity per evaluator; a
+	// repeated name (with the same or a different revision) is ambiguous.
+	reportReasonDuplicateProvenanceEvaluator = "duplicate evaluator name in provenance"
+)
 
 // SampleSubjectMismatchError reports that a sample's observation described a
 // subject whose revision did not match the target revision the sample's scenario

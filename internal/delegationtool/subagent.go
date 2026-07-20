@@ -34,9 +34,9 @@ import (
 // AUDIT. AuditSummary is the constant "Subagent": the agent name and message may carry
 // sensitive context and must never reach the audit event.
 
-// subagentToolName is the EXACT tool name. It is an UNKNOWN class to classifyTool
-// (no path/command boundary), so it reaches AutoApprove only via the manifest's
-// HardApprove list (which names "Subagent").
+// subagentToolName is the EXACT tool name. The tool's PrepareCall returns an
+// empty typed request (no requirements), so the combined access gate allows it
+// without a prompt; there is no path or command boundary to classify.
 const subagentToolName = "Subagent"
 
 // SubagentAction is the model-facing delegation verb carried by the envelope.

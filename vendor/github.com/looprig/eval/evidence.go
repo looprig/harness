@@ -100,6 +100,10 @@ const (
 	// EvidenceStructuredError records a structured-output validation failure as a
 	// classification, never as inferred free text.
 	EvidenceStructuredError EvidenceKind = "structured_output_error"
+	// EvidenceStructuredOutput is the positive signal that the subject produced
+	// structured output which validated against its declared schema. It carries
+	// only safe schema identity, never the raw model output.
+	EvidenceStructuredOutput EvidenceKind = "structured_output"
 	// EvidenceDiagnostic records an evaluator's own diagnostic.
 	EvidenceDiagnostic EvidenceKind = "evaluator_diagnostic"
 )
@@ -109,7 +113,8 @@ const (
 func (k EvidenceKind) Validate() error {
 	switch k {
 	case EvidenceConversationExcerpt, EvidenceMessageIndex, EvidenceTiming,
-		EvidenceUsage, EvidenceToolOperation, EvidenceStructuredError, EvidenceDiagnostic:
+		EvidenceUsage, EvidenceToolOperation, EvidenceStructuredError,
+		EvidenceStructuredOutput, EvidenceDiagnostic:
 		return nil
 	default:
 		return &InvalidEnumError{Enum: "EvidenceKind"}
@@ -131,6 +136,7 @@ type Evidence struct {
 	Usage               *UsageEvidence
 	ToolOperation       *ToolOperationEvidence
 	StructuredError     *StructuredOutputError
+	StructuredOutput    *StructuredOutput
 	Diagnostic          *DiagnosticEvidence
 }
 
@@ -272,6 +278,29 @@ func (s *StructuredOutputError) validate() error {
 	return s.DetailHash.Validate()
 }
 
+// StructuredOutput is the positive evidence that the subject produced structured
+// output that validated against its declared schema. It carries only safe schema
+// identity — the schema's name and/or revision — and never the raw model output,
+// so it is a content-free proof of structured-output success. Both identity
+// fields are optional (the presence of this evidence is itself the signal), and
+// each is validated only when supplied.
+type StructuredOutput struct {
+	SchemaName     Name
+	SchemaRevision Revision
+}
+
+func (s *StructuredOutput) validate() error {
+	if s.SchemaName != "" {
+		if err := s.SchemaName.Validate(); err != nil {
+			return err
+		}
+	}
+	if s.SchemaRevision != "" {
+		return s.SchemaRevision.Validate()
+	}
+	return nil
+}
+
 // DiagnosticEvidence records an evaluator's own diagnostic: a safe code, a
 // severity, and a bounded redacted message. Because a diagnostic may quote a
 // judge or an error, its Message is a RedactedExcerpt — bounded and never raw.
@@ -334,6 +363,9 @@ func (e Evidence) payloadCount() int {
 	if e.StructuredError != nil {
 		n++
 	}
+	if e.StructuredOutput != nil {
+		n++
+	}
 	if e.Diagnostic != nil {
 		n++
 	}
@@ -375,6 +407,11 @@ func (e Evidence) validatePayload() error {
 			return &EvidencePayloadError{Reason: payloadReasonMismatch}
 		}
 		return e.StructuredError.validate()
+	case EvidenceStructuredOutput:
+		if e.StructuredOutput == nil {
+			return &EvidencePayloadError{Reason: payloadReasonMismatch}
+		}
+		return e.StructuredOutput.validate()
 	case EvidenceDiagnostic:
 		if e.Diagnostic == nil {
 			return &EvidencePayloadError{Reason: payloadReasonMismatch}

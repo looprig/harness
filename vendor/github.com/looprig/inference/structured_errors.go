@@ -98,6 +98,17 @@ func (e *StructuredOutputWithToolsUnsupportedError) Error() string {
 	return "inference: structured output with tools unsupported"
 }
 
+// ImageInputUnsupportedError reports that a request thread carries image
+// blocks but the model does not advertise the AcceptsImages capability.
+// Model is bounded diagnostic metadata only.
+type ImageInputUnsupportedError struct {
+	Model string
+}
+
+func (e *ImageInputUnsupportedError) Error() string {
+	return "inference: image input unsupported"
+}
+
 // StructuredOutputConflictError reports an invalid request feature
 // combination. Feature is a bounded classification, never a schema or tool
 // payload supplied by the caller.

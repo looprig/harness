@@ -53,6 +53,10 @@ func ValidateRequestFeatures(req Request) error {
 		return &StructuredOutputConflictError{Feature: "tool_choice"}
 	}
 
+	if !req.Model.Caps.AcceptsImages && messagesCarryImages(req.Messages) {
+		return &ImageInputUnsupportedError{Model: boundedStructuredDiagnostic(req.Model.Name)}
+	}
+
 	if req.Output == nil {
 		return nil
 	}
@@ -78,6 +82,44 @@ func ValidateRequestFeatures(req Request) error {
 		return &StructuredOutputWithToolsUnsupportedError{Model: boundedStructuredDiagnostic(req.Model.Name)}
 	}
 	return nil
+}
+
+// messagesCarryImages reports whether any message in the thread carries an
+// ImageBlock, including images nested inside ToolResultBlock content. The
+// Conversation interface is sealed, so the four concrete message types are
+// enumerated; an unknown type contributes no blocks.
+func messagesCarryImages(msgs content.AgenticMessages) bool {
+	for _, conv := range msgs {
+		var blocks []content.Block
+		switch m := conv.(type) {
+		case *content.SystemMessage:
+			blocks = m.Blocks
+		case *content.UserMessage:
+			blocks = m.Blocks
+		case *content.AIMessage:
+			blocks = m.Blocks
+		case *content.ToolResultMessage:
+			blocks = m.Blocks
+		}
+		if blocksCarryImages(blocks) {
+			return true
+		}
+	}
+	return false
+}
+
+func blocksCarryImages(blocks []content.Block) bool {
+	for _, b := range blocks {
+		switch b := b.(type) {
+		case *content.ImageBlock:
+			return true
+		case *content.ToolResultBlock:
+			if blocksCarryImages(b.Content) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func boundedStructuredDiagnostic(value string) string {

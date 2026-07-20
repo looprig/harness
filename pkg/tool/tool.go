@@ -1,9 +1,18 @@
 // Package tool defines the dependency-free contract surface for the tools
 // subsystem: the BaseTool/InvokableTool interfaces every tool implements, the
-// ToolResult value tools return, and the optional capability interfaces the
-// runner probes for via type assertion. It imports only internal/content (plus
-// stdlib); it must never import internal/agent/loop or tools/, so both can
-// depend on it without a cycle.
+// ToolResult value tools return, the tool-owned preparation boundary
+// (CallPreparer, Request, Requirement, RuleCandidate — see preparation.go), and
+// the optional capability interfaces the runner probes for via type assertion.
+// It imports only core packages (plus stdlib); it must never import pkg/loop,
+// the runtime internals, or a concrete tools module, so all of them can depend
+// on it without a cycle.
+//
+// Ownership: tools own preparation — decoding untrusted arguments, normalizing
+// commands/URLs/paths, resolving canonical resource identities — and produce
+// the typed prepared Request. The three-state Deny/Gated/Allow decision, the
+// single combined approval, and response routing belong to pkg/gate; sandbox
+// profiles and OS enforcement belong to the enforcing consumer behind
+// structural seams; durable rule persistence is consumer-provided.
 package tool
 
 import (

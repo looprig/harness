@@ -42,6 +42,19 @@ const FindingEvaluatorError FindingCode = "evaluator_error"
 // evaluator-stage error, not a quality verdict.
 const FindingEvaluatorInvalidAssessment FindingCode = "evaluator_invalid_assessment"
 
+// FindingEvaluatorIdentityMismatch is the safe code attached to the error-status
+// assessment the runner synthesises when an evaluator returns a nil error and an
+// otherwise-valid Assessment whose Evaluator/Revision identity does not match the
+// evaluator's own descriptor. Assessment.Validate cannot catch this — it has no
+// descriptor to compare against — so the runner enforces it. The masqueraded
+// verdict is discarded (fail-secure): a buggy or hostile evaluator must not be
+// able to stamp its assessment with ANOTHER evaluator's identity and corrupt
+// report provenance and cross-evaluator comparison. The attacker-chosen identity
+// is never echoed (it may be adversarial); the failure is recorded as an
+// evaluator-stage error under the descriptor's true identity, not a quality
+// verdict.
+const FindingEvaluatorIdentityMismatch FindingCode = "evaluator_identity_mismatch"
+
 // Run executes suite against target, applying evaluators to every resulting
 // observation, and returns the report. It validates all inputs at preflight and
 // returns the zero Report with a typed error if any input is ill-formed. During
@@ -107,13 +120,25 @@ func preflight(cfg RunConfig, suite Suite, target Target, evaluators []Evaluator
 	if target == nil {
 		return &NilTargetError{}
 	}
+	seen := make(map[Name]struct{}, len(evaluators))
 	for _, ev := range evaluators {
 		if ev == nil {
 			return &NilEvaluatorError{}
 		}
-		if err := ev.Descriptor().Validate(); err != nil {
+		desc := ev.Descriptor()
+		if err := desc.Validate(); err != nil {
 			return err
 		}
+		// Within a run an evaluator name must identify exactly one evaluator. Two
+		// evaluators sharing a name collide: an identical pair corrupts a sample's
+		// assessment set (Report.Validate rejects the repeated name), and a
+		// same-name/different-revision pair silently loses one revision when a
+		// report or comparison keys a case by name. Reject the collision here,
+		// before any execution.
+		if _, dup := seen[desc.Name]; dup {
+			return &DuplicateEvaluatorNameError{}
+		}
+		seen[desc.Name] = struct{}{}
 	}
 	return nil
 }
@@ -257,9 +282,14 @@ func (r *runner) assess(ctx context.Context, sample Sample) []Assessment {
 // A non-nil error return is the evaluator's own failure to reach a verdict; it is
 // converted to an error-status assessment and never leaks the underlying error
 // text. When the evaluator returns no error, its assessment is trusted only after
-// it passes Assessment.Validate: a verdict that fails validation is discarded and
-// contained as an evaluator-stage error (fail-secure), so a buggy or hostile
-// evaluator can never place an invalid verdict into the report.
+// two checks. First it must pass Assessment.Validate: a verdict that fails
+// validation is discarded and contained as an evaluator-stage error (fail-secure).
+// Second, its Evaluator/Revision identity must match the descriptor's: because
+// Assessment.Validate has no descriptor to compare against, a well-formed verdict
+// stamped with another evaluator's identity would otherwise slip through and
+// corrupt provenance and comparison. Either failure discards the returned verdict
+// and contains it as an evaluator-stage error, so a buggy or hostile evaluator can
+// never place an invalid or masqueraded verdict into the report.
 func (r *runner) evaluate(ctx context.Context, ev Evaluator, desc Descriptor, sample Sample) Assessment {
 	ectx := ctx
 	if r.cfg.EvaluatorTimeout > 0 {
@@ -273,11 +303,17 @@ func (r *runner) evaluate(ctx context.Context, ev Evaluator, desc Descriptor, sa
 	}
 	if err := a.Validate(); err != nil {
 		// Fail secure: the returned verdict is ill-formed (a zero value, a pass
-		// carrying a severe finding, a duplicate measurement, a dangling evidence
-		// reference, or an identity that does not match the descriptor). Do not
-		// trust it; contain it as an evaluator-stage error without echoing the
-		// validation error's untrusted content.
+		// carrying a severe finding, a duplicate measurement, or a dangling evidence
+		// reference). Do not trust it; contain it as an evaluator-stage error without
+		// echoing the validation error's untrusted content.
 		return Errored(desc, evaluatorInvalidAssessmentFinding())
+	}
+	if a.Evaluator != desc.Name || a.Revision != desc.Revision {
+		// Fail secure: the verdict is well-formed but claims another evaluator's
+		// identity. Discard it and contain it as an evaluator-stage error under the
+		// descriptor's true identity, without echoing the (possibly adversarial)
+		// claimed identity.
+		return Errored(desc, evaluatorIdentityMismatchFinding())
 	}
 	return a
 }
@@ -300,6 +336,18 @@ func evaluatorInvalidAssessmentFinding() Finding {
 		Code:     FindingEvaluatorInvalidAssessment,
 		Severity: SeverityHigh,
 		Message:  "evaluator returned an invalid assessment",
+	}
+}
+
+// evaluatorIdentityMismatchFinding is the fixed, safe finding attached to the
+// error-status assessment synthesised when an evaluator returns an assessment
+// whose identity does not match its descriptor. It never embeds the claimed
+// (possibly adversarial) identity.
+func evaluatorIdentityMismatchFinding() Finding {
+	return Finding{
+		Code:     FindingEvaluatorIdentityMismatch,
+		Severity: SeverityHigh,
+		Message:  "evaluator returned an assessment with a mismatched identity",
 	}
 }
 

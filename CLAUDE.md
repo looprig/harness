@@ -70,7 +70,13 @@ srv := &http.Server{
 
 **Shell commands** — Never pass user input to `exec.Command` as a shell string. Always pass args as separate parameters.
 
-Harness defines runner and permission contracts but does not implement a shell tool. The optional `github.com/looprig/tools` module owns Bash, and `github.com/looprig/confinement` owns its reusable sandbox wiring.
+Harness defines runner and access-gate contracts but does not implement a shell tool. Ownership is split along the preparation/evaluation/enforcement boundary:
+
+- `pkg/gate` owns the generic three-state evaluation (Deny/Gated/Allow, deny-before-allow, one combined approval with exactly Approve / Approve always for this workspace / Deny) and response routing. It never parses tool arguments, never defines sandbox profiles, never imports an enforcement package, and never implements a permission-file format (see `pkg/gate/README.md`).
+- Tools own preparation: each tool decodes and validates its own untrusted arguments, normalizes commands/URLs/paths, and produces the typed `tool.Request` (`tool.CallPreparer`). Durable rule matching and persistence are consumer-provided behind `gate.RuleMatcher`/`gate.RuleWriter`.
+- The sandbox module owns access profiles and OS enforcement, satisfies the structural `gate.AccessSource`/`gate.GrantIssuer` seams without importing harness, and never opens an interactive gate itself.
+
+The optional `github.com/looprig/tools` module owns Bash, and `github.com/looprig/confinement` owns its reusable sandbox wiring.
 
 **File paths** — Always call `filepath.Clean` and verify the result stays within the expected root before opening files from user-supplied paths.
 

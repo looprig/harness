@@ -203,7 +203,11 @@ type functionResponsePayload struct {
 // classic Gemini functionResponse has no structured error flag, so the model
 // learns of a failure through the (loop-prefixed) result text.
 func encodeToolResult(m *content.ToolResultMessage, toolNames map[string]string) (geminiPart, error) {
-	payload, err := json.Marshal(functionResponsePayload{Result: concatText(m.Blocks)})
+	text, err := toolResultText(m.Blocks)
+	if err != nil {
+		return geminiPart{}, err
+	}
+	payload, err := json.Marshal(functionResponsePayload{Result: text})
 	if err != nil {
 		return geminiPart{}, &EncodeError{Reason: "marshal tool result", Err: err}
 	}
@@ -214,15 +218,19 @@ func encodeToolResult(m *content.ToolResultMessage, toolNames map[string]string)
 	}}, nil
 }
 
-// concatText joins all text blocks into a single string.
-func concatText(blocks []content.Block) string {
+// toolResultText flattens a tool result's blocks to the plain string the
+// text-only functionResponse carries. Any non-text block yields a typed
+// *UnsupportedBlockError — fail-secure, never a silent drop.
+func toolResultText(blocks []content.Block) (string, error) {
 	var out string
 	for _, b := range blocks {
-		if t, ok := b.(*content.TextBlock); ok {
-			out += t.Text
+		t, ok := b.(*content.TextBlock)
+		if !ok {
+			return "", &UnsupportedBlockError{Block: fmt.Sprintf("%T", b)}
 		}
+		out += t.Text
 	}
-	return out
+	return out, nil
 }
 
 // buildTools maps the exposed tools into Gemini's single tool entry holding all

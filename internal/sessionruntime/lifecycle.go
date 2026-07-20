@@ -102,7 +102,7 @@ type Lifecycle struct {
 	// NewSession and RestoreSession: limits, fingerprint projection,
 	// WithWorkspaceCheckpointing, WithForeignBuilders, WithGateCaps. They are forwarded verbatim to
 	// both NewSession and RestoreSession. The per-session dependencies (session ID,
-	// appenders, lease release, and security limit) are appended by each lifecycle call.
+	// appenders, and lease release) are appended by each lifecycle call.
 	baseOpts []Option
 
 	// allowConfigMismatch is the NewTopologyLifecycle-time opt-in forwarded to RestoreSession ONLY (as
@@ -429,10 +429,6 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	if r.frozenManifest != nil {
 		opts = append(opts, WithManifest(*r.frozenManifest))
 	}
-	// AMBIGUITY A1: mint a fresh per-session security limit state so concurrent sessions never share one
-	// mutable clamp. A configured factory returning nil fails closed; only an absent factory
-	// selects the session's internal default.
-
 	// Resolve the managed-workspace placement (design §"Placement details"). The session
 	// lease is already held (above), so the exclusive root lease is acquired AFTER it, as
 	// the design mandates. On root contention the session lease is released and the typed

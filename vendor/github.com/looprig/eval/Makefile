@@ -25,13 +25,29 @@ fmt-check:
 
 lint: fmt-check
 	go vet ./...
-	go tool staticcheck ./...
+	# staticcheck: analyze THIS module's concrete package dirs via GO_DIRS (the
+	# same go-list idiom gosec/fmt use) rather than a bare `./...`. A bare pattern
+	# that resolves to no packages makes staticcheck print a "matched no packages"
+	# warning and STILL EXIT 0 — a vacuous run that reads as success while nothing
+	# was analyzed. GO_DIRS is the explicit package set, and the guard below FAILS
+	# the target if go-list resolved nothing or staticcheck ever matches none, so a
+	# vacuous "clean" can never masquerade as a pass again.
+	@if [ -z "$(GO_DIRS)" ]; then \
+		echo "staticcheck: go list resolved no packages (GO_DIRS empty)"; exit 1; \
+	fi
+	@echo "go tool staticcheck $(words $(GO_DIRS)) packages"
+	@out=$$(go tool staticcheck $(GO_DIRS) 2>&1); rc=$$?; \
+	if [ -n "$$out" ]; then printf '%s\n' "$$out"; fi; \
+	if printf '%s\n' "$$out" | grep -q "matched no packages"; then \
+		echo "staticcheck matched no packages (vacuous success); failing"; exit 1; \
+	fi; \
+	if [ $$rc -ne 0 ]; then exit $$rc; fi
 	# gosec is NOT module-aware: its ./... is a filesystem walk that descends
 	# into nested .worktrees/ checkouts (separate modules) and, under
 	# -mod=vendor, reports modules.txt desyncs for those foreign trees. Scope it
 	# to THIS module's package dirs via GO_DIRS (the same go-list idiom
-	# fmt/fmt-check use). go vet and staticcheck are module-aware (go list stops
-	# at module boundaries), so they need no scoping.
+	# fmt/fmt-check use). go vet is module-aware (go list stops at module
+	# boundaries), so it needs no scoping.
 	go tool gosec $(GO_DIRS)
 
 vuln:

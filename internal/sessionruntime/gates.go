@@ -806,8 +806,8 @@ type translatedGateResponse struct {
 }
 
 // translateGateResponse validates the payload-specific parts of the response and
-// builds the translated command, redacted audit, and validated approval scope. It
-// returns a typed *GateError on validation failure (invalid grants, missing
+// builds the translated command, redacted audit, and exact approval action. It
+// returns a typed *GateError on validation failure (invalid action, missing
 // values, unknown kind).
 func (s *Session) translateGateResponse(entry gateEntry, response gate.GateResponse) (translatedGateResponse, error) {
 	cmdID, err := s.newCommandID()

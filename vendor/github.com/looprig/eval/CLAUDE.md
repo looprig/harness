@@ -16,6 +16,12 @@ rubrics, findings, measurements, reports, and sinks on top of the
   import `inference`.**
 - **No other third-party dependency without explicit approval.** If a task
   seems to need one, stop and confirm before running `go get`.
+- **The security toolchain is a sanctioned dev/tool-only exception.**
+  `honnef.co/go/tools/cmd/staticcheck`, `github.com/securego/gosec/v2/cmd/gosec`,
+  and `golang.org/x/vuln/cmd/govulncheck` are wired via `tool (...)` directives
+  in `go.mod` (mirroring the sibling `inference`/`harness` modules). They power
+  `make secure` and are **never linked into the library**, so the "no
+  third-party *runtime* dependency" rule still holds.
 
 ## Code rules
 
