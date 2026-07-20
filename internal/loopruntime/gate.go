@@ -285,13 +285,9 @@ func permissionGate(callID uuid.UUID, displayed tool.Request) gatedomain.Gate {
 		Effect:   gatedomain.EffectResume,
 		Subject:  gatedomain.Subject{ToolExecutionID: callID},
 		Prompt: gatedomain.Prompt{
-			Title: "Approve tool call",
-			Body:  renderApprovalBody(displayed),
-			Controls: []gatedomain.Control{
-				{Action: string(gatedomain.ApprovalApprove), Label: "Approve"},
-				{Action: string(gatedomain.ApprovalApproveAlwaysWorkspace), Label: "Approve always for this workspace"},
-				{Action: string(gatedomain.ApprovalDeny), Label: "Deny"},
-			},
+			Title:    "Approve tool call",
+			Body:     renderApprovalBody(displayed),
+			Controls: gatedomain.ApprovalControls(),
 		},
 	}
 }

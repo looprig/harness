@@ -1931,7 +1931,7 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 // (a later task) has one method to call and the blocks stay package-private.
 //
 // cfg is the sub-loop's loop.Definition — the CALLER builds a FRESH cfg per call (its
-// own ToolSet/PermissionChecker) so each sub-loop has independent approval state;
+// own ToolSet and access gate) so each sub-loop has independent approval state;
 // RunSubagent never reuses a shared ToolSet. parent is the spawning loop/turn/step
 // provenance (recorded on the sub-loop's registry entry and stamped on its
 // LoopStarted). The submit is stamped Agency=AgencyMachine — a subagent turn is a

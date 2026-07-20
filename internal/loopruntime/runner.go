@@ -205,7 +205,7 @@ type indexedResolved struct {
 }
 
 // newResolved builds the per-call working state: mints a ToolExecutionID via idGen, looks
-// up the tool, validates args JSON, runs Preparer.Prepare (once), queries WriteTarget,
+// up the tool, validates args JSON, runs CallPreparer.PrepareCall (once), queries WriteTarget,
 // and computes the redacted Summary. Pre-execution failures (id-gen failure, unknown
 // tool, invalid args, Prepare error, WriteTarget error) are recorded here; permission
 // is resolved later (sequentially).
@@ -556,7 +556,7 @@ func execute(
 }
 
 // runOne executes a single resolved call: builds the per-call ctx (ToolExecutionID + emit +
-// gateReg + the per-call Preparer artifact injected so the tool can emit / request
+// gateReg + the per-call prepared artifact injected so the tool can emit / request
 // user input / read back its prepared artifact), wraps InvokableRun in the middleware
 // chain (first listed = outermost), recovers a panic into an error result, and
 // normalizes the outcome to a result. It never aborts the batch.

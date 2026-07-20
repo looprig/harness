@@ -73,8 +73,8 @@ type Sequential interface {
 	Sequential() bool
 }
 
-// PreparedArtifact is the opaque, per-call artifact a Preparer produces — read by
-// the producing tool at both BuildRequest and InvokableRun time, opaque to the
+// PreparedArtifact is the opaque, per-call artifact a CallPreparer produces — read
+// by the producing tool at both PrepareCall and InvokableRun time, opaque to the
 // runner. Sealed via an unexported marker so only deliberate types satisfy it (no
 // bare any): a type in another package cannot supply the unexported method, so it
 // cannot masquerade as a PreparedArtifact. Concrete artifacts therefore live in
@@ -83,9 +83,9 @@ type PreparedArtifact interface{ preparedArtifact() }
 
 // TokenArtifact is the minimal concrete PreparedArtifact: it carries a single
 // opaque Token (e.g. a content hash or a callID-bound nonce) that the producing
-// tool reads at both BuildRequest and InvokableRun time. It is the simplest
-// artifact a Preparer can return when the bound value is a single string; richer
-// Preparers declare their own concrete artifact type in this package.
+// tool reads at both PrepareCall and InvokableRun time. It is the simplest
+// artifact a CallPreparer can return when the bound value is a single string;
+// richer CallPreparers declare their own concrete artifact type in this package.
 type TokenArtifact struct{ Token string }
 
 func (TokenArtifact) preparedArtifact() {}
