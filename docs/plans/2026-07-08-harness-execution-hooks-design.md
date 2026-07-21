@@ -7,20 +7,28 @@
 
 ## 1. Goal
 
-Add a typed, in-process hook API for harness execution phases so embedders can run
-custom code at well-defined session, loop, turn, step, and tool boundaries.
+Add a typed, in-process hook API at meaningful harness extension boundaries so
+embedders can observe execution and enforce policy without coupling themselves to
+runtime internals.
 
 Examples:
 
-- record metrics before and after each turn;
+- record metrics when turns and lifecycle transitions complete;
 - audit tool execution without parsing the event stream;
-- attach tracing spans around loop inference calls, step commit, or tool execution;
+- attach tracing spans around inference, compaction, or tool operations;
 - run cleanup logic when a loop or session stops;
-- enforce local policy at a small number of before-hooks.
+- reject unsafe tool calls or inference requests at explicit interception hooks.
 
 Hooks are not a replacement for events. Events remain the durable, externally
 observable history. Hooks are in-process extension points that run near the code
 performing the operation.
+
+The API is semantic rather than mechanically symmetric. A lifecycle occurrence
+such as `SessionStart` is one hook point. A fallible operation such as an inference
+call has `BeforeInferenceCall`, `AfterInferenceCall`, and
+`OnInferenceCallError` because those boundaries carry different data and control.
+There is no `BeforeSessionStart`/`AfterSessionStart` pair and no public step-start
+or step-end hook.
 
 ## 2. Non-Goals
 
@@ -37,6 +45,8 @@ performing the operation.
   hooks, but historical hooks are not re-run from the journal.
 - No hook points added only for symmetry. Error hooks exist only where there is a
   meaningful fallible operation.
+- No classifier-specific or OpenTelemetry-specific hook points. Those are
+  consumers of the general policy and observation boundaries defined here.
 
 ## 3. Package Shape
 
@@ -50,7 +60,7 @@ type Point string
 // StepIndex is the turn-local index of a native loop step.
 type StepIndex uint64
 
-type Func func(context.Context, Event) error
+type Func func(context.Context, Event) (context.Context, error)
 
 type FailurePolicy uint8
 
@@ -67,6 +77,15 @@ type Set struct {
 type Registry map[Point]Set
 ```
 
+Functions return a context so a before-hook can attach tracing state, deadlines,
+or request-scoped values to the wrapped operation. Functions within one set
+receive the previous function's returned context. The runner uses the final
+context for the operation and its matching after/error hook. A nil returned
+context is invalid and is treated as a hook error. When a function returns an
+error, its returned context is discarded: `FailureLog` continues with the input
+context and `FailureAbort` stops. Returned contexts from occurrence, after, and
+error hooks do not escape that hook point.
+
 The rig is the current composition root. `rig.WithHooks` installs one registry
 for sessions and loops created or restored by that immutable rig:
 
@@ -82,7 +101,9 @@ surface. Loop definitions also remain immutable domain definitions and do not
 carry runtime callbacks.
 
 Validation rejects unknown points, unknown failure policies, nil functions, and
-`FailureAbort` on after/error points where aborting has no coherent meaning.
+`FailureAbort` on occurrence, after, or error points where aborting has no coherent
+meaning. The only intercepting points in v1 are `BeforeTurn`,
+`BeforeInferenceCall`, `BeforeCompaction`, and `BeforeToolCall`.
 Because an immutable rig may create multiple live sessions, callbacks can run
 concurrently across sessions as well as across loops and parallel tool calls.
 Hook implementations must therefore be concurrency-safe; the runner does not
@@ -129,6 +150,7 @@ type Event struct {
 	Turn      *TurnData
 	Step      *StepData
 	Inference *InferenceData
+	Compaction *CompactionData
 	Tool      *ToolData
 
 	Err           error
@@ -142,10 +164,11 @@ Rules:
 - `Coordinates.SessionID` is set on every hook.
 - `Coordinates.LoopID` is set for loop-scoped and lower hooks.
 - `Coordinates.TurnID` is set for turn-scoped and lower hooks.
-- `Coordinates.StepID` is set for step/tool hooks once a step id exists.
-- `Err` on normal after-hooks is allowed only when the underlying domain result
-  is itself an error outcome, for example `event.TurnFailed`. Infrastructure
-  failures use `On*Error` hooks.
+- `Coordinates.StepID` is set for step, inference, and tool hooks once a step id
+  exists. Compaction may occur between steps and leaves it zero.
+- `Err` on normal occurrence/after hooks is allowed only when the underlying
+  domain result is itself an error outcome, for example `event.TurnFailed`.
+  Infrastructure failures use `On*Error` hooks.
 - Hooks must treat `Event` and nested data as read-only.
 - Because some fields point at existing content/request/result values, the
   implementation should clone where practical. Hook functions must still treat
@@ -192,10 +215,10 @@ type TurnData struct {
 }
 ```
 
-For `AfterTurnEnd`, `Terminal` is one of `event.TurnDone`,
+For `TurnEnd`, `Terminal` is one of `event.TurnDone`,
 `event.TurnFailed`, or `event.TurnInterrupted`. A model/provider failure that
 lands as `event.TurnFailed` is still a valid turn terminal, so
-`AfterTurnEnd` fires. `Err` is set to the terminal's underlying error for
+`TurnEnd` fires. `Err` is set to the terminal's underlying error for
 convenience.
 
 ### 4d. StepData
@@ -208,8 +231,9 @@ type StepData struct {
 }
 ```
 
-`AfterStepCommit` means the actor has appended the completed step group and
-emitted `StepDone`. That is distinct from `AfterInferenceCall`: an inference
+`StepCommit` means the actor has appended the completed step group and emitted
+`StepDone`. It is an occurrence hook and cannot veto or roll back the commit.
+That is distinct from `AfterInferenceCall`: an inference
 call can complete successfully before output validation, tool execution, and
 step commit. Interrupted or failed turns discard only the in-flight uncommitted
 step.
@@ -234,7 +258,26 @@ provider metadata when the provider supplied it. `OnInferenceCallError` carries
 the provider error in `Event.Err`; partial response blocks are not exposed as a
 successful result.
 
-### 4f. ToolData
+### 4f. CompactionData
+
+```go
+type CompactionData struct {
+	AttemptID event.CompactAttemptID
+	Input     *loop.CompactionInput
+	Output    *loop.CompactionOutput
+	StartedAt time.Time
+	EndedAt   time.Time
+}
+```
+
+`BeforeCompaction` receives the frozen compaction input immediately before the
+compactor is invoked. `AfterCompaction` receives an independently owned output
+after it passes validation and the resulting `CompactionCommitted` is durable and
+published. `OnCompactionError` carries execution, validation, or commit failures
+in `Event.Err`. These hooks surround the harness-owned compaction operation; they
+do not expose or instrument the hustle used to perform it.
+
+### 4g. ToolData
 
 ```go
 type ToolData struct {
@@ -259,117 +302,111 @@ type ToolData struct {
 
 `Summary` and `ResultPreview` are the safe logging fields. `ArgsJSON`,
 `Result`, `Inference.Request`, `InputMessage`, and `Inference.AIMessage` may
-contain secrets or user data. The hook package does not redact them because this
-is an in-process Go API, but docs and examples must steer logging toward the
-redacted fields.
+contain secrets or user data, as may compaction input and output. The hook package
+does not redact them because this is an in-process Go API, but docs and examples
+must steer logging toward redacted fields.
 
 ## 5. Hook Points
 
-Use consistent naming:
+Hook names describe what consumers can do:
 
-- `Start` / `Stop` for lifecycle.
-- `Active` / `Idle` for quiescence.
-- `Start` / `End` for turn, step, and tool execution phases.
-- Specific operation names for sub-phases such as `InferenceCall`, `Commit`,
-  `PermissionCheck`, and `Exec`.
+- occurrence hooks (`SessionStart`, `TurnEnd`, `StepCommit`) report a committed
+  lifecycle fact and cannot block it;
+- `BeforeX` hooks run before a real operation and may block it;
+- `AfterX` hooks receive the successful result of that operation;
+- `OnXError` hooks receive an operation failure and cannot recover or replace it.
+
+Do not manufacture `BeforeX`/`AfterX` pairs around lifecycle words such as
+`Start`, `Idle`, or `Stop`.
 
 ### 5a. Session Lifecycle and Quiescence
 
 ```go
 const (
-	BeforeSessionStart Point = "beforeSessionStart"
-	AfterSessionStart  Point = "afterSessionStart"
-	OnSessionStartError Point = "onSessionStartError"
-
-	BeforeSessionActive Point = "beforeSessionActive"
-	AfterSessionActive  Point = "afterSessionActive"
-
-	BeforeSessionIdle Point = "beforeSessionIdle"
-	AfterSessionIdle  Point = "afterSessionIdle"
-
-	BeforeSessionStop Point = "beforeSessionStop"
-	AfterSessionStop  Point = "afterSessionStop"
-	OnSessionStopError Point = "onSessionStopError"
-
+	SessionStart   Point = "sessionStart"
+	SessionActive  Point = "sessionActive"
+	SessionIdle    Point = "sessionIdle"
+	SessionStop    Point = "sessionStop"
 	OnSessionError Point = "onSessionError"
 )
 ```
 
-`Active` and `Idle` do not get dedicated error hooks. If publishing or applying a
-quiescence transition fails, fire `OnSessionError` with `FailedAt` set to the
-transition hook point.
+Each occurrence hook fires after the matching durable event has been appended and
+published live. `SessionStart` fires once for each usable runtime: after
+`SessionStarted` for a fresh session, or after `RestoreDone` for a restored
+session. It never replays the historical `SessionStarted` hook. If construction
+interception is ever required, it must be designed separately as a rig-level
+`SessionCreate` operation rather than disguised as `BeforeSessionStart`.
+
+`SessionActive` and `SessionIdle` fire only on real quiescence edges, not on every
+event while the session remains in that state. `SessionStop` fires after
+`SessionStopped` commits. Hook failures at these occurrence points are logged and
+never roll back the transition.
 
 ### 5b. Loop Lifecycle and Quiescence
 
 ```go
 const (
-	BeforeLoopStart Point = "beforeLoopStart"
-	AfterLoopStart  Point = "afterLoopStart"
-	OnLoopStartError Point = "onLoopStartError"
-
-	BeforeLoopIdle Point = "beforeLoopIdle"
-	AfterLoopIdle  Point = "afterLoopIdle"
-
-	BeforeLoopStop Point = "beforeLoopStop"
-	AfterLoopStop  Point = "afterLoopStop"
-	OnLoopStopError Point = "onLoopStopError"
-
+	LoopStart   Point = "loopStart"
+	LoopIdle    Point = "loopIdle"
+	LoopStop    Point = "loopStop"
 	OnLoopError Point = "onLoopError"
 )
 ```
 
-Use `Stop`, not `End`, for loops. A loop stops or exits; a turn/step/tool
-execution ends.
-
-`BeforeLoopIdle` fires immediately before publishing `LoopIdle` after a terminal
-turn if no chained turn starts. `AfterLoopIdle` fires after `LoopIdle` is
-published. The loop is still alive and can accept future input.
+These are also post-commit occurrence hooks. `LoopStart` fires for a newly
+committed `LoopStarted`; restoring an existing loop does not replay it. `LoopIdle`
+fires after `LoopIdle` is durable and published when no chained turn starts. The
+loop remains alive and can accept future input. A failure to construct a loop
+cannot invoke `LoopStart`; a runtime failure associated with an established loop
+invokes `OnLoopError` when no more specific operation error hook applies.
 
 ### 5c. Turn Hooks
 
 ```go
 const (
-	BeforeTurnStart Point = "beforeTurnStart"
-	AfterTurnStart  Point = "afterTurnStart"
-	OnTurnStartError Point = "onTurnStartError"
-
-	BeforeTurnEnd Point = "beforeTurnEnd"
-	AfterTurnEnd  Point = "afterTurnEnd"
-
-	BeforeTurnFold Point = "beforeTurnFold"
-	AfterTurnFold  Point = "afterTurnFold"
-
+	BeforeTurn  Point = "beforeTurn"
+	TurnStart   Point = "turnStart"
+	TurnFold    Point = "turnFold"
+	TurnEnd     Point = "turnEnd"
 	OnTurnError Point = "onTurnError"
 )
 ```
 
-Do not add `OnTurnEndError` in v1. If the turn reaches a terminal event, even
-`TurnFailed`, the end operation succeeded and `AfterTurnEnd` fires. If the
-harness fails while managing the turn, use `OnTurnError`.
+`BeforeTurn` is the admission seam. It fires after a queued or submitted input is
+selected to become a turn and a turn id is minted, but before the initial message
+is committed and before `TurnStarted` is appended or published. `FailureAbort`
+rejects that input without starting a turn. This is the semantic equivalent of a
+user-prompt-submit hook; it is not half of a start pair.
 
-### 5d. Step Hooks
+`TurnStart`, `TurnFold`, and `TurnEnd` are post-commit occurrence hooks for
+`TurnStarted`, `TurnFoldedInto`, and a terminal event respectively. `TurnEnd`
+fires for `TurnDone`, `TurnFailed`, and `TurnInterrupted`; a model/provider failure
+represented by `TurnFailed` is a completed terminal transition, not an
+`OnTurnError`. `OnTurnError` is reserved for harness failures that prevent the
+turn from reaching a durable terminal, and for `BeforeTurn` aborts.
+
+The context returned by `BeforeTurn` becomes the turn execution context and is
+passed to `TurnStart`, `TurnFold`, `TurnEnd`, or `OnTurnError`. This lets tracing
+span the turn without adding mechanical before/after-start hooks.
+
+### 5d. Step Commit
 
 ```go
 const (
-	BeforeStepStart Point = "beforeStepStart"
-	AfterStepStart  Point = "afterStepStart"
-
-	BeforeStepCommit Point = "beforeStepCommit"
-	AfterStepCommit  Point = "afterStepCommit"
+	StepCommit        Point = "stepCommit"
 	OnStepCommitError Point = "onStepCommitError"
-
-	BeforeStepEnd Point = "beforeStepEnd"
-	AfterStepEnd  Point = "afterStepEnd"
-
-	OnStepError Point = "onStepError"
 )
 ```
 
-`OnStepCommitError` is specific because commit is a real fallible operation:
-the turn goroutine sends a commit request and waits for the actor ack. If the
-turn context is cancelled before the ack, `AfterStepCommit` must not fire.
+There is no public `StepStart` or `StepEnd`. A step is an internal grouping of an
+inference result, possible tool results, and one atomic `StepDone` commit; its
+useful external seams are the operations inside it. `StepCommit` fires only after
+the actor appends and publishes `StepDone`. It cannot veto a durable commit.
+`OnStepCommitError` fires when the commit handshake fails or is cancelled before
+the acknowledgement.
 
-### 5e. Inference Hooks
+### 5e. Inference Call
 
 ```go
 const (
@@ -379,105 +416,132 @@ const (
 )
 ```
 
-An inference call is one provider attempt, not a whole step or turn. In v1 each
-native step has exactly one call. If retries are added later, every attempt gets
-its own before/after-or-error sequence under the same step coordinates.
+An inference call is one provider attempt, not a whole step or turn. If retries
+are added later, every attempt gets its own before/after-or-error sequence under
+the same step coordinates.
 
-`BeforeInferenceCall` fires after the exact request is assembled and measured,
-the step id is minted, and execution admission is acquired, immediately before
-`inference.Client.Stream`. A `FailureAbort` error prevents the provider call and
-fires `OnInferenceCallError` with `AbortedByHook: true`.
+`BeforeInferenceCall` fires after the exact request is assembled and defensively
+cloned, the step id is minted, and execution admission is acquired, immediately
+before `inference.Client.Stream`. It runs before any future
+`InferenceCallStarted` event is appended or published. A `FailureAbort` error
+prevents the provider call and fires `OnInferenceCallError` with
+`AbortedByHook: true`.
 
 `AfterInferenceCall` fires exactly once after clean stream EOF, response assembly,
-and capture of terminal stream metadata. It fires before harness output
-validation, tool execution, or step commit. A response that later fails output
-validation is therefore still a successfully completed inference call.
+and capture of terminal stream metadata. It fires before output validation, tool
+execution, or step commit. A response that later fails output validation is still
+a successfully completed inference call.
 
-`OnInferenceCallError` fires exactly once if opening or consuming the provider
-stream fails. It does not fire for empty, malformed, or policy-invalid model
-output after clean EOF; those are step/output failures. Neither inference hook
-fires for hustle `Client.Invoke` calls.
+`OnInferenceCallError` fires exactly once if the pre-hook aborts or opening or
+consuming the provider stream fails. It does not fire for empty, malformed, or
+policy-invalid model output after clean EOF; those are turn/step output failures.
+No inference hook fires for a hustle's `Client.Invoke` call.
 
-### 5f. Tool Hooks
+### 5f. Compaction
 
 ```go
 const (
-	BeforeToolBatch Point = "beforeToolBatch"
-	AfterToolBatch  Point = "afterToolBatch"
-
-	BeforeToolResolve Point = "beforeToolResolve"
-	AfterToolResolve  Point = "afterToolResolve"
-
-	BeforeToolPermissionCheck Point = "beforeToolPermissionCheck"
-	AfterToolPermissionCheck  Point = "afterToolPermissionCheck"
-
-	BeforeToolExec Point = "beforeToolExec"
-	AfterToolExec  Point = "afterToolExec"
-	OnToolExecError Point = "onToolExecError"
-
-	OnToolError Point = "onToolError"
+	BeforeCompaction  Point = "beforeCompaction"
+	AfterCompaction   Point = "afterCompaction"
+	OnCompactionError Point = "onCompactionError"
 )
 ```
 
-Tool pre-execution failures such as unknown tool, invalid JSON, permission deny,
-or `WriteTarget` error are model-visible tool results in the existing runner.
-Those should still fire `AfterToolResolve` or `AfterToolPermissionCheck` with the
-appropriate `ToolData`, but not `BeforeToolExec` because the tool is not executed.
+`BeforeCompaction` fires after a candidate is frozen and counted but before
+`CompactionStarted` is committed and before the compactor is invoked. An abort is
+recorded through the existing compaction rejection path. `AfterCompaction` fires
+after successful execution, output validation, and durable publication of
+`CompactionCommitted`; it is observational and cannot veto the commit.
+`OnCompactionError` fires for pre-hook abort, compactor failure, invalid output,
+or commit failure.
 
-`OnToolExecError` covers actual execution errors: `InvokableRun` returns a Go
-error, the tool panics, or the execution middleware returns an error.
+### 5g. Tool Call
+
+```go
+const (
+	BeforeToolCall  Point = "beforeToolCall"
+	AfterToolCall   Point = "afterToolCall"
+	OnToolCallError Point = "onToolCallError"
+)
+```
+
+One semantic tool-call boundary covers resolution, permission evaluation, and
+execution. This matches what policy consumers care about and avoids exposing the
+runner's internal phases as public API.
+
+`BeforeToolCall` receives the model-supplied name and arguments before
+`ToolCallStarted` is emitted, permission is checked, or tool code runs. A
+`FailureAbort` prevents permission and execution. The runner converts the abort
+into a model-visible error result and emits the normal started/completed audit
+pair for the attempted call after the hook decision.
+
+`AfterToolCall` fires after a model-visible result has been normalized and after
+`ToolCallCompleted` is durable and published. It fires with `ToolData.IsError`
+for unknown tools, invalid arguments, permission denial, `WriteTarget` failure,
+tool-returned errors, and recovered panics. Those are tool outcomes, not
+hook-pipeline failures.
+
+`OnToolCallError` fires for a `BeforeToolCall` abort or an infrastructure failure
+that prevents the runner from producing or committing a normalized result. A
+pre-hook abort can still have a durable, model-visible rejection outcome without
+becoming a successful hook sequence. The hook outcome is exclusive: after
+`BeforeToolCall`, exactly one of `AfterToolCall` or `OnToolCallError` fires.
+
+Batch scheduling is intentionally not a public hook point in v1. Each call has
+stable coordinates and can execute concurrently; consumers that need batch
+aggregation can correlate calls by step id.
 
 ## 6. Error Hook Semantics
 
 Use this rule:
 
 ```text
-BeforeX     = operation is about to run.
-AfterX      = operation reached that boundary successfully.
+X           = committed lifecycle occurrence; observation only.
+BeforeX     = operation is about to run; the only potentially blocking phase.
+AfterX      = operation produced a successful/normalized result.
 OnXError    = operation failed before reaching AfterX.
-OnScopeError = generic error hook for a scope when no specific OnXError exists.
+OnScopeError = established scope failed where no specific operation hook applies.
 ```
 
-Specific error hooks are useful for construction, shutdown, inference, commit,
-and tool execution:
+The specific operation error hooks in v1 are:
 
 ```go
-OnSessionStartError
-OnSessionStopError
-OnLoopStartError
-OnLoopStopError
-OnTurnStartError
 OnInferenceCallError
+OnCompactionError
+OnToolCallError
 OnStepCommitError
-OnToolExecError
 ```
 
-Generic hooks preserve precision with `FailedAt`:
+`OnSessionError`, `OnLoopError`, and `OnTurnError` are fallbacks. They carry
+`FailedAt` when a meaningful point is known:
 
 ```go
 hook.Event{
-	Point:    hook.OnLoopError,
-	FailedAt: hook.BeforeLoopIdle,
+	Point:    hook.OnTurnError,
+	FailedAt: hook.BeforeTurn,
 	Err:      err,
 }
 ```
 
-Do not add artificial hooks such as `OnSessionActiveError` or
-`OnLoopIdleError`. Active/idle are state transitions. If the transition's event
-publish or quiescence application fails, use the generic scope error.
+An error returned by an error hook is logged; it never recursively invokes
+another error hook. Hook failures are not journal events in v1. Operational
+failures continue through the existing durable domain event paths.
 
 ## 7. Ordering and Failure Policy
 
-For a hook set, functions run in registration order.
+For a hook set, functions run in registration order. Separate points may run
+concurrently across sessions, loops, and parallel tool calls.
 
-Default behavior is `FailureLog`: log the hook error and continue execution.
-This is the right default for metrics, tracing, and audit hooks.
+Default behavior is `FailureLog`: log the hook error and continue execution. This
+is the required policy for occurrence, after, and error hooks and the normal
+policy for metrics, tracing, and audit hooks.
 
-`FailureAbort` lets a before-hook block the operation:
+`FailureAbort` is valid only on `BeforeTurn`, `BeforeInferenceCall`,
+`BeforeCompaction`, and `BeforeToolCall`:
 
 ```go
 rig.WithHooks("policy-v1", hook.Registry{
-	hook.BeforeToolExec: hook.Set{
+	hook.BeforeToolCall: hook.Set{
 		FailurePolicy: hook.FailureAbort,
 		Funcs:         []hook.Func{enforceLocalPolicy},
 	},
@@ -486,70 +550,128 @@ rig.WithHooks("policy-v1", hook.Registry{
 
 Abort rules:
 
-- Only before-hooks can abort the wrapped operation.
-- After-hooks and error-hooks never change the already-computed result.
-- If a before-hook aborts, the matching `AfterX` hook does not fire.
-- The relevant `OnXError` or `OnScopeError` fires with `AbortedByHook: true`.
+- the wrapped operation does not start;
+- the matching `AfterX` hook does not fire;
+- the matching `OnXError`, or `OnTurnError` for `BeforeTurn`, fires with
+  `AbortedByHook: true`;
+- operation-specific code converts the abort into its existing public outcome
+  (`TurnRejected`, compaction rejection, model-visible tool error, or turn
+  failure) rather than inventing a second event protocol.
 
-Hook execution must respect `ctx`. Long-running hooks should return when
-`ctx.Done()` closes.
+Hook execution must respect `ctx`. Long-running hooks must return when
+`ctx.Done()` closes. A hook may call an external classifier, but it must use a
+separate client or pipeline so it cannot recursively invoke the same Harness hook
+path.
 
-## 8. Events vs Hooks
+When a before-hook returns a derived context, the runner passes it to the wrapped
+operation and then to the matching after/error point. This is how an
+OpenTelemetry adapter starts a span before an operation, makes provider/tool
+instrumentation its child, and ends the same span after success or failure.
 
-Events remain authoritative for consumers and persistence. Hooks do not replace
-or alter the event stream.
+## 8. Journal and Event Ordering
 
-Examples:
+Events remain authoritative for persistence, replay, and out-of-process
+observation. Hooks provide synchronous in-process control and rich snapshots; they
+do not replace or alter the event stream.
 
-- `AfterTurnStart` runs near the actor path that commits the initial user
-  message and publishes `TurnStarted`.
-- `AfterInferenceCall` runs after a native loop's provider stream reaches clean
-  EOF and the response snapshot is assembled, before output validation and any
-  durable step commit.
-- `AfterStepCommit` runs after the actor appends the step group and publishes
-  `StepDone`.
-- `AfterToolExec` runs after `InvokableRun` and middleware complete and after
-  the result is normalized into `ToolData`, but before the runner emits
-  `ToolCallCompleted`.
-- `AfterToolBatch` runs after every requested call in the batch has produced a
-  model-visible result and every `ToolCallCompleted` for the batch has been
-  emitted.
+| Hook kind | Journal/live-event ordering | May block? |
+|---|---|---|
+| Lifecycle occurrence (`SessionStart`, `TurnStart`, `StepCommit`) | After the matching event is durably appended and published; restored `SessionStart` follows `RestoreDone` | No |
+| `BeforeTurn` | Before `TurnStarted` append and publish | Yes |
+| `BeforeInferenceCall` | Before provider I/O and before any future inference-start event | Yes |
+| `AfterInferenceCall` | After clean provider completion; before output validation and `StepDone` | No |
+| `BeforeCompaction` | Before `CompactionStarted` and compactor invocation | Yes |
+| `AfterCompaction` | After `CompactionCommitted` is durably appended and published | No |
+| `BeforeToolCall` | Before `ToolCallStarted`, permission, and execution | Yes |
+| `AfterToolCall` | After `ToolCallCompleted` append and publish | No |
+| `OnXError` | After the failure is known; before or after a domain failure event as required by that operation | No |
 
-Prefer hook execution after the corresponding state mutation/event publish when
-the hook name says `After*`, so a hook that observes the session sees the same
-state implied by its name.
+The important invariant is that no hook intended to stop an operation runs after
+a `*Started` event for that operation. Post-operation and lifecycle hooks cannot
+undo state, journal records, provider calls, or tool side effects.
 
-## 9. Examples
+## 9. Integrations and Examples
 
-### 9a. Metrics
+### 9a. Safety and Prompt-Injection Classifiers
+
+Classifiers are not a second Harness pipeline. A consumer may build a composite
+classifier service internally, then invoke it from the hook that owns the relevant
+decision:
+
+- `BeforeToolCall` classifies command safety, arguments, target paths, and whether
+  untrusted content is influencing a side effect;
+- `BeforeInferenceCall` classifies the exact context about to leave the process,
+  including newly admitted tool output, retrieved content, or shell output;
+- `BeforeTurn` classifies input before a durable turn begins.
+
+This keeps classifier implementation, caching, model choice, and policy versioning
+outside Harness while giving it a synchronous enforcement seam. A classifier that
+uses inference must use a separate client and must not recursively call the hooked
+rig.
 
 ```go
 hooks := hook.Registry{
-	hook.AfterTurnEnd: hook.Set{
+	hook.BeforeToolCall: hook.Set{
+		FailurePolicy: hook.FailureAbort,
 		Funcs: []hook.Func{
-			func(ctx context.Context, ev hook.Event) error {
-				turnsCompleted.Add(ctx, 1)
-				if ev.Err != nil {
-					turnFailures.Add(ctx, 1)
+			func(ctx context.Context, ev hook.Event) (context.Context, error) {
+				if ev.Tool == nil {
+					return ctx, nil
 				}
-				return nil
+				if err := classifier.CheckToolCall(ctx, ev.Tool.ToolName, ev.Tool.ArgsJSON); err != nil {
+					return ctx, err
+				}
+				return ctx, nil
 			},
 		},
 	},
 }
 ```
 
-### 9b. Tool Audit
+### 9b. OpenTelemetry
+
+OpenTelemetry is an adapter over hooks, not a separate set of integration points.
+Before-hooks start spans and return the derived context; after/error hooks end and
+annotate them. Lifecycle occurrence hooks add instantaneous events or metrics.
+The durable event stream remains the source for offline reconstruction.
+
+```go
+func startInference(ctx context.Context, ev hook.Event) (context.Context, error) {
+	ctx, _ = tracer.Start(ctx, "harness.inference")
+	return ctx, nil
+}
+
+func endInference(ctx context.Context, ev hook.Event) (context.Context, error) {
+	span := trace.SpanFromContext(ctx)
+	if ev.Err != nil {
+		span.RecordError(ev.Err)
+	}
+	span.End()
+	return ctx, nil
+}
+
+hooks := hook.Registry{
+	hook.BeforeInferenceCall:  {Funcs: []hook.Func{startInference}},
+	hook.AfterInferenceCall:   {Funcs: []hook.Func{endInference}},
+	hook.OnInferenceCallError: {Funcs: []hook.Func{endInference}},
+}
+```
+
+The adapter should use OpenTelemetry semantic-convention attributes where they
+exist and default to the redacted fields in `hook.Event`. Raw prompts, arguments,
+and results are opt-in because they can contain secrets or user data.
+
+### 9c. Tool Audit
 
 ```go
 hooks := hook.Registry{
-	hook.AfterToolExec: hook.Set{
+	hook.AfterToolCall: hook.Set{
 		Funcs: []hook.Func{
-			func(ctx context.Context, ev hook.Event) error {
+			func(ctx context.Context, ev hook.Event) (context.Context, error) {
 				if ev.Tool == nil {
-					return nil
+					return ctx, nil
 				}
-				return audit.Record(ctx, audit.ToolCall{
+				err := audit.Record(ctx, audit.ToolCall{
 					SessionID: ev.Coordinates.SessionID,
 					LoopID:    ev.Coordinates.LoopID,
 					TurnID:    ev.Coordinates.TurnID,
@@ -559,41 +681,23 @@ hooks := hook.Registry{
 					Summary:   ev.Tool.Summary,
 					IsError:   ev.Tool.IsError,
 				})
+				return ctx, err
 			},
 		},
 	},
 }
 ```
-
-### 9c. Abort a Tool
-
-```go
-hooks := hook.Registry{
-	hook.BeforeToolExec: hook.Set{
-		FailurePolicy: hook.FailureAbort,
-		Funcs: []hook.Func{
-			func(ctx context.Context, ev hook.Event) error {
-				if ev.Tool != nil && ev.Tool.ToolName == "Bash" {
-					return errors.New("bash disabled by embedding application")
-				}
-				return nil
-			},
-		},
-	},
-}
-```
-
-The runner converts the abort into a model-visible tool-result error, consistent
-with existing tool execution failures.
 
 ## 10. Implementation Notes
 
 - Add a small internal runner helper in `pkg/hook` that invokes a registry point,
-  applies failure policy, and returns a typed hook error.
+  chains returned contexts, applies failure policy, and returns a typed hook
+  error.
 - Add `rig.WithHooks` as a singleton definition option, include its stable policy
   revision in `event.ConfigManifest`, and thread its cloned registry through
   `internal/sessionruntime.Lifecycle`, the session runtime, native-loop
-  `runtimeConfig`, `turnConfig`, `stepConfig`, and `RunBatch` only where needed.
+  `runtimeConfig`, `turnConfig`, `stepConfig`, the compaction coordinator, and
+  `RunBatch` only where needed.
   Do not thread it through hustle definitions, the hustle runtime, or foreign
   backend internals.
 - Keep hook invocation out of the durable event codec.
@@ -601,6 +705,9 @@ with existing tool execution failures.
   and existing leaf package types.
 - Avoid holding `loopsMu`, `gatesMu`, or actor-owned mutable state while running
   hooks. Build the `hook.Event` snapshot, release locks, then invoke hooks.
+- Invoke lifecycle occurrence hooks only after the corresponding durable append
+  and live publish succeed. Their latency may delay subsequent control flow but
+  cannot change the committed outcome.
 - For parallel tool execution, per-tool hooks run in the goroutine executing that
   tool. The hook runner must be safe for concurrent invocation.
 
@@ -610,14 +717,23 @@ Add focused tests:
 
 - hook point constants are unique;
 - registry validation rejects unknown points/policies, nil functions, and abort
-  policy on non-before points;
-- hooks run in registration order;
+  policy except on the four documented interception points;
+- hooks run in registration order and a returned context reaches the next hook,
+  the wrapped operation, and the matching after/error hook;
+- a nil returned context follows the configured failure policy;
 - `FailureLog` logs and continues;
 - `FailureAbort` on a before-hook prevents the operation and fires the relevant
   error hook;
 - after-hooks do not run when the wrapped operation fails before the boundary;
-- `AfterTurnEnd` fires for `TurnDone`, `TurnFailed`, and `TurnInterrupted`;
+- lifecycle occurrence hooks fire after durable append and live publication, and
+  their errors cannot roll back state;
+- fresh `SessionStart` follows `SessionStarted`, restored `SessionStart` follows
+  `RestoreDone`, and restore does not replay historical `LoopStart` hooks;
+- `BeforeTurn` abort produces no `TurnStarted`, while `TurnStart` fires only after
+  one commits;
+- `TurnEnd` fires for `TurnDone`, `TurnFailed`, and `TurnInterrupted`;
 - `OnStepCommitError` fires when the commit handshake is cancelled;
+- no `StepCommit` fires before `StepDone` commits;
 - `BeforeInferenceCall` receives the exact cloned request and full coordinates;
 - `AfterInferenceCall` fires only after clean EOF and receives independently
   owned response and terminal-metadata snapshots;
@@ -626,14 +742,31 @@ Add focused tests:
 - inference-hook `FailureAbort` prevents `Client.Stream` and releases execution
   admission;
 - hustle `Client.Invoke` calls never fire inference hooks;
-- `AfterToolExec` receives redacted `Summary` and capped `ResultPreview`;
+- `BeforeCompaction` abort prevents `CompactionStarted` and invokes the existing
+  rejection path;
+- `AfterCompaction` fires only after `CompactionCommitted`, while commit failure
+  fires `OnCompactionError` instead;
+- compaction hooks surround the harness compaction boundary but do not fire for
+  the underlying hustle invocation;
+- `BeforeToolCall` fires before `ToolCallStarted`, permission, and execution;
+- a tool-hook abort becomes a model-visible error and preserves the normal tool
+  audit pair;
+- `AfterToolCall` receives redacted `Summary` and capped `ResultPreview` for both
+  successful and normalized error outcomes;
+- exactly one of `AfterToolCall` or `OnToolCallError` follows a non-aborting
+  `BeforeToolCall`;
 - hook registry use is race-clean across sessions, loops, and parallel tool calls;
+- an OpenTelemetry test adapter proves that the span context returned by a before
+  hook is visible to provider/tool instrumentation and the matching terminal hook;
 - hook policy revision changes produce configuration drift and callback identity
   is absent from the manifest.
 
 ## 12. Future Work
 
-Configured task hooks can be built later as an adapter that compiles YAML/JSON
-task declarations into `hook.Func` values. That layer should own command
-execution, sandbox posture, environment templating, stdin JSON, timeouts, and
-redaction. It should not change the core hook API.
+Configured command hooks can be built later as an adapter that compiles YAML/JSON
+declarations into `hook.Func` values. Consumers could then point a hooks file at
+Bash scripts or other executables, but the core remains Go code and never executes
+commands itself. The adapter must own command lookup, sandbox posture, environment
+templating, stdin JSON, exit-code mapping, timeouts, output limits, and redaction.
+It must preserve the same point names and blocking rules rather than creating a
+parallel hook system.
