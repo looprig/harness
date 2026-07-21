@@ -17,7 +17,7 @@ import (
 
 const (
 	harnessModulePath          = "github.com/looprig/harness"
-	extractedForeignloopModule = "github.com/looprig/foreignloop"
+	extractedForeignloopModule = "github.com/looprig/foreignloops"
 	harnessInternalPrefix      = "github.com/looprig/harness/internal"
 	oldForeignloopPackage      = "github.com/looprig/harness/pkg/foreignloop"
 )
@@ -235,9 +235,10 @@ func TestForbiddenForeignloopDependencyClassifierAndParser(t *testing.T) {
 		path string
 		want bool
 	}{
-		{path: "github.com/looprig/foreignloop", want: true},
-		{path: "github.com/looprig/foreignloop/codex", want: true},
-		{path: "github.com/looprig/foreignloopish"},
+		{path: "github.com/looprig/foreignloops", want: true},
+		{path: "github.com/looprig/foreignloops/driver/codex", want: true},
+		{path: "github.com/looprig/foreignloopsish"},
+		{path: "github.com/looprig/foreignloop"},
 		{path: "github.com/looprig/harness/pkg/foreignloop"},
 		{path: "github.com/looprig/core/uuid"},
 	}
@@ -252,8 +253,8 @@ func TestForbiddenForeignloopDependencyClassifierAndParser(t *testing.T) {
 	input := strings.NewReader(strings.Join([]string{
 		"context",
 		"github.com/looprig/core/uuid",
-		"github.com/looprig/foreignloop",
-		"github.com/looprig/foreignloop/claude",
+		"github.com/looprig/foreignloops",
+		"github.com/looprig/foreignloops/driver/claude",
 		"github.com/looprig/harness/pkg/foreignloop",
 	}, "\n"))
 	got, err := forbiddenForeignloopDependencies(input)
@@ -261,8 +262,8 @@ func TestForbiddenForeignloopDependencyClassifierAndParser(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		"github.com/looprig/foreignloop",
-		"github.com/looprig/foreignloop/claude",
+		"github.com/looprig/foreignloops",
+		"github.com/looprig/foreignloops/driver/claude",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("forbiddenForeignloopDependencies() = %v, want %v", got, want)
@@ -290,7 +291,7 @@ func TestForeignPackageImportClassifier(t *testing.T) {
 		{name: "Harness public package", importPath: "github.com/looprig/harness/pkg/event"},
 		{
 			name:       "extracted foreignloop module",
-			importPath: "github.com/looprig/foreignloop/codex",
+			importPath: "github.com/looprig/foreignloops/driver/codex",
 			want:       "imports extracted foreignloop module",
 		},
 		{
@@ -425,11 +426,11 @@ func TestHarnessModuleRootRejectsWrongModule(t *testing.T) {
 func TestHarnessSourceImportBoundaryIncludesBuildTaggedFiles(t *testing.T) {
 	root := t.TempDir()
 	files := map[string]string{
-		"pkg/tagged/foreign_plan9_test.go": "//go:build plan9\n\npackage tagged\nimport _ \"github.com/looprig/foreignloop/codex\"\n",
-		"vendor/ignored/ignored.go":        "package ignored\nimport _ \"github.com/looprig/foreignloop\"\n",
-		".worktrees/ignored/leak.go":       "package ignored\nimport _ \"github.com/looprig/foreignloop\"\n",
+		"pkg/tagged/foreign_plan9_test.go": "//go:build plan9\n\npackage tagged\nimport _ \"github.com/looprig/foreignloops/driver/codex\"\n",
+		"vendor/ignored/ignored.go":        "package ignored\nimport _ \"github.com/looprig/foreignloops\"\n",
+		".worktrees/ignored/leak.go":       "package ignored\nimport _ \"github.com/looprig/foreignloops\"\n",
 		"nested/go.mod":                    "module github.com/example/nested\n",
-		"nested/ignored/leak.go":           "package ignored\nimport _ \"github.com/looprig/foreignloop\"\n",
+		"nested/ignored/leak.go":           "package ignored\nimport _ \"github.com/looprig/foreignloops\"\n",
 	}
 	for rel, contents := range files {
 		path := filepath.Join(root, filepath.FromSlash(rel))
@@ -445,7 +446,7 @@ func TestHarnessSourceImportBoundaryIncludesBuildTaggedFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{`pkg/tagged/foreign_plan9_test.go imports "github.com/looprig/foreignloop/codex"`}
+	want := []string{`pkg/tagged/foreign_plan9_test.go imports "github.com/looprig/foreignloops/driver/codex"`}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("harnessSourceImportViolations() = %v, want %v", got, want)
 	}

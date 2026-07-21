@@ -15,7 +15,7 @@ import (
 )
 
 const foreignloopImportPath = "github.com/looprig/harness/pkg/foreignloop"
-const extractedForeignloopImportPath = "github.com/looprig/foreignloop"
+const extractedForeignloopImportPath = "github.com/looprig/foreignloops"
 const harnessModulePath = "github.com/looprig/harness"
 
 func isForbiddenForeignloopImport(importPath string) bool {
@@ -72,8 +72,8 @@ func TestForeignloopImportBoundaryIncludesTestsBuildTagsAndNestedFiles(t *testin
 	files := map[string]string{
 		"prod.go":                         "package fixture\nimport _ \"github.com/looprig/harness/pkg/foreignloop\"\n",
 		"nested/consumer_test.go":         "package nested\nimport _ \"github.com/looprig/harness/pkg/foreignloop/claude\"\n",
-		"tagged/consumer_plan9_test.go":   "//go:build plan9\n\npackage tagged\nimport _ \"github.com/looprig/foreignloop/backend\"\n",
-		"vendor/ignored/consumer_test.go": "package ignored\nimport _ \"github.com/looprig/foreignloop\"\n",
+		"tagged/consumer_plan9_test.go":   "//go:build plan9\n\npackage tagged\nimport _ \"github.com/looprig/foreignloops/backend\"\n",
+		"vendor/ignored/consumer_test.go": "package ignored\nimport _ \"github.com/looprig/foreignloops\"\n",
 	}
 	for rel, contents := range files {
 		path := filepath.Join(root, filepath.FromSlash(rel))
@@ -92,7 +92,7 @@ func TestForeignloopImportBoundaryIncludesTestsBuildTagsAndNestedFiles(t *testin
 	want := []string{
 		`nested/consumer_test.go imports "github.com/looprig/harness/pkg/foreignloop/claude"`,
 		`prod.go imports "github.com/looprig/harness/pkg/foreignloop"`,
-		`tagged/consumer_plan9_test.go imports "github.com/looprig/foreignloop/backend"`,
+		`tagged/consumer_plan9_test.go imports "github.com/looprig/foreignloops/backend"`,
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("foreignloopImportViolations() = %v, want %v", got, want)
