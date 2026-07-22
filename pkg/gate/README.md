@@ -1,6 +1,6 @@
 # pkg/gate
 
-Package `gate` is the harness's generic access-decision layer. It defines the
+`pkg/gate` is the harness's **generic access-decision layer**. It defines the
 durable domain envelope for human- and policy-resolved gates and the generic
 three-state access evaluator that decides one typed prepared request per tool
 call.
@@ -15,6 +15,33 @@ It is deliberately **generic**. `pkg/gate`:
   harness;
 - does **not** implement a permission-file format — durable rule matching and
   persistence are consumer-provided (`RuleMatcher`, `RuleWriter`).
+
+## What is gate?
+
+A `gate.Evaluator` decides one prepared `tool.Request` per tool call:
+
+- **`Deny`** — the call is not executed; the model sees a paired
+  permission-denied tool result.
+- **`Gated`** — the call needs approval. The whole unmet set is resolved by
+  **one combined prompt** with exactly three actions: `Approve` (once),
+  `Approve always for this workspace` (persists the displayed candidates
+  atomically before any grant is minted), `Deny` (no error; nothing minted).
+- **`Allow`** — the call runs; no grant token is needed from this layer.
+
+Construction explicitly selects the interaction mode:
+
+- `NewInteractiveEvaluator(bindings, matcher, approver, writer, issuer)` —
+  requires both an `Approver` and a durable `RuleWriter`, so all three
+  approval actions are honest.
+- `NewHeadlessEvaluator(bindings, matcher, issuer)` — accepts neither,
+  never prompts, and resolves an unmet gated requirement as a typed
+  approval-required denial (`EvaluationApprovalRequired`).
+
+The package also defines the durable **gate envelope** (`Gate`, `Payload`,
+`GateResponse`, `GateRoute`, `ID`, `Answer`, `CloseReason`) used by every
+kind of host-facing gate — permission, ask-user, form, open-URL — and
+the response routing the session uses to deliver a human's reply back to
+the loop that opened one.
 
 ## Boundary of responsibilities
 
@@ -184,3 +211,20 @@ func Example() {
 	// Output: true
 }
 ```
+
+## Sibling packages
+
+- [`pkg/tool`](../tool/README.md) — `tool.Request`, `tool.Requirement`,
+  `tool.RuleCandidate`, `tool.ValidateRequest`, and the `CallPreparer`
+  boundary that produces the typed request the evaluator consumes.
+- [`pkg/command`](../command/README.md) — `command.ApproveToolCall` /
+  `command.DenyToolCall`, the routed wire forms of an `ApprovalAction`;
+  `ParseApprovalAction` is the single validation source shared by the
+  strict decoder here and the session route.
+- [`pkg/event`](../event/README.md) — `event.PermissionRequested`
+  carries the gate id the session uses to route a reply.
+- [`pkg/loop`](../loop/README.md) — `loop.AccessGate` is the runner's view
+  of an evaluator; `loop.GateApprover` is the `Approver` a live loop
+  passes to interactive construction.
+- `github.com/looprig/sandbox` — satisfies `AccessSource` /
+  `GrantIssuer` with OS confinement. Harness never imports it.
