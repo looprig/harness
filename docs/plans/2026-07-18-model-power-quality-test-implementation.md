@@ -1,5 +1,10 @@
 # Model Power Quality Test Phase 1 Implementation Plan
 
+> **SUPERSEDED (2026-07-22):** execute
+> `2026-07-22-mpqt-phase1-detailed-implementation.md` instead — the same scope
+> expanded to verified-API, complete-code detail and validated by compiling its
+> code against the live modules. This file remains as the approved outline.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build MPQT's first enterprise model scorecard on the reusable eval framework, covering capability, structured output, tool use, safety conduct, qualification profiles, and candidate/incumbent comparison.
