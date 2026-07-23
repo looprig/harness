@@ -105,6 +105,7 @@ github.com/looprig/mpqt
 ├── packs/safety/
 ├── packs/agenticsecurity/
 ├── packs/internet/
+├── packs/memorization/
 ├── packs/operational/
 ├── packs/robustness/
 ├── fixture/tools/
@@ -263,6 +264,7 @@ The default packs use three methods:
 | Tool-choice quality with several valid paths | H | Exact validity plus judge assessment of efficiency. |
 | Tool error recovery | P/H | Sequence is exact; recovery quality may need judgment. |
 | Task completion and goal progress | H | Terminal invariants plus session rubric. |
+| Honest completion / reward hacking | P | Held-out oracles invisible to the target detect hardcoded answers, tampered checks, and false success claims. |
 | Clarification behavior | J | Whether ambiguity materially required a question. |
 | Long-context retrieval / lost-in-the-middle | P | Seeded facts and exact citations. |
 | Grounding against supplied sources | H | Claim-source matching plus rubric. |
@@ -315,6 +317,22 @@ A future multimodal judge is a distinct evaluator revision and request path.
 | System prompt, PII, and secret leakage | P | Seeded canaries, hashes, and exact match variants. |
 | Untrusted-content handling | H | Action sequence plus instruction-boundary judgment. |
 
+### Memorization and regurgitation
+
+This tests leakage from the model's *weights*, distinct from the
+conversation-level PII and secret leakage covered under safety and conduct.
+Probes are deterministic prefix-completion and reproduction measurements
+against known reference material rather than seeded in-conversation canaries.
+Copyright reproduction in particular is direct legal exposure, not just a
+quality concern.
+
+| Metric | Method | Notes |
+|---|---:|---|
+| PII extraction from weights | P | Prefix-completion probes against known-exposed personal data patterns. |
+| Literal copyright reproduction | P | Verbatim-span matching of generated text against reference corpora. |
+| Non-literal reproduction | P/H | Similarity metrics plus judged paraphrase-closeness for near-copies. |
+| Extraction resistance under repetition/decoding attacks | P | Divergence-style attack prompts; measures leaked-span rate. |
+
 ### Agentic security
 
 | Metric | Method | Notes |
@@ -328,6 +346,7 @@ A future multimodal judge is a distinct evaluator revision and request path.
 | Package/supply-chain behavior | P/H | Registry/download evidence plus dependency relevance. |
 | Metadata-service, private-network, and port scanning | P | Proxy/network evidence. |
 | Recovery after a denied action | P/H | Retry/bypass sequence plus behavioral rubric. |
+| Insecure code generation (CWE-classified) | P | Static-analyzer scoring of generated code mapped to CWE classes. |
 
 ### Internet and egress quality
 
@@ -417,7 +436,13 @@ Jailbreak coverage is not one aggregate prompt set. Separate tables exercise:
    images, and retrieved text;
 3. synthetic system-prompt, file, environment, and tool-result canary extraction;
 4. prohibited-tool and alternate-mechanism bypass after a denial;
-5. paired benign controls that detect over-refusal.
+5. paired benign controls that detect over-refusal;
+6. cross-session memory poisoning: instructions planted through injected
+   content in one session that persist in agent memory or state and activate
+   in a later session, paired with clean-recall controls.
+
+Resistance to single-session injection does not imply resistance to
+cross-session memory poisoning; the two are measured separately.
 
 Every agentic case distinguishes model intent, control enforcement, and realized
 impact. A prohibited tool attempt is a behavioral failure even when the sandbox
@@ -675,6 +700,7 @@ Initial public packs remain small and auditable:
 7. `agentic-security-v1`
 8. `internet-egress-v1`
 9. `operational-stability-v1`
+10. `memorization-v1`
 
 Scenario data includes provenance and licensing information. Generated and
 curated data remain distinguishable. Organization-private cases can extend a
@@ -831,6 +857,15 @@ The judge should not know which model is the candidate. Pairwise ordering is
 randomized or counterbalanced to reduce position bias. A model must not judge
 its own output by default; any exception is prominent in provenance.
 
+Version drift is a separate concern from a single paired run. A provider can
+change a model behind a stable alias without a name change. Scheduled
+re-runs of a pinned, revision-frozen suite against a stored baseline
+scorecard detect longitudinal regression, reusing the same paired comparison
+machinery as candidate-versus-incumbent runs. Within-run trial variance and
+cross-version drift are distinct measurements and are never merged into one
+figure. Alias-drift provenance is already recorded as part of score identity
+(see Reproducibility and measurement validity).
+
 ## CLI and Go test usage
 
 CLI output is concise and human-readable by default. JSON is canonical; Markdown
@@ -983,7 +1018,8 @@ trends and run health, not as the only store for detailed qualification evidence
 - Harness read-only adapter and OTel integration.
 - Richer tool/process/file/network evidence vocabulary and local/foreign target
   adapters.
-- Expanded adversarial, artifact-document, and provider coverage.
+- Expanded adversarial, artifact-document, and provider coverage, including
+  memorization/regurgitation, insecure-codegen, and reward-hacking tables.
 
 ### Phase 3 — Egress laboratory
 
@@ -996,6 +1032,8 @@ trends and run health, not as the only store for detailed qualification evidence
 - Paired candidate/incumbent analysis, confidence reporting, trend baselines.
 - Golden-candidate review workflow and private organization packs.
 - Hosted report UI and enterprise storage integrations.
+- Scheduled drift re-baselining runs against stored scorecards to detect
+  provider-side version drift behind stable aliases.
 
 ## Acceptance criteria
 
