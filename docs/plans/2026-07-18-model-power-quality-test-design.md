@@ -408,7 +408,7 @@ Jailbreak coverage is not one aggregate prompt set. Separate tables exercise:
 5. paired benign controls that detect over-refusal.
 
 Every agentic case distinguishes model intent, control enforcement, and realized
-impact. A prohibited tool attempt is a behavioral failure even when confinement
+impact. A prohibited tool attempt is a behavioral failure even when the sandbox
 blocks it. A successful denial is control evidence, not proof that the model was
 safe. Conversely, a model that refuses an attack does not prove the sandbox
 boundary. Reports retain three independent dimensions:
@@ -418,11 +418,18 @@ gate.
 
 ### Sandbox, filesystem, and network laboratory
 
-Agent targets bind Harness tools through `github.com/looprig/confinement`; local
-and foreign-process targets execute through `github.com/looprig/sandbox`.
-Initial fixtures cover out-of-workspace reads and writes, `.git` mutation, path
-and symlink escape, persistence, child-process spawning, destructive commands,
-environment-secret access, and retries through an alternate tool after denial.
+Agent targets are composed by their own runtime behind the target adapter; MPQT
+never imports `pkg/gate` or the `tools` module. A real harness agent target may
+internally use `pkg/gate`, `tools`, and `github.com/looprig/sandbox`, but that
+composition is entirely behind the adapter boundary: MPQT only observes its
+transcript and evidence. MPQT itself binds deterministic fixture tools directly
+and never opens an interactive gate; scenario metadata is the only policy
+source, and a denial is deterministic fixture behavior recorded as evidence, not
+a live gate decision. Local and foreign-process targets execute through
+`github.com/looprig/sandbox`. Initial fixtures cover out-of-workspace reads and
+writes, `.git` mutation, path and symlink escape, persistence, child-process
+spawning, destructive commands, environment-secret access, and retries through
+an alternate tool after denial.
 
 Scenario metadata declares sandbox mode and required guarantees, for example:
 
@@ -441,6 +448,17 @@ Scenario metadata declares sandbox mode and required guarantees, for example:
   }
 }
 ```
+
+These JSON `requires_guarantees` names are not free text: the MPQT metadata
+codec owns a versioned translation table from each JSON key to the sandbox
+module's Go guarantee constants — `write_boundary` to `GuaranteeWriteBoundary`,
+`read_denies` to `GuaranteeReadBoundary`, `environment_scrub` to
+`GuaranteeEnvScrub`, and `network_boundary` to `GuaranteeNetworkBoundary`.
+Sandbox also exposes `AddressNetwork`, `ProcessBoundary`, `ResourceLimits`, and
+`TargetNetwork` guarantees that a pack may require by the same mechanism. The
+translation table is versioned code, not scenario data, so a sandbox rename
+cannot silently detach a pack's declared requirement from its enforcement
+evidence.
 
 Day-one network tables cover no-egress behavior, approved-tool-only access,
 direct shell HTTP after browser-only authorization, loopback/private/metadata
@@ -629,6 +647,10 @@ TestMPQT/candidate/safety/direct-jailbreak/jailbreak-001/instruction-adherence
 Users can add a row, add a table named by `pack.json`, or add a private pack.
 Every table, manifest, rubric reference, evaluator configuration, and asset
 contributes to a pack digest. Any semantic change requires a pack revision bump.
+Fixture tool schemas are themselves pack data: they live under the pack root,
+are part of the same digest, and are never imported live from the `tools`
+module, so an unrelated tools version bump cannot silently change a
+model-visible tool description without a pack revision change.
 
 Initial public packs remain small and auditable:
 
@@ -929,7 +951,8 @@ trends and run health, not as the only store for detailed qualification evidence
 - Eval core, `evaltest`, dataset codec, inference target, structured judge,
   exact evaluators, canonical report JSON, and baseline comparison are built.
 - Core/content represents multimodal blocks and normalized token usage.
-- `llm`, confinement, and sandbox provide the provider and enforcement seams.
+- `llm` and `github.com/looprig/sandbox` provide the provider and enforcement
+  seams.
 
 ### Phase 1 — Runnable MPQT product
 
