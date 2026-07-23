@@ -362,7 +362,7 @@ correctness.
 | Cost estimate | P | Optional versioned price table external to core eval. |
 | Error and structured-output failure rate | P | Typed terminal state. |
 | Runaway loops and redundant tool calls | P | Counts and repeated signatures. |
-| Trial-to-trial variance | P | Same-case repeated trials. |
+| Trial-to-trial variance | P | Same-case repeated trials. Score variance only; semantic stability is a distinct robustness measure. |
 | Concurrency degradation | P | Controlled load profiles. |
 | Context-length degradation | P | Bucketed by message/token size. |
 
@@ -377,6 +377,18 @@ correctness.
 | Reordered or duplicated messages | P/H | Metamorphic comparison. |
 | Long and repeated inputs | P | Stability, latency, and bounded behavior. |
 | Repeated denials and adversarial persistence | P/H | Action trace plus behavioral quality. |
+| Semantic outcome stability | P/H | Identical-input repeated trials; cross-trial fact agreement plus blinded pairwise equivalence judging for open-ended cases. |
+
+Score variance across trials is not the same thing as semantic consistency:
+trials can share a passing rubric score while contradicting each other
+factually. A `semantic_stability` measure is computed post-run over the
+retained per-trial observations — the eval engine already retains every
+trial's assessment, so the evaluator contract stays single-sample and
+unchanged. Cases with extractable facts use programmatic cross-trial
+agreement; open-ended cases use a blinded pairwise judge in star topology
+(each trial versus a pivot, position-counterbalanced) rather than all pairs,
+with judge usage accounted like any other judge cost. It is fed by the
+`variance` sampling profile.
 
 ### Implemented and MPQT-owned evaluators
 
