@@ -349,9 +349,35 @@ adapter maps Harness catalog metadata (`sessionstore.SessionMeta`) to ACP sessio
 information:
 
 - Harness session UUID to `sessionId`;
-- canonical workspace root (`SessionMeta.CurrentWorkspace`) to `cwd`;
 - `SessionMeta.Title` to `title`;
 - `SessionMeta.LastActiveAt` to `updatedAt`.
+
+**Correction (2026-07-25):** an earlier version of this section additionally
+claimed the canonical workspace root (`SessionMeta.CurrentWorkspace`) maps to
+`cwd`. That is factually wrong and was never implemented that way.
+`SessionMeta.CurrentWorkspace` is a `WorkspacePointer` naming a
+content-addressed workspace-*snapshot* digest (`Ref`, `"v1:sha256:<64 hex>"`,
+plus `EventID`/`Seq`/`Source`) — it identifies which immutable snapshot a
+session's workspace was last pointed at, not a live filesystem directory path.
+There is currently no field anywhere on `SessionMeta` that represents a
+session's working-directory string. Because the pinned ACP schema requires
+`SessionInfo.cwd` to be a non-empty absolute path, the ACP module (`acp/agent`)
+resolves `cwd` from two consumer-owned sources instead: `SessionCatalog`'s own
+per-entry `Cwd` field (`SessionCatalogEntry`, `acp/agent/host.go`) when a host
+knows a cold session's working directory, and — always taking priority when
+applicable — the already-validated `Setup.Cwd` of a session currently live in
+the ACP facade's own bounded session registry. A session for which neither
+source yields a cwd is omitted from the `session/list` response entirely
+rather than reported with an empty or fabricated `cwd`. See
+`acp/agent/list.go`'s package doc ("cwd resolution", "Pagination under cwd
+omission") for the full mechanism and its pagination-slot-consumption
+tradeoff, and `acp/agent/host.go`'s `SessionCatalogEntry` doc for the
+contract a host must uphold.
+
+A durable fix — persisting a real per-session cwd inside Harness's own
+`sessionstore.SessionMeta`, so a host would not need to track this mapping
+itself — is a legitimate future Harness-side follow-up. It is out of scope
+for the ACP bridge implementation plan (Harness is read-only there).
 
 ACP pagination cursors remain opaque even if the current Harness catalog returns a
 complete deterministic list. The facade owns bounded page construction and cursor
