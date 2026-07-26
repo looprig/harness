@@ -61,7 +61,8 @@ versions, not the replaces.
 | [`looprig/storage`](https://github.com/looprig/storage) | `Ledger`, `Leaser`, `KV`, `Blobs` leaf contracts + in-memory `memstore` + conformance suite | stdlib only |
 | [`looprig/harness`](https://github.com/looprig/harness) (this module) | the agent runtime: `Rig`, `Session`, `Loop`, `Hub`, `Gate`, `Event`, `Command`, `Tool`, durable journal + restore | `core`, `inference`, `storage`, `eval` |
 | [`looprig/eval`](https://github.com/looprig/eval) | the evaluation framework: conversations, evaluators (`exact`/`judge`), rubrics, reports | `core`, `inference` (judge only) |
-| [`looprig/foreignloops`](https://github.com/looprig/foreignloops) | `codex` and `claude` subprocess backends behind harness's `pkg/foreign` seams | `harness`, `core`, `inference` |
+| [`looprig/foreignloops`](https://github.com/looprig/foreignloops) | `codex`, `claude`, and `acp` (Task 5.2) subprocess/protocol backends behind harness's `pkg/foreign` seams | `harness`, `core`, `inference`, `acp` (`acp/client` only, for `driver/acp`) |
+| [`looprig/acp`](https://github.com/looprig/acp) | Agent Client Protocol bridge, split into a stdlib-only wire layer and one harness-facing facade: `acp/protocol` (generated ACP types + JSON-RPC envelope/errors) and `acp/transport/stdio` (NDJSON framing, subprocess spawn/supervision) have **no** harness or core dependency; `acp/client` drives a foreign ACP agent as a typed connection/session runtime (also harness-free — `foreignloops/driver/acp` is the only thing that turns its output into Harness events); `acp/agent` is the sole package that imports harness's public `session`/`event`/`gate`/`loop`/`identity` contracts (plus `core/content`, `core/uuid`) to expose a harness-backed product as an ACP agent through consumer-owned host interfaces, never importing product code | `acp/protocol`, `acp/transport/stdio`, `acp/client`: stdlib only. `acp/agent` only: `harness` (public pkgs), `core` |
 | [`looprig/tools`](https://github.com/looprig/tools) | `bash`, `web`, and the other standard tool implementations + their `CallPreparer` | `harness` (`pkg/tool`), `sandbox` |
 | [`looprig/sandbox`](https://github.com/looprig/sandbox) | OS access profiles and enforcement; satisfies `gate.AccessSource`/`GrantIssuer` without importing harness | stdlib + OS APIs |
 | [`looprig/mcp`](https://github.com/looprig/mcp) | MCP client and the harness integration that publishes `IntegrationStatus` | `harness`, `core` |
@@ -90,8 +91,18 @@ wired at the consumer's composition root.
   and the `AccessSource`/`GrantIssuer` seams; `looprig/sandbox` satisfies them
   with OS confinement. Harness never imports a sandbox package.
 - **Foreign loops** — `pkg/foreign` exposes `Builder`/`RestoredBuilder` seams
-  so `looprig/foreignloops` can back a loop with the `codex` or `claude` CLI
-  without harness knowing either protocol.
+  so `looprig/foreignloops` can back a loop with the `codex` or `claude` CLI,
+  or (via `foreignloops/driver/acp`) a foreign Agent Client Protocol agent,
+  without harness knowing any of the three protocols.
+- **ACP bridge** — `looprig/acp` is asymmetric by design: its wire layer
+  (`protocol`, `transport/stdio`, `client`) is a stdlib-only ACP
+  implementation usable against any ACP peer with zero harness dependency,
+  and only `acp/agent` crosses into harness's public packages to adapt the
+  protocol onto a real session. Harness itself carries no ACP import in
+  either direction — a harness-backed product depends on `acp/agent` to
+  *be* an ACP agent, and `looprig/foreignloops`'s `driver/acp` depends on
+  `acp/client` to *drive* one, exactly mirroring the existing `pkg/foreign`
+  seam so harness never needs to know the ACP wire format.
 - **Eval** — `pkg/evalmigration` is the build-tagged migration proof that the
   legacy harness eval examples re-express cleanly against `looprig/eval`. New
   evaluation code lives in `looprig/eval`, not here.
