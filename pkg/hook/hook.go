@@ -68,7 +68,9 @@ const (
 type GuardFunc func(context.Context, Call) error
 
 // BeginFunc begins observation of an operation and returns its derived context
-// and optional terminal callback.
+// and optional terminal callback. A returned context may add values or tighter
+// cancellation, but Runner preserves cancellation and deadlines from the input
+// context even if the returned context is detached.
 type BeginFunc func(context.Context, Call) (context.Context, FinishFunc)
 
 // FinishFunc observes the terminal result of an operation.

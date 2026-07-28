@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/inference"
@@ -189,6 +190,183 @@ func TestRunnerOrdersBeginsGuardsAndFinishesWithContextChaining(t *testing.T) {
 	want := []string{"a.begin", "b.begin", "g1", "g2", "operation", "b.finish", "a.finish"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("events = %v, want %v", got, want)
+	}
+}
+
+func TestRunnerDetachedBeginPreservesParentCancellationAndDeadline(t *testing.T) {
+	t.Parallel()
+
+	tests := []Call{
+		{Operation: OperationStep, Step: &StepData{}},
+		validRunnerCall(),
+		{Operation: OperationGateWait, GateWait: &GateWaitData{}},
+		{Operation: OperationToolExecution, ToolExecution: &ToolExecutionData{}},
+	}
+	for _, call := range tests {
+		call := call
+		t.Run(fmt.Sprintf("operation-%d", call.Operation), func(t *testing.T) {
+			t.Parallel()
+
+			valueKey := runnerContextKey("detached-value")
+			parentDeadline := time.Now().Add(time.Hour)
+			parent, cancel := context.WithDeadline(context.Background(), parentDeadline)
+			t.Cleanup(cancel)
+			runner, err := Compile(Set{Around: []Around{{
+				Operation: call.Operation,
+				Begin: func(context.Context, Call) (context.Context, FinishFunc) {
+					return context.WithValue(context.Background(), valueKey, "kept"), nil
+				},
+			}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			got, finish, startErr := runner.Start(parent, call)
+			if startErr != nil {
+				t.Fatal(startErr)
+			}
+			if value := got.Value(valueKey); value != "kept" {
+				t.Fatalf("derived context value = %v, want kept", value)
+			}
+			gotDeadline, ok := got.Deadline()
+			if !ok || !gotDeadline.Equal(parentDeadline) {
+				t.Fatalf("derived deadline = (%v, %v), want (%v, true)", gotDeadline, ok, parentDeadline)
+			}
+
+			cancel()
+			if !errors.Is(got.Err(), context.Canceled) {
+				t.Fatalf("derived context error = %v, want context.Canceled", got.Err())
+			}
+			finish(Result{Call: call, Outcome: OutcomeCompleted})
+		})
+	}
+}
+
+func TestRunnerChainedBeginsPreserveValuesAndCancellationForGuard(t *testing.T) {
+	t.Parallel()
+
+	firstKey := runnerContextKey("first-derived")
+	secondKey := runnerContextKey("second-derived")
+	parent, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	runner, err := Compile(Set{
+		PolicyRevision: "policy-v1",
+		Around: []Around{
+			{
+				Operation: OperationToolCall,
+				Begin: func(context.Context, Call) (context.Context, FinishFunc) {
+					return context.WithValue(context.Background(), firstKey, "first"), nil
+				},
+			},
+			{
+				Operation: OperationToolCall,
+				Begin: func(ctx context.Context, _ Call) (context.Context, FinishFunc) {
+					if got := ctx.Value(firstKey); got != "first" {
+						t.Errorf("second begin first value = %v, want first", got)
+					}
+					cancel()
+					return context.WithValue(ctx, secondKey, "second"), nil
+				},
+			},
+		},
+		Guards: []Guard{{
+			Operation: OperationToolCall,
+			Check: func(ctx context.Context, _ Call) error {
+				if got := ctx.Value(firstKey); got != "first" {
+					t.Errorf("guard first value = %v, want first", got)
+				}
+				if got := ctx.Value(secondKey); got != "second" {
+					t.Errorf("guard second value = %v, want second", got)
+				}
+				if !errors.Is(ctx.Err(), context.Canceled) {
+					t.Errorf("guard context error = %v, want context.Canceled", ctx.Err())
+				}
+				return nil
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, finish, startErr := runner.Start(parent, validRunnerCall())
+	if startErr != nil {
+		t.Fatal(startErr)
+	}
+	if got.Value(firstKey) != "first" || got.Value(secondKey) != "second" {
+		t.Fatalf("returned context lost derived values: first=%v second=%v", got.Value(firstKey), got.Value(secondKey))
+	}
+	if !errors.Is(got.Err(), context.Canceled) {
+		t.Fatalf("returned context error = %v, want context.Canceled", got.Err())
+	}
+	finish(validRunnerResult())
+}
+
+func TestRunnerFinishReleasesDetachedContextWithoutObserverFinish(t *testing.T) {
+	t.Parallel()
+
+	parent, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	runner, err := Compile(Set{Around: []Around{{
+		Operation: OperationToolCall,
+		Begin: func(context.Context, Call) (context.Context, FinishFunc) {
+			return context.Background(), nil
+		},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, finish, startErr := runner.Start(parent, validRunnerCall())
+	if startErr != nil {
+		t.Fatal(startErr)
+	}
+	if got.Done() == nil {
+		t.Fatal("detached returned context has no cleanup signal")
+	}
+	if got.Err() != nil {
+		t.Fatalf("context error before finish = %v, want nil", got.Err())
+	}
+	finish(validRunnerResult())
+	if !errors.Is(got.Err(), context.Canceled) {
+		t.Fatalf("context error after finish = %v, want context.Canceled", got.Err())
+	}
+}
+
+func TestRunnerGuardBlockFinishReleasesDetachedContext(t *testing.T) {
+	t.Parallel()
+
+	parent, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	runner, err := Compile(Set{
+		PolicyRevision: "policy-v1",
+		Around: []Around{{
+			Operation: OperationToolCall,
+			Begin: func(context.Context, Call) (context.Context, FinishFunc) {
+				return context.Background(), nil
+			},
+		}},
+		Guards: []Guard{{
+			Operation: OperationToolCall,
+			Check: func(context.Context, Call) error {
+				return Deny("policy.blocked", "not permitted")
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, finish, startErr := runner.Start(parent, validRunnerCall())
+	if _, denied := AsDenial(startErr); !denied {
+		t.Fatalf("Start() error = %T(%v), want denial", startErr, startErr)
+	}
+	if got.Err() != nil {
+		t.Fatalf("context error before finish = %v, want nil", got.Err())
+	}
+	finish(Result{Call: validRunnerCall(), Outcome: OutcomeDenied, Err: startErr})
+	if !errors.Is(got.Err(), context.Canceled) {
+		t.Fatalf("context error after denied finish = %v, want context.Canceled", got.Err())
 	}
 }
 
@@ -500,6 +678,30 @@ func TestRunnerFinishRunsOnce(t *testing.T) {
 	callers.Wait()
 	if got := count.Load(); got != 1 {
 		t.Fatalf("finish calls = %d, want 1", got)
+	}
+}
+
+func TestAggregateFinishReleasesResourcesOnceConcurrentlyWithoutObservers(t *testing.T) {
+	t.Parallel()
+
+	var releases atomic.Int32
+	finish := aggregateFinish(
+		OperationToolCall,
+		nil,
+		[]func(){func() { releases.Add(1) }},
+	)
+
+	var callers sync.WaitGroup
+	for range 20 {
+		callers.Add(1)
+		go func() {
+			defer callers.Done()
+			finish(validRunnerResult())
+		}()
+	}
+	callers.Wait()
+	if got := releases.Load(); got != 1 {
+		t.Fatalf("resource releases = %d, want 1", got)
 	}
 }
 

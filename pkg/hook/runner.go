@@ -23,6 +23,28 @@ type registeredFinish struct {
 	finish FinishFunc
 }
 
+type parentPreservingContext struct {
+	context.Context
+	parent context.Context
+	cancel context.CancelCauseFunc
+}
+
+func (c *parentPreservingContext) Done() <-chan struct{} {
+	c.syncParentCancellation()
+	return c.Context.Done()
+}
+
+func (c *parentPreservingContext) Err() error {
+	c.syncParentCancellation()
+	return c.Context.Err()
+}
+
+func (c *parentPreservingContext) syncParentCancellation() {
+	if c.parent.Err() != nil {
+		c.cancel(context.Cause(c.parent))
+	}
+}
+
 // Compile validates a hook set and takes independent ownership of its
 // registration slices.
 func Compile(set Set) (*Runner, error) {
@@ -46,8 +68,13 @@ func Compile(set Set) (*Runner, error) {
 // returned as *GuardError.
 //
 // The returned FinishFunc runs completed observers in reverse registration
-// order exactly once, including when a guard blocks. The caller must supply a
-// valid Result for the same operation with a valid terminal Outcome.
+// order exactly once, including when a guard blocks. Every non-nil context
+// returned by Begin keeps its values and tighter cancellation while also
+// preserving cancellation and deadlines from the previous context. Calling
+// Finish releases the resources used to bridge detached contexts, even when no
+// observer returned its own finish callback. The caller must therefore always
+// invoke Finish and supply a valid Result for the same operation with a valid
+// terminal Outcome.
 func (r *Runner) Start(
 	ctx context.Context,
 	call Call,
@@ -64,6 +91,7 @@ func (r *Runner) Start(
 	snapshot := CloneCall(call)
 
 	finishes := make([]registeredFinish, 0, len(r.around))
+	releases := make([]func(), 0, len(r.around))
 	for index, around := range r.around {
 		if around.Operation != snapshot.Operation {
 			continue
@@ -76,6 +104,11 @@ func (r *Runner) Start(
 		if next == nil {
 			logObservationFailure("hook: begin callback returned nil context", snapshot.Operation, index)
 		} else {
+			var release func()
+			next, release = preserveParentCancellation(ctx, next)
+			if release != nil {
+				releases = append(releases, release)
+			}
 			ctx = next
 		}
 		if finish != nil {
@@ -83,11 +116,12 @@ func (r *Runner) Start(
 		}
 	}
 
-	finish := aggregateFinish(snapshot.Operation, finishes)
+	finish := aggregateFinish(snapshot.Operation, finishes, releases)
 	for index, guard := range r.guards {
 		if guard.Operation != snapshot.Operation {
 			continue
 		}
+		syncParentCancellation(ctx)
 		err, panicked := checkGuard(ctx, snapshot, guard.Check)
 		if panicked {
 			return ctx, finish, &GuardError{
@@ -188,6 +222,7 @@ func checkGuard(
 func aggregateFinish(
 	operation Operation,
 	finishes []registeredFinish,
+	releases []func(),
 ) FinishFunc {
 	var once sync.Once
 	return func(result Result) {
@@ -202,7 +237,63 @@ func aggregateFinish(
 					)
 				}
 			}
+			for index := len(releases) - 1; index >= 0; index-- {
+				releases[index]()
+			}
 		})
+	}
+}
+
+func preserveParentCancellation(
+	parent context.Context,
+	next context.Context,
+) (context.Context, func()) {
+	syncParentCancellation(parent)
+	if parent.Done() == nil || parent.Done() == next.Done() {
+		return next, nil
+	}
+
+	cancelContext, cancel := context.WithCancelCause(next)
+	linked := context.Context(cancelContext)
+	deadlineCancel := func() {}
+	if deadline, ok := parent.Deadline(); ok {
+		linked, deadlineCancel = context.WithDeadlineCause(
+			linked,
+			deadline,
+			context.DeadlineExceeded,
+		)
+	}
+	linked = &parentPreservingContext{
+		Context: linked,
+		parent:  parent,
+		cancel:  cancel,
+	}
+
+	var stopParent func() bool
+	if parent.Err() != nil {
+		cancel(context.Cause(parent))
+	} else {
+		stopParent = context.AfterFunc(parent, func() {
+			cancel(context.Cause(parent))
+		})
+	}
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			if stopParent != nil {
+				stopParent()
+			}
+			deadlineCancel()
+			cancel(context.Canceled)
+		})
+	}
+	return linked, release
+}
+
+func syncParentCancellation(ctx context.Context) {
+	if linked, ok := ctx.(*parentPreservingContext); ok {
+		linked.syncParentCancellation()
 	}
 }
 
