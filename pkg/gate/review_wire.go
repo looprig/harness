@@ -205,6 +205,9 @@ func permissionReviewCommonSubjectDigest(
 }
 
 func permissionReviewSubjectDigest(subject PermissionReviewSubject) ([32]byte, error) {
+	if reason := permissionReviewBasisPreflightReason(subject.Basis); reason != "" {
+		return [32]byte{}, reviewSubjectError(ReviewValidationFieldBasis, reason)
+	}
 	if reason := permissionReviewRequestPreflightReason(subject.Request); reason != "" {
 		return [32]byte{}, reviewSubjectError(ReviewValidationFieldRequest, reason)
 	}
@@ -463,6 +466,14 @@ func validatePermissionReviewWireShape(
 		"security_ceiling",
 	); err != nil {
 		return err
+	}
+	if reason := permissionReviewBasisIdentityPreflightReason(
+		wire.Basis.ContextRevision,
+		wire.Basis.GatePolicyRevision,
+		wire.Basis.ClassifierRevision,
+		wire.Basis.SecurityCeiling,
+	); reason != "" {
+		return reviewSubjectError(ReviewValidationFieldBasis, reason)
 	}
 	request, err := requireReviewWireObject(root["request"], []string{
 		"tool_name", "summary", "execution_id", "command", "working_directory",

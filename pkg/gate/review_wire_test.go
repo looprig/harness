@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strconv"
 	"strings"
@@ -476,6 +477,54 @@ func TestReviewSubjectDigestKnownFixture(t *testing.T) {
 	const want = "d3143d47f3e68cd386b0e28d7d701633feec42651cce18bea8237b06b90d0e08"
 	if got := hex.EncodeToString(subject.Basis.SubjectDigest[:]); got != want {
 		t.Fatalf("digest = %s, want %s", got, want)
+	}
+}
+
+func TestPermissionReviewSubjectWireRejectsOversizedBasisRevision(t *testing.T) {
+	t.Parallel()
+
+	subject := validPermissionReviewSubject(t)
+	data, err := marshalPermissionReviewSubject(subject)
+	if err != nil {
+		t.Fatalf("marshalPermissionReviewSubject() error = %v", err)
+	}
+
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "classifier revision",
+			data: replaceWire(
+				data,
+				subject.Basis.ClassifierRevision,
+				strings.Repeat("c", MaxPermissionClassifierRevisionBytes+1),
+			),
+		},
+		{
+			name: "gate policy revision",
+			data: bytes.ReplaceAll(
+				data,
+				[]byte(subject.Basis.GatePolicyRevision),
+				[]byte(strings.Repeat("p", MaxPermissionReviewPolicyRevisionBytes+1)),
+			),
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := unmarshalPermissionReviewSubject(tt.data)
+			if err == nil || !reflect.DeepEqual(got, PermissionReviewSubject{}) {
+				t.Fatalf("unmarshalPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+			}
+			var validationErr *ReviewValidationError
+			if !errors.As(err, &validationErr) ||
+				validationErr.Field != ReviewValidationFieldBasis ||
+				validationErr.Reason != ReviewValidationOutOfBounds {
+				t.Fatalf("error = %#v, want bounded basis out-of-bounds", err)
+			}
+		})
 	}
 }
 

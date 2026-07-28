@@ -54,6 +54,12 @@ func NewPermissionReviewSubject(
 	request tool.Request,
 	context ReviewContext,
 ) (PermissionReviewSubject, error) {
+	if reason := permissionReviewBasisPreflightReason(basis); reason != "" {
+		return PermissionReviewSubject{}, reviewSubjectError(
+			ReviewValidationFieldBasis,
+			reason,
+		)
+	}
 	if basis.SubjectDigest != ([32]byte{}) {
 		return PermissionReviewSubject{}, reviewSubjectError(
 			ReviewValidationFieldDigest,
@@ -105,21 +111,8 @@ func SubjectDigest(subject PermissionReviewSubject) ([32]byte, error) {
 
 func validatePermissionReviewSubject(subject PermissionReviewSubject) error {
 	basis := subject.Basis
-	if basis.GateID.IsZero() || basis.ToolExecutionID.IsZero() {
-		return reviewSubjectError(ReviewValidationFieldBasis, ReviewValidationRequired)
-	}
-	for _, value := range []string{
-		basis.ContextRevision,
-		basis.GatePolicyRevision,
-		basis.ClassifierRevision,
-		basis.SecurityCeiling,
-	} {
-		if value == "" {
-			return reviewSubjectError(ReviewValidationFieldBasis, ReviewValidationRequired)
-		}
-		if !utf8.ValidString(value) {
-			return reviewSubjectError(ReviewValidationFieldBasis, ReviewValidationInvalid)
-		}
+	if reason := permissionReviewBasisPreflightReason(basis); reason != "" {
+		return reviewSubjectError(ReviewValidationFieldBasis, reason)
 	}
 	if reason := permissionReviewRequestPreflightReason(subject.Request); reason != "" {
 		return reviewSubjectError(ReviewValidationFieldRequest, reason)
@@ -144,6 +137,46 @@ func validatePermissionReviewSubject(subject PermissionReviewSubject) error {
 		return reviewSubjectError(ReviewValidationFieldBasis, ReviewValidationMismatch)
 	}
 	return nil
+}
+
+func permissionReviewBasisPreflightReason(basis ReviewBasis) ReviewValidationReason {
+	if basis.GateID.IsZero() || basis.ToolExecutionID.IsZero() {
+		return ReviewValidationRequired
+	}
+	return permissionReviewBasisIdentityPreflightReason(
+		basis.ContextRevision,
+		basis.GatePolicyRevision,
+		basis.ClassifierRevision,
+		basis.SecurityCeiling,
+	)
+}
+
+func permissionReviewBasisIdentityPreflightReason(
+	contextRevision string,
+	gatePolicyRevision string,
+	classifierRevision string,
+	securityCeiling string,
+) ReviewValidationReason {
+	for _, value := range [...]string{
+		contextRevision,
+		gatePolicyRevision,
+		classifierRevision,
+		securityCeiling,
+	} {
+		if value == "" {
+			return ReviewValidationRequired
+		}
+		if !utf8.ValidString(value) {
+			return ReviewValidationInvalid
+		}
+	}
+	if len(classifierRevision) > MaxPermissionClassifierRevisionBytes ||
+		len(gatePolicyRevision) > MaxPermissionReviewPolicyRevisionBytes ||
+		len(contextRevision) > MaxReviewContextRootFieldBytes ||
+		len(securityCeiling) > MaxReviewContextRootFieldBytes {
+		return ReviewValidationOutOfBounds
+	}
+	return ""
 }
 
 func permissionReviewRequestPreflightReason(request tool.Request) ReviewValidationReason {

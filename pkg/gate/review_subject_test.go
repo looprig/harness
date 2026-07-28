@@ -91,6 +91,74 @@ func TestPermissionReviewSubjectRejectsInvalidBasisAndRequest(t *testing.T) {
 	}
 }
 
+func TestPermissionReviewSubjectBasisRevisionByteBounds(t *testing.T) {
+	t.Parallel()
+
+	classifierExact := strings.Repeat("é", gate.MaxPermissionClassifierRevisionBytes/2)
+	classifierOneOver := classifierExact + "x"
+	policyExact := strings.Repeat("é", gate.MaxPermissionReviewPolicyRevisionBytes/2)
+	policyOneOver := policyExact + "x"
+	if len(classifierExact) != gate.MaxPermissionClassifierRevisionBytes ||
+		len(classifierOneOver) != gate.MaxPermissionClassifierRevisionBytes+1 ||
+		len(policyExact) != gate.MaxPermissionReviewPolicyRevisionBytes ||
+		len(policyOneOver) != gate.MaxPermissionReviewPolicyRevisionBytes+1 {
+		t.Fatal("test fixture does not exercise exact byte bounds")
+	}
+
+	tests := []struct {
+		name    string
+		exact   string
+		oneOver string
+		set     func(*gate.ReviewBasis, *gate.ReviewContext, string)
+	}{
+		{
+			name:    "classifier revision",
+			exact:   classifierExact,
+			oneOver: classifierOneOver,
+			set: func(basis *gate.ReviewBasis, _ *gate.ReviewContext, value string) {
+				basis.ClassifierRevision = value
+			},
+		},
+		{
+			name:    "gate policy revision",
+			exact:   policyExact,
+			oneOver: policyOneOver,
+			set: func(basis *gate.ReviewBasis, context *gate.ReviewContext, value string) {
+				basis.GatePolicyRevision = value
+				context.GatePolicyRevision = value
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			basis, request, context := validPermissionReviewSubjectInput()
+			tt.set(&basis, &context, tt.exact)
+			if _, err := gate.NewPermissionReviewSubject(basis, request, context); err != nil {
+				t.Fatalf("NewPermissionReviewSubject(exact) error = %v", err)
+			}
+
+			basis, request, context = validPermissionReviewSubjectInput()
+			tt.set(&basis, &context, tt.oneOver)
+			got, err := gate.NewPermissionReviewSubject(basis, request, context)
+			if err == nil || !reflect.DeepEqual(got, gate.PermissionReviewSubject{}) {
+				t.Fatalf("NewPermissionReviewSubject(one over) = (%#v, %v), want zero, error", got, err)
+			}
+			if strings.Contains(err.Error(), tt.oneOver) || len(err.Error()) > 128 {
+				t.Fatalf("error = %q, want bounded and non-echoing", err)
+			}
+			digest, digestErr := gate.SubjectDigest(gate.PermissionReviewSubject{
+				Basis: basis, Request: request, Context: context,
+			})
+			if digestErr == nil || digest != ([32]byte{}) {
+				t.Fatalf("SubjectDigest(one over) = (%x, %v), want zero, error", digest, digestErr)
+			}
+		})
+	}
+}
+
 func TestPermissionReviewSubjectRejectsInvalidUTF8InEverySerializedRequestString(t *testing.T) {
 	t.Parallel()
 	invalid := string([]byte{0xff})
@@ -682,7 +750,7 @@ func TestPermissionReviewSubjectAcceptsBuilderExactInputBoundWithDistinctPolicyR
 	t.Parallel()
 
 	basis, request, input := validPermissionReviewSubjectInput()
-	input.GatePolicyRevision = strings.Repeat("g", gate.MaxReviewContextRootFieldBytes)
+	input.GatePolicyRevision = strings.Repeat("g", gate.MaxPermissionReviewPolicyRevisionBytes)
 	basis.GatePolicyRevision = input.GatePolicyRevision
 	policy := gate.ReviewContextPolicy{
 		Revision:             "r",
@@ -744,45 +812,59 @@ func TestPermissionReviewSubjectEnforcesEveryContextRootFieldHardBound(t *testin
 
 	type rootMutation func(*gate.ReviewBasis, *gate.ReviewContext, int)
 	tests := []struct {
-		name   string
-		mutate rootMutation
+		name      string
+		limit     int
+		wantField gate.ReviewValidationField
+		mutate    rootMutation
 	}{
 		{
-			name: "context revision",
+			name:      "context revision",
+			limit:     gate.MaxReviewContextRootFieldBytes,
+			wantField: gate.ReviewValidationFieldBasis,
 			mutate: func(basis *gate.ReviewBasis, context *gate.ReviewContext, size int) {
 				context.ContextRevision = strings.Repeat("r", size)
 				basis.ContextRevision = context.ContextRevision
 			},
 		},
 		{
-			name: "workspace root",
+			name:      "workspace root",
+			limit:     gate.MaxReviewContextRootFieldBytes,
+			wantField: gate.ReviewValidationFieldContext,
 			mutate: func(_ *gate.ReviewBasis, context *gate.ReviewContext, size int) {
 				context.WorkspaceRoot = "/" + strings.Repeat("w", size-1)
 				context.WorkingDirectory = context.WorkspaceRoot
 			},
 		},
 		{
-			name: "working directory",
+			name:      "working directory",
+			limit:     gate.MaxReviewContextRootFieldBytes,
+			wantField: gate.ReviewValidationFieldContext,
 			mutate: func(_ *gate.ReviewBasis, context *gate.ReviewContext, size int) {
 				context.WorkingDirectory = context.WorkspaceRoot + "/" +
 					strings.Repeat("w", size-len(context.WorkspaceRoot)-1)
 			},
 		},
 		{
-			name: "retry reason",
+			name:      "retry reason",
+			limit:     gate.MaxReviewContextRootFieldBytes,
+			wantField: gate.ReviewValidationFieldContext,
 			mutate: func(_ *gate.ReviewBasis, context *gate.ReviewContext, size int) {
 				context.RetryReason = strings.Repeat("r", size)
 			},
 		},
 		{
-			name: "security ceiling",
+			name:      "security ceiling",
+			limit:     gate.MaxReviewContextRootFieldBytes,
+			wantField: gate.ReviewValidationFieldBasis,
 			mutate: func(basis *gate.ReviewBasis, context *gate.ReviewContext, size int) {
 				context.SecurityCeiling = strings.Repeat("s", size)
 				basis.SecurityCeiling = context.SecurityCeiling
 			},
 		},
 		{
-			name: "gate policy revision",
+			name:      "gate policy revision",
+			limit:     gate.MaxPermissionReviewPolicyRevisionBytes,
+			wantField: gate.ReviewValidationFieldBasis,
 			mutate: func(basis *gate.ReviewBasis, context *gate.ReviewContext, size int) {
 				context.GatePolicyRevision = strings.Repeat("g", size)
 				basis.GatePolicyRevision = context.GatePolicyRevision
@@ -793,13 +875,13 @@ func TestPermissionReviewSubjectEnforcesEveryContextRootFieldHardBound(t *testin
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			basis, request, context := validPermissionReviewSubjectInput()
-			tt.mutate(&basis, &context, gate.MaxReviewContextRootFieldBytes)
+			tt.mutate(&basis, &context, tt.limit)
 			if _, err := gate.NewPermissionReviewSubject(basis, request, context); err != nil {
 				t.Fatalf("NewPermissionReviewSubject(exact bound) error = %v", err)
 			}
 
 			basis, request, context = validPermissionReviewSubjectInput()
-			tt.mutate(&basis, &context, gate.MaxReviewContextRootFieldBytes+1)
+			tt.mutate(&basis, &context, tt.limit+1)
 			got, err := gate.NewPermissionReviewSubject(basis, request, context)
 			if err == nil || !reflect.DeepEqual(got, gate.PermissionReviewSubject{}) {
 				t.Fatalf(
@@ -810,9 +892,13 @@ func TestPermissionReviewSubjectEnforcesEveryContextRootFieldHardBound(t *testin
 			}
 			var validationErr *gate.ReviewValidationError
 			if !errors.As(err, &validationErr) ||
-				validationErr.Field != gate.ReviewValidationFieldContext ||
+				validationErr.Field != tt.wantField ||
 				validationErr.Reason != gate.ReviewValidationOutOfBounds {
-				t.Fatalf("error = %#v, want context out_of_bounds", validationErr)
+				t.Fatalf(
+					"error = %#v, want %s out_of_bounds",
+					validationErr,
+					tt.wantField,
+				)
 			}
 		})
 	}

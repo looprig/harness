@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"errors"
 	"math"
 	"strings"
 	"testing"
@@ -240,6 +241,121 @@ func TestPermissionReviewTypedEncodingPathsPreflightBeforeProjection(t *testing.
 	}
 	if data, err := marshalPermissionReviewSubject(subject); err == nil || data != nil {
 		t.Fatalf("marshalPermissionReviewSubject() = (%q, %v), want nil, error", data, err)
+	}
+}
+
+func TestPermissionReviewBasisPreflightRunsBeforeCloneAndProjection(t *testing.T) {
+	base := validPermissionReviewSubject(t)
+	request := base.Request
+	request.Requirements = make(
+		[]tool.Requirement,
+		MaxPermissionReviewRequestRequirements+1,
+	)
+	context := base.Context
+	context.Entries = make(
+		[]ReviewContextEntry,
+		MaxReviewContextInputEntries+1,
+	)
+
+	tests := []struct {
+		name   string
+		mutate func(*ReviewBasis)
+	}{
+		{
+			name: "classifier revision",
+			mutate: func(basis *ReviewBasis) {
+				basis.ClassifierRevision = strings.Repeat(
+					"x",
+					MaxPermissionClassifierRevisionBytes+1,
+				)
+			},
+		},
+		{
+			name: "gate policy revision",
+			mutate: func(basis *ReviewBasis) {
+				basis.GatePolicyRevision = strings.Repeat(
+					"x",
+					MaxPermissionReviewPolicyRevisionBytes+1,
+				)
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			basis := base.Basis
+			basis.SubjectDigest = [32]byte{}
+			tt.mutate(&basis)
+			subject := PermissionReviewSubject{
+				Basis: basis, Request: request, Context: context,
+			}
+
+			assertBasisError := func(err error) {
+				t.Helper()
+				var validationErr *ReviewValidationError
+				if !errors.As(err, &validationErr) ||
+					validationErr.Field != ReviewValidationFieldBasis ||
+					validationErr.Reason != ReviewValidationOutOfBounds {
+					t.Fatalf("error = %#v, want bounded basis out-of-bounds", err)
+				}
+			}
+			if got, err := NewPermissionReviewSubject(basis, request, context); err == nil ||
+				got.Basis != (ReviewBasis{}) ||
+				got.Request.ToolName != "" ||
+				len(got.Context.Entries) != 0 {
+				t.Fatalf("NewPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+			} else {
+				assertBasisError(err)
+			}
+			if digest, err := SubjectDigest(subject); err == nil || digest != ([32]byte{}) {
+				t.Fatalf("SubjectDigest() = (%x, %v), want zero, error", digest, err)
+			} else {
+				assertBasisError(err)
+			}
+			if digest, err := permissionReviewSubjectDigest(subject); err == nil ||
+				digest != ([32]byte{}) {
+				t.Fatalf("permissionReviewSubjectDigest() = (%x, %v), want zero, error", digest, err)
+			} else {
+				assertBasisError(err)
+			}
+			if digest, err := permissionReviewCommonSubjectDigest(subject); err == nil ||
+				digest != ([32]byte{}) {
+				t.Fatalf("permissionReviewCommonSubjectDigest() = (%x, %v), want zero, error", digest, err)
+			} else {
+				assertBasisError(err)
+			}
+			if data, err := marshalPermissionReviewSubject(subject); err == nil || data != nil {
+				t.Fatalf("marshalPermissionReviewSubject() = (%q, %v), want nil, error", data, err)
+			} else {
+				assertBasisError(err)
+			}
+
+			allocations := testing.AllocsPerRun(100, func() {
+				if _, err := NewPermissionReviewSubject(basis, request, context); err == nil {
+					panic("oversized basis unexpectedly accepted")
+				}
+			})
+			if allocations > 1 {
+				t.Fatalf(
+					"NewPermissionReviewSubject() allocations = %f, want at most one validation error allocation",
+					allocations,
+				)
+			}
+		})
+	}
+}
+
+func TestPermissionReviewBasisPreflightIsAllocationFree(t *testing.T) {
+	basis := validPermissionReviewSubject(t).Basis
+	if reason := permissionReviewBasisPreflightReason(basis); reason != "" {
+		t.Fatalf("permissionReviewBasisPreflightReason() = %q, want empty", reason)
+	}
+	if allocations := testing.AllocsPerRun(100, func() {
+		if reason := permissionReviewBasisPreflightReason(basis); reason != "" {
+			panic("basis preflight unexpectedly rejected fixed basis")
+		}
+	}); allocations != 0 {
+		t.Fatalf("basis preflight allocations = %f, want 0", allocations)
 	}
 }
 
