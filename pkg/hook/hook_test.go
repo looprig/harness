@@ -213,15 +213,15 @@ func TestValidateCallRequiresOneMatchingPayload(t *testing.T) {
 	tests := []struct {
 		name string
 		call Call
-		kind ConfigErrorKind
+		kind CallErrorKind
 	}{
-		{name: "unknown operation", call: Call{Operation: 99, Turn: &TurnData{}}, kind: ConfigUnknownOperation},
-		{name: "no payload", call: Call{Operation: OperationTurn}, kind: ConfigInvalidCall},
-		{name: "mismatched payload", call: Call{Operation: OperationTurn, Step: &StepData{}}, kind: ConfigInvalidCall},
+		{name: "unknown operation", call: Call{Operation: 99, Turn: &TurnData{}}, kind: CallUnknownOperation},
+		{name: "no payload", call: Call{Operation: OperationTurn}, kind: CallInvalidPayload},
+		{name: "mismatched payload", call: Call{Operation: OperationTurn, Step: &StepData{}}, kind: CallInvalidPayload},
 		{
 			name: "matching plus extra payload",
 			call: Call{Operation: OperationTurn, Turn: &TurnData{}, Step: &StepData{}},
-			kind: ConfigInvalidCall,
+			kind: CallInvalidPayload,
 		},
 	}
 	for _, test := range tests {
@@ -229,12 +229,16 @@ func TestValidateCallRequiresOneMatchingPayload(t *testing.T) {
 			t.Parallel()
 
 			err := ValidateCall(test.call)
-			var configErr *ConfigError
-			if !errors.As(err, &configErr) {
-				t.Fatalf("ValidateCall() error = %T, want *ConfigError", err)
+			var callErr *CallError
+			if !errors.As(err, &callErr) {
+				t.Fatalf("ValidateCall() error = %T, want *CallError", err)
 			}
-			if configErr.Kind != test.kind {
-				t.Fatalf("ConfigError.Kind = %q, want %q", configErr.Kind, test.kind)
+			if callErr.Kind != test.kind {
+				t.Fatalf("CallError.Kind = %q, want %q", callErr.Kind, test.kind)
+			}
+			var configErr *ConfigError
+			if errors.As(err, &configErr) {
+				t.Fatal("ValidateCall() exposed malformed runtime data as *ConfigError")
 			}
 		})
 	}

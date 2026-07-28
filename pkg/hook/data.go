@@ -102,7 +102,7 @@ type JournalAppendData struct {
 // ValidateCall validates the closed operation-payload union.
 func ValidateCall(call Call) error {
 	if !call.Operation.Valid() {
-		return &ConfigError{Kind: ConfigUnknownOperation, Operation: call.Operation, Field: "call"}
+		return &CallError{Kind: CallUnknownOperation, Operation: call.Operation}
 	}
 
 	payloads := 0
@@ -115,7 +115,7 @@ func ValidateCall(call Call) error {
 	payloads += boolInt(call.ToolExecution != nil)
 	payloads += boolInt(call.JournalAppend != nil)
 	if payloads != 1 || !call.payloadMatchesOperation() {
-		return &ConfigError{Kind: ConfigInvalidCall, Operation: call.Operation, Field: "payload"}
+		return &CallError{Kind: CallInvalidPayload, Operation: call.Operation}
 	}
 	return nil
 }

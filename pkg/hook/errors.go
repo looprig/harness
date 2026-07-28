@@ -22,7 +22,6 @@ const (
 	ConfigNilAround                ConfigErrorKind = "nil_around"
 	ConfigMissingPolicyRevision    ConfigErrorKind = "missing_policy_revision"
 	ConfigUnexpectedPolicyRevision ConfigErrorKind = "unexpected_policy_revision"
-	ConfigInvalidCall              ConfigErrorKind = "invalid_call"
 	ConfigInvalidDenial            ConfigErrorKind = "invalid_denial"
 )
 
@@ -43,6 +42,24 @@ func (e *ConfigError) Error() string {
 		message += fmt.Sprintf(" for operation %d", e.Operation)
 	}
 	return message
+}
+
+// CallErrorKind identifies a malformed operation call snapshot.
+type CallErrorKind string
+
+const (
+	CallUnknownOperation CallErrorKind = "unknown_operation"
+	CallInvalidPayload   CallErrorKind = "invalid_payload"
+)
+
+// CallError reports a malformed runtime operation snapshot.
+type CallError struct {
+	Kind      CallErrorKind
+	Operation Operation
+}
+
+func (e *CallError) Error() string {
+	return fmt.Sprintf("hook: invalid call: %s for operation %d", e.Kind, e.Operation)
 }
 
 // Denial is an intentional, bounded guard refusal.
