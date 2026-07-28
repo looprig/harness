@@ -36,6 +36,11 @@ var (
 	_ Event = IntegrationStatus{}
 
 	// Loop-scoped events.
+	_ Event = ProcessStarted{}
+	_ Event = ProcessBackgrounded{}
+	_ Event = ProcessCompleted{}
+	_ Event = ProcessStopRequested{}
+	_ Event = ProcessLost{}
 	_ Event = LoopIdle{}
 	_ Event = LoopStarted{}
 	_ Event = DelegateRequestAccepted{}

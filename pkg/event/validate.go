@@ -10,6 +10,7 @@ import (
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/tool"
 	model "github.com/looprig/inference/model"
 )
 
@@ -76,6 +77,7 @@ const (
 	FieldActor              FieldName = "Actor"
 	FieldGeneration         FieldName = "Generation"
 	FieldTools              FieldName = "Tools"
+	FieldProcess            FieldName = "Process"
 	FieldGateID             FieldName = "GateID"
 	FieldClassifier         FieldName = "Classifier"
 	FieldClassifierRevision FieldName = "ClassifierRevision"
@@ -282,6 +284,16 @@ func validateEventBody(ev Event) error {
 		return validatePermissionReviewStarted(e)
 	case PermissionReviewCompleted:
 		return validatePermissionReviewCompleted(e)
+	case ProcessStarted:
+		return validateProcessLifecycleEvent("ProcessStarted", e.Header, e.Process, tool.ProcessLifecycleStarted)
+	case ProcessBackgrounded:
+		return validateProcessLifecycleEvent("ProcessBackgrounded", e.Header, e.Process, tool.ProcessLifecycleBackgrounded)
+	case ProcessCompleted:
+		return validateProcessLifecycleEvent("ProcessCompleted", e.Header, e.Process, tool.ProcessLifecycleCompleted)
+	case ProcessStopRequested:
+		return validateProcessLifecycleEvent("ProcessStopRequested", e.Header, e.Process, tool.ProcessLifecycleStopRequested)
+	case ProcessLost:
+		return validateProcessLifecycleEvent("ProcessLost", e.Header, e.Process, tool.ProcessLifecycleLost)
 	case StepDone:
 		return validateStepDoneMessages(e.Messages)
 	case TurnDone:
@@ -381,10 +393,33 @@ func validatePermissionReviewMetadata(
 	return nil
 }
 
+func validateProcessLifecycleEvent(
+	name EventName,
+	header Header,
+	metadata tool.ProcessLifecycleMetadata,
+	wantKind tool.ProcessLifecycleKind,
+) error {
+	if metadata.EventID != header.EventID {
+		return &InvalidEventError{Event: name, Field: FieldEventID, Rule: RuleInvalid}
+	}
+	if metadata.SessionID != header.SessionID {
+		return &InvalidEventError{Event: name, Field: FieldSessionID, Rule: RuleInvalid}
+	}
+	if metadata.LoopID != header.LoopID {
+		return &InvalidEventError{Event: name, Field: FieldLoopID, Rule: RuleInvalid}
+	}
+	if metadata.Kind != wantKind {
+		return &InvalidEventError{Event: name, Field: FieldProcess, Rule: RuleInvalid}
+	}
+	if err := metadata.Validate(); err != nil {
+		return &InvalidEventError{Event: name, Field: FieldProcess, Rule: RuleInvalid}
+	}
+	return nil
+}
+
 func invalidPermissionReview(name EventName, field FieldName) error {
 	return &InvalidEventError{Event: name, Field: field, Rule: RuleInvalid}
 }
-
 // Bounds for ConfigurationAdopted's durable, partly user-authored payload: a
 // hostile or buggy decision must not be able to append an unbounded record to
 // the journal, and a legacy (SchemaVersion 0) manifest projection is never
@@ -928,6 +963,16 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "PermissionReviewStarted", toolProfile(), true
 	case PermissionReviewCompleted:
 		return "PermissionReviewCompleted", toolProfile(), true
+	case ProcessStarted:
+		return "ProcessStarted", loopProfile(), true
+	case ProcessBackgrounded:
+		return "ProcessBackgrounded", loopProfile(), true
+	case ProcessCompleted:
+		return "ProcessCompleted", loopProfile(), true
+	case ProcessStopRequested:
+		return "ProcessStopRequested", loopProfile(), true
+	case ProcessLost:
+		return "ProcessLost", loopProfile(), true
 	case LoopIdle:
 		return "LoopIdle", loopProfile(), true
 	case LoopStarted:

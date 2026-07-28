@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"time"
+	"unicode/utf8"
 
 	"github.com/looprig/core/uuid"
 )
@@ -188,11 +189,262 @@ const (
 	ProcessTerminalTerminated
 	ProcessTerminalKilled
 	ProcessTerminalRunnerShutdown
+	ProcessTerminalFailed
+	ProcessTerminalOutputLimit
+	ProcessTerminalLostOnRestore
 )
 
 // Valid reports whether r is a recognized terminal reason.
 func (r ProcessTerminalReason) Valid() bool {
-	return r >= ProcessTerminalExited && r <= ProcessTerminalRunnerShutdown
+	return r >= ProcessTerminalExited && r <= ProcessTerminalLostOnRestore
+}
+
+const (
+	// MaxProcessHandleBytes bounds the opaque URL-safe process identifier.
+	MaxProcessHandleBytes = 128
+	// MaxProcessDiagnosticBytes bounds the only free-form process lifecycle
+	// detail admitted to durable metadata.
+	MaxProcessDiagnosticBytes = 512
+)
+
+// ProcessLifecycleKind identifies one of the five durable process lifecycle
+// record shapes.
+type ProcessLifecycleKind uint8
+
+const (
+	ProcessLifecycleStarted ProcessLifecycleKind = iota + 1
+	ProcessLifecycleBackgrounded
+	ProcessLifecycleCompleted
+	ProcessLifecycleStopRequested
+	ProcessLifecycleLost
+)
+
+// Valid reports whether k belongs to the closed lifecycle kind domain.
+func (k ProcessLifecycleKind) Valid() bool {
+	return k >= ProcessLifecycleStarted && k <= ProcessLifecycleLost
+}
+
+// ProcessLifecycleState is the portable state carried by lifecycle records and
+// process completion notifications.
+type ProcessLifecycleState uint8
+
+const (
+	ProcessLifecycleStarting ProcessLifecycleState = iota + 1
+	ProcessLifecycleRunning
+	ProcessLifecycleExited
+	ProcessLifecycleFailed
+	ProcessLifecycleTimedOut
+	ProcessLifecycleInterrupted
+	ProcessLifecycleTerminated
+	ProcessLifecycleKilled
+	ProcessLifecycleLostOnRestore
+)
+
+// Valid reports whether s belongs to the closed lifecycle state domain.
+func (s ProcessLifecycleState) Valid() bool {
+	return s >= ProcessLifecycleStarting && s <= ProcessLifecycleLostOnRestore
+}
+
+// ProcessLifecycleMetadata is the bounded, neutral process lifecycle payload
+// shared with Harness. It intentionally excludes commands, output, stdin,
+// environment, host paths, spool paths, and OS process identifiers.
+type ProcessLifecycleMetadata struct {
+	EventID           uuid.UUID             `json:"event_id,omitzero"`
+	Kind              ProcessLifecycleKind  `json:"kind"`
+	SessionID         uuid.UUID             `json:"session_id,omitzero"`
+	LoopID            uuid.UUID             `json:"loop_id,omitzero"`
+	ProcessHandle     string                `json:"process_handle"`
+	OriginExecutionID uuid.UUID             `json:"origin_execution_id,omitzero"`
+	State             ProcessLifecycleState `json:"state"`
+	ProcessCreatedAt  time.Time             `json:"process_created_at"`
+	ProcessStartedAt  time.Time             `json:"process_started_at,omitzero"`
+	ProcessFinishedAt time.Time             `json:"process_finished_at,omitzero"`
+	HasExitCode       bool                  `json:"has_exit_code,omitzero"`
+	ExitCode          int32                 `json:"exit_code,omitzero"`
+	Reason            ProcessTerminalReason `json:"reason,omitzero"`
+	Diagnostic        string                `json:"diagnostic,omitzero"`
+}
+
+// ProcessCompletionNotification is the bounded terminal notification submitted
+// to the owning loop.
+type ProcessCompletionNotification struct {
+	CommandID     uuid.UUID             `json:"command_id,omitzero"`
+	SessionID     uuid.UUID             `json:"session_id,omitzero"`
+	LoopID        uuid.UUID             `json:"loop_id,omitzero"`
+	ProcessHandle string                `json:"process_handle"`
+	State         ProcessLifecycleState `json:"state"`
+	Reason        ProcessTerminalReason `json:"reason"`
+}
+
+// ProcessLifecycleValidationError identifies the first invalid lifecycle or
+// completion-notification field.
+type ProcessLifecycleValidationError struct {
+	Field string
+}
+
+func (e *ProcessLifecycleValidationError) Error() string {
+	return "tool: invalid process lifecycle metadata: " + e.Field
+}
+
+// Validate checks the closed kind/state/reason matrix, stable identity,
+// bounded strings, process-clock ordering, and exit-code presence contract.
+func (m ProcessLifecycleMetadata) Validate() error {
+	switch {
+	case m.EventID.IsZero():
+		return invalidProcessLifecycle("event_id")
+	case !m.Kind.Valid():
+		return invalidProcessLifecycle("kind")
+	case m.SessionID.IsZero():
+		return invalidProcessLifecycle("session_id")
+	case m.LoopID.IsZero():
+		return invalidProcessLifecycle("loop_id")
+	case !validProcessHandle(m.ProcessHandle):
+		return invalidProcessLifecycle("process_handle")
+	case m.OriginExecutionID.IsZero():
+		return invalidProcessLifecycle("origin_execution_id")
+	case !m.State.Valid():
+		return invalidProcessLifecycle("state")
+	case m.ProcessCreatedAt.IsZero():
+		return invalidProcessLifecycle("process_created_at")
+	case !m.ProcessStartedAt.IsZero() && m.ProcessStartedAt.Before(m.ProcessCreatedAt):
+		return invalidProcessLifecycle("process_started_at")
+	case !m.ProcessFinishedAt.IsZero() &&
+		(m.ProcessFinishedAt.Before(m.ProcessCreatedAt) ||
+			(!m.ProcessStartedAt.IsZero() && m.ProcessFinishedAt.Before(m.ProcessStartedAt))):
+		return invalidProcessLifecycle("process_finished_at")
+	case !utf8.ValidString(m.Diagnostic) || len(m.Diagnostic) > MaxProcessDiagnosticBytes:
+		return invalidProcessLifecycle("diagnostic")
+	case m.Diagnostic != "" &&
+		!((m.Kind == ProcessLifecycleCompleted && m.State == ProcessLifecycleFailed) ||
+			m.Kind == ProcessLifecycleLost):
+		return invalidProcessLifecycle("diagnostic")
+	case !m.HasExitCode && m.ExitCode != 0:
+		return invalidProcessLifecycle("exit_code")
+	}
+
+	if !validProcessLifecycleTuple(m.Kind, m.State, m.Reason) {
+		return invalidProcessLifecycle("state_reason")
+	}
+	if !validProcessLifecycleShape(m) {
+		return invalidProcessLifecycle("lifecycle_fields")
+	}
+	return nil
+}
+
+// Validate checks stable identity, the bounded process handle, and one of the
+// terminal state/reason pairs accepted by completed or lost lifecycle records.
+func (n ProcessCompletionNotification) Validate() error {
+	switch {
+	case n.CommandID.IsZero():
+		return invalidProcessLifecycle("command_id")
+	case n.SessionID.IsZero():
+		return invalidProcessLifecycle("session_id")
+	case n.LoopID.IsZero():
+		return invalidProcessLifecycle("loop_id")
+	case !validProcessHandle(n.ProcessHandle):
+		return invalidProcessLifecycle("process_handle")
+	case !validProcessCompletionTuple(n.State, n.Reason):
+		return invalidProcessLifecycle("state_reason")
+	default:
+		return nil
+	}
+}
+
+func invalidProcessLifecycle(field string) error {
+	return &ProcessLifecycleValidationError{Field: field}
+}
+
+func validProcessHandle(handle string) bool {
+	if len(handle) == 0 || len(handle) > MaxProcessHandleBytes {
+		return false
+	}
+	for i := 0; i < len(handle); i++ {
+		c := handle[i]
+		if (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') ||
+			c == '-' || c == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validProcessLifecycleTuple(
+	kind ProcessLifecycleKind,
+	state ProcessLifecycleState,
+	reason ProcessTerminalReason,
+) bool {
+	switch kind {
+	case ProcessLifecycleStarted, ProcessLifecycleBackgrounded:
+		return state == ProcessLifecycleRunning && reason == 0
+	case ProcessLifecycleStopRequested:
+		return (state == ProcessLifecycleStarting || state == ProcessLifecycleRunning) &&
+			(reason == ProcessTerminalInterrupted ||
+				reason == ProcessTerminalTerminated ||
+				reason == ProcessTerminalKilled)
+	case ProcessLifecycleCompleted:
+		return validProcessCompletionTuple(state, reason) && state != ProcessLifecycleLostOnRestore
+	case ProcessLifecycleLost:
+		return state == ProcessLifecycleLostOnRestore && reason == ProcessTerminalLostOnRestore
+	default:
+		return false
+	}
+}
+
+func validProcessCompletionTuple(state ProcessLifecycleState, reason ProcessTerminalReason) bool {
+	switch state {
+	case ProcessLifecycleExited:
+		return reason == ProcessTerminalExited
+	case ProcessLifecycleFailed:
+		return reason == ProcessTerminalFailed
+	case ProcessLifecycleTimedOut:
+		return reason == ProcessTerminalTimedOut
+	case ProcessLifecycleInterrupted:
+		return reason == ProcessTerminalInterrupted
+	case ProcessLifecycleTerminated:
+		return reason == ProcessTerminalTerminated ||
+			reason == ProcessTerminalRunnerShutdown ||
+			reason == ProcessTerminalOutputLimit
+	case ProcessLifecycleKilled:
+		return reason == ProcessTerminalKilled ||
+			reason == ProcessTerminalRunnerShutdown ||
+			reason == ProcessTerminalOutputLimit
+	case ProcessLifecycleLostOnRestore:
+		return reason == ProcessTerminalLostOnRestore
+	default:
+		return false
+	}
+}
+
+func validProcessLifecycleShape(m ProcessLifecycleMetadata) bool {
+	started := !m.ProcessStartedAt.IsZero()
+	finished := !m.ProcessFinishedAt.IsZero()
+	switch m.Kind {
+	case ProcessLifecycleStarted, ProcessLifecycleBackgrounded:
+		return started && !finished && !m.HasExitCode && m.ExitCode == 0
+	case ProcessLifecycleStopRequested:
+		return started == (m.State == ProcessLifecycleRunning) &&
+			!finished && !m.HasExitCode && m.ExitCode == 0 &&
+			m.Diagnostic == ""
+	case ProcessLifecycleCompleted:
+		if !finished {
+			return false
+		}
+		switch m.State {
+		case ProcessLifecycleExited:
+			return started && m.HasExitCode
+		case ProcessLifecycleFailed:
+			return !m.HasExitCode && m.ExitCode == 0
+		default:
+			return started && !m.HasExitCode && m.ExitCode == 0
+		}
+	case ProcessLifecycleLost:
+		return finished && !m.HasExitCode && m.ExitCode == 0
+	default:
+		return false
+	}
 }
 
 // ProcessResult is the terminal result of an asynchronous process. ExitCode is

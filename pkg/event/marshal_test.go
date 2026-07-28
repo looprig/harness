@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
 )
@@ -470,6 +471,11 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"HustleFailed", HustleFailed{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Duration: time.Second, Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference, Usage: &content.Usage{InputTokens: 2, OutputTokens: 1}}},
 		{"PermissionReviewStarted", validPermissionReviewStarted()},
 		{"PermissionReviewCompleted", validPermissionReviewCompleted()},
+		{"ProcessStarted", ProcessStarted{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleStarted, tool.ProcessLifecycleRunning, 0)), Process: validProcessEventMetadata(tool.ProcessLifecycleStarted, tool.ProcessLifecycleRunning, 0)}},
+		{"ProcessBackgrounded", ProcessBackgrounded{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleBackgrounded, tool.ProcessLifecycleRunning, 0)), Process: validProcessEventMetadata(tool.ProcessLifecycleBackgrounded, tool.ProcessLifecycleRunning, 0)}},
+		{"ProcessCompleted", ProcessCompleted{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleCompleted, tool.ProcessLifecycleExited, tool.ProcessTerminalExited)), Process: validProcessEventMetadata(tool.ProcessLifecycleCompleted, tool.ProcessLifecycleExited, tool.ProcessTerminalExited)}},
+		{"ProcessStopRequested", ProcessStopRequested{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleStopRequested, tool.ProcessLifecycleRunning, tool.ProcessTerminalInterrupted)), Process: validProcessEventMetadata(tool.ProcessLifecycleStopRequested, tool.ProcessLifecycleRunning, tool.ProcessTerminalInterrupted)}},
+		{"ProcessLost", ProcessLost{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleLost, tool.ProcessLifecycleLostOnRestore, tool.ProcessTerminalLostOnRestore)), Process: validProcessEventMetadata(tool.ProcessLifecycleLost, tool.ProcessLifecycleLostOnRestore, tool.ProcessTerminalLostOnRestore)}},
 		{"RestoreStarted", RestoreStarted{Header: fullHeaderSession()}},
 		{"RestoreDone", RestoreDone{Header: fullHeaderSession()}},
 		{"WorkspaceCheckpointed", WorkspaceCheckpointed{
@@ -867,7 +873,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 41
+const wantEnduringTypes = 46
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -880,6 +886,7 @@ func unionInstances() []Event {
 		HustleCompleted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime())},
 		HustleFailed{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference},
 		PermissionReviewStarted{}, PermissionReviewCompleted{},
+		ProcessStarted{}, ProcessBackgrounded{}, ProcessCompleted{}, ProcessStopRequested{}, ProcessLost{},
 		ConfigurationAdopted{},
 		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{}, WorkspaceRestored{}, ActiveLoopChanged{},
 		LoopIdle{}, LoopStarted{}, DelegateRequestAccepted{}, LoopInferenceChanged{}, LoopModeChanged{},

@@ -7,9 +7,223 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/looprig/core/uuid"
 )
+
+func processTestUUID(seed byte) uuid.UUID {
+	var id uuid.UUID
+	for i := range id {
+		id[i] = seed
+	}
+	return id
+}
+
+func validProcessLifecycleMetadata(kind ProcessLifecycleKind, state ProcessLifecycleState, reason ProcessTerminalReason) ProcessLifecycleMetadata {
+	created := time.Unix(100, 0).UTC()
+	started := created.Add(time.Second)
+	finished := started.Add(time.Second)
+	metadata := ProcessLifecycleMetadata{
+		EventID:           processTestUUID(1),
+		Kind:              kind,
+		SessionID:         processTestUUID(2),
+		LoopID:            processTestUUID(3),
+		ProcessHandle:     "Abc_123-xyz",
+		OriginExecutionID: processTestUUID(4),
+		State:             state,
+		ProcessCreatedAt:  created,
+		ProcessStartedAt:  started,
+		ProcessFinishedAt: finished,
+		Reason:            reason,
+	}
+	switch kind {
+	case ProcessLifecycleStarted, ProcessLifecycleBackgrounded:
+		metadata.ProcessFinishedAt = time.Time{}
+	case ProcessLifecycleStopRequested:
+		metadata.ProcessFinishedAt = time.Time{}
+		if state == ProcessLifecycleStarting {
+			metadata.ProcessStartedAt = time.Time{}
+		}
+	case ProcessLifecycleCompleted:
+		if state == ProcessLifecycleFailed {
+			metadata.Diagnostic = "spawn failed"
+		}
+		if state == ProcessLifecycleExited {
+			metadata.HasExitCode = true
+			metadata.ExitCode = 17
+		}
+	case ProcessLifecycleLost:
+		metadata.ProcessStartedAt = time.Time{}
+		metadata.Diagnostic = "process owner restarted"
+	}
+	return metadata
+}
+
+func TestProcessLifecycleMetadataValidation(t *testing.T) {
+	t.Parallel()
+
+	valid := validProcessLifecycleMetadata(ProcessLifecycleStarted, ProcessLifecycleRunning, 0)
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid metadata rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*ProcessLifecycleMetadata)
+		field  string
+	}{
+		{"event id", func(m *ProcessLifecycleMetadata) { m.EventID = uuid.UUID{} }, "event_id"},
+		{"session id", func(m *ProcessLifecycleMetadata) { m.SessionID = uuid.UUID{} }, "session_id"},
+		{"loop id", func(m *ProcessLifecycleMetadata) { m.LoopID = uuid.UUID{} }, "loop_id"},
+		{"origin execution id", func(m *ProcessLifecycleMetadata) { m.OriginExecutionID = uuid.UUID{} }, "origin_execution_id"},
+		{"empty handle", func(m *ProcessLifecycleMetadata) { m.ProcessHandle = "" }, "process_handle"},
+		{"unsafe handle", func(m *ProcessLifecycleMetadata) { m.ProcessHandle = "not/url+safe" }, "process_handle"},
+		{"long handle", func(m *ProcessLifecycleMetadata) { m.ProcessHandle = strings.Repeat("a", MaxProcessHandleBytes+1) }, "process_handle"},
+		{"zero creation", func(m *ProcessLifecycleMetadata) { m.ProcessCreatedAt = time.Time{} }, "process_created_at"},
+		{"start before creation", func(m *ProcessLifecycleMetadata) { m.ProcessStartedAt = m.ProcessCreatedAt.Add(-time.Nanosecond) }, "process_started_at"},
+		{"unexpected diagnostic", func(m *ProcessLifecycleMetadata) { m.Diagnostic = "details" }, "diagnostic"},
+		{"invalid utf8 diagnostic", func(m *ProcessLifecycleMetadata) {
+			m.Kind = ProcessLifecycleCompleted
+			m.State = ProcessLifecycleFailed
+			m.Reason = ProcessTerminalFailed
+			m.ProcessFinishedAt = m.ProcessStartedAt
+			m.Diagnostic = string([]byte{0xff})
+		}, "diagnostic"},
+		{"long diagnostic", func(m *ProcessLifecycleMetadata) {
+			m.Kind = ProcessLifecycleCompleted
+			m.State = ProcessLifecycleFailed
+			m.Reason = ProcessTerminalFailed
+			m.ProcessFinishedAt = m.ProcessStartedAt
+			m.Diagnostic = strings.Repeat("d", MaxProcessDiagnosticBytes+1)
+		}, "diagnostic"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			candidate := valid
+			tt.mutate(&candidate)
+			var validationErr *ProcessLifecycleValidationError
+			if err := candidate.Validate(); !errors.As(err, &validationErr) || validationErr.Field != tt.field {
+				t.Fatalf("Validate() error = %T %v, want field %q", err, err, tt.field)
+			}
+		})
+	}
+	if !utf8.ValidString(valid.Diagnostic) {
+		t.Fatal("test fixture diagnostic is not UTF-8")
+	}
+}
+
+func TestProcessLifecycleKindStateReasonMatrix(t *testing.T) {
+	t.Parallel()
+
+	valid := []ProcessLifecycleMetadata{
+		validProcessLifecycleMetadata(ProcessLifecycleStarted, ProcessLifecycleRunning, 0),
+		validProcessLifecycleMetadata(ProcessLifecycleBackgrounded, ProcessLifecycleRunning, 0),
+		validProcessLifecycleMetadata(ProcessLifecycleCompleted, ProcessLifecycleExited, ProcessTerminalExited),
+		validProcessLifecycleMetadata(ProcessLifecycleCompleted, ProcessLifecycleFailed, ProcessTerminalFailed),
+		validProcessLifecycleMetadata(ProcessLifecycleCompleted, ProcessLifecycleTimedOut, ProcessTerminalTimedOut),
+		validProcessLifecycleMetadata(ProcessLifecycleCompleted, ProcessLifecycleInterrupted, ProcessTerminalInterrupted),
+		validProcessLifecycleMetadata(ProcessLifecycleCompleted, ProcessLifecycleTerminated, ProcessTerminalTerminated),
+		validProcessLifecycleMetadata(ProcessLifecycleCompleted, ProcessLifecycleTerminated, ProcessTerminalRunnerShutdown),
+		validProcessLifecycleMetadata(ProcessLifecycleCompleted, ProcessLifecycleTerminated, ProcessTerminalOutputLimit),
+		validProcessLifecycleMetadata(ProcessLifecycleCompleted, ProcessLifecycleKilled, ProcessTerminalKilled),
+		validProcessLifecycleMetadata(ProcessLifecycleCompleted, ProcessLifecycleKilled, ProcessTerminalRunnerShutdown),
+		validProcessLifecycleMetadata(ProcessLifecycleCompleted, ProcessLifecycleKilled, ProcessTerminalOutputLimit),
+		validProcessLifecycleMetadata(ProcessLifecycleLost, ProcessLifecycleLostOnRestore, ProcessTerminalLostOnRestore),
+	}
+	for _, metadata := range valid {
+		if err := metadata.Validate(); err != nil {
+			t.Errorf("valid kind/state/reason (%v, %v, %v) rejected: %v", metadata.Kind, metadata.State, metadata.Reason, err)
+		}
+	}
+
+	invalid := []ProcessLifecycleMetadata{
+		validProcessLifecycleMetadata(ProcessLifecycleStarted, ProcessLifecycleStarting, 0),
+		validProcessLifecycleMetadata(ProcessLifecycleBackgrounded, ProcessLifecycleRunning, ProcessTerminalExited),
+		validProcessLifecycleMetadata(ProcessLifecycleCompleted, ProcessLifecycleRunning, 0),
+		validProcessLifecycleMetadata(ProcessLifecycleCompleted, ProcessLifecycleExited, ProcessTerminalFailed),
+		validProcessLifecycleMetadata(ProcessLifecycleCompleted, ProcessLifecycleFailed, ProcessTerminalExited),
+		validProcessLifecycleMetadata(ProcessLifecycleLost, ProcessLifecycleLostOnRestore, ProcessTerminalRunnerShutdown),
+	}
+	for _, metadata := range invalid {
+		if err := metadata.Validate(); err == nil {
+			t.Errorf("invalid kind/state/reason (%v, %v, %v) accepted", metadata.Kind, metadata.State, metadata.Reason)
+		}
+	}
+}
+
+func TestProcessLifecycleStopRequestedInvariants(t *testing.T) {
+	t.Parallel()
+
+	for _, state := range []ProcessLifecycleState{ProcessLifecycleStarting, ProcessLifecycleRunning} {
+		for _, reason := range []ProcessTerminalReason{ProcessTerminalInterrupted, ProcessTerminalTerminated, ProcessTerminalKilled} {
+			metadata := validProcessLifecycleMetadata(ProcessLifecycleStopRequested, state, reason)
+			if err := metadata.Validate(); err != nil {
+				t.Errorf("valid stop request (%v, %v) rejected: %v", state, reason, err)
+			}
+		}
+	}
+
+	invalid := []ProcessLifecycleMetadata{
+		validProcessLifecycleMetadata(ProcessLifecycleStopRequested, ProcessLifecycleRunning, ProcessTerminalRunnerShutdown),
+		validProcessLifecycleMetadata(ProcessLifecycleStopRequested, ProcessLifecycleStarting, ProcessTerminalOutputLimit),
+		validProcessLifecycleMetadata(ProcessLifecycleStopRequested, ProcessLifecycleRunning, ProcessTerminalFailed),
+	}
+	withFinished := validProcessLifecycleMetadata(ProcessLifecycleStopRequested, ProcessLifecycleRunning, ProcessTerminalInterrupted)
+	withFinished.ProcessFinishedAt = withFinished.ProcessStartedAt
+	invalid = append(invalid, withFinished)
+	withExit := validProcessLifecycleMetadata(ProcessLifecycleStopRequested, ProcessLifecycleRunning, ProcessTerminalInterrupted)
+	withExit.HasExitCode = true
+	invalid = append(invalid, withExit)
+	for _, metadata := range invalid {
+		if err := metadata.Validate(); err == nil {
+			t.Errorf("invalid stop request (%v, %v) accepted", metadata.State, metadata.Reason)
+		}
+	}
+}
+
+func TestProcessLifecycleTimestampsPreserved(t *testing.T) {
+	t.Parallel()
+
+	metadata := validProcessLifecycleMetadata(ProcessLifecycleCompleted, ProcessLifecycleExited, ProcessTerminalExited)
+	if got := metadata.ProcessCreatedAt; !got.Equal(time.Unix(100, 0).UTC()) {
+		t.Fatalf("ProcessCreatedAt = %v", got)
+	}
+	if !metadata.ProcessStartedAt.Equal(metadata.ProcessCreatedAt.Add(time.Second)) {
+		t.Fatalf("ProcessStartedAt = %v", metadata.ProcessStartedAt)
+	}
+	if !metadata.ProcessFinishedAt.Equal(metadata.ProcessStartedAt.Add(time.Second)) {
+		t.Fatalf("ProcessFinishedAt = %v", metadata.ProcessFinishedAt)
+	}
+}
+
+func TestProcessCompletionNotificationValidation(t *testing.T) {
+	t.Parallel()
+
+	valid := ProcessCompletionNotification{
+		CommandID:     processTestUUID(1),
+		SessionID:     processTestUUID(2),
+		LoopID:        processTestUUID(3),
+		ProcessHandle: "Abc_123-xyz",
+		State:         ProcessLifecycleExited,
+		Reason:        ProcessTerminalExited,
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid notification rejected: %v", err)
+	}
+
+	tests := []ProcessCompletionNotification{
+		{},
+		{CommandID: valid.CommandID, SessionID: valid.SessionID, LoopID: valid.LoopID, ProcessHandle: valid.ProcessHandle, State: ProcessLifecycleRunning},
+		{CommandID: valid.CommandID, SessionID: valid.SessionID, LoopID: valid.LoopID, ProcessHandle: valid.ProcessHandle, State: ProcessLifecycleTerminated, Reason: ProcessTerminalKilled},
+		{CommandID: valid.CommandID, SessionID: valid.SessionID, LoopID: valid.LoopID, ProcessHandle: "bad handle", State: ProcessLifecycleExited, Reason: ProcessTerminalExited},
+	}
+	for _, notification := range tests {
+		if err := notification.Validate(); err == nil {
+			t.Errorf("invalid notification accepted: %#v", notification)
+		}
+	}
+}
 
 func TestProcessContractFakeImplementsInterfaces(t *testing.T) {
 	t.Parallel()
@@ -108,6 +322,9 @@ func TestProcessContractEnumsValidateExplicitly(t *testing.T) {
 		{name: "terminated terminal reason", valid: ProcessTerminalTerminated.Valid()},
 		{name: "killed terminal reason", valid: ProcessTerminalKilled.Valid()},
 		{name: "runner shutdown terminal reason", valid: ProcessTerminalRunnerShutdown.Valid()},
+		{name: "failed terminal reason", valid: ProcessTerminalFailed.Valid()},
+		{name: "output-limit terminal reason", valid: ProcessTerminalOutputLimit.Valid()},
+		{name: "lost-on-restore terminal reason", valid: ProcessTerminalLostOnRestore.Valid()},
 		{name: "invalid terminal reason", valid: ProcessTerminalReason(0).Valid()},
 		{name: "filesystem activity", valid: WorkspaceActivityWrite.Valid()},
 		{name: "broad filesystem activity", valid: WorkspaceActivityBroadWrite.Valid()},
