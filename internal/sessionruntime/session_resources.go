@@ -319,9 +319,6 @@ func (r *sessionResources) Activate(ctx context.Context, services tool.SessionRe
 		for _, entry := range activationEntries {
 			entry.activationPending = false
 			entry.usabilityErr = result
-			if r.entries[entry.key] == entry {
-				delete(r.entries, entry.key)
-			}
 		}
 		r.mu.Unlock()
 
@@ -339,6 +336,9 @@ func (r *sessionResources) Activate(ctx context.Context, services tool.SessionRe
 	for _, entry := range activationEntries {
 		entry.activationPending = false
 		entry.usabilityErr = result
+		if result != nil && r.entries[entry.key] == entry {
+			delete(r.entries, entry.key)
+		}
 		r.closePublicationLocked(entry)
 	}
 	close(r.activateDone)
@@ -359,6 +359,10 @@ func (r *sessionResources) finishActivation(
 		r.mu.Unlock()
 		return nil
 	}
+	// Publish the per-key terminal error while retaining its tombstone. A
+	// Shutdown callback may then reenter GetOrCreate for this key without
+	// waiting on the cleanup operation it currently owns.
+	r.closePublicationLocked(entry)
 	r.mu.Unlock()
 
 	// Failed activation must never publish a live resource. Shutdown is invoked
@@ -372,7 +376,6 @@ func (r *sessionResources) finishActivation(
 	if r.entries[entry.key] == entry {
 		delete(r.entries, entry.key)
 	}
-	r.closePublicationLocked(entry)
 	r.mu.Unlock()
 	return result
 }

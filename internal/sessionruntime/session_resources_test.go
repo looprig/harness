@@ -19,6 +19,9 @@ type testSessionResource struct {
 	shutdownErr   error
 	activateStart chan struct{}
 	activateWait  chan struct{}
+	shutdownStart chan struct{}
+	shutdownWait  chan struct{}
+	shutdownHook  func()
 }
 
 func (r *testSessionResource) Activate(ctx context.Context, _ tool.SessionResourceServices) error {
@@ -38,6 +41,15 @@ func (r *testSessionResource) Activate(ctx context.Context, _ tool.SessionResour
 
 func (r *testSessionResource) Shutdown(context.Context) error {
 	r.shutdownCalls.Add(1)
+	if r.shutdownStart != nil {
+		close(r.shutdownStart)
+	}
+	if r.shutdownHook != nil {
+		r.shutdownHook()
+	}
+	if r.shutdownWait != nil {
+		<-r.shutdownWait
+	}
 	return r.shutdownErr
 }
 
@@ -416,6 +428,126 @@ func TestSessionResourcesActivateAndShutdownOnce(t *testing.T) {
 		})
 		if got != nil || !errors.Is(err, activateErr) {
 			t.Fatalf("later lookup = (%v, %v), want (nil, %v)", got, err, activateErr)
+		}
+		if got := resource.shutdownCalls.Load(); got != 1 {
+			t.Fatalf("resource Shutdown calls = %d, want 1", got)
+		}
+	})
+
+	t.Run("registry shutdown joins activation failure cleanup", func(t *testing.T) {
+		registry := newSessionResources(t.TempDir())
+		activateErr := errors.New("activation failed before cleanup")
+		resource := &testSessionResource{
+			activateErr:   activateErr,
+			shutdownStart: make(chan struct{}),
+			shutdownWait:  make(chan struct{}),
+		}
+		if _, err := registry.GetOrCreate(context.Background(), "cleanup", func(string) (tool.SessionResource, error) {
+			return resource, nil
+		}); err != nil {
+			t.Fatalf("GetOrCreate() error = %v", err)
+		}
+
+		activated := make(chan error, 1)
+		go func() {
+			activated <- registry.Activate(context.Background(), tool.SessionResourceServices{})
+		}()
+		<-resource.shutdownStart
+		registry.mu.Lock()
+		retainedDuringCleanup := registry.entries["cleanup"] != nil
+		registry.mu.Unlock()
+		if !retainedDuringCleanup {
+			t.Error("activation cleanup removed its registry tombstone before Shutdown could join")
+		}
+
+		shutdown := make(chan error, 1)
+		go func() {
+			shutdown <- registry.Shutdown(context.Background())
+		}()
+		for {
+			registry.mu.Lock()
+			started := registry.shutdownStarted
+			registry.mu.Unlock()
+			if started {
+				break
+			}
+			runtime.Gosched()
+		}
+		var earlyShutdown *error
+		for range 10_000 {
+			select {
+			case err := <-shutdown:
+				t.Errorf("registry Shutdown returned before activation cleanup: %v", err)
+				earlyShutdown = &err
+			default:
+				runtime.Gosched()
+			}
+			if earlyShutdown != nil {
+				break
+			}
+		}
+
+		close(resource.shutdownWait)
+		if err := <-activated; !errors.Is(err, activateErr) {
+			t.Fatalf("Activate() error = %v, want %v", err, activateErr)
+		}
+		var shutdownErr error
+		if earlyShutdown != nil {
+			shutdownErr = *earlyShutdown
+		} else {
+			shutdownErr = <-shutdown
+		}
+		if shutdownErr != nil {
+			t.Fatalf("Shutdown() error = %v", shutdownErr)
+		}
+		if got := resource.shutdownCalls.Load(); got != 1 {
+			t.Fatalf("resource Shutdown calls = %d, want 1", got)
+		}
+	})
+
+	t.Run("post-boundary cleanup may reenter its key", func(t *testing.T) {
+		registry := newSessionResources(t.TempDir())
+		if err := registry.Activate(context.Background(), tool.SessionResourceServices{}); err != nil {
+			t.Fatalf("initial Activate() error = %v", err)
+		}
+
+		activateErr := errors.New("late activation failed")
+		var factoryCalls atomic.Int32
+		resource := &testSessionResource{activateErr: activateErr}
+		resource.shutdownHook = func() {
+			registry.mu.Lock()
+			entry := registry.entries["late"]
+			if entry == nil {
+				registry.mu.Unlock()
+				t.Error("failed entry removed before activation cleanup")
+				return
+			}
+			publicationOpen := entry.publicationOpen
+			usabilityErr := entry.usabilityErr
+			registry.mu.Unlock()
+			if publicationOpen || !errors.Is(usabilityErr, activateErr) {
+				t.Errorf("cleanup tombstone = (open %v, err %v), want (false, %v)", publicationOpen, usabilityErr, activateErr)
+				return
+			}
+
+			got, err := registry.GetOrCreate(context.Background(), "late", func(string) (tool.SessionResource, error) {
+				t.Error("reentrant lookup invoked a new factory during cleanup")
+				return &testSessionResource{}, nil
+			})
+			if got != nil || !errors.Is(err, activateErr) {
+				t.Errorf("reentrant lookup = (%v, %v), want (nil, %v)", got, err, activateErr)
+			}
+		}
+
+		got, err := registry.GetOrCreate(context.Background(), "late", func(string) (tool.SessionResource, error) {
+			factoryCalls.Add(1)
+			return resource, nil
+		})
+		if got != nil || !errors.Is(err, activateErr) {
+			t.Fatalf("GetOrCreate() = (%v, %v), want (nil, %v)", got, err, activateErr)
+		}
+		if got := factoryCalls.Load(); got != 1 {
+			t.Fatalf("factory calls = %d, want 1", got)
 		}
 		if got := resource.shutdownCalls.Load(); got != 1 {
 			t.Fatalf("resource Shutdown calls = %d, want 1", got)
