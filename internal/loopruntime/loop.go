@@ -892,9 +892,66 @@ func runLoop(cfg loopConfig, state loopState) {
 			return false
 		}
 		disposition.Attempt = attempt
+		hookCtx := ctx
+		if candidate != nil && config.Hooks.Handles(hook.OperationCompaction) {
+			maxSummaryTokens := content.TokenCount(0)
+			if config.Compaction != nil {
+				maxSummaryTokens = config.Compaction.MaxSummaryTokens
+			}
+			input := &loop.CompactionInput{
+				Basis: attempt.Basis, Model: candidate.Measurement.Model,
+				RequestFingerprint: candidate.Measurement.RequestFingerprint,
+				Transcript:         cloneMessages(candidate.Transcript), MaxSummaryTokens: maxSummaryTokens,
+			}
+			call := hook.Call{
+				Operation: hook.OperationCompaction, StartedAt: hookNow(config.now),
+				Coordinates: identity.Coordinates{
+					SessionID: state.sessionID, LoopID: state.id, TurnID: state.turnID,
+				},
+				AgentName: config.AgentName, Cause: attempt.Cause,
+				Compaction: &hook.CompactionData{AttemptID: attempt.AttemptID, Input: input},
+			}
+			var finish hook.FinishFunc
+			var hookErr error
+			hookCtx, finish, hookErr = config.Hooks.Start(ctx, call)
+			scope := &compactionHookScope{ctx: hookCtx, call: call, finish: finish}
+			disposition.hookScope = scope
+			disposition.input = input
+			if hookErr != nil {
+				reason := event.CompactRejectInternal
+				outcome := hook.OutcomeFailed
+				var guardErr *hook.GuardError
+				if !errors.As(hookErr, &guardErr) {
+					if _, denied := hook.AsDenial(hookErr); denied {
+						reason = event.CompactRejectUnavailable
+						outcome = hook.OutcomeDenied
+					}
+				}
+				safeErr := safeHookError(hook.OperationCompaction, hookErr)
+				scope.setTerminal(outcome, safeErr, nil)
+				rejected := rejectedCompactionResult(reason)
+				rejected.Proposal.hookScope = scope
+				disposition.preRejected = &rejected
+				if candidateSink, ok := config.compactionSink.(compactionCandidateSink); ok {
+					if err := candidateSink.CoordinateCompactionCandidate(hookCtx, disposition, *candidate); err == nil {
+						return true
+					}
+				}
+				_, finalizationErr := compactionFinalizations.Finalize(
+					hookCtx, *attempt, compactionFinalizationProposal{RejectReason: reason, hookScope: scope},
+				)
+				if finalizationErr != nil {
+					reportCompactionFailure(attempt.WaiterCommandIDs, finalizationErr)
+					return false
+				}
+				compactions.complete(attempt.AttemptID)
+				resumeQueuedAfterCompaction()
+				return true
+			}
+		}
 		invoked := false
 		coordinateErr := publishCompactionStartedBeforeInference(
-			ctx, cfg.events, cfg.eventFactory, state.sessionID, state.id,
+			hookCtx, cfg.events, cfg.eventFactory, state.sessionID, state.id,
 			event.CompactionStarted{AttemptID: attempt.AttemptID, Reason: attempt.Reason, Basis: attempt.Basis},
 			func(inferCtx context.Context) error {
 				invoked = true
@@ -911,6 +968,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		if !invoked && isFatalPublication(coordinateErr) {
 			compactions.abort(attempt.AttemptID)
+			disposition.hookScope.finishInfrastructure(coordinateErr)
 			reportCompactionFailure(attempt.WaiterCommandIDs, &CompactionCoordinationError{
 				Kind: CompactionCoordinationOutcome, Cause: coordinateErr,
 			})
@@ -920,7 +978,11 @@ func runLoop(cfg loopConfig, state loopState) {
 		if invoked {
 			rejectReason = event.CompactRejectExecutionFailed
 		}
-		_, finalizationErr := compactionFinalizations.Finalize(ctx, *attempt, compactionFinalizationProposal{RejectReason: rejectReason})
+		disposition.hookScope.setTerminal(hook.OutcomeFailed, &compactionOperationError{Reason: rejectReason}, nil)
+		_, finalizationErr := compactionFinalizations.Finalize(
+			hookCtx, *attempt,
+			compactionFinalizationProposal{RejectReason: rejectReason, hookScope: disposition.hookScope},
+		)
 		if finalizationErr != nil {
 			reportCompactionFailure(attempt.WaiterCommandIDs, finalizationErr)
 			return false
@@ -2543,13 +2605,19 @@ func runLoop(cfg loopConfig, state loopState) {
 				continue
 			}
 			if reason := compactions.cancellationRejectReason(); reason != event.CompactRejectUnspecified {
+				scope := outcome.result.Proposal.hookScope
 				outcome.result = rejectedCompactionResult(reason)
+				outcome.result.Proposal.hookScope = scope
+				scope.setTerminal(hook.OutcomeCanceled, context.Canceled, nil)
 			}
 			settings, configured := contextSettings(config)
 			proposal := outcome.result.Proposal
 			disposition := outcome.result.Disposition
 			if validationErr := validateContextCompactionProposal(attempt, outcome.result); validationErr != nil {
-				proposal = compactionFinalizationProposal{RejectReason: event.CompactRejectInternal}
+				proposal = compactionFinalizationProposal{
+					RejectReason: event.CompactRejectInternal, hookScope: proposal.hookScope,
+				}
+				proposal.hookScope.setTerminal(hook.OutcomeFailed, validationErr, nil)
 				disposition = contextCompactionAwaitRejected
 			}
 			var replacementPlan *actorContextReplacement
@@ -2561,13 +2629,20 @@ func runLoop(cfg loopConfig, state loopState) {
 					if errors.As(replacementErr, &stale) {
 						rejectReason = event.CompactRejectStaleBasis
 					}
-					proposal = compactionFinalizationProposal{RejectReason: rejectReason}
+					proposal = compactionFinalizationProposal{
+						RejectReason: rejectReason, hookScope: proposal.hookScope,
+					}
+					proposal.hookScope.setTerminal(hook.OutcomeFailed, replacementErr, nil)
 					disposition = contextCompactionAwaitRejected
 				} else {
 					replacementPlan = &plan
 				}
 			}
-			terminal, finalizationErr := compactionFinalizations.Finalize(ctx, *attempt, proposal)
+			finalizeCtx := ctx
+			if proposal.hookScope != nil && proposal.hookScope.ctx != nil {
+				finalizeCtx = proposal.hookScope.ctx
+			}
+			terminal, finalizationErr := compactionFinalizations.Finalize(finalizeCtx, *attempt, proposal)
 			if finalizationErr != nil {
 				reportCompactionFailure(attempt.WaiterCommandIDs, finalizationErr)
 				outcome.reply <- contextCompactionOutcomeReply{err: finalizationErr}

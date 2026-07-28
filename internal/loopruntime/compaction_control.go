@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 const compactionControlWaiterCapacity = 64
@@ -90,6 +91,9 @@ type compactionDisposition struct {
 	Kind         compactionDispositionKind
 	Attempt      *compactionAttempt
 	RejectReason event.CompactRejectReason
+	hookScope    *compactionHookScope
+	input        *loop.CompactionInput
+	preRejected  *contextCompactionAwaitResult
 }
 
 // compactionDispositionSink accepts ownership of a start/reject decision made at
@@ -181,6 +185,7 @@ type compactionAttempt struct {
 	Reason           event.CompactionReason
 	Basis            event.ContextBasis
 	StartedAt        time.Time
+	Cause            identity.Cause
 }
 
 type pendingCompaction struct {
@@ -190,6 +195,7 @@ type pendingCompaction struct {
 	basis     event.ContextBasis
 	startedAt time.Time
 	phase     compactionPhase
+	cause     identity.Cause
 }
 
 // compactionControl owns one coalescing slot and a bounded waiter slice. It is
@@ -235,6 +241,11 @@ func (c *compactionControl) admit(request command.Compact, idGen idGenerator) (c
 		waiters:   []compactionWaiter{waiterFromCompact(request)},
 		reason:    compactionReason(request.Agency),
 		phase:     compactionPhasePending,
+		cause: identity.Cause{
+			CommandID:   request.CommandID,
+			Coordinates: request.Cause.Coordinates,
+			Agency:      request.Agency,
+		},
 	}
 	return compactionAdmission{Kind: compactionAdmissionOpened, AttemptID: attemptID}, nil
 }
@@ -355,7 +366,7 @@ func (c *compactionControl) pendingAttempt() *compactionAttempt {
 	}
 	return &compactionAttempt{
 		AttemptID: c.pending.attemptID, WaiterCommandIDs: waiters, Reason: c.pending.reason,
-		Basis: c.pending.basis, StartedAt: c.pending.startedAt,
+		Basis: c.pending.basis, StartedAt: c.pending.startedAt, Cause: c.pending.cause,
 	}
 }
 
