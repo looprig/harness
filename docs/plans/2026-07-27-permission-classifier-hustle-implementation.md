@@ -243,7 +243,9 @@ func (c ReviewContext) Clone() ReviewContext
 
 `BuildReviewContext` validates the non-zero coordinate quartet, non-empty
 context/policy revisions, workspace root, working directory, security ceiling,
-and gate-policy revision. It rejects invalid UTF-8 and zero/negative limits.
+and gate-policy revision. Workspace paths must already be absolute and clean,
+and the working directory must remain within the workspace root. It rejects
+invalid UTF-8 and zero/negative limits.
 It treats the final user-message entry as current intent and the final
 assistant-tool-request entry as the active action. Both must remain represented;
 construction rejects input missing either one so the caller leaves review
