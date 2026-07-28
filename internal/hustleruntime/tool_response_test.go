@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -67,7 +68,7 @@ func TestClassifyToolResponseTerminalAndEvidenceVariants(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := classifyToolResponse(tt.response, known, 256)
+			got, err := classifyToolResponse(tt.response, known, toolResponseLimits{outputBytes: 256, maxCallsPerRound: 16})
 			if err != nil {
 				t.Fatalf("classifyToolResponse() error = %v", err)
 			}
@@ -143,7 +144,7 @@ func TestClassifyToolResponseRejectsInvalidShapesWithoutEcho(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := classifyToolResponse(tt.response, known, 256)
+			got, err := classifyToolResponse(tt.response, known, toolResponseLimits{outputBytes: 256, maxCallsPerRound: 16})
 			if got != nil {
 				t.Fatalf("classifyToolResponse() variant = %T, want nil", got)
 			}
@@ -177,7 +178,7 @@ func TestClassifyToolResponseRejectsFinishReasonContradictions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := classifyToolResponse(tt.response, map[string]struct{}{"workspace.status": {}}, 256)
+			got, err := classifyToolResponse(tt.response, map[string]struct{}{"workspace.status": {}}, toolResponseLimits{outputBytes: 256, maxCallsPerRound: 16})
 			if got != nil {
 				t.Fatalf("variant = %T, want nil", got)
 			}
@@ -215,7 +216,7 @@ func TestClassifyToolResponseEnforcesExactTerminalOutputByteLimit(t *testing.T) 
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := classifyToolResponse(tt.response, nil, tt.limit)
+			got, err := classifyToolResponse(tt.response, nil, toolResponseLimits{outputBytes: tt.limit, maxCallsPerRound: 16})
 			if tt.wantErr {
 				var responseErr *ToolResponseError
 				if got != nil || !errors.As(err, &responseErr) || responseErr.Reason != ToolResponseFailureTooLarge {
@@ -231,6 +232,277 @@ func TestClassifyToolResponseEnforcesExactTerminalOutputByteLimit(t *testing.T) 
 	}
 }
 
+func TestClassifyToolResponseBoundsProviderControlledEvidenceFields(t *testing.T) {
+	t.Parallel()
+
+	const (
+		outputLimit      = 256
+		maxBlockCount    = 4096
+		maxThinkingBytes = 1 << 20
+		maxCallIDBytes   = 1024
+		maxToolNameBytes = 64
+	)
+	exactLengthToolName := strings.Repeat("n", maxToolNameBytes)
+	known := map[string]struct{}{"workspace.status": {}, exactLengthToolName: {}}
+	validCall := func() *content.ToolUseBlock {
+		return &content.ToolUseBlock{
+			ID: "call", Name: "workspace.status", Input: json.RawMessage(`{}`),
+		}
+	}
+
+	exactBlocks := make([]content.Block, maxBlockCount)
+	for index := range exactBlocks {
+		exactBlocks[index] = &content.ThinkingBlock{}
+	}
+	exactBlocks[len(exactBlocks)-1] = validCall()
+	overBlocks := append(append([]content.Block(nil), exactBlocks...), &content.ThinkingBlock{})
+
+	tests := []struct {
+		name     string
+		response *inference.Response
+		wantErr  bool
+	}{
+		{
+			name:     "block count exact",
+			response: toolResponse(stream.FinishReasonToolUse, exactBlocks...),
+		},
+		{
+			name:     "block count one over",
+			response: toolResponse(stream.FinishReasonToolUse, overBlocks...),
+			wantErr:  true,
+		},
+		{
+			name: "thinking bytes exact",
+			response: toolResponse(stream.FinishReasonToolUse,
+				&content.ThinkingBlock{Thinking: strings.Repeat("t", maxThinkingBytes)},
+				validCall(),
+			),
+		},
+		{
+			name: "thinking bytes one over",
+			response: toolResponse(stream.FinishReasonToolUse,
+				&content.ThinkingBlock{Thinking: strings.Repeat("t", maxThinkingBytes+1)},
+				validCall(),
+			),
+			wantErr: true,
+		},
+		{
+			name: "thinking and signature aggregate exact",
+			response: toolResponse(stream.FinishReasonToolUse,
+				&content.ThinkingBlock{
+					Thinking:  strings.Repeat("t", maxThinkingBytes/2),
+					Signature: strings.Repeat("s", maxThinkingBytes/2),
+				},
+				validCall(),
+			),
+		},
+		{
+			name: "thinking and signature aggregate one over",
+			response: toolResponse(stream.FinishReasonToolUse,
+				&content.ThinkingBlock{
+					Thinking:  strings.Repeat("t", maxThinkingBytes/2),
+					Signature: strings.Repeat("s", maxThinkingBytes/2+1),
+				},
+				validCall(),
+			),
+			wantErr: true,
+		},
+		{
+			name: "call id bytes exact",
+			response: toolResponse(stream.FinishReasonToolUse, &content.ToolUseBlock{
+				ID: strings.Repeat("i", maxCallIDBytes), Name: "workspace.status", Input: json.RawMessage(`{}`),
+			}),
+		},
+		{
+			name: "call id bytes one over",
+			response: toolResponse(stream.FinishReasonToolUse, &content.ToolUseBlock{
+				ID: strings.Repeat("i", maxCallIDBytes+1), Name: "workspace.status", Input: json.RawMessage(`{}`),
+			}),
+			wantErr: true,
+		},
+		{
+			name: "tool name bytes exact",
+			response: toolResponse(stream.FinishReasonToolUse, &content.ToolUseBlock{
+				ID: "call", Name: exactLengthToolName, Input: json.RawMessage(`{}`),
+			}),
+		},
+		{
+			name: "tool name bytes one over",
+			response: toolResponse(stream.FinishReasonToolUse, &content.ToolUseBlock{
+				ID: "call", Name: strings.Repeat("n", maxToolNameBytes+1), Input: json.RawMessage(`{}`),
+			}),
+			wantErr: true,
+		},
+		{
+			name: "argument bytes exact",
+			response: toolResponse(stream.FinishReasonToolUse, &content.ToolUseBlock{
+				ID: "call", Name: "workspace.status",
+				Input: json.RawMessage(`{"value":"` + strings.Repeat("a", outputLimit-len(`{"value":""}`)) + `"}`),
+			}),
+		},
+		{
+			name: "argument bytes one over",
+			response: toolResponse(stream.FinishReasonToolUse, &content.ToolUseBlock{
+				ID: "call", Name: "workspace.status",
+				Input: json.RawMessage(`{"value":"` + strings.Repeat("a", outputLimit-len(`{"value":""}`)+1) + `"}`),
+			}),
+			wantErr: true,
+		},
+		{
+			name: "aggregate argument bytes exact",
+			response: toolResponse(stream.FinishReasonToolUse,
+				&content.ToolUseBlock{ID: "a", Name: "workspace.status", Input: json.RawMessage(`{"value":"` + strings.Repeat("a", 112) + `"}`)},
+				&content.ToolUseBlock{ID: "b", Name: "workspace.status", Input: json.RawMessage(`{"value":"` + strings.Repeat("b", 120) + `"}`)},
+			),
+		},
+		{
+			name: "aggregate argument bytes one over",
+			response: toolResponse(stream.FinishReasonToolUse,
+				&content.ToolUseBlock{ID: "a", Name: "workspace.status", Input: json.RawMessage(`{"value":"` + strings.Repeat("a", 112) + `"}`)},
+				&content.ToolUseBlock{ID: "b", Name: "workspace.status", Input: json.RawMessage(`{"value":"` + strings.Repeat("b", 121) + `"}`)},
+			),
+			wantErr: true,
+		},
+	}
+
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := classifyToolResponse(testCase.response, known, toolResponseLimits{outputBytes: outputLimit, maxCallsPerRound: maxBlockCount})
+			if testCase.wantErr {
+				var responseErr *ToolResponseError
+				if got != nil || !errors.As(err, &responseErr) {
+					t.Fatalf("classifyToolResponse() = (%T, %v), want bounded failure", got, err)
+				}
+				if strings.Contains(testCase.name, "one over") && responseErr.Reason != ToolResponseFailureTooLarge {
+					t.Fatalf("reason = %q, want %q", responseErr.Reason, ToolResponseFailureTooLarge)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("classifyToolResponse() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidEvidenceArgumentsEnforcesDepthMemberAndTokenBounds(t *testing.T) {
+	t.Parallel()
+
+	const (
+		maxDepth   = 64
+		maxMembers = 65536
+		maxTokens  = 262144
+	)
+	nested := func(depth int) json.RawMessage {
+		return json.RawMessage(strings.Repeat(`{"v":`, depth) + `0` + strings.Repeat(`}`, depth))
+	}
+	members := func(count int) json.RawMessage {
+		var builder strings.Builder
+		builder.WriteByte('{')
+		for index := 0; index < count; index++ {
+			if index > 0 {
+				builder.WriteByte(',')
+			}
+			builder.WriteString(`"k`)
+			builder.WriteString(strconv.Itoa(index))
+			builder.WriteString(`":0`)
+		}
+		builder.WriteByte('}')
+		return json.RawMessage(builder.String())
+	}
+	arrayTokens := func(values int) json.RawMessage {
+		return json.RawMessage(`{"v":[` + strings.Repeat(`0,`, values-1) + `0]}`)
+	}
+
+	tests := []struct {
+		name  string
+		input json.RawMessage
+		want  bool
+	}{
+		{name: "depth exact", input: nested(maxDepth), want: true},
+		{name: "depth one over", input: nested(maxDepth + 1)},
+		{name: "members exact", input: members(maxMembers), want: true},
+		{name: "members one over", input: members(maxMembers + 1)},
+		{name: "tokens exact", input: arrayTokens(maxTokens - 5), want: true},
+		{name: "tokens one over", input: arrayTokens(maxTokens - 4)},
+		{name: "duplicate nested member", input: json.RawMessage(`{"outer":{"x":1,"x":2}}`)},
+		{name: "non object root", input: json.RawMessage(`[]`)},
+		{name: "trailing value", input: json.RawMessage(`{} {}`)},
+		{name: "malformed", input: json.RawMessage(`{"x":`)},
+	}
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			if got := validEvidenceArguments(testCase.input); got != testCase.want {
+				t.Fatalf("validEvidenceArguments() = %t, want %t", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestPreflightToolResponseEnforcesCallCountBeforeArgumentParsing(t *testing.T) {
+	t.Parallel()
+
+	response := toolResponse(stream.FinishReasonToolUse,
+		&content.ToolUseBlock{ID: "first", Name: "workspace.status", Input: json.RawMessage(`{}`)},
+		&content.ToolUseBlock{
+			ID: "second", Name: "workspace.status",
+			Input: json.RawMessage(`{"malformed":"provider-secret"`),
+		},
+	)
+	got, err := classifyToolResponse(
+		response,
+		map[string]struct{}{"workspace.status": {}},
+		toolResponseLimits{outputBytes: 256, maxCallsPerRound: 1},
+	)
+	var evidenceErr *EvidenceError
+	if got != nil || !errors.As(err, &evidenceErr) ||
+		evidenceErr.Reason != EvidenceFailureCallsPerRoundExceeded {
+		t.Fatalf("classifyToolResponse() = (%T, %v), want pre-parse calls-per-round failure", got, err)
+	}
+}
+
+func TestPreflightToolResponseEnforcesExactAggregateProviderByteLimit(t *testing.T) {
+	t.Parallel()
+
+	const callCount = maxProviderResponseBlocks
+	metadataBytes := callCount * (maxProviderCallIDBytes + maxProviderToolNameBytes)
+	argumentBytes := maxProviderResponseBytes - metadataBytes
+	if argumentBytes <= 0 {
+		t.Fatal("test contract requires positive argument budget")
+	}
+	makeResponse := func(extra int) *inference.Response {
+		blocks := make([]content.Block, callCount)
+		remaining := argumentBytes + extra
+		for index := range blocks {
+			size := remaining / (callCount - index)
+			remaining -= size
+			blocks[index] = &content.ToolUseBlock{
+				ID:    strings.Repeat("i", maxProviderCallIDBytes),
+				Name:  strings.Repeat("n", maxProviderToolNameBytes),
+				Input: json.RawMessage(strings.Repeat(" ", size)),
+			}
+		}
+		return toolResponse(stream.FinishReasonToolUse, blocks...)
+	}
+	limits := toolResponseLimits{
+		outputBytes:      maxProviderResponseBytes,
+		maxCallsPerRound: callCount,
+	}
+	if err := preflightToolResponse(makeResponse(0), limits); err != nil {
+		t.Fatalf("exact aggregate provider bytes rejected: %v", err)
+	}
+	var responseErr *ToolResponseError
+	if err := preflightToolResponse(makeResponse(1), limits); !errors.As(err, &responseErr) ||
+		responseErr.Reason != ToolResponseFailureTooLarge {
+		t.Fatalf("one-over aggregate provider bytes error = %v, want too large", err)
+	}
+}
+
 func TestClassifyToolResponseOwnsReturnedBytes(t *testing.T) {
 	t.Parallel()
 
@@ -238,7 +510,7 @@ func TestClassifyToolResponseOwnsReturnedBytes(t *testing.T) {
 	terminalResponse := toolResponse(stream.FinishReasonToolUse, &content.ToolUseBlock{
 		ID: "terminal", Name: inference.StructuredOutputToolName, Input: terminalInput,
 	})
-	gotTerminal, err := classifyToolResponse(terminalResponse, nil, len(terminalInput))
+	gotTerminal, err := classifyToolResponse(terminalResponse, nil, toolResponseLimits{outputBytes: len(terminalInput), maxCallsPerRound: 1})
 	if err != nil {
 		t.Fatalf("classify terminal: %v", err)
 	}
@@ -251,7 +523,7 @@ func TestClassifyToolResponseOwnsReturnedBytes(t *testing.T) {
 	evidenceResponse := toolResponse(stream.FinishReasonToolUse, &content.ToolUseBlock{
 		ID: "call", Name: "workspace.status", Input: callInput,
 	})
-	gotEvidence, err := classifyToolResponse(evidenceResponse, map[string]struct{}{"workspace.status": {}}, 256)
+	gotEvidence, err := classifyToolResponse(evidenceResponse, map[string]struct{}{"workspace.status": {}}, toolResponseLimits{outputBytes: 256, maxCallsPerRound: 1})
 	if err != nil {
 		t.Fatalf("classify evidence: %v", err)
 	}

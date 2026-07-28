@@ -1078,6 +1078,11 @@ Cover:
 Return a sealed internal variant: terminal or evidence calls, never both.
 Errors contain only bounded shape/reason values.
 
+Preflight the borrowed provider response before cloning or parsing. Enforce the
+configured output/argument and per-round call limits plus the fixed structural
+bounds in design §12.4. Use iterative, depth/member/token-bounded strict JSON
+object validation for ordinary arguments.
+
 **Step 4: Fuzz and run GREEN**
 
 **Step 5: Commit**
@@ -1165,8 +1170,9 @@ Script fake inference responses for:
 **Step 3: Implement the loop**
 
 Keep one execution deadline for the entire run. Clone every provider-owned
-response. Validate request features before each call. Accumulate usage with
-existing normalized arithmetic. Never publish intermediate evidence.
+response only after its read-only structural preflight succeeds. Validate
+request features before each call. Accumulate usage with existing normalized
+arithmetic. Never publish intermediate evidence.
 
 **Step 4: Run GREEN**
 

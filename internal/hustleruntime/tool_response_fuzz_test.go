@@ -3,6 +3,7 @@ package hustleruntime
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/looprig/core/content"
@@ -15,13 +16,15 @@ func FuzzClassifyToolResponse(f *testing.F) {
 	f.Add(uint8(1), uint8(2), `{"path":"README.md"}`, "call-1", "workspace.read", int32(256))
 	f.Add(uint8(2), uint8(1), `not-json`, "", "unknown-secret", int32(1))
 	f.Add(uint8(3), uint8(3), `{"nested":{"value":1}}`, "duplicate", "workspace.status", int32(-1))
+	f.Add(uint8(1), uint8(2), strings.Repeat(`{"v":`, maxEvidenceJSONDepth+1)+`0`+strings.Repeat(`}`, maxEvidenceJSONDepth+1), "deep", "workspace.status", int32(1<<20))
+	f.Add(uint8(1), uint8(2), `{"value":"`+strings.Repeat("a", 257)+`"}`, strings.Repeat("i", maxProviderCallIDBytes+1), "workspace.status", int32(256))
 
 	f.Fuzz(func(t *testing.T, shape, finish uint8, raw, id, name string, limit int32) {
 		response := fuzzToolResponse(shape, finish, raw, id, name)
 		got, err := classifyToolResponse(
 			response,
 			map[string]struct{}{"workspace.status": {}, "workspace.read": {}},
-			int(limit),
+			toolResponseLimits{outputBytes: int(limit), maxCallsPerRound: 2},
 		)
 		if err != nil {
 			if got != nil {
@@ -41,14 +44,23 @@ func FuzzClassifyToolResponse(f *testing.F) {
 			}
 			typed.output[0] ^= 0xff
 		case evidenceToolResponse:
-			if len(typed.calls) == 0 {
-				t.Fatal("empty evidence-call variant")
+			if len(typed.calls) == 0 || len(typed.calls) > 2 ||
+				len(typed.calls) > maxProviderResponseBlocks {
+				t.Fatalf("invalid evidence call count: %d", len(typed.calls))
 			}
+			argumentBytes := 0
 			for _, call := range typed.calls {
 				if call.id == "" || (call.name != "workspace.status" && call.name != "workspace.read") ||
-					len(call.input) == 0 || !json.Valid(call.input) {
+					len(call.id) > maxProviderCallIDBytes ||
+					len(call.name) > maxProviderToolNameBytes ||
+					len(call.input) == 0 || len(call.input) > int(limit) ||
+					!validEvidenceArguments(call.input) {
 					t.Fatalf("invalid evidence call metadata")
 				}
+				argumentBytes += len(call.input)
+			}
+			if argumentBytes > int(limit) {
+				t.Fatalf("aggregate argument bytes = %d, limit = %d", argumentBytes, limit)
 			}
 			typed.calls[0].input[0] ^= 0xff
 		default:

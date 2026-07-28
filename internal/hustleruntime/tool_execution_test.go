@@ -191,9 +191,15 @@ func TestEvidenceExecutionEnforcesRoundAndCallBoundsBeforeWork(t *testing.T) {
 				}
 				blocks := make([]content.Block, testCase.calls)
 				for i := range blocks {
+					input := json.RawMessage(`{"path":"file"}`)
+					if testCase.wantReason == EvidenceFailureCallsPerRoundExceeded && i == len(blocks)-1 {
+						// The call-count bound must win before argument parsing,
+						// cloning, preparation, or execution.
+						input = json.RawMessage(`{"malformed":"provider-secret"`)
+					}
 					blocks[i] = &content.ToolUseBlock{
 						ID: "call-" + string(rune('a'+i)), Name: "workspace_read",
-						Input: json.RawMessage(`{"path":"file"}`),
+						Input: input,
 					}
 				}
 				return &inference.Response{

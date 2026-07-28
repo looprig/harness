@@ -3,6 +3,7 @@ package hustleruntime
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 
@@ -10,6 +11,22 @@ import (
 	"github.com/looprig/inference"
 	"github.com/looprig/inference/stream"
 )
+
+const (
+	maxProviderResponseBlocks = 4096
+	maxProviderThinkingBytes  = 1 << 20
+	maxProviderCallIDBytes    = 1024
+	maxProviderToolNameBytes  = 64
+	maxProviderResponseBytes  = 20 << 20
+	maxEvidenceJSONDepth      = 64
+	maxEvidenceJSONMembers    = 65536
+	maxEvidenceJSONTokens     = 262144
+)
+
+type toolResponseLimits struct {
+	outputBytes      int
+	maxCallsPerRound int
+}
 
 // classifiedToolResponse is a sealed internal union. A successful
 // classification is exactly one terminal result or one non-empty ordered call
@@ -41,10 +58,10 @@ func (evidenceToolResponse) isClassifiedToolResponse() {}
 func classifyToolResponse(
 	response *inference.Response,
 	knownTools map[string]struct{},
-	outputLimit int,
+	limits toolResponseLimits,
 ) (classifiedToolResponse, error) {
-	if response == nil || response.Message == nil || response.Message.Role != content.RoleAssistant {
-		return nil, toolResponseError(ToolResponseFailureInvalidShape)
+	if err := preflightToolResponse(response, limits); err != nil {
+		return nil, err
 	}
 
 	shape, reason := inspectToolResponseBlocks(response.Message.Blocks)
@@ -57,7 +74,7 @@ func classifyToolResponse(
 
 	if shape.textSeen || shape.terminalCount == 1 {
 		rawBytes, overflow := terminalResponseBytes(shape)
-		if outputLimit <= 0 || overflow || rawBytes > outputLimit {
+		if limits.outputBytes <= 0 || overflow || rawBytes > limits.outputBytes {
 			return nil, toolResponseError(ToolResponseFailureTooLarge)
 		}
 		output, err := inference.StructuredMessageResult(response.Message)
@@ -72,6 +89,88 @@ func classifyToolResponse(
 		return nil, toolResponseError(reason)
 	}
 	return evidenceToolResponse{calls: calls}, nil
+}
+
+func preflightToolResponse(response *inference.Response, limits toolResponseLimits) error {
+	if response == nil || response.Message == nil || response.Message.Role != content.RoleAssistant {
+		return toolResponseError(ToolResponseFailureInvalidShape)
+	}
+	blocks := response.Message.Blocks
+	if len(blocks) > maxProviderResponseBlocks {
+		return toolResponseError(ToolResponseFailureTooLarge)
+	}
+
+	ordinaryCalls := 0
+	for _, block := range blocks {
+		switch typed := block.(type) {
+		case *content.TextBlock:
+			if typed == nil {
+				return toolResponseError(ToolResponseFailureInvalidShape)
+			}
+		case *content.ThinkingBlock:
+			if typed == nil {
+				return toolResponseError(ToolResponseFailureInvalidShape)
+			}
+		case *content.ToolUseBlock:
+			if typed == nil {
+				return toolResponseError(ToolResponseFailureInvalidShape)
+			}
+			if typed.Name != inference.StructuredOutputToolName {
+				ordinaryCalls++
+			}
+		case *content.ImageBlock:
+			return toolResponseError(ToolResponseFailureInvalidShape)
+		case *content.AudioBlock:
+			return toolResponseError(ToolResponseFailureInvalidShape)
+		case *content.DocumentBlock:
+			return toolResponseError(ToolResponseFailureInvalidShape)
+		case *content.ToolResultBlock:
+			return toolResponseError(ToolResponseFailureInvalidShape)
+		default:
+			return toolResponseError(ToolResponseFailureInvalidShape)
+		}
+	}
+	if ordinaryCalls > limits.maxCallsPerRound {
+		return evidenceError(EvidenceFailureCallsPerRoundExceeded)
+	}
+
+	totalBytes, thinkingBytes, argumentBytes := 0, 0, 0
+	for _, block := range blocks {
+		switch typed := block.(type) {
+		case *content.TextBlock:
+			if limits.outputBytes <= 0 || len(typed.Text) > limits.outputBytes ||
+				!addWithinLimit(&totalBytes, len(typed.Text), maxProviderResponseBytes) {
+				return toolResponseError(ToolResponseFailureTooLarge)
+			}
+		case *content.ThinkingBlock:
+			if !addWithinLimit(&thinkingBytes, len(typed.Thinking), maxProviderThinkingBytes) ||
+				!addWithinLimit(&thinkingBytes, len(typed.Signature), maxProviderThinkingBytes) ||
+				!addWithinLimit(&totalBytes, len(typed.Thinking), maxProviderResponseBytes) ||
+				!addWithinLimit(&totalBytes, len(typed.Signature), maxProviderResponseBytes) {
+				return toolResponseError(ToolResponseFailureTooLarge)
+			}
+		case *content.ToolUseBlock:
+			if len(typed.ID) > maxProviderCallIDBytes ||
+				len(typed.Name) > maxProviderToolNameBytes ||
+				limits.outputBytes <= 0 ||
+				len(typed.Input) > limits.outputBytes ||
+				!addWithinLimit(&argumentBytes, len(typed.Input), limits.outputBytes) ||
+				!addWithinLimit(&totalBytes, len(typed.ID), maxProviderResponseBytes) ||
+				!addWithinLimit(&totalBytes, len(typed.Name), maxProviderResponseBytes) ||
+				!addWithinLimit(&totalBytes, len(typed.Input), maxProviderResponseBytes) {
+				return toolResponseError(ToolResponseFailureTooLarge)
+			}
+		}
+	}
+	return nil
+}
+
+func addWithinLimit(total *int, increment, limit int) bool {
+	if total == nil || increment < 0 || limit < 0 || *total < 0 || increment > limit-*total {
+		return false
+	}
+	*total += increment
+	return true
 }
 
 type inspectedToolResponse struct {
@@ -196,63 +295,92 @@ func classifyEvidenceCalls(
 
 func validEvidenceArguments(input json.RawMessage) bool {
 	trimmed := bytes.TrimSpace(input)
-	if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
+	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return false
 	}
 	decoder := json.NewDecoder(bytes.NewReader(trimmed))
 	decoder.UseNumber()
-	token, err := decoder.Token()
-	if err != nil || token != json.Delim('{') || !consumeJSONObject(decoder) {
+	tokenCount := 0
+	nextToken := func() (json.Token, error) {
+		if tokenCount >= maxEvidenceJSONTokens {
+			return nil, errEvidenceJSONLimit
+		}
+		token, err := decoder.Token()
+		if err == nil {
+			tokenCount++
+		}
+		return token, err
+	}
+	token, err := nextToken()
+	if err != nil || token != json.Delim('{') {
 		return false
+	}
+
+	type frame struct {
+		kind       json.Delim
+		wantKey    bool
+		objectKeys map[string]struct{}
+	}
+	stack := []frame{{kind: json.Delim('{'), wantKey: true, objectKeys: make(map[string]struct{})}}
+	memberCount := 0
+	for len(stack) > 0 {
+		token, err := nextToken()
+		if err != nil {
+			return false
+		}
+		top := &stack[len(stack)-1]
+		if top.kind == json.Delim('{') && top.wantKey {
+			if token == json.Delim('}') {
+				stack = stack[:len(stack)-1]
+				continue
+			}
+			name, ok := token.(string)
+			if !ok || memberCount >= maxEvidenceJSONMembers {
+				return false
+			}
+			if _, duplicate := top.objectKeys[name]; duplicate {
+				return false
+			}
+			top.objectKeys[name] = struct{}{}
+			memberCount++
+			top.wantKey = false
+			continue
+		}
+
+		if top.kind == json.Delim('[') && token == json.Delim(']') {
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		if delim, ok := token.(json.Delim); ok {
+			if delim != json.Delim('{') && delim != json.Delim('[') ||
+				len(stack) >= maxEvidenceJSONDepth {
+				return false
+			}
+			if top.kind == json.Delim('{') {
+				top.wantKey = true
+			}
+			child := frame{kind: delim}
+			if delim == json.Delim('{') {
+				child.wantKey = true
+				child.objectKeys = make(map[string]struct{})
+			}
+			stack = append(stack, child)
+			continue
+		}
+		if top.kind == json.Delim('{') {
+			top.wantKey = true
+		}
+		switch token.(type) {
+		case nil, bool, string, json.Number:
+		default:
+			return false
+		}
 	}
 	_, err = decoder.Token()
 	return err == io.EOF
 }
 
-func consumeJSONObject(decoder *json.Decoder) bool {
-	members := make(map[string]struct{})
-	for decoder.More() {
-		token, err := decoder.Token()
-		name, ok := token.(string)
-		if err != nil || !ok {
-			return false
-		}
-		if _, duplicate := members[name]; duplicate {
-			return false
-		}
-		members[name] = struct{}{}
-		if !consumeJSONValue(decoder) {
-			return false
-		}
-	}
-	token, err := decoder.Token()
-	return err == nil && token == json.Delim('}')
-}
-
-func consumeJSONArray(decoder *json.Decoder) bool {
-	for decoder.More() {
-		if !consumeJSONValue(decoder) {
-			return false
-		}
-	}
-	token, err := decoder.Token()
-	return err == nil && token == json.Delim(']')
-}
-
-func consumeJSONValue(decoder *json.Decoder) bool {
-	token, err := decoder.Token()
-	if err != nil {
-		return false
-	}
-	switch token {
-	case json.Delim('{'):
-		return consumeJSONObject(decoder)
-	case json.Delim('['):
-		return consumeJSONArray(decoder)
-	default:
-		return true
-	}
-}
+var errEvidenceJSONLimit = errors.New("evidence JSON structural limit")
 
 func toolResponseError(reason ToolResponseFailureReason) *ToolResponseError {
 	return &ToolResponseError{Reason: reason}

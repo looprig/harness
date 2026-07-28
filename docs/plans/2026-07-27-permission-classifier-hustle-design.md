@@ -764,6 +764,23 @@ Sequential execution is deliberate. Evidence gathering is low volume, and
 deterministic order simplifies byte accounting, cancellation, audit, and
 reproduction.
 
+Every complete provider response is preflighted read-only before any response
+block or argument is cloned, parsed, prepared, or executed. The definition's
+`OutputBytes` limit bounds terminal text or terminal arguments exactly and also
+bounds both each ordinary evidence-call argument and their aggregate in one
+round. `MaxCallsPerRound` is enforced during the first shallow block scan, so a
+call-count violation wins before argument parsing.
+
+Structural denial-of-service limits are fixed runtime contract values: at most
+4,096 response blocks, 1 MiB aggregate thinking text and thinking signatures,
+1,024 bytes per call ID, 64 bytes per tool name, and 20 MiB across all
+provider-controlled block strings and argument bytes. Checked arithmetic is
+used throughout. Evidence argument JSON is a strict object with at most 64
+container levels, 65,536 object members across the document, and 262,144
+decoder tokens. Validation is iterative, rejects duplicate keys at every
+object level, and accepts neither a non-object root nor a trailing value.
+Limit failures use closed reasons and never retain provider content.
+
 ### 12.5 Usage
 
 Usage from every inference round is normalized and accumulated with checked

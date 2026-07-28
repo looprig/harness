@@ -437,6 +437,14 @@ func (r *runtimeController) executeEvidenceAttempt(
 		}
 		response, invokeErr := r.invoke(executionCtx, runID, plan.binding.Client, inferenceRequest)
 		rounds++
+		var classified classifiedToolResponse
+		var classifyErr error
+		if invokeErr == nil {
+			classified, classifyErr = classifyToolResponse(response, plan.knownTools, toolResponseLimits{
+				outputBytes:      definition.Limits().OutputBytes,
+				maxCallsPerRound: plan.policy.Limits.MaxCallsPerRound,
+			})
+		}
 		roundUsage, usageErr := responseUsage(response)
 		if usageErr == nil {
 			var addErr error
@@ -457,14 +465,10 @@ func (r *runtimeController) executeEvidenceAttempt(
 		if usageErr != nil {
 			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: usageErr})
 		}
-		ownedResponse, err := ownInferenceResponse(response)
-		if err != nil {
-			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
+		if classifyErr != nil {
+			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, classifyErr)
 		}
-		classified, err := classifyToolResponse(ownedResponse, plan.knownTools, definition.Limits().OutputBytes)
-		if err != nil {
-			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
-		}
+		providerMessage := response.Message
 		switch response := classified.(type) {
 		case terminalToolResponse:
 			result := hustle.Result{Output: append(json.RawMessage(nil), response.output...), Usage: cloneUsage(aggregate)}
@@ -517,7 +521,7 @@ func (r *runtimeController) executeEvidenceAttempt(
 				evidenceBytes += len(encoded)
 				remaining -= len(encoded)
 			}
-			assistant, err := ownAIMessage(ownedResponse.Message)
+			assistant, err := ownAIMessage(providerMessage)
 			if err != nil {
 				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 			}
@@ -612,19 +616,6 @@ func (r *runtimeController) runEvidence(
 		r.owner.poison(&WorkerPoisonError{RunID: runID, Cause: ctx.Err()})
 		return nil, ctx.Err()
 	}
-}
-
-func ownInferenceResponse(response *inference.Response) (*inference.Response, error) {
-	if response == nil {
-		return nil, nil
-	}
-	message, err := ownAIMessage(response.Message)
-	if err != nil {
-		return nil, toolResponseError(ToolResponseFailureInvalidShape)
-	}
-	return &inference.Response{
-		Message: message, Usage: cloneUsage(response.Usage), Model: response.Model, FinishReason: response.FinishReason,
-	}, nil
 }
 
 func ownAIMessage(message *content.AIMessage) (*content.AIMessage, error) {
