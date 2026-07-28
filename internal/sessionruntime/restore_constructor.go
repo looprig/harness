@@ -55,8 +55,15 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 		var compactor loopruntime.Compactor
 		compactor, err = s.compactorFor(bound, started.LoopID)
 		if err == nil {
-			backend, err = loopruntime.NewRestoredWithCompactor(
-				loopCtx, s.sessionID, started.LoopID, parent, s, bound, restoredStateFrom(folded, ri), compactor,
+			backend, err = loopruntime.NewRestoredWithRuntime(
+				loopCtx,
+				s.sessionID,
+				started.LoopID,
+				parent,
+				s,
+				bound,
+				restoredStateFrom(folded, ri),
+				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks},
 			)
 		}
 	default:
@@ -158,6 +165,7 @@ func restoreTopologySession(
 		releaseLease(lease)
 		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
 	}
+	j = journal.WithHooks(j, probe.hooks, sessionID)
 	// The replayer is bound to the stream BEGINNING (FromSeq 0). Restore intentionally
 	// drains RECORDS, not events, so the private GatePreparedRecord is visible while the
 	// normal event-based folds are derived from EventRecord payloads. Opening it is a
@@ -752,6 +760,10 @@ func buildRestoredSession(
 	now event.Clock,
 	opts ...Option,
 ) (*Session, error) {
+	commandAppender, err := journal.NewJournalCommandAppenderChecked(j)
+	if err != nil {
+		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
+	}
 	s := &Session{
 		sessionID:                sessionID,
 		sessionCtx:               sessionCtx,
@@ -760,7 +772,7 @@ func buildRestoredSession(
 		loops:                    make(map[uuid.UUID]*loopHandle),
 		newID:                    newID,
 		now:                      now,
-		cmdAppender:              nopCommandAppender{},
+		cmdAppender:              commandAppender,
 		factory:                  factory,
 		// Re-seed the cumulative spawn counter from the durable non-root LoopStarted count
 		// so the quota survives restart (§16.3). Set before the session is reachable, so no
@@ -777,10 +789,10 @@ func buildRestoredSession(
 		gateAppender:        nopGateAppender{},
 		checkpointAdmission: newCheckpointAdmissionGate(),
 	}
-	// Apply the same opts the probe read (WithCommandAppender wires the durable intent
-	// log; WithAllowConfigMismatch is a no-op here — already consumed; WithLimits sets the
-	// spawn caps the restored session enforces against the re-seeded counter). A nil
-	// appender option leaves the nop default installed.
+	// Apply the same opts the probe read (WithCommandAppender may replace the durable
+	// journal adapter for a direct/test caller; WithAllowConfigMismatch is a no-op here —
+	// already consumed; WithLimits sets the spawn caps the restored session enforces
+	// against the re-seeded counter). A nil appender option leaves the journal adapter.
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -842,8 +854,15 @@ func buildRestoredSession(
 		var compactor loopruntime.Compactor
 		compactor, err = s.compactorFor(cfg, rootLoopID)
 		if err == nil {
-			l, err = loopruntime.NewRestoredWithCompactor(
-				loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg, restoredStateFrom(folded, ri), compactor,
+			l, err = loopruntime.NewRestoredWithRuntime(
+				loopCtx,
+				sessionID,
+				rootLoopID,
+				loop.Provenance{},
+				s,
+				cfg,
+				restoredStateFrom(folded, ri),
+				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks},
 			)
 		}
 	default:

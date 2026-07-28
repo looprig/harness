@@ -7,6 +7,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreign"
+	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/sessionstore"
@@ -92,6 +93,7 @@ func (e *NewSessionError) Unwrap() error { return e.Cause }
 type Lifecycle struct {
 	topology Topology
 	store    *sessionstore.Store
+	hooks    *hook.Runner
 
 	// catalog is the derived session-index each session's event appender notifies (via
 	// journal.WithCatalog) after each durable append, so the replay-free status fold stays
@@ -225,6 +227,14 @@ func WithLifecyclePlacement(p WorkspacePlacement) LifecycleOption {
 // nil/zero argument is ignored (the default is kept), mirroring the session options' own
 // fail-safe convention.
 type LifecycleOption func(*Lifecycle)
+
+// WithLifecycleHooks captures one immutable compiled runner for every native
+// loop and journal built by NewSession or RestoreSession.
+func WithLifecycleHooks(runner *hook.Runner) LifecycleOption {
+	return func(lifecycle *Lifecycle) {
+		lifecycle.hooks = runner
+	}
+}
 
 // WithLifecycleLimits captures the in-session subagent-spawn safety caps (depth + quota) the
 // session enforces. Forwarded to both NewSession and RestoreSession as WithLimits.
@@ -389,6 +399,7 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 		releaseLease(lease)
 		return nil, &NewSessionError{Kind: NewSessionJournalFailed, Cause: err}
 	}
+	j = journal.WithHooks(j, r.hooks, sid)
 	evAp, err := journal.NewJournalEventAppenderChecked(j, journal.WithCatalog(r.catalog))
 	if err != nil {
 		releaseLease(lease)
@@ -412,6 +423,7 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	opts = append(opts, r.baseOpts...)
 	opts = append(opts, withSessionHustles(r.hustles, r.hustleLimits))
 	opts = append(opts,
+		WithHooks(r.hooks),
 		WithSessionID(sid),
 		WithEventAppender(evAp),
 		WithCommandAppender(cmdAp),
@@ -506,6 +518,7 @@ func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session,
 	opts := make([]Option, 0, len(r.baseOpts)+2)
 	opts = append(opts, r.baseOpts...)
 	opts = append(opts, withSessionHustles(r.hustles, r.hustleLimits))
+	opts = append(opts, WithHooks(r.hooks))
 	if r.frozenFingerprint != nil {
 		opts = append(opts, WithFingerprint(*r.frozenFingerprint))
 	} else {

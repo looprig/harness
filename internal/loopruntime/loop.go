@@ -257,7 +257,7 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 // mode-selective spawn, so a child begins in the requested mode without a synthetic
 // LoopModeChanged. An unknown mode name fails with the same typed BindError Bind uses.
 func NewInMode(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance, events eventPublisher, bound loop.BoundDefinition, initialMode loop.ModeName) (*Loop, error) {
-	return NewInModeWithCompactor(loopCtx, sessionID, loopID, parent, events, bound, initialMode, nil)
+	return NewInModeWithRuntime(loopCtx, sessionID, loopID, parent, events, bound, initialMode, RuntimeDependencies{})
 }
 
 // NewInModeWithCompactor is the focused native composition seam for a loop whose
@@ -273,11 +273,34 @@ func NewInModeWithCompactor(
 	initialMode loop.ModeName,
 	compactor Compactor,
 ) (*Loop, error) {
+	return NewInModeWithRuntime(
+		loopCtx,
+		sessionID,
+		loopID,
+		parent,
+		events,
+		bound,
+		initialMode,
+		RuntimeDependencies{Compactor: compactor},
+	)
+}
+
+// NewInModeWithRuntime constructs a native loop with its runtime-only
+// dependencies while keeping the declarative definition immutable.
+func NewInModeWithRuntime(
+	loopCtx context.Context,
+	sessionID, loopID uuid.UUID,
+	parent loop.Provenance,
+	events eventPublisher,
+	bound loop.BoundDefinition,
+	initialMode loop.ModeName,
+	deps RuntimeDependencies,
+) (*Loop, error) {
 	cfg, err := configFromBound(bound, initialMode)
 	if err != nil {
 		return nil, err
 	}
-	if err := installCompactionExecutor(loopCtx, &cfg, compactor); err != nil {
+	if err := installRuntimeDependencies(loopCtx, &cfg, deps); err != nil {
 		return nil, err
 	}
 	resolved := initialMode
@@ -285,6 +308,14 @@ func NewInModeWithCompactor(
 		resolved = bound.InitialMode()
 	}
 	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, bound, resolved, nil)
+}
+
+func installRuntimeDependencies(ctx context.Context, cfg *runtimeConfig, deps RuntimeDependencies) error {
+	if err := installCompactionExecutor(ctx, cfg, deps.Compactor); err != nil {
+		return err
+	}
+	cfg.Hooks = deps.Hooks
+	return nil
 }
 
 func newWithConfig(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance, events eventPublisher, cfg runtimeConfig) (*Loop, error) {

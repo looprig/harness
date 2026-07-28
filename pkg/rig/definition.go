@@ -183,6 +183,7 @@ func Define(options ...Option) (*Rig, error) {
 	}
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleFingerprint(fingerprint))
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleManifest(manifest))
+	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleHooks(state.compiledHooks))
 	primerNames := make([]identity.AgentName, len(state.primers))
 	for i, name := range state.primers {
 		primerNames[i] = identity.AgentName(name)

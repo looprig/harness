@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
+	"sync/atomic"
 	"testing"
 
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/journal"
@@ -76,6 +79,64 @@ func TestDefineCompilesAroundOnlyHooksWithoutPolicyRevision(t *testing.T) {
 	if rig.hooks == nil {
 		t.Fatal("Define did not retain compiled hooks for lifecycle handoff")
 	}
+}
+
+func TestCompiledHooksReachNewAndRestoredSessionJournals(t *testing.T) {
+	t.Parallel()
+
+	var appends atomic.Int64
+	var familiesMu sync.Mutex
+	var families []hook.RecordFamily
+	defined, _ := defineHookRig(t, hook.Set{Around: []hook.Around{{
+		Operation: hook.OperationJournalAppend,
+		Begin: func(ctx context.Context, call hook.Call) (context.Context, hook.FinishFunc) {
+			if call.JournalAppend == nil {
+				t.Error("journal hook received nil payload")
+			} else {
+				familiesMu.Lock()
+				families = append(families, call.JournalAppend.Family)
+				familiesMu.Unlock()
+			}
+			appends.Add(1)
+			return ctx, nil
+		},
+	}}})
+
+	live, err := defined.NewSession(context.Background())
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	sessionID := live.SessionID()
+	if appends.Load() == 0 {
+		t.Fatal("NewSession journal did not receive compiled hooks")
+	}
+	if err := live.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	beforeRestore := appends.Load()
+	restored, err := defined.RestoreSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("RestoreSession: %v", err)
+	}
+	t.Cleanup(func() { _ = restored.Shutdown(context.Background()) })
+	if appends.Load() <= beforeRestore {
+		t.Fatal("RestoreSession journal did not receive compiled hooks")
+	}
+	familiesMu.Lock()
+	families = nil
+	familiesMu.Unlock()
+	if _, err := restored.Submit(context.Background(), []content.Block{&content.TextBlock{Text: "observe restored command"}}); err != nil {
+		t.Fatalf("restored Submit: %v", err)
+	}
+	familiesMu.Lock()
+	defer familiesMu.Unlock()
+	for _, family := range families {
+		if family == hook.RecordCommand {
+			return
+		}
+	}
+	t.Fatal("restored session command appender did not use the hooked journal")
 }
 
 func TestAroundCallbacksDoNotChangeManifest(t *testing.T) {

@@ -63,7 +63,7 @@ type RestoredState struct {
 // RestoredState (empty Msgs, zero TurnIndex) yields a loop indistinguishable from a
 // freshly New'd one.
 func NewRestored(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance, events eventPublisher, bound loop.BoundDefinition, seed RestoredState) (*Loop, error) {
-	return NewRestoredWithCompactor(loopCtx, sessionID, loopID, parent, events, bound, seed, nil)
+	return NewRestoredWithRuntime(loopCtx, sessionID, loopID, parent, events, bound, seed, RuntimeDependencies{})
 }
 
 // NewRestoredWithCompactor is the restored counterpart to
@@ -77,6 +77,29 @@ func NewRestoredWithCompactor(
 	bound loop.BoundDefinition,
 	seed RestoredState,
 	compactor Compactor,
+) (*Loop, error) {
+	return NewRestoredWithRuntime(
+		loopCtx,
+		sessionID,
+		loopID,
+		parent,
+		events,
+		bound,
+		seed,
+		RuntimeDependencies{Compactor: compactor},
+	)
+}
+
+// NewRestoredWithRuntime is the restored counterpart to
+// NewInModeWithRuntime.
+func NewRestoredWithRuntime(
+	loopCtx context.Context,
+	sessionID, loopID uuid.UUID,
+	parent loop.Provenance,
+	events eventPublisher,
+	bound loop.BoundDefinition,
+	seed RestoredState,
+	deps RuntimeDependencies,
 ) (*Loop, error) {
 	// Resolve config at the RESTORED mode (last LoopModeChanged) rather than the definition's
 	// initial mode, so a loop that changed mode before teardown resumes under it. When the
@@ -102,7 +125,7 @@ func NewRestoredWithCompactor(
 		cfg.Model.Sampling = cfg.Model.Sampling.Clone()
 		cfg.Model.Sampling.Effort = seed.Runtime.Effort
 	}
-	if err := installCompactionExecutor(loopCtx, &cfg, compactor); err != nil {
+	if err := installRuntimeDependencies(loopCtx, &cfg, deps); err != nil {
 		return nil, err
 	}
 	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, bound, modeName, &seed)
