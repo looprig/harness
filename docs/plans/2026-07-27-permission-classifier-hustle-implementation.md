@@ -146,7 +146,73 @@ git add pkg/gate/review.go pkg/gate/review_test.go pkg/gate/deps_test.go
 git commit -m "feat(gate): add permission review taxonomy"
 ```
 
-## Task 2: Add review basis, subject cloning, canonical wire, and digest
+## Task 2: Add authority-labeled review context and deterministic truncation
+
+**Files:**
+
+- Create: `pkg/gate/review_context.go`
+- Create: `pkg/gate/review_context_test.go`
+- Create: `pkg/gate/review_context_fuzz_test.go`
+
+**Step 1: Write failing construction tests**
+
+Specify:
+
+```go
+type ReviewContextOrigin string
+type ReviewContextKind string
+
+type ReviewContextEntry struct {
+    Origin    ReviewContextOrigin
+    Kind      ReviewContextKind
+    Content   string
+    Truncated bool
+}
+
+type ReviewContextPolicy struct {
+    Revision             string
+    MaxBytes             int
+    MaxEntries           int
+    MaxUserEntryBytes    int
+    MaxAgentEntryBytes   int
+    MaxToolEntryBytes    int
+    MaxActiveActionBytes int
+}
+```
+
+Tests must cover user/assistant/tool/runtime/external/omission origins,
+defensive cloning, UTF-8-safe prefix/suffix truncation, stable omission
+markers, retention of current user intent, retention of the active assistant
+tool request, exact limits, one-byte-over limits, and material-truncation
+classification.
+
+**Step 2: Verify RED**
+
+Expected: compile failure.
+
+**Step 3: Implement deterministic builder**
+
+Keep raw `content.AgenticMessages` out of the public review domain. Accept
+already-labeled builder entries and return an immutable value. The loop adapter
+will own conversion from conversation types in Phase 4.
+
+The builder must reject invalid UTF-8 and zero/negative limits and must never
+silently omit an entry.
+
+**Step 4: Add fuzz coverage**
+
+Fuzz arbitrary UTF-8/invalid byte boundaries and limits. Assert output remains
+valid UTF-8, bounded, and deterministic.
+
+**Step 5: Run GREEN and commit**
+
+```bash
+git add pkg/gate/review_context.go pkg/gate/review_context_test.go \
+  pkg/gate/review_context_fuzz_test.go
+git commit -m "feat(gate): add bounded authority-labeled review context"
+```
+
+## Task 3: Add review basis, subject cloning, canonical wire, and digest
 
 **Files:**
 
@@ -232,72 +298,6 @@ git add pkg/gate/review_subject.go pkg/gate/review_subject_test.go \
   pkg/gate/review_wire.go pkg/gate/review_wire_test.go \
   pkg/gate/review_fuzz_test.go
 git commit -m "feat(gate): bind reviews to canonical subjects"
-```
-
-## Task 3: Add authority-labeled review context and deterministic truncation
-
-**Files:**
-
-- Create: `pkg/gate/review_context.go`
-- Create: `pkg/gate/review_context_test.go`
-- Create: `pkg/gate/review_context_fuzz_test.go`
-
-**Step 1: Write failing construction tests**
-
-Specify:
-
-```go
-type ReviewContextOrigin string
-type ReviewContextKind string
-
-type ReviewContextEntry struct {
-    Origin    ReviewContextOrigin
-    Kind      ReviewContextKind
-    Content   string
-    Truncated bool
-}
-
-type ReviewContextPolicy struct {
-    Revision            string
-    MaxBytes            int
-    MaxEntries          int
-    MaxUserEntryBytes   int
-    MaxAgentEntryBytes  int
-    MaxToolEntryBytes   int
-    MaxActiveActionBytes int
-}
-```
-
-Tests must cover user/assistant/tool/runtime/external/omission origins,
-defensive cloning, UTF-8-safe prefix/suffix truncation, stable omission
-markers, retention of current user intent, retention of the active assistant
-tool request, exact limits, one-byte-over limits, and material-truncation
-classification.
-
-**Step 2: Verify RED**
-
-Expected: compile failure.
-
-**Step 3: Implement deterministic builder**
-
-Keep raw `content.AgenticMessages` out of the public review domain. Accept
-already-labeled builder entries and return an immutable value. The loop adapter
-will own conversion from conversation types in Phase 4.
-
-The builder must reject invalid UTF-8 and zero/negative limits and must never
-silently omit an entry.
-
-**Step 4: Add fuzz coverage**
-
-Fuzz arbitrary UTF-8/invalid byte boundaries and limits. Assert output remains
-valid UTF-8, bounded, and deterministic.
-
-**Step 5: Run GREEN and commit**
-
-```bash
-git add pkg/gate/review_context.go pkg/gate/review_context_test.go \
-  pkg/gate/review_context_fuzz_test.go
-git commit -m "feat(gate): add bounded authority-labeled review context"
 ```
 
 ## Task 4: Add assessment validation, local policy, and conjunction
