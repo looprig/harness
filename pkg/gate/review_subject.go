@@ -171,6 +171,7 @@ func validateBuiltReviewContext(context ReviewContext) error {
 	activeAction := -1
 	omissions := 0
 	truncatedEntries := 0
+	var explainedNonBudget ReviewTruncationMask
 	for index, entry := range context.Entries {
 		if !utf8.ValidString(string(entry.Origin)) ||
 			!utf8.ValidString(string(entry.Kind)) ||
@@ -187,7 +188,6 @@ func validateBuiltReviewContext(context ReviewContext) error {
 			omissions++
 			if entry.Truncated ||
 				context.Truncation.OmittedEntries <= 0 ||
-				context.Truncation.OmittedBytes <= 0 ||
 				entry.Content != reviewContextOmissionMarker(
 					context.Truncation.OmittedEntries,
 					context.Truncation.OmittedBytes,
@@ -199,13 +199,14 @@ func validateBuiltReviewContext(context ReviewContext) error {
 			truncatedEntries++
 			entryMask := reviewTruncationMaskForEntry(entry)
 			exercised := context.Truncation.Applied & entryMask
+			explainedNonBudget |= exercised
 			markerIndex := strings.Index(entry.Content, reviewContextTruncationMarker)
 			if exercised == 0 ||
 				markerIndex <= 0 ||
 				markerIndex+len(reviewContextTruncationMarker) >= len(entry.Content) ||
 				strings.Count(entry.Content, reviewContextTruncationMarker) != 1 ||
 				materialReviewContextKind(entry.Kind) &&
-					context.Truncation.Material&exercised == 0 {
+					context.Truncation.Material&exercised != exercised {
 				return reviewContextError(ReviewValidationFieldContextEntry, ReviewValidationInvalid)
 			}
 		}
@@ -215,6 +216,10 @@ func validateBuiltReviewContext(context ReviewContext) error {
 	}
 	if context.Entries[activeAction].Truncated {
 		return reviewContextError(ReviewValidationFieldContextEntry, ReviewValidationInvalid)
+	}
+	if context.Truncation.Applied&reviewNonBudgetTruncationMask&^explainedNonBudget != 0 ||
+		context.Truncation.Material&reviewNonBudgetTruncationMask&^explainedNonBudget != 0 {
+		return reviewContextError(ReviewValidationFieldContext, ReviewValidationInvalid)
 	}
 	hasOmissions := context.Truncation.OmittedEntries > 0
 	hasBudgetTruncation := context.Truncation.Applied&reviewBudgetTruncationMask != 0
@@ -235,6 +240,12 @@ func validateBuiltReviewContext(context ReviewContext) error {
 const reviewBudgetTruncationMask = ReviewTruncationEntryCount |
 	ReviewTruncationTotalBytes |
 	ReviewTruncationEstimatedTokens
+
+const reviewNonBudgetTruncationMask = ReviewTruncationUserEntry |
+	ReviewTruncationAssistantEntry |
+	ReviewTruncationToolEntry |
+	ReviewTruncationBlock |
+	ReviewTruncationActiveAction
 
 func reviewTruncationMaskForEntry(entry ReviewContextEntry) ReviewTruncationMask {
 	switch entry.Kind {

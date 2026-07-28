@@ -257,6 +257,59 @@ func TestPermissionReviewSubjectRejectsImpossibleTruncationMetadata(t *testing.T
 	}
 }
 
+func TestPermissionReviewSubjectRejectsUnexplainedTruncationMasks(t *testing.T) {
+	t.Parallel()
+
+	const marker = "\n…[review context truncated]…\n"
+	tests := []struct {
+		name   string
+		mutate func(*gate.ReviewContext)
+	}{
+		{name: "active action", mutate: func(c *gate.ReviewContext) {
+			c.Truncation.Applied = gate.ReviewTruncationActiveAction
+		}},
+		{name: "user", mutate: func(c *gate.ReviewContext) {
+			c.Truncation.Applied = gate.ReviewTruncationUserEntry
+		}},
+		{name: "assistant", mutate: func(c *gate.ReviewContext) {
+			c.Truncation.Applied = gate.ReviewTruncationAssistantEntry
+		}},
+		{name: "tool", mutate: func(c *gate.ReviewContext) {
+			c.Truncation.Applied = gate.ReviewTruncationToolEntry
+		}},
+		{name: "block", mutate: func(c *gate.ReviewContext) {
+			c.Truncation.Applied = gate.ReviewTruncationBlock
+		}},
+		{name: "material entry missing one exercised bit", mutate: func(c *gate.ReviewContext) {
+			c.Entries[0].Content = "prefix" + marker + "suffix"
+			c.Entries[0].Truncated = true
+			c.Truncation.Applied = gate.ReviewTruncationUserEntry |
+				gate.ReviewTruncationBlock
+			c.Truncation.Material = gate.ReviewTruncationUserEntry
+		}},
+		{name: "unexplained material bit", mutate: func(c *gate.ReviewContext) {
+			c.Entries[0].Content = "prefix" + marker + "suffix"
+			c.Entries[0].Truncated = true
+			c.Truncation.Applied = gate.ReviewTruncationUserEntry |
+				gate.ReviewTruncationAssistantEntry
+			c.Truncation.Material = gate.ReviewTruncationUserEntry |
+				gate.ReviewTruncationAssistantEntry
+		}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			basis, request, context := validPermissionReviewSubjectInput()
+			tt.mutate(&context)
+			got, err := gate.NewPermissionReviewSubject(basis, request, context)
+			if err == nil || !reflect.DeepEqual(got, gate.PermissionReviewSubject{}) {
+				t.Fatalf("NewPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+			}
+		})
+	}
+}
+
 func TestPermissionReviewSubjectErrorsDoNotEchoContents(t *testing.T) {
 	t.Parallel()
 

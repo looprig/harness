@@ -244,6 +244,106 @@ func TestReviewSubjectWireRejectsNullForEveryScalarFamily(t *testing.T) {
 	}
 }
 
+func TestReviewSubjectWireRejectsUnexplainedTruncationMasks(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*ReviewContext)
+	}{
+		{name: "active action", mutate: func(c *ReviewContext) {
+			c.Truncation.Applied = ReviewTruncationActiveAction
+		}},
+		{name: "user", mutate: func(c *ReviewContext) {
+			c.Truncation.Applied = ReviewTruncationUserEntry
+		}},
+		{name: "assistant", mutate: func(c *ReviewContext) {
+			c.Truncation.Applied = ReviewTruncationAssistantEntry
+		}},
+		{name: "tool", mutate: func(c *ReviewContext) {
+			c.Truncation.Applied = ReviewTruncationToolEntry
+		}},
+		{name: "block", mutate: func(c *ReviewContext) {
+			c.Truncation.Applied = ReviewTruncationBlock
+		}},
+		{name: "partial material", mutate: func(c *ReviewContext) {
+			c.Entries[0].Content = "p\n…[review context truncated]…\ns"
+			c.Entries[0].Truncated = true
+			c.Truncation.Applied = ReviewTruncationUserEntry | ReviewTruncationBlock
+			c.Truncation.Material = ReviewTruncationUserEntry
+		}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			subject := validPermissionReviewSubject(t)
+			tt.mutate(&subject.Context)
+			data := marshalUncheckedPermissionReviewSubject(t, subject)
+			got, err := unmarshalPermissionReviewSubject(data)
+			if err == nil || !reflect.DeepEqual(got, PermissionReviewSubject{}) {
+				t.Fatalf("unmarshalPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+			}
+		})
+	}
+}
+
+func TestReviewSubjectWireRoundTripsBuilderTruncationAndZeroByteOmission(t *testing.T) {
+	t.Parallel()
+
+	t.Run("per-kind and block bits", func(t *testing.T) {
+		base := validPermissionReviewSubject(t)
+		input := base.Context.Clone()
+		input.Entries = append([]ReviewContextEntry{{
+			Origin: ReviewContextOriginTool, Kind: ReviewContextKindToolResult,
+			Content: strings.Repeat("tool-evidence", 40),
+		}}, input.Entries...)
+		policy := reviewContextWireTestPolicy()
+		policy.MaxToolEntryBytes = 96
+		policy.MaxBlockBytes = 64
+		built, err := BuildReviewContext(input, policy)
+		if err != nil {
+			t.Fatalf("BuildReviewContext() error = %v", err)
+		}
+		want := ReviewTruncationToolEntry | ReviewTruncationBlock
+		if built.Truncation.Applied != want || built.Truncation.Material != want {
+			t.Fatalf("Truncation = %#v, want both masks %#x", built.Truncation, want)
+		}
+		assertPermissionReviewContextWireRoundTrip(t, base, built)
+	})
+
+	t.Run("zero-byte omission", func(t *testing.T) {
+		base := validPermissionReviewSubject(t)
+		input := base.Context.Clone()
+		input.Entries = append([]ReviewContextEntry{
+			{
+				Origin: ReviewContextOriginAssistant, Kind: ReviewContextKindAssistantMessage,
+				Content: "",
+			},
+			{
+				Origin: ReviewContextOriginAssistant, Kind: ReviewContextKindAssistantMessage,
+				Content: "",
+			},
+		}, input.Entries...)
+		policy := reviewContextWireTestPolicy()
+		policy.MaxEntries = 3
+		built, err := BuildReviewContext(input, policy)
+		if err != nil {
+			t.Fatalf("BuildReviewContext() error = %v", err)
+		}
+		if built.Truncation.OmittedEntries != 2 ||
+			built.Truncation.OmittedBytes != 0 ||
+			built.Truncation.Applied != ReviewTruncationEntryCount ||
+			built.Truncation.Material != ReviewTruncationEntryCount {
+			t.Fatalf("Truncation = %#v, want two zero-byte material omissions", built.Truncation)
+		}
+		if built.Entries[0].Content != "omitted_entries=2 omitted_bytes=0" {
+			t.Fatalf("omission marker = %q", built.Entries[0].Content)
+		}
+		assertPermissionReviewContextWireRoundTrip(t, base, built)
+	})
+}
+
 func TestReviewSubjectDigestKnownFixture(t *testing.T) {
 	t.Parallel()
 
@@ -345,6 +445,51 @@ func reviewContextWireTestPolicy() ReviewContextPolicy {
 		MaxToolEntryBytes:    4096,
 		MaxBlockBytes:        4096,
 		MaxActiveActionBytes: 4096,
+	}
+}
+
+func marshalUncheckedPermissionReviewSubject(
+	t testing.TB,
+	subject PermissionReviewSubject,
+) []byte {
+	t.Helper()
+	subject.Basis.SubjectDigest = [32]byte{}
+	digest, err := permissionReviewSubjectDigest(subject)
+	if err != nil {
+		t.Fatalf("permissionReviewSubjectDigest() error = %v", err)
+	}
+	subject.Basis.SubjectDigest = digest
+	data, err := json.Marshal(
+		permissionReviewSubjectToWire(subject, hex.EncodeToString(digest[:])),
+	)
+	if err != nil {
+		t.Fatalf("json.Marshal(subject wire) error = %v", err)
+	}
+	return data
+}
+
+func assertPermissionReviewContextWireRoundTrip(
+	t testing.TB,
+	base PermissionReviewSubject,
+	context ReviewContext,
+) {
+	t.Helper()
+	basis := base.Basis
+	basis.SubjectDigest = [32]byte{}
+	subject, err := NewPermissionReviewSubject(basis, base.Request, context)
+	if err != nil {
+		t.Fatalf("NewPermissionReviewSubject() error = %v", err)
+	}
+	data, err := marshalPermissionReviewSubject(subject)
+	if err != nil {
+		t.Fatalf("marshalPermissionReviewSubject() error = %v", err)
+	}
+	got, err := unmarshalPermissionReviewSubject(data)
+	if err != nil {
+		t.Fatalf("unmarshalPermissionReviewSubject() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, subject) {
+		t.Fatalf("round trip = %#v, want %#v", got, subject)
 	}
 }
 

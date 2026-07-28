@@ -321,8 +321,10 @@ func TestPermissionReviewAssessmentValidationAndPolicy(t *testing.T) {
 			a.Rationale = "high risk"
 		}, reason: gate.ReviewDecisionAuthorization},
 		{name: "intrinsic material", mutate: func(s *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
-			s.Context.Truncation.Applied = gate.ReviewTruncationToolEntry
-			s.Context.Truncation.Material = gate.ReviewTruncationToolEntry
+			s.Context.Entries[0].Content = "p\n…[review context truncated]…\ns"
+			s.Context.Entries[0].Truncated = true
+			s.Context.Truncation.Applied = gate.ReviewTruncationUserEntry
+			s.Context.Truncation.Material = gate.ReviewTruncationUserEntry
 			digest, err := gate.SubjectDigest(*s)
 			if err != nil {
 				panic(err)
@@ -389,6 +391,64 @@ func TestPermissionReviewAssessmentCannotStampMalformedContext(t *testing.T) {
 	)
 	if got.Eligible || got.Reason != gate.ReviewDecisionInvalidAssessment {
 		t.Fatalf("decision = %#v, want invalid assessment", got)
+	}
+}
+
+func TestPermissionReviewAssessmentRejectsUnexplainedTruncationMasks(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*gate.ReviewContext)
+	}{
+		{name: "active action", mutate: func(c *gate.ReviewContext) {
+			c.Truncation.Applied = gate.ReviewTruncationActiveAction
+		}},
+		{name: "user", mutate: func(c *gate.ReviewContext) {
+			c.Truncation.Applied = gate.ReviewTruncationUserEntry
+		}},
+		{name: "assistant", mutate: func(c *gate.ReviewContext) {
+			c.Truncation.Applied = gate.ReviewTruncationAssistantEntry
+		}},
+		{name: "tool", mutate: func(c *gate.ReviewContext) {
+			c.Truncation.Applied = gate.ReviewTruncationToolEntry
+		}},
+		{name: "block", mutate: func(c *gate.ReviewContext) {
+			c.Truncation.Applied = gate.ReviewTruncationBlock
+		}},
+		{name: "partial material", mutate: func(c *gate.ReviewContext) {
+			c.Entries[0].Content = "p\n…[review context truncated]…\ns"
+			c.Entries[0].Truncated = true
+			c.Truncation.Applied = gate.ReviewTruncationUserEntry |
+				gate.ReviewTruncationBlock
+			c.Truncation.Material = gate.ReviewTruncationUserEntry
+		}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			subject := validPermissionReviewSubject(t)
+			tt.mutate(&subject.Context)
+			digest, err := gate.SubjectDigest(subject)
+			if err == nil {
+				subject.Basis.SubjectDigest = digest
+			}
+			assessment := validPermissionAssessment(
+				subject,
+				gate.ReviewRiskLow,
+				gate.ReviewAuthorizationUnknown,
+				gate.ReviewAllow,
+			)
+			got := gate.EvaluatePermissionAssessment(
+				mustDefaultPermissionReviewPolicy(t, "gate-policy-v1"),
+				subject,
+				assessment,
+			)
+			if got.Eligible || got.Reason != gate.ReviewDecisionInvalidAssessment {
+				t.Fatalf("decision = %#v, want invalid assessment", got)
+			}
+		})
 	}
 }
 
