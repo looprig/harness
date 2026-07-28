@@ -105,6 +105,19 @@ func bindableEvidenceDefinition(
 	return definition
 }
 
+func bindEvidenceForTest(
+	t *testing.T,
+	definition Definition,
+	bindings EvidenceBindings,
+) ([]BoundEvidenceTool, error) {
+	t.Helper()
+	bound, err := definition.Bind(context.Background(), Bindings{})
+	if err != nil {
+		return nil, err
+	}
+	return bound.BindEvidenceTools(context.Background(), bindings)
+}
+
 func TestBindEvidenceToolsAttenuatesBindingsAndFreezesIdentity(t *testing.T) {
 	t.Parallel()
 	sessionID, loopID := evidenceBindingIDs(t)
@@ -139,18 +152,25 @@ func TestBindEvidenceToolsAttenuatesBindingsAndFreezesIdentity(t *testing.T) {
 		},
 	)
 	hustleDefinition := bindableEvidenceDefinition(t, definition)
-	bound, err := hustleDefinition.Bind(context.Background(), Bindings{
-		SessionID: sessionID, LoopID: loopID, Workspace: workspace,
-	})
+	bound, err := hustleDefinition.Bind(context.Background(), Bindings{})
 	if err != nil {
 		t.Fatalf("Bind() error = %v", err)
+	}
+	if builds != 0 {
+		t.Fatalf("definition Bind built evidence tools %d times, want zero", builds)
+	}
+	evidence, err := bound.BindEvidenceTools(context.Background(), EvidenceBindings{
+		SessionID: sessionID, LoopID: loopID,
+		ReadWorkspace: &tool.ReadWorkspaceBinding{Root: workspace.Root},
+	})
+	if err != nil {
+		t.Fatalf("BindEvidenceTools() error = %v", err)
 	}
 	if builds != 1 {
 		t.Fatalf("build calls = %d, want 1", builds)
 	}
-	evidence := bound.EvidenceTools()
 	if len(evidence) != 1 || evidence[0].Name() != "workspace-status" {
-		t.Fatalf("EvidenceTools() = %#v", evidence)
+		t.Fatalf("BindEvidenceTools() = %#v", evidence)
 	}
 	if evidence[0].Tool() != concrete {
 		t.Fatal("bound evidence tool did not preserve the concrete capability")
@@ -161,19 +181,75 @@ func TestBindEvidenceToolsAttenuatesBindingsAndFreezesIdentity(t *testing.T) {
 		t.Fatalf("incomplete evidence identity: %#v", evidence[0])
 	}
 	evidence[0] = BoundEvidenceTool{}
-	if again := bound.EvidenceTools(); len(again) != 1 || again[0].Name() != "workspace-status" {
-		t.Fatal("EvidenceTools accessor exposed its slice")
+	fresh, err := bound.BindEvidenceTools(context.Background(), EvidenceBindings{
+		SessionID: sessionID, LoopID: loopID,
+		ReadWorkspace: &tool.ReadWorkspaceBinding{Root: workspace.Root},
+	})
+	if err != nil {
+		t.Fatalf("second BindEvidenceTools() error = %v", err)
 	}
-	info := bound.EvidenceTools()[0].Info()
+	if len(fresh) != 1 || fresh[0].Name() != "workspace-status" {
+		t.Fatal("BindEvidenceTools returned mutable shared state")
+	}
+	info := fresh[0].Info()
 	if info == nil {
 		t.Fatalf("frozen tool Info() = %#v", info)
 	}
 	info.Desc = "mutated"
 	info.Schema[0] = '['
-	again := bound.EvidenceTools()[0].Info()
+	again := fresh[0].Info()
 	if again.Desc != "read workspace status" ||
 		!bytes.Equal(again.Schema, json.RawMessage(`{"type":"object","additionalProperties":false}`)) {
 		t.Fatalf("frozen Info() changed: %#v", again)
+	}
+}
+
+func TestEvidenceToolsBindPerInvocationOrigin(t *testing.T) {
+	t.Parallel()
+	sessionID, _ := evidenceBindingIDs(t)
+	_, requestedLoopID := evidenceBindingIDs(t)
+	concrete := &evidenceToolStub{infos: []*tool.ToolInfo{{
+		Name: "workspace-status", Desc: "read workspace status",
+		Schema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+	}}}
+	builds := 0
+	definition := bindableEvidenceDefinition(t, tool.NewEvidenceDefinition(
+		"workspace-status",
+		tool.RequiresWorkspaceRead,
+		[]tool.ToolInfo{{
+			Name: "workspace-status", Desc: "read workspace status",
+			Schema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+		}},
+		func(_ context.Context, got tool.Bindings) ([]tool.InvokableTool, error) {
+			builds++
+			if got.SessionID != sessionID || got.LoopID != requestedLoopID {
+				t.Fatalf("tool binding IDs = %v/%v, want %v/%v", got.SessionID, got.LoopID, sessionID, requestedLoopID)
+			}
+			if got.ReadWorkspace == nil || got.ReadWorkspace.Root != "/workspace" {
+				t.Fatalf("read workspace binding = %#v", got.ReadWorkspace)
+			}
+			if got.Workspace != nil || got.Delegate != nil || got.ExtraTools != nil {
+				t.Fatalf("evidence tool received broader bindings: %#v", got)
+			}
+			return []tool.InvokableTool{concrete}, nil
+		},
+	))
+	bound, err := definition.Bind(context.Background(), Bindings{})
+	if err != nil {
+		t.Fatalf("Bind() error = %v", err)
+	}
+	if builds != 0 {
+		t.Fatalf("definition Bind built evidence tools %d times, want zero", builds)
+	}
+	evidence, err := bound.BindEvidenceTools(context.Background(), EvidenceBindings{
+		SessionID: sessionID, LoopID: requestedLoopID,
+		ReadWorkspace: &tool.ReadWorkspaceBinding{Root: "/workspace"},
+	})
+	if err != nil {
+		t.Fatalf("BindEvidenceTools() error = %v", err)
+	}
+	if builds != 1 || len(evidence) != 1 || evidence[0].Tool() != concrete {
+		t.Fatalf("run evidence = builds:%d tools:%#v", builds, evidence)
 	}
 }
 
@@ -191,11 +267,13 @@ func TestBindEvidenceToolIdentityCoversDescriptionAndCanonicalSchema(t *testing.
 				return []tool.InvokableTool{concrete}, nil
 			},
 		))
-		bound, err := definition.Bind(context.Background(), Bindings{SessionID: sessionID, LoopID: loopID})
+		evidence, err := bindEvidenceForTest(t, definition, EvidenceBindings{
+			SessionID: sessionID, LoopID: loopID,
+		})
 		if err != nil {
-			t.Fatalf("Bind() error = %v", err)
+			t.Fatalf("BindEvidenceTools() error = %v", err)
 		}
-		return bound.EvidenceTools()[0]
+		return evidence[0]
 	}
 	base := bind("read status", json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`))
 	whitespace := bind("read status", json.RawMessage("{\n \"type\":\"object\", \"properties\":{\"path\":{\"type\":\"string\"}}, \"required\":[\"path\"], \"additionalProperties\":false\n}"))
@@ -240,7 +318,9 @@ func TestBindEvidenceToolsRejectsInvalidConcreteTools(t *testing.T) {
 					return testCase.tools, nil
 				},
 			))
-			_, err := definition.Bind(context.Background(), Bindings{SessionID: sessionID, LoopID: loopID})
+			_, err := bindEvidenceForTest(t, definition, EvidenceBindings{
+				SessionID: sessionID, LoopID: loopID,
+			})
 			var bindErr *BindError
 			if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidEvidenceTools {
 				t.Fatalf("Bind() error = %T %v, want invalid evidence tools", err, err)
@@ -339,7 +419,9 @@ func TestBindEvidenceToolsRejectsBuildError(t *testing.T) {
 			return nil, errors.New("build failed")
 		},
 	))
-	_, err := definition.Bind(context.Background(), Bindings{SessionID: sessionID, LoopID: loopID})
+	_, err := bindEvidenceForTest(t, definition, EvidenceBindings{
+		SessionID: sessionID, LoopID: loopID,
+	})
 	var bindErr *BindError
 	if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidEvidenceTools {
 		t.Fatalf("Bind() error = %T %v, want invalid evidence tools", err, err)
@@ -364,8 +446,10 @@ func TestBindEvidenceToolsRejectsInfoDriftAndPreservesToollessBind(t *testing.T)
 			return []tool.InvokableTool{drifting}, nil
 		},
 	))
-	if _, err := definition.Bind(context.Background(), Bindings{SessionID: sessionID, LoopID: loopID}); err == nil {
-		t.Fatal("Bind() accepted ToolInfo drift")
+	if _, err := bindEvidenceForTest(t, definition, EvidenceBindings{
+		SessionID: sessionID, LoopID: loopID,
+	}); err == nil {
+		t.Fatal("BindEvidenceTools() accepted ToolInfo drift")
 	}
 
 	toolLess, err := Define(validNamedOptions(&testClient{}, validModel("tool-less"))...)
@@ -376,8 +460,8 @@ func TestBindEvidenceToolsRejectsInfoDriftAndPreservesToollessBind(t *testing.T)
 	if err != nil {
 		t.Fatalf("tool-less Bind() error = %v", err)
 	}
-	if got := bound.EvidenceTools(); got != nil {
-		t.Fatalf("tool-less EvidenceTools() = %#v, want nil", got)
+	if got, err := bound.BindEvidenceTools(context.Background(), EvidenceBindings{}); err != nil || got != nil {
+		t.Fatalf("tool-less BindEvidenceTools() = %#v, %v, want nil", got, err)
 	}
 }
 
@@ -415,7 +499,9 @@ func TestBindEvidenceToolsRejectsConcreteMetadataDriftFromStaticCatalog(t *testi
 					return []tool.InvokableTool{concrete}, nil
 				},
 			))
-			_, err := definition.Bind(context.Background(), Bindings{SessionID: sessionID, LoopID: loopID})
+			_, err := bindEvidenceForTest(t, definition, EvidenceBindings{
+				SessionID: sessionID, LoopID: loopID,
+			})
 			var bindErr *BindError
 			if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidEvidenceTools {
 				t.Fatalf("Bind() error = %T %v, want static metadata mismatch", err, err)
@@ -424,7 +510,7 @@ func TestBindEvidenceToolsRejectsConcreteMetadataDriftFromStaticCatalog(t *testi
 	}
 }
 
-func bindSingleEvidenceTool(t *testing.T, info *tool.ToolInfo) (BoundDefinition, error) {
+func bindSingleEvidenceTool(t *testing.T, info *tool.ToolInfo) ([]BoundEvidenceTool, error) {
 	t.Helper()
 	sessionID, loopID := evidenceBindingIDs(t)
 	concrete := &evidenceToolStub{infos: []*tool.ToolInfo{info}}
@@ -438,7 +524,9 @@ func bindSingleEvidenceTool(t *testing.T, info *tool.ToolInfo) (BoundDefinition,
 	if err != nil {
 		return nil, err
 	}
-	return definition.Bind(context.Background(), Bindings{SessionID: sessionID, LoopID: loopID})
+	return bindEvidenceForTest(t, definition, EvidenceBindings{
+		SessionID: sessionID, LoopID: loopID,
+	})
 }
 
 func nestedEvidenceArraySchema(arrayCount int) json.RawMessage {
@@ -479,7 +567,7 @@ func evidenceSchemaOfCompactSize(t *testing.T, size int) json.RawMessage {
 	return json.RawMessage(prefix + strings.Repeat("x", size-len(prefix)-len(suffix)) + suffix)
 }
 
-func bindEvidenceCatalogOfSize(t *testing.T, aggregateSize int) (BoundDefinition, error) {
+func bindEvidenceCatalogOfSize(t *testing.T, aggregateSize int) ([]BoundEvidenceTool, error) {
 	t.Helper()
 	const toolCount = MaxEvidenceProducedToolNames
 	names := make([]string, toolCount)
@@ -518,5 +606,7 @@ func bindEvidenceCatalogOfSize(t *testing.T, aggregateSize int) (BoundDefinition
 		return nil, err
 	}
 	sessionID, loopID := evidenceBindingIDs(t)
-	return definition.Bind(context.Background(), Bindings{SessionID: sessionID, LoopID: loopID})
+	return bindEvidenceForTest(t, definition, EvidenceBindings{
+		SessionID: sessionID, LoopID: loopID,
+	})
 }

@@ -89,8 +89,11 @@ func (b BoundEvidenceTool) Info() *tool.ToolInfo {
 func bindEvidenceTools(
 	ctx context.Context,
 	policy EvidenceToolPolicy,
-	bindings Bindings,
+	bindings EvidenceBindings,
 ) ([]BoundEvidenceTool, error) {
+	if ctx == nil {
+		return nil, &BindError{Kind: BindInvalidContext}
+	}
 	if !evidencePolicyEnabled(policy) {
 		return nil, nil
 	}
@@ -130,10 +133,10 @@ func bindEvidenceTools(
 			LoopID:    bindings.LoopID,
 		}
 		if definition.Requirements()&tool.RequiresWorkspaceRead != 0 {
-			if bindings.Workspace == nil {
+			if bindings.ReadWorkspace == nil {
 				return nil, invalidEvidenceBind(nil)
 			}
-			toolBindings.ReadWorkspace = &tool.ReadWorkspaceBinding{Root: bindings.Workspace.Root}
+			toolBindings.ReadWorkspace = &tool.ReadWorkspaceBinding{Root: bindings.ReadWorkspace.Root}
 		}
 		tools, err := definition.Build(ctx, toolBindings)
 		if err != nil {

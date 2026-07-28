@@ -215,14 +215,9 @@ func (s *Session) beginHustleBinding() error {
 
 func (s *Session) bindHustleDefinitions() ([]hustle.BoundDefinition, error) {
 	resolver := sessionHustleModelResolver{session: s}
-	originatingLoopID := s.ActiveLoopID()
-	workspace := s.newWorkspaceBinding()
 	bound := make([]hustle.BoundDefinition, 0, len(s.hustleDefinitions))
 	for index, definition := range s.hustleDefinitions {
-		candidate, err := definition.Bind(s.sessionCtx, hustle.Bindings{
-			Models: resolver, SessionID: s.sessionID, LoopID: originatingLoopID,
-			Workspace: workspace,
-		})
+		candidate, err := definition.Bind(s.sessionCtx, hustle.Bindings{Models: resolver})
 		if err != nil {
 			return nil, &HustleConstructionError{
 				Reason: HustleConstructionBindFailed, Name: definition.Name(), Index: index, Cause: err,

@@ -285,20 +285,23 @@ func sessionEvidenceDefinition(
 	return definition
 }
 
-func TestSessionBindsEvidenceToolsWithOriginAndAttenuatedWorkspace(t *testing.T) {
+func TestSessionDefersEvidenceBindingAndHonorsExplicitRunOrigin(t *testing.T) {
 	t.Parallel()
 	sessionID, _ := uuid.New()
-	loopID, _ := uuid.New()
+	rootLoopID, _ := uuid.New()
+	childLoopID, _ := uuid.New()
+	changedActiveLoopID, _ := uuid.New()
 	workspaceRoot := "/managed/workspace"
 	concrete := &sessionEvidenceTool{infos: []*tool.ToolInfo{{
 		Name: "workspace-status", Desc: "read workspace status",
 		Schema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
 	}}}
 	builds := 0
+	wantLoopID := rootLoopID
 	definition := sessionEvidenceDefinition(t, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		builds++
-		if bindings.SessionID != sessionID || bindings.LoopID != loopID {
-			t.Fatalf("tool bindings IDs = %v/%v, want %v/%v", bindings.SessionID, bindings.LoopID, sessionID, loopID)
+		if bindings.SessionID != sessionID || bindings.LoopID != wantLoopID {
+			t.Fatalf("tool bindings IDs = %v/%v, want %v/%v", bindings.SessionID, bindings.LoopID, sessionID, wantLoopID)
 		}
 		if bindings.ReadWorkspace == nil || bindings.ReadWorkspace.Root != workspaceRoot {
 			t.Fatalf("read workspace binding = %#v", bindings.ReadWorkspace)
@@ -309,7 +312,7 @@ func TestSessionBindsEvidenceToolsWithOriginAndAttenuatedWorkspace(t *testing.T)
 		return []tool.InvokableTool{concrete}, nil
 	})
 	s := &Session{
-		sessionID: sessionID, activeLoopID: loopID,
+		sessionID: sessionID, activeLoopID: rootLoopID,
 		sessionCtx: context.Background(), hustleDefinitions: []hustle.Definition{definition},
 		wsRoot: workspaceRoot, wsCoordinator: sessionEvidenceCoordinator{},
 	}
@@ -317,12 +320,35 @@ func TestSessionBindsEvidenceToolsWithOriginAndAttenuatedWorkspace(t *testing.T)
 	if err != nil {
 		t.Fatalf("bindHustleDefinitions() error = %v", err)
 	}
-	if builds != 1 || len(bound) != 1 || len(bound[0].EvidenceTools()) != 1 {
-		t.Fatalf("bound evidence = builds:%d definitions:%d tools:%d", builds, len(bound), len(bound[0].EvidenceTools()))
+	if builds != 0 || len(bound) != 1 {
+		t.Fatalf("construction evidence = builds:%d definitions:%d", builds, len(bound))
+	}
+	rootEvidence, err := bound[0].BindEvidenceTools(context.Background(), hustle.EvidenceBindings{
+		SessionID: sessionID, LoopID: rootLoopID,
+		ReadWorkspace: &tool.ReadWorkspaceBinding{Root: workspaceRoot},
+	})
+	if err != nil {
+		t.Fatalf("root BindEvidenceTools() error = %v", err)
+	}
+	if builds != 1 || len(rootEvidence) != 1 {
+		t.Fatalf("root evidence = builds:%d tools:%d", builds, len(rootEvidence))
+	}
+
+	s.activeLoopID = changedActiveLoopID
+	wantLoopID = childLoopID
+	childEvidence, err := bound[0].BindEvidenceTools(context.Background(), hustle.EvidenceBindings{
+		SessionID: sessionID, LoopID: childLoopID,
+		ReadWorkspace: &tool.ReadWorkspaceBinding{Root: workspaceRoot},
+	})
+	if err != nil {
+		t.Fatalf("child BindEvidenceTools() error = %v", err)
+	}
+	if builds != 2 || len(childEvidence) != 1 {
+		t.Fatalf("child evidence = builds:%d tools:%d", builds, len(childEvidence))
 	}
 }
 
-func TestSessionConstructionRejectsEvidenceSchemaDriftBeforeRun(t *testing.T) {
+func TestSessionRunBindingRejectsEvidenceSchemaDriftBeforeInference(t *testing.T) {
 	t.Parallel()
 	sessionID, _ := uuid.New()
 	loopID, _ := uuid.New()
@@ -333,24 +359,33 @@ func TestSessionConstructionRejectsEvidenceSchemaDriftBeforeRun(t *testing.T) {
 		{Name: "workspace-status", Desc: "read workspace", Schema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)},
 		{Name: "workspace-status", Desc: "read workspace", Schema: json.RawMessage(`{"type":"object","properties":{"changed":{"type":"boolean"}},"required":["changed"],"additionalProperties":false}`)},
 	}}
+	builds := 0
 	definition := sessionEvidenceDefinition(t, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		builds++
 		return []tool.InvokableTool{concrete}, nil
 	})
-	factory := event.NewFactory(uuid.New, time.Now)
 	s := &Session{
 		sessionID: sessionID, activeLoopID: loopID,
 		sessionCtx: context.Background(), hustleDefinitions: []hustle.Definition{definition},
-		hustleLimits: testHustleLimits(), factory: factory,
-		hub:    hub.New(sessionID, hub.WithFactory(factory)),
-		wsRoot: "/workspace", wsCoordinator: sessionEvidenceCoordinator{},
+		wsRoot: "/workspace",
 	}
-	err := s.bindSessionHustles()
-	var construction *HustleConstructionError
-	if !errors.As(err, &construction) || construction.Reason != HustleConstructionBindFailed {
-		t.Fatalf("bindSessionHustles() error = %T %v, want bind failure", err, err)
+	bound, err := s.bindHustleDefinitions()
+	if err != nil {
+		t.Fatalf("bindHustleDefinitions() error = %v", err)
 	}
-	if s.hustleController != nil {
-		t.Fatal("schema drift retained a runnable controller")
+	if builds != 0 {
+		t.Fatalf("session construction built evidence tools %d times, want zero", builds)
+	}
+	_, err = bound[0].BindEvidenceTools(context.Background(), hustle.EvidenceBindings{
+		SessionID: sessionID, LoopID: loopID,
+		ReadWorkspace: &tool.ReadWorkspaceBinding{Root: s.wsRoot},
+	})
+	var bindErr *hustle.BindError
+	if !errors.As(err, &bindErr) || bindErr.Kind != hustle.BindInvalidEvidenceTools {
+		t.Fatalf("BindEvidenceTools() error = %T %v, want evidence bind failure", err, err)
+	}
+	if builds != 1 {
+		t.Fatalf("run binding built evidence tools %d times, want one", builds)
 	}
 }
 

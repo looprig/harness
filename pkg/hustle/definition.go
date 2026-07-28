@@ -128,10 +128,17 @@ type ModelResolver interface {
 
 // Bindings supplies runtime collaborators needed by a definition.
 type Bindings struct {
-	Models    ModelResolver
-	SessionID uuid.UUID
-	LoopID    uuid.UUID
-	Workspace *tool.WorkspaceBinding
+	Models ModelResolver
+}
+
+// EvidenceBindings supplies only the invocation origin and structurally
+// read-only workspace capability needed to build one run's evidence catalog.
+// It intentionally cannot carry mutation, delegation, gate, grant, session,
+// observation, or loop-control capabilities.
+type EvidenceBindings struct {
+	SessionID     uuid.UUID
+	LoopID        uuid.UUID
+	ReadWorkspace *tool.ReadWorkspaceBinding
 }
 
 // DefinitionDescriptor is the complete secret-free behavioral projection used
@@ -905,11 +912,7 @@ func (d Definition) Bind(ctx context.Context, bindings Bindings) (BoundDefinitio
 	if d.state.descriptor.ModelSource == ModelSourceCurrentLoop && nilResolver(bindings.Models) {
 		return nil, &BindError{Kind: BindMissingModelResolver}
 	}
-	evidence, err := bindEvidenceTools(ctx, d.state.evidence, bindings)
-	if err != nil {
-		return nil, err
-	}
-	return &boundDefinitionState{definition: d, models: bindings.Models, evidence: evidence}, nil
+	return &boundDefinitionState{definition: d, models: bindings.Models}, nil
 }
 
 // BoundDefinition is the sealed runtime view of one immutable definition.
@@ -923,14 +926,13 @@ type BoundDefinition interface {
 	SystemPrompt() string
 	OutputSchema() (*inference.OutputSchema, bool)
 	EvidenceToolPolicy() (EvidenceToolPolicy, bool)
-	EvidenceTools() []BoundEvidenceTool
+	BindEvidenceTools(context.Context, EvidenceBindings) ([]BoundEvidenceTool, error)
 	boundDefinition()
 }
 
 type boundDefinitionState struct {
 	definition Definition
 	models     ModelResolver
-	evidence   []BoundEvidenceTool
 }
 
 func (b *boundDefinitionState) Name() Name                       { return b.definition.Name() }
@@ -942,8 +944,14 @@ func (b *boundDefinitionState) SystemPrompt() string             { return b.defi
 func (b *boundDefinitionState) EvidenceToolPolicy() (EvidenceToolPolicy, bool) {
 	return b.definition.EvidenceToolPolicy()
 }
-func (b *boundDefinitionState) EvidenceTools() []BoundEvidenceTool {
-	return append([]BoundEvidenceTool(nil), b.evidence...)
+func (b *boundDefinitionState) BindEvidenceTools(
+	ctx context.Context,
+	bindings EvidenceBindings,
+) ([]BoundEvidenceTool, error) {
+	if b == nil {
+		return nil, &BindError{Kind: BindInvalidDefinition}
+	}
+	return bindEvidenceTools(ctx, b.definition.state.evidence, bindings)
 }
 func (*boundDefinitionState) boundDefinition() {}
 

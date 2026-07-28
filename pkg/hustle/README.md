@@ -16,7 +16,13 @@ the typed audit taxonomy, and the secret-free descriptor projection.
   system prompt, optional structured output schema, timeout, and
   payload limits.
 - **`BoundDefinition`** — a hustle bound to a session: the runtime
-  view a `Controller` schedules against.
+  view a `Controller` schedules against. Session binding retains the
+  model resolver but does not build optional evidence tools.
+- **`EvidenceBindings`** — the invocation-scoped origin and read-only
+  workspace root used by `BoundDefinition.BindEvidenceTools`. The
+  evidence catalog is rebuilt for the exact requesting session/loop;
+  this binding cannot carry mutation, delegation, gate, grant,
+  observation, session, or loop-control capabilities.
 - **`DefinitionDescriptor`** — the complete secret-free behavioral
   projection used by rig identity and durable audit records (the
   `Name`, `Participation`, `ModelSource`, prompt SHA-256, output-schema
@@ -92,7 +98,7 @@ session stream (`HustleStarted`, `HustleCompleted`, `HustleFailed`).
                 ▼
        hustle.BoundDefinition (runtime view)
                 │
-                │  a loop invokes via the hustle tool
+                │  invocation origin + read-only evidence binding
                 ▼
    ┌────────────────────────────────────────────────────┐
    │ internal/hustleruntime.Controller                   │
