@@ -102,7 +102,8 @@ func Deny(code, reason string) error {
 }
 
 // AsDenial classifies an intentional guard denial. It revalidates exported
-// Denial fields so direct construction cannot bypass the bounded contract.
+// Denial fields so direct construction cannot bypass the bounded contract and
+// returns an independent copy owned by the caller.
 func AsDenial(err error) (*Denial, bool) {
 	var denial *Denial
 	if !errors.As(err, &denial) || denial == nil {
@@ -111,7 +112,8 @@ func AsDenial(err error) (*Denial, bool) {
 	if !validDenialCode(denial.Code) || !validDenialReason(denial.Reason) {
 		return nil, false
 	}
-	return denial, true
+	classified := *denial
+	return &classified, true
 }
 
 func validDenialCode(code string) bool {

@@ -47,7 +47,9 @@ type Result struct {
 	EndedAt time.Time
 	// Outcome is the bounded terminal classification.
 	Outcome Outcome
-	// Err is the original terminal error and is not deep-cloned.
+	// Err is the original trusted in-process terminal error and is not
+	// deep-cloned. Consumers must redact or classify it before exporting it to
+	// logs, telemetry, or another trust boundary.
 	Err error
 }
 

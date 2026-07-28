@@ -273,6 +273,22 @@ func TestAsDenialRevalidatesConstructedValues(t *testing.T) {
 	}
 }
 
+func TestAsDenialReturnsIndependentCopy(t *testing.T) {
+	t.Parallel()
+
+	original := &Denial{Code: "policy.blocked", Reason: "original reason"}
+	classified, ok := AsDenial(original)
+	if !ok {
+		t.Fatal("AsDenial(valid direct denial) = (_, false)")
+	}
+
+	original.Code = "policy.changed"
+	original.Reason = "changed reason"
+	if classified.Code != "policy.blocked" || classified.Reason != "original reason" {
+		t.Fatalf("classified denial aliases caller-owned value: %#v", classified)
+	}
+}
+
 func TestValidateCallRequiresOneMatchingPayload(t *testing.T) {
 	t.Parallel()
 
@@ -330,6 +346,7 @@ func TestCloneCallOwnsReferenceBackedData(t *testing.T) {
 	t.Parallel()
 
 	temperature := 0.25
+	topP := 0.75
 	maxTokens := 64
 	user := &content.UserMessage{Message: content.Message{
 		Role: content.RoleUser,
@@ -351,6 +368,7 @@ func TestCloneCallOwnsReferenceBackedData(t *testing.T) {
 	request := &inference.Request{
 		Model: model.Model{Sampling: model.Sampling{
 			Temperature: &temperature,
+			TopP:        &topP,
 			MaxTokens:   &maxTokens,
 			Stop:        []string{"END"},
 		}},
@@ -412,6 +430,7 @@ func TestCloneCallOwnsReferenceBackedData(t *testing.T) {
 
 	clonedInference := clones[1].Inference
 	*clonedInference.Request.Model.Sampling.Temperature = 0.9
+	*clonedInference.Request.Model.Sampling.TopP = 0.1
 	*clonedInference.Request.Model.Sampling.MaxTokens = 512
 	clonedInference.Request.Model.Sampling.Stop[0] = "CHANGED"
 	clonedInference.Request.Messages[0].(*content.UserMessage).Blocks[0] = &content.TextBlock{Text: "changed"}
@@ -423,7 +442,7 @@ func TestCloneCallOwnsReferenceBackedData(t *testing.T) {
 	clonedInference.AIMessage.Usage.InputTokens = 99
 	clonedInference.StreamResult.Usage.InputTokens = 99
 
-	if temperature != 0.25 || maxTokens != 64 || request.Model.Sampling.Stop[0] != "END" {
+	if temperature != 0.25 || topP != 0.75 || maxTokens != 64 || request.Model.Sampling.Stop[0] != "END" {
 		t.Fatal("inference clone aliases model sampling")
 	}
 	if _, ok := request.Messages[0].(*content.UserMessage).Blocks[0].(*content.ToolResultBlock); !ok {

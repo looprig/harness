@@ -13,7 +13,9 @@ import (
 )
 
 // CloneCall gives a hook independent ownership of every reference-backed
-// payload while preserving nil-versus-empty distinctions.
+// payload while preserving nil-versus-empty distinctions. It panics with
+// *CloneError if an upstream sealed content union gains an unsupported variant;
+// it never silently drops unknown content.
 func CloneCall(call Call) Call {
 	cloned := call
 	cloned.Turn = cloneTurnData(call.Turn)

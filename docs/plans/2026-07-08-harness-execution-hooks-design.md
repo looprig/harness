@@ -172,12 +172,24 @@ type Denial struct {
 }
 
 func Deny(code, reason string) error
+func AsDenial(err error) (*Denial, bool)
 ```
 
-`Code` is a bounded machine-readable identifier. `Reason` is a bounded safe
-message that an operation may expose to the model or caller. An arbitrary guard
-error is an internal hook failure: it still blocks, but its text is logged rather
-than exposed across a trust boundary.
+`Code` is a 1–64 byte ASCII machine identifier matching
+`[a-z][a-z0-9_.-]*`. `Reason` is a 1–1024 byte, valid UTF-8, trim-nonblank
+message with no Unicode control characters. An operation may expose a validated
+reason to the model or caller.
+
+`hook.AsDenial` is the only supported intentional-denial classifier. It follows
+wrapped errors, revalidates the exported fields, and returns an independently
+owned copy. Runtime code must not classify with a raw
+`errors.As` check against `*hook.Denial`: direct construction remains possible
+because the approved fields are exported, and a malformed direct construction
+is an internal guard failure, not an intentional denial. `OutcomeDenied` is
+selected only when `hook.AsDenial` succeeds.
+
+Any other guard error is an internal hook failure: it still blocks, but its text
+is redacted before logs, telemetry, or another trust boundary.
 
 Applications that explicitly want best-effort policy can catch their own
 classifier or service failure and return nil. Harness does not offer a global

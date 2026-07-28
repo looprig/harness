@@ -158,11 +158,16 @@ func ValidateCall(Call) error
 func CloneCall(Call) Call
 func CloneResult(Result) Result
 func Deny(code, reason string) error
+func AsDenial(err error) (*Denial, bool)
 ```
 
 Use typed `ConfigError`, `CallError`, and `Denial`. Set conservative denial
-bounds in named constants and reject blank codes, whitespace-only reasons,
-control characters, or values above the bounds.
+bounds in named constants: code must be a 1–64 byte ASCII machine identifier
+matching `[a-z][a-z0-9_.-]*`; reason must be 1–1024 bytes, valid UTF-8,
+trim-nonblank, and contain no Unicode control characters. `AsDenial` must be the
+only supported intentional-denial classifier: follow wrapped errors, revalidate
+the exported fields, and return an independent copy. A malformed directly
+constructed `Denial` is an internal guard failure.
 
 Copy the ownership logic currently proven by
 `internal/loopruntime/message_clone.go` into dependency-neutral helpers inside
@@ -545,8 +550,11 @@ func hookOutcome(ctx context.Context, err error) hook.Outcome
 func finishHook(finish hook.FinishFunc, call hook.Call, outcome hook.Outcome, err error)
 ```
 
-Use `OutcomeDenied` only for `*hook.Denial`, `OutcomeCanceled` for context
-cancel/deadline, and `OutcomeFailed` for other errors.
+Use `OutcomeDenied` only when `hook.AsDenial(err)` succeeds. Do not classify
+with a raw `errors.As` check against `*hook.Denial`: malformed direct
+constructions are internal guard failures and map to `OutcomeFailed`. Use
+`OutcomeCanceled` for context cancel/deadline and `OutcomeFailed` for all other
+errors.
 
 **Step 4: Instrument turn admission and terminal completion**
 
