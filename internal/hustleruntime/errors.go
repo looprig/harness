@@ -260,21 +260,24 @@ func (e *ToolResponseError) Error() string {
 type EvidenceFailureReason string
 
 const (
-	EvidenceFailureInvalidBinding      EvidenceFailureReason = "invalid_binding"
-	EvidenceFailureUnknownTool         EvidenceFailureReason = "unknown_tool"
-	EvidenceFailureUnprepared          EvidenceFailureReason = "unprepared"
-	EvidenceFailurePreparation         EvidenceFailureReason = "preparation"
-	EvidenceFailureInvalidRequest      EvidenceFailureReason = "invalid_request"
-	EvidenceFailureAmbiguousIdentity   EvidenceFailureReason = "ambiguous_identity"
-	EvidenceFailureForbiddenCapability EvidenceFailureReason = "forbidden_capability"
-	EvidenceFailureAccessRefused       EvidenceFailureReason = "access_refused"
-	EvidenceFailureExecution           EvidenceFailureReason = "execution"
-	EvidenceFailureInvalidResult       EvidenceFailureReason = "invalid_result"
-	EvidenceFailureResultTooLarge      EvidenceFailureReason = "result_too_large"
-	EvidenceFailureEvidenceTooLarge    EvidenceFailureReason = "evidence_too_large"
-	EvidenceFailureCanceled            EvidenceFailureReason = "canceled"
-	EvidenceFailureDeadline            EvidenceFailureReason = "deadline"
-	EvidenceFailureInternal            EvidenceFailureReason = "internal"
+	EvidenceFailureInvalidBinding        EvidenceFailureReason = "invalid_binding"
+	EvidenceFailureUnknownTool           EvidenceFailureReason = "unknown_tool"
+	EvidenceFailureUnprepared            EvidenceFailureReason = "unprepared"
+	EvidenceFailurePreparation           EvidenceFailureReason = "preparation"
+	EvidenceFailureInvalidRequest        EvidenceFailureReason = "invalid_request"
+	EvidenceFailureAmbiguousIdentity     EvidenceFailureReason = "ambiguous_identity"
+	EvidenceFailureForbiddenCapability   EvidenceFailureReason = "forbidden_capability"
+	EvidenceFailureAccessRefused         EvidenceFailureReason = "access_refused"
+	EvidenceFailureExecution             EvidenceFailureReason = "execution"
+	EvidenceFailureInvalidResult         EvidenceFailureReason = "invalid_result"
+	EvidenceFailureResultTooLarge        EvidenceFailureReason = "result_too_large"
+	EvidenceFailureEvidenceTooLarge      EvidenceFailureReason = "evidence_too_large"
+	EvidenceFailureRoundsExceeded        EvidenceFailureReason = "rounds_exceeded"
+	EvidenceFailureCallsExceeded         EvidenceFailureReason = "calls_exceeded"
+	EvidenceFailureCallsPerRoundExceeded EvidenceFailureReason = "calls_per_round_exceeded"
+	EvidenceFailureCanceled              EvidenceFailureReason = "canceled"
+	EvidenceFailureDeadline              EvidenceFailureReason = "deadline"
+	EvidenceFailureInternal              EvidenceFailureReason = "internal"
 )
 
 // Valid reports whether the reason is a recognized evidence failure.
@@ -292,6 +295,9 @@ func (r EvidenceFailureReason) Valid() bool {
 		EvidenceFailureInvalidResult,
 		EvidenceFailureResultTooLarge,
 		EvidenceFailureEvidenceTooLarge,
+		EvidenceFailureRoundsExceeded,
+		EvidenceFailureCallsExceeded,
+		EvidenceFailureCallsPerRoundExceeded,
 		EvidenceFailureCanceled,
 		EvidenceFailureDeadline,
 		EvidenceFailureInternal:

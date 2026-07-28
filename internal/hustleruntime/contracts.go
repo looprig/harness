@@ -47,6 +47,16 @@ type RuntimeConfig struct {
 	Faults              FaultReporter
 	Activity            ActivityTracker
 	FinalizerContext    FinalizerContextDecorator
+	Evidence            *EvidenceRuntimeConfig
+}
+
+// EvidenceRuntimeConfig supplies only the headless, read-only capabilities
+// needed by opt-in evidence-tool definitions.
+type EvidenceRuntimeConfig struct {
+	Access         EvidenceAccessEvaluator
+	AllowedKinds   []string
+	ReadWorkspace  *tool.ReadWorkspaceBinding
+	NewExecutionID EvidenceExecutionIDFactory
 }
 
 // HeaderStamper mints the identity fields of one internal lifecycle event.
@@ -95,10 +105,14 @@ type Finalizer func(context.Context, hustle.Outcome) error
 // evidenceAccessEvaluator is the deliberately non-interactive access seam used
 // by the evidence runner. gate.AccessBindings satisfies it without exposing
 // approval, stored-rule, persistence, or grant capabilities.
-type evidenceAccessEvaluator interface {
+type EvidenceAccessEvaluator interface {
 	AccessFor(tool.Requirement) (uint8, error)
 }
 
-type evidenceExecutionIDFactory func() (uuid.UUID, error)
+type evidenceAccessEvaluator = EvidenceAccessEvaluator
+
+type EvidenceExecutionIDFactory func() (uuid.UUID, error)
+
+type evidenceExecutionIDFactory = EvidenceExecutionIDFactory
 
 var withPreparedEvidenceCall = loop.WithPreparedCall
