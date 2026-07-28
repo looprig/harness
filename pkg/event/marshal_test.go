@@ -995,6 +995,7 @@ func FuzzDecodeEvent(f *testing.F) {
 func isTypedDecodeError(err error) bool {
 	var (
 		unknownEvent *UnknownEventTypeError
+		unsupported  *UnsupportedSchemaError
 		decode       *EventDecodeError
 		limit        *EventLimitError
 		invalid      *InvalidEventError
@@ -1003,6 +1004,7 @@ func isTypedDecodeError(err error) bool {
 		unknownBlock *content.UnknownBlockTypeError
 	)
 	return errors.As(err, &unknownEvent) ||
+		errors.As(err, &unsupported) ||
 		errors.As(err, &decode) ||
 		errors.As(err, &limit) ||
 		errors.As(err, &invalid) ||
