@@ -613,7 +613,7 @@ func restoreTopologySession(
 		return abortAccepted(s, &RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
 	if resources != nil {
-		if err := resources.Activate(ctx, tool.SessionResourceServices{}); err != nil {
+		if err := resources.Activate(ctx); err != nil {
 			return abortAccepted(s, &RestoreError{Kind: RestoreLoopFailed, Cause: err})
 		}
 	}

@@ -378,6 +378,8 @@ func processBindingFor(definition loop.Definition, resources *sessionResources) 
 type sessionResources struct {
 	storageRoot string
 
+	processServiceBridge *sessionProcessServiceBridge
+
 	mu      sync.Mutex
 	entries map[string]*sessionResourceEntry
 
@@ -434,9 +436,15 @@ func (e *sessionResourceErrorSet) Unwrap() []error {
 }
 
 func newSessionResources(storageRoot string) *sessionResources {
+	processServiceBridge, services, err := newSessionProcessServices()
+	if err != nil {
+		panic("sessionruntime: invalid process service bridge: " + err.Error())
+	}
 	return &sessionResources{
-		storageRoot: filepath.Clean(storageRoot),
-		entries:     make(map[string]*sessionResourceEntry),
+		storageRoot:          filepath.Clean(storageRoot),
+		processServiceBridge: processServiceBridge,
+		entries:              make(map[string]*sessionResourceEntry),
+		services:             services,
 	}
 }
 
@@ -606,7 +614,7 @@ func (r *sessionResources) awaitResource(
 // in-flight creators then join that gate until activation and failure cleanup
 // finish. Resources admitted after a successful boundary activate themselves
 // synchronously before publication.
-func (r *sessionResources) Activate(ctx context.Context, services tool.SessionResourceServices) error {
+func (r *sessionResources) Activate(ctx context.Context) error {
 	ctx = nonNilSessionResourceContext(ctx)
 
 	r.mu.Lock()
@@ -626,7 +634,7 @@ func (r *sessionResources) Activate(ctx context.Context, services tool.SessionRe
 	r.activateStarted = true
 	r.activateDone = make(chan struct{})
 	r.activated = true
-	r.services = services
+	services := r.services
 	snapshot := r.snapshotLocked()
 	for _, entry := range snapshot {
 		entry.activationPending = true

@@ -13,7 +13,6 @@ import (
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
-	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -771,7 +770,7 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 		return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
 	}
 	if resources != nil {
-		if err := resources.Activate(ctx, tool.SessionResourceServices{}); err != nil {
+		if err := resources.Activate(ctx); err != nil {
 			s.abortConstruction(err)
 			return nil, &NewSessionError{
 				Kind:  NewSessionRuntimeFailed,

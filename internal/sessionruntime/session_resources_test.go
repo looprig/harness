@@ -531,8 +531,8 @@ func TestSessionResourcesActivateAndShutdownOnce(t *testing.T) {
 		}
 	}
 
-	firstActivateErr := registry.Activate(context.Background(), tool.SessionResourceServices{})
-	secondActivateErr := registry.Activate(context.Background(), tool.SessionResourceServices{})
+	firstActivateErr := registry.Activate(context.Background())
+	secondActivateErr := registry.Activate(context.Background())
 	if firstActivateErr != nil || secondActivateErr != nil {
 		t.Fatalf("Activate() errors = (%v, %v), want nil", firstActivateErr, secondActivateErr)
 	}
@@ -583,7 +583,7 @@ func TestSessionResourcesActivateAndShutdownOnce(t *testing.T) {
 
 	activateErr := make(chan error, 1)
 	go func() {
-		activateErr <- racingRegistry.Activate(context.Background(), tool.SessionResourceServices{})
+		activateErr <- racingRegistry.Activate(context.Background())
 	}()
 	for {
 		racingRegistry.mu.Lock()
@@ -628,8 +628,8 @@ func TestSessionResourcesActivateAndShutdownOnce(t *testing.T) {
 			}
 		}
 
-		first := registry.Activate(context.Background(), tool.SessionResourceServices{})
-		second := registry.Activate(context.Background(), tool.SessionResourceServices{})
+		first := registry.Activate(context.Background())
+		second := registry.Activate(context.Background())
 		assertResourceErrors(t, first, activateA, activateB)
 		assertResourceErrors(t, second, activateA, activateB)
 		for key, resource := range resources {
@@ -658,7 +658,7 @@ func TestSessionResourcesActivateAndShutdownOnce(t *testing.T) {
 
 		activated := make(chan error, 1)
 		go func() {
-			activated <- registry.Activate(context.Background(), tool.SessionResourceServices{})
+			activated <- registry.Activate(context.Background())
 		}()
 		<-resource.activateStart
 
@@ -721,7 +721,7 @@ func TestSessionResourcesActivateAndShutdownOnce(t *testing.T) {
 
 		activated := make(chan error, 1)
 		go func() {
-			activated <- registry.Activate(context.Background(), tool.SessionResourceServices{})
+			activated <- registry.Activate(context.Background())
 		}()
 		<-resource.shutdownStart
 		registry.mu.Lock()
@@ -778,7 +778,7 @@ func TestSessionResourcesActivateAndShutdownOnce(t *testing.T) {
 
 	t.Run("post-boundary cleanup may reenter its key", func(t *testing.T) {
 		registry := newSessionResources(t.TempDir())
-		if err := registry.Activate(context.Background(), tool.SessionResourceServices{}); err != nil {
+		if err := registry.Activate(context.Background()); err != nil {
 			t.Fatalf("initial Activate() error = %v", err)
 		}
 
@@ -848,7 +848,7 @@ func TestSessionResourcesActivateAndShutdownOnce(t *testing.T) {
 
 		activated := make(chan error, 1)
 		go func() {
-			activated <- registry.Activate(context.Background(), tool.SessionResourceServices{})
+			activated <- registry.Activate(context.Background())
 		}()
 		for {
 			registry.mu.Lock()
@@ -898,7 +898,7 @@ func TestSessionResourcesActivateAndShutdownOnce(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		activated := make(chan error, 1)
 		go func() {
-			activated <- registry.Activate(ctx, tool.SessionResourceServices{})
+			activated <- registry.Activate(ctx)
 		}()
 		<-b.activateStart
 
@@ -956,10 +956,10 @@ func TestSessionResourcesActivateAndShutdownOnce(t *testing.T) {
 
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if err := registry.Activate(ctx, tool.SessionResourceServices{}); !errors.Is(err, context.Canceled) {
+		if err := registry.Activate(ctx); !errors.Is(err, context.Canceled) {
 			t.Fatalf("Activate() error = %v, want %v", err, context.Canceled)
 		}
-		if err := registry.Activate(context.Background(), tool.SessionResourceServices{}); !errors.Is(err, context.Canceled) {
+		if err := registry.Activate(context.Background()); !errors.Is(err, context.Canceled) {
 			t.Fatalf("second Activate() error = %v, want terminal %v", err, context.Canceled)
 		}
 		for key, resource := range resources {

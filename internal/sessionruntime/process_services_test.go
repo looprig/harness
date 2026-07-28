@@ -1,0 +1,160 @@
+package sessionruntime
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
+)
+
+func TestSessionProcessServiceBridgeIsValidatedAndUnavailable(t *testing.T) {
+	bridge, services, err := newSessionProcessServices()
+	if err != nil {
+		t.Fatalf("newSessionProcessServices() error = %v", err)
+	}
+	if bridge == nil {
+		t.Fatal("newSessionProcessServices() bridge = nil")
+	}
+	if err := services.Validate(); err != nil {
+		t.Fatalf("SessionResourceServices.Validate() error = %v", err)
+	}
+	if services.ProcessLifecyclePublisher() != bridge {
+		t.Fatal("lifecycle publisher did not retain the stable bridge")
+	}
+	if services.ProcessCompletionNotifier() != bridge {
+		t.Fatal("completion notifier did not retain the stable bridge")
+	}
+	if err := bridge.PublishProcessLifecycle(context.Background(), tool.ProcessLifecycleMetadata{}); !errors.Is(err, errSessionProcessServicesUnavailable) {
+		t.Fatalf("PublishProcessLifecycle() error = %v, want %v", err, errSessionProcessServicesUnavailable)
+	}
+	if err := bridge.NotifyProcessCompletion(context.Background(), tool.ProcessCompletionNotification{}); !errors.Is(err, errSessionProcessServicesUnavailable) {
+		t.Fatalf("NotifyProcessCompletion() error = %v, want %v", err, errSessionProcessServicesUnavailable)
+	}
+}
+
+type processServicesCaptureResource struct {
+	mu       sync.Mutex
+	services tool.SessionResourceServices
+}
+
+func (r *processServicesCaptureResource) Activate(_ context.Context, services tool.SessionResourceServices) error {
+	if err := services.Validate(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.services = services
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *processServicesCaptureResource) Shutdown(context.Context) error {
+	return nil
+}
+
+func (r *processServicesCaptureResource) capturedServices() tool.SessionResourceServices {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.services
+}
+
+type processServicesCapture struct {
+	bridge   *sessionProcessServiceBridge
+	resource *processServicesCaptureResource
+}
+
+func TestNewAndRestoreActivateResourcesWithTheirStableProcessServiceBridge(t *testing.T) {
+	var capturesMu sync.Mutex
+	captures := make(map[*sessionResources]processServicesCapture)
+	definition := processResourceDefinition(t, loop.EngineNative, func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+		registry, ok := bindings.Process.Registry.(*sessionResources)
+		if !ok {
+			return nil, errors.New("process registry is not *sessionResources")
+		}
+		resource, err := registry.GetOrCreate(ctx, "process-services-capture", func(string) (tool.SessionResource, error) {
+			captured := &processServicesCaptureResource{}
+			capturesMu.Lock()
+			captures[registry] = processServicesCapture{
+				bridge:   registry.processServiceBridge,
+				resource: captured,
+			}
+			capturesMu.Unlock()
+			return captured, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := resource.(*processServicesCaptureResource); !ok {
+			return nil, errors.New("process resource is not *processServicesCaptureResource")
+		}
+		return []tool.InvokableTool{primerTestTool{name: "process"}}, nil
+	})
+	store := processResourceStore(t)
+	resourceRoot := t.TempDir()
+	lifecycle, err := newTestLifecycle(
+		definition,
+		store,
+		WithLifecycleSessionResourceStorage(func(context.Context, uuid.UUID) (string, string, error) {
+			return resourceRoot, "stable-owner", nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewTopologyLifecycle() error = %v", err)
+	}
+
+	live, err := lifecycle.NewSession(context.Background(), "")
+	if err != nil {
+		t.Fatalf("NewSession() error = %v", err)
+	}
+	sessionID := live.SessionID()
+	assertCapturedProcessServices(t, &capturesMu, captures, 1)
+	if err := live.Shutdown(context.Background()); err != nil {
+		t.Fatalf("new Shutdown() error = %v", err)
+	}
+
+	restored, err := lifecycle.RestoreSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("RestoreSession() error = %v", err)
+	}
+	defer func() {
+		if err := restored.Shutdown(context.Background()); err != nil {
+			t.Errorf("restore Shutdown() error = %v", err)
+		}
+	}()
+	assertCapturedProcessServices(t, &capturesMu, captures, 2)
+}
+
+func assertCapturedProcessServices(
+	t *testing.T,
+	capturesMu *sync.Mutex,
+	captures map[*sessionResources]processServicesCapture,
+	want int,
+) {
+	t.Helper()
+	capturesMu.Lock()
+	defer capturesMu.Unlock()
+	if len(captures) != want {
+		t.Fatalf("captured registries = %d, want %d", len(captures), want)
+	}
+	for registry, captured := range captures {
+		if captured.bridge == nil {
+			t.Fatal("captured bridge = nil")
+		}
+		if registry.processServiceBridge != captured.bridge {
+			t.Fatal("registry replaced its process service bridge")
+		}
+		services := captured.resource.capturedServices()
+		if err := services.Validate(); err != nil {
+			t.Fatalf("captured SessionResourceServices.Validate() error = %v", err)
+		}
+		if services.ProcessLifecyclePublisher() != captured.bridge {
+			t.Fatal("activated resource captured a replacement lifecycle publisher")
+		}
+		if services.ProcessCompletionNotifier() != captured.bridge {
+			t.Fatal("activated resource captured a replacement completion notifier")
+		}
+	}
+}
