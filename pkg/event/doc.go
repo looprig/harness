@@ -64,4 +64,6 @@ var (
 	_ Event = UserInputRequested{}
 	_ Event = ToolCallStarted{}
 	_ Event = ToolCallCompleted{}
+	_ Event = PermissionReviewStarted{}
+	_ Event = PermissionReviewCompleted{}
 )

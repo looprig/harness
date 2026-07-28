@@ -8,6 +8,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	model "github.com/looprig/inference/model"
 )
@@ -38,6 +39,8 @@ func TestValidateEventValid(t *testing.T) {
 	loopH := event.Header{Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop}, EventID: evID}
 	turnH := event.Header{Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop, TurnID: turn}, EventID: evID}
 	stepH := event.Header{Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop, TurnID: turn, StepID: step}, EventID: evID}
+	reviewH := stepH
+	reviewH.EventVisibility = event.Internal
 	runtime := event.ModelRuntime{Key: model.ModelKey{Provider: "test", Model: "model"}}
 
 	tests := []struct {
@@ -86,6 +89,24 @@ func TestValidateEventValid(t *testing.T) {
 		{"UserInputRequested", event.UserInputRequested{Header: stepH, ToolExecutionID: toolID}},
 		{"ToolCallStarted", event.ToolCallStarted{Header: stepH, ToolExecutionID: toolID}},
 		{"ToolCallCompleted", event.ToolCallCompleted{Header: stepH, ToolExecutionID: toolID}},
+		{"PermissionReviewStarted", event.PermissionReviewStarted{
+			Header:             reviewH,
+			GateID:             gate.ID(vID(t)),
+			ToolExecutionID:    toolID,
+			Classifier:         hustle.Name("command-safety"),
+			ClassifierRevision: "v1",
+		}},
+		{"PermissionReviewCompleted", event.PermissionReviewCompleted{
+			Header:             reviewH,
+			GateID:             gate.ID(vID(t)),
+			ToolExecutionID:    toolID,
+			Classifier:         hustle.Name("command-safety"),
+			ClassifierRevision: "v1",
+			Status:             gate.ReviewStatusAllowed,
+			Risk:               gate.ReviewRiskLow,
+			Authorization:      gate.ReviewAuthorizationUnknown,
+			AutoApproved:       true,
+		}},
 		{"GatePrepared", event.GatePrepared{Header: stepH, Gate: gate.Gate{ID: gate.ID(toolID)}}},
 		{"GateOpened", event.GateOpened{Header: stepH, Gate: gate.Gate{ID: gate.ID(toolID)}}},
 		{"GateResolved", event.GateResolved{Header: stepH, GateID: gate.ID(toolID)}},

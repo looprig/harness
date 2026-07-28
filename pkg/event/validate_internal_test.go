@@ -155,6 +155,8 @@ func TestClassifyExhaustive(t *testing.T) {
 		{"HustleStarted", HustleStarted{}},
 		{"HustleCompleted", HustleCompleted{}},
 		{"HustleFailed", HustleFailed{}},
+		{"PermissionReviewStarted", PermissionReviewStarted{}},
+		{"PermissionReviewCompleted", PermissionReviewCompleted{}},
 		{"RestoreStarted", RestoreStarted{}},
 		{"RestoreDone", RestoreDone{}},
 		{"RestoreErrored", RestoreErrored{}},

@@ -421,6 +421,8 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"HustleStarted", HustleStarted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(ModelRuntime{})}},
 		{"HustleCompleted", HustleCompleted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Duration: time.Second, Usage: &content.Usage{InputTokens: 2, OutputTokens: 1}}},
 		{"HustleFailed", HustleFailed{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Duration: time.Second, Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference, Usage: &content.Usage{InputTokens: 2, OutputTokens: 1}}},
+		{"PermissionReviewStarted", validPermissionReviewStarted()},
+		{"PermissionReviewCompleted", validPermissionReviewCompleted()},
 		{"RestoreStarted", RestoreStarted{Header: fullHeaderSession()}},
 		{"RestoreDone", RestoreDone{Header: fullHeaderSession()}},
 		{"WorkspaceCheckpointed", WorkspaceCheckpointed{
@@ -794,7 +796,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 39
+const wantEnduringTypes = 41
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -806,6 +808,7 @@ func unionInstances() []Event {
 		HustleStarted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(ModelRuntime{})},
 		HustleCompleted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime())},
 		HustleFailed{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference},
+		PermissionReviewStarted{}, PermissionReviewCompleted{},
 		ConfigurationAdopted{},
 		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{}, WorkspaceRestored{}, ActiveLoopChanged{},
 		LoopIdle{}, LoopStarted{}, DelegateRequestAccepted{}, LoopInferenceChanged{}, LoopModeChanged{},
