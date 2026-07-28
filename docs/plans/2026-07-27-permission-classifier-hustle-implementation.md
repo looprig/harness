@@ -22,9 +22,16 @@ For every numbered task:
 3. The subagent writes one focused failing test and records the expected RED
    failure before production code.
 4. The subagent implements the minimum GREEN behavior, refactors only while
-   green, runs the owning package suite, self-reviews, and commits.
+   green, runs only the focused non-race tests needed to prove RED/GREEN plus a
+   quick owning-package compile/test, checks the diff, and commits.
 5. Record the commit and continue to the next task in the same phase without an
    independent task-level review.
+
+Per-task execution deliberately does **not** run race suites,
+integration-tagged suites, fuzz campaigns, static/security analysis,
+`govulncheck`, or trimpath builds. Any task-local “Run GREEN” text below means
+focused ordinary tests only. This keeps implementation latency low while
+retaining TDD.
 
 At each phase boundary:
 
@@ -39,6 +46,10 @@ At each phase boundary:
 3. Dispatch one fresh code-quality/security reviewer using
    `superpowers:requesting-code-review` for the entire phase diff.
 4. Fix every Critical and Important finding and re-review until approved.
+5. Run the complete phase verification matrix: focused and full race suites,
+   integration-tagged tests, all phase fuzz targets, formatting/vet/staticcheck/
+   gosec, vulnerability checks, module verification, dependency guards, and
+   CGO-disabled trimpath builds.
 
 Do not start the next phase with open findings.
 
