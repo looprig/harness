@@ -1147,8 +1147,10 @@ git commit -m "feat: enforce command safety policy"
 
 - Create: `internal/evidence/path.go`
 - Create: `internal/evidence/path_test.go`
+- Create: `internal/evidence/path_integration_test.go`
 - Create: `internal/evidence/git.go`
 - Create: `internal/evidence/git_test.go`
+- Create: `internal/evidence/git_integration_test.go`
 - Create: `internal/evidence/visibility.go`
 - Create: `internal/evidence/visibility_test.go`
 - Create: `internal/evidence/catalog.go`
@@ -1167,14 +1169,31 @@ Cover canonical metadata, missing/empty directories, bounded list/read/search,
 Git root/status/diff/remotes/branch/default-branch, and injected read-only
 visibility resolver.
 
-**Step 3: Verify RED**
+**Step 3: Write failing integration tests**
 
-**Step 4: Implement focused prepared tools**
+Tag both integration files with `//go:build integration`. Exercise real
+temporary filesystem trees and real `git` subprocesses, including symlink
+escapes, cancellation, unusual but valid file names, detached HEAD, empty
+repositories, and before/after snapshots proving no filesystem or repository
+mutation.
+
+**Step 4: Verify RED**
+
+Run both:
+
+```bash
+GOCACHE=/private/tmp/looprig-classifiers-go-cache GOFLAGS=-mod=vendor \
+  go test -race ./internal/evidence
+GOCACHE=/private/tmp/looprig-classifiers-go-cache GOFLAGS=-mod=vendor \
+  go test -tags integration -race ./internal/evidence
+```
+
+**Step 5: Implement focused prepared tools**
 
 Use direct argv for Git with a fixed allowlisted subcommand set and sanitized
 environment. Never expose arbitrary `git` arguments or shell.
 
-**Step 5: Run GREEN and commit**
+**Step 6: Run GREEN and commit**
 
 ```bash
 git add internal/evidence pkg/commandsafety
@@ -1276,7 +1295,7 @@ Commit module changes and vendor changes together.
 
 **Files:**
 
-- Create integration tests in CodeRig's application test package.
+- Create: `internal/app/permission_review_integration_test.go`
 - Add fake classifier inference fixtures.
 
 **Step 1: Write failing end-to-end tests**
@@ -1296,11 +1315,21 @@ Cover:
 
 **Step 2: Verify RED**
 
+The file uses `//go:build integration`. Run:
+
+```bash
+GOCACHE=/private/tmp/looprig-coderig-go-cache GOFLAGS=-mod=vendor \
+  go test -tags integration -race ./internal/app \
+  -run '^TestPermissionReview'
+```
+
 **Step 3: Add only necessary test/application plumbing**
 
 **Step 4: Run GREEN and commit**
 
-Run focused tests, full package, and CodeRig race suite.
+Run the focused integration command, full integration-tagged application
+package, default unit suite, and CodeRig race suite. Confirm the integration
+test actually executes by checking the named test in verbose output.
 
 ## Phase 6 review gate
 
@@ -1331,13 +1360,31 @@ Import Harness, classifiers, CodeRig-facing seams where allowed, tools,
 sandbox, and stores only in the integration module. Cover safe allow, human
 fallback, race, restore, and no leaked review content.
 
+The file uses the platform-aware tag:
+
+```go
+//go:build integration && (darwin || (linux && !android))
+```
+
 **Step 3: Verify RED**
+
+Run:
+
+```bash
+LOOPRIG_LIVE_NETWORK=0 GOWORK=off \
+  go test -tags integration -race -count=1 \
+  -run '^TestPermissionClassifier' ./...
+```
 
 **Step 4: Add minimum integration plumbing**
 
 No production policy belongs in `tests`.
 
 **Step 5: Run GREEN and commit**
+
+Run the focused command, then `make test` in the tests module. Use verbose
+output once to prove the integration-tagged tests are selected rather than
+silently excluded.
 
 ## Task 26: Add fuzz, race, leak, and dependency hardening
 
