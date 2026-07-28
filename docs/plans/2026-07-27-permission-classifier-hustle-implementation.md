@@ -204,6 +204,11 @@ type ReviewTruncation struct {
     OmittedEntries int
     OmittedBytes   int
 }
+
+const MaxReviewContextInputEntries = 4096
+const MaxReviewContextInputBytes = 4 << 20
+const MaxReviewContextEntryInputBytes = 2 << 20
+const MaxReviewContextRootFieldBytes = 64 << 10
 ```
 
 Tests must cover user/assistant/tool/runtime/external/omission origins,
@@ -222,6 +227,9 @@ Close the wire values:
 Add complete-value parse tests for both enums. Unknown, blank, mismatched, or
 invalid UTF-8 entries fail with the bounded non-echoing review validation
 error from Task 1.
+
+Test every hard bound at exact and one-over values. Consumer policy limits must
+not exceed the corresponding hard input/final-output bounds.
 
 **Step 2: Verify RED**
 
@@ -272,6 +280,15 @@ subject v1 wire so the two representations cannot drift. Oversized immutable
 root metadata fails closed when no valid omission can satisfy the bound.
 The deterministic token estimate remains
 `ceil(sum(entry content bytes)/4)` as specified above.
+
+Preflight uses checked arithmetic to reject more than 4,096 entries, more than
+4 MiB aggregate raw text, an entry over 2 MiB, or root metadata over 64 KiB
+before expensive encoding. Budget selection is linear: precompute canonical
+entry lengths and content totals once, scan newest optional entries once, use
+constant-size exact encodes for changing omission metadata, and build/encode
+the retained entry slice only once. Add a reducible input over 1 MiB and a
+4,096-entry adversarial test. Do not apply the final 1 MiB subject limit to an
+intermediate history that can be reduced below it.
 
 Because the v1 omission marker records counts but no trustworthy omitted-kind
 inventory, every omission is conservatively material in v1. A future wire
@@ -328,6 +345,8 @@ Tests must prove:
 
 - every basis field is required;
 - subject construction validates `tool.Request`;
+- every string in the serialized request projection is valid UTF-8 even when
+  `tool.ValidateRequest` conditionally ignores that optional field;
 - the basis context revision, gate-policy revision, and security ceiling exactly
   match the built context;
 - a non-empty request execution ID is canonical and equals the basis tool
@@ -420,6 +439,14 @@ Strict built-context validation accepts only values the v1 builder can emit:
   `Material`; and
 - masks/counters/markers cannot underreport one another.
 
+Add a private common-subject digest for conjunction. It uses the same complete
+canonical v1 projection but replaces only classifier revision and subject
+digest with fixed neutral values. Subjects with different classifier revisions
+must have different full subject digests and the same common digest when every
+other field is identical; mutating any gate/tool/request/context/policy/security
+field changes the common digest. Invalid UTF-8 raw JSON or typed request strings
+returns a zero subject/digest before `encoding/json` can replace bytes.
+
 **Step 4: Add fuzz seeds and invariants**
 
 Fuzz strict decoding and digest construction. An error must return a zero
@@ -500,6 +527,7 @@ type PermissionReviewPolicy struct {
     MinimumAuthorization map[ReviewRisk]ReviewAuthorization
     AbsoluteHuman        []ReviewRiskCategory
     MaterialTruncation   ReviewTruncationMask
+    // unexported canonical seal
 }
 
 func NewPermissionReviewPolicy(
@@ -521,6 +549,7 @@ func EvaluatePermissionAssessment(
 ) ReviewDecision
 
 type PermissionAssessmentOutcome struct {
+    Subject    PermissionReviewSubject
     Applicable bool
     Status     ReviewStatus
     Assessment PermissionAssessment
@@ -528,7 +557,6 @@ type PermissionAssessmentOutcome struct {
 
 func CombinePermissionAssessments(
     policy PermissionReviewPolicy,
-    subject PermissionReviewSubject,
     outcomes []PermissionAssessmentOutcome,
 ) ReviewDecision
 ```
@@ -557,6 +585,9 @@ Policy requirements:
   the default additional mask is zero;
 - evaluation revalidates the policy so mutation of its exported map after
   construction fails closed;
+- construction computes an unexported SHA-256 seal over a map-free canonical
+  projection of every policy field; evaluation requires the current projection
+  to match that seal, so even a still-valid weaker or stronger mutation fails;
 - policy revision is non-empty, bounded, valid UTF-8, and exactly equals the
   subject's gate-policy revision.
 
@@ -573,8 +604,18 @@ Assessment requirements:
 
 Conjunction requirements:
 
+- every outcome carries the exact classifier-specific subject used for
+  applicability and inference;
+- every subject validates independently and its assessment basis must match it
+  exactly;
+- classifier revisions are unique across outcomes;
+- a private common-subject digest neutralizes only classifier revision and
+  subject digest, and every outcome must share it;
+- any difference in gate/tool/request/context/policy/security identity fails
+  the conjunction;
 - an outcome is non-applicable only when `Applicable` is false and status is
-  `not_applicable`;
+  `not_applicable`, and only an applicable `allowed` outcome may carry a
+  non-zero assessment;
 - an applicable outcome is considered only when status is `allowed`;
 - any failed/timed-out/cancelled/stale/needs-human/inconsistent status fails
   the entire conjunction;
@@ -614,6 +655,24 @@ non-blocking participation, non-named model sources, missing structured output,
 name mismatch, and classifier revision mismatch with the definition
 descriptor's declared policy revision. It must not call `Applies`,
 `MarshalInput`, or `ValidateResult` during registration.
+
+Add:
+
+```go
+const MaxPermissionClassifierNameBytes = 128
+
+func ValidatePermissionClassifierName(hustle.Name) error
+```
+
+Permission names must be valid UTF-8, non-empty, already trimmed, NUL-free, at
+most 128 bytes, and valid under `hustle.Name.Validate`. Use the same bounded
+validator in registry and event validation.
+
+Read each implementation's `Name`, `Revision`, and `Definition` exactly once
+during registration. Store an unexported immutable wrapper with those frozen
+values and the trusted behavior delegate. `Classifiers` returns wrapper
+interfaces; later mutation of the source object's metadata cannot change the
+registered values. Add call-count and post-registration drift tests.
 
 **Step 5: Run GREEN and commit**
 
@@ -682,11 +741,12 @@ Validation is exact:
 - visibility must be `Internal`;
 - gate ID, tool execution ID, classifier name, and classifier revision are
   required;
-- classifier name uses `hustle.Name.Validate`; revision is valid UTF-8,
-  non-blank, and at most `gate.MaxPermissionClassifierRevisionBytes`;
+- classifier name uses `gate.ValidatePermissionClassifierName`; revision is
+  valid UTF-8, non-blank, and at most
+  `gate.MaxPermissionClassifierRevisionBytes`;
 - completed status must be one of the closed `gate.ReviewStatus` values;
 - `allowed` requires valid risk and authorization, valid unique categories,
-  and `AutoApproved=true`;
+  non-critical risk, and `AutoApproved=true`;
 - `needs_human` requires valid risk and authorization, valid unique categories,
   and `AutoApproved=false`; and
 - `not_applicable`, `timed_out`, `failed`, `cancelled`, and `stale` require
@@ -697,6 +757,9 @@ The wire uses exact discriminators `PermissionReviewStarted` and
 sealed-union/class/scope/terminal/visibility/identity/marshal/decode drift guard.
 The existing event envelope's additive unknown-field compatibility remains
 unchanged; do not make the global decoder stricter as part of this task.
+Reject invalid UTF-8 event-envelope bytes before `encoding/json` replacement;
+valid JSON/event records are UTF-8 and legacy compatibility does not require
+accepting invalid byte strings.
 Add fuzz seeds for both discriminators and assert decode never panics; every
 successful decode validates and remarshal/redecode is a fixed point.
 

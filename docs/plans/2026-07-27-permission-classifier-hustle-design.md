@@ -339,6 +339,20 @@ The strict v1 decoder also rejects JSON `null` for every scalar, object, and
 array member—including optional strings whose canonical value may be empty—
 before Go zero-value conversion can erase the distinction.
 
+Subject construction validates UTF-8 for every string serialized into the
+canonical request projection, including optional command and working-directory
+fields that `tool.ValidateRequest` does not inspect for a grant-free request.
+Canonical hashing never relies on `encoding/json`'s replacement of invalid
+UTF-8, so distinct typed inputs cannot collapse to one digest.
+
+Each classifier receives its own subject: `ClassifierRevision` and therefore
+`SubjectDigest` are classifier-specific. Conjunctive combination computes a
+second private common-subject digest with only those two fields neutralized.
+That digest proves every outcome covers the same gate, tool execution, complete
+request, context, gate policy, and security ceiling while allowing different
+classifier revisions. Assessment-to-subject validation always retains the full
+classifier-specific basis comparison.
+
 ### 8.3 Context snapshot
 
 The loop runtime builds a live-only `ReviewContext` before running a tool batch.
@@ -399,11 +413,29 @@ Context policy has separate limits for:
 - individual block bytes; and
 - active action bytes.
 
+The builder also has hard implementation bounds independent of consumer policy:
+
+- at most 4,096 input entries;
+- at most 4 MiB of checked aggregate raw input text;
+- at most 2 MiB in one entry; and
+- at most 64 KiB in one root metadata field.
+
+Consumer limits may tighten but not exceed their corresponding hard bounds.
+The final canonical context is at most the 1 MiB subject-wire ceiling.
+
 “Total encoded bytes” means the exact byte length of the canonical private
 JSON projection of the complete `ReviewContext`, including coordinates, root
 metadata, entries, and truncation metadata. It is not merely the sum of entry
 content. The context builder and subject wire share this projection so budget
 and digest representations cannot drift.
+
+Selection is linear in the bounded input domain. The builder precomputes each
+canonical entry contribution and checked content total once, scans optional
+entries newest-to-oldest once, and performs only bounded constant-size encodes
+for changing omission metadata plus one final full encode. It does not clone
+and re-encode the growing history for every candidate. An intermediate context
+may exceed the final 1 MiB ceiling when deterministic omission can reduce it
+below the configured limit.
 
 Truncation preserves both prefix and suffix when useful and emits an explicit
 typed omission entry. It never silently drops content.
@@ -511,6 +543,14 @@ Construction rejects:
 - nil or typed-nil implementations; and
 - definitions whose descriptors do not match the classifier metadata.
 
+Permission-classifier names are additionally valid UTF-8, trimmed canonical
+text without NUL, and at most 128 bytes. Registration reads name, revision, and
+definition once, validates them, and stores an immutable wrapper containing
+those frozen metadata values. Registry views expose the wrapper, never the
+mutable implementation's metadata methods. Applicability/input/result behavior
+delegates to the trusted implementation, but later metadata drift cannot
+change the registered name, revision, or definition.
+
 ## 10. Local decision policy
 
 The model recommendation is necessary but insufficient. Harness evaluates:
@@ -523,6 +563,11 @@ type PermissionReviewPolicy struct {
     MaterialTruncation   ReviewTruncationMask
 }
 ```
+
+Construction seals the complete canonical policy projection in unexported
+state. Evaluation validates both the public fields and that seal, so any
+post-construction mutation—including a different policy that would be valid if
+newly constructed—fails closed under the original revision.
 
 The hard Harness ceiling is:
 
@@ -551,6 +596,14 @@ Harness recomputes the policy decision from the typed assessment. A model
 
 Consumers register an ordered set, but applicable classifiers may execute
 concurrently subject to the blocking Hustle lane.
+
+Harness constructs one classifier-specific `PermissionReviewSubject` per
+registered classifier. An outcome carries that exact subject. Combination
+validates each assessment against its own full basis, rejects duplicate
+classifier revisions, and compares a private common-subject digest that
+neutralizes only classifier revision and subject digest. Any difference in
+gate, tool execution, prepared request, context, gate policy, or security
+ceiling leaves the gate human.
 
 Decision combination is conjunctive:
 
@@ -930,6 +983,9 @@ Statuses are closed:
 - `failed`;
 - `cancelled`; and
 - `stale`.
+
+An `allowed` completion can never carry `critical` risk; durable validation
+rejects that globally impossible audit state even if a producer is buggy.
 
 Events exclude:
 
