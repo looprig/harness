@@ -19,19 +19,30 @@ type PermissionAssessmentOutcome struct {
 	Assessment PermissionAssessment
 }
 
-// CombinePermissionAssessments applies ordered conjunctive review semantics.
-// The first applicable failure wins; non-applicable outcomes are neutral only
-// when their status is exactly not_applicable.
+// CombinePermissionAssessments applies ordered conjunctive review semantics
+// against one immutable registered classifier set. Every registered classifier
+// must contribute exactly one outcome in registration order. The first
+// applicable failure wins; non-applicable outcomes are neutral only when their
+// status is exactly not_applicable.
 func CombinePermissionAssessments(
 	policy PermissionReviewPolicy,
+	classifiers PermissionClassifierSet,
 	outcomes []PermissionAssessmentOutcome,
 ) ReviewDecision {
 	if !validPermissionReviewPolicy(policy) {
 		return reviewDecision(ReviewDecisionInvalidPolicy)
 	}
+	if len(classifiers.ordered) == 0 ||
+		len(outcomes) != len(classifiers.ordered) {
+		return reviewDecision(ReviewDecisionInvalidAssessment)
+	}
 	var commonDigest [32]byte
 	revisions := make(map[string]struct{}, len(outcomes))
 	for index, outcome := range outcomes {
+		if outcome.Subject.Basis.ClassifierRevision !=
+			classifiers.ordered[index].Revision() {
+			return reviewDecision(ReviewDecisionInvalidAssessment)
+		}
 		if !validPermissionAssessmentOutcomeStatus(outcome) {
 			return reviewDecision(ReviewDecisionClassifierStatus)
 		}
@@ -185,18 +196,18 @@ func (c *frozenPermissionClassifier) Name() hustle.Name             { return c.n
 func (c *frozenPermissionClassifier) Revision() string              { return c.revision }
 func (c *frozenPermissionClassifier) Definition() hustle.Definition { return c.definition }
 func (c *frozenPermissionClassifier) Applies(subject PermissionReviewSubject) bool {
-	return c.source.Applies(subject)
+	return c.source.Applies(subject.Clone())
 }
 func (c *frozenPermissionClassifier) MarshalInput(
 	subject PermissionReviewSubject,
 ) (json.RawMessage, error) {
-	return c.source.MarshalInput(subject)
+	return c.source.MarshalInput(subject.Clone())
 }
 func (c *frozenPermissionClassifier) ValidateResult(
 	subject PermissionReviewSubject,
 	result hustle.Result,
 ) (PermissionAssessment, error) {
-	return c.source.ValidateResult(subject, result)
+	return c.source.ValidateResult(subject.Clone(), result)
 }
 
 // NewPermissionClassifierSet validates metadata without executing classifier

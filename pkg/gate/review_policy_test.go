@@ -551,6 +551,11 @@ func TestCombinePermissionAssessments(t *testing.T) {
 	policy := mustDefaultPermissionReviewPolicy(t, "gate-policy-v1")
 	first := validPermissionReviewSubject(t)
 	second := permissionReviewSubjectWithClassifierRevision(t, first, "command-safety-v2")
+	classifiers := mustPermissionClassifierSet(
+		t,
+		validPermissionClassifier(t, "first", first.Basis.ClassifierRevision),
+		validPermissionClassifier(t, "second", second.Basis.ClassifierRevision),
+	)
 	allowFirst := validPermissionAssessment(first, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow)
 	allowSecond := validPermissionAssessment(second, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow)
 	human := allowFirst
@@ -561,24 +566,32 @@ func TestCombinePermissionAssessments(t *testing.T) {
 		reason   gate.ReviewDecisionReason
 		eligible bool
 	}{
-		{name: "empty", reason: gate.ReviewDecisionNoApplicableClassifier},
-		{name: "neutral", outcomes: []gate.PermissionAssessmentOutcome{{Subject: first, Status: gate.ReviewStatusNotApplicable}}, reason: gate.ReviewDecisionNoApplicableClassifier},
-		{name: "one allow", outcomes: []gate.PermissionAssessmentOutcome{{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst}}, reason: gate.ReviewDecisionEligible, eligible: true},
-		{name: "multiple classifier allow", outcomes: []gate.PermissionAssessmentOutcome{
+		{name: "all allowed", outcomes: []gate.PermissionAssessmentOutcome{
 			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst},
 			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
 		}, reason: gate.ReviewDecisionEligible, eligible: true},
-		{name: "human", outcomes: []gate.PermissionAssessmentOutcome{{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: human}}, reason: gate.ReviewDecisionRecommendation},
-		{name: "false allowed", outcomes: []gate.PermissionAssessmentOutcome{{Status: gate.ReviewStatusAllowed}}, reason: gate.ReviewDecisionClassifierStatus},
-		{name: "true not applicable", outcomes: []gate.PermissionAssessmentOutcome{{Subject: first, Applicable: true, Status: gate.ReviewStatusNotApplicable}}, reason: gate.ReviewDecisionClassifierStatus},
-		{name: "neutral then failure", outcomes: []gate.PermissionAssessmentOutcome{{Subject: first, Status: gate.ReviewStatusNotApplicable}, {Subject: second, Applicable: true, Status: gate.ReviewStatusFailed}}, reason: gate.ReviewDecisionClassifierStatus},
-		{name: "first failure wins", outcomes: []gate.PermissionAssessmentOutcome{{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: human}, {Subject: second, Applicable: true, Status: gate.ReviewStatusFailed}}, reason: gate.ReviewDecisionRecommendation},
+		{name: "non applicable is neutral", outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Status: gate.ReviewStatusNotApplicable},
+			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
+		}, reason: gate.ReviewDecisionEligible, eligible: true},
+		{name: "all non applicable", outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Status: gate.ReviewStatusNotApplicable},
+			{Subject: second, Status: gate.ReviewStatusNotApplicable},
+		}, reason: gate.ReviewDecisionNoApplicableClassifier},
+		{name: "human", outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: human},
+			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
+		}, reason: gate.ReviewDecisionRecommendation},
+		{name: "failure", outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst},
+			{Subject: second, Applicable: true, Status: gate.ReviewStatusFailed},
+		}, reason: gate.ReviewDecisionClassifierStatus},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := gate.CombinePermissionAssessments(policy, tt.outcomes)
+			got := gate.CombinePermissionAssessments(policy, classifiers, tt.outcomes)
 			if got.Eligible != tt.eligible || got.Reason != tt.reason {
 				t.Fatalf("decision = %#v, want eligible=%v reason=%q", got, tt.eligible, tt.reason)
 			}
@@ -592,44 +605,79 @@ func TestCombinePermissionAssessments(t *testing.T) {
 		gate.ReviewStatusCancelled,
 		gate.ReviewStatusStale,
 	} {
-		got := gate.CombinePermissionAssessments(policy, []gate.PermissionAssessmentOutcome{{Subject: first, Applicable: true, Status: status}})
+		got := gate.CombinePermissionAssessments(policy, classifiers, []gate.PermissionAssessmentOutcome{
+			{Subject: first, Applicable: true, Status: status},
+			{Subject: second, Status: gate.ReviewStatusNotApplicable},
+		})
 		if got.Eligible || got.Reason != gate.ReviewDecisionClassifierStatus {
 			t.Fatalf("status %q decision = %#v", status, got)
 		}
 	}
 }
 
-func TestCombinePermissionAssessmentsRejectsSubjectOrOutcomeConfusion(t *testing.T) {
+func TestCombinePermissionAssessmentsRequiresCompleteRegisteredSet(t *testing.T) {
 	t.Parallel()
 	policy := mustDefaultPermissionReviewPolicy(t, "gate-policy-v1")
 	first := validPermissionReviewSubject(t)
 	second := permissionReviewSubjectWithClassifierRevision(t, first, "command-safety-v2")
+	classifiers := mustPermissionClassifierSet(
+		t,
+		validPermissionClassifier(t, "first", first.Basis.ClassifierRevision),
+		validPermissionClassifier(t, "second", second.Basis.ClassifierRevision),
+	)
 	allowFirst := validPermissionAssessment(first, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow)
 	allowSecond := validPermissionAssessment(second, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow)
-	nonZero := allowFirst
+	invented := permissionReviewSubjectWithClassifierRevision(t, first, "invented-v1")
 	tests := []struct {
 		name     string
+		set      gate.PermissionClassifierSet
 		outcomes []gate.PermissionAssessmentOutcome
 	}{
+		{name: "no registered set"},
+		{name: "missing allowed member", set: classifiers, outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: second, Applicable: true, Status: gate.ReviewStatusFailed},
+		}},
+		{name: "missing non applicable member", set: classifiers, outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst},
+		}},
+		{name: "missing failed member", set: classifiers, outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst},
+		}},
+		{name: "extra invented member", set: classifiers, outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst},
+			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
+			{Subject: invented, Status: gate.ReviewStatusNotApplicable},
+		}},
+		{name: "invented revision replaces registered", set: classifiers, outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst},
+			{Subject: invented, Status: gate.ReviewStatusNotApplicable},
+		}},
+		{name: "reversed", set: classifiers, outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst},
+		}},
 		{name: "duplicate classifier revision", outcomes: []gate.PermissionAssessmentOutcome{
 			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst},
 			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst},
-		}},
+		}, set: classifiers},
 		{name: "assessment bound to another classifier", outcomes: []gate.PermissionAssessmentOutcome{
 			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
-		}},
+			{Subject: second, Status: gate.ReviewStatusNotApplicable},
+		}, set: classifiers},
 		{name: "non applicable carries assessment", outcomes: []gate.PermissionAssessmentOutcome{
-			{Subject: first, Status: gate.ReviewStatusNotApplicable, Assessment: nonZero},
-		}},
+			{Subject: first, Status: gate.ReviewStatusNotApplicable, Assessment: allowFirst},
+			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
+		}, set: classifiers},
 		{name: "failed carries assessment", outcomes: []gate.PermissionAssessmentOutcome{
-			{Subject: first, Applicable: true, Status: gate.ReviewStatusFailed, Assessment: nonZero},
-		}},
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusFailed, Assessment: allowFirst},
+			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
+		}, set: classifiers},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := gate.CombinePermissionAssessments(policy, tt.outcomes)
+			got := gate.CombinePermissionAssessments(policy, tt.set, tt.outcomes)
 			if got.Eligible || got.Reason != gate.ReviewDecisionInvalidAssessment {
 				t.Fatalf("decision = %#v, want invalid assessment", got)
 			}
@@ -642,6 +690,11 @@ func TestCombinePermissionAssessmentsRejectsDifferentCommonSubject(t *testing.T)
 	policy := mustDefaultPermissionReviewPolicy(t, "gate-policy-v1")
 	first := validPermissionReviewSubject(t)
 	second := permissionReviewSubjectWithClassifierRevision(t, first, "command-safety-v2")
+	classifiers := mustPermissionClassifierSet(
+		t,
+		validPermissionClassifier(t, "first", first.Basis.ClassifierRevision),
+		validPermissionClassifier(t, "second", second.Basis.ClassifierRevision),
+	)
 	basis := second.Basis
 	basis.SubjectDigest = [32]byte{}
 	request := second.Request.Clone()
@@ -650,7 +703,7 @@ func TestCombinePermissionAssessmentsRejectsDifferentCommonSubject(t *testing.T)
 	if err != nil {
 		t.Fatalf("NewPermissionReviewSubject(different) error = %v", err)
 	}
-	got := gate.CombinePermissionAssessments(policy, []gate.PermissionAssessmentOutcome{
+	got := gate.CombinePermissionAssessments(policy, classifiers, []gate.PermissionAssessmentOutcome{
 		{
 			Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed,
 			Assessment: validPermissionAssessment(first, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow),
@@ -663,6 +716,18 @@ func TestCombinePermissionAssessmentsRejectsDifferentCommonSubject(t *testing.T)
 	if got.Eligible || got.Reason != gate.ReviewDecisionInvalidAssessment {
 		t.Fatalf("decision = %#v, want invalid assessment", got)
 	}
+}
+
+func mustPermissionClassifierSet(
+	t *testing.T,
+	classifiers ...gate.PermissionClassifier,
+) gate.PermissionClassifierSet {
+	t.Helper()
+	set, err := gate.NewPermissionClassifierSet(classifiers...)
+	if err != nil {
+		t.Fatalf("NewPermissionClassifierSet() error = %v", err)
+	}
+	return set
 }
 
 func permissionReviewSubjectWithClassifierRevision(

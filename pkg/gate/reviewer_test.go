@@ -3,6 +3,7 @@ package gate_test
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,7 @@ type permissionClassifierStub struct {
 	applies    int
 	marshals   int
 	validates  int
+	mutate     func(*gate.PermissionReviewSubject)
 }
 
 func (s *permissionClassifierStub) Name() hustle.Name {
@@ -49,16 +51,25 @@ func (s *permissionClassifierStub) Definition() hustle.Definition {
 	s.defCalls++
 	return s.definition
 }
-func (s *permissionClassifierStub) Applies(gate.PermissionReviewSubject) bool {
+func (s *permissionClassifierStub) Applies(subject gate.PermissionReviewSubject) bool {
 	s.applies++
+	if s.mutate != nil {
+		s.mutate(&subject)
+	}
 	return true
 }
-func (s *permissionClassifierStub) MarshalInput(gate.PermissionReviewSubject) (json.RawMessage, error) {
+func (s *permissionClassifierStub) MarshalInput(subject gate.PermissionReviewSubject) (json.RawMessage, error) {
 	s.marshals++
+	if s.mutate != nil {
+		s.mutate(&subject)
+	}
 	return json.RawMessage(`{}`), nil
 }
-func (s *permissionClassifierStub) ValidateResult(gate.PermissionReviewSubject, hustle.Result) (gate.PermissionAssessment, error) {
+func (s *permissionClassifierStub) ValidateResult(subject gate.PermissionReviewSubject, _ hustle.Result) (gate.PermissionAssessment, error) {
 	s.validates++
+	if s.mutate != nil {
+		s.mutate(&subject)
+	}
 	return gate.PermissionAssessment{}, nil
 }
 
@@ -211,6 +222,91 @@ func TestPermissionClassifierSetFreezesMetadataAndDelegatesBehavior(t *testing.T
 			source.marshals,
 			source.validates,
 		)
+	}
+}
+
+func TestPermissionClassifierSetDelegationOwnsSubject(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		call func(*testing.T, gate.PermissionClassifier, gate.PermissionReviewSubject)
+	}{
+		{
+			name: "applies",
+			call: func(t *testing.T, classifier gate.PermissionClassifier, subject gate.PermissionReviewSubject) {
+				t.Helper()
+				if !classifier.Applies(subject) {
+					t.Fatal("Applies() = false, want delegated true")
+				}
+			},
+		},
+		{
+			name: "marshal input",
+			call: func(t *testing.T, classifier gate.PermissionClassifier, subject gate.PermissionReviewSubject) {
+				t.Helper()
+				got, err := classifier.MarshalInput(subject)
+				if err != nil {
+					t.Fatalf("MarshalInput() error = %v", err)
+				}
+				if string(got) != `{}` {
+					t.Fatalf("MarshalInput() = %q, want delegated result", got)
+				}
+			},
+		},
+		{
+			name: "validate result",
+			call: func(t *testing.T, classifier gate.PermissionClassifier, subject gate.PermissionReviewSubject) {
+				t.Helper()
+				got, err := classifier.ValidateResult(subject, hustle.Result{})
+				if err != nil {
+					t.Fatalf("ValidateResult() error = %v", err)
+				}
+				if !reflect.DeepEqual(got, gate.PermissionAssessment{}) {
+					t.Fatalf("ValidateResult() = %#v, want delegated zero assessment", got)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			source := validPermissionClassifier(t, "command-safety", "command-safety-v1")
+			source.mutate = func(subject *gate.PermissionReviewSubject) {
+				subject.Request.Requirements[0].Description = "mutated requirement"
+				subject.Request.Requirements[0].Candidates[0].Description = "mutated candidate"
+				subject.Context.Entries[0].Content = "mutated context"
+				subject.Basis.SubjectDigest = [32]byte{}
+			}
+			set, err := gate.NewPermissionClassifierSet(source)
+			if err != nil {
+				t.Fatalf("NewPermissionClassifierSet() error = %v", err)
+			}
+			if source.applies != 0 || source.marshals != 0 || source.validates != 0 {
+				t.Fatal("registration executed classifier behavior")
+			}
+			subject := validPermissionReviewSubject(t)
+			original := subject.Clone()
+			tt.call(t, set.Classifiers()[0], subject)
+			if !reflect.DeepEqual(subject, original) {
+				t.Fatalf("delegation mutated caller subject:\ngot  %#v\nwant %#v", subject, original)
+			}
+			digest, err := gate.SubjectDigest(subject)
+			if err != nil {
+				t.Fatalf("SubjectDigest() error = %v", err)
+			}
+			if digest != original.Basis.SubjectDigest {
+				t.Fatalf("digest = %x, want original %x", digest, original.Basis.SubjectDigest)
+			}
+			if source.nameCalls != 1 || source.revCalls != 1 || source.defCalls != 1 {
+				t.Fatalf(
+					"metadata calls = name:%d revision:%d definition:%d, want exactly once",
+					source.nameCalls,
+					source.revCalls,
+					source.defCalls,
+				)
+			}
+		})
 	}
 }
 
