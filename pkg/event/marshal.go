@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"unicode/utf8"
 
@@ -626,15 +627,15 @@ func decodePayload(tag string, data []byte) (Event, error) {
 	case "PermissionReviewCompleted":
 		return decodePlain[PermissionReviewCompleted](tag, data)
 	case "ProcessStarted":
-		return decodePlain[ProcessStarted](tag, data)
+		return decodeProcessLifecycleEvent(tag, data)
 	case "ProcessBackgrounded":
-		return decodePlain[ProcessBackgrounded](tag, data)
+		return decodeProcessLifecycleEvent(tag, data)
 	case "ProcessCompleted":
-		return decodePlain[ProcessCompleted](tag, data)
+		return decodeProcessLifecycleEvent(tag, data)
 	case "ProcessStopRequested":
-		return decodePlain[ProcessStopRequested](tag, data)
+		return decodeProcessLifecycleEvent(tag, data)
 	case "ProcessLost":
-		return decodePlain[ProcessLost](tag, data)
+		return decodeProcessLifecycleEvent(tag, data)
 	case "LoopIdle":
 		return decodePlain[LoopIdle](tag, data)
 	case "LoopStarted":
@@ -774,6 +775,44 @@ func decodePlain[T any](tag string, data []byte) (Event, error) {
 		return nil, &UnknownEventTypeError{Type: tag}
 	}
 	return ev, nil
+}
+
+type processLifecycleEventWire struct {
+	Type string  `json:"type"`
+	V    *uint32 `json:"v"`
+	Header
+	Process tool.ProcessLifecycleMetadata `json:"process"`
+}
+
+func decodeProcessLifecycleEvent(tag string, data []byte) (Event, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+
+	var wire processLifecycleEventWire
+	if err := decoder.Decode(&wire); err != nil {
+		return nil, &EventDecodeError{Type: tag, Cause: err}
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = errors.New("trailing JSON value")
+		}
+		return nil, &EventDecodeError{Type: tag, Cause: err}
+	}
+
+	switch tag {
+	case "ProcessStarted":
+		return ProcessStarted{Header: wire.Header, Process: wire.Process}, nil
+	case "ProcessBackgrounded":
+		return ProcessBackgrounded{Header: wire.Header, Process: wire.Process}, nil
+	case "ProcessCompleted":
+		return ProcessCompleted{Header: wire.Header, Process: wire.Process}, nil
+	case "ProcessStopRequested":
+		return ProcessStopRequested{Header: wire.Header, Process: wire.Process}, nil
+	case "ProcessLost":
+		return ProcessLost{Header: wire.Header, Process: wire.Process}, nil
+	default:
+		return nil, &UnknownEventTypeError{Type: tag}
+	}
 }
 
 func decodeStepDone(data []byte) (Event, error) {

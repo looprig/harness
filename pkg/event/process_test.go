@@ -59,13 +59,7 @@ func processEventHeader(metadata tool.ProcessLifecycleMetadata) Header {
 func TestProcessLifecycleEventsRoundTripSealedCodec(t *testing.T) {
 	t.Parallel()
 
-	records := []Event{
-		ProcessStarted{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleStarted, tool.ProcessLifecycleRunning, 0)), Process: validProcessEventMetadata(tool.ProcessLifecycleStarted, tool.ProcessLifecycleRunning, 0)},
-		ProcessBackgrounded{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleBackgrounded, tool.ProcessLifecycleRunning, 0)), Process: validProcessEventMetadata(tool.ProcessLifecycleBackgrounded, tool.ProcessLifecycleRunning, 0)},
-		ProcessCompleted{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleCompleted, tool.ProcessLifecycleExited, tool.ProcessTerminalExited)), Process: validProcessEventMetadata(tool.ProcessLifecycleCompleted, tool.ProcessLifecycleExited, tool.ProcessTerminalExited)},
-		ProcessStopRequested{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleStopRequested, tool.ProcessLifecycleRunning, tool.ProcessTerminalInterrupted)), Process: validProcessEventMetadata(tool.ProcessLifecycleStopRequested, tool.ProcessLifecycleRunning, tool.ProcessTerminalInterrupted)},
-		ProcessLost{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleLost, tool.ProcessLifecycleLostOnRestore, tool.ProcessTerminalLostOnRestore)), Process: validProcessEventMetadata(tool.ProcessLifecycleLost, tool.ProcessLifecycleLostOnRestore, tool.ProcessTerminalLostOnRestore)},
-	}
+	records := validProcessLifecycleEvents()
 	for _, record := range records {
 		encoded, err := MarshalEvent(record)
 		if err != nil {
@@ -91,6 +85,118 @@ func TestProcessLifecycleEventsRoundTripSealedCodec(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestProcessLifecycleEventsRejectUnknownWireFields(t *testing.T) {
+	t.Parallel()
+
+	unknownValues := map[string]json.RawMessage{
+		"command":     json.RawMessage(`"printf secret"`),
+		"output":      json.RawMessage(`"secret output"`),
+		"stdin":       json.RawMessage(`"secret input"`),
+		"environment": json.RawMessage(`{"TOKEN":"secret"}`),
+		"path":        json.RawMessage(`"/host/private"`),
+		"pid":         json.RawMessage(`31337`),
+		"unexpected":  json.RawMessage(`true`),
+	}
+	for _, record := range validProcessLifecycleEvents() {
+		record := record
+		eventName := reflect.TypeOf(record).Name()
+		for field, value := range unknownValues {
+			field, value := field, value
+			for _, location := range []string{"envelope", "process"} {
+				location := location
+				t.Run(eventName+"/"+location+"/"+field, func(t *testing.T) {
+					t.Parallel()
+
+					wire := processEventWireWithUnknownField(t, record, location, field, value)
+					decoded, err := UnmarshalEvent(wire)
+					if decoded != nil {
+						t.Fatalf("UnmarshalEvent() event = %#v, want nil", decoded)
+					}
+					var decodeErr *EventDecodeError
+					if !errors.As(err, &decodeErr) {
+						t.Fatalf("UnmarshalEvent() error = %T %v, want *EventDecodeError", err, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestProcessLifecycleStrictDecoderRejectsTrailingJSON(t *testing.T) {
+	t.Parallel()
+
+	for _, record := range validProcessLifecycleEvents() {
+		record := record
+		tag := reflect.TypeOf(record).Name()
+		t.Run(tag, func(t *testing.T) {
+			t.Parallel()
+
+			wire, err := MarshalEvent(record)
+			if err != nil {
+				t.Fatalf("MarshalEvent(%T) error = %v", record, err)
+			}
+			decoded, err := decodeProcessLifecycleEvent(tag, append(wire, []byte(`{}`)...))
+			if decoded != nil {
+				t.Fatalf("decodeProcessLifecycleEvent() event = %#v, want nil", decoded)
+			}
+			var decodeErr *EventDecodeError
+			if !errors.As(err, &decodeErr) {
+				t.Fatalf("decodeProcessLifecycleEvent() error = %T %v, want *EventDecodeError", err, err)
+			}
+		})
+	}
+}
+
+func validProcessLifecycleEvents() []Event {
+	return []Event{
+		ProcessStarted{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleStarted, tool.ProcessLifecycleRunning, 0)), Process: validProcessEventMetadata(tool.ProcessLifecycleStarted, tool.ProcessLifecycleRunning, 0)},
+		ProcessBackgrounded{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleBackgrounded, tool.ProcessLifecycleRunning, 0)), Process: validProcessEventMetadata(tool.ProcessLifecycleBackgrounded, tool.ProcessLifecycleRunning, 0)},
+		ProcessCompleted{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleCompleted, tool.ProcessLifecycleExited, tool.ProcessTerminalExited)), Process: validProcessEventMetadata(tool.ProcessLifecycleCompleted, tool.ProcessLifecycleExited, tool.ProcessTerminalExited)},
+		ProcessStopRequested{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleStopRequested, tool.ProcessLifecycleRunning, tool.ProcessTerminalInterrupted)), Process: validProcessEventMetadata(tool.ProcessLifecycleStopRequested, tool.ProcessLifecycleRunning, tool.ProcessTerminalInterrupted)},
+		ProcessLost{Header: processEventHeader(validProcessEventMetadata(tool.ProcessLifecycleLost, tool.ProcessLifecycleLostOnRestore, tool.ProcessTerminalLostOnRestore)), Process: validProcessEventMetadata(tool.ProcessLifecycleLost, tool.ProcessLifecycleLostOnRestore, tool.ProcessTerminalLostOnRestore)},
+	}
+}
+
+func processEventWireWithUnknownField(
+	t *testing.T,
+	record Event,
+	location string,
+	field string,
+	value json.RawMessage,
+) []byte {
+	t.Helper()
+
+	encoded, err := MarshalEvent(record)
+	if err != nil {
+		t.Fatalf("MarshalEvent(%T) error = %v", record, err)
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &envelope); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	switch location {
+	case "envelope":
+		envelope[field] = value
+	case "process":
+		var process map[string]json.RawMessage
+		if err := json.Unmarshal(envelope["process"], &process); err != nil {
+			t.Fatalf("decode process: %v", err)
+		}
+		process[field] = value
+		envelope["process"], err = json.Marshal(process)
+		if err != nil {
+			t.Fatalf("encode process: %v", err)
+		}
+	default:
+		t.Fatalf("unknown location %q", location)
+	}
+	wire, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("encode hostile wire: %v", err)
+	}
+	return wire
 }
 
 func TestProcessLifecycleEventValidationMatchesHeader(t *testing.T) {
