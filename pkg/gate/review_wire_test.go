@@ -436,6 +436,39 @@ func TestReviewSubjectWireRoundTripsBuilderTruncationAndZeroByteOmission(t *test
 	})
 }
 
+func TestReviewSubjectWireRoundTripsReducibleContextOverWireLimit(t *testing.T) {
+	t.Parallel()
+
+	base := validPermissionReviewSubject(t)
+	input := base.Context.Clone()
+	input.Entries = append([]ReviewContextEntry{{
+		Origin: ReviewContextOriginAssistant,
+		Kind:   ReviewContextKindAssistantMessage,
+		Content: strings.Repeat(
+			"x",
+			MaxPermissionReviewSubjectWireBytes+(64<<10),
+		),
+	}}, input.Entries...)
+	policy := reviewContextWireTestPolicy()
+	policy.MaxBytes = 4096
+	policy.MaxEstimatedTokens = MaxReviewContextInputBytes / 4
+	policy.MaxAgentEntryBytes = MaxReviewContextEntryInputBytes
+	policy.MaxBlockBytes = MaxReviewContextEntryInputBytes
+
+	built, err := BuildReviewContext(input, policy)
+	if err != nil {
+		t.Fatalf("BuildReviewContext() error = %v", err)
+	}
+	if built.Truncation.OmittedBytes <= MaxPermissionReviewSubjectWireBytes {
+		t.Fatalf(
+			"OmittedBytes = %d, want > %d",
+			built.Truncation.OmittedBytes,
+			MaxPermissionReviewSubjectWireBytes,
+		)
+	}
+	assertPermissionReviewContextWireRoundTrip(t, base, built)
+}
+
 func TestReviewSubjectDigestKnownFixture(t *testing.T) {
 	t.Parallel()
 

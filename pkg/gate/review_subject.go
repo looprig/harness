@@ -175,16 +175,26 @@ func validateBuiltReviewContext(context ReviewContext) error {
 		context.Coordinates.StepID.IsZero() {
 		return reviewContextError(ReviewValidationFieldContext, ReviewValidationRequired)
 	}
-	for _, value := range []string{
+	rootText := []string{
 		context.ContextRevision,
 		context.WorkspaceRoot,
 		context.WorkingDirectory,
 		context.RetryReason,
 		context.SecurityCeiling,
 		context.GatePolicyRevision,
-	} {
+	}
+	totalInputBytes := 0
+	for _, value := range rootText {
 		if !utf8.ValidString(value) {
 			return reviewContextError(ReviewValidationFieldContext, ReviewValidationInvalid)
+		}
+		if len(value) > MaxReviewContextRootFieldBytes {
+			return reviewContextError(ReviewValidationFieldContext, ReviewValidationOutOfBounds)
+		}
+		var ok bool
+		totalInputBytes, ok = checkedReviewContextAdd(totalInputBytes, len(value))
+		if !ok || totalInputBytes > MaxReviewContextInputBytes {
+			return reviewContextError(ReviewValidationFieldContext, ReviewValidationOutOfBounds)
 		}
 	}
 	if context.ContextRevision == "" ||
@@ -202,13 +212,16 @@ func validateBuiltReviewContext(context ReviewContext) error {
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return reviewContextError(ReviewValidationFieldContext, ReviewValidationInvalid)
 	}
+	if len(context.Entries) > MaxReviewContextInputEntries {
+		return reviewContextError(ReviewValidationFieldContextEntry, ReviewValidationOutOfBounds)
+	}
 	if context.Truncation.Applied&^SupportedReviewTruncationMask != 0 ||
 		context.Truncation.Material&^SupportedReviewTruncationMask != 0 ||
 		context.Truncation.Material&^context.Truncation.Applied != 0 ||
 		context.Truncation.OmittedEntries < 0 ||
-		context.Truncation.OmittedEntries > MaxPermissionReviewSubjectWireBytes ||
+		context.Truncation.OmittedEntries > MaxReviewContextInputEntries ||
 		context.Truncation.OmittedBytes < 0 ||
-		context.Truncation.OmittedBytes > MaxPermissionReviewSubjectWireBytes {
+		context.Truncation.OmittedBytes > MaxReviewContextInputBytes {
 		return reviewContextError(ReviewValidationFieldContext, ReviewValidationOutOfBounds)
 	}
 
@@ -218,6 +231,26 @@ func validateBuiltReviewContext(context ReviewContext) error {
 	truncatedEntries := 0
 	var explainedNonBudget ReviewTruncationMask
 	for index, entry := range context.Entries {
+		if len(entry.Content) > MaxReviewContextEntryInputBytes {
+			return reviewContextError(
+				ReviewValidationFieldContextEntry,
+				ReviewValidationOutOfBounds,
+			)
+		}
+		for _, size := range []int{
+			len(entry.Origin),
+			len(entry.Kind),
+			len(entry.Content),
+		} {
+			var ok bool
+			totalInputBytes, ok = checkedReviewContextAdd(totalInputBytes, size)
+			if !ok || totalInputBytes > MaxReviewContextInputBytes {
+				return reviewContextError(
+					ReviewValidationFieldContextEntry,
+					ReviewValidationOutOfBounds,
+				)
+			}
+		}
 		if !utf8.ValidString(string(entry.Origin)) ||
 			!utf8.ValidString(string(entry.Kind)) ||
 			!utf8.ValidString(entry.Content) ||

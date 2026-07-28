@@ -3,6 +3,7 @@ package gate_test
 import (
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -219,7 +220,11 @@ func TestPermissionReviewSubjectRejectsInvalidBuiltContext(t *testing.T) {
 			tt.mutate(&context)
 			got, err := gate.NewPermissionReviewSubject(basis, request, context)
 			if err == nil || !reflect.DeepEqual(got, gate.PermissionReviewSubject{}) {
-				t.Fatalf("NewPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+				t.Fatalf(
+					"NewPermissionReviewSubject() returned zero=%t, error=%v; want zero, error",
+					reflect.DeepEqual(got, gate.PermissionReviewSubject{}),
+					err,
+				)
 			}
 		})
 	}
@@ -327,6 +332,198 @@ func TestPermissionReviewSubjectRejectsImpossibleTruncationMetadata(t *testing.T
 				t.Fatalf("NewPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
 			}
 		})
+	}
+}
+
+func TestPermissionReviewSubjectRejectsContextBeyondBuilderHardBounds(t *testing.T) {
+	t.Parallel()
+
+	omission := func(entries int, bytes int) func(*gate.ReviewContext) {
+		return func(context *gate.ReviewContext) {
+			context.Entries = append([]gate.ReviewContextEntry{{
+				Origin: gate.ReviewContextOriginOmission,
+				Kind:   gate.ReviewContextKindOmission,
+				Content: "omitted_entries=" + strconv.Itoa(entries) +
+					" omitted_bytes=" + strconv.Itoa(bytes),
+			}}, context.Entries...)
+			context.Truncation = gate.ReviewTruncation{
+				Applied:        gate.ReviewTruncationEntryCount,
+				Material:       gate.ReviewTruncationEntryCount,
+				OmittedEntries: entries,
+				OmittedBytes:   bytes,
+			}
+		}
+	}
+	tests := []struct {
+		name      string
+		wantField gate.ReviewValidationField
+		mutate    func(*gate.ReviewContext)
+	}{
+		{
+			name:      "entry count",
+			wantField: gate.ReviewValidationFieldContextEntry,
+			mutate: func(context *gate.ReviewContext) {
+				entries := make(
+					[]gate.ReviewContextEntry,
+					gate.MaxReviewContextInputEntries+1,
+				)
+				for index := range entries {
+					entries[index] = gate.ReviewContextEntry{
+						Origin: gate.ReviewContextOriginAssistant,
+						Kind:   gate.ReviewContextKindAssistantMessage,
+					}
+				}
+				copy(entries[len(entries)-2:], context.Entries)
+				context.Entries = entries
+			},
+		},
+		{
+			name:      "omitted entry count",
+			wantField: gate.ReviewValidationFieldContext,
+			mutate: omission(
+				gate.MaxReviewContextInputEntries+1,
+				1,
+			),
+		},
+		{
+			name:      "omitted bytes",
+			wantField: gate.ReviewValidationFieldContext,
+			mutate: omission(
+				1,
+				gate.MaxReviewContextInputBytes+1,
+			),
+		},
+		{
+			name:      "entry content",
+			wantField: gate.ReviewValidationFieldContextEntry,
+			mutate: func(context *gate.ReviewContext) {
+				context.Entries[0].Content = strings.Repeat(
+					"x",
+					gate.MaxReviewContextEntryInputBytes+1,
+				)
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			basis, request, context := validPermissionReviewSubjectInput()
+			tt.mutate(&context)
+			got, err := gate.NewPermissionReviewSubject(basis, request, context)
+			if err == nil || !reflect.DeepEqual(got, gate.PermissionReviewSubject{}) {
+				t.Fatalf("NewPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+			}
+			var validationErr *gate.ReviewValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("error = %T, want *ReviewValidationError", err)
+			}
+			if validationErr.Field != tt.wantField ||
+				validationErr.Reason != gate.ReviewValidationOutOfBounds {
+				t.Fatalf(
+					"error = %#v, want field %q reason %q",
+					validationErr,
+					tt.wantField,
+					gate.ReviewValidationOutOfBounds,
+				)
+			}
+		})
+	}
+}
+
+func TestPermissionReviewSubjectEnforcesEveryContextRootFieldHardBound(t *testing.T) {
+	t.Parallel()
+
+	type rootMutation func(*gate.ReviewBasis, *gate.ReviewContext, int)
+	tests := []struct {
+		name   string
+		mutate rootMutation
+	}{
+		{
+			name: "context revision",
+			mutate: func(basis *gate.ReviewBasis, context *gate.ReviewContext, size int) {
+				context.ContextRevision = strings.Repeat("r", size)
+				basis.ContextRevision = context.ContextRevision
+			},
+		},
+		{
+			name: "workspace root",
+			mutate: func(_ *gate.ReviewBasis, context *gate.ReviewContext, size int) {
+				context.WorkspaceRoot = "/" + strings.Repeat("w", size-1)
+				context.WorkingDirectory = context.WorkspaceRoot
+			},
+		},
+		{
+			name: "working directory",
+			mutate: func(_ *gate.ReviewBasis, context *gate.ReviewContext, size int) {
+				context.WorkingDirectory = context.WorkspaceRoot + "/" +
+					strings.Repeat("w", size-len(context.WorkspaceRoot)-1)
+			},
+		},
+		{
+			name: "retry reason",
+			mutate: func(_ *gate.ReviewBasis, context *gate.ReviewContext, size int) {
+				context.RetryReason = strings.Repeat("r", size)
+			},
+		},
+		{
+			name: "security ceiling",
+			mutate: func(basis *gate.ReviewBasis, context *gate.ReviewContext, size int) {
+				context.SecurityCeiling = strings.Repeat("s", size)
+				basis.SecurityCeiling = context.SecurityCeiling
+			},
+		},
+		{
+			name: "gate policy revision",
+			mutate: func(basis *gate.ReviewBasis, context *gate.ReviewContext, size int) {
+				context.GatePolicyRevision = strings.Repeat("g", size)
+				basis.GatePolicyRevision = context.GatePolicyRevision
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			basis, request, context := validPermissionReviewSubjectInput()
+			tt.mutate(&basis, &context, gate.MaxReviewContextRootFieldBytes)
+			if _, err := gate.NewPermissionReviewSubject(basis, request, context); err != nil {
+				t.Fatalf("NewPermissionReviewSubject(exact bound) error = %v", err)
+			}
+
+			basis, request, context = validPermissionReviewSubjectInput()
+			tt.mutate(&basis, &context, gate.MaxReviewContextRootFieldBytes+1)
+			got, err := gate.NewPermissionReviewSubject(basis, request, context)
+			if err == nil || !reflect.DeepEqual(got, gate.PermissionReviewSubject{}) {
+				t.Fatalf(
+					"NewPermissionReviewSubject(one over) returned zero=%t, error=%v; want zero, error",
+					reflect.DeepEqual(got, gate.PermissionReviewSubject{}),
+					err,
+				)
+			}
+			var validationErr *gate.ReviewValidationError
+			if !errors.As(err, &validationErr) ||
+				validationErr.Field != gate.ReviewValidationFieldContext ||
+				validationErr.Reason != gate.ReviewValidationOutOfBounds {
+				t.Fatalf("error = %#v, want context out_of_bounds", validationErr)
+			}
+		})
+	}
+}
+
+func TestPermissionReviewSubjectAcceptsBuilderMaximumEntryCount(t *testing.T) {
+	t.Parallel()
+
+	basis, request, context := validPermissionReviewSubjectInput()
+	entries := make([]gate.ReviewContextEntry, gate.MaxReviewContextInputEntries)
+	for index := range entries {
+		entries[index] = gate.ReviewContextEntry{
+			Origin: gate.ReviewContextOriginAssistant,
+			Kind:   gate.ReviewContextKindAssistantMessage,
+		}
+	}
+	copy(entries[len(entries)-2:], context.Entries)
+	context.Entries = entries
+	if _, err := gate.NewPermissionReviewSubject(basis, request, context); err != nil {
+		t.Fatalf("NewPermissionReviewSubject(exact entry bound) error = %v", err)
 	}
 }
 
