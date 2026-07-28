@@ -267,6 +267,7 @@ const (
 	EvidenceFailureInvalidRequest        EvidenceFailureReason = "invalid_request"
 	EvidenceFailureAmbiguousIdentity     EvidenceFailureReason = "ambiguous_identity"
 	EvidenceFailureForbiddenCapability   EvidenceFailureReason = "forbidden_capability"
+	EvidenceFailureContainmentRefused    EvidenceFailureReason = "containment_refused"
 	EvidenceFailureAccessRefused         EvidenceFailureReason = "access_refused"
 	EvidenceFailureExecution             EvidenceFailureReason = "execution"
 	EvidenceFailureInvalidResult         EvidenceFailureReason = "invalid_result"
@@ -290,6 +291,7 @@ func (r EvidenceFailureReason) Valid() bool {
 		EvidenceFailureInvalidRequest,
 		EvidenceFailureAmbiguousIdentity,
 		EvidenceFailureForbiddenCapability,
+		EvidenceFailureContainmentRefused,
 		EvidenceFailureAccessRefused,
 		EvidenceFailureExecution,
 		EvidenceFailureInvalidResult,
@@ -350,6 +352,16 @@ type WorkerPanicError struct {
 }
 
 func (e *WorkerPanicError) Error() string { return "hustleruntime: inference client panicked" }
+
+// EvidenceWorkerPanicError is the redacted recovery product for an unexpected
+// panic anywhere inside evidence catalog binding or evidence execution.
+type EvidenceWorkerPanicError struct {
+	RunID hustle.RunID
+}
+
+func (e *EvidenceWorkerPanicError) Error() string {
+	return "hustleruntime: evidence worker panicked"
+}
 
 // AuditOperation identifies the checked lifecycle publication step which
 // failed.

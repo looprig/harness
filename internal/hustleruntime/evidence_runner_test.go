@@ -626,14 +626,20 @@ func bindSingleRuntimeEvidenceTool(t *testing.T, concrete tool.InvokableTool, in
 func newTestEvidenceRunner(t *testing.T, access evidenceAccessEvaluator, ids []uuid.UUID) *evidenceRunner {
 	t.Helper()
 	index := 0
-	runner, err := newEvidenceRunner(access, []string{evidenceReadKind}, func() (uuid.UUID, error) {
-		if index >= len(ids) {
-			t.Fatal("unexpected execution id request")
-		}
-		id := ids[index]
-		index++
-		return id, nil
-	})
+	runner, err := newEvidenceRunner(
+		access,
+		&evidenceContainmentStub{},
+		EvidenceContainmentPolicy{ReadRoot: "/workspace", SecurityCeiling: "read-only"},
+		[]string{evidenceReadKind},
+		func() (uuid.UUID, error) {
+			if index >= len(ids) {
+				t.Fatal("unexpected execution id request")
+			}
+			id := ids[index]
+			index++
+			return id, nil
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

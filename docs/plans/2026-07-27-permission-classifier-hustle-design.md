@@ -833,6 +833,29 @@ only when:
 
 Unknown access state or any dependency error fails closed.
 
+The runtime does not infer containment from the generic, tool-owned
+`Requirement.Scope` or `Requirement.Match` strings. Consumer composition must
+provide a narrow `EvidenceContainmentVerifier` together with the canonical read
+root and effective security ceiling. The verifier receives only those two
+policy values and a defensive clone of the normalized prepared request. It
+must resolve every target (including symlinks), reject ambiguous requirement
+semantics and root escape, and enforce the ceiling independently before
+configured access is consulted. Nil/typed-nil verifiers, an invalid policy,
+verifier error, or verifier panic fail closed; no session, gate, rule, grant,
+mutation, delegation, or loop-control capability crosses this seam.
+
+The runtime deep-clones the request immediately after `PrepareCall` returns.
+Containment, access evaluation, and `PreparedCall` execution each receive
+independently owned views, so a preparer or verifier retaining a slice cannot
+rewrite another collaborator's authorization input. The opaque
+`PreparedArtifact` remains the preparer's authoritative per-call value.
+
+Invocation-scoped evidence catalog binding and evidence execution both run in
+controller-owned, buffered workers under the original single deadline. A
+worker panic is redacted and fault-reported. A collaborator that ignores
+cancellation beyond `WorkerDrainTimeout` poisons both admission lanes and no
+new evidence worker is admitted.
+
 ### 13.2 Initial evidence capabilities
 
 The complete initial command-safety evidence pack includes:

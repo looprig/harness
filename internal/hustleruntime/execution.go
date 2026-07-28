@@ -90,7 +90,16 @@ func newRuntimeController(sessionCtx context.Context, config RuntimeConfig) (*ru
 			return nil, &ConfigError{Reason: ConfigMissingCollaborator, Field: "runtime.evidence"}
 		}
 		var err error
-		runner, err = newEvidenceRunner(config.Evidence.Access, config.Evidence.AllowedKinds, config.Evidence.NewExecutionID)
+		runner, err = newEvidenceRunner(
+			config.Evidence.Access,
+			config.Evidence.Containment,
+			EvidenceContainmentPolicy{
+				ReadRoot:        config.Evidence.ReadWorkspace.Root,
+				SecurityCeiling: config.Evidence.SecurityCeiling,
+			},
+			config.Evidence.AllowedKinds,
+			config.Evidence.NewExecutionID,
+		)
 		if err != nil {
 			return nil, &ConfigError{Reason: ConfigMissingCollaborator, Field: "runtime.evidence"}
 		}
@@ -420,7 +429,9 @@ func (r *runtimeController) executeEvidenceAttempt(
 	if err != nil {
 		return hustle.Result{}, nil, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 	}
-	catalog, err := bindEvidenceInvocation(executionCtx, definition, runRequest, r.evidenceWorkspace)
+	catalog, err := r.bindEvidence(
+		executionCtx, runID, definition, runRequest, r.evidenceWorkspace,
+	)
 	if err != nil {
 		return hustle.Result{}, nil, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 	}
@@ -587,6 +598,7 @@ func addUsage(aggregate, current *content.Usage) (*content.Usage, error) {
 type evidenceRunResult struct {
 	results []evidenceToolResult
 	err     error
+	panic   bool
 }
 
 func (r *runtimeController) runEvidence(
@@ -598,11 +610,23 @@ func (r *runtimeController) runEvidence(
 ) ([]evidenceToolResult, error) {
 	done := make(chan evidenceRunResult, 1)
 	go func() {
+		defer func() {
+			if recover() != nil {
+				done <- evidenceRunResult{
+					err: evidenceError(EvidenceFailureInternal), panic: true,
+				}
+			}
+		}()
 		results, err := r.evidenceRunner.run(ctx, catalog, calls, limits)
 		done <- evidenceRunResult{results: results, err: err}
 	}()
 	select {
 	case result := <-done:
+		var collaboratorPanic *evidencePanicError
+		if result.panic || errors.As(result.err, &collaboratorPanic) {
+			r.reportFault(&EvidenceWorkerPanicError{RunID: runID})
+			return nil, evidenceError(EvidenceFailureInternal)
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -610,7 +634,70 @@ func (r *runtimeController) runEvidence(
 	case <-ctx.Done():
 	}
 	select {
-	case <-done:
+	case result := <-done:
+		var collaboratorPanic *evidencePanicError
+		if result.panic || errors.As(result.err, &collaboratorPanic) {
+			r.reportFault(&EvidenceWorkerPanicError{RunID: runID})
+			return nil, evidenceError(EvidenceFailureInternal)
+		}
+		return nil, ctx.Err()
+	case <-r.after(r.workerDrainTimeout):
+		r.owner.poison(&WorkerPoisonError{RunID: runID, Cause: ctx.Err()})
+		return nil, ctx.Err()
+	}
+}
+
+type evidenceBindResult struct {
+	catalog []hustle.BoundEvidenceTool
+	err     error
+	panic   bool
+}
+
+// bindEvidence places invocation-scoped factory construction and Info
+// validation under the same bounded worker ownership policy as inference and
+// evidence execution. A factory that ignores cancellation poisons admission;
+// a panic is recovered and reported without retaining its value.
+func (r *runtimeController) bindEvidence(
+	ctx context.Context,
+	runID hustle.RunID,
+	definition hustle.BoundDefinition,
+	request hustle.Request,
+	readWorkspace *tool.ReadWorkspaceBinding,
+) ([]hustle.BoundEvidenceTool, error) {
+	done := make(chan evidenceBindResult, 1)
+	go func() {
+		defer func() {
+			if recover() != nil {
+				done <- evidenceBindResult{
+					err: evidenceError(EvidenceFailureInternal), panic: true,
+				}
+			}
+		}()
+		catalog, err := bindEvidenceInvocation(
+			ctx, definition, request, readWorkspace,
+		)
+		done <- evidenceBindResult{catalog: catalog, err: err}
+	}()
+	select {
+	case result := <-done:
+		var collaboratorPanic *evidencePanicError
+		if result.panic || errors.As(result.err, &collaboratorPanic) {
+			r.reportFault(&EvidenceWorkerPanicError{RunID: runID})
+			return nil, evidenceError(EvidenceFailureInternal)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return result.catalog, result.err
+	case <-ctx.Done():
+	}
+	select {
+	case result := <-done:
+		var collaboratorPanic *evidencePanicError
+		if result.panic || errors.As(result.err, &collaboratorPanic) {
+			r.reportFault(&EvidenceWorkerPanicError{RunID: runID})
+			return nil, evidenceError(EvidenceFailureInternal)
+		}
 		return nil, ctx.Err()
 	case <-r.after(r.workerDrainTimeout):
 		r.owner.poison(&WorkerPoisonError{RunID: runID, Cause: ctx.Err()})

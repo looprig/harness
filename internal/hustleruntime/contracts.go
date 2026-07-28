@@ -53,10 +53,12 @@ type RuntimeConfig struct {
 // EvidenceRuntimeConfig supplies only the headless, read-only capabilities
 // needed by opt-in evidence-tool definitions.
 type EvidenceRuntimeConfig struct {
-	Access         EvidenceAccessEvaluator
-	AllowedKinds   []string
-	ReadWorkspace  *tool.ReadWorkspaceBinding
-	NewExecutionID EvidenceExecutionIDFactory
+	Access          EvidenceAccessEvaluator
+	Containment     EvidenceContainmentVerifier
+	AllowedKinds    []string
+	ReadWorkspace   *tool.ReadWorkspaceBinding
+	SecurityCeiling string
+	NewExecutionID  EvidenceExecutionIDFactory
 }
 
 // HeaderStamper mints the identity fields of one internal lifecycle event.
@@ -110,6 +112,25 @@ type EvidenceAccessEvaluator interface {
 }
 
 type evidenceAccessEvaluator = EvidenceAccessEvaluator
+
+// EvidenceContainmentPolicy is the complete security context exposed to the
+// evidence containment verifier. ReadRoot must be the canonical workspace root;
+// SecurityCeiling is the trusted consumer's effective, non-widenable policy.
+type EvidenceContainmentPolicy struct {
+	ReadRoot        string
+	SecurityCeiling string
+}
+
+// EvidenceContainmentVerifier independently resolves every prepared target,
+// including symlinks and ambiguous scopes, against the canonical read root and
+// enforces the configured security ceiling. It receives no session, gate,
+// mutation, grant, rule, or loop-control capability. Implementations must fail
+// closed when a tool-owned Requirement cannot be mapped unambiguously.
+type EvidenceContainmentVerifier interface {
+	VerifyEvidenceContainment(context.Context, EvidenceContainmentPolicy, tool.Request) error
+}
+
+type evidenceContainmentVerifier = EvidenceContainmentVerifier
 
 type EvidenceExecutionIDFactory func() (uuid.UUID, error)
 

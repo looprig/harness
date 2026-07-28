@@ -676,10 +676,12 @@ func runtimeEvidenceControllerWith(
 			AuditTimeout: timeout, FinalizationTimeout: time.Second, WorkerDrainTimeout: workerDrain,
 			Stamper: factory, Audit: audit, Faults: &runtimeTestFaults{}, Activity: &runtimeTestActivity{},
 			Evidence: &EvidenceRuntimeConfig{
-				Access:         &evidenceAccessStub{access: gate.AccessAllow},
-				AllowedKinds:   []string{evidenceReadKind},
-				ReadWorkspace:  &tool.ReadWorkspaceBinding{Root: "/workspace"},
-				NewExecutionID: uuid.New,
+				Access:          &evidenceAccessStub{access: gate.AccessAllow},
+				Containment:     &evidenceContainmentStub{},
+				AllowedKinds:    []string{evidenceReadKind},
+				ReadWorkspace:   &tool.ReadWorkspaceBinding{Root: "/workspace"},
+				SecurityCeiling: "read-only",
+				NewExecutionID:  uuid.New,
 			},
 		},
 	})

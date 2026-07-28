@@ -1116,10 +1116,28 @@ Use real tiny prepared tools to prove:
 - result content is paired and byte bounded; and
 - panic becomes a bounded internal failure.
 
+Require a narrow consumer-provided `EvidenceContainmentVerifier`. Give it only
+the canonical read root, effective security ceiling, and a defensive clone of
+the normalized prepared request. Prove it runs exactly once per request before
+`AccessFor`, rejects outside-root and symlink-resolved escape, ambiguous
+tool-owned scopes, and ceiling violations, and fails closed on nil/typed-nil,
+error, or panic. Do not implement generic string-prefix containment over
+`Requirement.Scope` or `Requirement.Match`.
+
+Clone `tool.Request` immediately after preparation, then give containment,
+access, and execution independently owned views. Include retained-slice
+mutation and concurrent shared-tool tests suitable for the phase race run.
+
 Build the bound evidence catalog at the start of each invocation using
 `request.Cause` session/loop identity and a read-only workspace binding.
 Changed-active and child-loop invocations must reach factories with their own
 originating loop, never the session construction loop.
+
+Put catalog binding and complete evidence execution inside controller-owned,
+buffered workers. Recover and fault-report all collaborator panics without
+retaining panic values. On cancellation, drain for `WorkerDrainTimeout`; poison
+both lanes if a factory or runner ignores cancellation, bounding future worker
+admission.
 
 **Step 2: Verify RED**
 

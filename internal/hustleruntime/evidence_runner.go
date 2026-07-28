@@ -2,6 +2,7 @@ package hustleruntime
 
 import (
 	"context"
+	"path/filepath"
 	"reflect"
 	"strings"
 
@@ -22,16 +23,23 @@ type evidenceToolResult struct {
 // evidenceRunner owns only sequential, read-only evidence execution.
 type evidenceRunner struct {
 	access         evidenceAccessEvaluator
+	containment    evidenceContainmentVerifier
+	policy         EvidenceContainmentPolicy
 	allowedKinds   map[string]struct{}
 	newExecutionID evidenceExecutionIDFactory
 }
 
 func newEvidenceRunner(
 	access evidenceAccessEvaluator,
+	containment evidenceContainmentVerifier,
+	policy EvidenceContainmentPolicy,
 	allowedKinds []string,
 	newExecutionID evidenceExecutionIDFactory,
 ) (*evidenceRunner, error) {
-	if nilEvidenceRuntimeValue(reflect.ValueOf(access)) || newExecutionID == nil || len(allowedKinds) == 0 {
+	if nilEvidenceRuntimeValue(reflect.ValueOf(access)) ||
+		nilEvidenceRuntimeValue(reflect.ValueOf(containment)) ||
+		!validEvidenceContainmentPolicy(policy) ||
+		newExecutionID == nil || len(allowedKinds) == 0 {
 		return nil, evidenceError(EvidenceFailureInvalidBinding)
 	}
 	allowed := make(map[string]struct{}, len(allowedKinds))
@@ -44,7 +52,19 @@ func newEvidenceRunner(
 		}
 		allowed[kind] = struct{}{}
 	}
-	return &evidenceRunner{access: access, allowedKinds: allowed, newExecutionID: newExecutionID}, nil
+	return &evidenceRunner{
+		access: access, containment: containment, policy: policy,
+		allowedKinds: allowed, newExecutionID: newExecutionID,
+	}, nil
+}
+
+func validEvidenceContainmentPolicy(policy EvidenceContainmentPolicy) bool {
+	return filepath.IsAbs(policy.ReadRoot) &&
+		filepath.Clean(policy.ReadRoot) == policy.ReadRoot &&
+		!strings.ContainsRune(policy.ReadRoot, '\x00') &&
+		policy.SecurityCeiling != "" &&
+		policy.SecurityCeiling == strings.TrimSpace(policy.SecurityCeiling) &&
+		!strings.ContainsRune(policy.SecurityCeiling, '\x00')
 }
 
 // bindEvidenceInvocation builds and validates the concrete catalog from the
@@ -67,7 +87,7 @@ func bindEvidenceInvocation(
 	defer func() {
 		if recover() != nil {
 			catalog = nil
-			err = evidenceError(EvidenceFailureInternal)
+			err = &evidencePanicError{}
 		}
 	}()
 	catalog, bindErr := definition.BindEvidenceTools(ctx, hustle.EvidenceBindings{
@@ -89,7 +109,9 @@ func (r *evidenceRunner) run(
 	calls []evidenceToolCall,
 	limits hustle.ToolLoopLimits,
 ) ([]evidenceToolResult, error) {
-	if r == nil || nilEvidenceRuntimeValue(reflect.ValueOf(r.access)) || r.newExecutionID == nil ||
+	if r == nil || nilEvidenceRuntimeValue(reflect.ValueOf(r.access)) ||
+		nilEvidenceRuntimeValue(reflect.ValueOf(r.containment)) ||
+		!validEvidenceContainmentPolicy(r.policy) || r.newExecutionID == nil ||
 		len(r.allowedKinds) == 0 || len(catalog) == 0 || len(calls) == 0 ||
 		limits.MaxResultBytes <= 0 || limits.MaxEvidenceBytes <= 0 ||
 		limits.MaxResultBytes > limits.MaxEvidenceBytes {
@@ -129,12 +151,14 @@ func (r *evidenceRunner) run(
 		if request.ExecutionID != executionID.String() || request.ToolName != call.name {
 			return nil, evidenceError(EvidenceFailureAmbiguousIdentity)
 		}
-		if err := authorizeEvidenceRequest(ctx, r.access, r.allowedKinds, request); err != nil {
+		if err := authorizeEvidenceRequest(
+			ctx, r.access, r.containment, r.policy, r.allowedKinds, request,
+		); err != nil {
 			return nil, err
 		}
 		prepared := tool.PreparedCall{
 			ExecutionID: executionID,
-			Request:     request,
+			Request:     request.Clone(),
 			Artifact:    artifact,
 		}
 		result, err := executeEvidenceCall(ctx, concrete, string(call.input), prepared)
@@ -219,13 +243,17 @@ func prepareEvidenceCall(
 		if recover() != nil {
 			request = tool.Request{}
 			artifact = nil
-			err = evidenceError(EvidenceFailureInternal)
+			err = &evidencePanicError{}
 		}
 	}()
 	request, artifact, err = preparer.PrepareCall(ctx, executionID, args)
 	if err != nil {
 		return tool.Request{}, nil, evidenceError(EvidenceFailurePreparation)
 	}
+	// Take ownership before any other collaborator can observe the prepared
+	// request. A preparer retaining its returned slice cannot mutate the
+	// authoritative request used for authorization or execution.
+	request = request.Clone()
 	if failure := evidenceContextFailure(ctx); failure != nil {
 		return tool.Request{}, nil, failure
 	}
@@ -235,6 +263,8 @@ func prepareEvidenceCall(
 func authorizeEvidenceRequest(
 	ctx context.Context,
 	access evidenceAccessEvaluator,
+	containment evidenceContainmentVerifier,
+	policy EvidenceContainmentPolicy,
 	allowedKinds map[string]struct{},
 	request tool.Request,
 ) (err error) {
@@ -248,19 +278,49 @@ func authorizeEvidenceRequest(
 	if err := tool.ValidateRequest(request); err != nil {
 		return evidenceError(EvidenceFailureInvalidRequest)
 	}
+	if err := verifyEvidenceContainment(ctx, containment, policy, request.Clone()); err != nil {
+		return err
+	}
 	defer func() {
 		if recover() != nil {
-			err = evidenceError(EvidenceFailureInternal)
+			err = &evidencePanicError{}
 		}
 	}()
 	for _, requirement := range request.Requirements {
 		if failure := evidenceContextFailure(ctx); failure != nil {
 			return failure
 		}
-		configured, accessErr := access.AccessFor(requirement)
+		configured, accessErr := access.AccessFor(requirement.Clone())
 		if accessErr != nil || configured != gate.AccessAllow {
 			return evidenceError(EvidenceFailureAccessRefused)
 		}
+	}
+	return nil
+}
+
+func verifyEvidenceContainment(
+	ctx context.Context,
+	containment evidenceContainmentVerifier,
+	policy EvidenceContainmentPolicy,
+	request tool.Request,
+) (err error) {
+	if nilEvidenceRuntimeValue(reflect.ValueOf(containment)) ||
+		!validEvidenceContainmentPolicy(policy) {
+		return evidenceError(EvidenceFailureInvalidBinding)
+	}
+	if failure := evidenceContextFailure(ctx); failure != nil {
+		return failure
+	}
+	defer func() {
+		if recover() != nil {
+			err = &evidencePanicError{}
+		}
+	}()
+	if err := containment.VerifyEvidenceContainment(ctx, policy, request.Clone()); err != nil {
+		return evidenceError(EvidenceFailureContainmentRefused)
+	}
+	if failure := evidenceContextFailure(ctx); failure != nil {
+		return failure
 	}
 	return nil
 }
@@ -274,7 +334,7 @@ func executeEvidenceCall(
 	defer func() {
 		if recover() != nil {
 			result = nil
-			err = evidenceError(EvidenceFailureInternal)
+			err = &evidencePanicError{}
 		}
 	}()
 	result, err = concrete.InvokableRun(withPreparedEvidenceCall(ctx, prepared), args)
@@ -331,3 +391,11 @@ func nilEvidenceRuntimeValue(value reflect.Value) bool {
 func evidenceError(reason EvidenceFailureReason) *EvidenceError {
 	return &EvidenceError{Reason: reason}
 }
+
+// evidencePanicError marks a recovered collaborator panic without retaining its
+// value. It unwraps to the public closed failure while allowing the
+// controller-owned worker boundary to report the unexpected collaborator.
+type evidencePanicError struct{}
+
+func (*evidencePanicError) Error() string { return evidenceError(EvidenceFailureInternal).Error() }
+func (*evidencePanicError) Unwrap() error { return evidenceError(EvidenceFailureInternal) }
