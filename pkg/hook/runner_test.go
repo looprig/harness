@@ -10,6 +10,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/looprig/core/content"
+	"github.com/looprig/inference"
 )
 
 type runnerContextKey string
@@ -509,6 +512,202 @@ func TestRunnerRejectsMalformedCallBeforeCallbacks(t *testing.T) {
 	if finish != nil {
 		t.Fatal("malformed call returned finish")
 	}
+}
+
+func TestRunnerUnmatchedOperationReturnsBeforeDeepClone(t *testing.T) {
+	t.Parallel()
+
+	callWithUnsupportedNestedContent := Call{
+		Operation: OperationInference,
+		Inference: &InferenceData{Request: &inference.Request{
+			Messages: content.AgenticMessages{&content.UserMessage{
+				Message: content.Message{
+					Role:   content.RoleUser,
+					Blocks: []content.Block{nil},
+				},
+			}},
+		}},
+	}
+
+	var unmatchedCalled atomic.Bool
+	runner, err := Compile(Set{Around: []Around{{
+		Operation: OperationTurn,
+		Begin: func(ctx context.Context, _ Call) (context.Context, FinishFunc) {
+			unmatchedCalled.Store(true)
+			return ctx, nil
+		},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, finish, startErr := runner.Start(ctx, Call{Operation: OperationInference}); startErr == nil {
+		t.Fatal("unmatched malformed Start() = nil error")
+	} else {
+		var callErr *CallError
+		if !errors.As(startErr, &callErr) {
+			t.Fatalf("unmatched malformed Start() error = %T, want *CallError", startErr)
+		}
+		if finish != nil {
+			t.Fatal("unmatched malformed Start() returned finish")
+		}
+	}
+	got, finish, startErr := runner.Start(ctx, callWithUnsupportedNestedContent)
+	if startErr != nil {
+		t.Fatalf("unmatched Start() error = %v", startErr)
+	}
+	if got != ctx {
+		t.Fatal("unmatched Start() changed context")
+	}
+	if finish == nil {
+		t.Fatal("unmatched Start() returned nil finish")
+	}
+	finish(Result{})
+	if unmatchedCalled.Load() {
+		t.Fatal("unmatched callback ran")
+	}
+
+	var called atomic.Bool
+	matching, err := Compile(Set{Around: []Around{{
+		Operation: OperationInference,
+		Begin: func(ctx context.Context, _ Call) (context.Context, FinishFunc) {
+			called.Store(true)
+			return ctx, nil
+		},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, matchingFinish, startErr := matching.Start(context.Background(), Call{
+		Operation: OperationInference,
+		Inference: &InferenceData{},
+	})
+	if startErr != nil {
+		t.Fatalf("matching Start() error = %v", startErr)
+	}
+	if !called.Load() {
+		t.Fatal("matching callback did not run")
+	}
+	if matchingFinish == nil {
+		t.Fatal("matching Start() returned nil finish")
+	}
+	called.Store(false)
+
+	defer func() {
+		recovered := recover()
+		var cloneErr *CloneError
+		if !errors.As(asError(recovered), &cloneErr) {
+			t.Fatalf("matching Start() panic = %T(%v), want *CloneError", recovered, recovered)
+		}
+		if called.Load() {
+			t.Fatal("matching callback ran before its snapshot was cloned")
+		}
+	}()
+	_, _, _ = matching.Start(context.Background(), callWithUnsupportedNestedContent)
+	t.Fatal("matching Start() did not deep-clone the call")
+}
+
+type panickingAsError struct {
+	detail string
+}
+
+func (e *panickingAsError) Error() string {
+	return e.detail
+}
+
+func (e *panickingAsError) As(any) bool {
+	panic(e.detail)
+}
+
+type panickingUnwrapError struct {
+	detail string
+}
+
+func (e *panickingUnwrapError) Error() string {
+	return e.detail
+}
+
+func (e *panickingUnwrapError) Unwrap() error {
+	panic(e.detail)
+}
+
+func TestRunnerDenialClassificationPanicBecomesRedactedGuardError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "As", err: &panickingAsError{detail: "sensitive-as-detail"}},
+		{name: "Unwrap", err: &panickingUnwrapError{detail: "sensitive-unwrap-detail"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			runner, err := Compile(Set{
+				PolicyRevision: "policy-v1",
+				Guards: []Guard{{
+					Operation: OperationToolCall,
+					Check: func(context.Context, Call) error {
+						return test.err
+					},
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, finish, startErr := runner.Start(context.Background(), validRunnerCall())
+			var guardErr *GuardError
+			if !errors.As(startErr, &guardErr) {
+				t.Fatalf("Start() error = %T, want *GuardError", startErr)
+			}
+			if guardErr.Operation != OperationToolCall || guardErr.Index != 0 {
+				t.Fatalf("GuardError = %#v", guardErr)
+			}
+			if !errors.Is(startErr, errDenialClassificationPanicked) {
+				t.Fatalf("GuardError does not unwrap to classification sentinel: %v", startErr)
+			}
+			if strings.Contains(startErr.Error(), test.err.Error()) {
+				t.Fatalf("GuardError.Error exposed sensitive callback detail: %q", startErr)
+			}
+			if _, ok := AsDenial(startErr); ok {
+				t.Fatal("classification panic was exposed as an intentional denial")
+			}
+			if finish == nil {
+				t.Fatal("Start() returned nil finish after classification panic")
+			}
+		})
+	}
+}
+
+func TestGuardErrorRedactsAndUnwrapsTrustedCause(t *testing.T) {
+	t.Parallel()
+
+	cause := errors.New("sensitive trusted cause")
+	err := &GuardError{
+		Operation: OperationCompaction,
+		Index:     7,
+		Cause:     cause,
+	}
+	if strings.Contains(err.Error(), cause.Error()) {
+		t.Fatalf("GuardError.Error() exposed cause: %q", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatal("GuardError does not unwrap to trusted cause")
+	}
+}
+
+func asError(value any) error {
+	if value == nil {
+		return nil
+	}
+	err, ok := value.(error)
+	if ok {
+		return err
+	}
+	return fmt.Errorf("%v", value)
 }
 
 func TestRunnerConcurrentDispatch(t *testing.T) {

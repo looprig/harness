@@ -7,7 +7,10 @@ import (
 	"sync"
 )
 
-var errGuardPanicked = errors.New("hook: guard callback panicked")
+var (
+	errGuardPanicked                = errors.New("hook: guard callback panicked")
+	errDenialClassificationPanicked = errors.New("hook: denial classification panicked")
+)
 
 // Runner is an immutable, compiled hook set safe for concurrent dispatch.
 type Runner struct {
@@ -32,8 +35,19 @@ func Compile(set Set) (*Runner, error) {
 	}, nil
 }
 
-// Start begins observation and evaluates policy for one operation. Its returned
-// finish function remains usable when a guard blocks the operation.
+// Start begins observation and evaluates policy for one valid operation call.
+// Matching begin callbacks run in registration order with chained contexts,
+// followed by matching guards in registration order. Every callback receives
+// an independent snapshot.
+//
+// Observer panics are logged without callback-owned details and fail open. A
+// guard or denial-classification panic fails closed as *GuardError. A validated
+// intentional denial is returned as *Denial; every other guard failure is
+// returned as *GuardError.
+//
+// The returned FinishFunc runs completed observers in reverse registration
+// order exactly once, including when a guard blocks. The caller must supply a
+// valid Result for the same operation with a valid terminal Outcome.
 func (r *Runner) Start(
 	ctx context.Context,
 	call Call,
@@ -43,6 +57,9 @@ func (r *Runner) Start(
 	}
 	if err := ValidateCall(call); err != nil {
 		return ctx, nil, err
+	}
+	if !r.matches(call.Operation) {
+		return ctx, func(Result) {}, nil
 	}
 	snapshot := CloneCall(call)
 
@@ -82,7 +99,15 @@ func (r *Runner) Start(
 		if err == nil {
 			continue
 		}
-		if denial, ok := AsDenial(err); ok {
+		denial, denied, classificationPanicked := classifyDenial(err)
+		if classificationPanicked {
+			return ctx, finish, &GuardError{
+				Operation: snapshot.Operation,
+				Index:     index,
+				Cause:     errDenialClassificationPanicked,
+			}
+		}
+		if denied {
 			return ctx, finish, denial
 		}
 		return ctx, finish, &GuardError{
@@ -92,6 +117,36 @@ func (r *Runner) Start(
 		}
 	}
 	return ctx, finish, nil
+}
+
+func (r *Runner) matches(operation Operation) bool {
+	for _, around := range r.around {
+		if around.Operation == operation {
+			return true
+		}
+	}
+	for _, guard := range r.guards {
+		if guard.Operation == operation {
+			return true
+		}
+	}
+	return false
+}
+
+func classifyDenial(err error) (denial *Denial, denied bool, panicked bool) {
+	completed := false
+	defer func() {
+		if completed {
+			return
+		}
+		_ = recover()
+		denial = nil
+		denied = false
+		panicked = true
+	}()
+	denial, denied = AsDenial(err)
+	completed = true
+	return denial, denied, false
 }
 
 func beginAround(
