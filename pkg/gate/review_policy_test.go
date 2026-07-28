@@ -1,0 +1,500 @@
+package gate_test
+
+import (
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/looprig/harness/pkg/gate"
+)
+
+func TestPermissionReviewDecisionReasonClosedDomain(t *testing.T) {
+	t.Parallel()
+	values := []gate.ReviewDecisionReason{
+		gate.ReviewDecisionEligible,
+		gate.ReviewDecisionInvalidPolicy,
+		gate.ReviewDecisionInvalidAssessment,
+		gate.ReviewDecisionBasisMismatch,
+		gate.ReviewDecisionRecommendation,
+		gate.ReviewDecisionRiskCeiling,
+		gate.ReviewDecisionAuthorization,
+		gate.ReviewDecisionAbsoluteHuman,
+		gate.ReviewDecisionMaterialTruncation,
+		gate.ReviewDecisionNoApplicableClassifier,
+		gate.ReviewDecisionClassifierStatus,
+	}
+	for _, value := range values {
+		value := value
+		t.Run(string(value), func(t *testing.T) {
+			t.Parallel()
+			if !value.Valid() {
+				t.Fatalf("%q.Valid() = false", value)
+			}
+			if parsed, ok := gate.ParseReviewDecisionReason(string(value)); !ok || parsed != value {
+				t.Fatalf("ParseReviewDecisionReason(%q) = (%q,%v)", value, parsed, ok)
+			}
+		})
+	}
+	for _, value := range []gate.ReviewDecisionReason{"", "unknown", "ELIGIBLE"} {
+		if value.Valid() {
+			t.Fatalf("%q.Valid() = true", value)
+		}
+		if _, ok := gate.ParseReviewDecisionReason(string(value)); ok {
+			t.Fatalf("ParseReviewDecisionReason(%q) succeeded", value)
+		}
+	}
+}
+
+func TestPermissionReviewDefaultPolicyMatrix(t *testing.T) {
+	t.Parallel()
+	policy := mustDefaultPermissionReviewPolicy(t, "gate-policy-v1")
+	risks := []gate.ReviewRisk{
+		gate.ReviewRiskLow,
+		gate.ReviewRiskMedium,
+		gate.ReviewRiskHigh,
+		gate.ReviewRiskCritical,
+	}
+	authorizations := []gate.ReviewAuthorization{
+		gate.ReviewAuthorizationUnknown,
+		gate.ReviewAuthorizationLow,
+		gate.ReviewAuthorizationMedium,
+		gate.ReviewAuthorizationHigh,
+	}
+	recommendations := []gate.ReviewRecommendation{
+		gate.ReviewAllow,
+		gate.ReviewNeedsHuman,
+	}
+	for _, risk := range risks {
+		for _, authorization := range authorizations {
+			for _, recommendation := range recommendations {
+				risk, authorization, recommendation := risk, authorization, recommendation
+				name := string(risk) + "/" + string(authorization) + "/" + string(recommendation)
+				t.Run(name, func(t *testing.T) {
+					t.Parallel()
+					subject := validPermissionReviewSubject(t)
+					assessment := validPermissionAssessment(subject, risk, authorization, recommendation)
+					got := gate.EvaluatePermissionAssessment(policy, subject, assessment)
+					wantEligible := recommendation == gate.ReviewAllow &&
+						risk != gate.ReviewRiskCritical &&
+						(risk != gate.ReviewRiskHigh ||
+							authorization == gate.ReviewAuthorizationMedium ||
+							authorization == gate.ReviewAuthorizationHigh)
+					if got.Eligible != wantEligible {
+						t.Fatalf("Eligible = %v, want %v (reason %q)", got.Eligible, wantEligible, got.Reason)
+					}
+					if wantEligible && got.Reason != gate.ReviewDecisionEligible {
+						t.Fatalf("Reason = %q, want eligible", got.Reason)
+					}
+					if recommendation == gate.ReviewNeedsHuman && got.Reason != gate.ReviewDecisionRecommendation {
+						t.Fatalf("Reason = %q, want recommendation", got.Reason)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestPermissionReviewPolicyUsesClosedDomainOrdering(t *testing.T) {
+	t.Parallel()
+	risks := []gate.ReviewRisk{
+		gate.ReviewRiskLow,
+		gate.ReviewRiskMedium,
+		gate.ReviewRiskHigh,
+		gate.ReviewRiskCritical,
+	}
+	maximums := []gate.ReviewRisk{
+		gate.ReviewRiskLow,
+		gate.ReviewRiskMedium,
+		gate.ReviewRiskHigh,
+	}
+	for maximumIndex, maximum := range maximums {
+		policy, err := gate.NewPermissionReviewPolicy(
+			"gate-policy-v1",
+			maximum,
+			map[gate.ReviewRisk]gate.ReviewAuthorization{
+				gate.ReviewRiskLow:    gate.ReviewAuthorizationUnknown,
+				gate.ReviewRiskMedium: gate.ReviewAuthorizationUnknown,
+				gate.ReviewRiskHigh:   gate.ReviewAuthorizationMedium,
+			},
+			nil,
+			0,
+		)
+		if err != nil {
+			t.Fatalf("NewPermissionReviewPolicy(maximum %q) error = %v", maximum, err)
+		}
+		for riskIndex, risk := range risks {
+			subject := validPermissionReviewSubject(t)
+			assessment := validPermissionAssessment(
+				subject,
+				risk,
+				gate.ReviewAuthorizationHigh,
+				gate.ReviewAllow,
+			)
+			got := gate.EvaluatePermissionAssessment(policy, subject, assessment)
+			wantEligible := risk != gate.ReviewRiskCritical && riskIndex <= maximumIndex
+			if got.Eligible != wantEligible {
+				t.Fatalf("risk %q with maximum %q: Eligible = %v, want %v", risk, maximum, got.Eligible, wantEligible)
+			}
+		}
+	}
+
+	authorizations := []gate.ReviewAuthorization{
+		gate.ReviewAuthorizationUnknown,
+		gate.ReviewAuthorizationLow,
+		gate.ReviewAuthorizationMedium,
+		gate.ReviewAuthorizationHigh,
+	}
+	for minimumIndex, minimum := range authorizations {
+		policy, err := gate.NewPermissionReviewPolicy(
+			"gate-policy-v1",
+			gate.ReviewRiskHigh,
+			map[gate.ReviewRisk]gate.ReviewAuthorization{
+				gate.ReviewRiskLow:    minimum,
+				gate.ReviewRiskMedium: gate.ReviewAuthorizationUnknown,
+				gate.ReviewRiskHigh:   gate.ReviewAuthorizationMedium,
+			},
+			nil,
+			0,
+		)
+		if err != nil {
+			t.Fatalf("NewPermissionReviewPolicy(minimum %q) error = %v", minimum, err)
+		}
+		for authorizationIndex, authorization := range authorizations {
+			subject := validPermissionReviewSubject(t)
+			assessment := validPermissionAssessment(
+				subject,
+				gate.ReviewRiskLow,
+				authorization,
+				gate.ReviewAllow,
+			)
+			got := gate.EvaluatePermissionAssessment(policy, subject, assessment)
+			wantEligible := authorizationIndex >= minimumIndex
+			if got.Eligible != wantEligible {
+				t.Fatalf("authorization %q with minimum %q: Eligible = %v, want %v", authorization, minimum, got.Eligible, wantEligible)
+			}
+		}
+	}
+}
+
+func TestPermissionReviewPolicyConstructionAndOwnership(t *testing.T) {
+	t.Parallel()
+	minimum := map[gate.ReviewRisk]gate.ReviewAuthorization{
+		gate.ReviewRiskLow:    gate.ReviewAuthorizationLow,
+		gate.ReviewRiskMedium: gate.ReviewAuthorizationMedium,
+		gate.ReviewRiskHigh:   gate.ReviewAuthorizationHigh,
+	}
+	absolute := []gate.ReviewRiskCategory{gate.ReviewCategoryCredentialAccess}
+	policy, err := gate.NewPermissionReviewPolicy(
+		" policy-v1 ",
+		gate.ReviewRiskMedium,
+		minimum,
+		absolute,
+		gate.ReviewTruncationToolEntry,
+	)
+	if err != nil {
+		t.Fatalf("NewPermissionReviewPolicy() error = %v", err)
+	}
+	if policy.Revision != " policy-v1 " {
+		t.Fatalf("Revision = %q, want exact spelling", policy.Revision)
+	}
+	minimum[gate.ReviewRiskLow] = gate.ReviewAuthorizationUnknown
+	absolute[0] = gate.ReviewCategoryTargetAmbiguity
+	if policy.MinimumAuthorization[gate.ReviewRiskLow] != gate.ReviewAuthorizationLow ||
+		policy.AbsoluteHuman[0] != gate.ReviewCategoryCredentialAccess {
+		t.Fatal("constructed policy aliases inputs")
+	}
+}
+
+func TestPermissionReviewPolicyRejectsInvalidAndRelaxedValues(t *testing.T) {
+	t.Parallel()
+	validMinimum := func() map[gate.ReviewRisk]gate.ReviewAuthorization {
+		return map[gate.ReviewRisk]gate.ReviewAuthorization{
+			gate.ReviewRiskLow:    gate.ReviewAuthorizationUnknown,
+			gate.ReviewRiskMedium: gate.ReviewAuthorizationUnknown,
+			gate.ReviewRiskHigh:   gate.ReviewAuthorizationMedium,
+		}
+	}
+	tests := []struct {
+		name     string
+		revision string
+		maximum  gate.ReviewRisk
+		minimum  map[gate.ReviewRisk]gate.ReviewAuthorization
+		absolute []gate.ReviewRiskCategory
+		material gate.ReviewTruncationMask
+	}{
+		{name: "blank revision", revision: " ", maximum: gate.ReviewRiskHigh, minimum: validMinimum()},
+		{name: "invalid utf8 revision", revision: string([]byte{0xff}), maximum: gate.ReviewRiskHigh, minimum: validMinimum()},
+		{name: "long revision", revision: strings.Repeat("r", gate.MaxPermissionReviewPolicyRevisionBytes+1), maximum: gate.ReviewRiskHigh, minimum: validMinimum()},
+		{name: "critical maximum", revision: "r", maximum: gate.ReviewRiskCritical, minimum: validMinimum()},
+		{name: "unknown maximum", revision: "r", maximum: "", minimum: validMinimum()},
+		{name: "nil minimum", revision: "r", maximum: gate.ReviewRiskHigh},
+		{name: "missing low", revision: "r", maximum: gate.ReviewRiskHigh, minimum: map[gate.ReviewRisk]gate.ReviewAuthorization{gate.ReviewRiskMedium: gate.ReviewAuthorizationUnknown, gate.ReviewRiskHigh: gate.ReviewAuthorizationMedium}},
+		{name: "extra critical", revision: "r", maximum: gate.ReviewRiskHigh, minimum: func() map[gate.ReviewRisk]gate.ReviewAuthorization {
+			value := validMinimum()
+			value[gate.ReviewRiskCritical] = gate.ReviewAuthorizationHigh
+			return value
+		}()},
+		{name: "unknown authorization", revision: "r", maximum: gate.ReviewRiskHigh, minimum: func() map[gate.ReviewRisk]gate.ReviewAuthorization {
+			value := validMinimum()
+			value[gate.ReviewRiskLow] = ""
+			return value
+		}()},
+		{name: "relaxed high authorization", revision: "r", maximum: gate.ReviewRiskHigh, minimum: func() map[gate.ReviewRisk]gate.ReviewAuthorization {
+			value := validMinimum()
+			value[gate.ReviewRiskHigh] = gate.ReviewAuthorizationLow
+			return value
+		}()},
+		{name: "high less than medium", revision: "r", maximum: gate.ReviewRiskHigh, minimum: map[gate.ReviewRisk]gate.ReviewAuthorization{
+			gate.ReviewRiskLow: gate.ReviewAuthorizationUnknown, gate.ReviewRiskMedium: gate.ReviewAuthorizationHigh, gate.ReviewRiskHigh: gate.ReviewAuthorizationMedium,
+		}},
+		{name: "duplicate absolute", revision: "r", maximum: gate.ReviewRiskHigh, minimum: validMinimum(), absolute: []gate.ReviewRiskCategory{gate.ReviewCategoryCredentialAccess, gate.ReviewCategoryCredentialAccess}},
+		{name: "invalid absolute", revision: "r", maximum: gate.ReviewRiskHigh, minimum: validMinimum(), absolute: []gate.ReviewRiskCategory{"other"}},
+		{name: "unsupported material", revision: "r", maximum: gate.ReviewRiskHigh, minimum: validMinimum(), material: 1 << 15},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := gate.NewPermissionReviewPolicy(tt.revision, tt.maximum, tt.minimum, tt.absolute, tt.material); err == nil {
+				t.Fatal("NewPermissionReviewPolicy() error = nil")
+			}
+		})
+	}
+}
+
+func TestPermissionReviewAssessmentValidationAndPolicy(t *testing.T) {
+	t.Parallel()
+	policy := mustDefaultPermissionReviewPolicy(t, "gate-policy-v1")
+	tests := []struct {
+		name   string
+		mutate func(*gate.PermissionReviewSubject, *gate.PermissionAssessment, *gate.PermissionReviewPolicy)
+		reason gate.ReviewDecisionReason
+	}{
+		{name: "forged subject digest", mutate: func(s *gate.PermissionReviewSubject, _ *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
+			s.Basis.SubjectDigest[0] ^= 1
+		}, reason: gate.ReviewDecisionInvalidAssessment},
+		{name: "basis mismatch", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
+			a.Basis.ClassifierRevision = "other"
+		}, reason: gate.ReviewDecisionBasisMismatch},
+		{name: "policy revision mismatch", mutate: func(s *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
+			s.Basis.GatePolicyRevision = "other"
+			a.Basis = s.Basis
+		}, reason: gate.ReviewDecisionInvalidAssessment},
+		{name: "invalid risk", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
+			a.Risk = "other"
+		}, reason: gate.ReviewDecisionInvalidAssessment},
+		{name: "invalid authorization", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
+			a.Authorization = "other"
+		}, reason: gate.ReviewDecisionInvalidAssessment},
+		{name: "invalid recommendation", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
+			a.Recommendation = "other"
+		}, reason: gate.ReviewDecisionInvalidAssessment},
+		{name: "duplicate category", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
+			a.Categories = []gate.ReviewRiskCategory{gate.ReviewCategoryCredentialAccess, gate.ReviewCategoryCredentialAccess}
+		}, reason: gate.ReviewDecisionInvalidAssessment},
+		{name: "invalid utf8 rationale", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
+			a.Rationale = string([]byte{0xff})
+		}, reason: gate.ReviewDecisionInvalidAssessment},
+		{name: "long rationale", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
+			a.Rationale = strings.Repeat("x", gate.MaxPermissionReviewRationaleBytes+1)
+		}, reason: gate.ReviewDecisionInvalidAssessment},
+		{name: "non-low blank rationale", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
+			a.Risk = gate.ReviewRiskMedium
+			a.Rationale = " "
+		}, reason: gate.ReviewDecisionInvalidAssessment},
+		{name: "absolute category", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, p *gate.PermissionReviewPolicy) {
+			a.Categories = []gate.ReviewRiskCategory{gate.ReviewCategoryCredentialAccess}
+			p.AbsoluteHuman = []gate.ReviewRiskCategory{gate.ReviewCategoryCredentialAccess}
+		}, reason: gate.ReviewDecisionAbsoluteHuman},
+		{name: "critical", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
+			a.Risk = gate.ReviewRiskCritical
+			a.Rationale = "critical risk"
+		}, reason: gate.ReviewDecisionRiskCeiling},
+		{name: "over maximum", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, p *gate.PermissionReviewPolicy) {
+			p.MaximumAutoRisk = gate.ReviewRiskLow
+			a.Risk = gate.ReviewRiskMedium
+			a.Rationale = "medium risk"
+		}, reason: gate.ReviewDecisionRiskCeiling},
+		{name: "authorization", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
+			a.Risk = gate.ReviewRiskHigh
+			a.Authorization = gate.ReviewAuthorizationLow
+			a.Rationale = "high risk"
+		}, reason: gate.ReviewDecisionAuthorization},
+		{name: "intrinsic material", mutate: func(s *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
+			s.Context.Truncation.Applied = gate.ReviewTruncationToolEntry
+			s.Context.Truncation.Material = gate.ReviewTruncationToolEntry
+			digest, err := gate.SubjectDigest(*s)
+			if err != nil {
+				panic(err)
+			}
+			s.Basis.SubjectDigest = digest
+			a.Basis = s.Basis
+		}, reason: gate.ReviewDecisionMaterialTruncation},
+		{name: "additional material", mutate: func(s *gate.PermissionReviewSubject, a *gate.PermissionAssessment, p *gate.PermissionReviewPolicy) {
+			s.Context.Truncation.Applied = gate.ReviewTruncationToolEntry
+			s.Context.Entries = append(s.Context.Entries, gate.ReviewContextEntry{Origin: gate.ReviewContextOriginTool, Kind: gate.ReviewContextKindToolResult, Content: "cut", Truncated: true})
+			digest, err := gate.SubjectDigest(*s)
+			if err != nil {
+				panic(err)
+			}
+			s.Basis.SubjectDigest = digest
+			a.Basis = s.Basis
+			p.MaterialTruncation = gate.ReviewTruncationToolEntry
+		}, reason: gate.ReviewDecisionMaterialTruncation},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			subject := validPermissionReviewSubject(t)
+			assessment := validPermissionAssessment(subject, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow)
+			localPolicy := cloneReviewPolicy(policy)
+			tt.mutate(&subject, &assessment, &localPolicy)
+			got := gate.EvaluatePermissionAssessment(localPolicy, subject, assessment)
+			if got.Eligible || got.Reason != tt.reason {
+				t.Fatalf("decision = %#v, want false/%q", got, tt.reason)
+			}
+			if assessment.Rationale != "" && strings.Contains(string(got.Reason), assessment.Rationale) {
+				t.Fatal("decision reason leaked rationale")
+			}
+		})
+	}
+}
+
+func TestPermissionReviewPolicyRevalidatesMutation(t *testing.T) {
+	t.Parallel()
+	policy := mustDefaultPermissionReviewPolicy(t, "gate-policy-v1")
+	policy.MinimumAuthorization[gate.ReviewRiskCritical] = gate.ReviewAuthorizationHigh
+	subject := validPermissionReviewSubject(t)
+	got := gate.EvaluatePermissionAssessment(
+		policy,
+		subject,
+		validPermissionAssessment(subject, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow),
+	)
+	if got.Eligible || got.Reason != gate.ReviewDecisionInvalidPolicy {
+		t.Fatalf("decision = %#v, want invalid policy", got)
+	}
+}
+
+func TestPermissionReviewPolicyRequiresExactSubjectRevision(t *testing.T) {
+	t.Parallel()
+	policy := mustDefaultPermissionReviewPolicy(t, "other-policy")
+	subject := validPermissionReviewSubject(t)
+	assessment := validPermissionAssessment(
+		subject,
+		gate.ReviewRiskLow,
+		gate.ReviewAuthorizationUnknown,
+		gate.ReviewAllow,
+	)
+	got := gate.EvaluatePermissionAssessment(policy, subject, assessment)
+	if got.Eligible || got.Reason != gate.ReviewDecisionInvalidPolicy {
+		t.Fatalf("decision = %#v, want invalid policy", got)
+	}
+}
+
+func TestCombinePermissionAssessments(t *testing.T) {
+	t.Parallel()
+	policy := mustDefaultPermissionReviewPolicy(t, "gate-policy-v1")
+	subject := validPermissionReviewSubject(t)
+	allow := validPermissionAssessment(subject, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow)
+	human := allow
+	human.Recommendation = gate.ReviewNeedsHuman
+	tests := []struct {
+		name     string
+		outcomes []gate.PermissionAssessmentOutcome
+		reason   gate.ReviewDecisionReason
+		eligible bool
+	}{
+		{name: "empty", reason: gate.ReviewDecisionNoApplicableClassifier},
+		{name: "neutral", outcomes: []gate.PermissionAssessmentOutcome{{Status: gate.ReviewStatusNotApplicable}}, reason: gate.ReviewDecisionNoApplicableClassifier},
+		{name: "one allow", outcomes: []gate.PermissionAssessmentOutcome{{Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allow}}, reason: gate.ReviewDecisionEligible, eligible: true},
+		{name: "multiple allow", outcomes: []gate.PermissionAssessmentOutcome{{Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allow}, {Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allow}}, reason: gate.ReviewDecisionEligible, eligible: true},
+		{name: "human", outcomes: []gate.PermissionAssessmentOutcome{{Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: human}}, reason: gate.ReviewDecisionRecommendation},
+		{name: "false allowed", outcomes: []gate.PermissionAssessmentOutcome{{Status: gate.ReviewStatusAllowed}}, reason: gate.ReviewDecisionClassifierStatus},
+		{name: "true not applicable", outcomes: []gate.PermissionAssessmentOutcome{{Applicable: true, Status: gate.ReviewStatusNotApplicable}}, reason: gate.ReviewDecisionClassifierStatus},
+		{name: "neutral then failure", outcomes: []gate.PermissionAssessmentOutcome{{Status: gate.ReviewStatusNotApplicable}, {Applicable: true, Status: gate.ReviewStatusFailed}}, reason: gate.ReviewDecisionClassifierStatus},
+		{name: "first failure wins", outcomes: []gate.PermissionAssessmentOutcome{{Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: human}, {Applicable: true, Status: gate.ReviewStatusFailed}}, reason: gate.ReviewDecisionRecommendation},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := gate.CombinePermissionAssessments(policy, subject, tt.outcomes)
+			if got.Eligible != tt.eligible || got.Reason != tt.reason {
+				t.Fatalf("decision = %#v, want eligible=%v reason=%q", got, tt.eligible, tt.reason)
+			}
+		})
+	}
+	for _, status := range []gate.ReviewStatus{
+		"",
+		gate.ReviewStatusNeedsHuman,
+		gate.ReviewStatusTimedOut,
+		gate.ReviewStatusFailed,
+		gate.ReviewStatusCancelled,
+		gate.ReviewStatusStale,
+	} {
+		got := gate.CombinePermissionAssessments(policy, subject, []gate.PermissionAssessmentOutcome{{Applicable: true, Status: status}})
+		if got.Eligible || got.Reason != gate.ReviewDecisionClassifierStatus {
+			t.Fatalf("status %q decision = %#v", status, got)
+		}
+	}
+}
+
+func mustDefaultPermissionReviewPolicy(t *testing.T, revision string) gate.PermissionReviewPolicy {
+	t.Helper()
+	policy, err := gate.DefaultPermissionReviewPolicy(revision)
+	if err != nil {
+		t.Fatalf("DefaultPermissionReviewPolicy() error = %v", err)
+	}
+	return policy
+}
+
+func validPermissionReviewSubject(t *testing.T) gate.PermissionReviewSubject {
+	t.Helper()
+	basis, request, context := validPermissionReviewSubjectInput()
+	subject, err := gate.NewPermissionReviewSubject(basis, request, context)
+	if err != nil {
+		t.Fatalf("NewPermissionReviewSubject() error = %v", err)
+	}
+	return subject
+}
+
+func validPermissionAssessment(
+	subject gate.PermissionReviewSubject,
+	risk gate.ReviewRisk,
+	authorization gate.ReviewAuthorization,
+	recommendation gate.ReviewRecommendation,
+) gate.PermissionAssessment {
+	rationale := ""
+	if risk != gate.ReviewRiskLow {
+		rationale = "bounded explanation"
+	}
+	return gate.PermissionAssessment{
+		Basis: subject.Basis, Risk: risk, Authorization: authorization,
+		Recommendation: recommendation, Rationale: rationale,
+	}
+}
+
+func cloneReviewPolicy(policy gate.PermissionReviewPolicy) gate.PermissionReviewPolicy {
+	clone := policy
+	clone.MinimumAuthorization = make(map[gate.ReviewRisk]gate.ReviewAuthorization, len(policy.MinimumAuthorization))
+	for risk, authorization := range policy.MinimumAuthorization {
+		clone.MinimumAuthorization[risk] = authorization
+	}
+	clone.AbsoluteHuman = append([]gate.ReviewRiskCategory(nil), policy.AbsoluteHuman...)
+	return clone
+}
+
+func TestPermissionReviewPolicyDefaultShape(t *testing.T) {
+	t.Parallel()
+	got := mustDefaultPermissionReviewPolicy(t, "r")
+	wantMinimum := map[gate.ReviewRisk]gate.ReviewAuthorization{
+		gate.ReviewRiskLow: gate.ReviewAuthorizationUnknown, gate.ReviewRiskMedium: gate.ReviewAuthorizationUnknown, gate.ReviewRiskHigh: gate.ReviewAuthorizationMedium,
+	}
+	if got.MaximumAutoRisk != gate.ReviewRiskHigh ||
+		!reflect.DeepEqual(got.MinimumAuthorization, wantMinimum) ||
+		len(got.AbsoluteHuman) != 0 ||
+		got.MaterialTruncation != 0 {
+		t.Fatalf("default = %#v", got)
+	}
+}
