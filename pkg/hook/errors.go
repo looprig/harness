@@ -63,6 +63,23 @@ func (e *CallError) Error() string {
 	return fmt.Sprintf("hook: invalid call: %s for operation %d", e.Kind, e.Operation)
 }
 
+// GuardError reports an internal guard callback failure. Intentional denials
+// are returned as validated *Denial values instead.
+type GuardError struct {
+	Operation Operation
+	Index     int
+	Cause     error
+}
+
+func (e *GuardError) Error() string {
+	return fmt.Sprintf("hook: guard failed for operation %d at index %d", e.Operation, e.Index)
+}
+
+// Unwrap exposes the trusted in-process cause for classification.
+func (e *GuardError) Unwrap() error {
+	return e.Cause
+}
+
 // CloneErrorKind identifies the sealed union that gained an unsupported variant.
 type CloneErrorKind string
 
