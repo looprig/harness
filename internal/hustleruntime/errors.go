@@ -255,6 +255,67 @@ func (e *ToolResponseError) Error() string {
 	return "hustleruntime: invalid tool response"
 }
 
+// EvidenceFailureReason is a closed, security-safe classification for evidence
+// binding, preparation, authorization, and execution failures.
+type EvidenceFailureReason string
+
+const (
+	EvidenceFailureInvalidBinding      EvidenceFailureReason = "invalid_binding"
+	EvidenceFailureUnknownTool         EvidenceFailureReason = "unknown_tool"
+	EvidenceFailureUnprepared          EvidenceFailureReason = "unprepared"
+	EvidenceFailurePreparation         EvidenceFailureReason = "preparation"
+	EvidenceFailureInvalidRequest      EvidenceFailureReason = "invalid_request"
+	EvidenceFailureAmbiguousIdentity   EvidenceFailureReason = "ambiguous_identity"
+	EvidenceFailureForbiddenCapability EvidenceFailureReason = "forbidden_capability"
+	EvidenceFailureAccessRefused       EvidenceFailureReason = "access_refused"
+	EvidenceFailureExecution           EvidenceFailureReason = "execution"
+	EvidenceFailureInvalidResult       EvidenceFailureReason = "invalid_result"
+	EvidenceFailureResultTooLarge      EvidenceFailureReason = "result_too_large"
+	EvidenceFailureEvidenceTooLarge    EvidenceFailureReason = "evidence_too_large"
+	EvidenceFailureCanceled            EvidenceFailureReason = "canceled"
+	EvidenceFailureDeadline            EvidenceFailureReason = "deadline"
+	EvidenceFailureInternal            EvidenceFailureReason = "internal"
+)
+
+// Valid reports whether the reason is a recognized evidence failure.
+func (r EvidenceFailureReason) Valid() bool {
+	switch r {
+	case EvidenceFailureInvalidBinding,
+		EvidenceFailureUnknownTool,
+		EvidenceFailureUnprepared,
+		EvidenceFailurePreparation,
+		EvidenceFailureInvalidRequest,
+		EvidenceFailureAmbiguousIdentity,
+		EvidenceFailureForbiddenCapability,
+		EvidenceFailureAccessRefused,
+		EvidenceFailureExecution,
+		EvidenceFailureInvalidResult,
+		EvidenceFailureResultTooLarge,
+		EvidenceFailureEvidenceTooLarge,
+		EvidenceFailureCanceled,
+		EvidenceFailureDeadline,
+		EvidenceFailureInternal:
+		return true
+	default:
+		return false
+	}
+}
+
+// EvidenceError deliberately retains no tool arguments, results, dependency
+// errors, or panic values.
+type EvidenceError struct {
+	Reason EvidenceFailureReason
+}
+
+func (e *EvidenceError) Valid() bool { return e != nil && e.Reason.Valid() }
+
+func (e *EvidenceError) Error() string {
+	if e.Valid() {
+		return "hustleruntime: evidence call failed (" + string(e.Reason) + ")"
+	}
+	return "hustleruntime: evidence call failed"
+}
+
 // CallbackPanicError is the redacted recovery product for a consumer callback.
 // It deliberately retains no panic value.
 type CallbackPanicError struct {

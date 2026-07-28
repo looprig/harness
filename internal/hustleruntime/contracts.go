@@ -7,6 +7,8 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hustle"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 const maxLaneQueued = 10_000
@@ -89,3 +91,14 @@ type ValidateResult func(context.Context, hustle.Result) error
 // built from focused product capability and must never capture a Session,
 // Shutdown function, or other generic session-control capability.
 type Finalizer func(context.Context, hustle.Outcome) error
+
+// evidenceAccessEvaluator is the deliberately non-interactive access seam used
+// by the evidence runner. gate.AccessBindings satisfies it without exposing
+// approval, stored-rule, persistence, or grant capabilities.
+type evidenceAccessEvaluator interface {
+	AccessFor(tool.Requirement) (uint8, error)
+}
+
+type evidenceExecutionIDFactory func() (uuid.UUID, error)
+
+var withPreparedEvidenceCall = loop.WithPreparedCall

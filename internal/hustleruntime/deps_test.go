@@ -20,7 +20,7 @@ func TestDependencyBoundaries(t *testing.T) {
 			"github.com/looprig/harness/pkg/hub",
 			"github.com/looprig/harness/pkg/session",
 			"github.com/looprig/harness/pkg/rig",
-			"github.com/looprig/harness/pkg/tool",
+			"github.com/looprig/harness/internal/loopruntime",
 			"github.com/looprig/harness/internal/sessionruntime",
 		}},
 	}
