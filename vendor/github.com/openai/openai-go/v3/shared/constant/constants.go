@@ -322,6 +322,7 @@ type ResponseWebSearchCallSearching string                   // Always "response
 type RetentionRatio string                                   // Always "retention_ratio"
 type Role string                                             // Always "role"
 type RoleDeleted string                                      // Always "role.deleted"
+type SafetyIdentifierBlocked string                          // Always "safety_identifier.blocked"
 type ScoreModel string                                       // Always "score_model"
 type Screenshot string                                       // Always "screenshot"
 type Scroll string                                           // Always "scroll"
@@ -926,6 +927,9 @@ func (c ResponseWebSearchCallSearching) Default() ResponseWebSearchCallSearching
 func (c RetentionRatio) Default() RetentionRatio { return "retention_ratio" }
 func (c Role) Default() Role                     { return "role" }
 func (c RoleDeleted) Default() RoleDeleted       { return "role.deleted" }
+func (c SafetyIdentifierBlocked) Default() SafetyIdentifierBlocked {
+	return "safety_identifier.blocked"
+}
 func (c ScoreModel) Default() ScoreModel         { return "score_model" }
 func (c Screenshot) Default() Screenshot         { return "screenshot" }
 func (c Scroll) Default() Scroll                 { return "scroll" }
@@ -1376,6 +1380,7 @@ func (c ResponseWebSearchCallSearching) MarshalJSON() ([]byte, error)     { retu
 func (c RetentionRatio) MarshalJSON() ([]byte, error)                     { return marshalString(c) }
 func (c Role) MarshalJSON() ([]byte, error)                               { return marshalString(c) }
 func (c RoleDeleted) MarshalJSON() ([]byte, error)                        { return marshalString(c) }
+func (c SafetyIdentifierBlocked) MarshalJSON() ([]byte, error)            { return marshalString(c) }
 func (c ScoreModel) MarshalJSON() ([]byte, error)                         { return marshalString(c) }
 func (c Screenshot) MarshalJSON() ([]byte, error)                         { return marshalString(c) }
 func (c Scroll) MarshalJSON() ([]byte, error)                             { return marshalString(c) }
