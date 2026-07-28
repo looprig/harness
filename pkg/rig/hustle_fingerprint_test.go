@@ -43,6 +43,7 @@ type rigHustleSpec struct {
 	limits        hustle.Limits
 	output        *inference.OutputSchema
 	evidence      *hustle.EvidenceToolPolicy
+	retry         hustle.RetryPolicy
 }
 
 func rigHustleOutput() *inference.OutputSchema {
@@ -82,6 +83,9 @@ func defineRigHustle(t *testing.T, spec rigHustleSpec) hustle.Definition {
 	}
 	if spec.evidence != nil {
 		options = append(options, hustle.WithEvidenceTools(spec.evidence.Clone()))
+	}
+	if spec.retry != hustle.RetryPolicyNone {
+		options = append(options, hustle.WithRetryPolicy(spec.retry))
 	}
 	definition, err := hustle.Define(options...)
 	if err != nil {
@@ -612,6 +616,31 @@ func TestHustleBoundTopologyFingerprintSensitivity(t *testing.T) {
 				t.Fatalf("bound topology revision unchanged: %q", got)
 			}
 		})
+	}
+}
+
+func TestHustleTopologyFingerprintIncludesRetryPolicy(t *testing.T) {
+	t.Parallel()
+
+	loopDefinition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
+	bound := bindFingerprintDefinition(loopDefinition)
+	baseSpec := defaultRigHustleSpec()
+	evidence := rigEvidencePolicy("status")
+	baseSpec.evidence = &evidence
+	base := defineRigHustle(t, baseSpec)
+	enabledSpec := baseSpec
+	enabledSpec.retry = hustle.RetryPolicyClassifiedOnce
+	enabled := defineRigHustle(t, enabledSpec)
+	limits := validHustleLimits()
+	revision := func(definition hustle.Definition) string {
+		return fingerprintWithTopologyAndHustles(
+			bound, ConfigFingerprintFields{}, []loop.Definition{loopDefinition},
+			[]string{"agent"}, "agent", []hustle.Definition{definition}, limits,
+		).TopologyRev
+	}
+	if base.PolicyRevision() == enabled.PolicyRevision() ||
+		revision(base) == revision(enabled) {
+		t.Fatal("retry policy did not change definition and rig topology identity")
 	}
 }
 

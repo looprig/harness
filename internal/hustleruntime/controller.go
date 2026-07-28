@@ -148,6 +148,12 @@ func (c *Controller) addDrainOwnership() {
 	c.drainMu.Unlock()
 }
 
+func (c *Controller) isPoisoned() bool {
+	c.admissionMu.Lock()
+	defer c.admissionMu.Unlock()
+	return c.poisoned
+}
+
 func (c *Controller) releaseDrainOwnership() {
 	c.drainMu.Lock()
 	c.drainOwned--

@@ -154,6 +154,85 @@ func TestEvidenceToolPolicyRejectsDefinitionsWithoutFrozenToolInfos(t *testing.T
 	}
 }
 
+func TestRetryPolicyIsOptInEvidenceOnlyImmutableIdentity(t *testing.T) {
+	t.Parallel()
+
+	client := &testClient{}
+	base, err := Define(validNamedOptions(client, validModel("model"))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicitNone, err := Define(append(validNamedOptions(client, validModel("model")), WithRetryPolicy(RetryPolicyNone))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicitNone.Descriptor() != base.Descriptor() || explicitNone.PolicyRevision() != base.PolicyRevision() {
+		t.Fatal("explicit disabled retry changed legacy identity")
+	}
+
+	options := validEvidenceOptionsWithoutPolicy()
+	options = append(options, WithEvidenceTools(validEvidenceToolPolicy()))
+	withoutRetry, err := Define(options...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withRetry, err := Define(append(options, WithRetryPolicy(RetryPolicyClassifiedOnce))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withRetry.RetryPolicy() != RetryPolicyClassifiedOnce ||
+		withRetry.Descriptor().RetryPolicy != RetryPolicyClassifiedOnce ||
+		withRetry.PolicyRevision() == withoutRetry.PolicyRevision() {
+		t.Fatal("enabled retry policy missing from immutable definition identity")
+	}
+	bound, err := withRetry.Bind(context.Background(), Bindings{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound.RetryPolicy() != RetryPolicyClassifiedOnce {
+		t.Fatalf("bound retry policy = %v", bound.RetryPolicy())
+	}
+}
+
+func TestRetryPolicyRejectsInvalidNonEvidenceAndDuplicateOptions(t *testing.T) {
+	t.Parallel()
+
+	client := &testClient{}
+	tests := []struct {
+		name string
+		opts []Option
+		kind DefinitionErrorKind
+	}{
+		{
+			name: "invalid value",
+			opts: append(validNamedOptions(client, validModel("model")), WithRetryPolicy(RetryPolicy(255))),
+			kind: DefinitionInvalidRetryPolicy,
+		},
+		{
+			name: "retry requires evidence reviewer",
+			opts: append(validNamedOptions(client, validModel("model")), WithRetryPolicy(RetryPolicyClassifiedOnce)),
+			kind: DefinitionInvalidRetryPolicy,
+		},
+		{
+			name: "duplicate",
+			opts: append(validNamedOptions(client, validModel("model")),
+				WithRetryPolicy(RetryPolicyNone), WithRetryPolicy(RetryPolicyClassifiedOnce)),
+			kind: DefinitionDuplicateOption,
+		},
+	}
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Define(testCase.opts...)
+			var definitionErr *DefinitionError
+			if !errors.As(err, &definitionErr) || definitionErr.Kind != testCase.kind {
+				t.Fatalf("Define() error = %#v, want %q", err, testCase.kind)
+			}
+		})
+	}
+}
+
 func TestEvidenceToolCatalogIdentityIncludesStaticModelFacingMetadataAndLoopPolicy(t *testing.T) {
 	t.Parallel()
 	define := func(policy EvidenceToolPolicy) Definition {
@@ -1251,7 +1330,7 @@ func assertSecretFreeDescriptor(t *testing.T, definition Definition) {
 		"StructuredOutputRevision", "PolicyRevision", "TimeoutNanos", "Limits",
 		"EvidenceToolPolicyRevision", "EvidenceToolDefinitionsSHA256",
 		"EvidenceProducedToolNamesSHA256", "EvidenceToolLimits",
-		"EvidenceToolDefinitionCount", "StructuredOutputWithTools",
+		"EvidenceToolDefinitionCount", "StructuredOutputWithTools", "RetryPolicy",
 	}
 	typeOf := reflect.TypeOf(descriptor)
 	if typeOf.NumField() != len(wantFields) {

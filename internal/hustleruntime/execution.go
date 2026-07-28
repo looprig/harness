@@ -325,62 +325,124 @@ func (r *runtimeController) executeWithEvidence(
 ) (hustle.Result, event.ModelRuntime, *content.Usage, *RunError) {
 	executionCtx, cancel := r.newExecutionContext(ctx, definition.Timeout())
 	defer cancel()
+	plan, runtime, runErr := r.prepareEvidenceExecution(
+		executionCtx, definition, runRequest, runID, input,
+	)
+	if runErr != nil {
+		return hustle.Result{}, runtime, nil, runErr
+	}
+	var aggregate *content.Usage
+	for attempt := 0; ; attempt++ {
+		result, usage, runErr := r.executeEvidenceAttempt(
+			executionCtx, definition, runRequest, runID, plan, validate,
+		)
+		var usageErr error
+		aggregate, usageErr = addUsage(aggregate, usage)
+		if usageErr != nil {
+			return hustle.Result{}, runtime, aggregate, executionError(
+				runRequest.Name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput,
+				executionCtx, &OutputError{Cause: usageErr},
+			)
+		}
+		if runErr == nil {
+			result.Usage = cloneUsage(aggregate)
+			return result, runtime, aggregate, nil
+		}
+		if !shouldRetry(
+			definition.RetryPolicy(), attempt, executionCtx.Err(), runErr,
+			r.owner.isPoisoned(),
+		) {
+			return hustle.Result{}, runtime, aggregate, runErr
+		}
+	}
+}
+
+type evidenceExecutionPlan struct {
+	binding    hustle.InferenceBinding
+	policy     hustle.EvidenceToolPolicy
+	knownTools map[string]struct{}
+	request    inference.Request
+}
+
+func (r *runtimeController) prepareEvidenceExecution(
+	executionCtx context.Context,
+	definition hustle.BoundDefinition,
+	runRequest hustle.Request,
+	runID hustle.RunID,
+	input json.RawMessage,
+) (evidenceExecutionPlan, event.ModelRuntime, *RunError) {
 	name := runRequest.Name
 	if runRequest.Cause.SessionID.IsZero() || runRequest.Cause.SessionID != r.sessionID {
-		return hustle.Result{}, event.ModelRuntime{}, nil, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureInvalidBinding))
+		return evidenceExecutionPlan{}, event.ModelRuntime{}, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureInvalidBinding))
 	}
 	binding, err := definition.ResolveInference(executionCtx, runRequest.Cause.LoopID)
 	if err != nil {
-		return hustle.Result{}, event.ModelRuntime{}, nil, executionError(name, runID, hustle.StageModelResolution, hustle.ReasonModelResolution, executionCtx, err)
+		return evidenceExecutionPlan{}, event.ModelRuntime{}, executionError(name, runID, hustle.StageModelResolution, hustle.ReasonModelResolution, executionCtx, err)
 	}
 	if err := executionCtx.Err(); err != nil {
-		return hustle.Result{}, event.ModelRuntime{}, nil, executionError(name, runID, hustle.StageModelResolution, hustle.ReasonModelResolution, executionCtx, err)
+		return evidenceExecutionPlan{}, event.ModelRuntime{}, executionError(name, runID, hustle.StageModelResolution, hustle.ReasonModelResolution, executionCtx, err)
 	}
 	runtime := event.ModelRuntime{Key: binding.Model.Key(), Limits: binding.Model.Limits, Effort: binding.Model.Sampling.Effort}
 	output, outputEnabled := definition.OutputSchema()
 	policy, policyEnabled := definition.EvidenceToolPolicy()
 	if !outputEnabled || !policyEnabled || r.evidenceRunner == nil || r.evidenceWorkspace == nil {
-		return hustle.Result{}, runtime, nil, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureInvalidBinding))
+		return evidenceExecutionPlan{}, runtime, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureInvalidBinding))
 	}
 	tools, knownTools, err := staticEvidenceTools(policy)
 	if err != nil {
-		return hustle.Result{}, runtime, nil, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
+		return evidenceExecutionPlan{}, runtime, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 	}
-	inferenceRequest := inference.Request{
+	request := inference.Request{
 		Model: binding.Model.Clone(), System: definition.SystemPrompt(),
 		Messages: content.AgenticMessages{&content.UserMessage{Message: content.Message{
 			Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: string(input)}},
 		}}},
 		Tools: tools, Output: output, ToolChoice: inference.ToolChoiceAuto,
 	}
-	// Validate the full feature combination before factories, preparation, or
-	// evidence execution can observe the review.
-	if err := validateEvidenceRequestFeatures(inferenceRequest); err != nil {
-		return hustle.Result{}, runtime, nil, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: err})
+	if err := validateEvidenceRequestFeatures(request); err != nil {
+		return evidenceExecutionPlan{}, runtime, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: err})
+	}
+	return evidenceExecutionPlan{
+		binding: binding, policy: policy, knownTools: knownTools, request: request,
+	}, runtime, nil
+}
+
+func (r *runtimeController) executeEvidenceAttempt(
+	executionCtx context.Context,
+	definition hustle.BoundDefinition,
+	runRequest hustle.Request,
+	runID hustle.RunID,
+	plan evidenceExecutionPlan,
+	validate ValidateResult,
+) (hustle.Result, *content.Usage, *RunError) {
+	name := runRequest.Name
+	inferenceRequest, err := ownInferenceRequest(plan.request)
+	if err != nil {
+		return hustle.Result{}, nil, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 	}
 	catalog, err := bindEvidenceInvocation(executionCtx, definition, runRequest, r.evidenceWorkspace)
 	if err != nil {
-		return hustle.Result{}, runtime, nil, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
+		return hustle.Result{}, nil, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 	}
 
 	var aggregate *content.Usage
 	rounds, calls, evidenceBytes := 0, 0, 0
 	seenCallIDs := make(map[string]struct{})
 	for {
-		if rounds >= policy.Limits.MaxRounds {
-			return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureRoundsExceeded))
+		if rounds >= plan.policy.Limits.MaxRounds {
+			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureRoundsExceeded))
 		}
 		if err := validateEvidenceRequestFeatures(inferenceRequest); err != nil {
-			return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: err})
+			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: err})
 		}
-		response, invokeErr := r.invoke(executionCtx, runID, binding.Client, inferenceRequest)
+		response, invokeErr := r.invoke(executionCtx, runID, plan.binding.Client, inferenceRequest)
 		rounds++
 		roundUsage, usageErr := responseUsage(response)
 		if usageErr == nil {
 			var addErr error
 			aggregate, addErr = addUsage(aggregate, roundUsage)
 			if addErr != nil {
-				return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: addErr})
+				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: addErr})
 			}
 		}
 		if invokeErr != nil {
@@ -390,18 +452,18 @@ func (r *runtimeController) executeWithEvidence(
 				reason = hustle.ReasonInternal
 				r.reportFault(panicErr)
 			}
-			return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageInference, reason, executionCtx, invokeErr)
+			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageInference, reason, executionCtx, invokeErr)
 		}
 		if usageErr != nil {
-			return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: usageErr})
+			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: usageErr})
 		}
 		ownedResponse, err := ownInferenceResponse(response)
 		if err != nil {
-			return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
+			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 		}
-		classified, err := classifyToolResponse(ownedResponse, knownTools, definition.Limits().OutputBytes)
+		classified, err := classifyToolResponse(ownedResponse, plan.knownTools, definition.Limits().OutputBytes)
 		if err != nil {
-			return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
+			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 		}
 		switch response := classified.(type) {
 		case terminalToolResponse:
@@ -413,29 +475,29 @@ func (r *runtimeController) executeWithEvidence(
 					reason = hustle.ReasonInternal
 					r.reportFault(panicErr)
 				}
-				return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, reason, executionCtx, &OutputError{Cause: err})
+				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, reason, executionCtx, &OutputError{Cause: err})
 			}
 			if err := executionCtx.Err(); err != nil {
-				return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
+				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 			}
-			return result, runtime, aggregate, nil
+			return result, aggregate, nil
 		case evidenceToolResponse:
-			if len(response.calls) > policy.Limits.MaxCallsPerRound {
-				return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureCallsPerRoundExceeded))
+			if len(response.calls) > plan.policy.Limits.MaxCallsPerRound {
+				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureCallsPerRoundExceeded))
 			}
-			if calls > policy.Limits.MaxCalls-len(response.calls) {
-				return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureCallsExceeded))
+			if calls > plan.policy.Limits.MaxCalls-len(response.calls) {
+				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureCallsExceeded))
 			}
 			for _, call := range response.calls {
 				if _, duplicate := seenCallIDs[call.id]; duplicate {
-					return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, toolResponseError(ToolResponseFailureDuplicateCallID))
+					return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, toolResponseError(ToolResponseFailureDuplicateCallID))
 				}
 			}
 			for _, call := range response.calls {
 				seenCallIDs[call.id] = struct{}{}
 			}
-			remaining := policy.Limits.MaxEvidenceBytes - evidenceBytes
-			roundLimits := policy.Limits
+			remaining := plan.policy.Limits.MaxEvidenceBytes - evidenceBytes
+			roundLimits := plan.policy.Limits
 			roundLimits.MaxEvidenceBytes = remaining
 			if roundLimits.MaxEvidenceBytes < roundLimits.MaxResultBytes {
 				// Preserve the independent per-result bound. Aggregate bytes
@@ -444,26 +506,26 @@ func (r *runtimeController) executeWithEvidence(
 			}
 			results, err := r.runEvidence(executionCtx, runID, catalog, response.calls, roundLimits)
 			if err != nil {
-				return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
+				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 			}
 			calls += len(response.calls)
 			for _, result := range results {
 				encoded, marshalErr := content.MarshalBlocks(result.content)
 				if marshalErr != nil || len(encoded) > remaining {
-					return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureEvidenceTooLarge))
+					return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureEvidenceTooLarge))
 				}
 				evidenceBytes += len(encoded)
 				remaining -= len(encoded)
 			}
 			assistant, err := ownAIMessage(ownedResponse.Message)
 			if err != nil {
-				return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
+				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 			}
 			inferenceRequest.Messages = append(inferenceRequest.Messages, assistant)
 			for _, result := range results {
 				blocks, err := ownBlocks(result.content)
 				if err != nil {
-					return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
+					return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 				}
 				inferenceRequest.Messages = append(inferenceRequest.Messages, &content.ToolResultMessage{
 					Message:   content.Message{Role: content.RoleTool, Blocks: blocks},
@@ -471,7 +533,7 @@ func (r *runtimeController) executeWithEvidence(
 				})
 			}
 		default:
-			return hustle.Result{}, runtime, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, toolResponseError(ToolResponseFailureInvalidShape))
+			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, toolResponseError(ToolResponseFailureInvalidShape))
 		}
 	}
 }

@@ -165,6 +165,7 @@ type DefinitionDescriptor struct {
 	EvidenceToolLimits              ToolLoopLimits    `json:",omitzero"`
 	EvidenceToolDefinitionCount     int               `json:",omitzero"`
 	StructuredOutputWithTools       bool              `json:",omitzero"`
+	RetryPolicy                     RetryPolicy       `json:",omitzero"`
 }
 
 // Validate checks the complete descriptor-only constructor domain without
@@ -199,6 +200,10 @@ func (d DefinitionDescriptor) Validate() error {
 	}
 	if err := validateDescriptorEvidenceTools(d); err != nil {
 		return err
+	}
+	if !d.RetryPolicy.Valid() ||
+		d.RetryPolicy != RetryPolicyNone && d.EvidenceToolPolicyRevision == "" {
+		return &DefinitionError{Kind: DefinitionInvalidRetryPolicy, Field: "retry_policy"}
 	}
 	if d.ModelSource == ModelSourceNamed {
 		if err := d.NamedModelKey.Validate(); err != nil {
@@ -321,6 +326,7 @@ type definitionOptions struct {
 	policyRevision string
 	output         *inference.OutputSchema
 	evidence       EvidenceToolPolicy
+	retryPolicy    RetryPolicy
 	seen           map[string]struct{}
 }
 
@@ -458,6 +464,18 @@ func WithEvidenceTools(policy EvidenceToolPolicy) Option {
 	}
 }
 
+// WithRetryPolicy selects one immutable retry policy. Classified retry is
+// intentionally limited to evidence-backed reviewer definitions.
+func WithRetryPolicy(policy RetryPolicy) Option {
+	return func(options *definitionOptions) error {
+		if err := options.singleton("retry_policy"); err != nil {
+			return err
+		}
+		options.retryPolicy = policy
+		return nil
+	}
+}
+
 // Define validates and freezes one text-only hustle definition.
 func Define(opts ...Option) (Definition, error) {
 	resolved := &definitionOptions{seen: make(map[string]struct{})}
@@ -523,6 +541,10 @@ func validateDefinitionOptions(options *definitionOptions) error {
 		if options.participation != ParticipationBlocking {
 			return invalidEvidenceTools("participation")
 		}
+	}
+	if !options.retryPolicy.Valid() ||
+		options.retryPolicy != RetryPolicyNone && !evidencePolicyEnabled(options.evidence) {
+		return &DefinitionError{Kind: DefinitionInvalidRetryPolicy, Field: "retry_policy"}
 	}
 	return nil
 }
@@ -698,6 +720,7 @@ func freezeDefinition(options *definitionOptions) (Definition, error) {
 		Name: options.name, Participation: options.participation, ModelSource: options.modelSource,
 		PromptRevision: options.promptRevision, PromptSHA256: sha256.Sum256([]byte(options.systemPrompt)),
 		PolicyRevision: options.policyRevision, TimeoutNanos: int64(options.timeout), Limits: options.limits,
+		RetryPolicy: options.retryPolicy,
 	}
 	var output *inference.OutputSchema
 	if options.output != nil {
@@ -892,6 +915,14 @@ func (d Definition) PolicyRevision() string {
 	return d.state.policyDigest
 }
 
+// RetryPolicy returns the immutable bounded retry behavior.
+func (d Definition) RetryPolicy() RetryPolicy {
+	if d.state == nil {
+		return RetryPolicyNone
+	}
+	return d.state.descriptor.RetryPolicy
+}
+
 // EvidenceToolPolicy returns an independently owned policy slice when evidence
 // tools are enabled.
 func (d Definition) EvidenceToolPolicy() (EvidenceToolPolicy, bool) {
@@ -926,6 +957,7 @@ type BoundDefinition interface {
 	SystemPrompt() string
 	OutputSchema() (*inference.OutputSchema, bool)
 	EvidenceToolPolicy() (EvidenceToolPolicy, bool)
+	RetryPolicy() RetryPolicy
 	BindEvidenceTools(context.Context, EvidenceBindings) ([]BoundEvidenceTool, error)
 	boundDefinition()
 }
@@ -944,6 +976,7 @@ func (b *boundDefinitionState) SystemPrompt() string             { return b.defi
 func (b *boundDefinitionState) EvidenceToolPolicy() (EvidenceToolPolicy, bool) {
 	return b.definition.EvidenceToolPolicy()
 }
+func (b *boundDefinitionState) RetryPolicy() RetryPolicy { return b.definition.RetryPolicy() }
 func (b *boundDefinitionState) BindEvidenceTools(
 	ctx context.Context,
 	bindings EvidenceBindings,

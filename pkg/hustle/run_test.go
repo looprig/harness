@@ -96,3 +96,19 @@ func TestReasonAllowedExhaustive(t *testing.T) {
 		})
 	}
 }
+
+func TestRetryPolicyIsClosedAndZeroDisabled(t *testing.T) {
+	t.Parallel()
+
+	if RetryPolicyNone != 0 {
+		t.Fatalf("RetryPolicyNone = %d, want zero", RetryPolicyNone)
+	}
+	if !RetryPolicyNone.Valid() || !RetryPolicyClassifiedOnce.Valid() {
+		t.Fatal("known retry policies must be valid")
+	}
+	for _, policy := range []RetryPolicy{RetryPolicy(2), RetryPolicy(255)} {
+		if policy.Valid() {
+			t.Fatalf("RetryPolicy(%d).Valid() = true, want false", policy)
+		}
+	}
+}

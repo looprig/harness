@@ -61,6 +61,22 @@ func (s TerminalStatus) Valid() bool {
 	return s == TerminalStatusCompleted || s == TerminalStatusFailed
 }
 
+// RetryPolicy selects the immutable, bounded retry behavior of one definition.
+// The zero value preserves the historical single-attempt behavior.
+type RetryPolicy uint8
+
+const (
+	RetryPolicyNone RetryPolicy = iota
+	// RetryPolicyClassifiedOnce permits one clean restart after a closed set of
+	// transient inference or recoverable terminal-parse failures.
+	RetryPolicyClassifiedOnce
+)
+
+// Valid reports whether the policy is a recognized immutable behavior.
+func (p RetryPolicy) Valid() bool {
+	return p == RetryPolicyNone || p == RetryPolicyClassifiedOnce
+}
+
 // ReasonAllowed reports whether reason is a valid durable classification for
 // stage. The closed matrix prevents impossible stage/reason audit records.
 func ReasonAllowed(stage Stage, reason ReasonCode) bool {

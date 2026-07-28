@@ -21,6 +21,7 @@ const (
 	DefinitionInvalidPolicyRevision DefinitionErrorKind = "invalid_policy_revision"
 	DefinitionInvalidOutputSchema   DefinitionErrorKind = "invalid_output_schema"
 	DefinitionInvalidEvidenceTools  DefinitionErrorKind = "invalid_evidence_tools"
+	DefinitionInvalidRetryPolicy    DefinitionErrorKind = "invalid_retry_policy"
 )
 
 // DefinitionError reports a definition boundary failure without retaining raw
