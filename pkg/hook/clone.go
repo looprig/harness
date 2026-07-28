@@ -2,6 +2,7 @@ package hook
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/gate"
@@ -120,7 +121,7 @@ func cloneInferenceRequest(request *inference.Request) *inference.Request {
 		return nil
 	}
 	cloned := *request
-	cloned.Model = request.Model.Clone()
+	cloned.Model = request.Model
 	cloned.Model.Sampling = cloneSampling(request.Model.Sampling)
 	cloned.Messages = cloneMessages(request.Messages)
 	cloned.Tools = cloneInferenceTools(request.Tools)
@@ -136,7 +137,19 @@ func cloneInferenceRequest(request *inference.Request) *inference.Request {
 }
 
 func cloneSampling(sampling model.Sampling) model.Sampling {
-	cloned := sampling.Clone()
+	cloned := sampling
+	if sampling.Temperature != nil {
+		value := *sampling.Temperature
+		cloned.Temperature = &value
+	}
+	if sampling.TopP != nil {
+		value := *sampling.TopP
+		cloned.TopP = &value
+	}
+	if sampling.MaxTokens != nil {
+		value := *sampling.MaxTokens
+		cloned.MaxTokens = &value
+	}
 	if sampling.Stop != nil {
 		cloned.Stop = make([]string, len(sampling.Stop))
 		copy(cloned.Stop, sampling.Stop)
@@ -208,7 +221,11 @@ func cloneConversation(message content.Conversation) content.Conversation {
 	case *content.ToolResultMessage:
 		return cloneToolResultMessage(typed)
 	default:
-		return nil
+		// The content union is sealed and exhaustive today. Fail visibly if an
+		// upstream release adds a variant before this ownership boundary does.
+		panic(&CloneError{
+			Kind: CloneUnknownConversation, ValueType: fmt.Sprintf("%T", message),
+		})
 	}
 }
 
@@ -317,7 +334,8 @@ func cloneBlock(block content.Block) content.Block {
 			IsError:   typed.IsError,
 		}
 	default:
-		return nil
+		// See cloneConversation: silent nil would erase future content.
+		panic(&CloneError{Kind: CloneUnknownBlock, ValueType: fmt.Sprintf("%T", block)})
 	}
 }
 

@@ -1,6 +1,7 @@
 package hook
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"unicode"
@@ -25,7 +26,7 @@ const (
 	ConfigInvalidDenial            ConfigErrorKind = "invalid_denial"
 )
 
-// ConfigError reports an invalid hook configuration or call boundary.
+// ConfigError reports invalid hook-set or denial configuration.
 type ConfigError struct {
 	Kind      ConfigErrorKind
 	Operation Operation
@@ -62,6 +63,25 @@ func (e *CallError) Error() string {
 	return fmt.Sprintf("hook: invalid call: %s for operation %d", e.Kind, e.Operation)
 }
 
+// CloneErrorKind identifies the sealed union that gained an unsupported variant.
+type CloneErrorKind string
+
+const (
+	CloneUnknownConversation CloneErrorKind = "unknown_conversation"
+	CloneUnknownBlock        CloneErrorKind = "unknown_block"
+)
+
+// CloneError reports a sealed content variant the hook snapshot clone does not
+// yet support. CloneCall panics with this error rather than silently losing data.
+type CloneError struct {
+	Kind      CloneErrorKind
+	ValueType string
+}
+
+func (e *CloneError) Error() string {
+	return "hook: clone: " + string(e.Kind) + ": " + e.ValueType
+}
+
 // Denial is an intentional, bounded guard refusal.
 type Denial struct {
 	Code   string
@@ -75,18 +95,50 @@ func (e *Denial) Error() string {
 // Deny constructs an intentional denial or returns ConfigError when its
 // diagnostic fields violate the bounded public contract.
 func Deny(code, reason string) error {
-	if !validDenialText(code, maxDenialCodeBytes) ||
-		!validDenialText(reason, maxDenialReasonBytes) {
+	if !validDenialCode(code) || !validDenialReason(reason) {
 		return &ConfigError{Kind: ConfigInvalidDenial, Field: "denial"}
 	}
 	return &Denial{Code: code, Reason: reason}
 }
 
-func validDenialText(value string, maxBytes int) bool {
-	if strings.TrimSpace(value) == "" || len(value) > maxBytes || !utf8.ValidString(value) {
+// AsDenial classifies an intentional guard denial. It revalidates exported
+// Denial fields so direct construction cannot bypass the bounded contract.
+func AsDenial(err error) (*Denial, bool) {
+	var denial *Denial
+	if !errors.As(err, &denial) || denial == nil {
+		return nil, false
+	}
+	if !validDenialCode(denial.Code) || !validDenialReason(denial.Reason) {
+		return nil, false
+	}
+	return denial, true
+}
+
+func validDenialCode(code string) bool {
+	if len(code) == 0 || len(code) > maxDenialCodeBytes {
 		return false
 	}
-	for _, r := range value {
+	if code[0] < 'a' || code[0] > 'z' {
+		return false
+	}
+	for index := 1; index < len(code); index++ {
+		value := code[index]
+		if (value < 'a' || value > 'z') &&
+			(value < '0' || value > '9') &&
+			value != '_' && value != '.' && value != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func validDenialReason(reason string) bool {
+	if strings.TrimSpace(reason) == "" ||
+		len(reason) > maxDenialReasonBytes ||
+		!utf8.ValidString(reason) {
+		return false
+	}
+	for _, r := range reason {
 		if unicode.IsControl(r) {
 			return false
 		}

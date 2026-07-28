@@ -86,11 +86,19 @@ type Around struct {
 	Begin     BeginFunc
 }
 
-// Set is an ordered collection of guards and around observers.
+// Set is an ordered collection of guards and around observers. A Set and its
+// backing slices are immutable after installation. Callbacks may run
+// concurrently for different operations and must be concurrency-safe; Call and
+// Result arguments are read-only snapshots.
 type Set struct {
+	// PolicyRevision identifies behavior implemented by Guards. It is required
+	// when Guards is non-empty and forbidden otherwise; Around observers are
+	// operational configuration and do not contribute to policy identity.
 	PolicyRevision string
-	Guards         []Guard
-	Around         []Around
+	// Guards run in registration order at guardable operation boundaries.
+	Guards []Guard
+	// Around observers begin in registration order and finish in reverse order.
+	Around []Around
 }
 
 // ValidateSet validates one declarative hook set.

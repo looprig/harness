@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +45,27 @@ func TestOperationValidityAndGuardability(t *testing.T) {
 		}
 		if got := test.operation.Guardable(); got != test.guardable {
 			t.Errorf("Operation(%d).Guardable() = %v, want %v", test.operation, got, test.guardable)
+		}
+	}
+}
+
+func TestOutcomeValidity(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		outcome Outcome
+		valid   bool
+	}{
+		{Outcome(0), false},
+		{OutcomeCompleted, true},
+		{OutcomeDenied, true},
+		{OutcomeFailed, true},
+		{OutcomeCanceled, true},
+		{OutcomeCanceled + 1, false},
+	}
+	for _, test := range tests {
+		if got := test.outcome.Valid(); got != test.valid {
+			t.Errorf("Outcome(%d).Valid() = %v, want %v", test.outcome, got, test.valid)
 		}
 	}
 }
@@ -167,7 +190,12 @@ func TestDeny(t *testing.T) {
 		{name: "control in code", code: "bad\x00code", reason: "reason"},
 		{name: "control in reason", code: "code", reason: "bad\nreason"},
 		{name: "invalid UTF-8 code", code: string([]byte{0xff}), reason: "reason"},
+		{name: "non-ASCII code", code: "policy.bloqué", reason: "reason"},
 		{name: "invalid UTF-8 reason", code: "code", reason: string([]byte{0xff})},
+		{name: "uppercase code", code: "Policy.blocked", reason: "reason"},
+		{name: "numeric prefix code", code: "1policy", reason: "reason"},
+		{name: "punctuation prefix code", code: ".policy", reason: "reason"},
+		{name: "invalid code punctuation", code: "policy/blocked", reason: "reason"},
 		{name: "oversized code", code: strings.Repeat("c", 65), reason: "reason"},
 		{name: "oversized reason", code: "code", reason: strings.Repeat("r", 1025)},
 	}
@@ -184,10 +212,64 @@ func TestDeny(t *testing.T) {
 			if configErr.Kind != ConfigInvalidDenial {
 				t.Fatalf("ConfigError.Kind = %q, want %q", configErr.Kind, ConfigInvalidDenial)
 			}
-			if errors.As(err, &denial) {
+			var malformed *Denial
+			if errors.As(err, &malformed) {
 				t.Fatal("invalid denial was exposed as an intentional *Denial")
 			}
 		})
+	}
+}
+
+func TestAsDenialRevalidatesConstructedValues(t *testing.T) {
+	t.Parallel()
+
+	validErr := fmt.Errorf(
+		"wrapped guard result: %w",
+		Deny("policy.blocked-1", "operation is not permitted — retry later"),
+	)
+	denial, ok := AsDenial(validErr)
+	if !ok {
+		t.Fatalf("AsDenial(Deny()) = (_, false), error type %T", validErr)
+	}
+	if denial.Code != "policy.blocked-1" || denial.Reason != "operation is not permitted — retry later" {
+		t.Fatalf("AsDenial(Deny()) = %#v", denial)
+	}
+	if _, ok := AsDenial(Deny(
+		"a"+strings.Repeat("z", 63),
+		strings.Repeat("r", 1024),
+	)); !ok {
+		t.Fatal("AsDenial rejected maximum-size valid fields")
+	}
+
+	tests := []struct {
+		name   string
+		denial *Denial
+	}{
+		{name: "blank", denial: &Denial{}},
+		{name: "uppercase code", denial: &Denial{Code: "Policy.blocked", Reason: "reason"}},
+		{name: "numeric prefix", denial: &Denial{Code: "1policy", Reason: "reason"}},
+		{name: "invalid punctuation", denial: &Denial{Code: "policy/blocked", Reason: "reason"}},
+		{name: "oversized code", denial: &Denial{Code: strings.Repeat("c", 65), Reason: "reason"}},
+		{name: "invalid UTF-8 code", denial: &Denial{Code: string([]byte{0xff}), Reason: "reason"}},
+		{name: "non-ASCII code", denial: &Denial{Code: "policy.bloqué", Reason: "reason"}},
+		{name: "control in code", denial: &Denial{Code: "policy\x00blocked", Reason: "reason"}},
+		{name: "blank reason", denial: &Denial{Code: "policy.blocked", Reason: " \t"}},
+		{name: "oversized reason", denial: &Denial{Code: "policy.blocked", Reason: strings.Repeat("r", 1025)}},
+		{name: "invalid UTF-8 reason", denial: &Denial{Code: "policy.blocked", Reason: string([]byte{0xff})}},
+		{name: "control in reason", denial: &Denial{Code: "policy.blocked", Reason: "bad\nreason"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got, ok := AsDenial(test.denial); ok || got != nil {
+				t.Fatalf("AsDenial(%#v) = (%#v, %v), want (nil, false)", test.denial, got, ok)
+			}
+		})
+	}
+
+	if got, ok := AsDenial(errors.New("ordinary")); ok || got != nil {
+		t.Fatalf("AsDenial(ordinary) = (%#v, %v), want (nil, false)", got, ok)
 	}
 }
 
@@ -420,6 +502,166 @@ func TestCloneCallPreservesNilAndEmptySlices(t *testing.T) {
 	if emptyInference.Inference.Request.Messages == nil || emptyInference.Inference.Request.Tools == nil {
 		t.Fatal("CloneCall converted non-nil empty inference slices to nil")
 	}
+
+	emptyGateAnswer := CloneCall(Call{
+		Operation: OperationGateWait,
+		GateWait:  &GateWaitData{Answer: &gate.Answer{Values: map[string]string{}}},
+	})
+	if emptyGateAnswer.GateWait.Answer.Values == nil {
+		t.Fatal("CloneCall converted non-nil empty gate answer map to nil")
+	}
+
+	emptyNestedBlocks := CloneCall(Call{
+		Operation: OperationToolExecution,
+		ToolExecution: &ToolExecutionData{Result: &tool.ToolResult{
+			Content: []content.Block{&content.ToolResultBlock{Content: []content.Block{}}},
+		}},
+	})
+	nested := emptyNestedBlocks.ToolExecution.Result.Content[0].(*content.ToolResultBlock)
+	if nested.Content == nil {
+		t.Fatal("CloneCall converted non-nil empty nested block slice to nil")
+	}
+}
+
+func TestCloneConversationVariants(t *testing.T) {
+	t.Parallel()
+
+	messages := content.AgenticMessages{
+		&content.UserMessage{Message: content.Message{
+			Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "user"}},
+		}},
+		&content.AIMessage{
+			Message: content.Message{
+				Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: "assistant"}},
+			},
+			Usage: &content.Usage{InputTokens: 1},
+		},
+		&content.SystemMessage{Message: content.Message{
+			Role: content.RoleSystem, Blocks: []content.Block{&content.TextBlock{Text: "system"}},
+		}},
+		&content.ToolResultMessage{
+			Message: content.Message{
+				Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: "tool"}},
+			},
+			ToolUseID: "call", IsError: true,
+		},
+	}
+
+	cloned := cloneMessages(messages)
+	for index := range messages {
+		if reflect.ValueOf(messages[index]).Pointer() == reflect.ValueOf(cloned[index]).Pointer() {
+			t.Errorf("conversation %d retained its source pointer", index)
+		}
+		cloneConversationBlocks(cloned[index])[0].(*content.TextBlock).Text = "changed"
+		if got := cloneConversationBlocks(messages[index])[0].(*content.TextBlock).Text; got == "changed" {
+			t.Errorf("conversation %d aliases blocks", index)
+		}
+	}
+	cloned[1].(*content.AIMessage).Usage.InputTokens = 99
+	if messages[1].(*content.AIMessage).Usage.InputTokens != 1 {
+		t.Fatal("AI conversation clone aliases usage")
+	}
+}
+
+func TestCloneBlockVariants(t *testing.T) {
+	t.Parallel()
+
+	blocks := []content.Block{
+		&content.TextBlock{Text: "text"},
+		&content.ImageBlock{
+			MediaType: "image/png", Source: content.ImageSource{URL: "https://example.invalid", Data: []byte{1}},
+		},
+		&content.AudioBlock{MediaType: "audio/wav", Data: []byte{2}},
+		&content.DocumentBlock{MediaType: "text/plain", Name: "doc", Data: []byte{3}, Text: "document"},
+		&content.ThinkingBlock{Thinking: "thought", Signature: "signature"},
+		&content.ToolUseBlock{ID: "call", Name: "tool", Input: json.RawMessage(`{"x":1}`)},
+		&content.ToolResultBlock{
+			ToolUseID: "call", Content: []content.Block{&content.TextBlock{Text: "result"}}, IsError: true,
+		},
+	}
+
+	cloned := cloneBlocks(blocks)
+	for index := range blocks {
+		if reflect.ValueOf(blocks[index]).Pointer() == reflect.ValueOf(cloned[index]).Pointer() {
+			t.Errorf("block %d retained its source pointer", index)
+		}
+	}
+	cloned[1].(*content.ImageBlock).Source.Data[0] = 9
+	cloned[2].(*content.AudioBlock).Data[0] = 9
+	cloned[3].(*content.DocumentBlock).Data[0] = 9
+	cloned[5].(*content.ToolUseBlock).Input[0] = '['
+	cloned[6].(*content.ToolResultBlock).Content[0].(*content.TextBlock).Text = "changed"
+	if blocks[1].(*content.ImageBlock).Source.Data[0] != 1 ||
+		blocks[2].(*content.AudioBlock).Data[0] != 2 ||
+		blocks[3].(*content.DocumentBlock).Data[0] != 3 ||
+		string(blocks[5].(*content.ToolUseBlock).Input) != `{"x":1}` ||
+		blocks[6].(*content.ToolResultBlock).Content[0].(*content.TextBlock).Text != "result" {
+		t.Fatal("block clone aliases reference-backed data")
+	}
+}
+
+func TestClonePreservesTypedNilVariants(t *testing.T) {
+	t.Parallel()
+
+	conversations := []content.Conversation{
+		(*content.UserMessage)(nil),
+		(*content.AIMessage)(nil),
+		(*content.SystemMessage)(nil),
+		(*content.ToolResultMessage)(nil),
+	}
+	for index, conversation := range conversations {
+		cloned := cloneConversation(conversation)
+		if reflect.TypeOf(cloned) != reflect.TypeOf(conversation) || !reflect.ValueOf(cloned).IsNil() {
+			t.Errorf("typed-nil conversation %d cloned as %#v", index, cloned)
+		}
+	}
+
+	blocks := []content.Block{
+		(*content.TextBlock)(nil),
+		(*content.ImageBlock)(nil),
+		(*content.AudioBlock)(nil),
+		(*content.DocumentBlock)(nil),
+		(*content.ThinkingBlock)(nil),
+		(*content.ToolUseBlock)(nil),
+		(*content.ToolResultBlock)(nil),
+	}
+	for index, block := range blocks {
+		cloned := cloneBlock(block)
+		if reflect.TypeOf(cloned) != reflect.TypeOf(block) || !reflect.ValueOf(cloned).IsNil() {
+			t.Errorf("typed-nil block %d cloned as %#v", index, cloned)
+		}
+	}
+}
+
+func TestCloneRejectsUnknownSealedVariants(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		kind CloneErrorKind
+		run  func()
+	}{
+		{name: "conversation", kind: CloneUnknownConversation, run: func() { cloneConversation(nil) }},
+		{name: "block", kind: CloneUnknownBlock, run: func() { cloneBlock(nil) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			defer func() {
+				recovered := recover()
+				cloneErr, ok := recovered.(*CloneError)
+				if !ok {
+					t.Fatalf("panic = %T(%v), want *CloneError", recovered, recovered)
+				}
+				if cloneErr.Kind != test.kind {
+					t.Fatalf("CloneError.Kind = %q, want %q", cloneErr.Kind, test.kind)
+				}
+			}()
+			test.run()
+			t.Fatal("clone returned silently for an unknown sealed variant")
+		})
+	}
 }
 
 func TestCloneResultClonesCallAndRetainsError(t *testing.T) {
@@ -452,5 +694,20 @@ func TestCloneResultClonesCallAndRetainsError(t *testing.T) {
 	}
 	if !cloned.EndedAt.Equal(result.EndedAt) || cloned.Outcome != OutcomeFailed {
 		t.Fatal("CloneResult did not preserve terminal scalars")
+	}
+}
+
+func cloneConversationBlocks(message content.Conversation) []content.Block {
+	switch typed := message.(type) {
+	case *content.UserMessage:
+		return typed.Blocks
+	case *content.AIMessage:
+		return typed.Blocks
+	case *content.SystemMessage:
+		return typed.Blocks
+	case *content.ToolResultMessage:
+		return typed.Blocks
+	default:
+		panic(fmt.Sprintf("unexpected test conversation %T", message))
 	}
 }
