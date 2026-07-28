@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -93,7 +94,7 @@ func TestNewAndRestoreActivateResourcesWithTheirStableProcessServiceBridge(t *te
 		return []tool.InvokableTool{primerTestTool{name: "process"}}, nil
 	})
 	store := processResourceStore(t)
-	resourceRoot := t.TempDir()
+	resourceRoot := filepath.Join(t.TempDir(), "resources")
 	lifecycle, err := newTestLifecycle(
 		definition,
 		store,
