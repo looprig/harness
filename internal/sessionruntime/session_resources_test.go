@@ -396,6 +396,111 @@ func TestResourceStorageAnchorRejectsSymlinkAndOversize(t *testing.T) {
 	}
 }
 
+func TestResourceStorageRejectsWorkspaceIdentityOverlap(t *testing.T) {
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New() error = %v", err)
+	}
+
+	base := t.TempDir()
+	workspace := filepath.Join(base, "workspace")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatalf("Mkdir(workspace) error = %v", err)
+	}
+	descendant := filepath.Join(workspace, "resources")
+	ancestor := filepath.Dir(workspace)
+	symlink := filepath.Join(base, "workspace-link")
+	if err := os.Symlink(workspace, symlink); err != nil {
+		t.Fatalf("Symlink(workspace) error = %v", err)
+	}
+
+	tests := []struct {
+		name          string
+		resourceRoot  string
+		workspaceRoot string
+		mustNotCreate string
+	}{
+		{name: "equal", resourceRoot: workspace, workspaceRoot: workspace},
+		{name: "resource ancestor", resourceRoot: ancestor, workspaceRoot: workspace},
+		{
+			name:          "resource descendant",
+			resourceRoot:  descendant,
+			workspaceRoot: workspace,
+			mustNotCreate: descendant,
+		},
+		{name: "workspace symlink alias", resourceRoot: workspace, workspaceRoot: symlink},
+		{
+			name:          "resource symlink parent",
+			resourceRoot:  filepath.Join(symlink, "resources"),
+			workspaceRoot: workspace,
+			mustNotCreate: descendant,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := resolveSessionResources(
+				context.Background(),
+				id,
+				func(context.Context, uuid.UUID) (string, string, error) {
+					return tt.resourceRoot, "owner", nil
+				},
+				tt.workspaceRoot,
+				false,
+			)
+			var storageErr *SessionResourceStorageError
+			if !errors.As(err, &storageErr) || storageErr.Kind != SessionResourceStorageWorkspaceOverlap {
+				t.Fatalf("resolveSessionResources() error = %T %v, want workspace_overlap", err, err)
+			}
+			if tt.mustNotCreate != "" {
+				if _, statErr := os.Lstat(tt.mustNotCreate); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("overlapping resource path was created: Lstat(%q) error = %v", tt.mustNotCreate, statErr)
+				}
+			}
+		})
+	}
+}
+
+func TestResourceStorageRejectsWorkspaceCaseAliasOnCaseInsensitiveFilesystem(t *testing.T) {
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New() error = %v", err)
+	}
+	base := t.TempDir()
+	workspace := filepath.Join(base, "CaseSensitiveProbe")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatalf("Mkdir(workspace) error = %v", err)
+	}
+	alias := filepath.Join(base, "cASEsENSITIVEpROBE")
+	workspaceInfo, err := os.Stat(workspace)
+	if err != nil {
+		t.Fatalf("Stat(workspace) error = %v", err)
+	}
+	aliasInfo, err := os.Stat(alias)
+	if errors.Is(err, os.ErrNotExist) {
+		t.Skip("filesystem is case-sensitive")
+	}
+	if err != nil {
+		t.Fatalf("Stat(case alias) error = %v", err)
+	}
+	if !os.SameFile(workspaceInfo, aliasInfo) {
+		t.Skip("filesystem does not resolve the case alias to the same directory")
+	}
+
+	_, err = resolveSessionResources(
+		context.Background(),
+		id,
+		func(context.Context, uuid.UUID) (string, string, error) {
+			return alias, "owner", nil
+		},
+		workspace,
+		false,
+	)
+	var storageErr *SessionResourceStorageError
+	if !errors.As(err, &storageErr) || storageErr.Kind != SessionResourceStorageWorkspaceOverlap {
+		t.Fatalf("resolveSessionResources() error = %T %v, want workspace_overlap", err, err)
+	}
+}
+
 func processResourceDefinition(
 	t *testing.T,
 	engine loop.Engine,

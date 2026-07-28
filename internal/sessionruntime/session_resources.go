@@ -194,7 +194,7 @@ func canonicalSessionResourceRoot(root string) (string, error) {
 
 func establishSessionResourceRoot(root string, create bool) error {
 	if create {
-		if err := os.MkdirAll(root, 0o700); err != nil {
+		if err := createPrivateSessionResourceRoot(root); err != nil {
 			return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: err}
 		}
 	}
@@ -205,7 +205,11 @@ func establishSessionResourceRoot(root string, create bool) error {
 		}
 		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: err}
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+	private, securityErr := sessionResourcePathIsPrivate(root, info, true)
+	if securityErr != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: securityErr}
+	}
+	if !private {
 		return &SessionResourceStorageError{Kind: SessionResourceStorageInvalid, Path: root}
 	}
 	return nil
@@ -235,7 +239,30 @@ func pathsOverlap(left, right string) bool {
 		return true
 	}
 	relative, err = filepath.Rel(right, left)
-	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+	if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return true
+	}
+
+	leftInfo, leftErr := os.Stat(left)
+	rightInfo, rightErr := os.Stat(right)
+	if leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo) {
+		return true
+	}
+	return leftErr == nil && pathHasAncestorIdentity(right, leftInfo) ||
+		rightErr == nil && pathHasAncestorIdentity(left, rightInfo)
+}
+
+func pathHasAncestorIdentity(path string, target os.FileInfo) bool {
+	for candidate := filepath.Clean(path); ; candidate = filepath.Dir(candidate) {
+		info, err := os.Stat(candidate)
+		if err == nil && os.SameFile(info, target) {
+			return true
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return false
+		}
+	}
 }
 
 func ensureSessionResourceAnchor(root string, id uuid.UUID, identity string, restore bool) error {
@@ -243,7 +270,11 @@ func ensureSessionResourceAnchor(root string, id uuid.UUID, identity string, res
 	info, err := os.Lstat(anchorPath)
 	switch {
 	case err == nil:
-		if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		private, securityErr := sessionResourcePathIsPrivate(anchorPath, info, false)
+		if securityErr != nil {
+			return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: anchorPath, Cause: securityErr}
+		}
+		if !private {
 			return &SessionResourceStorageError{Kind: SessionResourceStorageAnchorCorrupt, Path: anchorPath}
 		}
 		return validateSessionResourceAnchor(anchorPath, id, identity)
@@ -266,7 +297,7 @@ func ensureSessionResourceAnchor(root string, id uuid.UUID, identity string, res
 	}
 	temporaryPath := temporary.Name()
 	defer func() { _ = os.Remove(temporaryPath) }()
-	if err := temporary.Chmod(0o600); err != nil {
+	if err := protectSessionResourceFile(temporaryPath, temporary); err != nil {
 		_ = temporary.Close()
 		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: temporaryPath, Cause: err}
 	}
@@ -281,8 +312,8 @@ func ensureSessionResourceAnchor(root string, id uuid.UUID, identity string, res
 	if err := temporary.Close(); err != nil {
 		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: temporaryPath, Cause: err}
 	}
-	if err := os.Link(temporaryPath, anchorPath); err != nil {
-		if errors.Is(err, os.ErrExist) {
+	if err := commitSessionResourceAnchor(temporaryPath, anchorPath); err != nil {
+		if _, statErr := os.Lstat(anchorPath); statErr == nil {
 			return validateSessionResourceAnchor(anchorPath, id, identity)
 		}
 		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: anchorPath, Cause: err}
@@ -291,19 +322,10 @@ func ensureSessionResourceAnchor(root string, id uuid.UUID, identity string, res
 	if err != nil {
 		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: err}
 	}
-	directory, err := rootHandle.Open(".")
-	if err != nil {
-		_ = rootHandle.Close()
-		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: err}
-	}
-	syncErr := directory.Sync()
-	closeErr := directory.Close()
+	syncErr := syncSessionResourceDirectory(rootHandle)
 	rootCloseErr := rootHandle.Close()
 	if syncErr != nil {
 		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: syncErr}
-	}
-	if closeErr != nil {
-		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: closeErr}
 	}
 	if rootCloseErr != nil {
 		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: rootCloseErr}
@@ -319,8 +341,11 @@ func validateSessionResourceAnchor(path string, id uuid.UUID, identity string) e
 		}
 		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: path, Cause: err}
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
-		info.Mode().Perm()&0o077 != 0 || info.Size() <= 0 || info.Size() > 1024 {
+	private, securityErr := sessionResourcePathIsPrivate(path, info, false)
+	if securityErr != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: path, Cause: securityErr}
+	}
+	if !private || info.Size() <= 0 || info.Size() > 1024 {
 		return &SessionResourceStorageError{Kind: SessionResourceStorageAnchorCorrupt, Path: path}
 	}
 	root, err := os.OpenRoot(filepath.Dir(path))
@@ -337,8 +362,11 @@ func validateSessionResourceAnchor(path string, id uuid.UUID, identity string) e
 	if err != nil {
 		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: path, Cause: err}
 	}
-	if !os.SameFile(info, openedInfo) || !openedInfo.Mode().IsRegular() ||
-		openedInfo.Mode().Perm()&0o077 != 0 || openedInfo.Size() != info.Size() {
+	openedPrivate, securityErr := sessionResourcePathIsPrivate(path, openedInfo, false)
+	if securityErr != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: path, Cause: securityErr}
+	}
+	if !os.SameFile(info, openedInfo) || !openedPrivate || openedInfo.Size() != info.Size() {
 		return &SessionResourceStorageError{Kind: SessionResourceStorageAnchorCorrupt, Path: path}
 	}
 	decoder := json.NewDecoder(io.LimitReader(file, 1025))
