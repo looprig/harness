@@ -76,7 +76,7 @@ The Harness design commit is `ac99e57`.
 
 - Create: `pkg/gate/review.go`
 - Create: `pkg/gate/review_test.go`
-- Modify: `pkg/gate/deps_test.go`
+- Create: `pkg/gate/deps_test.go`
 
 **Step 1: Write the failing enum table test**
 
