@@ -29,6 +29,7 @@ const (
 	DriftAgentName     DriftCategory = "agent_name"
 	DriftAdapter       DriftCategory = "adapter"
 	DriftRuntimeSkills DriftCategory = "runtime_skills"
+	DriftHookPolicy    DriftCategory = "hook_policy"
 	DriftApp           DriftCategory = "app"
 )
 
@@ -110,6 +111,9 @@ func AssessDrift(baseline, candidate ConfigManifest) DriftAssessment {
 	}
 	if baseline.RuntimeSkills != candidate.RuntimeSkills {
 		add(DriftRuntimeSkills, "", boolID(baseline.RuntimeSkills), boolID(candidate.RuntimeSkills), DriftWarn)
+	}
+	if baseline.HookPolicyRev != candidate.HookPolicyRev {
+		add(DriftHookPolicy, "", baseline.HookPolicyRev, candidate.HookPolicyRev, DriftWarn)
 	}
 	assessAppFields(baseline.AppFields, candidate.AppFields, add)
 

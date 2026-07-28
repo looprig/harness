@@ -1,6 +1,9 @@
 package event
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestAssessDrift(t *testing.T) {
 	base := testManifest()
@@ -52,6 +55,8 @@ func TestAssessDrift(t *testing.T) {
 			wantCategory: DriftAdapter, wantSeverity: DriftWarn},
 		{name: "runtime skills flip is warn", mutate: func(m *ConfigManifest) { m.RuntimeSkills = false },
 			wantCategory: DriftRuntimeSkills, wantSeverity: DriftWarn},
+		{name: "hook policy change is warn", mutate: func(m *ConfigManifest) { m.HookPolicyRev = "hook-v2" },
+			wantCategory: DriftHookPolicy, wantSeverity: DriftWarn},
 		{name: "app field change is info", mutate: func(m *ConfigManifest) { m.AppFields["a"] = "x" },
 			wantCategory: DriftApp, wantSeverity: DriftInfo},
 	}
@@ -70,6 +75,54 @@ func TestAssessDrift(t *testing.T) {
 					change.Category, change.Severity, tt.wantCategory, tt.wantSeverity)
 			}
 		})
+	}
+}
+
+func TestAssessDriftLegacyHookPolicyUpgradeFailsSecure(t *testing.T) {
+	t.Parallel()
+	legacy := ManifestFromLegacy(ConfigFingerprint{ToolPolicyRev: hexSHA256Event("")})
+	candidate := legacy
+	candidate.SchemaVersion = ManifestSchemaVersion
+	candidate.HookPolicyRev = "guard-v1"
+
+	assessment := AssessDrift(legacy, candidate)
+	if !assessment.BaselineUpgrade {
+		t.Fatal("BaselineUpgrade = false, want true")
+	}
+	if len(assessment.Changes) != 1 {
+		t.Fatalf("Changes = %+v, want one hook policy change", assessment.Changes)
+	}
+	change := assessment.Changes[0]
+	if change.Category != DriftHookPolicy || change.Severity != DriftWarn {
+		t.Errorf("change = %+v, want hook policy warn", change)
+	}
+}
+
+func TestConfigDriftBudgetCoversDisjointValidManifests(t *testing.T) {
+	t.Parallel()
+	baseline := ConfigManifest{
+		SchemaVersion: ManifestSchemaVersion,
+		Tools:         make([]ToolManifestEntry, maxConfigManifestTools),
+		AppFields:     make(map[string]string, maxConfigManifestAppFields),
+	}
+	candidate := ConfigManifest{
+		SchemaVersion: ManifestSchemaVersion,
+		HookPolicyRev: "guard-v1",
+		Tools:         make([]ToolManifestEntry, maxConfigManifestTools),
+		AppFields:     make(map[string]string, maxConfigManifestAppFields),
+	}
+	for index := range baseline.Tools {
+		baseline.Tools[index].Name = fmt.Sprintf("old-tool-%04d", index)
+		candidate.Tools[index].Name = fmt.Sprintf("new-tool-%04d", index)
+	}
+	for index := 0; index < maxConfigManifestAppFields; index++ {
+		baseline.AppFields[fmt.Sprintf("old-field-%04d", index)] = "old"
+		candidate.AppFields[fmt.Sprintf("new-field-%04d", index)] = "new"
+	}
+
+	assessment := AssessDrift(baseline, candidate)
+	if len(assessment.Changes) > maxConfigDriftChanges {
+		t.Fatalf("valid drift has %d changes, exceeds validation budget %d", len(assessment.Changes), maxConfigDriftChanges)
 	}
 }
 

@@ -251,11 +251,12 @@ const (
 	maxConfigManifestAppFields = 1024
 	// maxConfigDriftChanges must never reject a drift summary a VALID manifest
 	// comparison can legitimately produce, or a large-but-legitimate change would
-	// brick every restore. A schema-1↔schema-1 assessment can emit one change per
-	// tool (up to maxConfigManifestTools) plus one per app field (up to
-	// maxConfigManifestAppFields) plus the ~dozen scalar-field categories; the +64
-	// covers those scalars with slack. It still bounds a decoded hostile event.
-	maxConfigDriftChanges = maxConfigManifestTools + maxConfigManifestAppFields + 64
+	// brick every restore. A schema-2 assessment can emit one removal and one
+	// addition per bounded collection member when baseline and candidate are
+	// disjoint, plus thirteen scalar-field categories including hook policy.
+	// It still bounds a decoded hostile event.
+	maxConfigDriftScalarChanges = 13
+	maxConfigDriftChanges       = 2*maxConfigManifestTools + 2*maxConfigManifestAppFields + maxConfigDriftScalarChanges
 	// MaxConfigMessageLen and MaxConfigActorLen bound the durable, partly
 	// user-authored audit fields. They are exported so the restore constructor can
 	// TRUNCATE a decider's over-long Message/Actor before building the adoption (a

@@ -5,6 +5,7 @@ import (
 
 	"github.com/looprig/harness/internal/sessionruntime"
 	"github.com/looprig/harness/pkg/foreign"
+	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/session"
@@ -30,6 +31,7 @@ const (
 	keySnapshots           singletonKey = "snapshots"
 	keyOffloadGC           singletonKey = "offload_gc"
 	keyHustleLimits        singletonKey = "hustle_limits"
+	keyHooks               singletonKey = "hooks"
 )
 
 // MaxHustleQueued is the largest configured waiting capacity for either hustle
@@ -133,6 +135,21 @@ func WithDelegationLimits(limits DelegationLimits) Option {
 
 func WithFingerprintFields(fields ConfigFingerprintFields) Option {
 	return singleton(keyConfigFingerprint, func(state *definitionState) { state.fingerprintFields = fields })
+}
+
+// WithHooks installs one immutable operation-hook set. Define validates and
+// compiles the captured set after every option has resolved.
+func WithHooks(set hook.Set) Option {
+	captured := cloneHookSet(set)
+	return singleton(keyHooks, func(state *definitionState) {
+		state.hooks = cloneHookSet(captured)
+	})
+}
+
+func cloneHookSet(set hook.Set) hook.Set {
+	set.Guards = append([]hook.Guard(nil), set.Guards...)
+	set.Around = append([]hook.Around(nil), set.Around...)
+	return set
 }
 
 func WithForeignBuilders(builder foreign.Builder, restored foreign.RestoredBuilder) Option {

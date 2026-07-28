@@ -26,6 +26,7 @@ func testManifest() ConfigManifest {
 		ConfinementRev:            "gggg",
 		ConfinementStrictness:     2,
 		ExternalCapabilityRev:     "hhhh",
+		HookPolicyRev:             "iiii",
 		AppFields:                 map[string]string{"b": "2", "a": "1"},
 	}
 }
@@ -47,6 +48,9 @@ func TestManifestFingerprint(t *testing.T) {
 		{name: "strictness change alters fingerprint", mutate: func(m *ConfigManifest) {
 			m.PermissionStrictness = 1
 		}, same: false},
+		{name: "hook policy change alters fingerprint", mutate: func(m *ConfigManifest) {
+			m.HookPolicyRev = "other"
+		}, same: false},
 		{name: "schema version change alters fingerprint", mutate: func(m *ConfigManifest) {
 			m.SchemaVersion = ManifestSchemaVersion + 1
 		}, same: false},
@@ -64,6 +68,16 @@ func TestManifestFingerprint(t *testing.T) {
 	}
 }
 
+func TestManifestHookSchemaContract(t *testing.T) {
+	t.Parallel()
+	if ManifestSchemaVersion != 2 {
+		t.Errorf("ManifestSchemaVersion = %d, want 2", ManifestSchemaVersion)
+	}
+	if manifestEncodingDomain != "looprig/config-manifest/v2" {
+		t.Errorf("manifestEncodingDomain = %q, want v2 domain", manifestEncodingDomain)
+	}
+}
+
 // The canonical encoding is a durable contract: this golden vector pins it. If
 // this test ever fails, the encoding changed — that is a manifest schema bump,
 // not a test to update casually.
@@ -73,7 +87,7 @@ func TestManifestFingerprintGolden(t *testing.T) {
 		t.Fatalf("fingerprint %q is not lowercase hex sha256", got)
 	}
 	// Frozen on first run; drift here means the canonical encoding changed.
-	const golden = "6dfa05a68de160225451630245e9d7a3ce5e709f39dd376dfc6708bfd4a6da3e"
+	const golden = "3578d2110aee394c496f8136df5fcbe9f227cc376aa3fdbd5a9caf4e52cde652"
 	if golden != "" && got != golden {
 		t.Errorf("canonical encoding drifted: fingerprint = %s, want %s", got, golden)
 	}
@@ -122,6 +136,9 @@ func TestManifestFromLegacy(t *testing.T) {
 	}
 	if got.legacyToolPolicyRev != "tp" {
 		t.Errorf("legacyToolPolicyRev = %q, want %q", got.legacyToolPolicyRev, "tp")
+	}
+	if got.HookPolicyRev != "" {
+		t.Errorf("HookPolicyRev = %q, want empty for legacy projection", got.HookPolicyRev)
 	}
 }
 

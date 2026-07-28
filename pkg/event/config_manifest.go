@@ -12,12 +12,12 @@ import (
 // changes the canonical encoding, which changes every fingerprint — restore
 // therefore never treats raw fingerprint inequality across schema versions as
 // drift (see AssessDrift) and records a one-time baseline upgrade instead.
-const ManifestSchemaVersion uint32 = 1
+const ManifestSchemaVersion uint32 = 2
 
 // manifestEncodingDomain separates manifest digests from every other SHA-256
 // in the system. It is part of the durable contract; never change it without a
 // schema bump.
-const manifestEncodingDomain = "looprig/config-manifest/v1"
+const manifestEncodingDomain = "looprig/config-manifest/v2"
 
 // ConfigEpoch orders the configurations explicitly adopted within one Session.
 // SessionStarted is epoch 1; each ConfigurationAdopted increments it.
@@ -66,6 +66,7 @@ type ConfigManifest struct {
 	ConfinementRev            string          `json:"confinement_rev,omitzero"`
 	ConfinementStrictness     StrictnessLevel `json:"confinement_strictness,omitzero"`
 	ExternalCapabilityRev     string          `json:"external_capability_rev,omitzero"`
+	HookPolicyRev             string          `json:"hook_policy_rev,omitzero"`
 	// AppFields are application-defined, secret-free compatibility fields.
 	// Canonically encoded in sorted key order.
 	AppFields map[string]string `json:"app_fields,omitzero"`
@@ -119,6 +120,7 @@ func (m ConfigManifest) canonical() []byte {
 	material = appendManifestString(material, m.ConfinementRev)
 	material = binary.BigEndian.AppendUint64(material, uint64(m.ConfinementStrictness))
 	material = appendManifestString(material, m.ExternalCapabilityRev)
+	material = appendManifestString(material, m.HookPolicyRev)
 	keys := make([]string, 0, len(m.AppFields))
 	for key := range m.AppFields {
 		keys = append(keys, key)
