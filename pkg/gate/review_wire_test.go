@@ -107,6 +107,155 @@ func TestReviewSubjectWireRejectsUntrustedInput(t *testing.T) {
 	}
 }
 
+func TestReviewSubjectWireRejectsNonCanonicalKeysAtEveryObjectLevel(t *testing.T) {
+	t.Parallel()
+
+	valid, err := marshalPermissionReviewSubject(validPermissionReviewSubject(t))
+	if err != nil {
+		t.Fatalf("marshalPermissionReviewSubject() error = %v", err)
+	}
+	tests := []struct {
+		name           string
+		canonical      string
+		alias          string
+		exactDuplicate string
+	}{
+		{
+			name: "root", canonical: `"version":`, alias: `"Version":`,
+			exactDuplicate: `"version":null,"version":`,
+		},
+		{
+			name: "basis", canonical: `"gate_id":`, alias: `"Gate_ID":`,
+			exactDuplicate: `"gate_id":null,"gate_id":`,
+		},
+		{
+			name: "request", canonical: `"tool_name":`, alias: `"Tool_Name":`,
+			exactDuplicate: `"tool_name":null,"tool_name":`,
+		},
+		{
+			name: "requirement", canonical: `"scope":`, alias: `"Scope":`,
+			exactDuplicate: `"scope":null,"scope":`,
+		},
+		{
+			name:           "candidate",
+			canonical:      `"candidates":[{"kind":`,
+			alias:          `"candidates":[{"Kind":`,
+			exactDuplicate: `"candidates":[{"kind":null,"kind":`,
+		},
+		{
+			name: "context", canonical: `"coordinates":`, alias: `"Coordinates":`,
+			exactDuplicate: `"coordinates":null,"coordinates":`,
+		},
+		{
+			name: "coordinates", canonical: `"session_id":`, alias: `"Session_ID":`,
+			exactDuplicate: `"session_id":null,"session_id":`,
+		},
+		{
+			name: "entry", canonical: `"origin":`, alias: `"Origin":`,
+			exactDuplicate: `"origin":null,"origin":`,
+		},
+		{
+			name: "truncation", canonical: `"applied":`, alias: `"Applied":`,
+			exactDuplicate: `"applied":null,"applied":`,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name+" case alias", func(t *testing.T) {
+			t.Parallel()
+			data := replaceWire(valid, tt.canonical, tt.alias)
+			got, err := unmarshalPermissionReviewSubject(data)
+			if err == nil || !reflect.DeepEqual(got, PermissionReviewSubject{}) {
+				t.Fatalf("unmarshalPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+			}
+			if len(err.Error()) > 128 {
+				t.Fatalf("error length = %d, want bounded", len(err.Error()))
+			}
+		})
+		t.Run(tt.name+" unknown key", func(t *testing.T) {
+			t.Parallel()
+			data := replaceWire(valid, tt.canonical, `"unexpected":0,`+tt.canonical)
+			got, err := unmarshalPermissionReviewSubject(data)
+			if err == nil || !reflect.DeepEqual(got, PermissionReviewSubject{}) {
+				t.Fatalf("unmarshalPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+			}
+			if len(err.Error()) > 128 || strings.Contains(err.Error(), "unexpected") {
+				t.Fatalf("error = %q, want bounded and non-echoing", err)
+			}
+		})
+		t.Run(tt.name+" exact duplicate", func(t *testing.T) {
+			t.Parallel()
+			data := replaceWire(valid, tt.canonical, tt.exactDuplicate)
+			got, err := unmarshalPermissionReviewSubject(data)
+			if err == nil || !reflect.DeepEqual(got, PermissionReviewSubject{}) {
+				t.Fatalf("unmarshalPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+			}
+			if len(err.Error()) > 128 {
+				t.Fatalf("error length = %d, want bounded", len(err.Error()))
+			}
+		})
+	}
+}
+
+func TestReviewSubjectWireRejectsSemanticDuplicateWithMatchingDigest(t *testing.T) {
+	t.Parallel()
+
+	original := validPermissionReviewSubject(t)
+	changed := original.Clone()
+	changed.Basis.SubjectDigest = [32]byte{}
+	changed.Request.Summary = "changed summary"
+	changed, err := NewPermissionReviewSubject(changed.Basis, changed.Request, changed.Context)
+	if err != nil {
+		t.Fatalf("NewPermissionReviewSubject(changed) error = %v", err)
+	}
+	changedWire, err := marshalPermissionReviewSubject(changed)
+	if err != nil {
+		t.Fatalf("marshalPermissionReviewSubject(changed) error = %v", err)
+	}
+	if _, err := unmarshalPermissionReviewSubject(changedWire); err != nil {
+		t.Fatalf("canonical changed subject rejected: %v", err)
+	}
+
+	originalRequest, err := json.Marshal(
+		permissionReviewSubjectToWire(original, hex.EncodeToString(original.Basis.SubjectDigest[:])).Request,
+	)
+	if err != nil {
+		t.Fatalf("json.Marshal(original request) error = %v", err)
+	}
+	changedRequest, err := json.Marshal(
+		permissionReviewSubjectToWire(changed, hex.EncodeToString(changed.Basis.SubjectDigest[:])).Request,
+	)
+	if err != nil {
+		t.Fatalf("json.Marshal(changed request) error = %v", err)
+	}
+	rootDuplicate := replaceWire(
+		changedWire,
+		`"request":`+string(changedRequest),
+		`"request":`+string(originalRequest)+`,"Request":`+string(changedRequest),
+	)
+	nestedDuplicate := replaceWire(
+		changedWire,
+		`"summary":"changed summary"`,
+		`"summary":"run git status","Summary":"changed summary"`,
+	)
+	for _, tt := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "root request alias", data: rootDuplicate},
+		{name: "nested summary alias", data: nestedDuplicate},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := unmarshalPermissionReviewSubject(tt.data)
+			if err == nil || !reflect.DeepEqual(got, PermissionReviewSubject{}) {
+				t.Fatalf("unmarshalPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+			}
+		})
+	}
+}
+
 func TestReviewSubjectWireRejectsInvalidUTF8BeforeJSONReplacement(t *testing.T) {
 	t.Parallel()
 	for _, invalidByte := range []byte{0xfe, 0xff} {
@@ -119,6 +268,43 @@ func TestReviewSubjectWireRejectsInvalidUTF8BeforeJSONReplacement(t *testing.T) 
 		if len(err.Error()) > 128 || strings.Contains(err.Error(), string([]byte{invalidByte})) {
 			t.Fatalf("byte %x error = %q, want bounded and non-echoing", invalidByte, err)
 		}
+	}
+}
+
+func TestPermissionReviewCommonSubjectDigestAcceptsExactWireLimit(t *testing.T) {
+	t.Parallel()
+
+	base := validPermissionReviewSubject(t)
+	basis := base.Basis
+	basis.SubjectDigest = [32]byte{}
+	basis.ClassifierRevision = "x"
+	context := base.Context.Clone()
+	context.Entries[0].Content = ""
+	initial, err := NewPermissionReviewSubject(basis, base.Request, context)
+	if err != nil {
+		t.Fatalf("NewPermissionReviewSubject(initial) error = %v", err)
+	}
+	initialWire, err := marshalPermissionReviewSubject(initial)
+	if err != nil {
+		t.Fatalf("marshalPermissionReviewSubject(initial) error = %v", err)
+	}
+	context.Entries[0].Content = strings.Repeat(
+		"x",
+		MaxPermissionReviewSubjectWireBytes-len(initialWire),
+	)
+	subject, err := NewPermissionReviewSubject(basis, base.Request, context)
+	if err != nil {
+		t.Fatalf("NewPermissionReviewSubject(boundary) error = %v", err)
+	}
+	wire, err := marshalPermissionReviewSubject(subject)
+	if err != nil {
+		t.Fatalf("marshalPermissionReviewSubject(boundary) error = %v", err)
+	}
+	if len(wire) != MaxPermissionReviewSubjectWireBytes {
+		t.Fatalf("wire length = %d, want %d", len(wire), MaxPermissionReviewSubjectWireBytes)
+	}
+	if _, err := permissionReviewCommonSubjectDigest(subject); err != nil {
+		t.Fatalf("permissionReviewCommonSubjectDigest(boundary) error = %v", err)
 	}
 }
 

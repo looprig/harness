@@ -17,8 +17,9 @@ import (
 const (
 	permissionReviewSubjectWireVersion = "permission_review_subject.v1"
 	permissionReviewSubjectWireKind    = "harness.permission"
-	permissionReviewCommonClassifier   = "classifier-neutral.v1"
-	zeroPermissionReviewDigestHex      = "0000000000000000000000000000000000000000000000000000000000000000"
+	// The common projection must never grow a valid classifier-specific wire.
+	permissionReviewCommonClassifierRevision = ""
+	zeroPermissionReviewDigestHex            = "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
 // MaxPermissionReviewSubjectWireBytes bounds strict subject decoding before
@@ -193,7 +194,7 @@ func permissionReviewCommonSubjectDigest(
 		)
 	}
 	wire := permissionReviewSubjectToWire(subject, zeroPermissionReviewDigestHex)
-	wire.Basis.ClassifierRevision = permissionReviewCommonClassifier
+	wire.Basis.ClassifierRevision = permissionReviewCommonClassifierRevision
 	data, err := json.Marshal(wire)
 	if err != nil || len(data) > MaxPermissionReviewSubjectWireBytes {
 		return [sha256.Size]byte{}, reviewSubjectError(
@@ -621,6 +622,9 @@ func requireReviewWireObject(
 	}
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(data, &object); err != nil || object == nil {
+		return nil, reviewSubjectError(ReviewValidationFieldWire, ReviewValidationInvalid)
+	}
+	if len(object) != len(required) {
 		return nil, reviewSubjectError(ReviewValidationFieldWire, ReviewValidationInvalid)
 	}
 	for _, key := range required {
