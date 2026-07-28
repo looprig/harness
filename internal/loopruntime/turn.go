@@ -440,7 +440,20 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			TurnID: identity.turnID,
 			StepID: st.id,
 		})
-		results := RunBatch(batchCtx, toolUses, cfg.tools, cfg.gateReg, cfg.idGen, stepEmit)
+		results := RunBatch(batchCtx, toolUses, cfg.tools, BatchRuntime{
+			GateRegistrations: cfg.gateReg,
+			IDGen:             cfg.idGen,
+			Emit:              stepEmit,
+			Hooks:             cfg.hooks,
+			Coordinates: identitydomain.Coordinates{
+				SessionID: identity.sessionID,
+				LoopID:    identity.loopID,
+				TurnID:    identity.turnID,
+				StepID:    st.id,
+			},
+			AgentName: cfg.agentName,
+			Cause:     cfg.cause,
+		})
 		if stepCtx.Err() != nil {
 			// A cancelled batch's results are discarded; the step never completes, so
 			// it is not appended/committed and emits no StepDone.

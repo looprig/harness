@@ -7,12 +7,15 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	gatedomain "github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hook"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
@@ -52,7 +55,11 @@ const (
 	errToolUnprepared = "error: permission denied: tool has no call preparation"
 	// errPrepareBinding is the fail-closed tool-result for a prepared request
 	// bound to a different execution ID than the one the runner minted.
-	errPrepareBinding = "error: tool preparation failed: request is not bound to this execution"
+	errPrepareBinding       = "error: tool preparation failed: request is not bound to this execution"
+	errToolHookDeniedPrefix = "error: tool call denied: "
+	errToolHookFailure      = "error: internal: tool call blocked by hook"
+	errToolCanceled         = "error: tool call canceled"
+	errToolPanicRedacted    = "error: tool panicked"
 )
 
 // ResultPreview caps. ResultPreview may hold a slice of tool output, so it is
@@ -78,6 +85,7 @@ type result struct {
 // resolved is the runner's per-call working state, threaded from resolution
 // through execution. It is built once per requested call in call order.
 type resolved struct {
+	ctx     context.Context
 	callID  uuid.UUID
 	block   content.ToolUseBlock
 	argsstr string
@@ -108,9 +116,31 @@ type resolved struct {
 	hasWrite bool
 
 	sequential bool
+
+	hookCall       hook.Call
+	finishToolCall hook.FinishFunc
+	terminalErr    error
+	hooks          *hook.Runner
+
+	permissionEffect event.PermissionDecisionEffect
+	permissionReason string
+	hookPreview      string
 }
 
-// RunBatch executes a batch of tool calls. It mints a ToolExecutionID per call via idGen
+// BatchRuntime carries the runtime-owned services and attribution shared by one
+// batch. Zero values are safe: UUID generation defaults to uuid.New, event
+// emission is discarded, and a nil hook runner is a no-op.
+type BatchRuntime struct {
+	GateRegistrations chan<- gateRegistration
+	IDGen             func() (uuid.UUID, error)
+	Emit              func(event.Event)
+	Hooks             *hook.Runner
+	Coordinates       identity.Coordinates
+	AgentName         identity.AgentName
+	Cause             identity.Cause
+}
+
+// RunBatch executes a batch of tool calls. It mints a ToolExecutionID per call via runtime.IDGen
 // (fail-secure: a call whose ToolExecutionID cannot be minted is NOT executed and NO gate
 // is opened for it), resolves tools + permissions sequentially (so a session grant
 // on call N is visible to call N+1's Check), emits ALL ToolCallStarted before
@@ -126,22 +156,27 @@ func RunBatch(
 	ctx context.Context,
 	calls []content.ToolUseBlock,
 	ts ToolSet,
-	gateReg chan<- gateRegistration,
-	idGen func() (uuid.UUID, error),
-	emit func(event.Event),
+	runtime BatchRuntime,
 ) []result {
+	if runtime.IDGen == nil {
+		runtime.IDGen = uuid.New
+	}
+	if runtime.Emit == nil {
+		runtime.Emit = func(event.Event) {}
+	}
 	// safeEmit serializes all event emission so the caller's emit need not be
 	// concurrent-safe (the parallel executor calls Completed from many goroutines).
 	var emitMu sync.Mutex
 	safeEmit := func(ev event.Event) {
 		emitMu.Lock()
 		defer emitMu.Unlock()
-		emit(ev)
+		runtime.Emit(ev)
 	}
 
 	rs := make([]*resolved, len(calls))
 	for i, c := range calls {
-		rs[i] = newResolved(ctx, c, ts, idGen)
+		callID, idErr := runtime.IDGen()
+		rs[i] = newResolved(ctx, c, ts, callID, idErr, runtime)
 	}
 
 	// Sequential access resolution, in call order, BEFORE any execution, so a
@@ -153,9 +188,14 @@ func RunBatch(
 		if r.failed || r.t == nil {
 			continue
 		}
-		if err := resolveAccess(ctx, r, ts, gateReg, safeEmit); err != nil {
-			if ctx.Err() != nil {
-				return collectResults(rs)
+		if err := resolveAccess(r.ctx, r, ts, runtime.GateRegistrations, safeEmit); err != nil {
+			if r.ctx.Err() != nil {
+				for _, pending := range rs {
+					if !pending.failed {
+						pending.failWith(errToolCanceled, r.ctx.Err())
+					}
+				}
+				break
 			}
 			// A non-ctx error is fail-closed: resolveAccess has already marked
 			// r.failed (denied), so the call is never executed.
@@ -175,10 +215,11 @@ func RunBatch(
 	// a zero-key collision from a failed mint; indexing removes that hazard.)
 	final := make([]result, len(rs))
 
-	complete := func(i int, r result) {
-		final[i] = r
-		preview, isErr := previewOf(r)
-		safeEmit(event.ToolCallCompleted{ToolExecutionID: r.ToolExecutionID, IsError: isErr, ResultPreview: preview})
+	complete := func(i int, resolvedCall *resolved, callResult result) {
+		final[i] = callResult
+		preview, isErr := previewOf(callResult)
+		safeEmit(event.ToolCallCompleted{ToolExecutionID: callResult.ToolExecutionID, IsError: isErr, ResultPreview: preview})
+		resolvedCall.finish(preview, isErr)
 	}
 
 	// Pre-execution failures complete immediately, in the Started order. executable
@@ -186,13 +227,13 @@ func RunBatch(
 	var executable []indexedResolved
 	for i, r := range rs {
 		if r.failed {
-			complete(i, failureResult(r))
+			complete(i, r, failureResult(r))
 			continue
 		}
 		executable = append(executable, indexedResolved{i: i, r: r})
 	}
 
-	execute(ctx, executable, ts, gateReg, safeEmit, complete)
+	execute(executable, ts, runtime, safeEmit, complete)
 
 	return final
 }
@@ -204,31 +245,65 @@ type indexedResolved struct {
 	r *resolved
 }
 
-// newResolved builds the per-call working state: mints a ToolExecutionID via idGen, looks
-// up the tool, validates args JSON, runs CallPreparer.PrepareCall (once), queries WriteTarget,
-// and computes the redacted Summary. Pre-execution failures (id-gen failure, unknown
-// tool, invalid args, Prepare error, WriteTarget error) are recorded here; permission
-// is resolved later (sequentially).
+// newResolved builds the per-call working state around an already-minted
+// ToolExecutionID (or its minting error), starts the ToolCall hook before any
+// resolution side effect, looks up the tool, validates args JSON, runs
+// CallPreparer.PrepareCall once, queries WriteTarget, and computes the redacted
+// Summary. Pre-execution failures are recorded here; permission is resolved
+// later (sequentially).
 //
 // An idGen error is fail-secure: the call is marked failed with errIDGenFailure
 // (so it is NOT executed and NO gate is opened — a missing ToolExecutionID can't safely
 // route a gate) and the error is NOT swallowed (it is surfaced as a model-visible
 // tool-result and logged). The zero ToolExecutionID it then carries is harmless: a failed
 // call neither opens a gate nor shares a result slot (results are indexed).
-func newResolved(ctx context.Context, c content.ToolUseBlock, ts ToolSet, idGen func() (uuid.UUID, error)) *resolved {
-	r := &resolved{block: c, argsstr: string(c.Input)}
-
-	cid, err := idGen()
-	if err != nil {
-		slog.Error("loop: tool-call id generation failed; failing call fail-secure (not executed, no gate)",
-			"tool", c.Name, "error", err)
-		r.summary = c.Name // no ToolExecutionID → Summary is just the requested name
-		r.fail(errIDGenFailure)
+func newResolved(
+	ctx context.Context,
+	c content.ToolUseBlock,
+	ts ToolSet,
+	callID uuid.UUID,
+	idErr error,
+	runtime BatchRuntime,
+) *resolved {
+	call := hook.Call{
+		Operation:   hook.OperationToolCall,
+		StartedAt:   time.Now(),
+		Coordinates: runtime.Coordinates,
+		AgentName:   runtime.AgentName,
+		Cause:       runtime.Cause,
+		ToolCall: &hook.ToolCallData{
+			ToolExecutionID: callID,
+			ToolUseID:       c.ID,
+			ToolName:        c.Name,
+			Summary:         c.Name,
+			ArgsJSON:        append([]byte(nil), c.Input...),
+		},
+	}
+	hookCtx, finish, hookErr := runtime.Hooks.Start(ctx, call)
+	r := &resolved{
+		ctx: hookCtx, callID: callID, block: c, argsstr: string(c.Input),
+		summary: c.Name, hookCall: call, finishToolCall: finish, hooks: runtime.Hooks,
+	}
+	if hookErr != nil {
+		if denial, denied := hook.AsDenial(hookErr); denied {
+			r.terminalErr = denial
+			r.fail(errToolHookDeniedPrefix + denial.Reason)
+		} else {
+			r.terminalErr = safeHookError(hook.OperationToolCall, hookErr)
+			r.fail(errToolHookFailure)
+		}
 		return r
 	}
-	r.callID = cid
 
-	r.t = lookupTool(ctx, ts.Registry, c.Name)
+	if idErr != nil {
+		slog.Error("loop: tool-call id generation failed; failing call fail-secure (not executed, no gate)",
+			"tool", c.Name, "error", idErr)
+		r.summary = c.Name // no ToolExecutionID → Summary is just the requested name
+		r.failWith(errIDGenFailure, idErr)
+		return r
+	}
+
+	r.t = lookupTool(r.ctx, ts.Registry, c.Name)
 	if r.t == nil {
 		r.summary = c.Name // no tool → Summary is just the requested name
 		r.fail(errPrefixUnknownTool + c.Name)
@@ -259,7 +334,7 @@ func newResolved(ctx context.Context, c content.ToolUseBlock, ts ToolSet, idGen 
 		r.fail(errToolUnprepared)
 		return r
 	}
-	request, artifact, err := preparer.PrepareCall(ctx, r.callID, r.argsstr)
+	request, artifact, err := preparer.PrepareCall(r.ctx, r.callID, r.argsstr)
 	if err != nil {
 		slog.Warn("loop: tool PrepareCall failed; failing call fail-secure (not executed, no gate)",
 			"tool", c.Name, "error", err)
@@ -299,6 +374,28 @@ func newResolved(ctx context.Context, c content.ToolUseBlock, ts ToolSet, idGen 
 func (r *resolved) fail(msg string) {
 	r.failed = true
 	r.failedMsg = msg
+}
+
+func (r *resolved) failWith(msg string, err error) {
+	r.fail(msg)
+	r.terminalErr = err
+}
+
+func (r *resolved) finish(preview string, isErr bool) {
+	if r.hookPreview != "" {
+		preview = r.hookPreview
+	}
+	call := r.hookCall
+	call.ToolCall.Summary = r.summary
+	call.ToolCall.PermissionEffect = r.permissionEffect
+	call.ToolCall.PermissionReason = r.permissionReason
+	call.ToolCall.ResultPreview = preview
+	call.ToolCall.IsError = isErr
+	outcome := hook.OutcomeCompleted
+	if r.terminalErr != nil {
+		outcome = hookOutcome(r.ctx, r.terminalErr)
+	}
+	finishHook(r.finishToolCall, call, outcome, r.terminalErr)
 }
 
 // lookupTool resolves a tool by its Info(ctx).Name. Returns nil for an unknown
@@ -387,6 +484,8 @@ func resolveAccess(
 // emitAccessDecided emits the redacted non-gated decision audit (an interactive
 // prompt path emits PermissionRequested instead).
 func emitAccessDecided(r *resolved, effect event.PermissionDecisionEffect, reason string, emit func(event.Event)) {
+	r.permissionEffect = effect
+	r.permissionReason = reason
 	emit(event.PermissionDecided{
 		ToolExecutionID: r.callID,
 		Effect:          effect,
@@ -437,11 +536,31 @@ func approvalRequesterFor(
 		// matching Approve/Deny cannot be dropped on a race.
 		emit(event.PermissionRequested{ToolExecutionID: r.callID, Request: displayed})
 
+		g.ID = installed.gateID
+		waitCtx, waitCall, finishWait, waitErr := startGateWaitWithRunner(ctx, r.hookCall, g, r.hooks)
+		if waitErr != nil {
+			return "", waitErr
+		}
 		select {
 		case cmd := <-reply:
-			return approvalActionFromCommand(cmd, r.callID, installed.gateID)
-		case <-ctx.Done():
-			return "", ctx.Err()
+			action, err := approvalActionFromCommand(cmd, r.callID, installed.gateID)
+			answer := &gatedomain.Answer{
+				GateID: installed.gateID,
+				Action: string(action),
+				Source: gateResponseSource(cmd),
+			}
+			finishGateWait(finishWait, waitCall, answer, err)
+			if err == nil {
+				if action == gatedomain.ApprovalDeny {
+					r.permissionEffect, r.permissionReason = event.PermissionEffectDeny, "permission_denied"
+				} else {
+					r.permissionEffect, r.permissionReason = event.PermissionEffectApprove, "permission_approved"
+				}
+			}
+			return action, err
+		case <-waitCtx.Done():
+			finishGateWait(finishWait, waitCall, nil, waitCtx.Err())
+			return "", waitCtx.Err()
 		}
 	}
 }
@@ -493,12 +612,11 @@ func displayedRequest(prompt gatedomain.ApprovalPrompt) tool.Request {
 // finished call is reported via complete(index, result) so it lands in its own
 // result slot. execute does not return until every executable call has completed.
 func execute(
-	ctx context.Context,
 	executable []indexedResolved,
 	ts ToolSet,
-	gateReg chan<- gateRegistration,
+	runtime BatchRuntime,
 	emit func(event.Event),
-	complete func(int, result),
+	complete func(int, *resolved, result),
 ) {
 	var serial, parallel []indexedResolved
 	for _, ir := range executable {
@@ -511,7 +629,7 @@ func execute(
 
 	// Serial batch drains fully first (in call order).
 	for _, ir := range serial {
-		complete(ir.i, runOne(ctx, ir.r, ts, gateReg, emit))
+		complete(ir.i, ir.r, runOne(ir.r.ctx, ir.r, ts, runtime, emit))
 	}
 
 	if len(parallel) == 0 {
@@ -549,7 +667,7 @@ func execute(
 				lk.Lock()
 				defer lk.Unlock()
 			}
-			complete(ir.i, runOne(ctx, ir.r, ts, gateReg, emit))
+			complete(ir.i, ir.r, runOne(ir.r.ctx, ir.r, ts, runtime, emit))
 		}(ir)
 	}
 	wg.Wait()
@@ -564,24 +682,54 @@ func runOne(
 	ctx context.Context,
 	r *resolved,
 	ts ToolSet,
-	gateReg chan<- gateRegistration,
+	runtime BatchRuntime,
 	emit func(event.Event),
 ) (res result) {
-	ctx2 := WithPreparedCall(withGateReg(withEmit(withToolUseID(withCallID(ctx, r.callID), r.block.ID), emit), gateReg), r.prepared)
+	ctx2 := WithPreparedCall(withGateReg(withEmit(withToolUseID(withCallID(ctx, r.callID), r.block.ID), emit), runtime.GateRegistrations), r.prepared)
 	ctx2 = WithUserInputRequester(ctx2, RequestUserInput)
+	ctx2 = withOperationHookRuntime(ctx2, operationHookRuntime{
+		hooks: runtime.Hooks, coordinates: runtime.Coordinates,
+		agentName: runtime.AgentName, cause: runtime.Cause,
+	})
 
+	executionCall := hook.Call{
+		Operation:   hook.OperationToolExecution,
+		StartedAt:   time.Now(),
+		Coordinates: runtime.Coordinates,
+		AgentName:   runtime.AgentName,
+		Cause:       runtime.Cause,
+		ToolExecution: &hook.ToolExecutionData{
+			ToolExecutionID: r.callID,
+			ToolUseID:       r.block.ID,
+			ToolName:        r.block.Name,
+			ArgsJSON:        append([]byte(nil), r.block.Input...),
+		},
+	}
+	execCtx, finishExecution, startErr := runtime.Hooks.Start(ctx2, executionCall)
+	if startErr != nil {
+		res = errResult(r, errToolHookFailure)
+		finishExecutionHook(finishExecution, executionCall, res, startErr)
+		return res
+	}
+
+	var executionErr error
 	defer func() {
 		if rec := recover(); rec != nil {
 			res = errResult(r, fmt.Sprintf("%s%v", errPanicPrefix, rec))
+			executionErr = &operationHookPanicError{Operation: hook.OperationToolExecution}
+			r.hookPreview = errToolPanicRedacted
 		}
+		finishExecutionHook(finishExecution, executionCall, res, executionErr)
 	}()
 
 	exec := chain(r.t, ts.Middlewares)
-	tr, err := exec(ctx2, r.argsstr)
+	tr, err := exec(execCtx, r.argsstr)
 	if err != nil {
+		executionErr = err
 		return errResult(r, errToolPrefix+err.Error())
 	}
 	if tr == nil || len(tr.Content) == 0 {
+		executionErr = fmt.Errorf("loop: tool returned an empty result")
 		return errResult(r, errEmptyResult)
 	}
 	return result{
@@ -590,6 +738,18 @@ func runOne(
 		Content:         tr.Content,
 		IsError:         isErrorResult(tr),
 	}
+}
+
+func finishExecutionHook(finish hook.FinishFunc, call hook.Call, res result, err error) {
+	preview, isErr := previewOf(res)
+	if _, panicked := err.(*operationHookPanicError); panicked {
+		preview = errToolPanicRedacted
+		res.Content = []content.Block{&content.TextBlock{Text: errToolPanicRedacted}}
+	}
+	call.ToolExecution.Result = &tool.ToolResult{Content: append([]content.Block(nil), res.Content...)}
+	call.ToolExecution.ResultPreview = preview
+	call.ToolExecution.IsError = isErr
+	finishHook(finish, call, hookOutcome(context.Background(), err), err)
 }
 
 // isErrorResult reports whether a successful (non-nil, non-empty) ToolResult is an
@@ -631,18 +791,6 @@ func errResult(r *resolved, msg string) result {
 		Content:         []content.Block{&content.TextBlock{Text: msg}},
 		IsError:         true,
 	}
-}
-
-// collectResults gathers whatever results exist (used on the ctx-cancel teardown
-// path). A torn-down batch's results are discarded by runTurn's rollback, so this
-// just returns a best-effort, call-ordered slice with empty entries for
-// unresolved calls.
-func collectResults(rs []*resolved) []result {
-	out := make([]result, len(rs))
-	for i, r := range rs {
-		out[i] = result{ToolExecutionID: r.callID, ToolUseID: r.block.ID}
-	}
-	return out
 }
 
 // previewOf returns the (capped) ResultPreview and the IsError flag for a result.

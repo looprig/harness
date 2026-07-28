@@ -182,7 +182,7 @@ func TestRunBatch_PreparerSeam(t *testing.T) {
 			gateReg := approveActor()
 
 			results := withRunTimeout(t, func() []result {
-				return RunBatch(context.Background(), []content.ToolUseBlock{call(t, "P", `{}`)}, ts, gateReg, uuid.New, emit)
+				return RunBatch(context.Background(), []content.ToolUseBlock{call(t, "P", `{}`)}, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
 			})
 
 			if len(results) != 1 {

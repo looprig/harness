@@ -193,7 +193,7 @@ func call(t *testing.T, name, args string) content.ToolUseBlock {
 // the real uuid.New idGen seam (the production default).
 func runBatchNoGate(ctx context.Context, calls []content.ToolUseBlock, ts ToolSet, emit func(event.Event)) []result {
 	gateReg := make(chan gateRegistration)
-	return RunBatch(ctx, calls, ts, gateReg, uuid.New, emit)
+	return RunBatch(ctx, calls, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
 }
 
 // resultText returns the flattened text of a result.
@@ -422,7 +422,7 @@ func TestRunBatch_WorkspaceRuleVisibleToLaterCall(t *testing.T) {
 	}()
 
 	calls := []content.ToolUseBlock{call(t, "T", `{"n":1}`), call(t, "T", `{"n":2}`)}
-	results := RunBatch(context.Background(), calls, ts, gateReg, uuid.New, emit)
+	results := RunBatch(context.Background(), calls, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
 
 	if len(results) != 2 || results[0].IsError || results[1].IsError {
 		t.Fatalf("results = %+v, want 2 successes", results)
@@ -619,7 +619,7 @@ func TestRunBatch_AllStartedBeforeAnyCompleted(t *testing.T) {
 		calls = append(calls, call(t, "P", `{}`))
 	}
 	calls = append(calls, call(t, unknown, `{}`)) // include a pre-exec failure
-	RunBatch(context.Background(), calls, ts, make(chan gateRegistration), uuid.New, emit)
+	RunBatch(context.Background(), calls, ts, BatchRuntime{GateRegistrations: make(chan gateRegistration), IDGen: uuid.New, Emit: emit})
 
 	evs := getEvents()
 	lastStarted, firstCompleted, nStarted, nCompleted := startedCompletedOrder(evs)
@@ -717,7 +717,7 @@ func TestRunBatch_FailureVisibility(t *testing.T) {
 			t.Parallel()
 			ts, c, gateReg := tt.setup(t)
 			emit, getEvents := collectEmit()
-			results := RunBatch(context.Background(), []content.ToolUseBlock{c}, ts, gateReg, uuid.New, emit)
+			results := RunBatch(context.Background(), []content.ToolUseBlock{c}, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
 
 			if len(results) != 1 {
 				t.Fatalf("len(results) = %d, want 1", len(results))
@@ -807,7 +807,7 @@ func TestRunBatch_IDGenFailure(t *testing.T) {
 			for i := 0; i < tt.nCalls; i++ {
 				calls = append(calls, call(t, "T", `{}`))
 			}
-			results := RunBatch(context.Background(), calls, ts, make(chan gateRegistration), idGen, emit)
+			results := RunBatch(context.Background(), calls, ts, BatchRuntime{GateRegistrations: make(chan gateRegistration), IDGen: idGen, Emit: emit})
 
 			if len(results) != tt.nCalls {
 				t.Fatalf("len(results) = %d, want %d", len(results), tt.nCalls)
@@ -932,7 +932,7 @@ func TestRunBatch_PermissionDecisionAuditSkipsGatedAsk(t *testing.T) {
 		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Action: gatedomain.ApprovalApprove}
 	}()
 
-	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
 
 	if len(results) != 1 || results[0].IsError {
 		t.Fatalf("results = %+v, want one approved success", results)
@@ -964,7 +964,7 @@ func TestRunBatch_ResultPreviewCapped(t *testing.T) {
 	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{tl, small}, MaxParallelToolCalls: 4}
 	emit, getEvents := collectEmit()
 	calls := []content.ToolUseBlock{call(t, "Big", `{}`), call(t, "Small", `{}`)}
-	RunBatch(context.Background(), calls, ts, make(chan gateRegistration), uuid.New, emit)
+	RunBatch(context.Background(), calls, ts, BatchRuntime{GateRegistrations: make(chan gateRegistration), IDGen: uuid.New, Emit: emit})
 
 	var bigPreview, smallPreview string
 	for _, ev := range getEvents() {
@@ -998,7 +998,7 @@ func TestRunBatch_PreviewLineCap(t *testing.T) {
 	tl := &fakeRunTool{name: "Lines", output: sb.String()}
 	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
 	emit, getEvents := collectEmit()
-	RunBatch(context.Background(), []content.ToolUseBlock{call(t, "Lines", `{}`)}, ts, make(chan gateRegistration), uuid.New, emit)
+	RunBatch(context.Background(), []content.ToolUseBlock{call(t, "Lines", `{}`)}, ts, BatchRuntime{GateRegistrations: make(chan gateRegistration), IDGen: uuid.New, Emit: emit})
 	var preview string
 	for _, ev := range getEvents() {
 		if c, ok := ev.(event.ToolCallCompleted); ok {
@@ -1036,7 +1036,7 @@ func TestRunBatch_WriterErrorFailsClosed(t *testing.T) {
 		close(reg.ack)
 		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Action: gatedomain.ApprovalApproveAlwaysWorkspace}
 	}()
-	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
 	if !results[0].IsError || !strings.Contains(resultText(results[0]), "permission denied") {
 		t.Errorf("result = %+v / %q, want fail-closed denial on persistence failure", results[0], resultText(results[0]))
 	}
@@ -1071,7 +1071,7 @@ func TestRunBatch_MiddlewareOutermostFirst(t *testing.T) {
 		MaxParallelToolCalls: 4,
 	}
 	emit, _ := collectEmit()
-	RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, make(chan gateRegistration), uuid.New, emit)
+	RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, BatchRuntime{GateRegistrations: make(chan gateRegistration), IDGen: uuid.New, Emit: emit})
 	want := []string{"outer:before", "inner:before", "inner:after", "outer:after"}
 	mu.Lock()
 	defer mu.Unlock()
@@ -1125,7 +1125,7 @@ func TestRunBatch_CtxInjectedPerCall(t *testing.T) {
 		close(reg.ack)
 		reg.reply <- command.ProvideUserInput{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Answer: "green"}
 	}()
-	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "Ask", `{}`)}, ts, gateReg, uuid.New, emit)
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "Ask", `{}`)}, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
 	if results[0].IsError {
 		t.Fatalf("result = %+v, want success", results[0])
 	}
@@ -1189,7 +1189,7 @@ func TestRunBatch_CtxCancelDuringGate(t *testing.T) {
 	}()
 	done := make(chan []result, 1)
 	go func() {
-		done <- RunBatch(ctx, []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
+		done <- RunBatch(ctx, []content.ToolUseBlock{call(t, "T", `{}`)}, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
 	}()
 	select {
 	case <-done:

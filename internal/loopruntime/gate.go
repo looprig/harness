@@ -3,11 +3,14 @@ package loopruntime
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	gatedomain "github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hook"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -105,6 +108,23 @@ func accepts(kind gateKind, cmd command.Command) bool {
 type emitKey struct{}
 type callIDKey struct{}
 type gateRegKey struct{}
+type operationHookRuntimeKey struct{}
+
+type operationHookRuntime struct {
+	hooks       *hook.Runner
+	coordinates identity.Coordinates
+	agentName   identity.AgentName
+	cause       identity.Cause
+}
+
+func withOperationHookRuntime(ctx context.Context, runtime operationHookRuntime) context.Context {
+	return context.WithValue(ctx, operationHookRuntimeKey{}, runtime)
+}
+
+func operationHooksFromContext(ctx context.Context) operationHookRuntime {
+	runtime, _ := ctx.Value(operationHookRuntimeKey{}).(operationHookRuntime)
+	return runtime
+}
 
 // withEmit returns a child ctx carrying the per-turn emit func. The runner injects
 // it per tool call; EmitFromContext / RequestUserInput read it back.
@@ -227,18 +247,81 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 	// Install-before-emit: only now is the session gate guaranteed active.
 	emit(event.UserInputRequested{ToolExecutionID: callID, Question: question, Choices: choices})
 
+	g.ID = installed.gateID
+	runtime := operationHooksFromContext(ctx)
+	parentCall := hook.Call{
+		Coordinates: runtime.coordinates,
+		AgentName:   runtime.agentName,
+		Cause:       runtime.cause,
+	}
+	waitCtx, waitCall, finishWait, waitErr := startGateWaitWithRunner(ctx, parentCall, g, runtime.hooks)
+	if waitErr != nil {
+		return "", waitErr
+	}
 	select {
 	case cmd := <-reply:
 		// runLoop already matched by ToolExecutionID + kind; re-validate the ToolExecutionID as cheap
 		// defence in depth, and narrow to the concrete command for the answer.
 		pui, ok := cmd.(command.ProvideUserInput)
 		if !ok || pui.GateToolExecutionID() != callID || (!pui.GateRoute.GateID.IsZero() && pui.GateRoute.GateID != installed.gateID) {
-			return "", &GateReplyMismatchError{ToolExecutionID: callID}
+			err := &GateReplyMismatchError{ToolExecutionID: callID}
+			finishGateWait(finishWait, waitCall, nil, err)
+			return "", err
 		}
+		answer := &gatedomain.Answer{
+			GateID: installed.gateID,
+			Values: map[string]string{"answer": pui.Answer},
+			Source: gateResponseSource(cmd),
+		}
+		finishGateWait(finishWait, waitCall, answer, nil)
 		return pui.Answer, nil
-	case <-ctx.Done():
-		return "", ctx.Err()
+	case <-waitCtx.Done():
+		finishGateWait(finishWait, waitCall, nil, waitCtx.Err())
+		return "", waitCtx.Err()
 	}
+}
+
+func gateResponseSource(cmd command.Command) gatedomain.ResponseSource {
+	if cmd.CommandHeader().Agency == identity.AgencyUser {
+		return gatedomain.ResponseSource{Kind: gatedomain.ResponseFromUser}
+	}
+	// Machine agency cannot distinguish policy from model provenance once the
+	// response has been translated onto the loop command wire.
+	return gatedomain.ResponseSource{}
+}
+
+func startGateWaitWithRunner(
+	ctx context.Context,
+	parent hook.Call,
+	g gatedomain.Gate,
+	hooks *hook.Runner,
+) (context.Context, hook.Call, hook.FinishFunc, error) {
+	call := hook.Call{
+		Operation:   hook.OperationGateWait,
+		StartedAt:   time.Now(),
+		Coordinates: parent.Coordinates,
+		AgentName:   parent.AgentName,
+		Cause:       parent.Cause,
+		GateWait: &hook.GateWaitData{
+			GateID:   g.ID,
+			Kind:     g.Kind,
+			Resolver: g.Resolver,
+			Blocks:   g.Blocks,
+			Effect:   g.Effect,
+		},
+	}
+	waitCtx, finish, err := hooks.Start(ctx, call)
+	return waitCtx, call, finish, err
+}
+
+func finishGateWait(
+	finish hook.FinishFunc,
+	call hook.Call,
+	answer *gatedomain.Answer,
+	err error,
+) {
+	call.GateWait.Answer = answer
+	finishHook(finish, call, hookOutcome(context.Background(), err), err)
 }
 
 // GateReplyMismatchError is returned if the command delivered on a gateUserInput
