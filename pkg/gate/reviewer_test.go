@@ -276,7 +276,6 @@ func TestPermissionClassifierSetFreezesDefinitionDescriptor(t *testing.T) {
 
 func TestPermissionClassifierSetRejectsInvalidRegistration(t *testing.T) {
 	t.Parallel()
-	valid := validPermissionClassifier(t, "valid", "revision-1")
 	var typedNil *permissionClassifierStub
 	tests := []struct {
 		name        string
@@ -289,8 +288,8 @@ func TestPermissionClassifierSetRejectsInvalidRegistration(t *testing.T) {
 		{name: "blank revision", classifiers: []gate.PermissionClassifier{classifierWithMetadata(t, "blank", " ")}},
 		{name: "invalid utf8 revision", classifiers: []gate.PermissionClassifier{classifierWithMetadata(t, "utf8", string([]byte{0xff}))}},
 		{name: "long revision", classifiers: []gate.PermissionClassifier{classifierWithMetadata(t, "long", strings.Repeat("r", gate.MaxPermissionClassifierRevisionBytes+1))}},
-		{name: "duplicate name", classifiers: []gate.PermissionClassifier{valid, validPermissionClassifier(t, "valid", "revision-2")}},
-		{name: "duplicate revision", classifiers: []gate.PermissionClassifier{valid, validPermissionClassifier(t, "other", "revision-1")}},
+		{name: "duplicate name", classifiers: []gate.PermissionClassifier{validPermissionClassifier(t, "valid", "revision-1"), validPermissionClassifier(t, "valid", "revision-2")}},
+		{name: "duplicate revision", classifiers: []gate.PermissionClassifier{validPermissionClassifier(t, "valid", "revision-1"), validPermissionClassifier(t, "other", "revision-1")}},
 		{name: "zero definition", classifiers: []gate.PermissionClassifier{&permissionClassifierStub{name: "zero", revision: "revision-1"}}},
 		{name: "background", classifiers: []gate.PermissionClassifier{classifierWithDefinition(t, "background", "revision-1", hustle.ParticipationBackground, false, true)}},
 		{name: "current loop", classifiers: []gate.PermissionClassifier{classifierWithDefinition(t, "current", "revision-1", hustle.ParticipationBlocking, true, true)}},
