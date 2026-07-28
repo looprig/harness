@@ -10,11 +10,19 @@ import (
 	"unicode/utf8"
 
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 )
 
 const (
-	maxEvidenceToolDescriptionBytes = 1 << 20
-	maxEvidenceToolSchemaBytes      = 1 << 20
+	// MaxEvidenceToolDescriptionBytes bounds each concrete tool description
+	// by encoded UTF-8 bytes before the metadata is retained or fingerprinted.
+	MaxEvidenceToolDescriptionBytes = 4 << 10
+	// MaxEvidenceToolSchemaBytes bounds each concrete tool's raw JSON schema
+	// before validation and whitespace compaction.
+	MaxEvidenceToolSchemaBytes = 1 << 20
+	// MaxEvidenceToolMetadataBytes bounds the aggregate model-facing concrete
+	// tool names, descriptions, and compact schemas in one bound catalog.
+	MaxEvidenceToolMetadataBytes = 4 << 20
 )
 
 // BoundEvidenceTool is an immutable, fingerprinted evidence capability. Its
@@ -89,10 +97,24 @@ func bindEvidenceTools(
 	if bindings.SessionID.IsZero() || bindings.LoopID.IsZero() {
 		return nil, invalidEvidenceBind(nil)
 	}
+	if len(policy.Definitions) == 0 || len(policy.Definitions) > MaxEvidenceToolDefinitions {
+		return nil, invalidEvidenceBind(nil)
+	}
 	built := make([]tool.InvokableTool, 0)
 	declared := make([]string, 0)
 	for _, definition := range policy.Definitions {
+		if nilToolDefinition(definition) {
+			return nil, invalidEvidenceBind(nil)
+		}
 		names := definition.ProducedToolNames()
+		if len(names) == 0 || len(names) > MaxEvidenceProducedToolNames-len(declared) {
+			return nil, invalidEvidenceBind(nil)
+		}
+		for _, name := range names {
+			if !canonicalEvidenceToolName(name) {
+				return nil, invalidEvidenceBind(nil)
+			}
+		}
 		declared = append(declared, names...)
 		toolBindings := tool.Bindings{
 			SessionID: bindings.SessionID,
@@ -105,13 +127,17 @@ func bindEvidenceTools(
 		if err != nil {
 			return nil, invalidEvidenceBind(err)
 		}
+		if len(tools) > MaxEvidenceProducedToolNames-len(built) {
+			return nil, invalidEvidenceBind(nil)
+		}
 		built = append(built, tools...)
 	}
-	if len(built) != len(declared) {
+	if len(built) == 0 || len(built) > MaxEvidenceProducedToolNames || len(built) != len(declared) {
 		return nil, invalidEvidenceBind(nil)
 	}
 	result := make([]BoundEvidenceTool, len(built))
 	seen := make(map[string]struct{}, len(built))
+	metadataBytes := 0
 	for index, concrete := range built {
 		if nilEvidenceTool(concrete) {
 			return nil, invalidEvidenceBind(nil)
@@ -142,6 +168,17 @@ func bindEvidenceTools(
 			return nil, invalidEvidenceBind(nil)
 		}
 		seen[info.Name] = struct{}{}
+		var withinLimit bool
+		metadataBytes, withinLimit = addEvidenceMetadataBytes(metadataBytes, len(info.Name))
+		if withinLimit {
+			metadataBytes, withinLimit = addEvidenceMetadataBytes(metadataBytes, len(info.Desc))
+		}
+		if withinLimit {
+			metadataBytes, withinLimit = addEvidenceMetadataBytes(metadataBytes, len(canonicalSchema))
+		}
+		if !withinLimit {
+			return nil, invalidEvidenceBind(nil)
+		}
 		frozenInfo := tool.ToolInfo{
 			Name: info.Name, Desc: info.Desc,
 			Schema: append(json.RawMessage(nil), canonicalSchema...),
@@ -168,14 +205,15 @@ func validateEvidenceToolInfo(info tool.ToolInfo) ([]byte, error) {
 		info.Desc != strings.TrimSpace(info.Desc) ||
 		info.Desc == "" ||
 		strings.ContainsRune(info.Desc, '\x00') ||
-		len(info.Desc) > maxEvidenceToolDescriptionBytes ||
+		len(info.Desc) > MaxEvidenceToolDescriptionBytes ||
 		len(info.Schema) == 0 ||
-		len(info.Schema) > maxEvidenceToolSchemaBytes ||
+		len(info.Schema) > MaxEvidenceToolSchemaBytes ||
 		!utf8.Valid(info.Schema) {
 		return nil, invalidEvidenceBind(nil)
 	}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(info.Schema, &object); err != nil || object == nil {
+	if err := inference.ValidateOutputSchema(inference.OutputSchema{
+		Name: info.Name, Description: info.Desc, Schema: info.Schema, Strict: true,
+	}); err != nil {
 		return nil, invalidEvidenceBind(err)
 	}
 	var compact bytes.Buffer
@@ -183,6 +221,14 @@ func validateEvidenceToolInfo(info tool.ToolInfo) ([]byte, error) {
 		return nil, err
 	}
 	return append([]byte(nil), compact.Bytes()...), nil
+}
+
+func addEvidenceMetadataBytes(total, size int) (int, bool) {
+	if total < 0 || size < 0 || total > MaxEvidenceToolMetadataBytes ||
+		size > MaxEvidenceToolMetadataBytes-total {
+		return 0, false
+	}
+	return total + size, true
 }
 
 func digestBoundEvidenceTool(name, description string, schema []byte) ([sha256.Size]byte, error) {

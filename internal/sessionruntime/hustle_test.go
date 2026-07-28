@@ -286,7 +286,7 @@ func TestSessionBindsEvidenceToolsWithOriginAndAttenuatedWorkspace(t *testing.T)
 	workspaceRoot := "/managed/workspace"
 	concrete := &sessionEvidenceTool{infos: []*tool.ToolInfo{{
 		Name: "workspace-status", Desc: "read workspace status",
-		Schema: json.RawMessage(`{"type":"object"}`),
+		Schema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
 	}}}
 	builds := 0
 	definition := sessionEvidenceDefinition(t, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
@@ -320,10 +320,12 @@ func TestSessionConstructionRejectsEvidenceSchemaDriftBeforeRun(t *testing.T) {
 	t.Parallel()
 	sessionID, _ := uuid.New()
 	loopID, _ := uuid.New()
+	// tool.Definition.Build consumes the first entry before the Hustle binder's
+	// two-read drift check.
 	concrete := &sessionEvidenceTool{infos: []*tool.ToolInfo{
-		{Name: "workspace-status", Desc: "read workspace", Schema: json.RawMessage(`{"type":"object"}`)},
-		{Name: "workspace-status", Desc: "read workspace", Schema: json.RawMessage(`{"type":"object"}`)},
-		{Name: "workspace-status", Desc: "read workspace", Schema: json.RawMessage(`{"type":"object","properties":{"changed":{"type":"boolean"}}}`)},
+		{Name: "workspace-status", Desc: "read workspace", Schema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)},
+		{Name: "workspace-status", Desc: "read workspace", Schema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)},
+		{Name: "workspace-status", Desc: "read workspace", Schema: json.RawMessage(`{"type":"object","properties":{"changed":{"type":"boolean"}},"required":["changed"],"additionalProperties":false}`)},
 	}}
 	definition := sessionEvidenceDefinition(t, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 		return []tool.InvokableTool{concrete}, nil
