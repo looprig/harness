@@ -277,8 +277,9 @@ Beginning around hooks before guards makes policy latency and denial outcomes
 observable. Reverse finish order gives normal nested middleware semantics.
 
 The context returned by one begin callback is passed to the next callback, the
-guards, the operation, and its nested operations. A callback must preserve
-cancelation and deadlines and should add values only. A nil returned context is
+guards, the operation, and its nested operations. The runner retains the prior
+context's cancellation and deadline even if a callback returns a detached
+context; callbacks should normally add values only. A nil returned context is
 ignored and reported as an observation failure; it never replaces the valid
 input context.
 
@@ -294,6 +295,13 @@ A guard panic is recovered as an internal guard error and blocks the operation.
 Callbacks may run concurrently across sessions, loops, parallel tool calls, and
 journal appends. Harness preserves order only within one operation dispatch.
 Callbacks must be concurrency-safe.
+
+The operation owner must invoke the aggregate finish function on every terminal
+path, including guard rejection. Finish is both the exactly-once notification
+and cleanup for any cancellation links installed while chaining contexts.
+Actor boundaries pass the derived operation context, rather than the actor's
+long-lived base context, into durable appends so journal observation inherits
+the active operation.
 
 ## 8. Operation Boundaries
 
@@ -346,7 +354,11 @@ panic is normalized. This boundary excludes gate latency.
 
 Begins immediately before one checked append and finishes after acknowledgement
 or failure. Its payload is bounded and secret-free. It does not expose raw event,
-command, gate, or record bytes.
+command, gate, or record bytes. Each append is wrapped once at the journal
+boundary. Lifecycle construction and restore own their fresh opening fence;
+operation owners retain ownership of their terminal append and finish only
+after that append resolves. Restore replay reads historical records without
+dispatching hooks.
 
 ## 9. Events and OpenTelemetry
 

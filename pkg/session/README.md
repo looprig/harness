@@ -5,6 +5,12 @@ for one running rig. It is the surface a consumer (TUI, CLI, HTTP, test)
 holds and drives; session construction and restoration are owned
 exclusively by [`pkg/rig`](../rig/README.md).
 
+Operation hooks are also installed at the rig boundary, not on a live session.
+Pass a [`hook.Set`](../hook/README.md) with `rig.WithHooks` when defining the
+rig. Every new or restored session then uses that immutable compiled policy for
+new native-loop work and checked journal appends; sessions expose no mutable
+hook registry.
+
 It is a contracts package — it defines interfaces, not implementations.
 The concrete `Session` lives in `internal/sessionruntime` and is returned
 to callers as `session.SessionController`.
@@ -77,6 +83,8 @@ if ok {
   `event.Subscription` for `SubscribeEvents`.
 - [`pkg/gate`](../gate/README.md) — `gate.GateResponse` for `RespondGate`
   and `gate.Gate`/`gate.Payload` for `OpenHostGate`.
+- [`pkg/hook`](../hook/README.md) — rig-installed guards and around observers
+  for native runtime operations and checked journal appends.
 - [`pkg/workspacestore`](../workspacestore/README.md) — `workspacestore.Ref`
   for `CheckpointWorkspace` / `RestoreWorkspace`.
 
