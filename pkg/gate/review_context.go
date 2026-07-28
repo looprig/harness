@@ -217,6 +217,13 @@ func BuildReviewContext(input ReviewContext, policy ReviewContextPolicy) (Review
 		}
 		entry := &output.Entries[i]
 		limit, mask := entryLimit(*entry, policy)
+		if (len(entry.Content) > limit || len(entry.Content) > policy.MaxBlockBytes) &&
+			strings.Contains(entry.Content, reviewContextTruncationMarker) {
+			return ReviewContext{}, reviewContextError(
+				ReviewValidationFieldContextEntry,
+				ReviewValidationReserved,
+			)
+		}
 		if len(entry.Content) > limit {
 			truncated, err := truncateReviewContextContent(entry.Content, limit)
 			if err != nil {

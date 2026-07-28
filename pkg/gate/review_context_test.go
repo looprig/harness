@@ -416,6 +416,107 @@ func TestReviewContextTruncationIsUTF8SafePrefixAndSuffix(t *testing.T) {
 	}
 }
 
+func TestReviewContextRejectsReservedMarkerOnlyWhenSourceContentNeedsTruncation(t *testing.T) {
+	t.Parallel()
+
+	const marker = "\n…[review context truncated]…\n"
+	const attackerContent = "attacker-controlled-marker-collision"
+	const limit = 64
+
+	tests := []struct {
+		name     string
+		entry    gate.ReviewContextEntry
+		setLimit func(*gate.ReviewContextPolicy, int)
+	}{
+		{
+			name:  "user",
+			entry: gate.ReviewContextEntry{Origin: gate.ReviewContextOriginUser, Kind: gate.ReviewContextKindUserMessage},
+			setLimit: func(policy *gate.ReviewContextPolicy, value int) {
+				policy.MaxUserEntryBytes = value
+			},
+		},
+		{
+			name:  "assistant",
+			entry: gate.ReviewContextEntry{Origin: gate.ReviewContextOriginAssistant, Kind: gate.ReviewContextKindAssistantMessage},
+			setLimit: func(policy *gate.ReviewContextPolicy, value int) {
+				policy.MaxAgentEntryBytes = value
+			},
+		},
+		{
+			name:  "tool",
+			entry: gate.ReviewContextEntry{Origin: gate.ReviewContextOriginTool, Kind: gate.ReviewContextKindToolResult},
+			setLimit: func(policy *gate.ReviewContextPolicy, value int) {
+				policy.MaxToolEntryBytes = value
+			},
+		},
+		{
+			name:  "runtime",
+			entry: gate.ReviewContextEntry{Origin: gate.ReviewContextOriginRuntime, Kind: gate.ReviewContextKindRuntimeContext},
+			setLimit: func(policy *gate.ReviewContextPolicy, value int) {
+				policy.MaxBlockBytes = value
+			},
+		},
+		{
+			name:  "external",
+			entry: gate.ReviewContextEntry{Origin: gate.ReviewContextOriginExternal, Kind: gate.ReviewContextKindExternalContent},
+			setLimit: func(policy *gate.ReviewContextPolicy, value int) {
+				policy.MaxBlockBytes = value
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			entry := tt.entry
+			entry.Content = "prefix-" + marker + attackerContent
+			input := validReviewContext()
+			if entry.Kind == gate.ReviewContextKindUserMessage {
+				input.Entries[0] = entry
+			} else {
+				input.Entries = append([]gate.ReviewContextEntry{entry}, input.Entries...)
+			}
+			policy := validReviewContextPolicy()
+			tt.setLimit(&policy, limit)
+
+			got, err := gate.BuildReviewContext(input, policy)
+			if !reflect.DeepEqual(got, gate.ReviewContext{}) {
+				t.Fatalf("BuildReviewContext() output = %#v, want zero value", got)
+			}
+			var validationErr *gate.ReviewValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("BuildReviewContext() error = %T %v, want *ReviewValidationError", err, err)
+			}
+			if validationErr.Field != gate.ReviewValidationFieldContextEntry ||
+				validationErr.Reason != gate.ReviewValidationReserved {
+				t.Errorf(
+					"BuildReviewContext() validation = (%q, %q), want (%q, %q)",
+					validationErr.Field,
+					validationErr.Reason,
+					gate.ReviewValidationFieldContextEntry,
+					gate.ReviewValidationReserved,
+				)
+			}
+			if strings.Contains(err.Error(), attackerContent) || len(err.Error()) > 128 {
+				t.Errorf("BuildReviewContext() error = %q, want bounded and non-echoing", err)
+			}
+
+			entry.Content = "prefix" + marker + "suffix"
+			input = validReviewContext()
+			if entry.Kind == gate.ReviewContextKindUserMessage {
+				input.Entries[0] = entry
+			} else {
+				input.Entries = append([]gate.ReviewContextEntry{entry}, input.Entries...)
+			}
+			tt.setLimit(&policy, len(entry.Content))
+			if _, err := gate.BuildReviewContext(input, policy); err != nil {
+				t.Fatalf("BuildReviewContext(non-truncated source marker) error = %v", err)
+			}
+		})
+	}
+}
+
 func TestReviewContextAppliesBlockLimitAndRejectsMisleadingTinyLimit(t *testing.T) {
 	t.Parallel()
 

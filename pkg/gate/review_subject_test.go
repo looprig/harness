@@ -807,6 +807,40 @@ func TestPermissionReviewSubjectAcceptsBuilderExactInputBoundWithDistinctPolicyR
 	}
 }
 
+func TestPermissionReviewSubjectReceivesNoAmbiguousBuilderTruncationMarker(t *testing.T) {
+	t.Parallel()
+
+	const marker = "\n…[review context truncated]…\n"
+	basis, request, context := validPermissionReviewSubjectInput()
+	context.Entries[0].Content = "prefix" + marker + "suffix"
+	policy := validReviewContextPolicy()
+
+	built, err := gate.BuildReviewContext(context, policy)
+	if err != nil {
+		t.Fatalf("BuildReviewContext(non-truncated source marker) error = %v", err)
+	}
+	if _, err := gate.NewPermissionReviewSubject(basis, request, built); err != nil {
+		t.Fatalf("NewPermissionReviewSubject(builder output) error = %v", err)
+	}
+
+	context.Entries[0].Content = "prefix-" + marker + strings.Repeat("x", 128)
+	policy.MaxUserEntryBytes = 64
+	got, err := gate.BuildReviewContext(context, policy)
+	if err == nil || !reflect.DeepEqual(got, gate.ReviewContext{}) {
+		t.Fatalf(
+			"BuildReviewContext(ambiguous truncation marker) = (%#v, %v), want zero, error",
+			got,
+			err,
+		)
+	}
+	var validationErr *gate.ReviewValidationError
+	if !errors.As(err, &validationErr) ||
+		validationErr.Field != gate.ReviewValidationFieldContextEntry ||
+		validationErr.Reason != gate.ReviewValidationReserved {
+		t.Fatalf("BuildReviewContext() error = %T %v, want reserved context-entry error", err, err)
+	}
+}
+
 func TestPermissionReviewSubjectEnforcesEveryContextRootFieldHardBound(t *testing.T) {
 	t.Parallel()
 
