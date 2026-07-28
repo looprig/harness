@@ -7,7 +7,10 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -36,7 +39,6 @@ const (
 	errPrefixUnknownTool = "error: unknown tool: "
 	errInvalidArgs       = "error: invalid tool arguments (not valid JSON)"
 	errPermissionDenied  = "error: permission denied"
-	errPanicPrefix       = "error: tool panicked: "
 	errEmptyResult       = "error: empty result"
 	errWriteTargetPrefix = "error: invalid tool arguments: "
 	// errIDGenFailure is the fail-secure tool-result for a call whose ToolExecutionID could
@@ -60,6 +62,7 @@ const (
 	errToolHookFailure      = "error: internal: tool call blocked by hook"
 	errToolCanceled         = "error: tool call canceled"
 	errToolPanicRedacted    = "error: tool panicked"
+	errToolDependencyFailed = "error: internal: tool call failed"
 )
 
 // ResultPreview caps. ResultPreview may hold a slice of tool output, so it is
@@ -69,6 +72,9 @@ const (
 	previewMaxBytes  = 2 * 1024 // ~2 KiB
 	previewMaxLines  = 20
 	truncationMarker = "… [truncated]"
+	// diagnosticMaxBytes bounds tool-controlled diagnostics before they reach
+	// model-visible results, audit summaries, or structured logs.
+	diagnosticMaxBytes = 1024
 )
 
 // result is the package-private outcome of one tool call. Results are returned in
@@ -81,6 +87,12 @@ type result struct {
 	Content         []content.Block
 	IsError         bool
 }
+
+type toolExecutionHookError struct{}
+
+func (*toolExecutionHookError) Error() string { return "loop: tool execution failed" }
+
+type runtimeInvariantPanic struct{ value any }
 
 // resolved is the runner's per-call working state, threaded from resolution
 // through execution. It is built once per requested call in call order.
@@ -125,6 +137,8 @@ type resolved struct {
 	permissionEffect event.PermissionDecisionEffect
 	permissionReason string
 	hookPreview      string
+	finishOnce       sync.Once
+	finished         atomic.Bool
 }
 
 // BatchRuntime carries the runtime-owned services and attribution shared by one
@@ -170,12 +184,30 @@ func RunBatch(
 	safeEmit := func(ev event.Event) {
 		emitMu.Lock()
 		defer emitMu.Unlock()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				panic(runtimeInvariantPanic{value: recovered})
+			}
+		}()
 		runtime.Emit(ev)
 	}
 
 	rs := make([]*resolved, len(calls))
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			for _, r := range rs {
+				if r != nil {
+					r.finishInvariantFailure()
+				}
+			}
+			if invariant, ok := recovered.(runtimeInvariantPanic); ok {
+				panic(invariant.value)
+			}
+			panic(recovered)
+		}
+	}()
 	for i, c := range calls {
-		callID, idErr := runtime.IDGen()
+		callID, idErr := mintToolExecutionID(runtime.IDGen)
 		rs[i] = newResolved(ctx, c, ts, callID, idErr, runtime)
 	}
 
@@ -188,7 +220,7 @@ func RunBatch(
 		if r.failed || r.t == nil {
 			continue
 		}
-		if err := resolveAccess(r.ctx, r, ts, runtime.GateRegistrations, safeEmit); err != nil {
+		if err := resolveAccessSafely(r.ctx, r, ts, runtime.GateRegistrations, safeEmit); err != nil {
 			if r.ctx.Err() != nil {
 				for _, pending := range rs {
 					if !pending.failed {
@@ -238,6 +270,16 @@ func RunBatch(
 	return final
 }
 
+func mintToolExecutionID(idGen func() (uuid.UUID, error)) (id uuid.UUID, err error) {
+	defer func() {
+		if recover() != nil {
+			id = uuid.UUID{}
+			err = &operationHookPanicError{Operation: hook.OperationToolCall}
+		}
+	}()
+	return idGen()
+}
+
 // indexedResolved pairs an executable call with the result slot it owns, so each
 // executor (serial or parallel) writes a distinct final[i] with no shared state.
 type indexedResolved struct {
@@ -264,7 +306,7 @@ func newResolved(
 	callID uuid.UUID,
 	idErr error,
 	runtime BatchRuntime,
-) *resolved {
+) (r *resolved) {
 	call := hook.Call{
 		Operation:   hook.OperationToolCall,
 		StartedAt:   time.Now(),
@@ -275,15 +317,20 @@ func newResolved(
 			ToolExecutionID: callID,
 			ToolUseID:       c.ID,
 			ToolName:        c.Name,
-			Summary:         c.Name,
+			Summary:         boundedDiagnostic(c.Name),
 			ArgsJSON:        append([]byte(nil), c.Input...),
 		},
 	}
 	hookCtx, finish, hookErr := runtime.Hooks.Start(ctx, call)
-	r := &resolved{
+	r = &resolved{
 		ctx: hookCtx, callID: callID, block: c, argsstr: string(c.Input),
-		summary: c.Name, hookCall: call, finishToolCall: finish, hooks: runtime.Hooks,
+		summary: boundedDiagnostic(c.Name), hookCall: call, finishToolCall: finish, hooks: runtime.Hooks,
 	}
+	defer func() {
+		if recover() != nil {
+			r.failWith(errToolDependencyFailed, &operationHookPanicError{Operation: hook.OperationToolCall})
+		}
+	}()
 	if hookErr != nil {
 		if denial, denied := hook.AsDenial(hookErr); denied {
 			r.terminalErr = denial
@@ -297,16 +344,16 @@ func newResolved(
 
 	if idErr != nil {
 		slog.Error("loop: tool-call id generation failed; failing call fail-secure (not executed, no gate)",
-			"tool", c.Name, "error", idErr)
-		r.summary = c.Name // no ToolExecutionID → Summary is just the requested name
+			"tool", boundedDiagnostic(c.Name), "error", boundedDiagnostic(safeErrorText(idErr)))
+		r.summary = boundedDiagnostic(c.Name) // no ToolExecutionID → Summary is just the requested name
 		r.failWith(errIDGenFailure, idErr)
 		return r
 	}
 
 	r.t = lookupTool(r.ctx, ts.Registry, c.Name)
 	if r.t == nil {
-		r.summary = c.Name // no tool → Summary is just the requested name
-		r.fail(errPrefixUnknownTool + c.Name)
+		r.summary = boundedDiagnostic(c.Name) // no tool → Summary is just the requested name
+		r.fail(boundedDiagnostic(errPrefixUnknownTool + c.Name))
 		return r
 	}
 
@@ -336,15 +383,17 @@ func newResolved(
 	}
 	request, artifact, err := preparer.PrepareCall(r.ctx, r.callID, r.argsstr)
 	if err != nil {
+		detail := safeErrorText(err)
 		slog.Warn("loop: tool PrepareCall failed; failing call fail-secure (not executed, no gate)",
-			"tool", c.Name, "error", err)
-		r.fail(errPreparePrefix + err.Error())
+			"tool", boundedDiagnostic(c.Name), "error", boundedDiagnostic(detail))
+		r.fail(boundedDiagnostic(errPreparePrefix + detail))
 		return r
 	}
 	if err := tool.ValidateRequest(request); err != nil {
+		detail := safeErrorText(err)
 		slog.Warn("loop: tool prepared an invalid request; failing call fail-secure (not executed, no gate)",
-			"tool", c.Name, "error", err)
-		r.fail(errPreparePrefix + err.Error())
+			"tool", boundedDiagnostic(c.Name), "error", boundedDiagnostic(detail))
+		r.fail(boundedDiagnostic(errPreparePrefix + detail))
 		return r
 	}
 	if request.ExecutionID != "" && request.ExecutionID != r.callID.String() {
@@ -358,7 +407,7 @@ func newResolved(
 	if wt, ok := r.t.(tool.WriteTarget); ok {
 		key, has, err := wt.WriteTarget(r.argsstr)
 		if err != nil {
-			r.fail(errWriteTargetPrefix + err.Error())
+			r.fail(boundedDiagnostic(errWriteTargetPrefix + safeErrorText(err)))
 			return r
 		}
 		r.writeKey, r.hasWrite = key, has
@@ -368,6 +417,26 @@ func newResolved(
 		r.sequential = sq.Sequential()
 	}
 	return r
+}
+
+func resolveAccessSafely(
+	ctx context.Context,
+	r *resolved,
+	ts ToolSet,
+	gateReg chan<- gateRegistration,
+	emit func(event.Event),
+) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if invariant, ok := recovered.(runtimeInvariantPanic); ok {
+				panic(invariant.value)
+			}
+			panicErr := &operationHookPanicError{Operation: hook.OperationToolCall}
+			r.failWith(errToolDependencyFailed, panicErr)
+			err = panicErr
+		}
+	}()
+	return resolveAccess(ctx, r, ts, gateReg, emit)
 }
 
 // fail marks r as a pre-execution failure with the given model-visible message.
@@ -382,20 +451,31 @@ func (r *resolved) failWith(msg string, err error) {
 }
 
 func (r *resolved) finish(preview string, isErr bool) {
-	if r.hookPreview != "" {
-		preview = r.hookPreview
+	r.finishOnce.Do(func() {
+		if r.hookPreview != "" {
+			preview = r.hookPreview
+		}
+		call := r.hookCall
+		call.ToolCall.Summary = r.summary
+		call.ToolCall.PermissionEffect = r.permissionEffect
+		call.ToolCall.PermissionReason = r.permissionReason
+		call.ToolCall.ResultPreview = preview
+		call.ToolCall.IsError = isErr
+		outcome := hook.OutcomeCompleted
+		if r.terminalErr != nil {
+			outcome = hookOutcome(r.ctx, r.terminalErr)
+		}
+		finishHook(r.finishToolCall, call, outcome, r.terminalErr)
+		r.finished.Store(true)
+	})
+}
+
+func (r *resolved) finishInvariantFailure() {
+	if r.finished.Load() {
+		return
 	}
-	call := r.hookCall
-	call.ToolCall.Summary = r.summary
-	call.ToolCall.PermissionEffect = r.permissionEffect
-	call.ToolCall.PermissionReason = r.permissionReason
-	call.ToolCall.ResultPreview = preview
-	call.ToolCall.IsError = isErr
-	outcome := hook.OutcomeCompleted
-	if r.terminalErr != nil {
-		outcome = hookOutcome(r.ctx, r.terminalErr)
-	}
-	finishHook(r.finishToolCall, call, outcome, r.terminalErr)
+	r.failWith(errToolDependencyFailed, &operationHookPanicError{Operation: hook.OperationToolCall})
+	r.finish(errToolDependencyFailed, true)
 }
 
 // lookupTool resolves a tool by its Info(ctx).Name. Returns nil for an unknown
@@ -418,9 +498,48 @@ func lookupTool(ctx context.Context, registry []tool.InvokableTool, name string)
 // the tool name. Summary is NEVER built from raw args.
 func summaryOf(t tool.InvokableTool, name, argsJSON string) string {
 	if a, ok := t.(tool.Auditable); ok {
-		return a.AuditSummary(argsJSON)
+		return boundedDiagnostic(a.AuditSummary(argsJSON))
 	}
-	return name
+	return boundedDiagnostic(name)
+}
+
+func safeErrorText(err error) (text string) {
+	if err == nil {
+		return ""
+	}
+	defer func() {
+		if recover() != nil {
+			text = "internal error"
+		}
+	}()
+	return err.Error()
+}
+
+func boundedDiagnostic(value string) string {
+	value = strings.ToValidUTF8(value, "�")
+	var sanitized strings.Builder
+	sanitized.Grow(min(len(value), diagnosticMaxBytes))
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			r = ' '
+		}
+		sanitized.WriteRune(r)
+	}
+	value = sanitized.String()
+	if len(value) <= diagnosticMaxBytes {
+		return value
+	}
+
+	budget := diagnosticMaxBytes - len(truncationMarker)
+	cut := 0
+	for cut < len(value) {
+		_, size := utf8.DecodeRuneInString(value[cut:])
+		if cut+size > budget {
+			break
+		}
+		cut += size
+	}
+	return value[:cut] + truncationMarker
 }
 
 // resolveAccess runs one (resolvable) call's prepared request through the
@@ -458,7 +577,7 @@ func resolveAccess(
 			return ctx.Err()
 		}
 		slog.Warn("loop: access authorization failed; failing call fail-closed (not executed)",
-			"tool", r.block.Name, "error", err)
+			"tool", boundedDiagnostic(r.block.Name), "error", boundedDiagnostic(safeErrorText(err)))
 		if !r.prompted {
 			emitAccessDecided(r, event.PermissionEffectDeny, "access_error", emit)
 		}
@@ -649,11 +768,17 @@ func execute(
 
 	// Semaphore bounds peak concurrency to MaxParallelToolCalls.
 	sem := make(chan struct{}, resolveMaxParallelToolCalls(ts.MaxParallelToolCalls))
+	panics := make(chan any, len(parallel))
 	var wg sync.WaitGroup
 	for _, ir := range parallel {
 		wg.Add(1)
 		go func(ir indexedResolved) {
 			defer wg.Done()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					panics <- recovered
+				}
+			}()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
@@ -671,6 +796,11 @@ func execute(
 		}(ir)
 	}
 	wg.Wait()
+	select {
+	case recovered := <-panics:
+		panic(recovered)
+	default:
+	}
 }
 
 // runOne executes a single resolved call: builds the per-call ctx (ToolExecutionID + emit +
@@ -715,7 +845,13 @@ func runOne(
 	var executionErr error
 	defer func() {
 		if rec := recover(); rec != nil {
-			res = errResult(r, fmt.Sprintf("%s%v", errPanicPrefix, rec))
+			if invariant, ok := rec.(runtimeInvariantPanic); ok {
+				res = errResult(r, errToolDependencyFailed)
+				executionErr = &operationHookPanicError{Operation: hook.OperationToolExecution}
+				finishExecutionHook(finishExecution, executionCall, res, executionErr)
+				panic(invariant.value)
+			}
+			res = errResult(r, errToolPanicRedacted)
 			executionErr = &operationHookPanicError{Operation: hook.OperationToolExecution}
 			r.hookPreview = errToolPanicRedacted
 		}
@@ -726,7 +862,10 @@ func runOne(
 	tr, err := exec(execCtx, r.argsstr)
 	if err != nil {
 		executionErr = err
-		return errResult(r, errToolPrefix+err.Error())
+		if cancelErr := execCtx.Err(); cancelErr != nil {
+			r.terminalErr = cancelErr
+		}
+		return errResult(r, boundedDiagnostic(errToolPrefix+safeErrorText(err)))
 	}
 	if tr == nil || len(tr.Content) == 0 {
 		executionErr = fmt.Errorf("loop: tool returned an empty result")
@@ -749,7 +888,17 @@ func finishExecutionHook(finish hook.FinishFunc, call hook.Call, res result, err
 	call.ToolExecution.Result = &tool.ToolResult{Content: append([]content.Block(nil), res.Content...)}
 	call.ToolExecution.ResultPreview = preview
 	call.ToolExecution.IsError = isErr
-	finishHook(finish, call, hookOutcome(context.Background(), err), err)
+	outcome := hookOutcome(context.Background(), err)
+	finishErr := err
+	if err != nil {
+		switch outcome {
+		case hook.OutcomeCanceled:
+			finishErr = context.Canceled
+		default:
+			finishErr = &toolExecutionHookError{}
+		}
+	}
+	finishHook(finish, call, outcome, finishErr)
 }
 
 // isErrorResult reports whether a successful (non-nil, non-empty) ToolResult is an

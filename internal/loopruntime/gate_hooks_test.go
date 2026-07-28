@@ -177,3 +177,43 @@ func TestGateHooks_PermissionWaitCapturesApproval(t *testing.T) {
 		t.Fatalf("permission GateWait finish = %+v", got)
 	}
 }
+
+func TestGateHooks_DetachedWaitContextStillHonorsParentCancellation(t *testing.T) {
+	t.Parallel()
+	parent, cancel := context.WithCancel(context.Background())
+	callID := newCallID(t)
+	gateID := newCallID(t)
+	gateReg := make(chan gateRegistration)
+	emitted := make(chan event.Event, 1)
+	finished := make(chan hook.Result, 1)
+	hooks := compileRuntimeHooks(t, hook.Set{Around: []hook.Around{{
+		Operation: hook.OperationGateWait,
+		Begin: func(context.Context, hook.Call) (context.Context, hook.FinishFunc) {
+			return context.Background(), func(result hook.Result) { finished <- result }
+		},
+	}}})
+	ctx := withGateReg(withCallID(withEmit(parent, func(ev event.Event) { emitted <- ev }), callID), gateReg)
+	ctx = withOperationHookRuntime(ctx, operationHookRuntime{hooks: hooks})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := RequestUserInput(ctx, "q", nil)
+		done <- err
+	}()
+	reg := <-gateReg
+	reg.ack <- gateInstallAck{gateID: gateID}
+	<-emitted
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RequestUserInput error = %v, want canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("detached GateWait context ignored parent cancellation")
+	}
+	if got := <-finished; got.Outcome != hook.OutcomeCanceled {
+		t.Fatalf("GateWait outcome = %v, want canceled", got.Outcome)
+	}
+}
