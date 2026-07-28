@@ -809,6 +809,231 @@ func TestReviewContextBudgetsRetainFinalUserAndFinalToolRequest(t *testing.T) {
 	}
 }
 
+func TestReviewContextHardInputBounds(t *testing.T) {
+	t.Parallel()
+
+	t.Run("entry count exact", func(t *testing.T) {
+		t.Parallel()
+		input := validReviewContext()
+		optional := make([]gate.ReviewContextEntry, gate.MaxReviewContextInputEntries-2)
+		for i := range optional {
+			optional[i] = gate.ReviewContextEntry{
+				Origin:  gate.ReviewContextOriginAssistant,
+				Kind:    gate.ReviewContextKindAssistantMessage,
+				Content: "x",
+			}
+		}
+		input.Entries = append(optional, input.Entries...)
+		policy := maximumReviewContextPolicy()
+		if _, err := gate.BuildReviewContext(input, policy); err != nil {
+			t.Fatalf("BuildReviewContext(exact entries) error = %v", err)
+		}
+		input.Entries = append([]gate.ReviewContextEntry{optional[0]}, input.Entries...)
+		assertReviewBuildRejected(t, input, policy)
+	})
+
+	t.Run("entry bytes exact", func(t *testing.T) {
+		t.Parallel()
+		input := validReviewContext()
+		input.Entries = append([]gate.ReviewContextEntry{{
+			Origin: gate.ReviewContextOriginAssistant,
+			Kind:   gate.ReviewContextKindAssistantMessage,
+			Content: strings.Repeat(
+				"x",
+				gate.MaxReviewContextEntryInputBytes,
+			),
+		}}, input.Entries...)
+		policy := maximumReviewContextPolicy()
+		if _, err := gate.BuildReviewContext(input, policy); err != nil {
+			t.Fatalf("BuildReviewContext(exact entry bytes) error = %v", err)
+		}
+		input.Entries[0].Content += "x"
+		assertReviewBuildRejected(t, input, policy)
+	})
+
+	t.Run("aggregate bytes exact", func(t *testing.T) {
+		t.Parallel()
+		input := validReviewContext()
+		input.Entries[0].Content = "u"
+		input.Entries[1].Content = "a"
+		policy := maximumReviewContextPolicy()
+		const optionalEntries = 3
+		for range optionalEntries {
+			input.Entries = append([]gate.ReviewContextEntry{{
+				Origin: gate.ReviewContextOriginAssistant,
+				Kind:   gate.ReviewContextKindAssistantMessage,
+			}}, input.Entries...)
+		}
+		remaining := gate.MaxReviewContextInputBytes - rawReviewContextTextBytes(input, policy)
+		for i := 0; i < optionalEntries; i++ {
+			size := min(remaining, gate.MaxReviewContextEntryInputBytes)
+			input.Entries[i].Content = strings.Repeat("x", size)
+			remaining -= size
+		}
+		if remaining != 0 || rawReviewContextTextBytes(input, policy) != gate.MaxReviewContextInputBytes {
+			t.Fatalf("test setup remaining = %d, raw bytes = %d", remaining, rawReviewContextTextBytes(input, policy))
+		}
+		if _, err := gate.BuildReviewContext(input, policy); err != nil {
+			t.Fatalf("BuildReviewContext(exact aggregate bytes) error = %v", err)
+		}
+		input.Entries[optionalEntries-1].Content += "x"
+		assertReviewBuildRejected(t, input, policy)
+	})
+}
+
+func TestReviewContextRootFieldHardBounds(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*gate.ReviewContext, *gate.ReviewContextPolicy, int)
+	}{
+		{name: "context revision", mutate: func(c *gate.ReviewContext, _ *gate.ReviewContextPolicy, n int) {
+			c.ContextRevision = strings.Repeat("r", n)
+		}},
+		{name: "workspace root", mutate: func(c *gate.ReviewContext, _ *gate.ReviewContextPolicy, n int) {
+			c.WorkspaceRoot = "/" + strings.Repeat("r", n-1)
+			c.WorkingDirectory = c.WorkspaceRoot
+		}},
+		{name: "working directory", mutate: func(c *gate.ReviewContext, _ *gate.ReviewContextPolicy, n int) {
+			c.WorkingDirectory = c.WorkspaceRoot + "/" + strings.Repeat("r", n-len(c.WorkspaceRoot)-1)
+		}},
+		{name: "retry reason", mutate: func(c *gate.ReviewContext, _ *gate.ReviewContextPolicy, n int) {
+			c.RetryReason = strings.Repeat("r", n)
+		}},
+		{name: "security ceiling", mutate: func(c *gate.ReviewContext, _ *gate.ReviewContextPolicy, n int) {
+			c.SecurityCeiling = strings.Repeat("r", n)
+		}},
+		{name: "gate policy revision", mutate: func(c *gate.ReviewContext, _ *gate.ReviewContextPolicy, n int) {
+			c.GatePolicyRevision = strings.Repeat("r", n)
+		}},
+		{name: "review policy revision", mutate: func(_ *gate.ReviewContext, p *gate.ReviewContextPolicy, n int) {
+			p.Revision = strings.Repeat("r", n)
+		}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			input := validReviewContext()
+			policy := maximumReviewContextPolicy()
+			tt.mutate(&input, &policy, gate.MaxReviewContextRootFieldBytes)
+			if _, err := gate.BuildReviewContext(input, policy); err != nil {
+				t.Fatalf("BuildReviewContext(exact root field) error = %v", err)
+			}
+			tt.mutate(&input, &policy, gate.MaxReviewContextRootFieldBytes+1)
+			assertReviewBuildRejected(t, input, policy)
+		})
+	}
+}
+
+func TestReviewContextRejectsConsumerLimitsOverHardBounds(t *testing.T) {
+	t.Parallel()
+
+	if _, err := gate.BuildReviewContext(validReviewContext(), maximumReviewContextPolicy()); err != nil {
+		t.Fatalf("BuildReviewContext(exact maximum policy) error = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*gate.ReviewContextPolicy)
+	}{
+		{name: "canonical bytes", mutate: func(p *gate.ReviewContextPolicy) {
+			p.MaxBytes = gate.MaxPermissionReviewSubjectWireBytes + 1
+		}},
+		{name: "estimated tokens", mutate: func(p *gate.ReviewContextPolicy) {
+			p.MaxEstimatedTokens = gate.MaxReviewContextInputBytes/4 + 1
+		}},
+		{name: "entries", mutate: func(p *gate.ReviewContextPolicy) {
+			p.MaxEntries = gate.MaxReviewContextInputEntries + 1
+		}},
+		{name: "user entry", mutate: func(p *gate.ReviewContextPolicy) {
+			p.MaxUserEntryBytes = gate.MaxReviewContextEntryInputBytes + 1
+		}},
+		{name: "assistant entry", mutate: func(p *gate.ReviewContextPolicy) {
+			p.MaxAgentEntryBytes = gate.MaxReviewContextEntryInputBytes + 1
+		}},
+		{name: "tool entry", mutate: func(p *gate.ReviewContextPolicy) {
+			p.MaxToolEntryBytes = gate.MaxReviewContextEntryInputBytes + 1
+		}},
+		{name: "block", mutate: func(p *gate.ReviewContextPolicy) {
+			p.MaxBlockBytes = gate.MaxReviewContextEntryInputBytes + 1
+		}},
+		{name: "active action", mutate: func(p *gate.ReviewContextPolicy) {
+			p.MaxActiveActionBytes = gate.MaxReviewContextEntryInputBytes + 1
+		}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			policy := maximumReviewContextPolicy()
+			tt.mutate(&policy)
+			assertReviewBuildRejected(t, validReviewContext(), policy)
+		})
+	}
+}
+
+func TestReviewContextReducesIntermediateHistoryOverSubjectCeiling(t *testing.T) {
+	t.Parallel()
+
+	input := validReviewContext()
+	input.Entries = append([]gate.ReviewContextEntry{
+		{
+			Origin:  gate.ReviewContextOriginAssistant,
+			Kind:    gate.ReviewContextKindAssistantMessage,
+			Content: strings.Repeat("a", 600<<10),
+		},
+		{
+			Origin:  gate.ReviewContextOriginTool,
+			Kind:    gate.ReviewContextKindToolResult,
+			Content: strings.Repeat("t", 600<<10),
+		},
+	}, input.Entries...)
+	policy := maximumReviewContextPolicy()
+	policy.MaxBytes = 128 << 10
+
+	got, err := gate.BuildReviewContext(input, policy)
+	if err != nil {
+		t.Fatalf("BuildReviewContext() reducible >1 MiB history error = %v", err)
+	}
+	if got.Truncation.OmittedEntries != 2 {
+		t.Fatalf("OmittedEntries = %d, want 2", got.Truncation.OmittedEntries)
+	}
+	if size := canonicalContextBytes(t, got); size > policy.MaxBytes ||
+		size > gate.MaxPermissionReviewSubjectWireBytes {
+		t.Fatalf("canonical bytes = %d, want <= %d and <= subject ceiling", size, policy.MaxBytes)
+	}
+}
+
+func maximumReviewContextPolicy() gate.ReviewContextPolicy {
+	return gate.ReviewContextPolicy{
+		Revision:             "review-policy-v1",
+		MaxBytes:             gate.MaxPermissionReviewSubjectWireBytes,
+		MaxEstimatedTokens:   gate.MaxReviewContextInputBytes / 4,
+		MaxEntries:           gate.MaxReviewContextInputEntries,
+		MaxUserEntryBytes:    gate.MaxReviewContextEntryInputBytes,
+		MaxAgentEntryBytes:   gate.MaxReviewContextEntryInputBytes,
+		MaxToolEntryBytes:    gate.MaxReviewContextEntryInputBytes,
+		MaxBlockBytes:        gate.MaxReviewContextEntryInputBytes,
+		MaxActiveActionBytes: gate.MaxReviewContextEntryInputBytes,
+	}
+}
+
+func rawReviewContextTextBytes(input gate.ReviewContext, policy gate.ReviewContextPolicy) int {
+	total := len(input.ContextRevision) +
+		len(input.WorkspaceRoot) +
+		len(input.WorkingDirectory) +
+		len(input.RetryReason) +
+		len(input.SecurityCeiling) +
+		len(input.GatePolicyRevision) +
+		len(policy.Revision)
+	for _, entry := range input.Entries {
+		total += len(entry.Origin) + len(entry.Kind) + len(entry.Content)
+	}
+	return total
+}
+
 func validReviewContext() gate.ReviewContext {
 	return gate.ReviewContext{
 		Coordinates: identity.Coordinates{
