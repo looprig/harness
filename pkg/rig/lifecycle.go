@@ -23,7 +23,7 @@ func (r *Rig) NewSession(ctx context.Context, opts ...SessionOption) (session.Se
 func (r *Rig) newSession(ctx context.Context, seed workspacestore.Ref) (session.SessionController, error) {
 	runtime, err := r.lifecycle.NewSession(ctx, seed)
 	if err != nil {
-		return nil, mapLifecycleError(err)
+		return nil, mapRunError(err)
 	}
 	return runtime, nil
 }
@@ -31,15 +31,29 @@ func (r *Rig) newSession(ctx context.Context, seed workspacestore.Ref) (session.
 func (r *Rig) RestoreSession(ctx context.Context, id uuid.UUID) (session.SessionController, error) {
 	runtime, err := r.lifecycle.RestoreSession(ctx, id)
 	if err != nil {
-		return nil, mapLifecycleError(err)
+		return nil, mapRestoreError(err)
 	}
 	return runtime, nil
 }
 
-func mapLifecycleError(err error) error {
+func mapProcessNotificationsUnsupported(err error) (error, bool) {
 	var unsupported *sessionruntime.ProcessServicesUnsupportedError
 	if errors.As(err, &unsupported) {
-		return &LifecycleError{Kind: LifecycleProcessNotificationsUnsupported, Cause: err}
+		return &LifecycleError{Kind: LifecycleProcessNotificationsUnsupported, Cause: err}, true
+	}
+	return nil, false
+}
+
+func mapRestoreError(err error) error {
+	if mapped, ok := mapProcessNotificationsUnsupported(err); ok {
+		return mapped
+	}
+	return err
+}
+
+func mapRunError(err error) error {
+	if mapped, ok := mapProcessNotificationsUnsupported(err); ok {
+		return mapped
 	}
 	var run *sessionruntime.NewSessionError
 	if !errors.As(err, &run) {

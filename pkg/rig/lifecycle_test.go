@@ -246,30 +246,38 @@ func TestNewSessionFailureStagesReleaseAcquiredResourcesInReverse(t *testing.T) 
 func TestMapLifecycleErrorProcessNotificationsUnsupported(t *testing.T) {
 	unsupported := &sessionruntime.ProcessServicesUnsupportedError{Engine: loop.EngineForeignClaude}
 	tests := []struct {
-		name string
-		err  error
+		name     string
+		mapError func(error) error
+		err      error
 	}{
-		{name: "new session wrapper", err: &sessionruntime.NewSessionError{
+		{name: "new session wrapper", mapError: mapRunError, err: &sessionruntime.NewSessionError{
 			Kind:  sessionruntime.NewSessionRuntimeFailed,
 			Cause: unsupported,
 		}},
-		{name: "restore direct", err: unsupported},
+		{name: "restore direct", mapError: mapRestoreError, err: unsupported},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := mapLifecycleError(tt.err)
+			err := tt.mapError(tt.err)
 			var lifecycleErr *LifecycleError
 			if !errors.As(err, &lifecycleErr) {
-				t.Fatalf("mapLifecycleError() = %T %v, want public LifecycleError", err, err)
+				t.Fatalf("mapped error = %T %v, want public LifecycleError", err, err)
 			}
 			if lifecycleErr.Kind != LifecycleProcessNotificationsUnsupported {
 				t.Fatalf("LifecycleError.Kind = %q, want %q",
 					lifecycleErr.Kind, LifecycleProcessNotificationsUnsupported)
 			}
 			if !errors.Is(err, unsupported) {
-				t.Fatalf("mapLifecycleError() = %v, want wrapped unsupported cause", err)
+				t.Fatalf("mapped error = %v, want wrapped unsupported cause", err)
 			}
 		})
+	}
+}
+
+func TestMapRestoreErrorPreservesExistingTaxonomy(t *testing.T) {
+	restoreErr := &session.RestoreError{Kind: session.RestoreReplayFailed}
+	if got := mapRestoreError(restoreErr); got != restoreErr {
+		t.Fatalf("mapRestoreError() = %T %v, want original %T %v", got, got, restoreErr, restoreErr)
 	}
 }
 
