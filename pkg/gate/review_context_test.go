@@ -701,6 +701,122 @@ func TestReviewContextCombinedBudgetsRecordEveryExercisedLimit(t *testing.T) {
 	}
 }
 
+func TestReviewContextEntryBudgetRecordsTokenConstraintExercisedByCandidate(t *testing.T) {
+	t.Parallel()
+
+	input := budgetReviewContext(10)
+	policy := validReviewContextPolicy()
+	policy.MaxEntries = 3
+	// The unmodified five-entry context is exactly eleven estimated tokens.
+	// The required entries plus the omission marker fit twelve, while adding
+	// the newest optional entry alongside that marker exercises the token
+	// budget even though entry count was the only initial failure.
+	policy.MaxEstimatedTokens = 12
+
+	got, err := gate.BuildReviewContext(input, policy)
+	if err != nil {
+		t.Fatalf("BuildReviewContext() error = %v", err)
+	}
+	want := gate.ReviewTruncationEntryCount |
+		gate.ReviewTruncationEstimatedTokens
+	assertBudgetedReviewContext(t, got, want, 3, 30, []gate.ReviewContextKind{
+		gate.ReviewContextKindOmission,
+		gate.ReviewContextKindUserMessage,
+		gate.ReviewContextKindAssistantToolRequest,
+	})
+
+	basis, request, _ := validPermissionReviewSubjectInput()
+	subject, err := gate.NewPermissionReviewSubject(basis, request, got)
+	if err != nil {
+		t.Fatalf("NewPermissionReviewSubject() error = %v", err)
+	}
+	digest, err := gate.SubjectDigest(subject)
+	if err != nil {
+		t.Fatalf("SubjectDigest() error = %v", err)
+	}
+	if digest != subject.Basis.SubjectDigest {
+		t.Fatalf("SubjectDigest() = %x, want stored %x", digest, subject.Basis.SubjectDigest)
+	}
+}
+
+func TestReviewContextEntryBudgetRecordsByteConstraintExercisedByCandidate(t *testing.T) {
+	t.Parallel()
+
+	input := budgetReviewContext(0)
+	input.Entries = input.Entries[1:]
+	policy := validReviewContextPolicy()
+	policy.MaxEntries = 3
+
+	base := input.Clone()
+	base.Entries = []gate.ReviewContextEntry{
+		{
+			Origin:  gate.ReviewContextOriginOmission,
+			Kind:    gate.ReviewContextKindOmission,
+			Content: "omitted_entries=2 omitted_bytes=0",
+		},
+		input.Entries[2],
+		input.Entries[3],
+	}
+	base.Truncation = gate.ReviewTruncation{
+		Applied:        gate.ReviewTruncationEntryCount,
+		Material:       gate.ReviewTruncationEntryCount,
+		OmittedEntries: 2,
+	}
+	candidate := input.Clone()
+	candidate.Entries = []gate.ReviewContextEntry{
+		{
+			Origin:  gate.ReviewContextOriginOmission,
+			Kind:    gate.ReviewContextKindOmission,
+			Content: "omitted_entries=1 omitted_bytes=0",
+		},
+		input.Entries[1],
+		input.Entries[2],
+		input.Entries[3],
+	}
+	candidate.Truncation = gate.ReviewTruncation{
+		Applied:        gate.ReviewTruncationEntryCount,
+		Material:       gate.ReviewTruncationEntryCount,
+		OmittedEntries: 1,
+	}
+	fullBytes := canonicalContextBytes(t, input)
+	baseBytes := canonicalContextBytes(t, base)
+	policy.MaxBytes = max(fullBytes, baseBytes)
+	if candidateBytes := canonicalContextBytes(t, candidate); candidateBytes <= policy.MaxBytes {
+		t.Fatalf(
+			"test setup candidate bytes = %d, want > full/base limit %d",
+			candidateBytes,
+			policy.MaxBytes,
+		)
+	}
+
+	got, err := gate.BuildReviewContext(input, policy)
+	if err != nil {
+		t.Fatalf("BuildReviewContext() error = %v", err)
+	}
+	want := gate.ReviewTruncationEntryCount |
+		gate.ReviewTruncationTotalBytes
+	assertBudgetedReviewContext(t, got, want, 2, 0, []gate.ReviewContextKind{
+		gate.ReviewContextKindOmission,
+		gate.ReviewContextKindUserMessage,
+		gate.ReviewContextKindAssistantToolRequest,
+	})
+
+	basis, request, _ := validPermissionReviewSubjectInput()
+	subject, err := gate.NewPermissionReviewSubject(basis, request, got)
+	if err != nil {
+		t.Fatalf("NewPermissionReviewSubject() error = %v", err)
+	}
+	if digest, digestErr := gate.SubjectDigest(subject); digestErr != nil ||
+		digest != subject.Basis.SubjectDigest {
+		t.Fatalf(
+			"SubjectDigest() = (%x, %v), want stored %x",
+			digest,
+			digestErr,
+			subject.Basis.SubjectDigest,
+		)
+	}
+}
+
 func TestReviewContextV1OmissionIsAlwaysMaterial(t *testing.T) {
 	t.Parallel()
 

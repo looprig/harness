@@ -604,6 +604,80 @@ func TestPermissionReviewSubjectEnforcesReconstructedOriginalRawInputBytes(t *te
 	}
 }
 
+func TestPermissionReviewSubjectEnforcesOmittedByteDistribution(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		omittedEntries int
+		omittedBytes   int
+		wantErr        bool
+	}{
+		{
+			name:           "one entry exact",
+			omittedEntries: 1,
+			omittedBytes:   gate.MaxReviewContextEntryInputBytes,
+		},
+		{
+			name:           "one entry one over",
+			omittedEntries: 1,
+			omittedBytes:   gate.MaxReviewContextEntryInputBytes + 1,
+			wantErr:        true,
+		},
+		{
+			name:           "two entries distribute one over single entry",
+			omittedEntries: 2,
+			omittedBytes:   gate.MaxReviewContextEntryInputBytes + 1,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			basis, request, context := validPermissionReviewSubjectInput()
+			addPermissionReviewOmission(
+				&context,
+				tt.omittedEntries,
+				tt.omittedBytes,
+			)
+			got, err := gate.NewPermissionReviewSubject(basis, request, context)
+			if tt.wantErr {
+				if err == nil ||
+					!reflect.DeepEqual(got, gate.PermissionReviewSubject{}) {
+					t.Fatalf(
+						"NewPermissionReviewSubject() = (%#v, %v), want zero, error",
+						got,
+						err,
+					)
+				}
+				assertReviewSubjectOutOfBounds(
+					t,
+					err,
+					gate.ReviewValidationFieldContextEntry,
+				)
+				if len(err.Error()) > 128 ||
+					strings.Contains(err.Error(), strconv.Itoa(tt.omittedBytes)) {
+					t.Fatalf("error = %q, want bounded and non-echoing", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewPermissionReviewSubject() error = %v", err)
+			}
+			if digest, digestErr := gate.SubjectDigest(got); digestErr != nil ||
+				digest != got.Basis.SubjectDigest {
+				t.Fatalf(
+					"SubjectDigest() = (%x, %v), want stored %x",
+					digest,
+					digestErr,
+					got.Basis.SubjectDigest,
+				)
+			}
+		})
+	}
+}
+
 func TestPermissionReviewSubjectAcceptsBuilderExactInputBoundWithDistinctPolicyRevisions(t *testing.T) {
 	t.Parallel()
 

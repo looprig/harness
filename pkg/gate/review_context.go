@@ -533,26 +533,38 @@ func applyReviewContextBudgets(
 			ReviewValidationOutOfBounds,
 		)
 	}
+	markerJSONBytes, err := reviewContextEntryEncodedSize(
+		reviewContextOmissionEntry(marker),
+	)
+	if err != nil {
+		return ReviewContext{}, err
+	}
+	baseEntriesJSONBytes, entriesOK := checkedReviewContextAdd(
+		requiredJSONBytes,
+		markerJSONBytes,
+	)
+	baseContentBytes, contentOK := checkedReviewContextAdd(
+		requiredContentBytes,
+		len(marker),
+	)
+	if !entriesOK || !contentOK {
+		return ReviewContext{}, reviewContextError(
+			ReviewValidationFieldContextPolicy,
+			ReviewValidationOutOfBounds,
+		)
+	}
 	applied := initialFailures
-	truncation := reviewContextOmissionTruncation(
+	applied, baseFailures := plan.convergedFailures(
+		3,
+		baseEntriesJSONBytes,
+		baseContentBytes,
 		context.Truncation,
 		applied,
 		omittedEntries,
 		omittedBytes,
-	)
-	markerJSONBytes, err := reviewContextEntryEncodedSize(reviewContextOmissionEntry(marker))
-	if err != nil {
-		return ReviewContext{}, err
-	}
-	baseEntriesJSONBytes, ok := checkedReviewContextAdd(requiredJSONBytes, markerJSONBytes)
-	baseContentBytes, contentOK := checkedReviewContextAdd(requiredContentBytes, len(marker))
-	if !ok || !contentOK || plan.failures(
-		3,
-		baseEntriesJSONBytes,
-		baseContentBytes,
-		truncation,
 		policy,
-	) != 0 {
+	)
+	if baseFailures != 0 {
 		return ReviewContext{}, reviewContextError(
 			ReviewValidationFieldContextPolicy,
 			ReviewValidationOutOfBounds,
@@ -598,25 +610,24 @@ func applyReviewContextBudgets(
 				len(candidateMarker),
 			)
 		}
-		candidateTruncation := reviewContextOmissionTruncation(
-			context.Truncation,
-			applied,
-			candidateOmittedEntries,
-			candidateOmittedBytes,
-		)
 		if !addOK || !contentOK {
 			return ReviewContext{}, reviewContextError(
 				ReviewValidationFieldContextPolicy,
 				ReviewValidationOutOfBounds,
 			)
 		}
-		if plan.failures(
+		var candidateFailures ReviewTruncationMask
+		applied, candidateFailures = plan.convergedFailures(
 			retainedEntries+2,
 			candidateEntriesJSONBytes,
 			candidateContentBytes,
-			candidateTruncation,
+			context.Truncation,
+			applied,
+			candidateOmittedEntries,
+			candidateOmittedBytes,
 			policy,
-		) != 0 {
+		)
+		if candidateFailures != 0 {
 			break
 		}
 		keep[i] = true
@@ -648,6 +659,43 @@ func applyReviewContextBudgets(
 			ReviewValidationInvalid,
 		)
 	}
+	markerJSONBytes, err = reviewContextEntryEncodedSize(
+		reviewContextOmissionEntry(marker),
+	)
+	if err != nil {
+		return ReviewContext{}, err
+	}
+	finalEntriesJSONBytes, entriesOK := checkedReviewContextAdd(
+		requiredJSONBytes,
+		markerJSONBytes,
+	)
+	finalContentBytes, contentOK := checkedReviewContextAdd(
+		requiredContentBytes,
+		len(marker),
+	)
+	if !entriesOK || !contentOK {
+		return ReviewContext{}, reviewContextError(
+			ReviewValidationFieldContextPolicy,
+			ReviewValidationOutOfBounds,
+		)
+	}
+	var finalFailures ReviewTruncationMask
+	applied, finalFailures = plan.convergedFailures(
+		retainedEntries+1,
+		finalEntriesJSONBytes,
+		finalContentBytes,
+		context.Truncation,
+		applied,
+		omittedEntries,
+		omittedBytes,
+		policy,
+	)
+	if finalFailures != 0 {
+		return ReviewContext{}, reviewContextError(
+			ReviewValidationFieldContextPolicy,
+			ReviewValidationOutOfBounds,
+		)
+	}
 	output := reviewContextBudgetCandidate(
 		context,
 		keep,
@@ -663,6 +711,42 @@ func applyReviewContextBudgets(
 		)
 	}
 	return output, nil
+}
+
+func (p reviewContextBudgetPlan) convergedFailures(
+	entryCount int,
+	entriesJSONBytes int,
+	contentBytes int,
+	truncation ReviewTruncation,
+	applied ReviewTruncationMask,
+	omittedEntries int,
+	omittedBytes int,
+	policy ReviewContextPolicy,
+) (ReviewTruncationMask, ReviewTruncationMask) {
+	// failures can add only the three closed budget bits. Re-encoding the
+	// bounded truncation projection after each addition accounts exactly for
+	// decimal-width changes in its numeric masks without encoding a context.
+	for range 4 {
+		candidateTruncation := reviewContextOmissionTruncation(
+			truncation,
+			applied,
+			omittedEntries,
+			omittedBytes,
+		)
+		failures := p.failures(
+			entryCount,
+			entriesJSONBytes,
+			contentBytes,
+			candidateTruncation,
+			policy,
+		)
+		next := applied | failures&reviewBudgetTruncationMask
+		if next == applied {
+			return applied, failures
+		}
+		applied = next
+	}
+	return applied, SupportedReviewTruncationMask
 }
 
 type reviewContextBudgetPlan struct {

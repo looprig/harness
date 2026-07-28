@@ -488,6 +488,17 @@ func validateReconstructedReviewContextInputBounds(
 			ReviewValidationOutOfBounds,
 		)
 	}
+	maxDistributedOmittedBytes, ok := checkedReviewContextMultiply(
+		context.Truncation.OmittedEntries,
+		MaxReviewContextEntryInputBytes,
+	)
+	if !ok ||
+		context.Truncation.OmittedBytes > maxDistributedOmittedBytes {
+		return reviewContextError(
+			ReviewValidationFieldContextEntry,
+			ReviewValidationOutOfBounds,
+		)
+	}
 
 	originalInputBytes, ok := checkedReviewContextAdd(
 		retainedInputBytes,
@@ -519,6 +530,14 @@ func validateReconstructedReviewContextInputBounds(
 		}
 	}
 	return nil
+}
+
+func checkedReviewContextMultiply(left int, right int) (int, bool) {
+	if left < 0 || right < 0 ||
+		left != 0 && right > math.MaxInt/left {
+		return 0, false
+	}
+	return left * right, true
 }
 
 func minimumOriginalReviewContextEntryLabelBytes() (int, bool) {
