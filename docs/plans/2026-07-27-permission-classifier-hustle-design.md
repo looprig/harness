@@ -346,7 +346,11 @@ Canonical hashing never relies on `encoding/json`'s replacement of invalid
 UTF-8, so distinct typed inputs cannot collapse to one digest.
 
 Before cloning or constructing a wire projection, subject construction performs
-an allocation-free checked preflight over the caller-owned request and context.
+an allocation-free checked preflight over the caller-owned basis, request, and
+context. Classifier revision is capped by the same 128-byte registry/event
+identity bound, and gate-policy revision by the same 128-byte local-policy
+bound, so every constructible subject can correspond to registered/evaluable
+state. These basis limits are enforced before any clone or JSON projection.
 The request domain is independently bounded to 4,096 requirements, 4,096
 candidates in aggregate, 1 MiB in any one request string, and 1 MiB of aggregate
 request string text. Inputs outside those bounds fail closed before a second

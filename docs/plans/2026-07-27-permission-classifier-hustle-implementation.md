@@ -430,11 +430,15 @@ func SubjectDigest(s PermissionReviewSubject) ([32]byte, error)
 
 Before any `Clone`, map construction in `tool.ValidateRequest`, private wire
 projection, or JSON marshal, run an allocation-free checked preflight over the
-original request and context. Reject more than 4,096 requirements, more than
-4,096 candidates in aggregate, a request string over 1 MiB, or more than 1 MiB
-of aggregate request string text. Validate the original context hard bounds
-before cloning it. Add adversarial tests using oversized slice lengths and
-large valid UTF-8 strings while keeping fixtures bounded enough for race tests.
+original basis, request, and context. Require classifier revision at most
+`MaxPermissionClassifierRevisionBytes` and gate-policy revision at most
+`MaxPermissionReviewPolicyRevisionBytes`, in addition to their canonical
+non-empty UTF-8 rules. Reject more than 4,096 requirements, more than 4,096
+candidates in aggregate, a request string over 1 MiB, or more than 1 MiB of
+aggregate request string text. Validate the original context hard bounds before
+cloning it. Add exact/one-over basis tests and deterministic allocation guards,
+plus adversarial request tests using oversized slice lengths and large valid
+UTF-8 strings while keeping fixtures bounded enough for race tests.
 
 Digest the subject with `SubjectDigest` zeroed, then install and validate the
 computed value. Avoid a recursive digest. `NewPermissionReviewSubject` accepts
