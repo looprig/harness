@@ -13,6 +13,7 @@ import (
 // review state. Only applicable, allowed outcomes carry an assessment that can
 // contribute to eligibility.
 type PermissionAssessmentOutcome struct {
+	Subject    PermissionReviewSubject
 	Applicable bool
 	Status     ReviewStatus
 	Assessment PermissionAssessment
@@ -23,29 +24,55 @@ type PermissionAssessmentOutcome struct {
 // when their status is exactly not_applicable.
 func CombinePermissionAssessments(
 	policy PermissionReviewPolicy,
-	subject PermissionReviewSubject,
 	outcomes []PermissionAssessmentOutcome,
 ) ReviewDecision {
-	if !validStoredPermissionReviewSubject(subject) {
-		return reviewDecision(ReviewDecisionInvalidAssessment)
-	}
-	if !validPermissionReviewPolicy(policy) ||
-		policy.Revision != subject.Basis.GatePolicyRevision {
+	if !validPermissionReviewPolicy(policy) {
 		return reviewDecision(ReviewDecisionInvalidPolicy)
+	}
+	var commonDigest [32]byte
+	revisions := make(map[string]struct{}, len(outcomes))
+	for index, outcome := range outcomes {
+		if !validPermissionAssessmentOutcomeStatus(outcome) {
+			return reviewDecision(ReviewDecisionClassifierStatus)
+		}
+		if outcome.Status != ReviewStatusAllowed &&
+			!zeroPermissionAssessment(outcome.Assessment) {
+			return reviewDecision(ReviewDecisionInvalidAssessment)
+		}
+		if !validStoredPermissionReviewSubject(outcome.Subject) {
+			return reviewDecision(ReviewDecisionInvalidAssessment)
+		}
+		if policy.Revision != outcome.Subject.Basis.GatePolicyRevision {
+			return reviewDecision(ReviewDecisionInvalidPolicy)
+		}
+		revision := outcome.Subject.Basis.ClassifierRevision
+		if _, duplicate := revisions[revision]; duplicate {
+			return reviewDecision(ReviewDecisionInvalidAssessment)
+		}
+		revisions[revision] = struct{}{}
+		digest, err := permissionReviewCommonSubjectDigest(outcome.Subject)
+		if err != nil {
+			return reviewDecision(ReviewDecisionInvalidAssessment)
+		}
+		if index == 0 {
+			commonDigest = digest
+		} else if digest != commonDigest {
+			return reviewDecision(ReviewDecisionInvalidAssessment)
+		}
+		if !validPermissionAssessmentOutcome(outcome) {
+			return reviewDecision(ReviewDecisionInvalidAssessment)
+		}
 	}
 	applicable := false
 	for _, outcome := range outcomes {
 		if !outcome.Applicable {
-			if outcome.Status == ReviewStatusNotApplicable {
-				continue
-			}
-			return reviewDecision(ReviewDecisionClassifierStatus)
+			continue
 		}
 		applicable = true
 		if outcome.Status != ReviewStatusAllowed {
 			return reviewDecision(ReviewDecisionClassifierStatus)
 		}
-		decision := EvaluatePermissionAssessment(policy, subject, outcome.Assessment)
+		decision := EvaluatePermissionAssessment(policy, outcome.Subject, outcome.Assessment)
 		if !decision.Eligible {
 			return decision
 		}
@@ -54,6 +81,33 @@ func CombinePermissionAssessments(
 		return reviewDecision(ReviewDecisionNoApplicableClassifier)
 	}
 	return ReviewDecision{Eligible: true, Reason: ReviewDecisionEligible}
+}
+
+func validPermissionAssessmentOutcome(outcome PermissionAssessmentOutcome) bool {
+	if outcome.Status != ReviewStatusAllowed {
+		return zeroPermissionAssessment(outcome.Assessment)
+	}
+	return outcome.Assessment.Basis == outcome.Subject.Basis &&
+		validPermissionAssessment(outcome.Assessment)
+}
+
+func validPermissionAssessmentOutcomeStatus(
+	outcome PermissionAssessmentOutcome,
+) bool {
+	if !outcome.Applicable {
+		return outcome.Status == ReviewStatusNotApplicable
+	}
+	status, valid := ParseReviewStatus(string(outcome.Status))
+	return valid && status != ReviewStatusNotApplicable
+}
+
+func zeroPermissionAssessment(assessment PermissionAssessment) bool {
+	return assessment.Basis == (ReviewBasis{}) &&
+		assessment.Risk == "" &&
+		assessment.Authorization == "" &&
+		len(assessment.Categories) == 0 &&
+		assessment.Recommendation == "" &&
+		assessment.Rationale == ""
 }
 
 // PermissionClassifier is the deliberately narrow contract implemented by

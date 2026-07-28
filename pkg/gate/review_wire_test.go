@@ -106,6 +106,98 @@ func TestReviewSubjectWireRejectsUntrustedInput(t *testing.T) {
 	}
 }
 
+func TestReviewSubjectWireRejectsInvalidUTF8BeforeJSONReplacement(t *testing.T) {
+	t.Parallel()
+	for _, invalidByte := range []byte{0xfe, 0xff} {
+		data := append([]byte(`{"version":"`), invalidByte)
+		data = append(data, []byte(`"}`)...)
+		got, err := unmarshalPermissionReviewSubject(data)
+		if err == nil || !reflect.DeepEqual(got, PermissionReviewSubject{}) {
+			t.Fatalf("byte %x unmarshal = (%#v, %v), want zero, error", invalidByte, got, err)
+		}
+		if len(err.Error()) > 128 || strings.Contains(err.Error(), string([]byte{invalidByte})) {
+			t.Fatalf("byte %x error = %q, want bounded and non-echoing", invalidByte, err)
+		}
+	}
+}
+
+func TestPermissionReviewCommonSubjectDigestNeutralizesOnlyClassifierIdentity(t *testing.T) {
+	t.Parallel()
+	first := validPermissionReviewSubject(t)
+	basis := first.Basis
+	basis.SubjectDigest = [32]byte{}
+	basis.ClassifierRevision = "command-safety-v2"
+	second, err := NewPermissionReviewSubject(basis, first.Request, first.Context)
+	if err != nil {
+		t.Fatalf("NewPermissionReviewSubject(second) error = %v", err)
+	}
+	if first.Basis.SubjectDigest == second.Basis.SubjectDigest {
+		t.Fatal("classifier-specific full subject digests are equal")
+	}
+	firstCommon, err := permissionReviewCommonSubjectDigest(first)
+	if err != nil {
+		t.Fatalf("permissionReviewCommonSubjectDigest(first) error = %v", err)
+	}
+	secondCommon, err := permissionReviewCommonSubjectDigest(second)
+	if err != nil {
+		t.Fatalf("permissionReviewCommonSubjectDigest(second) error = %v", err)
+	}
+	if firstCommon != secondCommon {
+		t.Fatalf("common digests differ: %x != %x", firstCommon, secondCommon)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*PermissionReviewSubject)
+	}{
+		{name: "gate id", mutate: func(s *PermissionReviewSubject) { s.Basis.GateID[15]++ }},
+		{name: "tool execution id", mutate: func(s *PermissionReviewSubject) {
+			s.Basis.ToolExecutionID[15]++
+			s.Request.ExecutionID = s.Basis.ToolExecutionID.String()
+		}},
+		{name: "request", mutate: func(s *PermissionReviewSubject) { s.Request.Summary = "different request" }},
+		{name: "context coordinates", mutate: func(s *PermissionReviewSubject) {
+			s.Context.Coordinates.StepID[15]++
+		}},
+		{name: "context revision", mutate: func(s *PermissionReviewSubject) {
+			s.Basis.ContextRevision = "context-v2"
+			s.Context.ContextRevision = "context-v2"
+		}},
+		{name: "gate policy", mutate: func(s *PermissionReviewSubject) {
+			s.Basis.GatePolicyRevision = "gate-policy-v2"
+			s.Context.GatePolicyRevision = "gate-policy-v2"
+		}},
+		{name: "security ceiling", mutate: func(s *PermissionReviewSubject) {
+			s.Basis.SecurityCeiling = "restricted-v2"
+			s.Context.SecurityCeiling = "restricted-v2"
+		}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			changed := second.Clone()
+			changed.Basis.SubjectDigest = [32]byte{}
+			tt.mutate(&changed)
+			changed, err := NewPermissionReviewSubject(
+				changed.Basis,
+				changed.Request,
+				changed.Context,
+			)
+			if err != nil {
+				t.Fatalf("NewPermissionReviewSubject(changed) error = %v", err)
+			}
+			changedCommon, err := permissionReviewCommonSubjectDigest(changed)
+			if err != nil {
+				t.Fatalf("permissionReviewCommonSubjectDigest(changed) error = %v", err)
+			}
+			if firstCommon == changedCommon {
+				t.Fatalf("%s mutation did not change common subject digest", tt.name)
+			}
+		})
+	}
+}
+
 func TestReviewSubjectWireRejectsStoredDigestMismatchOnMarshal(t *testing.T) {
 	t.Parallel()
 

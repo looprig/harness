@@ -104,6 +104,9 @@ func validatePermissionReviewSubject(subject PermissionReviewSubject) error {
 	if err := tool.ValidateRequest(subject.Request); err != nil {
 		return reviewSubjectError(ReviewValidationFieldRequest, ReviewValidationInvalid)
 	}
+	if !validPermissionReviewRequestUTF8(subject.Request) {
+		return reviewSubjectError(ReviewValidationFieldRequest, ReviewValidationInvalid)
+	}
 	if subject.Request.ExecutionID != "" {
 		executionID, err := uuid.Parse(subject.Request.ExecutionID)
 		if err != nil ||
@@ -121,6 +124,48 @@ func validatePermissionReviewSubject(subject PermissionReviewSubject) error {
 		return reviewSubjectError(ReviewValidationFieldBasis, ReviewValidationMismatch)
 	}
 	return nil
+}
+
+func validPermissionReviewRequestUTF8(request tool.Request) bool {
+	for _, value := range []string{
+		request.ToolName,
+		request.Summary,
+		request.ExecutionID,
+		request.Command,
+		request.WorkingDirectory,
+	} {
+		if !utf8.ValidString(value) {
+			return false
+		}
+	}
+	for _, requirement := range request.Requirements {
+		for _, value := range []string{
+			requirement.Kind,
+			requirement.Scope,
+			requirement.Match,
+			requirement.Description,
+			requirement.GrantClass,
+			requirement.GrantTarget,
+		} {
+			if !utf8.ValidString(value) {
+				return false
+			}
+		}
+		for _, candidate := range requirement.Candidates {
+			for _, value := range []string{
+				candidate.Kind,
+				candidate.Match,
+				candidate.Description,
+				candidate.GrantClass,
+				candidate.GrantTarget,
+			} {
+				if !utf8.ValidString(value) {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 func validateBuiltReviewContext(context ReviewContext) error {

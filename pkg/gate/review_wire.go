@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
@@ -16,6 +17,7 @@ import (
 const (
 	permissionReviewSubjectWireVersion = "permission_review_subject.v1"
 	permissionReviewSubjectWireKind    = "harness.permission"
+	permissionReviewCommonClassifier   = "classifier-neutral.v1"
 	zeroPermissionReviewDigestHex      = "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
@@ -125,7 +127,8 @@ func marshalPermissionReviewSubject(subject PermissionReviewSubject) ([]byte, er
 func unmarshalPermissionReviewSubject(data []byte) (PermissionReviewSubject, error) {
 	if len(data) == 0 ||
 		len(data) > MaxPermissionReviewSubjectWireBytes ||
-		isExplicitJSONNull(data) {
+		isExplicitJSONNull(data) ||
+		!utf8.Valid(data) {
 		return PermissionReviewSubject{}, reviewSubjectError(
 			ReviewValidationFieldWire,
 			ReviewValidationOutOfBounds,
@@ -172,6 +175,33 @@ func unmarshalPermissionReviewSubject(data []byte) (PermissionReviewSubject, err
 		)
 	}
 	return subject, nil
+}
+
+func permissionReviewCommonSubjectDigest(
+	subject PermissionReviewSubject,
+) ([sha256.Size]byte, error) {
+	if err := validatePermissionReviewSubject(subject); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	digest, err := permissionReviewSubjectDigest(subject)
+	if err != nil ||
+		subject.Basis.SubjectDigest == ([sha256.Size]byte{}) ||
+		subject.Basis.SubjectDigest != digest {
+		return [sha256.Size]byte{}, reviewSubjectError(
+			ReviewValidationFieldDigest,
+			ReviewValidationMismatch,
+		)
+	}
+	wire := permissionReviewSubjectToWire(subject, zeroPermissionReviewDigestHex)
+	wire.Basis.ClassifierRevision = permissionReviewCommonClassifier
+	data, err := json.Marshal(wire)
+	if err != nil || len(data) > MaxPermissionReviewSubjectWireBytes {
+		return [sha256.Size]byte{}, reviewSubjectError(
+			ReviewValidationFieldDigest,
+			ReviewValidationOutOfBounds,
+		)
+	}
+	return sha256.Sum256(data), nil
 }
 
 func permissionReviewSubjectDigest(subject PermissionReviewSubject) ([32]byte, error) {

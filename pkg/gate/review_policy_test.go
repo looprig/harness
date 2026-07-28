@@ -305,7 +305,7 @@ func TestPermissionReviewAssessmentValidationAndPolicy(t *testing.T) {
 		{name: "absolute category", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, p *gate.PermissionReviewPolicy) {
 			a.Categories = []gate.ReviewRiskCategory{gate.ReviewCategoryCredentialAccess}
 			p.AbsoluteHuman = []gate.ReviewRiskCategory{gate.ReviewCategoryCredentialAccess}
-		}, reason: gate.ReviewDecisionAbsoluteHuman},
+		}, reason: gate.ReviewDecisionInvalidPolicy},
 		{name: "critical", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
 			a.Risk = gate.ReviewRiskCritical
 			a.Rationale = "critical risk"
@@ -314,7 +314,7 @@ func TestPermissionReviewAssessmentValidationAndPolicy(t *testing.T) {
 			p.MaximumAutoRisk = gate.ReviewRiskLow
 			a.Risk = gate.ReviewRiskMedium
 			a.Rationale = "medium risk"
-		}, reason: gate.ReviewDecisionRiskCeiling},
+		}, reason: gate.ReviewDecisionInvalidPolicy},
 		{name: "authorization", mutate: func(_ *gate.PermissionReviewSubject, a *gate.PermissionAssessment, _ *gate.PermissionReviewPolicy) {
 			a.Risk = gate.ReviewRiskHigh
 			a.Authorization = gate.ReviewAuthorizationLow
@@ -345,7 +345,7 @@ func TestPermissionReviewAssessmentValidationAndPolicy(t *testing.T) {
 			s.Basis.SubjectDigest = digest
 			a.Basis = s.Basis
 			p.MaterialTruncation = gate.ReviewTruncationAssistantEntry
-		}, reason: gate.ReviewDecisionMaterialTruncation},
+		}, reason: gate.ReviewDecisionInvalidPolicy},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -467,6 +467,69 @@ func TestPermissionReviewPolicyRevalidatesMutation(t *testing.T) {
 	}
 }
 
+func TestPermissionReviewPolicySealRejectsEveryPostConstructionMutation(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		mutate func(*gate.PermissionReviewPolicy)
+	}{
+		{name: "revision", mutate: func(p *gate.PermissionReviewPolicy) { p.Revision = "gate-policy-v2" }},
+		{name: "maximum weaker", mutate: func(p *gate.PermissionReviewPolicy) { p.MaximumAutoRisk = gate.ReviewRiskCritical }},
+		{name: "maximum stronger", mutate: func(p *gate.PermissionReviewPolicy) { p.MaximumAutoRisk = gate.ReviewRiskLow }},
+		{name: "minimum weaker", mutate: func(p *gate.PermissionReviewPolicy) {
+			p.MinimumAuthorization[gate.ReviewRiskHigh] = gate.ReviewAuthorizationUnknown
+		}},
+		{name: "minimum stronger", mutate: func(p *gate.PermissionReviewPolicy) {
+			p.MinimumAuthorization[gate.ReviewRiskLow] = gate.ReviewAuthorizationHigh
+		}},
+		{name: "absolute append", mutate: func(p *gate.PermissionReviewPolicy) {
+			p.AbsoluteHuman = append(p.AbsoluteHuman, gate.ReviewCategoryCredentialAccess)
+		}},
+		{name: "absolute reorder", mutate: func(p *gate.PermissionReviewPolicy) {
+			p.AbsoluteHuman[0], p.AbsoluteHuman[1] = p.AbsoluteHuman[1], p.AbsoluteHuman[0]
+		}},
+		{name: "absolute clear", mutate: func(p *gate.PermissionReviewPolicy) { p.AbsoluteHuman = nil }},
+		{name: "material add", mutate: func(p *gate.PermissionReviewPolicy) {
+			p.MaterialTruncation |= gate.ReviewTruncationAssistantEntry
+		}},
+		{name: "material clear", mutate: func(p *gate.PermissionReviewPolicy) { p.MaterialTruncation = 0 }},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			policy, err := gate.NewPermissionReviewPolicy(
+				"gate-policy-v1",
+				gate.ReviewRiskHigh,
+				defaultMinimumForTest(),
+				[]gate.ReviewRiskCategory{
+					gate.ReviewCategoryCredentialAccess,
+					gate.ReviewCategoryDataExfiltration,
+				},
+				gate.ReviewTruncationUserEntry,
+			)
+			if err != nil {
+				t.Fatalf("NewPermissionReviewPolicy() error = %v", err)
+			}
+			tt.mutate(&policy)
+			subject := validPermissionReviewSubject(t)
+			got := gate.EvaluatePermissionAssessment(
+				policy,
+				subject,
+				validPermissionAssessment(
+					subject,
+					gate.ReviewRiskLow,
+					gate.ReviewAuthorizationUnknown,
+					gate.ReviewAllow,
+				),
+			)
+			if got.Eligible || got.Reason != gate.ReviewDecisionInvalidPolicy {
+				t.Fatalf("decision = %#v, want invalid policy", got)
+			}
+		})
+	}
+}
+
 func TestPermissionReviewPolicyRequiresExactSubjectRevision(t *testing.T) {
 	t.Parallel()
 	policy := mustDefaultPermissionReviewPolicy(t, "other-policy")
@@ -486,9 +549,11 @@ func TestPermissionReviewPolicyRequiresExactSubjectRevision(t *testing.T) {
 func TestCombinePermissionAssessments(t *testing.T) {
 	t.Parallel()
 	policy := mustDefaultPermissionReviewPolicy(t, "gate-policy-v1")
-	subject := validPermissionReviewSubject(t)
-	allow := validPermissionAssessment(subject, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow)
-	human := allow
+	first := validPermissionReviewSubject(t)
+	second := permissionReviewSubjectWithClassifierRevision(t, first, "command-safety-v2")
+	allowFirst := validPermissionAssessment(first, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow)
+	allowSecond := validPermissionAssessment(second, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow)
+	human := allowFirst
 	human.Recommendation = gate.ReviewNeedsHuman
 	tests := []struct {
 		name     string
@@ -497,20 +562,23 @@ func TestCombinePermissionAssessments(t *testing.T) {
 		eligible bool
 	}{
 		{name: "empty", reason: gate.ReviewDecisionNoApplicableClassifier},
-		{name: "neutral", outcomes: []gate.PermissionAssessmentOutcome{{Status: gate.ReviewStatusNotApplicable}}, reason: gate.ReviewDecisionNoApplicableClassifier},
-		{name: "one allow", outcomes: []gate.PermissionAssessmentOutcome{{Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allow}}, reason: gate.ReviewDecisionEligible, eligible: true},
-		{name: "multiple allow", outcomes: []gate.PermissionAssessmentOutcome{{Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allow}, {Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allow}}, reason: gate.ReviewDecisionEligible, eligible: true},
-		{name: "human", outcomes: []gate.PermissionAssessmentOutcome{{Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: human}}, reason: gate.ReviewDecisionRecommendation},
+		{name: "neutral", outcomes: []gate.PermissionAssessmentOutcome{{Subject: first, Status: gate.ReviewStatusNotApplicable}}, reason: gate.ReviewDecisionNoApplicableClassifier},
+		{name: "one allow", outcomes: []gate.PermissionAssessmentOutcome{{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst}}, reason: gate.ReviewDecisionEligible, eligible: true},
+		{name: "multiple classifier allow", outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst},
+			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
+		}, reason: gate.ReviewDecisionEligible, eligible: true},
+		{name: "human", outcomes: []gate.PermissionAssessmentOutcome{{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: human}}, reason: gate.ReviewDecisionRecommendation},
 		{name: "false allowed", outcomes: []gate.PermissionAssessmentOutcome{{Status: gate.ReviewStatusAllowed}}, reason: gate.ReviewDecisionClassifierStatus},
-		{name: "true not applicable", outcomes: []gate.PermissionAssessmentOutcome{{Applicable: true, Status: gate.ReviewStatusNotApplicable}}, reason: gate.ReviewDecisionClassifierStatus},
-		{name: "neutral then failure", outcomes: []gate.PermissionAssessmentOutcome{{Status: gate.ReviewStatusNotApplicable}, {Applicable: true, Status: gate.ReviewStatusFailed}}, reason: gate.ReviewDecisionClassifierStatus},
-		{name: "first failure wins", outcomes: []gate.PermissionAssessmentOutcome{{Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: human}, {Applicable: true, Status: gate.ReviewStatusFailed}}, reason: gate.ReviewDecisionRecommendation},
+		{name: "true not applicable", outcomes: []gate.PermissionAssessmentOutcome{{Subject: first, Applicable: true, Status: gate.ReviewStatusNotApplicable}}, reason: gate.ReviewDecisionClassifierStatus},
+		{name: "neutral then failure", outcomes: []gate.PermissionAssessmentOutcome{{Subject: first, Status: gate.ReviewStatusNotApplicable}, {Subject: second, Applicable: true, Status: gate.ReviewStatusFailed}}, reason: gate.ReviewDecisionClassifierStatus},
+		{name: "first failure wins", outcomes: []gate.PermissionAssessmentOutcome{{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: human}, {Subject: second, Applicable: true, Status: gate.ReviewStatusFailed}}, reason: gate.ReviewDecisionRecommendation},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := gate.CombinePermissionAssessments(policy, subject, tt.outcomes)
+			got := gate.CombinePermissionAssessments(policy, tt.outcomes)
 			if got.Eligible != tt.eligible || got.Reason != tt.reason {
 				t.Fatalf("decision = %#v, want eligible=%v reason=%q", got, tt.eligible, tt.reason)
 			}
@@ -524,11 +592,96 @@ func TestCombinePermissionAssessments(t *testing.T) {
 		gate.ReviewStatusCancelled,
 		gate.ReviewStatusStale,
 	} {
-		got := gate.CombinePermissionAssessments(policy, subject, []gate.PermissionAssessmentOutcome{{Applicable: true, Status: status}})
+		got := gate.CombinePermissionAssessments(policy, []gate.PermissionAssessmentOutcome{{Subject: first, Applicable: true, Status: status}})
 		if got.Eligible || got.Reason != gate.ReviewDecisionClassifierStatus {
 			t.Fatalf("status %q decision = %#v", status, got)
 		}
 	}
+}
+
+func TestCombinePermissionAssessmentsRejectsSubjectOrOutcomeConfusion(t *testing.T) {
+	t.Parallel()
+	policy := mustDefaultPermissionReviewPolicy(t, "gate-policy-v1")
+	first := validPermissionReviewSubject(t)
+	second := permissionReviewSubjectWithClassifierRevision(t, first, "command-safety-v2")
+	allowFirst := validPermissionAssessment(first, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow)
+	allowSecond := validPermissionAssessment(second, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow)
+	nonZero := allowFirst
+	tests := []struct {
+		name     string
+		outcomes []gate.PermissionAssessmentOutcome
+	}{
+		{name: "duplicate classifier revision", outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst},
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst},
+		}},
+		{name: "assessment bound to another classifier", outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
+		}},
+		{name: "non applicable carries assessment", outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Status: gate.ReviewStatusNotApplicable, Assessment: nonZero},
+		}},
+		{name: "failed carries assessment", outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusFailed, Assessment: nonZero},
+		}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := gate.CombinePermissionAssessments(policy, tt.outcomes)
+			if got.Eligible || got.Reason != gate.ReviewDecisionInvalidAssessment {
+				t.Fatalf("decision = %#v, want invalid assessment", got)
+			}
+		})
+	}
+}
+
+func TestCombinePermissionAssessmentsRejectsDifferentCommonSubject(t *testing.T) {
+	t.Parallel()
+	policy := mustDefaultPermissionReviewPolicy(t, "gate-policy-v1")
+	first := validPermissionReviewSubject(t)
+	second := permissionReviewSubjectWithClassifierRevision(t, first, "command-safety-v2")
+	basis := second.Basis
+	basis.SubjectDigest = [32]byte{}
+	request := second.Request.Clone()
+	request.Summary = "different but valid request"
+	different, err := gate.NewPermissionReviewSubject(basis, request, second.Context)
+	if err != nil {
+		t.Fatalf("NewPermissionReviewSubject(different) error = %v", err)
+	}
+	got := gate.CombinePermissionAssessments(policy, []gate.PermissionAssessmentOutcome{
+		{
+			Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed,
+			Assessment: validPermissionAssessment(first, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow),
+		},
+		{
+			Subject: different, Applicable: true, Status: gate.ReviewStatusAllowed,
+			Assessment: validPermissionAssessment(different, gate.ReviewRiskLow, gate.ReviewAuthorizationUnknown, gate.ReviewAllow),
+		},
+	})
+	if got.Eligible || got.Reason != gate.ReviewDecisionInvalidAssessment {
+		t.Fatalf("decision = %#v, want invalid assessment", got)
+	}
+}
+
+func permissionReviewSubjectWithClassifierRevision(
+	t *testing.T,
+	base gate.PermissionReviewSubject,
+	revision string,
+) gate.PermissionReviewSubject {
+	t.Helper()
+	basis := base.Basis
+	basis.SubjectDigest = [32]byte{}
+	basis.ClassifierRevision = revision
+	subject, err := gate.NewPermissionReviewSubject(basis, base.Request, base.Context)
+	if err != nil {
+		t.Fatalf("NewPermissionReviewSubject(%q) error = %v", revision, err)
+	}
+	if subject.Basis.SubjectDigest == base.Basis.SubjectDigest {
+		t.Fatal("classifier-specific subjects have equal full digests")
+	}
+	return subject
 }
 
 func mustDefaultPermissionReviewPolicy(t *testing.T, revision string) gate.PermissionReviewPolicy {
@@ -538,6 +691,14 @@ func mustDefaultPermissionReviewPolicy(t *testing.T, revision string) gate.Permi
 		t.Fatalf("DefaultPermissionReviewPolicy() error = %v", err)
 	}
 	return policy
+}
+
+func defaultMinimumForTest() map[gate.ReviewRisk]gate.ReviewAuthorization {
+	return map[gate.ReviewRisk]gate.ReviewAuthorization{
+		gate.ReviewRiskLow:    gate.ReviewAuthorizationUnknown,
+		gate.ReviewRiskMedium: gate.ReviewAuthorizationUnknown,
+		gate.ReviewRiskHigh:   gate.ReviewAuthorizationMedium,
+	}
 }
 
 func validPermissionReviewSubject(t *testing.T) gate.PermissionReviewSubject {

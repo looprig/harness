@@ -90,6 +90,79 @@ func TestPermissionReviewSubjectRejectsInvalidBasisAndRequest(t *testing.T) {
 	}
 }
 
+func TestPermissionReviewSubjectRejectsInvalidUTF8InEverySerializedRequestString(t *testing.T) {
+	t.Parallel()
+	invalid := string([]byte{0xff})
+	tests := []struct {
+		name   string
+		mutate func(*tool.Request)
+	}{
+		{name: "tool name", mutate: func(r *tool.Request) { r.ToolName = invalid }},
+		{name: "summary", mutate: func(r *tool.Request) { r.Summary = invalid }},
+		{name: "execution id", mutate: func(r *tool.Request) { r.ExecutionID = invalid }},
+		{name: "command", mutate: func(r *tool.Request) { r.Command = invalid }},
+		{name: "working directory", mutate: func(r *tool.Request) { r.WorkingDirectory = invalid }},
+		{name: "requirement kind", mutate: func(r *tool.Request) { r.Requirements[0].Kind = invalid }},
+		{name: "requirement scope", mutate: func(r *tool.Request) { r.Requirements[0].Scope = invalid }},
+		{name: "requirement match", mutate: func(r *tool.Request) { r.Requirements[0].Match = invalid }},
+		{name: "requirement description", mutate: func(r *tool.Request) { r.Requirements[0].Description = invalid }},
+		{name: "requirement grant class", mutate: func(r *tool.Request) { r.Requirements[0].GrantClass = invalid }},
+		{name: "requirement grant target", mutate: func(r *tool.Request) { r.Requirements[0].GrantTarget = invalid }},
+		{name: "candidate kind", mutate: func(r *tool.Request) { r.Requirements[0].Candidates[0].Kind = invalid }},
+		{name: "candidate match", mutate: func(r *tool.Request) { r.Requirements[0].Candidates[0].Match = invalid }},
+		{name: "candidate description", mutate: func(r *tool.Request) { r.Requirements[0].Candidates[0].Description = invalid }},
+		{name: "candidate grant class", mutate: func(r *tool.Request) { r.Requirements[0].Candidates[0].GrantClass = invalid }},
+		{name: "candidate grant target", mutate: func(r *tool.Request) { r.Requirements[0].Candidates[0].GrantTarget = invalid }},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			basis, request, context := validPermissionReviewSubjectInput()
+			tt.mutate(&request)
+			got, err := gate.NewPermissionReviewSubject(basis, request, context)
+			if err == nil || !reflect.DeepEqual(got, gate.PermissionReviewSubject{}) {
+				t.Fatalf("NewPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+			}
+			if strings.Contains(err.Error(), invalid) || len(err.Error()) > 128 {
+				t.Fatalf("error = %q, want bounded and non-echoing", err)
+			}
+		})
+	}
+}
+
+func TestPermissionReviewSubjectRejectsInvalidUTF8GrantFreeOptionalFieldsWithoutDigestCollision(t *testing.T) {
+	t.Parallel()
+	basis, request, context := validPermissionReviewSubjectInput()
+	request.Requirements = nil
+	request.ExecutionID = ""
+	request.ExpiresAtUnixMilli = 0
+	for _, field := range []string{"command", "working_directory"} {
+		field := field
+		t.Run(field, func(t *testing.T) {
+			t.Parallel()
+			for _, invalidByte := range []byte{0xfe, 0xff} {
+				candidate := request.Clone()
+				if field == "command" {
+					candidate.Command = string([]byte{invalidByte})
+				} else {
+					candidate.WorkingDirectory = string([]byte{invalidByte})
+				}
+				subject, err := gate.NewPermissionReviewSubject(basis, candidate, context)
+				if err == nil || !reflect.DeepEqual(subject, gate.PermissionReviewSubject{}) {
+					t.Fatalf("byte %x subject = (%#v, %v), want zero, error", invalidByte, subject, err)
+				}
+				digest, digestErr := gate.SubjectDigest(gate.PermissionReviewSubject{
+					Basis: basis, Request: candidate, Context: context,
+				})
+				if digestErr == nil || digest != ([32]byte{}) {
+					t.Fatalf("byte %x digest = (%x, %v), want zero, error", invalidByte, digest, digestErr)
+				}
+			}
+		})
+	}
+}
+
 func TestPermissionReviewSubjectRejectsInvalidBuiltContext(t *testing.T) {
 	t.Parallel()
 

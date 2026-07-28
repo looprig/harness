@@ -1,6 +1,8 @@
 package gate
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"strings"
 	"unicode/utf8"
 )
@@ -33,6 +35,17 @@ type PermissionReviewPolicy struct {
 	MinimumAuthorization map[ReviewRisk]ReviewAuthorization
 	AbsoluteHuman        []ReviewRiskCategory
 	MaterialTruncation   ReviewTruncationMask
+	seal                 [sha256.Size]byte
+}
+
+type permissionReviewPolicyProjection struct {
+	Revision           string               `json:"revision"`
+	MaximumAutoRisk    ReviewRisk           `json:"maximum_auto_risk"`
+	MinimumLow         ReviewAuthorization  `json:"minimum_low"`
+	MinimumMedium      ReviewAuthorization  `json:"minimum_medium"`
+	MinimumHigh        ReviewAuthorization  `json:"minimum_high"`
+	AbsoluteHuman      []ReviewRiskCategory `json:"absolute_human"`
+	MaterialTruncation ReviewTruncationMask `json:"material_truncation"`
 }
 
 // ReviewDecisionReason is the closed, non-sensitive explanation for a local
@@ -102,12 +115,20 @@ func NewPermissionReviewPolicy(
 		AbsoluteHuman:        append([]ReviewRiskCategory(nil), absoluteHuman...),
 		MaterialTruncation:   material,
 	}
-	if !validPermissionReviewPolicy(policy) {
+	if !validPermissionReviewPolicyShape(policy) {
 		return PermissionReviewPolicy{}, reviewSubjectError(
 			ReviewValidationFieldBasis,
 			ReviewValidationInvalid,
 		)
 	}
+	seal, ok := permissionReviewPolicySeal(policy)
+	if !ok {
+		return PermissionReviewPolicy{}, reviewSubjectError(
+			ReviewValidationFieldBasis,
+			ReviewValidationInvalid,
+		)
+	}
+	policy.seal = seal
 	return policy, nil
 }
 
@@ -169,6 +190,15 @@ func EvaluatePermissionAssessment(
 }
 
 func validPermissionReviewPolicy(policy PermissionReviewPolicy) bool {
+	if !validPermissionReviewPolicyShape(policy) ||
+		policy.seal == ([sha256.Size]byte{}) {
+		return false
+	}
+	seal, ok := permissionReviewPolicySeal(policy)
+	return ok && seal == policy.seal
+}
+
+func validPermissionReviewPolicyShape(policy PermissionReviewPolicy) bool {
 	if strings.TrimSpace(policy.Revision) == "" ||
 		!utf8.ValidString(policy.Revision) ||
 		len(policy.Revision) > MaxPermissionReviewPolicyRevisionBytes {
@@ -204,6 +234,25 @@ func validPermissionReviewPolicy(policy PermissionReviewPolicy) bool {
 		return false
 	}
 	return true
+}
+
+func permissionReviewPolicySeal(
+	policy PermissionReviewPolicy,
+) ([sha256.Size]byte, bool) {
+	projection := permissionReviewPolicyProjection{
+		Revision:           policy.Revision,
+		MaximumAutoRisk:    policy.MaximumAutoRisk,
+		MinimumLow:         policy.MinimumAuthorization[ReviewRiskLow],
+		MinimumMedium:      policy.MinimumAuthorization[ReviewRiskMedium],
+		MinimumHigh:        policy.MinimumAuthorization[ReviewRiskHigh],
+		AbsoluteHuman:      append([]ReviewRiskCategory(nil), policy.AbsoluteHuman...),
+		MaterialTruncation: policy.MaterialTruncation,
+	}
+	data, err := json.Marshal(projection)
+	if err != nil {
+		return [sha256.Size]byte{}, false
+	}
+	return sha256.Sum256(data), true
 }
 
 func validPermissionAssessment(assessment PermissionAssessment) bool {
