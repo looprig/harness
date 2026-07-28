@@ -483,7 +483,7 @@ func TestPermissionReviewSubjectEnforcesReconstructedOriginalRawInputBytes(t *te
 		len(base.RetryReason) +
 		len(base.SecurityCeiling) +
 		len(base.GatePolicyRevision) +
-		len(base.GatePolicyRevision)
+		1 // minimum valid unretained ReviewContextPolicy.Revision
 	for _, entry := range base.Entries {
 		retainedRawBytes += len(entry.Origin) + len(entry.Kind) + len(entry.Content)
 	}
@@ -522,6 +522,67 @@ func TestPermissionReviewSubjectEnforcesReconstructedOriginalRawInputBytes(t *te
 				t.Fatalf("NewPermissionReviewSubject() exact bound error = %v", err)
 			}
 		})
+	}
+}
+
+func TestPermissionReviewSubjectAcceptsBuilderExactInputBoundWithDistinctPolicyRevisions(t *testing.T) {
+	t.Parallel()
+
+	basis, request, input := validPermissionReviewSubjectInput()
+	input.GatePolicyRevision = strings.Repeat("g", gate.MaxReviewContextRootFieldBytes)
+	basis.GatePolicyRevision = input.GatePolicyRevision
+	policy := gate.ReviewContextPolicy{
+		Revision:             "r",
+		MaxBytes:             gate.MaxPermissionReviewSubjectWireBytes,
+		MaxEstimatedTokens:   gate.MaxReviewContextInputBytes / 4,
+		MaxEntries:           3,
+		MaxUserEntryBytes:    gate.MaxReviewContextEntryInputBytes,
+		MaxAgentEntryBytes:   gate.MaxReviewContextEntryInputBytes,
+		MaxToolEntryBytes:    gate.MaxReviewContextEntryInputBytes,
+		MaxBlockBytes:        gate.MaxReviewContextEntryInputBytes,
+		MaxActiveActionBytes: gate.MaxReviewContextEntryInputBytes,
+	}
+	const omittedEntries = 2
+	input.Entries = append([]gate.ReviewContextEntry{
+		{Origin: gate.ReviewContextOriginTool, Kind: gate.ReviewContextKindToolResult},
+		{Origin: gate.ReviewContextOriginTool, Kind: gate.ReviewContextKindToolResult},
+	}, input.Entries...)
+	remaining := gate.MaxReviewContextInputBytes -
+		rawPermissionReviewContextTextBytes(input, policy)
+	for i := 0; i < omittedEntries; i++ {
+		size := min(remaining, gate.MaxReviewContextEntryInputBytes)
+		input.Entries[i].Content = strings.Repeat("x", size)
+		remaining -= size
+	}
+	if remaining != 0 ||
+		rawPermissionReviewContextTextBytes(input, policy) != gate.MaxReviewContextInputBytes {
+		t.Fatalf(
+			"test setup remaining = %d, raw bytes = %d",
+			remaining,
+			rawPermissionReviewContextTextBytes(input, policy),
+		)
+	}
+
+	built, err := gate.BuildReviewContext(input, policy)
+	if err != nil {
+		t.Fatalf("BuildReviewContext(exact aggregate bound) error = %v", err)
+	}
+	if built.Truncation.OmittedEntries != omittedEntries {
+		t.Fatalf(
+			"BuildReviewContext().Truncation.OmittedEntries = %d, want %d",
+			built.Truncation.OmittedEntries,
+			omittedEntries,
+		)
+	}
+	if _, err := gate.NewPermissionReviewSubject(basis, request, built); err != nil {
+		t.Fatalf("NewPermissionReviewSubject(builder output) error = %v", err)
+	}
+
+	input.Entries[omittedEntries-1].Content += "x"
+	if _, err := gate.BuildReviewContext(input, policy); err == nil {
+		t.Fatal("BuildReviewContext(one over aggregate bound) error = nil")
+	} else {
+		assertReviewSubjectOutOfBounds(t, err, gate.ReviewValidationFieldContextEntry)
 	}
 }
 
@@ -903,6 +964,23 @@ func minimumOriginalReviewContextEntryLabelBytesForTest() int {
 		}
 	}
 	return minimum
+}
+
+func rawPermissionReviewContextTextBytes(
+	input gate.ReviewContext,
+	policy gate.ReviewContextPolicy,
+) int {
+	total := len(input.ContextRevision) +
+		len(input.WorkspaceRoot) +
+		len(input.WorkingDirectory) +
+		len(input.RetryReason) +
+		len(input.SecurityCeiling) +
+		len(input.GatePolicyRevision) +
+		len(policy.Revision)
+	for _, entry := range input.Entries {
+		total += len(entry.Origin) + len(entry.Kind) + len(entry.Content)
+	}
+	return total
 }
 
 func assertReviewSubjectOutOfBounds(

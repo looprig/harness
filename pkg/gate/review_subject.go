@@ -182,10 +182,6 @@ func validateBuiltReviewContext(context ReviewContext) error {
 		context.RetryReason,
 		context.SecurityCeiling,
 		context.GatePolicyRevision,
-		// BuildReviewContext preflights policy.Revision separately. The built
-		// context binds that revision as GatePolicyRevision, so account for
-		// the original policy input here as well.
-		context.GatePolicyRevision,
 	}
 	totalInputBytes := 0
 	for _, value := range rootText {
@@ -200,6 +196,19 @@ func validateBuiltReviewContext(context ReviewContext) error {
 		if !ok || totalInputBytes > MaxReviewContextInputBytes {
 			return reviewContextError(ReviewValidationFieldContext, ReviewValidationOutOfBounds)
 		}
+	}
+	// BuildReviewContext requires a non-empty UTF-8 policy revision but does
+	// not retain it in ReviewContext. Account for the smallest input that
+	// could have produced this context without guessing it from another
+	// independently versioned field.
+	const minimumReviewContextPolicyRevisionBytes = 1
+	var ok bool
+	totalInputBytes, ok = checkedReviewContextAdd(
+		totalInputBytes,
+		minimumReviewContextPolicyRevisionBytes,
+	)
+	if !ok || totalInputBytes > MaxReviewContextInputBytes {
+		return reviewContextError(ReviewValidationFieldContext, ReviewValidationOutOfBounds)
 	}
 	if context.ContextRevision == "" ||
 		context.WorkspaceRoot == "" ||
