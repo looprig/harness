@@ -579,9 +579,6 @@ func validateBindings(requirements Requirements, bindings Bindings) error {
 		if nilSessionResourceRegistry(bindings.Process.Registry) {
 			return &InvalidBindingsError{Field: "process.registry"}
 		}
-		if nilAsyncProcessRunner(bindings.Process.Runner) {
-			return &InvalidBindingsError{Field: "process.runner"}
-		}
 	}
 	return nil
 }
@@ -599,10 +596,6 @@ func nilDelegateController(value DelegateController) bool {
 }
 
 func nilSessionResourceRegistry(value SessionResourceRegistry) bool {
-	return value == nil || nilReflectValue(reflect.ValueOf(value))
-}
-
-func nilAsyncProcessRunner(value AsyncProcessRunner) bool {
 	return value == nil || nilReflectValue(reflect.ValueOf(value))
 }
 

@@ -24,5 +24,4 @@ type SessionResourceServices struct{}
 // tool definitions.
 type ProcessBinding struct {
 	Registry SessionResourceRegistry
-	Runner   AsyncProcessRunner
 }
