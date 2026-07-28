@@ -313,6 +313,10 @@ Tests must prove:
 
 - every basis field is required;
 - subject construction validates `tool.Request`;
+- the basis context revision, gate-policy revision, and security ceiling exactly
+  match the built context;
+- a non-empty request execution ID is canonical and equals the basis tool
+  execution ID;
 - `Clone` does not share requirement, candidate, context-entry, or byte slices;
 - the digest is stable across map allocation/order and insignificant JSON
   whitespace;
@@ -331,6 +335,34 @@ Use an unexported v1 wire struct with no maps in the digest path unless keys are
 explicitly sorted. Reuse the gate package's strict JSON and duplicate-field
 rejection helpers.
 
+The exact wire version is `permission_review_subject.v1`; the encoded gate kind
+is always `harness.permission`. Encode UUIDs as canonical lowercase strings and
+the digest as fixed-length lowercase hex. Reject non-canonical UUID/digest text
+even when a permissive parser could normalize it. Bound encoded input with:
+
+```go
+const MaxPermissionReviewSubjectWireBytes = 1 << 20
+```
+
+Keep the wire codec unexported because subjects cross the trusted classifier
+interface as typed values, not as a public persistence format:
+
+```go
+func marshalPermissionReviewSubject(
+    subject PermissionReviewSubject,
+) ([]byte, error)
+
+func unmarshalPermissionReviewSubject(
+    data []byte,
+) (PermissionReviewSubject, error)
+```
+
+The unmarshal path revalidates every closed context enum and pair, UUID,
+request, truncation mask/counter, required entry, basis/context equality, and
+stored digest. It wraps strict-JSON scanner/decoder failures in the bounded
+non-echoing review validation error rather than returning attacker-controlled
+JSON keys or contents.
+
 Implement conceptually:
 
 ```go
@@ -345,7 +377,12 @@ func SubjectDigest(s PermissionReviewSubject) ([32]byte, error)
 ```
 
 Digest the subject with `SubjectDigest` zeroed, then install and validate the
-computed value. Avoid a recursive digest.
+computed value. Avoid a recursive digest. `NewPermissionReviewSubject` accepts
+only a zero incoming digest, validates every other field, clones all mutable
+input, computes the digest, and returns the stamped subject.
+`SubjectDigest` recomputes from an otherwise valid subject while ignoring its
+stored digest; the strict decoder separately requires the stored value to equal
+that recomputation.
 
 **Step 4: Add fuzz seeds and invariants**
 
