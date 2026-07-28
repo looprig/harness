@@ -106,7 +106,10 @@ type ModelResolver interface {
 
 // Bindings supplies runtime collaborators needed by a definition.
 type Bindings struct {
-	Models ModelResolver
+	Models    ModelResolver
+	SessionID uuid.UUID
+	LoopID    uuid.UUID
+	Workspace *tool.WorkspaceBinding
 }
 
 // DefinitionDescriptor is the complete secret-free behavioral projection used
@@ -818,7 +821,11 @@ func (d Definition) Bind(ctx context.Context, bindings Bindings) (BoundDefinitio
 	if d.state.descriptor.ModelSource == ModelSourceCurrentLoop && nilResolver(bindings.Models) {
 		return nil, &BindError{Kind: BindMissingModelResolver}
 	}
-	return &boundDefinitionState{definition: d, models: bindings.Models}, nil
+	evidence, err := bindEvidenceTools(ctx, d.state.evidence, bindings)
+	if err != nil {
+		return nil, err
+	}
+	return &boundDefinitionState{definition: d, models: bindings.Models, evidence: evidence}, nil
 }
 
 // BoundDefinition is the sealed runtime view of one immutable definition.
@@ -832,12 +839,14 @@ type BoundDefinition interface {
 	SystemPrompt() string
 	OutputSchema() (*inference.OutputSchema, bool)
 	EvidenceToolPolicy() (EvidenceToolPolicy, bool)
+	EvidenceTools() []BoundEvidenceTool
 	boundDefinition()
 }
 
 type boundDefinitionState struct {
 	definition Definition
 	models     ModelResolver
+	evidence   []BoundEvidenceTool
 }
 
 func (b *boundDefinitionState) Name() Name                       { return b.definition.Name() }
@@ -848,6 +857,9 @@ func (b *boundDefinitionState) Descriptor() DefinitionDescriptor { return b.defi
 func (b *boundDefinitionState) SystemPrompt() string             { return b.definition.state.systemPrompt }
 func (b *boundDefinitionState) EvidenceToolPolicy() (EvidenceToolPolicy, bool) {
 	return b.definition.EvidenceToolPolicy()
+}
+func (b *boundDefinitionState) EvidenceTools() []BoundEvidenceTool {
+	return append([]BoundEvidenceTool(nil), b.evidence...)
 }
 func (*boundDefinitionState) boundDefinition() {}
 

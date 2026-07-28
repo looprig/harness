@@ -2,6 +2,7 @@ package sessionruntime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -12,6 +13,8 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/hustle"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 )
 
 func testHustleLimits() HustleLimits {
@@ -202,6 +205,144 @@ func TestBindSessionHustlesIsSingleTransactionalConstruction(t *testing.T) {
 				t.Fatalf("second bind error = %T %v, want already-bound", err, err)
 			}
 		})
+	}
+}
+
+type sessionEvidenceTool struct {
+	infos []*tool.ToolInfo
+	calls int
+}
+
+func (t *sessionEvidenceTool) Info(context.Context) (*tool.ToolInfo, error) {
+	index := t.calls
+	if index >= len(t.infos) {
+		index = len(t.infos) - 1
+	}
+	t.calls++
+	info := *t.infos[index]
+	info.Schema = append(json.RawMessage(nil), info.Schema...)
+	return &info, nil
+}
+
+func (*sessionEvidenceTool) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
+	return tool.TextResult("ok"), nil
+}
+
+type sessionEvidenceCoordinator struct{}
+
+func (sessionEvidenceCoordinator) Acquire(context.Context, tool.WorkspaceOperation, string) (tool.WorkspacePermit, error) {
+	return sessionEvidencePermit{}, nil
+}
+func (sessionEvidenceCoordinator) Healthy() error { return nil }
+
+type sessionEvidencePermit struct{}
+
+func (sessionEvidencePermit) Release() {}
+
+func sessionEvidenceDefinition(
+	t *testing.T,
+	factory tool.Factory,
+) hustle.Definition {
+	t.Helper()
+	definition, err := hustle.Define(
+		hustle.WithName("permission-review"),
+		hustle.WithParticipation(hustle.ParticipationBlocking),
+		hustle.WithTimeout(time.Second),
+		hustle.WithLimits(hustle.Limits{InputBytes: 4096, OutputBytes: 4096}),
+		hustle.WithNamedInference(&stubLLM{}, validModel("reviewer")),
+		hustle.WithSystemPrompt("review", "prompt-v1"),
+		hustle.WithPolicyRevision("review-v1"),
+		hustle.WithOutputSchema(inference.OutputSchema{
+			Name: "assessment",
+			Schema: json.RawMessage(`{
+				"type":"object",
+				"properties":{"recommendation":{"type":"string"}},
+				"required":["recommendation"],
+				"additionalProperties":false
+			}`),
+			Strict: true,
+		}),
+		hustle.WithEvidenceTools(hustle.EvidenceToolPolicy{
+			Revision: "evidence-v1",
+			Limits: hustle.ToolLoopLimits{
+				MaxRounds: 1, MaxCalls: 1, MaxCallsPerRound: 1,
+				MaxResultBytes: 1024, MaxEvidenceBytes: 1024,
+			},
+			Definitions: []tool.Definition{
+				tool.NewDefinition("workspace-status", tool.RequiresWorkspace, factory),
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("hustle.Define() error = %v", err)
+	}
+	return definition
+}
+
+func TestSessionBindsEvidenceToolsWithOriginAndAttenuatedWorkspace(t *testing.T) {
+	t.Parallel()
+	sessionID, _ := uuid.New()
+	loopID, _ := uuid.New()
+	workspaceRoot := "/managed/workspace"
+	concrete := &sessionEvidenceTool{infos: []*tool.ToolInfo{{
+		Name: "workspace-status", Desc: "read workspace status",
+		Schema: json.RawMessage(`{"type":"object"}`),
+	}}}
+	builds := 0
+	definition := sessionEvidenceDefinition(t, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+		builds++
+		if bindings.SessionID != sessionID || bindings.LoopID != loopID {
+			t.Fatalf("tool bindings IDs = %v/%v, want %v/%v", bindings.SessionID, bindings.LoopID, sessionID, loopID)
+		}
+		if bindings.Workspace == nil || bindings.Workspace.Root != workspaceRoot {
+			t.Fatalf("workspace binding = %#v", bindings.Workspace)
+		}
+		if bindings.Delegate != nil || bindings.ExtraTools != nil {
+			t.Fatalf("evidence binding was not attenuated: %#v", bindings)
+		}
+		return []tool.InvokableTool{concrete}, nil
+	})
+	s := &Session{
+		sessionID: sessionID, activeLoopID: loopID,
+		sessionCtx: context.Background(), hustleDefinitions: []hustle.Definition{definition},
+		wsRoot: workspaceRoot, wsCoordinator: sessionEvidenceCoordinator{},
+	}
+	bound, err := s.bindHustleDefinitions()
+	if err != nil {
+		t.Fatalf("bindHustleDefinitions() error = %v", err)
+	}
+	if builds != 1 || len(bound) != 1 || len(bound[0].EvidenceTools()) != 1 {
+		t.Fatalf("bound evidence = builds:%d definitions:%d tools:%d", builds, len(bound), len(bound[0].EvidenceTools()))
+	}
+}
+
+func TestSessionConstructionRejectsEvidenceSchemaDriftBeforeRun(t *testing.T) {
+	t.Parallel()
+	sessionID, _ := uuid.New()
+	loopID, _ := uuid.New()
+	concrete := &sessionEvidenceTool{infos: []*tool.ToolInfo{
+		{Name: "workspace-status", Desc: "read workspace", Schema: json.RawMessage(`{"type":"object"}`)},
+		{Name: "workspace-status", Desc: "read workspace", Schema: json.RawMessage(`{"type":"object"}`)},
+		{Name: "workspace-status", Desc: "read workspace", Schema: json.RawMessage(`{"type":"object","properties":{"changed":{"type":"boolean"}}}`)},
+	}}
+	definition := sessionEvidenceDefinition(t, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{concrete}, nil
+	})
+	factory := event.NewFactory(uuid.New, time.Now)
+	s := &Session{
+		sessionID: sessionID, activeLoopID: loopID,
+		sessionCtx: context.Background(), hustleDefinitions: []hustle.Definition{definition},
+		hustleLimits: testHustleLimits(), factory: factory,
+		hub:    hub.New(sessionID, hub.WithFactory(factory)),
+		wsRoot: "/workspace", wsCoordinator: sessionEvidenceCoordinator{},
+	}
+	err := s.bindSessionHustles()
+	var construction *HustleConstructionError
+	if !errors.As(err, &construction) || construction.Reason != HustleConstructionBindFailed {
+		t.Fatalf("bindSessionHustles() error = %T %v, want bind failure", err, err)
+	}
+	if s.hustleController != nil {
+		t.Fatal("schema drift retained a runnable controller")
 	}
 }
 

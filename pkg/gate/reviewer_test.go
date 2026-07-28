@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
 	stream "github.com/looprig/inference/stream"
@@ -390,6 +391,7 @@ func TestPermissionClassifierSetRejectsInvalidRegistration(t *testing.T) {
 		{name: "background", classifiers: []gate.PermissionClassifier{classifierWithDefinition(t, "background", "revision-1", hustle.ParticipationBackground, false, true)}},
 		{name: "current loop", classifiers: []gate.PermissionClassifier{classifierWithDefinition(t, "current", "revision-1", hustle.ParticipationBlocking, true, true)}},
 		{name: "missing structured output", classifiers: []gate.PermissionClassifier{classifierWithDefinition(t, "plain", "revision-1", hustle.ParticipationBlocking, false, false)}},
+		{name: "missing evidence policy", classifiers: []gate.PermissionClassifier{classifierWithDefinitionWithoutEvidence(t, "no-evidence", "revision-1")}},
 		{name: "name drift", classifiers: []gate.PermissionClassifier{&permissionClassifierStub{name: "outer", revision: "revision-1", definition: validPermissionDefinition(t, "inner", "revision-1", hustle.ParticipationBlocking, false, true)}}},
 		{name: "revision drift", classifiers: []gate.PermissionClassifier{&permissionClassifierStub{name: "drift", revision: "outer-revision", definition: validPermissionDefinition(t, "drift", "inner-revision", hustle.ParticipationBlocking, false, true)}}},
 	}
@@ -494,12 +496,71 @@ func validPermissionDefinition(
 			}`),
 			Strict: true,
 		}))
+		if participation == hustle.ParticipationBlocking {
+			options = append(options, hustle.WithEvidenceTools(permissionEvidencePolicy()))
+		}
 	}
 	definition, err := hustle.Define(options...)
 	if err != nil {
 		t.Fatalf("hustle.Define() error = %v", err)
 	}
 	return definition
+}
+
+type permissionEvidenceTool struct{}
+
+func (*permissionEvidenceTool) Info(context.Context) (*tool.ToolInfo, error) {
+	return &tool.ToolInfo{
+		Name: "permission-evidence", Desc: "read permission evidence",
+		Schema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+	}, nil
+}
+
+func (*permissionEvidenceTool) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
+	return tool.TextResult("ok"), nil
+}
+
+func permissionEvidencePolicy() hustle.EvidenceToolPolicy {
+	return hustle.EvidenceToolPolicy{
+		Revision: "permission-evidence-v1",
+		Limits: hustle.ToolLoopLimits{
+			MaxRounds: 1, MaxCalls: 1, MaxCallsPerRound: 1,
+			MaxResultBytes: 1024, MaxEvidenceBytes: 1024,
+		},
+		Definitions: []tool.Definition{tool.NewDefinition(
+			"permission-evidence", 0,
+			func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+				return []tool.InvokableTool{&permissionEvidenceTool{}}, nil
+			},
+		)},
+	}
+}
+
+func classifierWithDefinitionWithoutEvidence(
+	t *testing.T,
+	name hustle.Name,
+	revision string,
+) *permissionClassifierStub {
+	t.Helper()
+	options := []hustle.Option{
+		hustle.WithName(name),
+		hustle.WithParticipation(hustle.ParticipationBlocking),
+		hustle.WithTimeout(time.Second),
+		hustle.WithLimits(hustle.Limits{InputBytes: 4096, OutputBytes: 4096}),
+		hustle.WithSystemPrompt("review safely", "prompt-v1"),
+		hustle.WithPolicyRevision(revision),
+		hustle.WithNamedInference(&permissionClassifierClient{}, permissionClassifierModel()),
+		hustle.WithOutputSchema(inference.OutputSchema{
+			Name:   "permission_assessment",
+			Schema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+			Strict: true,
+		}),
+	}
+	definition, err := hustle.Define(options...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &permissionClassifierStub{name: name, revision: revision, definition: definition}
 }
 
 func permissionClassifierModel() model.Model {

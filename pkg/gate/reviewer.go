@@ -249,6 +249,10 @@ func NewPermissionClassifierSet(
 			descriptor.OutputSchemaName == "" ||
 			descriptor.OutputSchemaSHA256 == ([32]byte{}) ||
 			descriptor.StructuredOutputRevision == "" ||
+			descriptor.EvidenceToolPolicyRevision == "" ||
+			descriptor.EvidenceToolDefinitionsSHA256 == ([32]byte{}) ||
+			descriptor.EvidenceProducedToolNamesSHA256 == ([32]byte{}) ||
+			!descriptor.StructuredOutputWithTools ||
 			descriptor.Name != name ||
 			descriptor.PolicyRevision != revision {
 			return PermissionClassifierSet{}, classifierSetError(index, PermissionClassifierInvalid)

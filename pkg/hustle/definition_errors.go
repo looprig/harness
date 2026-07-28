@@ -48,6 +48,7 @@ const (
 	BindInvalidDefinition    BindErrorKind = "invalid_definition"
 	BindInvalidContext       BindErrorKind = "invalid_context"
 	BindMissingModelResolver BindErrorKind = "missing_model_resolver"
+	BindInvalidEvidenceTools BindErrorKind = "invalid_evidence_tools"
 )
 
 // BindError reports why an immutable definition could not be bound.
