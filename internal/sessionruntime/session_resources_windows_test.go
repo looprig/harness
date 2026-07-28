@@ -31,8 +31,8 @@ func TestWindowsResourceStorageNewAndRestoreUseOwnerOnlySecurityDescriptors(t *t
 	if created.storageRoot != root {
 		t.Fatalf("new storage root = %q, want %q", created.storageRoot, root)
 	}
-	assertWindowsOwnerOnlyPath(t, root)
-	assertWindowsOwnerOnlyPath(t, filepath.Join(root, sessionResourceAnchorName))
+	assertWindowsOwnerOnlyPath(t, root, true)
+	assertWindowsOwnerOnlyPath(t, filepath.Join(root, sessionResourceAnchorName), false)
 
 	restored, err := resolveSessionResources(context.Background(), id, resolve, "", true)
 	if err != nil {
@@ -41,8 +41,59 @@ func TestWindowsResourceStorageNewAndRestoreUseOwnerOnlySecurityDescriptors(t *t
 	if restored.storageRoot != root {
 		t.Fatalf("restore storage root = %q, want %q", restored.storageRoot, root)
 	}
-	assertWindowsOwnerOnlyPath(t, root)
-	assertWindowsOwnerOnlyPath(t, filepath.Join(root, sessionResourceAnchorName))
+	assertWindowsOwnerOnlyPath(t, root, true)
+	assertWindowsOwnerOnlyPath(t, filepath.Join(root, sessionResourceAnchorName), false)
+}
+
+func TestWindowsResourceStorageRejectsNonInheritableRootDACL(t *testing.T) {
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New() error = %v", err)
+	}
+	root := filepath.Join(t.TempDir(), "resources")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatalf("Mkdir(root) error = %v", err)
+	}
+	descriptor, err := privateWindowsSecurityDescriptor(false)
+	if err != nil {
+		t.Fatalf("privateWindowsSecurityDescriptor(file) error = %v", err)
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		t.Fatalf("DACL() error = %v", err)
+	}
+	tokenUser, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatalf("GetTokenUser() error = %v", err)
+	}
+	if err := windows.SetNamedSecurityInfo(
+		root,
+		windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|
+			windows.DACL_SECURITY_INFORMATION|
+			windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		tokenUser.User.Sid,
+		nil,
+		dacl,
+		nil,
+	); err != nil {
+		t.Fatalf("SetNamedSecurityInfo(root) error = %v", err)
+	}
+
+	resources, err := resolveSessionResources(
+		context.Background(),
+		id,
+		func(context.Context, uuid.UUID) (string, string, error) {
+			return root, "owner", nil
+		},
+		"",
+		false,
+	)
+	var storageErr *SessionResourceStorageError
+	if resources != nil || !errors.As(err, &storageErr) ||
+		storageErr.Kind != SessionResourceStorageInvalid {
+		t.Fatalf("resolveSessionResources() = (%v, %T %v), want invalid storage", resources, err, err)
+	}
 }
 
 func TestWindowsResourceStorageRejectsCaseAlias(t *testing.T) {
@@ -71,7 +122,7 @@ func TestWindowsResourceStorageRejectsCaseAlias(t *testing.T) {
 	}
 }
 
-func assertWindowsOwnerOnlyPath(t *testing.T, path string) {
+func assertWindowsOwnerOnlyPath(t *testing.T, path string, directory bool) {
 	t.Helper()
 
 	tokenUser, err := windows.GetCurrentProcessToken().GetTokenUser()
@@ -120,5 +171,12 @@ func assertWindowsOwnerOnlyPath(t *testing.T, path string) {
 	}
 	if ace.Mask&windows.GENERIC_ALL == 0 {
 		t.Fatalf("DACL(%q) mask = %#x, want GENERIC_ALL", path, ace.Mask)
+	}
+	wantFlags := uint8(0)
+	if directory {
+		wantFlags = windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE
+	}
+	if ace.Header.AceFlags != wantFlags {
+		t.Fatalf("DACL(%q) ACE flags = %#x, want %#x", path, ace.Header.AceFlags, wantFlags)
 	}
 }

@@ -109,7 +109,8 @@ func sessionResourcePathIsPrivate(path string, info os.FileInfo, directory bool)
 		return false, err
 	}
 	if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE ||
-		ace.Mask&windows.GENERIC_ALL == 0 {
+		ace.Mask&windows.GENERIC_ALL == 0 ||
+		!sessionResourceWindowsACEFlagsArePrivate(ace.Header.AceFlags, directory) {
 		return false, nil
 	}
 	trustee := (*windows.SID)(unsafe.Pointer(&ace.SidStart))

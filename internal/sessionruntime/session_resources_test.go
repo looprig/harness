@@ -501,6 +501,37 @@ func TestResourceStorageRejectsWorkspaceCaseAliasOnCaseInsensitiveFilesystem(t *
 	}
 }
 
+func TestSessionResourceWindowsACEFlagsArePrivate(t *testing.T) {
+	const (
+		objectInherit    uint8 = 0x01
+		containerInherit uint8 = 0x02
+		inherited        uint8 = 0x10
+	)
+	tests := []struct {
+		name      string
+		flags     uint8
+		directory bool
+		want      bool
+	}{
+		{name: "directory object and container inheritance", flags: objectInherit | containerInherit, directory: true, want: true},
+		{name: "directory no inheritance", directory: true},
+		{name: "directory object inheritance only", flags: objectInherit, directory: true},
+		{name: "directory container inheritance only", flags: containerInherit, directory: true},
+		{name: "directory inherited ACE", flags: objectInherit | containerInherit | inherited, directory: true},
+		{name: "file no inheritance", want: true},
+		{name: "file object inheritance", flags: objectInherit},
+		{name: "file container inheritance", flags: containerInherit},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sessionResourceWindowsACEFlagsArePrivate(tt.flags, tt.directory); got != tt.want {
+				t.Fatalf("sessionResourceWindowsACEFlagsArePrivate(%#x, %t) = %t, want %t",
+					tt.flags, tt.directory, got, tt.want)
+			}
+		})
+	}
+}
+
 func processResourceDefinition(
 	t *testing.T,
 	engine loop.Engine,
