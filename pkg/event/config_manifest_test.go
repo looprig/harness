@@ -93,6 +93,23 @@ func TestManifestFingerprintGolden(t *testing.T) {
 	}
 }
 
+func TestManifestV1FingerprintCompatibility(t *testing.T) {
+	t.Parallel()
+	manifest := testManifest()
+	manifest.SchemaVersion = 1
+	manifest.HookPolicyRev = ""
+
+	const historical = "6dfa05a68de160225451630245e9d7a3ce5e709f39dd376dfc6708bfd4a6da3e"
+	if got := manifest.Fingerprint(); got != historical {
+		t.Fatalf("schema-v1 fingerprint = %s, want historical %s", got, historical)
+	}
+
+	manifest.HookPolicyRev = "must-not-enter-v1"
+	if got := manifest.Fingerprint(); got != historical {
+		t.Errorf("schema-v1 hook field changed fingerprint to %s, want %s", got, historical)
+	}
+}
+
 // TestManifestFingerprintDuplicateToolOrderIndependent proves the full-tuple tool
 // sort makes duplicate-name entries order-independent: two manifests differing only
 // in the input order of same-named tools must fingerprint identically.

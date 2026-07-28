@@ -3,6 +3,7 @@ package event
 import (
 	"encoding/json"
 	"errors"
+	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -519,6 +520,30 @@ func TestConfigurationAdoptedRoundTrip(t *testing.T) {
 	}
 	if original.Scope() != ScopeSession {
 		t.Errorf("Scope() = %v, want ScopeSession", original.Scope())
+	}
+}
+
+func TestConfigurationAdoptedV1ReplayFixture(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile("testdata/configuration_adopted_v1.json")
+	if err != nil {
+		t.Fatalf("read v1 fixture: %v", err)
+	}
+	decoded, err := UnmarshalEvent(raw)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent(v1 fixture): %v", err)
+	}
+	adopted, ok := decoded.(ConfigurationAdopted)
+	if !ok {
+		t.Fatalf("decoded type = %T, want ConfigurationAdopted", decoded)
+	}
+	const historical = "6dfa05a68de160225451630245e9d7a3ce5e709f39dd376dfc6708bfd4a6da3e"
+	if adopted.Manifest.SchemaVersion != 1 {
+		t.Errorf("manifest schema = %d, want 1", adopted.Manifest.SchemaVersion)
+	}
+	if adopted.AdoptedFingerprint != historical || adopted.Manifest.Fingerprint() != historical {
+		t.Errorf("persisted/computed fingerprint = %s/%s, want %s",
+			adopted.AdoptedFingerprint, adopted.Manifest.Fingerprint(), historical)
 	}
 }
 

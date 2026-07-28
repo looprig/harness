@@ -19,6 +19,10 @@ const ManifestSchemaVersion uint32 = 2
 // schema bump.
 const manifestEncodingDomain = "looprig/config-manifest/v2"
 
+// manifestEncodingDomainV1 preserves verification of fingerprints already
+// persisted before HookPolicyRev extended the canonical schema.
+const manifestEncodingDomainV1 = "looprig/config-manifest/v1"
+
 // ConfigEpoch orders the configurations explicitly adopted within one Session.
 // SessionStarted is epoch 1; each ConfigurationAdopted increments it.
 type ConfigEpoch uint64
@@ -84,7 +88,11 @@ func (m ConfigManifest) Fingerprint() string {
 }
 
 func (m ConfigManifest) canonical() []byte {
-	material := appendManifestString(nil, manifestEncodingDomain)
+	domain := manifestEncodingDomain
+	if m.SchemaVersion == 1 {
+		domain = manifestEncodingDomainV1
+	}
+	material := appendManifestString(nil, domain)
 	material = binary.BigEndian.AppendUint64(material, uint64(m.SchemaVersion))
 	material = appendManifestString(material, m.AgentKind)
 	material = appendManifestString(material, m.TopologyRev)
@@ -120,7 +128,9 @@ func (m ConfigManifest) canonical() []byte {
 	material = appendManifestString(material, m.ConfinementRev)
 	material = binary.BigEndian.AppendUint64(material, uint64(m.ConfinementStrictness))
 	material = appendManifestString(material, m.ExternalCapabilityRev)
-	material = appendManifestString(material, m.HookPolicyRev)
+	if m.SchemaVersion != 1 {
+		material = appendManifestString(material, m.HookPolicyRev)
+	}
 	keys := make([]string, 0, len(m.AppFields))
 	for key := range m.AppFields {
 		keys = append(keys, key)

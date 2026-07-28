@@ -1,6 +1,7 @@
 package event
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 )
@@ -101,15 +102,44 @@ func TestAssessDriftLegacyHookPolicyUpgradeFailsSecure(t *testing.T) {
 func TestConfigDriftBudgetCoversDisjointValidManifests(t *testing.T) {
 	t.Parallel()
 	baseline := ConfigManifest{
-		SchemaVersion: ManifestSchemaVersion,
-		Tools:         make([]ToolManifestEntry, maxConfigManifestTools),
-		AppFields:     make(map[string]string, maxConfigManifestAppFields),
+		SchemaVersion:             ManifestSchemaVersion,
+		AgentKind:                 "old-kind",
+		TopologyRev:               "old-topology",
+		ModelID:                   "old-model",
+		SystemPromptRev:           "old-prompt",
+		RuntimeSkills:             false,
+		WorkspaceRoot:             "old-root",
+		WorkspaceTrust:            "old-trust",
+		AgentAdapter:              "old-adapter",
+		PermissionPosture:         "old-posture",
+		NativePermissionPolicyRev: "old-permission",
+		PermissionStrictness:      2,
+		ConfinementRev:            "old-confinement",
+		ConfinementStrictness:     2,
+		ExternalCapabilityRev:     "old-external",
+		HookPolicyRev:             "old-hook",
+		Tools:                     make([]ToolManifestEntry, maxConfigManifestTools),
+		AppFields:                 make(map[string]string, maxConfigManifestAppFields),
 	}
 	candidate := ConfigManifest{
-		SchemaVersion: ManifestSchemaVersion,
-		HookPolicyRev: "guard-v1",
-		Tools:         make([]ToolManifestEntry, maxConfigManifestTools),
-		AppFields:     make(map[string]string, maxConfigManifestAppFields),
+		SchemaVersion:             ManifestSchemaVersion,
+		AgentKind:                 "new-kind",
+		TopologyRev:               "new-topology",
+		ModelID:                   "new-model",
+		SystemPromptRev:           "new-prompt",
+		RuntimeSkills:             true,
+		WorkspaceRoot:             "new-root",
+		WorkspaceTrust:            "new-trust",
+		AgentAdapter:              "new-adapter",
+		PermissionPosture:         "new-posture",
+		NativePermissionPolicyRev: "new-permission",
+		PermissionStrictness:      3,
+		ConfinementRev:            "new-confinement",
+		ConfinementStrictness:     3,
+		ExternalCapabilityRev:     "new-external",
+		HookPolicyRev:             "new-hook",
+		Tools:                     make([]ToolManifestEntry, maxConfigManifestTools),
+		AppFields:                 make(map[string]string, maxConfigManifestAppFields),
 	}
 	for index := range baseline.Tools {
 		baseline.Tools[index].Name = fmt.Sprintf("old-tool-%04d", index)
@@ -121,8 +151,35 @@ func TestConfigDriftBudgetCoversDisjointValidManifests(t *testing.T) {
 	}
 
 	assessment := AssessDrift(baseline, candidate)
-	if len(assessment.Changes) > maxConfigDriftChanges {
-		t.Fatalf("valid drift has %d changes, exceeds validation budget %d", len(assessment.Changes), maxConfigDriftChanges)
+	assessment.Changes = append(assessment.Changes, DriftChange{
+		Category: DriftAgentName,
+		Old:      "old-agent",
+		New:      "new-agent",
+		Severity: DriftWarn,
+	})
+	adoption := ConfigurationAdopted{
+		Header:             fullHeaderSession(),
+		Epoch:              2,
+		AdoptedFingerprint: candidate.Fingerprint(),
+		Manifest:           candidate,
+		Drift:              assessment.Changes,
+		Source:             DecisionSourcePolicy,
+	}
+	if err := ValidateEvent(adoption); err != nil {
+		t.Fatalf("maximum valid drift with agent name rejected: %v (changes=%d budget=%d)",
+			err, len(adoption.Drift), maxConfigDriftChanges)
+	}
+
+	adoption.Drift = append(adoption.Drift, DriftChange{
+		Category: DriftAgentName,
+		Old:      "another-old-agent",
+		New:      "another-new-agent",
+		Severity: DriftWarn,
+	})
+	err := ValidateEvent(adoption)
+	var invalid *InvalidEventError
+	if !errors.As(err, &invalid) || invalid.Field != FieldDrift || invalid.Rule != RuleInvalid {
+		t.Fatalf("one-over-limit error = %T %v, want invalid Drift", err, err)
 	}
 }
 
