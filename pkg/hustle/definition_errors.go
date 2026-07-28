@@ -20,6 +20,7 @@ const (
 	DefinitionMissingPolicyRevision DefinitionErrorKind = "missing_policy_revision"
 	DefinitionInvalidPolicyRevision DefinitionErrorKind = "invalid_policy_revision"
 	DefinitionInvalidOutputSchema   DefinitionErrorKind = "invalid_output_schema"
+	DefinitionInvalidEvidenceTools  DefinitionErrorKind = "invalid_evidence_tools"
 )
 
 // DefinitionError reports a definition boundary failure without retaining raw

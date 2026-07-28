@@ -16,6 +16,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
 	stream "github.com/looprig/inference/stream"
@@ -111,6 +112,272 @@ func validOutputSchema() inference.OutputSchema {
 			"additionalProperties":false
 		}`),
 		Strict: true,
+	}
+}
+
+func validEvidenceToolPolicy() EvidenceToolPolicy {
+	return EvidenceToolPolicy{
+		Revision: "evidence-policy-v1",
+		Limits: ToolLoopLimits{
+			MaxRounds:        3,
+			MaxCalls:         6,
+			MaxCallsPerRound: 2,
+			MaxResultBytes:   4096,
+			MaxEvidenceBytes: 8192,
+		},
+		Definitions: []tool.Definition{
+			tool.NewDefinition("workspace-status", tool.RequiresWorkspace, nil),
+			tool.NewBundleDefinition("git-evidence", []string{"git-diff", "git-status"}, tool.RequiresWorkspace, nil),
+		},
+	}
+}
+
+func validEvidenceOptions() []Option {
+	options := validNamedOptions(&testClient{}, validModel("evidence"))
+	options = replaceOption(options, 1, WithParticipation(ParticipationBlocking))
+	options = append(options, WithOutputSchema(validOutputSchema()), WithEvidenceTools(validEvidenceToolPolicy()))
+	return options
+}
+
+func TestEvidenceToolsRequireCompleteValidPolicy(t *testing.T) {
+	t.Parallel()
+	base := validEvidenceToolPolicy()
+	typedNil := reflect.Zero(reflect.TypeOf(base.Definitions[0])).Interface().(tool.Definition)
+	tests := []struct {
+		name   string
+		mutate func(*EvidenceToolPolicy)
+	}{
+		{name: "missing revision", mutate: func(p *EvidenceToolPolicy) { p.Revision = "" }},
+		{name: "blank revision", mutate: func(p *EvidenceToolPolicy) { p.Revision = " \t" }},
+		{name: "invalid utf8 revision", mutate: func(p *EvidenceToolPolicy) { p.Revision = "policy-\xff" }},
+		{name: "overlong revision", mutate: func(p *EvidenceToolPolicy) { p.Revision = strings.Repeat("r", maxEvidenceToolPolicyRevisionBytes+1) }},
+		{name: "zero rounds", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxRounds = 0 }},
+		{name: "zero calls", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxCalls = 0 }},
+		{name: "zero calls per round", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxCallsPerRound = 0 }},
+		{name: "zero result bytes", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxResultBytes = 0 }},
+		{name: "zero evidence bytes", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxEvidenceBytes = 0 }},
+		{name: "excessive rounds", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxRounds = maxToolLoopCount + 1 }},
+		{name: "excessive calls", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxCalls = maxToolLoopCount + 1 }},
+		{name: "excessive result bytes", mutate: func(p *EvidenceToolPolicy) {
+			p.Limits.MaxResultBytes = maxPayloadBytes + 1
+			p.Limits.MaxEvidenceBytes = maxPayloadBytes + 1
+		}},
+		{name: "excessive evidence bytes", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxEvidenceBytes = maxPayloadBytes + 1 }},
+		{name: "calls per round exceeds total", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxCallsPerRound = p.Limits.MaxCalls + 1 }},
+		{name: "result exceeds evidence", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxResultBytes = p.Limits.MaxEvidenceBytes + 1 }},
+		{name: "no definitions", mutate: func(p *EvidenceToolPolicy) { p.Definitions = nil }},
+		{name: "nil definition", mutate: func(p *EvidenceToolPolicy) { p.Definitions[0] = nil }},
+		{name: "typed nil definition", mutate: func(p *EvidenceToolPolicy) { p.Definitions[0] = typedNil }},
+		{name: "blank definition name", mutate: func(p *EvidenceToolPolicy) {
+			p.Definitions[0] = tool.NewDefinition(" ", tool.RequiresWorkspace, nil)
+		}},
+		{name: "noncanonical definition name", mutate: func(p *EvidenceToolPolicy) {
+			p.Definitions[0] = tool.NewDefinition(" workspace-status ", tool.RequiresWorkspace, nil)
+		}},
+		{name: "duplicate definition name", mutate: func(p *EvidenceToolPolicy) {
+			p.Definitions[1] = tool.NewDefinition("workspace-status", tool.RequiresWorkspace, nil)
+		}},
+		{name: "no produced names", mutate: func(p *EvidenceToolPolicy) {
+			p.Definitions[0] = tool.NewBundleDefinition("workspace-status", nil, tool.RequiresWorkspace, nil)
+		}},
+		{name: "blank produced name", mutate: func(p *EvidenceToolPolicy) {
+			p.Definitions[0] = tool.NewBundleDefinition("workspace-status", []string{" "}, tool.RequiresWorkspace, nil)
+		}},
+		{name: "noncanonical produced name", mutate: func(p *EvidenceToolPolicy) {
+			p.Definitions[0] = tool.NewBundleDefinition("workspace-status", []string{" status "}, tool.RequiresWorkspace, nil)
+		}},
+		{name: "duplicate produced name in definition", mutate: func(p *EvidenceToolPolicy) {
+			p.Definitions[0] = tool.NewBundleDefinition("workspace-status", []string{"status", "status"}, tool.RequiresWorkspace, nil)
+		}},
+		{name: "duplicate produced name across definitions", mutate: func(p *EvidenceToolPolicy) {
+			p.Definitions[1] = tool.NewBundleDefinition("git-evidence", []string{"workspace-status"}, tool.RequiresWorkspace, nil)
+		}},
+		{name: "delegate controller requirement", mutate: func(p *EvidenceToolPolicy) {
+			p.Definitions[0] = tool.NewDefinition("delegate", tool.RequiresDelegateController, nil)
+		}},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			policy := base.Clone()
+			testCase.mutate(&policy)
+			_, err := Define(append(validEvidenceOptionsWithoutPolicy(), WithEvidenceTools(policy))...)
+			var definitionErr *DefinitionError
+			if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionInvalidEvidenceTools {
+				t.Fatalf("Define() error = %T %v, want invalid evidence tools", err, err)
+			}
+			if strings.Contains(err.Error(), policy.Revision) && policy.Revision != "" {
+				t.Fatalf("error echoed evidence policy revision: %v", err)
+			}
+		})
+	}
+}
+
+func TestEvidenceToolPolicyAcceptsExactBoundariesAndCurrentLoopModel(t *testing.T) {
+	t.Parallel()
+	policy := validEvidenceToolPolicy()
+	policy.Revision = strings.Repeat("r", maxEvidenceToolPolicyRevisionBytes)
+	policy.Limits = ToolLoopLimits{
+		MaxRounds:        maxToolLoopCount,
+		MaxCalls:         maxToolLoopCount,
+		MaxCallsPerRound: maxToolLoopCount,
+		MaxResultBytes:   maxPayloadBytes,
+		MaxEvidenceBytes: maxPayloadBytes,
+	}
+	options := replaceOption(validCurrentOptions(), 1, WithParticipation(ParticipationBlocking))
+	options = append(options, WithOutputSchema(validOutputSchema()), WithEvidenceTools(policy))
+	if _, err := Define(options...); err != nil {
+		t.Fatalf("Define(exact evidence boundaries with current-loop model) error = %v", err)
+	}
+}
+
+func TestZeroEvidenceToolPolicyPreservesToollessIdentity(t *testing.T) {
+	t.Parallel()
+	without, err := Define(validCurrentOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withZero, err := Define(append(validCurrentOptions(), WithEvidenceTools(EvidenceToolPolicy{}))...)
+	if err != nil {
+		t.Fatalf("Define(zero evidence policy) error = %v", err)
+	}
+	if withZero.Descriptor() != without.Descriptor() || withZero.PolicyRevision() != without.PolicyRevision() {
+		t.Fatalf("zero evidence policy changed tool-less identity:\n%#v\n%#v", without.Descriptor(), withZero.Descriptor())
+	}
+	if policy, ok := withZero.EvidenceToolPolicy(); ok || policy.Revision != "" || policy.Limits != (ToolLoopLimits{}) || policy.Definitions != nil {
+		t.Fatalf("EvidenceToolPolicy() = %#v, %v, want zero,false", policy, ok)
+	}
+}
+
+func validEvidenceOptionsWithoutPolicy() []Option {
+	options := validNamedOptions(&testClient{}, validModel("evidence"))
+	options = replaceOption(options, 1, WithParticipation(ParticipationBlocking))
+	return append(options, WithOutputSchema(validOutputSchema()))
+}
+
+func TestEvidenceToolsRequireStructuredBlockingDefinition(t *testing.T) {
+	t.Parallel()
+	policy := validEvidenceToolPolicy()
+	tests := []struct {
+		name string
+		opts []Option
+	}{
+		{name: "missing structured output", opts: append(validNamedOptions(&testClient{}, validModel("evidence")), WithEvidenceTools(policy))},
+		{name: "background participation", opts: append(validCurrentOptions(), WithOutputSchema(validOutputSchema()), WithEvidenceTools(policy))},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Define(testCase.opts...)
+			var definitionErr *DefinitionError
+			if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionInvalidEvidenceTools {
+				t.Fatalf("Define() error = %T %v, want invalid evidence tools", err, err)
+			}
+		})
+	}
+}
+
+func TestEvidenceToolsDuplicateOptionRejected(t *testing.T) {
+	t.Parallel()
+	policy := validEvidenceToolPolicy()
+	_, err := Define(append(validEvidenceOptions(), WithEvidenceTools(policy))...)
+	var definitionErr *DefinitionError
+	if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionDuplicateOption || definitionErr.Field != "evidence_tools" {
+		t.Fatalf("Define() error = %T %v, want duplicate evidence_tools option", err, err)
+	}
+}
+
+func TestEvidenceToolPolicyIsImmutable(t *testing.T) {
+	t.Parallel()
+	policy := validEvidenceToolPolicy()
+	wantFirst := policy.Definitions[0]
+	option := WithEvidenceTools(policy)
+	policy.Revision = "mutated"
+	policy.Limits.MaxCalls++
+	policy.Definitions[0] = policy.Definitions[1]
+	policy.Definitions = append(policy.Definitions, policy.Definitions[1])
+
+	definition, err := Define(append(validEvidenceOptionsWithoutPolicy(), option)...)
+	if err != nil {
+		t.Fatalf("Define() error = %v", err)
+	}
+	got, ok := definition.EvidenceToolPolicy()
+	if !ok || got.Revision != "evidence-policy-v1" || got.Limits != validEvidenceToolPolicy().Limits || len(got.Definitions) != 2 || got.Definitions[0] != wantFirst {
+		t.Fatalf("EvidenceToolPolicy() = %#v, %v", got, ok)
+	}
+	got.Definitions[0] = got.Definitions[1]
+	again, ok := definition.EvidenceToolPolicy()
+	if !ok || again.Definitions[0] != wantFirst {
+		t.Fatal("EvidenceToolPolicy accessor exposed mutable definition slice")
+	}
+}
+
+func TestEvidenceToolsDescriptorIsSecretFreeAndIdentityComplete(t *testing.T) {
+	t.Parallel()
+	define := func(t *testing.T, policy EvidenceToolPolicy) Definition {
+		t.Helper()
+		definition, err := Define(append(validEvidenceOptionsWithoutPolicy(), WithEvidenceTools(policy))...)
+		if err != nil {
+			t.Fatalf("Define() error = %v", err)
+		}
+		return definition
+	}
+	basePolicy := validEvidenceToolPolicy()
+	base := define(t, basePolicy)
+	descriptor := base.Descriptor()
+	if descriptor.EvidenceToolPolicyRevision != basePolicy.Revision ||
+		descriptor.EvidenceToolDefinitionCount != len(basePolicy.Definitions) ||
+		descriptor.EvidenceToolLimits != basePolicy.Limits ||
+		descriptor.EvidenceToolDefinitionsSHA256 == ([sha256.Size]byte{}) ||
+		descriptor.EvidenceProducedToolNamesSHA256 == ([sha256.Size]byte{}) ||
+		!descriptor.StructuredOutputWithTools {
+		t.Fatalf("evidence descriptor incomplete: %#v", descriptor)
+	}
+	encoded, err := json.Marshal(descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{"workspace-status", "git-evidence", "git-diff", "git-status"} {
+		if bytes.Contains(encoded, []byte(raw)) {
+			t.Fatalf("descriptor leaked raw evidence metadata %q: %s", raw, encoded)
+		}
+	}
+
+	mutations := []struct {
+		name   string
+		mutate func(*EvidenceToolPolicy)
+	}{
+		{name: "revision", mutate: func(p *EvidenceToolPolicy) { p.Revision = "evidence-policy-v2" }},
+		{name: "rounds", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxRounds++ }},
+		{name: "calls", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxCalls++ }},
+		{name: "calls per round", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxCallsPerRound++ }},
+		{name: "result bytes", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxResultBytes++ }},
+		{name: "evidence bytes", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxEvidenceBytes++ }},
+		{name: "definition name", mutate: func(p *EvidenceToolPolicy) {
+			p.Definitions[0] = tool.NewDefinition("workspace-tree", tool.RequiresWorkspace, nil)
+		}},
+		{name: "definition requirements", mutate: func(p *EvidenceToolPolicy) {
+			p.Definitions[0] = tool.NewDefinition("workspace-status", 0, nil)
+		}},
+		{name: "produced name", mutate: func(p *EvidenceToolPolicy) {
+			p.Definitions[1] = tool.NewBundleDefinition("git-evidence", []string{"git-diff", "git-log"}, tool.RequiresWorkspace, nil)
+		}},
+		{name: "produced name order", mutate: func(p *EvidenceToolPolicy) {
+			p.Definitions[1] = tool.NewBundleDefinition("git-evidence", []string{"git-status", "git-diff"}, tool.RequiresWorkspace, nil)
+		}},
+		{name: "definition order", mutate: func(p *EvidenceToolPolicy) {
+			p.Definitions[0], p.Definitions[1] = p.Definitions[1], p.Definitions[0]
+		}},
+	}
+	for _, testCase := range mutations {
+		t.Run(testCase.name, func(t *testing.T) {
+			policy := basePolicy.Clone()
+			testCase.mutate(&policy)
+			changed := define(t, policy)
+			if changed.PolicyRevision() == base.PolicyRevision() {
+				t.Fatal("behavioral mutation did not change policy identity")
+			}
+		})
 	}
 }
 
@@ -306,6 +573,11 @@ func TestOutputSchemaAbsentPreservesLegacyIdentity(t *testing.T) {
 	encoded, err := json.Marshal(definition.Descriptor())
 	if err != nil {
 		t.Fatalf("json.Marshal(Descriptor()) error = %v", err)
+	}
+	const wantDescriptor = `{"Name":"current-model-job","Participation":2,"ModelSource":1,"NamedModelKey":{"Provider":"","Model":""},"NamedModelPolicyRevision":"","PromptRevision":"prompt-v2","PromptSHA256":[96,237,206,114,218,60,219,9,3,59,125,91,20,95,2,115,56,120,242,198,248,226,184,42,138,16,158,155,28,35,152,108],"PolicyRevision":"classifier-v1","TimeoutNanos":3000000000,"Limits":{"InputBytes":1024,"OutputBytes":512}}`
+	const wantPolicyRevision = "a68d812281998bcf7a364da8b7bdd3c25ce95a42c844e1391dad82d7931e3a42"
+	if string(encoded) != wantDescriptor || definition.PolicyRevision() != wantPolicyRevision {
+		t.Fatalf("tool-less fixture drifted:\n%s\n%s", encoded, definition.PolicyRevision())
 	}
 	for _, key := range []string{"OutputSchemaName", "OutputSchemaSHA256", "StructuredOutputRevision"} {
 		if bytes.Contains(encoded, []byte(key)) {
@@ -767,7 +1039,14 @@ func assertSecretFreeDescriptor(t *testing.T, definition Definition) {
 			t.Fatalf("descriptor or policy leaked %q: %s / %s", secret, encoded, definition.PolicyRevision())
 		}
 	}
-	wantFields := []string{"Name", "Participation", "ModelSource", "NamedModelKey", "NamedModelPolicyRevision", "PromptRevision", "PromptSHA256", "OutputSchemaName", "OutputSchemaSHA256", "StructuredOutputRevision", "PolicyRevision", "TimeoutNanos", "Limits"}
+	wantFields := []string{
+		"Name", "Participation", "ModelSource", "NamedModelKey", "NamedModelPolicyRevision",
+		"PromptRevision", "PromptSHA256", "OutputSchemaName", "OutputSchemaSHA256",
+		"StructuredOutputRevision", "PolicyRevision", "TimeoutNanos", "Limits",
+		"EvidenceToolPolicyRevision", "EvidenceToolDefinitionsSHA256",
+		"EvidenceProducedToolNamesSHA256", "EvidenceToolLimits",
+		"EvidenceToolDefinitionCount", "StructuredOutputWithTools",
+	}
 	typeOf := reflect.TypeOf(descriptor)
 	if typeOf.NumField() != len(wantFields) {
 		t.Fatalf("DefinitionDescriptor has %d fields, want exactly %d", typeOf.NumField(), len(wantFields))

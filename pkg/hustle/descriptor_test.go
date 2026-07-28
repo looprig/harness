@@ -22,6 +22,7 @@ func TestDefinitionDescriptorValidate(t *testing.T) {
 	t.Parallel()
 	current := descriptorFromOptions(t, validCurrentOptions())
 	structured := descriptorFromOptions(t, append(validCurrentOptions(), WithOutputSchema(validOutputSchema())))
+	evidence := descriptorFromOptions(t, validEvidenceOptions())
 	named := descriptorFromOptions(t, validNamedOptions(&testClient{}, validModel("named")))
 	zeroPromptHash := current
 	zeroPromptHash.PromptSHA256 = [32]byte{}
@@ -60,6 +61,22 @@ func TestDefinitionDescriptorValidate(t *testing.T) {
 	longOutputName.OutputSchemaName = "a" + strings.Repeat("b", maxOutputSchemaNameBytes)
 	longOutputRevision := structured
 	longOutputRevision.StructuredOutputRevision = strings.Repeat("r", 129)
+	partialEvidenceRevision := current
+	partialEvidenceRevision.EvidenceToolPolicyRevision = "evidence-v1"
+	partialEvidenceLimits := current
+	partialEvidenceLimits.EvidenceToolLimits = validEvidenceToolPolicy().Limits
+	evidenceMissingRevision := evidence
+	evidenceMissingRevision.EvidenceToolPolicyRevision = ""
+	evidenceMissingDefinitionDigest := evidence
+	evidenceMissingDefinitionDigest.EvidenceToolDefinitionsSHA256 = [sha256.Size]byte{}
+	evidenceMissingNamesDigest := evidence
+	evidenceMissingNamesDigest.EvidenceProducedToolNamesSHA256 = [sha256.Size]byte{}
+	evidenceMissingCount := evidence
+	evidenceMissingCount.EvidenceToolDefinitionCount = 0
+	evidenceMissingMarker := evidence
+	evidenceMissingMarker.StructuredOutputWithTools = false
+	evidenceBadLimits := evidence
+	evidenceBadLimits.EvidenceToolLimits.MaxCallsPerRound = evidenceBadLimits.EvidenceToolLimits.MaxCalls + 1
 	tests := []struct {
 		name    string
 		value   DefinitionDescriptor
@@ -68,6 +85,7 @@ func TestDefinitionDescriptorValidate(t *testing.T) {
 		{name: "valid current", value: current},
 		{name: "valid named", value: named},
 		{name: "valid structured", value: structured},
+		{name: "valid evidence tools", value: evidence},
 		{name: "minimum boundary", value: minimum},
 		{name: "maximum payload boundary", value: maximum},
 		{name: "zero descriptor", value: DefinitionDescriptor{}, wantErr: true},
@@ -97,6 +115,14 @@ func TestDefinitionDescriptorValidate(t *testing.T) {
 		{name: "invalid output name", value: invalidOutputName, wantErr: true},
 		{name: "long output name", value: longOutputName, wantErr: true},
 		{name: "long output revision", value: longOutputRevision, wantErr: true},
+		{name: "partial evidence revision", value: partialEvidenceRevision, wantErr: true},
+		{name: "partial evidence limits", value: partialEvidenceLimits, wantErr: true},
+		{name: "evidence missing revision", value: evidenceMissingRevision, wantErr: true},
+		{name: "evidence missing definition digest", value: evidenceMissingDefinitionDigest, wantErr: true},
+		{name: "evidence missing names digest", value: evidenceMissingNamesDigest, wantErr: true},
+		{name: "evidence missing definition count", value: evidenceMissingCount, wantErr: true},
+		{name: "evidence missing structured marker", value: evidenceMissingMarker, wantErr: true},
+		{name: "evidence invalid limits", value: evidenceBadLimits, wantErr: true},
 	}
 	for _, tt := range tests {
 		testCase := tt

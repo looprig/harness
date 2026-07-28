@@ -18,7 +18,6 @@ func TestDependencyBoundaries(t *testing.T) {
 		"github.com/looprig/harness/pkg/loop",
 		"github.com/looprig/harness/pkg/rig",
 		"github.com/looprig/harness/pkg/session",
-		"github.com/looprig/harness/pkg/tool",
 		"github.com/looprig/harness/pkg/tools",
 		"github.com/looprig/tools",
 		"github.com/looprig/llm",
@@ -60,5 +59,16 @@ func TestDependencyBoundaries(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEvidenceToolsAddOnlyTheNarrowToolContractDependency(t *testing.T) {
+	t.Parallel()
+	source, err := os.ReadFile("definition.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(source), `"github.com/looprig/harness/pkg/tool"`) {
+		t.Fatal("definition.go must use the narrow pkg/tool definition contract")
 	}
 }
