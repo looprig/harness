@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -213,6 +214,170 @@ func frozenManifestWithHustles(fields ConfigFingerprintFields, definitions []loo
 		manifest.TopologyRev = topologyRevisionWithHustles(definitions, primers, active, hustles, limits)
 	}
 	return manifest
+}
+
+// permissionReviewFingerprint is the minimal, secret-free projection of
+// permission review behavior owned by the rig. Classifier order is preserved.
+// Raw prompts, schemas, descriptions, clients, subjects, and workspace state
+// never enter this value.
+type permissionReviewFingerprint struct {
+	reviewPolicyRevision string
+	classifiers          []permissionClassifierFingerprint
+}
+
+type permissionClassifierFingerprint struct {
+	name                          hustle.Name
+	revision                      string
+	definitionPolicyRevision      string
+	outputSchemaName              string
+	outputSchemaSHA256            [sha256.Size]byte
+	structuredOutputRevision      string
+	evidenceToolPolicyRevision    string
+	evidenceToolDefinitionsSHA256 [sha256.Size]byte
+	evidenceProducedNamesSHA256   [sha256.Size]byte
+	evidenceToolLimits            hustle.ToolLoopLimits
+	evidenceToolDefinitionCount   int
+}
+
+type permissionReviewFingerprintError struct{}
+
+func (*permissionReviewFingerprintError) Error() string {
+	return "rig: invalid permission review fingerprint"
+}
+
+func permissionReviewFingerprintFrom(
+	set gate.PermissionClassifierSet,
+	reviewPolicyRevision string,
+) (*permissionReviewFingerprint, error) {
+	if !validPermissionReviewPolicyRevision(reviewPolicyRevision) {
+		return nil, &permissionReviewFingerprintError{}
+	}
+	classifiers := set.Classifiers()
+	if len(classifiers) == 0 {
+		return nil, &permissionReviewFingerprintError{}
+	}
+	rows := make([]permissionClassifierFingerprint, len(classifiers))
+	for index, classifier := range classifiers {
+		if classifier == nil {
+			return nil, &permissionReviewFingerprintError{}
+		}
+		definition := classifier.Definition()
+		descriptor := definition.Descriptor()
+		if err := descriptor.Validate(); err != nil ||
+			descriptor.Name != classifier.Name() ||
+			descriptor.PolicyRevision != classifier.Revision() ||
+			definition.PolicyRevision() == "" {
+			return nil, &permissionReviewFingerprintError{}
+		}
+		rows[index] = permissionClassifierFingerprint{
+			name:                          classifier.Name(),
+			revision:                      classifier.Revision(),
+			definitionPolicyRevision:      definition.PolicyRevision(),
+			outputSchemaName:              descriptor.OutputSchemaName,
+			outputSchemaSHA256:            descriptor.OutputSchemaSHA256,
+			structuredOutputRevision:      descriptor.StructuredOutputRevision,
+			evidenceToolPolicyRevision:    descriptor.EvidenceToolPolicyRevision,
+			evidenceToolDefinitionsSHA256: descriptor.EvidenceToolDefinitionsSHA256,
+			evidenceProducedNamesSHA256:   descriptor.EvidenceProducedToolNamesSHA256,
+			evidenceToolLimits:            descriptor.EvidenceToolLimits,
+			evidenceToolDefinitionCount:   descriptor.EvidenceToolDefinitionCount,
+		}
+	}
+	return &permissionReviewFingerprint{
+		reviewPolicyRevision: reviewPolicyRevision,
+		classifiers:          rows,
+	}, nil
+}
+
+func frozenFingerprintWithPermissionReview(
+	fields ConfigFingerprintFields,
+	definitions []loop.Definition,
+	primers []string,
+	active string,
+	hustles []hustle.Definition,
+	limits HustleLimits,
+	review *permissionReviewFingerprint,
+) event.ConfigFingerprint {
+	fingerprint := frozenFingerprintWithHustles(
+		fields, definitions, primers, active, hustles, limits,
+	)
+	if review != nil {
+		fingerprint.TopologyRev = topologyRevisionWithHustlesAndPermissionReview(
+			definitions, primers, active, hustles, limits, review,
+		)
+	}
+	return fingerprint
+}
+
+func frozenManifestWithPermissionReview(
+	fields ConfigFingerprintFields,
+	definitions []loop.Definition,
+	primers []string,
+	active string,
+	hustles []hustle.Definition,
+	limits HustleLimits,
+	review *permissionReviewFingerprint,
+) event.ConfigManifest {
+	manifest := frozenManifestWithHustles(
+		fields, definitions, primers, active, hustles, limits,
+	)
+	if review != nil {
+		manifest.TopologyRev = topologyRevisionWithHustlesAndPermissionReview(
+			definitions, primers, active, hustles, limits, review,
+		)
+	}
+	return manifest
+}
+
+func topologyRevisionWithHustlesAndPermissionReview(
+	definitions []loop.Definition,
+	primers []string,
+	active string,
+	hustles []hustle.Definition,
+	limits HustleLimits,
+	review *permissionReviewFingerprint,
+) string {
+	if review == nil {
+		return topologyRevisionWithHustles(
+			definitions, primers, active, hustles, limits,
+		)
+	}
+	base := topologyRevision(definitions, primers, active)
+	if len(hustles) > 0 {
+		base = topologyRevisionWithHustles(
+			definitions, primers, active, hustles, limits,
+		)
+	}
+	return hexSHA256Bytes(canonicalPermissionReviewMaterial(base, *review))
+}
+
+func canonicalPermissionReviewMaterial(
+	baseTopologyRevision string,
+	review permissionReviewFingerprint,
+) []byte {
+	const encodingDomain string = "looprig/rig/permission-review-topology/v1"
+	material := appendCanonicalString(nil, encodingDomain)
+	material = appendCanonicalString(material, baseTopologyRevision)
+	material = appendCanonicalString(material, review.reviewPolicyRevision)
+	material = binary.BigEndian.AppendUint64(material, uint64(len(review.classifiers)))
+	for _, row := range review.classifiers {
+		material = appendCanonicalString(material, string(row.name))
+		material = appendCanonicalString(material, row.revision)
+		material = appendCanonicalString(material, row.definitionPolicyRevision)
+		material = appendCanonicalString(material, row.outputSchemaName)
+		material = append(material, row.outputSchemaSHA256[:]...)
+		material = appendCanonicalString(material, row.structuredOutputRevision)
+		material = appendCanonicalString(material, row.evidenceToolPolicyRevision)
+		material = append(material, row.evidenceToolDefinitionsSHA256[:]...)
+		material = append(material, row.evidenceProducedNamesSHA256[:]...)
+		material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxRounds))
+		material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxCalls))
+		material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxCallsPerRound))
+		material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxResultBytes))
+		material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxEvidenceBytes))
+		material = appendCanonicalInt64(material, int64(row.evidenceToolDefinitionCount))
+	}
+	return material
 }
 
 func topologyRevisionWithHustles(definitions []loop.Definition, primers []string, active string, hustles []hustle.Definition, limits HustleLimits) string {

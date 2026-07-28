@@ -38,6 +38,8 @@ r, err := rig.Define(
     rig.WithExclusiveWorkspace(workspaceStore, "/repo", leaser),
     rig.WithHustles(/* ...optional hustle.Definition values... */...),
     rig.WithHustleLimits(rig.HustleLimits{ /* ... */ }),
+    rig.WithPermissionClassifiers(permissionClassifiers),
+    rig.WithPermissionReviewPolicyRevision(permissionReviewPolicy.Revision),
     rig.WithForeignBuilders(/* ...foreign.Builder for codex/claude... */...),
     rig.WithGateCaps(rig.GateCaps{MaxOpen: 16, MaxTimeout: 30*time.Second}),
     rig.WithDelegationLimits(rig.DelegationLimits{Depth: 4, Quota: 32}),
@@ -114,6 +116,12 @@ created:
 - A `*sessionstore.Store` is required; workspace placement is optional
   but at most one placement may be configured.
 - Hustle lane bounds are within `MaxHustleQueued`; gate caps are positive.
+- Permission classifiers are supplied as one validated, ordered
+  `gate.PermissionClassifierSet` and are paired with a canonical local review
+  policy revision. Supplying only one half is rejected. Their frozen
+  definitions are automatically registered as blocking Hustles, so
+  `WithHustleLimits` is required and consumers must not also pass those same
+  definitions to `WithHustles`.
 - Foreign builders and restore decider are optional with fail-secure
   defaults.
 
@@ -129,3 +137,22 @@ rig runs the configured `RestoreDecider` against a `DriftAssessment` and
 records the decision as a durable `ConfigurationAdopted`; the default
 `DefaultPolicyDecider` accepts only when every change is `Info` and
 rejects when any is `Warn`.
+
+Permission review extends the topology identity with the local review-policy
+revision and the classifiers in registration order. Each classifier row carries
+only frozen, secret-free identity: classifier name and revision, its complete
+definition digest, structured-output digest/revision, evidence definition and
+produced-name digests, and every evidence-loop bound. Classifier order is
+significant because combination is ordered. Raw prompts, schemas,
+descriptions, model clients and credentials, workspace paths, live review
+subjects, and runtime-bound tool objects are never serialized into this
+projection. Concrete evidence tools still validate and freeze their schema and
+description identity during session construction; metadata drift fails
+construction rather than changing the rig fingerprint after persistence has
+started. Automatic classifier-definition registration deliberately routes this
+through the same Hustle binding path as every other evidence-enabled
+definition.
+
+Omitting both permission-review options preserves the pre-classifier
+fingerprint and gate behavior byte-for-byte. There is no implicit classifier
+registry or default review policy.

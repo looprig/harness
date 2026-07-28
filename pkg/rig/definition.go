@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/looprig/harness/internal/sessionruntime"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
@@ -11,16 +12,18 @@ import (
 )
 
 type definitionState struct {
-	loops             []loop.Definition
-	hustles           []hustle.Definition
-	hustleLimits      HustleLimits
-	primers           []string
-	activePrimer      string
-	store             *sessionstore.Store
-	storeSet          bool
-	seen              map[singletonKey]bool
-	lifecycleOptions  []sessionruntime.LifecycleOption
-	fingerprintFields ConfigFingerprintFields
+	loops                          []loop.Definition
+	hustles                        []hustle.Definition
+	hustleLimits                   HustleLimits
+	primers                        []string
+	activePrimer                   string
+	store                          *sessionstore.Store
+	storeSet                       bool
+	seen                           map[singletonKey]bool
+	lifecycleOptions               []sessionruntime.LifecycleOption
+	fingerprintFields              ConfigFingerprintFields
+	permissionClassifiers          gate.PermissionClassifierSet
+	permissionReviewPolicyRevision string
 	// placements accumulates every workspace placement option. Define enforces at most
 	// one; more than one is a typed rejection.
 	placements     []pendingPlacement
@@ -102,6 +105,10 @@ func Define(options ...Option) (*Rig, error) {
 			return nil, &DefinitionError{Kind: DefinitionInvalidLoop, Name: name}
 		}
 	}
+	permissionReview, err := resolvePermissionReviewFingerprint(state)
+	if err != nil {
+		return nil, err
+	}
 	if err := validateHustleRegistration(state); err != nil {
 		return nil, err
 	}
@@ -139,8 +146,14 @@ func Define(options ...Option) (*Rig, error) {
 		// field so a placement change (mode or path) is a config change.
 		fields.WorkspaceRoot = placementFingerprint(placement, region)
 	}
-	fingerprint := frozenFingerprintWithHustles(fields, state.loops, state.primers, state.activePrimer, state.hustles, state.hustleLimits)
-	manifest := frozenManifestWithHustles(fields, state.loops, state.primers, state.activePrimer, state.hustles, state.hustleLimits)
+	fingerprint := frozenFingerprintWithPermissionReview(
+		fields, state.loops, state.primers, state.activePrimer,
+		state.hustles, state.hustleLimits, permissionReview,
+	)
+	manifest := frozenManifestWithPermissionReview(
+		fields, state.loops, state.primers, state.activePrimer,
+		state.hustles, state.hustleLimits, permissionReview,
+	)
 	lifecycleOptions := append([]sessionruntime.LifecycleOption(nil), state.lifecycleOptions...)
 	if len(state.hustles) > 0 {
 		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleHustles(
@@ -180,6 +193,25 @@ func Define(options ...Option) (*Rig, error) {
 		return nil, &DefinitionError{Kind: DefinitionInvalidSessionStore, Cause: err}
 	}
 	return &Rig{lifecycle: lifecycle}, nil
+}
+
+func resolvePermissionReviewFingerprint(state *definitionState) (*permissionReviewFingerprint, error) {
+	classifiersConfigured := state.seen[keyPermissionClassifiers]
+	policyConfigured := state.seen[keyPermissionReviewPolicyRevision]
+	if !classifiersConfigured && !policyConfigured {
+		return nil, nil
+	}
+	if !classifiersConfigured || !policyConfigured {
+		return nil, &DefinitionError{Kind: DefinitionIncompletePermissionReview}
+	}
+	projection, err := permissionReviewFingerprintFrom(
+		state.permissionClassifiers,
+		state.permissionReviewPolicyRevision,
+	)
+	if err != nil {
+		return nil, &DefinitionError{Kind: DefinitionInvalidPermissionClassifiers, Cause: err}
+	}
+	return projection, nil
 }
 
 func lifecycleHustleLimits(limits HustleLimits) sessionruntime.HustleLimits {

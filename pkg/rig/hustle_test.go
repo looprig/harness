@@ -5,9 +5,11 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
@@ -91,6 +93,149 @@ func TestDefineHustlesAreAdditiveAndDefensivelyCopied(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPermissionReviewOptionsFreezeOrderedClassifierIdentity(t *testing.T) {
+	t.Parallel()
+	first := defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("status"))
+	second := defineRigPermissionClassifier(t, "zulu", rigEvidencePolicy("diff"))
+	set := rigPermissionClassifierSet(t, first, second)
+
+	state := &definitionState{seen: make(map[singletonKey]bool)}
+	if err := WithPermissionClassifiers(set)(state); err != nil {
+		t.Fatalf("WithPermissionClassifiers: %v", err)
+	}
+	if err := WithPermissionReviewPolicyRevision("review-policy-v1")(state); err != nil {
+		t.Fatalf("WithPermissionReviewPolicyRevision: %v", err)
+	}
+	got := state.permissionClassifiers.Classifiers()
+	if len(got) != 2 || got[0].Name() != "alpha" || got[1].Name() != "zulu" {
+		t.Fatalf("classifier order = %#v", got)
+	}
+	if len(state.hustles) != 2 ||
+		state.hustles[0].Name() != "alpha" ||
+		state.hustles[1].Name() != "zulu" {
+		t.Fatalf("classifier hustle definitions = %#v", state.hustles)
+	}
+	if state.permissionReviewPolicyRevision != "review-policy-v1" {
+		t.Fatalf("review policy revision = %q", state.permissionReviewPolicyRevision)
+	}
+}
+
+func TestPermissionReviewOptionsRejectInvalidAndDuplicateValues(t *testing.T) {
+	t.Parallel()
+	valid := rigPermissionClassifierSet(
+		t, defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("status")),
+	)
+	tests := []struct {
+		name string
+		run  func(*definitionState) error
+		kind DefinitionErrorKind
+	}{
+		{name: "zero classifier set", run: func(state *definitionState) error {
+			return WithPermissionClassifiers(gate.PermissionClassifierSet{})(state)
+		}, kind: DefinitionInvalidPermissionClassifiers},
+		{name: "blank review policy", run: func(state *definitionState) error {
+			return WithPermissionReviewPolicyRevision(" ")(state)
+		}, kind: DefinitionInvalidPermissionReviewPolicy},
+		{name: "invalid utf8 review policy", run: func(state *definitionState) error {
+			return WithPermissionReviewPolicyRevision("policy-\xff")(state)
+		}, kind: DefinitionInvalidPermissionReviewPolicy},
+		{name: "nul review policy", run: func(state *definitionState) error {
+			return WithPermissionReviewPolicyRevision("policy-\x00")(state)
+		}, kind: DefinitionInvalidPermissionReviewPolicy},
+		{name: "overlong review policy", run: func(state *definitionState) error {
+			return WithPermissionReviewPolicyRevision(strings.Repeat("r", gate.MaxPermissionReviewPolicyRevisionBytes+1))(state)
+		}, kind: DefinitionInvalidPermissionReviewPolicy},
+		{name: "classifier duplicate option", run: func(state *definitionState) error {
+			if err := WithPermissionClassifiers(valid)(state); err != nil {
+				return err
+			}
+			return WithPermissionClassifiers(valid)(state)
+		}, kind: DefinitionDuplicateOption},
+		{name: "policy duplicate option", run: func(state *definitionState) error {
+			if err := WithPermissionReviewPolicyRevision("review-v1")(state); err != nil {
+				return err
+			}
+			return WithPermissionReviewPolicyRevision("review-v2")(state)
+		}, kind: DefinitionDuplicateOption},
+	}
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			state := &definitionState{seen: make(map[singletonKey]bool)}
+			err := testCase.run(state)
+			var target *DefinitionError
+			if !errors.As(err, &target) || target.Kind != testCase.kind {
+				t.Fatalf("option error = %T %v, want DefinitionError kind %q", err, err, testCase.kind)
+			}
+		})
+	}
+}
+
+func TestPermissionReviewPolicyRevisionAcceptsExactBound(t *testing.T) {
+	t.Parallel()
+	revision := strings.Repeat("r", gate.MaxPermissionReviewPolicyRevisionBytes)
+	state := &definitionState{seen: make(map[singletonKey]bool)}
+	if err := WithPermissionReviewPolicyRevision(revision)(state); err != nil {
+		t.Fatalf("WithPermissionReviewPolicyRevision(exact bound): %v", err)
+	}
+	if state.permissionReviewPolicyRevision != revision {
+		t.Fatalf("stored revision length = %d, want %d", len(state.permissionReviewPolicyRevision), len(revision))
+	}
+}
+
+func TestDefinePermissionReviewRequiresCompleteConfiguration(t *testing.T) {
+	t.Parallel()
+	set := rigPermissionClassifierSet(
+		t, defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("status")),
+	)
+	tests := []struct {
+		name    string
+		options []Option
+	}{
+		{name: "classifiers without review policy", options: []Option{WithPermissionClassifiers(set)}},
+		{name: "review policy without classifiers", options: []Option{WithPermissionReviewPolicyRevision("review-v1")}},
+	}
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Define(validRigOptions(t, testCase.options...)...)
+			var target *DefinitionError
+			if !errors.As(err, &target) || target.Kind != DefinitionIncompletePermissionReview {
+				t.Fatalf("Define() error = %T %v, want incomplete permission review", err, err)
+			}
+		})
+	}
+}
+
+func TestDefinePermissionReviewUsesHustleRegistrationAndBindingPath(t *testing.T) {
+	t.Parallel()
+	classifier := defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("status"))
+	set := rigPermissionClassifierSet(t, classifier)
+	base := []Option{
+		WithPermissionClassifiers(set),
+		WithPermissionReviewPolicyRevision("review-v1"),
+	}
+	_, err := Define(validRigOptions(t, base...)...)
+	var target *DefinitionError
+	if !errors.As(err, &target) || target.Kind != DefinitionMissingHustleLimits {
+		t.Fatalf("Define() without shared hustle limits error = %T %v", err, err)
+	}
+	if _, err := Define(validRigOptions(t, append(base, WithHustleLimits(validHustleLimits()))...)...); err != nil {
+		t.Fatalf("Define() with classifier hustle registration: %v", err)
+	}
+	if _, err := Define(validRigOptions(
+		t,
+		append(base,
+			WithHustles(classifier.Definition()),
+			WithHustleLimits(validHustleLimits()),
+		)...,
+	)...); !errors.As(err, &target) || target.Kind != DefinitionDuplicateHustle {
+		t.Fatalf("explicit duplicate classifier hustle error = %T %v", err, err)
 	}
 }
 

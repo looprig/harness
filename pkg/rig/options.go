@@ -1,10 +1,13 @@
 package rig
 
 import (
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/looprig/harness/internal/sessionruntime"
 	"github.com/looprig/harness/pkg/foreign"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/session"
@@ -20,17 +23,68 @@ type Option func(*definitionState) error
 type singletonKey string
 
 const (
-	keyActivePrimer        singletonKey = "active_primer"
-	keyDelegationLimits    singletonKey = "delegation_limits"
-	keyConfigFingerprint   singletonKey = "config_fingerprint"
-	keyForeignBuilder      singletonKey = "foreign_builders"
-	keyGateCaps            singletonKey = "gate_caps"
-	keyAllowConfigMismatch singletonKey = "allow_config_mismatch"
-	keyRestoreDecider      singletonKey = "restore_decider"
-	keySnapshots           singletonKey = "snapshots"
-	keyOffloadGC           singletonKey = "offload_gc"
-	keyHustleLimits        singletonKey = "hustle_limits"
+	keyActivePrimer                   singletonKey = "active_primer"
+	keyDelegationLimits               singletonKey = "delegation_limits"
+	keyConfigFingerprint              singletonKey = "config_fingerprint"
+	keyForeignBuilder                 singletonKey = "foreign_builders"
+	keyGateCaps                       singletonKey = "gate_caps"
+	keyAllowConfigMismatch            singletonKey = "allow_config_mismatch"
+	keyRestoreDecider                 singletonKey = "restore_decider"
+	keySnapshots                      singletonKey = "snapshots"
+	keyOffloadGC                      singletonKey = "offload_gc"
+	keyHustleLimits                   singletonKey = "hustle_limits"
+	keyPermissionClassifiers          singletonKey = "permission_classifiers"
+	keyPermissionReviewPolicyRevision singletonKey = "permission_review_policy_revision"
 )
+
+// WithPermissionClassifiers installs the already-validated, ordered permission
+// classifier registry. Registration order is behavioral and therefore remains
+// significant in the rig fingerprint.
+func WithPermissionClassifiers(classifiers gate.PermissionClassifierSet) Option {
+	return func(state *definitionState) error {
+		if state.seen[keyPermissionClassifiers] {
+			return &DefinitionError{Kind: DefinitionDuplicateOption, Name: string(keyPermissionClassifiers)}
+		}
+		// Re-register the exported view at the rig boundary. This rejects the
+		// zero value and freezes a new, independently owned registry view.
+		frozen, err := gate.NewPermissionClassifierSet(classifiers.Classifiers()...)
+		if err != nil {
+			return &DefinitionError{Kind: DefinitionInvalidPermissionClassifiers, Cause: err}
+		}
+		state.seen[keyPermissionClassifiers] = true
+		state.permissionClassifiers = frozen
+		for _, classifier := range frozen.Classifiers() {
+			state.hustles = append(state.hustles, classifier.Definition())
+		}
+		return nil
+	}
+}
+
+// WithPermissionReviewPolicyRevision records the immutable local decision
+// policy identity. The policy value itself is wired into the runtime in the
+// later review-integration phase; fingerprints need only this secret-free
+// revision.
+func WithPermissionReviewPolicyRevision(revision string) Option {
+	return func(state *definitionState) error {
+		if state.seen[keyPermissionReviewPolicyRevision] {
+			return &DefinitionError{Kind: DefinitionDuplicateOption, Name: string(keyPermissionReviewPolicyRevision)}
+		}
+		if !validPermissionReviewPolicyRevision(revision) {
+			return &DefinitionError{Kind: DefinitionInvalidPermissionReviewPolicy}
+		}
+		state.seen[keyPermissionReviewPolicyRevision] = true
+		state.permissionReviewPolicyRevision = revision
+		return nil
+	}
+}
+
+func validPermissionReviewPolicyRevision(revision string) bool {
+	return utf8.ValidString(revision) &&
+		revision != "" &&
+		strings.TrimSpace(revision) == revision &&
+		!strings.ContainsRune(revision, '\x00') &&
+		len(revision) <= gate.MaxPermissionReviewPolicyRevisionBytes
+}
 
 // MaxHustleQueued is the largest configured waiting capacity for either hustle
 // lane. The execution controller may allocate no queue larger than this bound.

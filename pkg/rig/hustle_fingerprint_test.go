@@ -1,16 +1,20 @@
 package rig
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
 	stream "github.com/looprig/inference/stream"
@@ -38,6 +42,7 @@ type rigHustleSpec struct {
 	timeout       time.Duration
 	limits        hustle.Limits
 	output        *inference.OutputSchema
+	evidence      *hustle.EvidenceToolPolicy
 }
 
 func rigHustleOutput() *inference.OutputSchema {
@@ -75,11 +80,232 @@ func defineRigHustle(t *testing.T, spec rigHustleSpec) hustle.Definition {
 	if spec.output != nil {
 		options = append(options, hustle.WithOutputSchema(*spec.output))
 	}
+	if spec.evidence != nil {
+		options = append(options, hustle.WithEvidenceTools(spec.evidence.Clone()))
+	}
 	definition, err := hustle.Define(options...)
 	if err != nil {
 		t.Fatalf("hustle.Define: %v", err)
 	}
 	return definition
+}
+
+type rigPermissionClassifier struct {
+	name       hustle.Name
+	revision   string
+	definition hustle.Definition
+}
+
+func (c rigPermissionClassifier) Name() hustle.Name             { return c.name }
+func (c rigPermissionClassifier) Revision() string              { return c.revision }
+func (c rigPermissionClassifier) Definition() hustle.Definition { return c.definition }
+func (rigPermissionClassifier) Applies(gate.PermissionReviewSubject) bool {
+	return true
+}
+func (rigPermissionClassifier) MarshalInput(gate.PermissionReviewSubject) (json.RawMessage, error) {
+	return json.RawMessage(`{}`), nil
+}
+func (rigPermissionClassifier) ValidateResult(gate.PermissionReviewSubject, hustle.Result) (gate.PermissionAssessment, error) {
+	return gate.PermissionAssessment{}, nil
+}
+
+func rigEvidencePolicy(name string) hustle.EvidenceToolPolicy {
+	return hustle.EvidenceToolPolicy{
+		Revision: "evidence-policy-v1",
+		Limits: hustle.ToolLoopLimits{
+			MaxRounds: 2, MaxCalls: 3, MaxCallsPerRound: 2,
+			MaxResultBytes: 1024, MaxEvidenceBytes: 2048,
+		},
+		Definitions: []tool.Definition{
+			tool.NewDefinition("definition-"+name, tool.RequiresWorkspace, nil),
+		},
+	}
+}
+
+func defineRigPermissionClassifier(t *testing.T, name hustle.Name, evidence hustle.EvidenceToolPolicy) gate.PermissionClassifier {
+	t.Helper()
+	return defineRigPermissionClassifierWith(t, name, "classifier-"+string(name)+"-v1", evidence, rigHustleOutput())
+}
+
+func defineRigPermissionClassifierWith(
+	t *testing.T,
+	name hustle.Name,
+	revision string,
+	evidence hustle.EvidenceToolPolicy,
+	output *inference.OutputSchema,
+) gate.PermissionClassifier {
+	t.Helper()
+	spec := defaultRigHustleSpec()
+	spec.name = name
+	spec.modelSource = hustle.ModelSourceNamed
+	spec.policyRev = revision
+	spec.evidence = &evidence
+	spec.output = output
+	definition := defineRigHustle(t, spec)
+	return rigPermissionClassifier{name: name, revision: spec.policyRev, definition: definition}
+}
+
+func rigPermissionClassifierSet(t *testing.T, classifiers ...gate.PermissionClassifier) gate.PermissionClassifierSet {
+	t.Helper()
+	set, err := gate.NewPermissionClassifierSet(classifiers...)
+	if err != nil {
+		t.Fatalf("gate.NewPermissionClassifierSet: %v", err)
+	}
+	return set
+}
+
+func TestPermissionReviewTopologyFingerprintSensitivity(t *testing.T) {
+	t.Parallel()
+	loopDefinition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
+	limits := validHustleLimits()
+	baseEvidence := rigEvidencePolicy("status")
+	baseClassifier := defineRigPermissionClassifier(t, "alpha", baseEvidence)
+	secondClassifier := defineRigPermissionClassifier(t, "zulu", rigEvidencePolicy("diff"))
+	baseSet := rigPermissionClassifierSet(t, baseClassifier, secondClassifier)
+	revision := func(set gate.PermissionClassifierSet, reviewPolicyRevision string) string {
+		projection, err := permissionReviewFingerprintFrom(set, reviewPolicyRevision)
+		if err != nil {
+			t.Fatalf("permissionReviewFingerprintFrom: %v", err)
+		}
+		return topologyRevisionWithHustlesAndPermissionReview(
+			[]loop.Definition{loopDefinition}, []string{"agent"}, "agent",
+			nil, limits, projection,
+		)
+	}
+	base := revision(baseSet, "review-policy-v1")
+
+	tests := []struct {
+		name   string
+		set    gate.PermissionClassifierSet
+		policy string
+	}{
+		{name: "review policy revision", set: baseSet, policy: "review-policy-v2"},
+		{name: "classifier order", set: rigPermissionClassifierSet(t, secondClassifier, baseClassifier), policy: "review-policy-v1"},
+		{name: "classifier revision", set: rigPermissionClassifierSet(t,
+			defineRigPermissionClassifierWith(t, "alpha", "classifier-alpha-v2", baseEvidence, rigHustleOutput()),
+			secondClassifier), policy: "review-policy-v1"},
+		{name: "evidence policy revision", set: rigPermissionClassifierSet(t,
+			defineRigPermissionClassifier(t, "alpha", func() hustle.EvidenceToolPolicy {
+				value := baseEvidence.Clone()
+				value.Revision = "evidence-policy-v2"
+				return value
+			}()), secondClassifier), policy: "review-policy-v1"},
+		{name: "produced tool metadata", set: rigPermissionClassifierSet(t,
+			defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("changed")), secondClassifier), policy: "review-policy-v1"},
+		{name: "definition requirements metadata", set: rigPermissionClassifierSet(t,
+			defineRigPermissionClassifier(t, "alpha", func() hustle.EvidenceToolPolicy {
+				value := baseEvidence.Clone()
+				value.Definitions[0] = tool.NewDefinition("definition-status", 0, nil)
+				return value
+			}()), secondClassifier), policy: "review-policy-v1"},
+		{name: "output schema digest", set: rigPermissionClassifierSet(t,
+			defineRigPermissionClassifierWith(t, "alpha", "classifier-alpha-v1", baseEvidence, func() *inference.OutputSchema {
+				value := rigHustleOutput().Clone()
+				value.Schema = json.RawMessage(`{"type":"object","properties":{"decision":{"type":"string"}},"required":["decision"],"additionalProperties":false}`)
+				return &value
+			}()), secondClassifier), policy: "review-policy-v1"},
+		{name: "output description digest", set: rigPermissionClassifierSet(t,
+			defineRigPermissionClassifierWith(t, "alpha", "classifier-alpha-v1", baseEvidence, func() *inference.OutputSchema {
+				value := rigHustleOutput().Clone()
+				value.Description = "Changed classifier output contract"
+				return &value
+			}()), secondClassifier), policy: "review-policy-v1"},
+	}
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			if got := revision(testCase.set, testCase.policy); got == base {
+				t.Fatalf("topology revision unchanged: %q", got)
+			}
+		})
+	}
+
+	for _, mutation := range []struct {
+		name   string
+		mutate func(*hustle.ToolLoopLimits)
+	}{
+		{name: "max rounds", mutate: func(v *hustle.ToolLoopLimits) { v.MaxRounds++ }},
+		{name: "max calls", mutate: func(v *hustle.ToolLoopLimits) { v.MaxCalls++ }},
+		{name: "max calls per round", mutate: func(v *hustle.ToolLoopLimits) { v.MaxCallsPerRound++ }},
+		{name: "max result bytes", mutate: func(v *hustle.ToolLoopLimits) { v.MaxResultBytes++ }},
+		{name: "max evidence bytes", mutate: func(v *hustle.ToolLoopLimits) { v.MaxEvidenceBytes++ }},
+	} {
+		mutation := mutation
+		t.Run(mutation.name, func(t *testing.T) {
+			t.Parallel()
+			evidence := baseEvidence.Clone()
+			mutation.mutate(&evidence.Limits)
+			changed := rigPermissionClassifierSet(t,
+				defineRigPermissionClassifier(t, "alpha", evidence), secondClassifier)
+			if got := revision(changed, "review-policy-v1"); got == base {
+				t.Fatalf("topology revision unchanged: %q", got)
+			}
+		})
+	}
+}
+
+func TestPermissionReviewFingerprintPreservesLegacyIdentityWhenDisabled(t *testing.T) {
+	t.Parallel()
+	definition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
+	legacy := topologyRevisionWithHustles(
+		[]loop.Definition{definition}, []string{"agent"}, "agent", nil, HustleLimits{},
+	)
+	got := topologyRevisionWithHustlesAndPermissionReview(
+		[]loop.Definition{definition}, []string{"agent"}, "agent", nil, HustleLimits{}, nil,
+	)
+	if got != legacy {
+		t.Fatalf("disabled permission review changed legacy identity: %q != %q", got, legacy)
+	}
+	fields := ConfigFingerprintFields{AgentKind: "legacy"}
+	legacyFingerprint := frozenFingerprintWithHustles(
+		fields, []loop.Definition{definition}, []string{"agent"}, "agent", nil, HustleLimits{},
+	)
+	gotFingerprint := frozenFingerprintWithPermissionReview(
+		fields, []loop.Definition{definition}, []string{"agent"}, "agent", nil, HustleLimits{}, nil,
+	)
+	if gotFingerprint != legacyFingerprint {
+		t.Fatalf("disabled review changed frozen fingerprint: %#v != %#v", gotFingerprint, legacyFingerprint)
+	}
+	legacyManifest := frozenManifestWithHustles(
+		fields, []loop.Definition{definition}, []string{"agent"}, "agent", nil, HustleLimits{},
+	)
+	gotManifest := frozenManifestWithPermissionReview(
+		fields, []loop.Definition{definition}, []string{"agent"}, "agent", nil, HustleLimits{}, nil,
+	)
+	if !reflect.DeepEqual(gotManifest, legacyManifest) {
+		t.Fatalf("disabled review changed frozen manifest: %#v != %#v", gotManifest, legacyManifest)
+	}
+}
+
+func TestPermissionReviewFingerprintMaterialIsDeterministicAndSecretFree(t *testing.T) {
+	t.Parallel()
+	evidence := rigEvidencePolicy("status")
+	classifier := defineRigPermissionClassifier(t, "alpha", evidence)
+	set := rigPermissionClassifierSet(t, classifier)
+	left, err := permissionReviewFingerprintFrom(set, "review-policy-v1")
+	if err != nil {
+		t.Fatalf("permissionReviewFingerprintFrom: %v", err)
+	}
+	right, err := permissionReviewFingerprintFrom(set, "review-policy-v1")
+	if err != nil {
+		t.Fatalf("permissionReviewFingerprintFrom: %v", err)
+	}
+	leftMaterial := canonicalPermissionReviewMaterial("base", *left)
+	rightMaterial := canonicalPermissionReviewMaterial("base", *right)
+	if !bytes.Equal(leftMaterial, rightMaterial) {
+		t.Fatal("identical permission review configuration encoded nondeterministically")
+	}
+	for _, forbidden := range [][]byte{
+		[]byte("raw prompt alpha"),
+		[]byte("Return the classifier result"),
+		[]byte(`"properties":{"allowed"`),
+		[]byte("credential-a"),
+	} {
+		if bytes.Contains(leftMaterial, forbidden) {
+			t.Fatalf("fingerprint material exposed forbidden raw input %q", forbidden)
+		}
+	}
 }
 
 func TestHustleTopologyFingerprintDeterministic(t *testing.T) {
