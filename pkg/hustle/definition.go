@@ -20,12 +20,26 @@ import (
 )
 
 const (
-	maxPayloadBytes                    = 16 * 1024 * 1024
-	maxOutputSchemaNameBytes           = 64
-	maxStructuredOutputRevisionBytes   = 128
-	maxEvidenceToolPolicyRevisionBytes = 128
-	maxToolLoopCount                   = 4096
-	reservedNamePrefix                 = "_looprig."
+	maxPayloadBytes                  = 16 * 1024 * 1024
+	maxOutputSchemaNameBytes         = 64
+	maxStructuredOutputRevisionBytes = 128
+	maxToolLoopCount                 = 4096
+	reservedNamePrefix               = "_looprig."
+)
+
+const (
+	// MaxEvidenceToolDefinitions bounds the number of definitions in one
+	// evidence policy before any catalog-sized allocation or digest work.
+	MaxEvidenceToolDefinitions = 64
+	// MaxEvidenceProducedToolNames bounds all concrete tool names declared by
+	// one evidence policy, including names spread across bundle definitions.
+	MaxEvidenceProducedToolNames = 128
+	// MaxEvidenceToolNameBytes bounds definition and concrete tool names by
+	// encoded UTF-8 bytes, not runes.
+	MaxEvidenceToolNameBytes = 64
+	// MaxEvidenceToolPolicyRevisionBytes bounds the canonical policy revision
+	// by encoded UTF-8 bytes.
+	MaxEvidenceToolPolicyRevisionBytes = 128
 )
 
 // Name is the stable registration name of one hustle definition.
@@ -206,7 +220,8 @@ func validateDescriptorEvidenceTools(descriptor DefinitionDescriptor) error {
 	if descriptor.EvidenceProducedToolNamesSHA256 == zeroDigest {
 		return invalidEvidenceTools("evidence_produced_tool_names_sha256")
 	}
-	if descriptor.EvidenceToolDefinitionCount <= 0 {
+	if descriptor.EvidenceToolDefinitionCount <= 0 ||
+		descriptor.EvidenceToolDefinitionCount > MaxEvidenceToolDefinitions {
 		return invalidEvidenceTools("evidence_tool_definition_count")
 	}
 	if err := validateToolLoopLimits(descriptor.EvidenceToolLimits); err != nil {
@@ -410,6 +425,14 @@ func WithOutputSchema(output inference.OutputSchema) Option {
 // WithEvidenceTools enables a bounded evidence-tool loop. The option owns a
 // defensive copy immediately; the zero policy explicitly leaves tools off.
 func WithEvidenceTools(policy EvidenceToolPolicy) Option {
+	if len(policy.Definitions) > MaxEvidenceToolDefinitions {
+		return func(options *definitionOptions) error {
+			if err := options.singleton("evidence_tools"); err != nil {
+				return err
+			}
+			return invalidEvidenceTools("definitions")
+		}
+	}
 	frozen := policy.Clone()
 	return func(options *definitionOptions) error {
 		if err := options.singleton("evidence_tools"); err != nil {
@@ -496,11 +519,12 @@ func validateEvidenceToolPolicy(policy EvidenceToolPolicy) error {
 	if err := validateToolLoopLimits(policy.Limits); err != nil {
 		return err
 	}
-	if len(policy.Definitions) == 0 {
+	if len(policy.Definitions) == 0 || len(policy.Definitions) > MaxEvidenceToolDefinitions {
 		return invalidEvidenceTools("definitions")
 	}
 	definitionNames := make(map[string]struct{}, len(policy.Definitions))
-	producedNames := make(map[string]struct{})
+	producedNames := make(map[string]struct{}, min(MaxEvidenceProducedToolNames, len(policy.Definitions)))
+	producedNameCount := 0
 	for index, definition := range policy.Definitions {
 		if nilToolDefinition(definition) {
 			return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "]")
@@ -520,6 +544,10 @@ func validateEvidenceToolPolicy(policy EvidenceToolPolicy) error {
 		if len(names) == 0 {
 			return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].produced_tool_names")
 		}
+		if len(names) > MaxEvidenceProducedToolNames-producedNameCount {
+			return invalidEvidenceTools("produced_tool_names")
+		}
+		producedNameCount += len(names)
 		for nameIndex, producedName := range names {
 			if !canonicalEvidenceToolName(producedName) {
 				return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].produced_tool_names[" + strconv.Itoa(nameIndex) + "]")
@@ -538,8 +566,8 @@ func evidencePolicyEnabled(policy EvidenceToolPolicy) bool {
 }
 
 func validateEvidencePolicyRevision(revision string) error {
-	if !utf8.ValidString(revision) || strings.TrimSpace(revision) == "" ||
-		len(revision) > maxEvidenceToolPolicyRevisionBytes || strings.ContainsRune(revision, '\x00') {
+	if !utf8.ValidString(revision) || revision == "" || revision != strings.TrimSpace(revision) ||
+		len(revision) > MaxEvidenceToolPolicyRevisionBytes || strings.ContainsRune(revision, '\x00') {
 		return invalidEvidenceTools("evidence_tool_policy_revision")
 	}
 	return nil
@@ -558,7 +586,8 @@ func validateToolLoopLimits(limits ToolLoopLimits) error {
 }
 
 func canonicalEvidenceToolName(name string) bool {
-	return utf8.ValidString(name) && name != "" && name == strings.TrimSpace(name) && !strings.ContainsRune(name, '\x00')
+	return utf8.ValidString(name) && name != "" && len(name) <= MaxEvidenceToolNameBytes &&
+		name == strings.TrimSpace(name) && !strings.ContainsRune(name, '\x00')
 }
 
 func nilToolDefinition(definition tool.Definition) bool {

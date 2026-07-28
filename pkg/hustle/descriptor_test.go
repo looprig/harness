@@ -77,6 +77,14 @@ func TestDefinitionDescriptorValidate(t *testing.T) {
 	evidenceMissingMarker.StructuredOutputWithTools = false
 	evidenceBadLimits := evidence
 	evidenceBadLimits.EvidenceToolLimits.MaxCallsPerRound = evidenceBadLimits.EvidenceToolLimits.MaxCalls + 1
+	evidenceTooManyDefinitions := evidence
+	evidenceTooManyDefinitions.EvidenceToolDefinitionCount = MaxEvidenceToolDefinitions + 1
+	evidenceLeadingRevisionSpace := evidence
+	evidenceLeadingRevisionSpace.EvidenceToolPolicyRevision = " evidence-policy-v1"
+	evidenceTrailingRevisionSpace := evidence
+	evidenceTrailingRevisionSpace.EvidenceToolPolicyRevision = "evidence-policy-v1 "
+	evidenceNULRevision := evidence
+	evidenceNULRevision.EvidenceToolPolicyRevision = "evidence\x00policy"
 	tests := []struct {
 		name    string
 		value   DefinitionDescriptor
@@ -123,6 +131,10 @@ func TestDefinitionDescriptorValidate(t *testing.T) {
 		{name: "evidence missing definition count", value: evidenceMissingCount, wantErr: true},
 		{name: "evidence missing structured marker", value: evidenceMissingMarker, wantErr: true},
 		{name: "evidence invalid limits", value: evidenceBadLimits, wantErr: true},
+		{name: "evidence too many definitions", value: evidenceTooManyDefinitions, wantErr: true},
+		{name: "evidence leading revision whitespace", value: evidenceLeadingRevisionSpace, wantErr: true},
+		{name: "evidence trailing revision whitespace", value: evidenceTrailingRevisionSpace, wantErr: true},
+		{name: "evidence NUL revision", value: evidenceNULRevision, wantErr: true},
 	}
 	for _, tt := range tests {
 		testCase := tt

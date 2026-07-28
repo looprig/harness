@@ -149,8 +149,11 @@ func TestEvidenceToolsRequireCompleteValidPolicy(t *testing.T) {
 	}{
 		{name: "missing revision", mutate: func(p *EvidenceToolPolicy) { p.Revision = "" }},
 		{name: "blank revision", mutate: func(p *EvidenceToolPolicy) { p.Revision = " \t" }},
+		{name: "leading whitespace revision", mutate: func(p *EvidenceToolPolicy) { p.Revision = " evidence-policy-v1" }},
+		{name: "trailing whitespace revision", mutate: func(p *EvidenceToolPolicy) { p.Revision = "evidence-policy-v1 " }},
+		{name: "nul revision", mutate: func(p *EvidenceToolPolicy) { p.Revision = "evidence\x00policy" }},
 		{name: "invalid utf8 revision", mutate: func(p *EvidenceToolPolicy) { p.Revision = "policy-\xff" }},
-		{name: "overlong revision", mutate: func(p *EvidenceToolPolicy) { p.Revision = strings.Repeat("r", maxEvidenceToolPolicyRevisionBytes+1) }},
+		{name: "overlong revision", mutate: func(p *EvidenceToolPolicy) { p.Revision = strings.Repeat("r", MaxEvidenceToolPolicyRevisionBytes+1) }},
 		{name: "zero rounds", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxRounds = 0 }},
 		{name: "zero calls", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxCalls = 0 }},
 		{name: "zero calls per round", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxCallsPerRound = 0 }},
@@ -216,7 +219,7 @@ func TestEvidenceToolsRequireCompleteValidPolicy(t *testing.T) {
 func TestEvidenceToolPolicyAcceptsExactBoundariesAndCurrentLoopModel(t *testing.T) {
 	t.Parallel()
 	policy := validEvidenceToolPolicy()
-	policy.Revision = strings.Repeat("r", maxEvidenceToolPolicyRevisionBytes)
+	policy.Revision = strings.Repeat("r", MaxEvidenceToolPolicyRevisionBytes)
 	policy.Limits = ToolLoopLimits{
 		MaxRounds:        maxToolLoopCount,
 		MaxCalls:         maxToolLoopCount,
@@ -229,6 +232,119 @@ func TestEvidenceToolPolicyAcceptsExactBoundariesAndCurrentLoopModel(t *testing.
 	if _, err := Define(options...); err != nil {
 		t.Fatalf("Define(exact evidence boundaries with current-loop model) error = %v", err)
 	}
+}
+
+func TestEvidenceToolPolicyCatalogBoundaries(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		definitions []tool.Definition
+		wantErr     bool
+	}{
+		{
+			name:        "exact definition limit",
+			definitions: evidenceDefinitions(MaxEvidenceToolDefinitions, 1),
+		},
+		{
+			name:        "definition limit plus one",
+			definitions: evidenceDefinitions(MaxEvidenceToolDefinitions+1, 1),
+			wantErr:     true,
+		},
+		{
+			name:        "exact aggregate produced-name limit",
+			definitions: evidenceDefinitions(MaxEvidenceToolDefinitions, MaxEvidenceProducedToolNames/MaxEvidenceToolDefinitions),
+		},
+		{
+			name:        "aggregate produced-name limit plus one",
+			definitions: evidenceDefinitionsWithProducedCount(MaxEvidenceToolDefinitions, MaxEvidenceProducedToolNames+1),
+			wantErr:     true,
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			policy := validEvidenceToolPolicy()
+			policy.Definitions = testCase.definitions
+			_, err := Define(append(validEvidenceOptionsWithoutPolicy(), WithEvidenceTools(policy))...)
+			if (err != nil) != testCase.wantErr {
+				t.Fatalf("Define() error = %v, wantErr %v", err, testCase.wantErr)
+			}
+			if testCase.wantErr {
+				var definitionErr *DefinitionError
+				if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionInvalidEvidenceTools || len(err.Error()) > 256 {
+					t.Fatalf("Define() error = %T %v, want bounded invalid evidence tools", err, err)
+				}
+			}
+		})
+	}
+}
+
+func TestEvidenceToolPolicyNameByteBoundaries(t *testing.T) {
+	t.Parallel()
+	exactASCII := strings.Repeat("a", MaxEvidenceToolNameBytes)
+	exactUTF8 := strings.Repeat("é", MaxEvidenceToolNameBytes/2)
+	overUTF8 := exactUTF8 + "a"
+	tests := []struct {
+		name           string
+		definitionName string
+		producedName   string
+		wantErr        bool
+	}{
+		{name: "exact ASCII definition and produced name", definitionName: exactASCII, producedName: exactASCII},
+		{name: "exact UTF-8 bytes", definitionName: exactUTF8, producedName: exactUTF8},
+		{name: "definition name one byte over", definitionName: overUTF8, producedName: "produced", wantErr: true},
+		{name: "produced name one byte over", definitionName: "definition", producedName: overUTF8, wantErr: true},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			policy := validEvidenceToolPolicy()
+			policy.Definitions = []tool.Definition{
+				tool.NewBundleDefinition(testCase.definitionName, []string{testCase.producedName}, tool.RequiresWorkspace, nil),
+			}
+			_, err := Define(append(validEvidenceOptionsWithoutPolicy(), WithEvidenceTools(policy))...)
+			if (err != nil) != testCase.wantErr {
+				t.Fatalf("Define() error = %v, wantErr %v", err, testCase.wantErr)
+			}
+		})
+	}
+}
+
+func evidenceDefinitions(definitionCount, producedPerDefinition int) []tool.Definition {
+	definitions := make([]tool.Definition, definitionCount)
+	for definitionIndex := range definitionCount {
+		produced := make([]string, producedPerDefinition)
+		for producedIndex := range producedPerDefinition {
+			produced[producedIndex] = fmt.Sprintf("tool-%03d-%03d", definitionIndex, producedIndex)
+		}
+		definitions[definitionIndex] = tool.NewBundleDefinition(
+			fmt.Sprintf("definition-%03d", definitionIndex),
+			produced,
+			tool.RequiresWorkspace,
+			nil,
+		)
+	}
+	return definitions
+}
+
+func evidenceDefinitionsWithProducedCount(definitionCount, producedCount int) []tool.Definition {
+	definitions := make([]tool.Definition, 0, definitionCount)
+	remaining := producedCount
+	for definitionIndex := range definitionCount {
+		count := remaining / (definitionCount - definitionIndex)
+		produced := make([]string, count)
+		for producedIndex := range count {
+			produced[producedIndex] = fmt.Sprintf("tool-%03d-%03d", definitionIndex, producedIndex)
+		}
+		definitions = append(definitions, tool.NewBundleDefinition(
+			fmt.Sprintf("definition-%03d", definitionIndex),
+			produced,
+			tool.RequiresWorkspace,
+			nil,
+		))
+		remaining -= count
+	}
+	return definitions
 }
 
 func TestZeroEvidenceToolPolicyPreservesToollessIdentity(t *testing.T) {
