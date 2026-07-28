@@ -290,6 +290,14 @@ the retained entry slice only once. Add a reducible input over 1 MiB and a
 4,096-entry adversarial test. Do not apply the final 1 MiB subject limit to an
 intermediate history that can be reduced below it.
 
+If a candidate re-addition exercises a byte or token limit after a different
+limit first triggered omission, merge every newly observed budget bit into
+`Applied` and `Material`. Recompute the bounded constant-size truncation
+projection until the closed three-bit budget mask reaches a fixed point before
+accepting the candidate or final output. Add cases where entry count first
+causes omission and omission-marker overhead then exercises total bytes or
+estimated tokens.
+
 Because the v1 omission marker records counts but no trustworthy omitted-kind
 inventory, every omission is conservatively material in v1. A future wire
 revision may distinguish non-material omission only by adding a typed,
@@ -376,6 +384,10 @@ even when a permissive parser could normalize it. Bound encoded input with:
 
 ```go
 const MaxPermissionReviewSubjectWireBytes = 1 << 20
+const MaxPermissionReviewRequestRequirements = 4096
+const MaxPermissionReviewRequestCandidates = 4096
+const MaxPermissionReviewRequestStringBytes = 1 << 20
+const MaxPermissionReviewRequestInputBytes = 1 << 20
 ```
 
 Keep the wire codec unexported because subjects cross the trusted classifier
@@ -416,6 +428,14 @@ func (s PermissionReviewSubject) Clone() PermissionReviewSubject
 func SubjectDigest(s PermissionReviewSubject) ([32]byte, error)
 ```
 
+Before any `Clone`, map construction in `tool.ValidateRequest`, private wire
+projection, or JSON marshal, run an allocation-free checked preflight over the
+original request and context. Reject more than 4,096 requirements, more than
+4,096 candidates in aggregate, a request string over 1 MiB, or more than 1 MiB
+of aggregate request string text. Validate the original context hard bounds
+before cloning it. Add adversarial tests using oversized slice lengths and
+large valid UTF-8 strings while keeping fixtures bounded enough for race tests.
+
 Digest the subject with `SubjectDigest` zeroed, then install and validate the
 computed value. Avoid a recursive digest. `NewPermissionReviewSubject` accepts
 only a zero incoming digest, validates every other field, clones all mutable
@@ -437,6 +457,8 @@ Strict built-context validation accepts only values the v1 builder can emit:
 - one omission marker has a positive omitted-entry count, an exact nonnegative
   omitted-byte count, and matching budget bits in both `Applied` and
   `Material`; and
+- omitted bytes do not exceed the checked product of omitted entries and the
+  2 MiB per-input-entry hard bound; and
 - masks/counters/markers cannot underreport one another.
 
 Add a private common-subject digest for conjunction. It uses the same complete
@@ -557,6 +579,7 @@ type PermissionAssessmentOutcome struct {
 
 func CombinePermissionAssessments(
     policy PermissionReviewPolicy,
+    classifiers PermissionClassifierSet,
     outcomes []PermissionAssessmentOutcome,
 ) ReviewDecision
 ```
@@ -604,6 +627,10 @@ Assessment requirements:
 
 Conjunction requirements:
 
+- combination receives the immutable registered classifier set and requires
+  exactly one outcome in registration order for every frozen classifier
+  revision;
+- missing, extra, reordered, duplicate, or invented revisions fail closed;
 - every outcome carries the exact classifier-specific subject used for
   applicability and inference;
 - every subject validates independently and its assessment basis must match it
@@ -672,7 +699,9 @@ Read each implementation's `Name`, `Revision`, and `Definition` exactly once
 during registration. Store an unexported immutable wrapper with those frozen
 values and the trusted behavior delegate. `Classifiers` returns wrapper
 interfaces; later mutation of the source object's metadata cannot change the
-registered values. Add call-count and post-registration drift tests.
+registered values. Each behavior delegation receives `subject.Clone()` so a
+classifier cannot mutate or race the caller's slice-backed subject. Add
+call-count, post-registration drift, and mutating-classifier ownership tests.
 
 **Step 5: Run GREEN and commit**
 

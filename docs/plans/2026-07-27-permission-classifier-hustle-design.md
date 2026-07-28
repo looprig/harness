@@ -345,6 +345,14 @@ fields that `tool.ValidateRequest` does not inspect for a grant-free request.
 Canonical hashing never relies on `encoding/json`'s replacement of invalid
 UTF-8, so distinct typed inputs cannot collapse to one digest.
 
+Before cloning or constructing a wire projection, subject construction performs
+an allocation-free checked preflight over the caller-owned request and context.
+The request domain is independently bounded to 4,096 requirements, 4,096
+candidates in aggregate, 1 MiB in any one request string, and 1 MiB of aggregate
+request string text. Inputs outside those bounds fail closed before a second
+large slice or string tree can be allocated. Context hard bounds are likewise
+checked on the original typed value before cloning.
+
 Each classifier receives its own subject: `ClassifierRevision` and therefore
 `SubjectDigest` are classifier-specific. Conjunctive combination computes a
 second private common-subject digest with only those two fields neutralized.
@@ -437,6 +445,12 @@ and re-encode the growing history for every candidate. An intermediate context
 may exceed the final 1 MiB ceiling when deterministic omission can reduce it
 below the configured limit.
 
+Every budget constraint encountered while testing candidate retention is
+recorded in `Applied` and `Material`. Because adding a mask bit changes the
+canonical context size, the selector converges the closed three-bit budget mask
+before accepting a candidate or final output; it never reports only the first
+constraint that triggered omission.
+
 Truncation preserves both prefix and suffix when useful and emits an explicit
 typed omission entry. It never silently drops content.
 
@@ -457,6 +471,8 @@ current intent or required evidence. Every applied non-budget mask bit must be
 explained by an actual truncated entry; the active-action bit cannot appear in
 a successfully built v1 context. Omission requires a positive entry count, but
 its exact omitted-byte count may be zero when omitted entries were empty.
+Strict provenance also requires omitted bytes to be distributable across the
+reported omitted entry count under the 2 MiB per-input-entry hard bound.
 
 ### 8.5 Subject
 
@@ -605,6 +621,12 @@ neutralizes only classifier revision and subject digest. Any difference in
 gate, tool execution, prepared request, context, gate policy, or security
 ceiling leaves the gate human.
 
+Combination also receives the immutable registered classifier set. It requires
+exactly one ordered outcome for every frozen classifier revision; missing,
+extra, reordered, duplicate, or invented revisions leave the gate human.
+This prevents a caller from manufacturing eligibility by omitting an enabled
+classifier that failed or required human review.
+
 Decision combination is conjunctive:
 
 1. At least one enabled classifier must apply.
@@ -617,6 +639,10 @@ Decision combination is conjunctive:
 
 An allow result cannot widen the policy or evidence toolset used by another
 classifier.
+
+Frozen registry wrappers pass a deep clone of the subject to `Applies`,
+`MarshalInput`, and `ValidateResult`. A buggy trusted classifier therefore
+cannot mutate or race the caller's canonical subject through slice aliases.
 
 ## 12. Tool-using Hustle extension
 
