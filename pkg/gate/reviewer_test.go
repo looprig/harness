@@ -533,7 +533,7 @@ func permissionEvidencePolicy() hustle.EvidenceToolPolicy {
 				Name: "permission-evidence", Desc: "read permission evidence",
 				Schema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
 			}},
-			func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+			func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 				return []tool.InvokableTool{&permissionEvidenceTool{}}, nil
 			},
 		)},

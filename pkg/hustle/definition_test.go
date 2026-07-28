@@ -132,7 +132,7 @@ func validEvidenceToolPolicy() EvidenceToolPolicy {
 	}
 }
 
-func testEvidenceDefinition(name string, requirements tool.Requirements, names []string, factory tool.Factory) tool.Definition {
+func testEvidenceDefinition(name string, requirements tool.Requirements, names []string, factory tool.EvidenceFactory) tool.Definition {
 	infos := make([]tool.ToolInfo, len(names))
 	for i, produced := range names {
 		infos[i] = tool.ToolInfo{

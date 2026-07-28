@@ -77,17 +77,40 @@ func TestReadWorkspaceBindingIsStructurallyReadOnly(t *testing.T) {
 	}
 }
 
-func TestEvidenceDefinitionReceivesOnlyReadWorkspaceBinding(t *testing.T) {
+func TestEvidenceFactoryBindingsExposeOnlyInvocationOriginAndReadWorkspace(t *testing.T) {
+	t.Parallel()
+
+	bindingType := reflect.TypeOf(tool.EvidenceFactoryBindings{})
+	want := []struct {
+		name string
+		typ  reflect.Type
+	}{
+		{name: "SessionID", typ: reflect.TypeOf(uuid.UUID{})},
+		{name: "LoopID", typ: reflect.TypeOf(uuid.UUID{})},
+		{name: "ReadWorkspace", typ: reflect.TypeOf((*tool.ReadWorkspaceBinding)(nil))},
+	}
+	if bindingType.NumField() != len(want) {
+		t.Fatalf("EvidenceFactoryBindings fields = %d, want exactly %d", bindingType.NumField(), len(want))
+	}
+	for index, expected := range want {
+		field := bindingType.Field(index)
+		if field.Name != expected.name || field.Type != expected.typ || !field.IsExported() {
+			t.Fatalf("EvidenceFactoryBindings field %d = %#v, want exported %s %v", index, field, expected.name, expected.typ)
+		}
+	}
+}
+
+func TestEvidenceDefinitionReceivesOnlyEvidenceFactoryBindings(t *testing.T) {
 	t.Parallel()
 
 	bindings := validBindings()
 	bindings.ReadWorkspace = &tool.ReadWorkspaceBinding{Root: "/canonical/workspace"}
-	var got tool.Bindings
+	var got tool.EvidenceFactoryBindings
 	definition := tool.NewEvidenceDefinition(
 		"workspace-status",
 		tool.RequiresWorkspaceRead,
 		[]tool.ToolInfo{{Name: "workspace-status", Desc: "read status", Schema: json.RawMessage(`{"type":"object"}`)}},
-		func(_ context.Context, bound tool.Bindings) ([]tool.InvokableTool, error) {
+		func(_ context.Context, bound tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 			got = bound
 			return []tool.InvokableTool{&reportedNameTool{info: &tool.ToolInfo{Name: "workspace-status"}}}, nil
 		},
@@ -104,9 +127,6 @@ func TestEvidenceDefinitionReceivesOnlyReadWorkspaceBinding(t *testing.T) {
 	}
 	if got.ReadWorkspace == bindings.ReadWorkspace {
 		t.Fatal("factory received caller's ReadWorkspaceBinding pointer")
-	}
-	if got.Workspace != nil || got.Delegate != nil || got.ExtraTools != nil {
-		t.Fatalf("factory received forbidden capabilities: Workspace=%v Delegate=%v ExtraTools=%v", got.Workspace, got.Delegate, got.ExtraTools)
 	}
 	got.ReadWorkspace.Root = "/mutated"
 	if bindings.ReadWorkspace.Root != "/canonical/workspace" {
@@ -179,7 +199,7 @@ func TestEvidenceDefinitionFreezesToolInfos(t *testing.T) {
 		{Name: "status", Desc: "read status", Schema: schema},
 		{Name: "diff", Desc: "read diff", Schema: json.RawMessage(`{"type":"object"}`)},
 	}
-	definition := tool.NewEvidenceDefinition("git-evidence", tool.RequiresWorkspaceRead, infos, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+	definition := tool.NewEvidenceDefinition("git-evidence", tool.RequiresWorkspaceRead, infos, func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 		return []tool.InvokableTool{
 			&reportedNameTool{info: &tool.ToolInfo{Name: "diff"}},
 			&reportedNameTool{info: &tool.ToolInfo{Name: "status"}},
@@ -247,7 +267,7 @@ func TestDefinitionStaticToolInfoValidation(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			definition := tool.NewEvidenceDefinition("evidence", 0, tt.infos, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+			definition := tool.NewEvidenceDefinition("evidence", 0, tt.infos, func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 				return []tool.InvokableTool{&reportedNameTool{info: &tool.ToolInfo{Name: "status"}}}, nil
 			})
 			_, err := definition.Build(context.Background(), validBindings())
@@ -276,7 +296,7 @@ func TestEvidenceDefinitionRejectsMutationCapabilities(t *testing.T) {
 				"status",
 				requirements,
 				[]tool.ToolInfo{{Name: "status"}},
-				func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+				func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 					called = true
 					return []tool.InvokableTool{&reportedNameTool{info: &tool.ToolInfo{Name: "status"}}}, nil
 				},

@@ -936,7 +936,9 @@ Tests must prove:
 
 - evidence definitions declare frozen model-facing `ToolInfo` metadata whose
   names exactly match produced names;
-- read-workspace-required definitions receive only
+- read-workspace-required definitions use the distinct
+  `tool.EvidenceFactory` seam and receive only
+  `tool.EvidenceFactoryBindings` with invocation session/loop IDs and a
   `tool.ReadWorkspaceBinding`;
 - generic mutation-capable workspace requirements are rejected and the
   evidence factory cannot structurally reach `WorkspaceCoordinator`,
@@ -966,12 +968,15 @@ Tests must prove:
 **Step 3: Extend Hustle bindings narrowly**
 
 Add `tool.RequiresWorkspaceRead`, a sealed evidence-definition constructor with
-frozen `ToolInfo`, and `tool.ReadWorkspaceBinding` containing only the canonical
-root. `hustle.Definition.Bind` freezes configuration and model resolution but
-does not build evidence tools. The sealed bound definition exposes a
-run-scoped evidence bind method that requires the originating session/loop and
-read-only workspace binding, builds concrete tools, and compares them to frozen
-metadata. Never pass `tool.WorkspaceBinding`, session, gate registrar, loop
+frozen `ToolInfo`, and a distinct `tool.EvidenceFactory` callback. Its
+`tool.EvidenceFactoryBindings` has exactly the originating `SessionID`,
+`LoopID`, and a `tool.ReadWorkspaceBinding` containing only the canonical root;
+it is not an alias for and cannot accept generic `tool.Bindings`.
+`hustle.Definition.Bind` freezes configuration and model resolution but does
+not build evidence tools. The sealed bound definition exposes a run-scoped
+evidence bind method that requires the originating session/loop and read-only
+workspace binding, builds concrete tools, and compares them to frozen metadata.
+Never pass `tool.WorkspaceBinding`, session controller, gate registrar, loop
 controller, rule writer, grant issuer, observations, extra tools, or delegate
 controller.
 

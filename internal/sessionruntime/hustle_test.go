@@ -241,7 +241,7 @@ func (sessionEvidencePermit) Release() {}
 
 func sessionEvidenceDefinition(
 	t *testing.T,
-	factory tool.Factory,
+	factory tool.EvidenceFactory,
 ) hustle.Definition {
 	t.Helper()
 	definition, err := hustle.Define(
@@ -298,16 +298,13 @@ func TestSessionDefersEvidenceBindingAndHonorsExplicitRunOrigin(t *testing.T) {
 	}}}
 	builds := 0
 	wantLoopID := rootLoopID
-	definition := sessionEvidenceDefinition(t, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+	definition := sessionEvidenceDefinition(t, func(_ context.Context, bindings tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 		builds++
 		if bindings.SessionID != sessionID || bindings.LoopID != wantLoopID {
 			t.Fatalf("tool bindings IDs = %v/%v, want %v/%v", bindings.SessionID, bindings.LoopID, sessionID, wantLoopID)
 		}
 		if bindings.ReadWorkspace == nil || bindings.ReadWorkspace.Root != workspaceRoot {
 			t.Fatalf("read workspace binding = %#v", bindings.ReadWorkspace)
-		}
-		if bindings.Workspace != nil || bindings.Delegate != nil || bindings.ExtraTools != nil {
-			t.Fatalf("evidence binding was not attenuated: %#v", bindings)
 		}
 		return []tool.InvokableTool{concrete}, nil
 	})
@@ -360,7 +357,7 @@ func TestSessionRunBindingRejectsEvidenceSchemaDriftBeforeInference(t *testing.T
 		{Name: "workspace-status", Desc: "read workspace", Schema: json.RawMessage(`{"type":"object","properties":{"changed":{"type":"boolean"}},"required":["changed"],"additionalProperties":false}`)},
 	}}
 	builds := 0
-	definition := sessionEvidenceDefinition(t, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+	definition := sessionEvidenceDefinition(t, func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 		builds++
 		return []tool.InvokableTool{concrete}, nil
 	})

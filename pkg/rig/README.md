@@ -145,7 +145,11 @@ definition digest, structured-output digest/revision, evidence definition and
 produced-name digests, and every evidence-loop bound. Classifier order is
 significant because combination is ordered. Evidence policies accept only
 sealed `tool.NewEvidenceDefinition` definitions with frozen `ToolInfo`
-metadata. Canonical static descriptions and compact portable schemas contribute
+metadata. Their factories use `tool.EvidenceFactoryBindings`, whose complete
+public capability surface is the invocation session/loop identity and an
+optional root-only `tool.ReadWorkspaceBinding`; generic workspace mutation,
+observations, delegation, gate/grant/control state, and extra tools are not in
+the factory API. Canonical static descriptions and compact portable schemas contribute
 to the evidence catalog digest, so either can change topology identity before a
 session is persisted or restored. The fingerprint stores only those versioned
 digests: raw prompts, schemas, descriptions, model clients and credentials,

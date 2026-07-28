@@ -24,6 +24,11 @@ implementations (bash, web, …) live in the sibling
 - **`Definition`** — a design-time binding of a tool name to a factory
   that builds live `InvokableTool` values from `tool.Bindings`. Loops
   hold `Definition` values; the runtime `Bind`s them at loop start.
+- **`NewEvidenceDefinition`** — a sealed, read-only definition with
+  frozen `ToolInfo`. Its `EvidenceFactory` receives only invocation
+  `SessionID`, `LoopID`, and an optional root-only
+  `ReadWorkspaceBinding`; the API does not expose mutation,
+  observations, delegation, gates, grants, control, or extra tools.
 - **`ToolMiddleware`** — wraps each invocation (observability, retry,
   redaction, …) with a `func(next InvokableTool) InvokableTool` shape.
 - **`CallPreparer`** — the tool-owned preparation boundary. Decodes and
@@ -60,6 +65,24 @@ func (t MyTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolRe
     return tool.TextResult("done"), nil
 }
 ```
+
+Evidence collectors use the narrower factory boundary:
+
+```go
+definition := tool.NewEvidenceDefinition(
+    "workspace-status",
+    tool.RequiresWorkspaceRead,
+    []tool.ToolInfo{statusInfo},
+    func(ctx context.Context, bindings tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
+        return []tool.InvokableTool{
+            newStatusTool(bindings.ReadWorkspace.Root),
+        }, nil
+    },
+)
+```
+
+The read-workspace pointer is a per-build copy. Evidence factories must still
+treat the binding as invocation-scoped and must not retain it after returning.
 
 If your tool is effectful, implement `CallPreparer` so the gate gets a
 typed request to decide on:

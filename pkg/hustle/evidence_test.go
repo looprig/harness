@@ -90,8 +90,11 @@ func bindableEvidenceDefinition(
 		}
 		static[i] = tool.NewEvidenceDefinition(
 			definition.Name(), 0, infos,
-			func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
-				return definition.Build(ctx, bindings)
+			func(ctx context.Context, bindings tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
+				return definition.Build(ctx, tool.Bindings{
+					SessionID: bindings.SessionID,
+					LoopID:    bindings.LoopID,
+				})
 			},
 		)
 	}
@@ -137,16 +140,13 @@ func TestBindEvidenceToolsAttenuatesBindingsAndFreezesIdentity(t *testing.T) {
 		"workspace-status",
 		tool.RequiresWorkspaceRead,
 		[]tool.ToolInfo{staticInfo},
-		func(_ context.Context, got tool.Bindings) ([]tool.InvokableTool, error) {
+		func(_ context.Context, got tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 			builds++
 			if got.SessionID != sessionID || got.LoopID != loopID {
 				t.Fatalf("tool binding IDs = %v/%v, want %v/%v", got.SessionID, got.LoopID, sessionID, loopID)
 			}
 			if got.ReadWorkspace == nil || got.ReadWorkspace.Root != workspace.Root {
 				t.Fatalf("read workspace binding = %#v, want root %q", got.ReadWorkspace, workspace.Root)
-			}
-			if got.Workspace != nil || got.Delegate != nil || got.ExtraTools != nil {
-				t.Fatalf("evidence tool received broader bindings: %#v", got)
 			}
 			return []tool.InvokableTool{concrete}, nil
 		},
@@ -220,16 +220,13 @@ func TestEvidenceToolsBindPerInvocationOrigin(t *testing.T) {
 			Name: "workspace-status", Desc: "read workspace status",
 			Schema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
 		}},
-		func(_ context.Context, got tool.Bindings) ([]tool.InvokableTool, error) {
+		func(_ context.Context, got tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 			builds++
 			if got.SessionID != sessionID || got.LoopID != requestedLoopID {
 				t.Fatalf("tool binding IDs = %v/%v, want %v/%v", got.SessionID, got.LoopID, sessionID, requestedLoopID)
 			}
 			if got.ReadWorkspace == nil || got.ReadWorkspace.Root != "/workspace" {
 				t.Fatalf("read workspace binding = %#v", got.ReadWorkspace)
-			}
-			if got.Workspace != nil || got.Delegate != nil || got.ExtraTools != nil {
-				t.Fatalf("evidence tool received broader bindings: %#v", got)
 			}
 			return []tool.InvokableTool{concrete}, nil
 		},
@@ -263,7 +260,7 @@ func TestBindEvidenceToolIdentityCoversDescriptionAndCanonicalSchema(t *testing.
 		}}}
 		definition := bindableEvidenceDefinition(t, tool.NewEvidenceDefinition(
 			"status", 0, []tool.ToolInfo{{Name: "status", Desc: desc, Schema: schema}},
-			func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+			func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 				return []tool.InvokableTool{concrete}, nil
 			},
 		))
@@ -442,7 +439,7 @@ func TestBindEvidenceToolsRejectsInfoDriftAndPreservesToollessBind(t *testing.T)
 		"status", 0, []tool.ToolInfo{{
 			Name: "status", Desc: "first",
 			Schema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
-		}}, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		}}, func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 			return []tool.InvokableTool{drifting}, nil
 		},
 	))
@@ -495,7 +492,7 @@ func TestBindEvidenceToolsRejectsConcreteMetadataDriftFromStaticCatalog(t *testi
 			concrete := &evidenceToolStub{infos: []*tool.ToolInfo{&testCase.concrete}}
 			definition := bindableEvidenceDefinition(t, tool.NewEvidenceDefinition(
 				"status", 0, []tool.ToolInfo{testCase.static},
-				func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+				func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 					return []tool.InvokableTool{concrete}, nil
 				},
 			))
@@ -516,7 +513,7 @@ func bindSingleEvidenceTool(t *testing.T, info *tool.ToolInfo) ([]BoundEvidenceT
 	concrete := &evidenceToolStub{infos: []*tool.ToolInfo{info}}
 	policy := validEvidenceToolPolicy()
 	policy.Definitions = []tool.Definition{tool.NewEvidenceDefinition(
-		info.Name, 0, []tool.ToolInfo{info.Clone()}, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		info.Name, 0, []tool.ToolInfo{info.Clone()}, func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 			return []tool.InvokableTool{concrete}, nil
 		},
 	)}
@@ -596,7 +593,7 @@ func bindEvidenceCatalogOfSize(t *testing.T, aggregateSize int) ([]BoundEvidence
 	}
 	policy := validEvidenceToolPolicy()
 	policy.Definitions = []tool.Definition{tool.NewEvidenceDefinition(
-		"aggregate", 0, staticInfos, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		"aggregate", 0, staticInfos, func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 			return tools, nil
 		},
 	)}

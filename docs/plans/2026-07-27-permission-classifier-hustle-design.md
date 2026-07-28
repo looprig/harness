@@ -714,12 +714,15 @@ Every build validates the concrete `ToolInfo` against the frozen static
 metadata before inference. Static metadata drift changes topology/restore
 identity; factory drift under unchanged metadata fails that review closed.
 
-Evidence definitions use a dedicated read-only workspace requirement and
-receive a `ReadWorkspaceBinding` containing only the canonical root needed for
-read evidence. The binding type has no mutation coordinator, observations,
-delegate controller, extra tools, session, gate, rule, grant, or loop-control
-capability. Generic mutation-capable `RequiresWorkspace` definitions are
-invalid in evidence policies.
+Evidence definitions use a dedicated read-only workspace requirement. Their
+distinct `EvidenceFactory` receives `EvidenceFactoryBindings`, whose exact
+public fields are the invocation `SessionID`, invocation `LoopID`, and a
+`ReadWorkspaceBinding` containing only the canonical root needed for read
+evidence. Neither factory nor binding is the generic `tool.Factory` /
+`tool.Bindings` seam: the evidence API has no mutation coordinator,
+observations, delegate controller, extra tools, session controller, gate, rule,
+grant, or loop-control capability. Generic mutation-capable
+`RequiresWorkspace` definitions are invalid in evidence policies.
 
 ### 12.3 Model capability
 

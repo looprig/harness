@@ -237,13 +237,29 @@ type Definition interface {
 // not return nil tools.
 type Factory func(context.Context, Bindings) ([]InvokableTool, error)
 
+// EvidenceFactoryBindings contains the complete capability set supplied to an
+// evidence factory for one invocation origin. It deliberately has no generic
+// workspace, mutation coordinator, observations, delegation, session, gate,
+// grant, control, or extra-tool capability.
+type EvidenceFactoryBindings struct {
+	SessionID     uuid.UUID
+	LoopID        uuid.UUID
+	ReadWorkspace *ReadWorkspaceBinding
+}
+
+// EvidenceFactory builds concrete, read-only evidence tools for one invocation
+// origin. It may be called concurrently and must not retain or mutate bindings
+// after returning.
+type EvidenceFactory func(context.Context, EvidenceFactoryBindings) ([]InvokableTool, error)
+
 type factoryDefinition struct {
-	name          string
-	producedNames []string
-	toolInfos     []ToolInfo
-	requirements  Requirements
-	factory       Factory
-	evidence      bool
+	name            string
+	producedNames   []string
+	toolInfos       []ToolInfo
+	requirements    Requirements
+	factory         Factory
+	evidenceFactory EvidenceFactory
+	evidence        bool
 }
 
 // NewDefinition returns an immutable, factory-backed definition. Validation is
@@ -271,19 +287,19 @@ func NewBundleDefinition(name string, producedToolNames []string, requirements R
 //
 // Validation is performed by Build, matching NewDefinition and
 // NewBundleDefinition's declarative construction behavior.
-func NewEvidenceDefinition(name string, requirements Requirements, infos []ToolInfo, factory Factory) Definition {
+func NewEvidenceDefinition(name string, requirements Requirements, infos []ToolInfo, factory EvidenceFactory) Definition {
 	frozen := cloneToolInfos(infos)
 	producedNames := make([]string, len(frozen))
 	for i := range frozen {
 		producedNames[i] = frozen[i].Name
 	}
 	return &factoryDefinition{
-		name:          name,
-		producedNames: producedNames,
-		toolInfos:     frozen,
-		requirements:  requirements,
-		factory:       factory,
-		evidence:      true,
+		name:            name,
+		producedNames:   producedNames,
+		toolInfos:       frozen,
+		requirements:    requirements,
+		evidenceFactory: factory,
+		evidence:        true,
 	}
 }
 
@@ -311,7 +327,7 @@ func (d *factoryDefinition) Build(ctx context.Context, bindings Bindings) ([]Inv
 	if strings.TrimSpace(d.name) == "" {
 		return nil, &InvalidDefinitionError{Field: "name"}
 	}
-	if d.factory == nil {
+	if (!d.evidence && d.factory == nil) || (d.evidence && d.evidenceFactory == nil) {
 		return nil, &InvalidDefinitionError{Field: "factory"}
 	}
 	if ctx == nil {
@@ -335,7 +351,12 @@ func (d *factoryDefinition) Build(ctx context.Context, bindings Bindings) ([]Inv
 	if err := validateBindings(d.requirements, bindings); err != nil {
 		return nil, err
 	}
-	built, err := d.factory(ctx, attenuateBindings(d.requirements, bindings))
+	var built []InvokableTool
+	if d.evidence {
+		built, err = d.evidenceFactory(ctx, evidenceFactoryBindings(d.requirements, bindings))
+	} else {
+		built, err = d.factory(ctx, attenuateBindings(d.requirements, bindings))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -357,6 +378,18 @@ func (d *factoryDefinition) Build(ctx context.Context, bindings Bindings) ([]Inv
 	result := make([]InvokableTool, len(built))
 	copy(result, built)
 	return result, nil
+}
+
+func evidenceFactoryBindings(requirements Requirements, bindings Bindings) EvidenceFactoryBindings {
+	narrow := EvidenceFactoryBindings{
+		SessionID: bindings.SessionID,
+		LoopID:    bindings.LoopID,
+	}
+	if requirements&RequiresWorkspaceRead != 0 {
+		readWorkspace := *bindings.ReadWorkspace
+		narrow.ReadWorkspace = &readWorkspace
+	}
+	return narrow
 }
 
 func normalizeDeclaredToolNames(names []string) ([]string, error) {
