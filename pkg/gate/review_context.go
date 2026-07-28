@@ -496,6 +496,7 @@ func applyReviewContextBudgets(
 	keep := make([]bool, len(context.Entries))
 	keep[currentUser] = true
 	keep[activeAction] = true
+	retainedOptionals := make([]int, 0, len(context.Entries)-2)
 	retainedEntries := 2
 	requiredContentBytes, ok := checkedReviewContextAdd(
 		len(context.Entries[currentUser].Content),
@@ -631,6 +632,7 @@ func applyReviewContextBudgets(
 			break
 		}
 		keep[i] = true
+		retainedOptionals = append(retainedOptionals, i)
 		retainedEntries++
 		nextRequiredJSONBytes, requiredJSONOK := checkedReviewContextAdd(
 			requiredJSONBytes,
@@ -650,7 +652,6 @@ func applyReviewContextBudgets(
 		requiredContentBytes = nextRequiredContentBytes
 		omittedEntries = candidateOmittedEntries
 		omittedBytes = candidateOmittedBytes
-		marker = candidateMarker
 	}
 
 	if omittedEntries <= 0 {
@@ -659,42 +660,77 @@ func applyReviewContextBudgets(
 			ReviewValidationInvalid,
 		)
 	}
-	markerJSONBytes, err = reviewContextEntryEncodedSize(
-		reviewContextOmissionEntry(marker),
-	)
-	if err != nil {
-		return ReviewContext{}, err
-	}
-	finalEntriesJSONBytes, entriesOK := checkedReviewContextAdd(
-		requiredJSONBytes,
-		markerJSONBytes,
-	)
-	finalContentBytes, contentOK := checkedReviewContextAdd(
-		requiredContentBytes,
-		len(marker),
-	)
-	if !entriesOK || !contentOK {
-		return ReviewContext{}, reviewContextError(
-			ReviewValidationFieldContextPolicy,
-			ReviewValidationOutOfBounds,
+	for {
+		marker = reviewContextOmissionMarker(omittedEntries, omittedBytes)
+		if len(marker) > policy.MaxBlockBytes {
+			return ReviewContext{}, reviewContextError(
+				ReviewValidationFieldContextPolicy,
+				ReviewValidationOutOfBounds,
+			)
+		}
+		markerJSONBytes, err = reviewContextEntryEncodedSize(
+			reviewContextOmissionEntry(marker),
 		)
-	}
-	var finalFailures ReviewTruncationMask
-	applied, finalFailures = plan.convergedFailures(
-		retainedEntries+1,
-		finalEntriesJSONBytes,
-		finalContentBytes,
-		context.Truncation,
-		applied,
-		omittedEntries,
-		omittedBytes,
-		policy,
-	)
-	if finalFailures != 0 {
-		return ReviewContext{}, reviewContextError(
-			ReviewValidationFieldContextPolicy,
-			ReviewValidationOutOfBounds,
+		if err != nil {
+			return ReviewContext{}, err
+		}
+		finalEntriesJSONBytes, finalEntriesOK := checkedReviewContextAdd(
+			requiredJSONBytes,
+			markerJSONBytes,
 		)
+		finalContentBytes, finalContentOK := checkedReviewContextAdd(
+			requiredContentBytes,
+			len(marker),
+		)
+		if !finalEntriesOK || !finalContentOK {
+			return ReviewContext{}, reviewContextError(
+				ReviewValidationFieldContextPolicy,
+				ReviewValidationOutOfBounds,
+			)
+		}
+		var finalFailures ReviewTruncationMask
+		applied, finalFailures = plan.convergedFailures(
+			retainedEntries+1,
+			finalEntriesJSONBytes,
+			finalContentBytes,
+			context.Truncation,
+			applied,
+			omittedEntries,
+			omittedBytes,
+			policy,
+		)
+		if finalFailures == 0 {
+			break
+		}
+		if len(retainedOptionals) == 0 {
+			return ReviewContext{}, reviewContextError(
+				ReviewValidationFieldContextPolicy,
+				ReviewValidationOutOfBounds,
+			)
+		}
+
+		// Selection retains optionals newest-first. Remove the oldest
+		// retained optional when provenance growth invalidates that selection
+		// so the newest feasible suffix survives.
+		last := len(retainedOptionals) - 1
+		index := retainedOptionals[last]
+		retainedOptionals = retainedOptionals[:last]
+		keep[index] = false
+		retainedEntries--
+		requiredJSONBytes -= plan.entryJSONBytes[index]
+		requiredContentBytes -= len(context.Entries[index].Content)
+		omittedEntries++
+		var omittedBytesOK bool
+		omittedBytes, omittedBytesOK = checkedReviewContextAdd(
+			omittedBytes,
+			len(context.Entries[index].Content),
+		)
+		if !omittedBytesOK {
+			return ReviewContext{}, reviewContextError(
+				ReviewValidationFieldContextPolicy,
+				ReviewValidationOutOfBounds,
+			)
+		}
 	}
 	output := reviewContextBudgetCandidate(
 		context,

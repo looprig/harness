@@ -701,6 +701,38 @@ func TestReviewContextCombinedBudgetsRecordEveryExercisedLimit(t *testing.T) {
 	}
 }
 
+func TestReviewContextRollsBackRetainedOptionalWhenLaterFailureEnlargesProvenance(t *testing.T) {
+	t.Parallel()
+
+	input := budgetReviewContext(30)
+	policy := validReviewContextPolicy()
+	policy.MaxEntries = 4
+
+	entryBounded, err := gate.BuildReviewContext(input, policy)
+	if err != nil {
+		t.Fatalf("BuildReviewContext(entry bound) error = %v", err)
+	}
+	priorMask := gate.ReviewTruncationEntryCount | gate.ReviewTruncationTotalBytes
+	entryBounded.Truncation.Applied = priorMask
+	entryBounded.Truncation.Material = priorMask
+	policy.MaxBytes = canonicalContextBytes(t, entryBounded)
+	policy.MaxEstimatedTokens = estimatedReviewTokens(input.Entries)
+
+	got, err := gate.BuildReviewContext(input, policy)
+	if err != nil {
+		t.Fatalf("BuildReviewContext() error = %v, want rollback to a valid more-omitted context", err)
+	}
+	wantMask := priorMask | gate.ReviewTruncationEstimatedTokens
+	assertBudgetedReviewContext(t, got, wantMask, 3, 90, []gate.ReviewContextKind{
+		gate.ReviewContextKindOmission,
+		gate.ReviewContextKindUserMessage,
+		gate.ReviewContextKindAssistantToolRequest,
+	})
+	if size := canonicalContextBytes(t, got); size > policy.MaxBytes {
+		t.Errorf("canonical context bytes = %d, want <= %d", size, policy.MaxBytes)
+	}
+}
+
 func TestReviewContextEntryBudgetRecordsTokenConstraintExercisedByCandidate(t *testing.T) {
 	t.Parallel()
 
