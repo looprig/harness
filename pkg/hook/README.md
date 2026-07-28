@@ -74,7 +74,8 @@ copy. A malformed directly constructed `Denial` remains an internal failure.
 `PolicyRevision` is required exactly when guards are present. It enters
 `SessionStarted.Manifest.HookPolicyRev`, so changing guard behavior requires a
 new revision and restore reports `event.DriftHookPolicy` at `Warn`. Around-only
-sets keep the field empty and do not affect configuration identity.
+sets keep the field empty and do not affect configuration identity. Revisions
+are bounded to 128 bytes and must be valid UTF-8 without control characters.
 
 ## Around-hook execution
 

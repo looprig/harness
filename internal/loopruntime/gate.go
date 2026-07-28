@@ -311,8 +311,10 @@ func abandonInstalledGate(
 	gateID gatedomain.ID,
 ) error {
 	ack := make(chan gateInstallAck, 1)
+	closeCtx, release := operationValuesWithLifetime(operationCtx, lifetimeCtx)
+	defer release()
 	request := gateRegistration{
-		ctx:       context.WithoutCancel(operationCtx),
+		ctx:       closeCtx,
 		abandonID: gateID,
 		ack:       ack,
 	}
@@ -326,6 +328,33 @@ func abandonInstalledGate(
 		return result.err
 	case <-lifetimeCtx.Done():
 		return lifetimeCtx.Err()
+	}
+}
+
+func operationValuesWithLifetime(
+	operationCtx context.Context,
+	lifetimeCtx context.Context,
+) (context.Context, func()) {
+	values := context.WithoutCancel(operationCtx)
+	linked, cancel := context.WithCancelCause(values)
+	deadlineCancel := func() {}
+	if deadline, ok := lifetimeCtx.Deadline(); ok {
+		linked, deadlineCancel = context.WithDeadlineCause(
+			linked,
+			deadline,
+			context.DeadlineExceeded,
+		)
+	}
+	stopLifetime := context.AfterFunc(lifetimeCtx, func() {
+		cancel(context.Cause(lifetimeCtx))
+	})
+	if lifetimeCtx.Err() != nil {
+		cancel(context.Cause(lifetimeCtx))
+	}
+	return linked, func() {
+		stopLifetime()
+		deadlineCancel()
+		cancel(context.Canceled)
 	}
 }
 

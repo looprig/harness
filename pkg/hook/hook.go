@@ -111,6 +111,8 @@ func ValidateSet(set Set) error {
 		}
 	} else if strings.TrimSpace(set.PolicyRevision) == "" {
 		return &ConfigError{Kind: ConfigMissingPolicyRevision, Field: "policy_revision"}
+	} else if !validPolicyRevision(set.PolicyRevision) {
+		return &ConfigError{Kind: ConfigInvalidPolicyRevision, Field: "policy_revision"}
 	}
 
 	for index, guard := range set.Guards {

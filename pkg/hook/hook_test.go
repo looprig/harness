@@ -144,6 +144,30 @@ func TestValidateSet(t *testing.T) {
 			kind: ConfigMissingPolicyRevision,
 		},
 		{
+			name: "guard with oversized revision",
+			set: Set{
+				PolicyRevision: strings.Repeat("r", 129),
+				Guards:         []Guard{{Operation: OperationTurn, Check: noopGuard}},
+			},
+			kind: ConfigInvalidPolicyRevision,
+		},
+		{
+			name: "guard with invalid utf8 revision",
+			set: Set{
+				PolicyRevision: string([]byte{0xff}),
+				Guards:         []Guard{{Operation: OperationTurn, Check: noopGuard}},
+			},
+			kind: ConfigInvalidPolicyRevision,
+		},
+		{
+			name: "guard with control character revision",
+			set: Set{
+				PolicyRevision: "policy\nrevision",
+				Guards:         []Guard{{Operation: OperationTurn, Check: noopGuard}},
+			},
+			kind: ConfigInvalidPolicyRevision,
+		},
+		{
 			name: "revision without guard",
 			set:  Set{PolicyRevision: "v1", Around: []Around{{Operation: OperationTurn, Begin: noopAround}}},
 			kind: ConfigUnexpectedPolicyRevision,

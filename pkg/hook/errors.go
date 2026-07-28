@@ -9,8 +9,9 @@ import (
 )
 
 const (
-	maxDenialCodeBytes   = 64
-	maxDenialReasonBytes = 1024
+	maxPolicyRevisionBytes = 128
+	maxDenialCodeBytes     = 64
+	maxDenialReasonBytes   = 1024
 )
 
 // ConfigErrorKind identifies an invalid hook declaration or typed payload.
@@ -23,6 +24,7 @@ const (
 	ConfigNilAround                ConfigErrorKind = "nil_around"
 	ConfigMissingPolicyRevision    ConfigErrorKind = "missing_policy_revision"
 	ConfigUnexpectedPolicyRevision ConfigErrorKind = "unexpected_policy_revision"
+	ConfigInvalidPolicyRevision    ConfigErrorKind = "invalid_policy_revision"
 	ConfigInvalidDenial            ConfigErrorKind = "invalid_denial"
 )
 
@@ -145,6 +147,20 @@ func validDenialCode(code string) bool {
 		if (value < 'a' || value > 'z') &&
 			(value < '0' || value > '9') &&
 			value != '_' && value != '.' && value != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func validPolicyRevision(revision string) bool {
+	if len(revision) == 0 ||
+		len(revision) > maxPolicyRevisionBytes ||
+		!utf8.ValidString(revision) {
+		return false
+	}
+	for _, r := range revision {
+		if unicode.IsControl(r) {
 			return false
 		}
 	}

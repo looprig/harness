@@ -2349,11 +2349,11 @@ func runLoop(cfg loopConfig, state loopState) {
 		case reg := <-gateReg:
 			if !reg.abandonID.IsZero() {
 				if _, open := state.pendingGates[reg.abandonID]; open {
-					delete(state.pendingGates, reg.abandonID)
-					reg.ack <- gateInstallAck{
-						gateID: reg.abandonID,
-						err:    cfg.gates.CloseGate(reg.ctx, reg.abandonID, gatedomain.CloseAbandoned),
+					closeErr := cfg.gates.CloseGate(reg.ctx, reg.abandonID, gatedomain.CloseAbandoned)
+					if closeErr == nil {
+						delete(state.pendingGates, reg.abandonID)
 					}
+					reg.ack <- gateInstallAck{gateID: reg.abandonID, err: closeErr}
 				} else {
 					reg.ack <- gateInstallAck{gateID: reg.abandonID}
 				}

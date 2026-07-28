@@ -18,6 +18,8 @@ type gateRegistrarPublisher struct {
 	gateID      gatedomain.ID
 	prepareErr  error
 	activateErr error
+	closeErr    error
+	closeFn     func(context.Context, gatedomain.ID) error
 	prepared    []gatedomain.Gate
 	activated   []gatedomain.Route
 	closed      []gatedomain.ID
@@ -44,9 +46,12 @@ func (p *gateRegistrarPublisher) ActivateGate(_ context.Context, id gatedomain.I
 	return nil
 }
 
-func (p *gateRegistrarPublisher) CloseGate(_ context.Context, id gatedomain.ID, _ gatedomain.CloseReason) error {
+func (p *gateRegistrarPublisher) CloseGate(ctx context.Context, id gatedomain.ID, _ gatedomain.CloseReason) error {
 	p.closed = append(p.closed, id)
-	return nil
+	if p.closeFn != nil {
+		return p.closeFn(ctx, id)
+	}
+	return p.closeErr
 }
 
 func newLoopWithGateRegistrar(t *testing.T, registrar *gateRegistrarPublisher) (*Loop, context.CancelFunc) {
@@ -220,6 +225,93 @@ func TestLoopGateAbandonmentClosesAndDeregisters(t *testing.T) {
 	}
 	if _, ok := recvReply(t, reply, 200*time.Millisecond); ok {
 		t.Fatal("gate reply delivered after abandonment")
+	}
+}
+
+func TestLoopGateAbandonmentCloseFailureRetainsRoute(t *testing.T) {
+	t.Parallel()
+	callID := newCallID(t)
+	gateID := newCallID(t)
+	closeErr := errors.New("close unavailable")
+	registrar := &gateRegistrarPublisher{gateID: gateID, closeErr: closeErr}
+	l, _ := newLoopWithGateRegistrar(t, registrar)
+	reply := registerGate(t, l, callID, gateUserInput)
+	ack := make(chan gateInstallAck, 1)
+
+	l.gateReg <- gateRegistration{
+		ctx:       context.Background(),
+		abandonID: gateID,
+		ack:       ack,
+	}
+	if got := <-ack; !errors.Is(got.err, closeErr) {
+		t.Fatalf("gate abandonment error = %v, want %v", got.err, closeErr)
+	}
+
+	lateReply := command.ProvideUserInput{
+		GateRoute: command.GateRoute{GateID: gateID, ToolExecutionID: callID},
+		Answer:    "still routed",
+	}
+	select {
+	case l.Commands <- lateReply:
+	case <-time.After(2 * time.Second):
+		t.Fatal("loop actor remained blocked after close failure")
+	}
+	got, ok := recvReply(t, reply, 2*time.Second)
+	if !ok {
+		t.Fatal("gate route was orphaned after close failure")
+	}
+	if answer, ok := got.(command.ProvideUserInput); !ok || answer.Answer != "still routed" {
+		t.Fatalf("gate reply = %#v, want retained route", got)
+	}
+}
+
+func TestLoopGateAbandonmentPreservesValuesAndLifetimeCancellation(t *testing.T) {
+	t.Parallel()
+	type closeContextKey struct{}
+	callID := newCallID(t)
+	gateID := newCallID(t)
+	closeEntered := make(chan struct{})
+	closeValue := make(chan any, 1)
+	registrar := &gateRegistrarPublisher{gateID: gateID}
+	registrar.closeFn = func(ctx context.Context, _ gatedomain.ID) error {
+		closeValue <- ctx.Value(closeContextKey{})
+		close(closeEntered)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	l, _ := newLoopWithGateRegistrar(t, registrar)
+	reply := registerGate(t, l, callID, gateUserInput)
+	lifetime, cancelLifetime := context.WithCancel(context.Background())
+	operationCtx := context.WithValue(context.Background(), closeContextKey{}, "operation-value")
+	done := make(chan error, 1)
+
+	go func() {
+		done <- abandonInstalledGate(lifetime, operationCtx, l.gateReg, gateID)
+	}()
+	select {
+	case <-closeEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("gate close did not start")
+	}
+	cancelLifetime()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("abandonInstalledGate error = %v, want canceled lifetime", err)
+	}
+	if got := <-closeValue; got != "operation-value" {
+		t.Fatalf("close context value = %v, want operation-value", got)
+	}
+
+	lateReply := command.ProvideUserInput{
+		GateRoute: command.GateRoute{GateID: gateID, ToolExecutionID: callID},
+		Answer:    "actor responsive",
+	}
+	select {
+	case l.Commands <- lateReply:
+	case <-time.After(2 * time.Second):
+		t.Fatal("loop actor remained blocked after canceled close")
+	}
+	if _, ok := recvReply(t, reply, 2*time.Second); !ok {
+		t.Fatal("loop actor remained blocked or gate route was orphaned after canceled close")
 	}
 }
 
