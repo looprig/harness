@@ -397,6 +397,30 @@ func (*delegateStub) Execute(context.Context, tool.DelegateRequest) (tool.Delega
 	return tool.DelegateResult{}, nil
 }
 
+type sessionResourceStub struct{}
+
+func (*sessionResourceStub) Activate(context.Context, tool.SessionResourceServices) error {
+	return nil
+}
+
+func (*sessionResourceStub) Shutdown(context.Context) error { return nil }
+
+type sessionResourceRegistryStub struct{}
+
+func (*sessionResourceRegistryStub) GetOrCreate(
+	_ context.Context,
+	_ string,
+	factory func(string) (tool.SessionResource, error),
+) (tool.SessionResource, error) {
+	return factory("/resource")
+}
+
+type asyncProcessRunnerStub struct{}
+
+func (*asyncProcessRunnerStub) PrepareProcess(context.Context, tool.ProcessRequest) (tool.PreparedProcess, error) {
+	return nil, errors.New("not implemented")
+}
+
 func TestDefinitionMetadataAndFreshBuilds(t *testing.T) {
 	t.Parallel()
 
@@ -674,6 +698,102 @@ func TestBindingsValidation(t *testing.T) {
 	}
 }
 
+func TestProcessBindingRequiresRegistry(t *testing.T) {
+	t.Parallel()
+
+	bindings := validBindings()
+	bindings.Process = &tool.ProcessBinding{Runner: &asyncProcessRunnerStub{}}
+	definition := tool.NewDefinition("custom", tool.RequiresProcessServices, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{&definitionTool{}}, nil
+	})
+
+	_, err := definition.Build(context.Background(), bindings)
+	var bindingErr *tool.InvalidBindingsError
+	if !errors.As(err, &bindingErr) {
+		t.Fatalf("Build() error = %T %v, want *tool.InvalidBindingsError", err, err)
+	}
+	if bindingErr.Field != "process.registry" {
+		t.Fatalf("InvalidBindingsError.Field = %q, want process.registry", bindingErr.Field)
+	}
+}
+
+func TestProcessBindingRejectsTypedNilServices(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		process   *tool.ProcessBinding
+		wantField string
+	}{
+		{
+			name: "typed nil registry",
+			process: &tool.ProcessBinding{
+				Registry: (*sessionResourceRegistryStub)(nil),
+				Runner:   &asyncProcessRunnerStub{},
+			},
+			wantField: "process.registry",
+		},
+		{
+			name: "typed nil runner",
+			process: &tool.ProcessBinding{
+				Registry: &sessionResourceRegistryStub{},
+				Runner:   (*asyncProcessRunnerStub)(nil),
+			},
+			wantField: "process.runner",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			bindings := validBindings()
+			bindings.Process = tt.process
+			definition := tool.NewDefinition("custom", tool.RequiresProcessServices, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+				return []tool.InvokableTool{&definitionTool{}}, nil
+			})
+
+			_, err := definition.Build(context.Background(), bindings)
+			var bindingErr *tool.InvalidBindingsError
+			if !errors.As(err, &bindingErr) {
+				t.Fatalf("Build() error = %T %v, want *tool.InvalidBindingsError", err, err)
+			}
+			if bindingErr.Field != tt.wantField {
+				t.Fatalf("InvalidBindingsError.Field = %q, want %q", bindingErr.Field, tt.wantField)
+			}
+		})
+	}
+}
+
+func TestAttenuateBindingsPreservesOnlyRequiredProcessServices(t *testing.T) {
+	t.Parallel()
+
+	bindings := validBindings()
+	originalProcess := bindings.Process
+	definition := tool.NewDefinition("custom", tool.RequiresProcessServices, func(_ context.Context, got tool.Bindings) ([]tool.InvokableTool, error) {
+		if got.Process == nil {
+			t.Fatal("factory process binding = nil, want required process services")
+		}
+		if got.Process == originalProcess {
+			t.Fatal("factory process binding aliases caller binding")
+		}
+		if got.Process.Registry != originalProcess.Registry || got.Process.Runner != originalProcess.Runner {
+			t.Fatal("factory process services differ from caller services")
+		}
+		if got.Workspace != nil || got.Delegate != nil || got.ExtraTools != nil {
+			t.Fatalf("factory received undeclared bindings: %+v", got)
+		}
+		got.Process.Registry = nil
+		return []tool.InvokableTool{&definitionTool{}}, nil
+	})
+
+	if _, err := definition.Build(context.Background(), bindings); err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if bindings.Process != originalProcess || bindings.Process.Registry == nil {
+		t.Fatal("factory mutation changed caller process binding")
+	}
+}
+
 func TestDefinitionRejectsUnknownRequirementsBeforeFactory(t *testing.T) {
 	t.Parallel()
 
@@ -841,5 +961,9 @@ func validBindings() tool.Bindings {
 		LoopID:    uuid.MustParse("22222222-2222-4222-8222-222222222222"),
 		Workspace: &tool.WorkspaceBinding{Root: "/workspace", Coordinator: &coordinatorStub{}},
 		Delegate:  &delegateStub{},
+		Process: &tool.ProcessBinding{
+			Registry: &sessionResourceRegistryStub{},
+			Runner:   &asyncProcessRunnerStub{},
+		},
 	}
 }
