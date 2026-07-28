@@ -222,6 +222,18 @@ func runStepWithAdmission(
 // The LLM request for each step is built from cfg.base + ts.msgs — never live
 // loopState.msgs — so the already-committed parts are not duplicated.
 func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
+	var activeStepScope *operationHookScope
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if activeStepScope != nil {
+				activeStepScope.Finish(
+					hook.OutcomeFailed,
+					&operationHookPanicError{Operation: hook.OperationStep},
+				)
+			}
+			panic(recovered)
+		}
+	}()
 	if cfg.admit == nil {
 		cfg.admit = func(context.Context) (func(), error) { return func() {}, nil }
 	}
@@ -296,8 +308,15 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 				Err:       safeHookError(hook.OperationStep, stepStartErr),
 			}
 		}
+		stepScope := &operationHookScope{
+			call: stepCall, finish: finishStep,
+		}
+		activeStepScope = stepScope
 		finishStepWith := func(err error) {
-			finishHook(finishStep, stepCall, hookOutcome(stepCtx, err), err)
+			stepScope.Finish(hookOutcome(stepCtx, err), err)
+			if activeStepScope == stepScope {
+				activeStepScope = nil
+			}
 		}
 
 		releaseAdmission := cfg.firstAdmission
@@ -495,7 +514,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// answer (handled above) never reaches here, so folding cannot extend a turn
 		// past the model's final answer.
 		stagedBeforeFold := len(ts.msgs)
-		if ferr := foldPending(ctx, cfg, &ts); ferr != nil {
+		if ferr := foldPending(stepCtx, cfg, &ts); ferr != nil {
 			// The drain or a fold commit was cancelled (Interrupt/Shutdown) before it
 			// completed: treat as interrupt. Committed steps + any already-committed
 			// folds stay in loopState.msgs; the actor returns the rest of the inbox and

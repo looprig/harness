@@ -20,10 +20,71 @@ type orderedTurnPublisher struct {
 	order []string
 }
 
+type hookBoundaryContextKey struct{}
+
+type hookBoundaryObservation struct {
+	marker any
+	err    error
+}
+
+type hookContextBoundary struct {
+	recordingPublisher
+	mu       sync.Mutex
+	contexts map[string]hookBoundaryObservation
+}
+
+func newHookContextBoundary() *hookContextBoundary {
+	return &hookContextBoundary{contexts: make(map[string]hookBoundaryObservation)}
+}
+
+func (b *hookContextBoundary) record(name string, ctx context.Context) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.contexts[name] = hookBoundaryObservation{
+		marker: ctx.Value(hookBoundaryContextKey{}),
+		err:    ctx.Err(),
+	}
+}
+
+func (b *hookContextBoundary) observed(name string) (hookBoundaryObservation, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	value, ok := b.contexts[name]
+	return value, ok
+}
+
+func (b *hookContextBoundary) PublishEventChecked(ctx context.Context, value event.Event) error {
+	if _, ok := value.(event.TurnStarted); ok {
+		b.record("turn_started", ctx)
+	}
+	return b.recordingPublisher.PublishEventChecked(ctx, value)
+}
+
+func (b *hookContextBoundary) CommitContextBoundary(ctx context.Context, value event.Event) (bool, error) {
+	if _, ok := value.(event.StepDone); ok {
+		b.record("step_done", ctx)
+	}
+	return true, b.recordingPublisher.PublishEventChecked(ctx, value)
+}
+
+func (b *hookContextBoundary) CommitBoundary(ctx context.Context, value event.Event) error {
+	if value.EndsTurn() {
+		b.record("turn_terminal", ctx)
+	}
+	return b.recordingPublisher.PublishEventChecked(ctx, value)
+}
+
 func (p *orderedTurnPublisher) appendOrder(value string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.order = append(p.order, value)
+}
+
+func (p *orderedTurnPublisher) PublishEvent(ctx context.Context, value event.Event) error {
+	if _, ok := value.(event.TurnRejected); ok {
+		p.appendOrder("turn.rejected")
+	}
+	return p.recordingPublisher.PublishEvent(ctx, value)
 }
 
 func (p *orderedTurnPublisher) PublishEventChecked(ctx context.Context, value event.Event) error {
@@ -220,6 +281,126 @@ func TestTurnHooksDenialPublishesNoStartedAndReleasesAdmissionOnce(t *testing.T)
 	}
 	if finishCount.Load() != 1 || finish.Outcome != hook.OutcomeDenied {
 		t.Fatalf("finish = %#v count=%d, want one denied", finish, finishCount.Load())
+	}
+}
+
+func TestTurnHooksDenialFinishesAfterInputResolution(t *testing.T) {
+	t.Parallel()
+	publisher := &orderedTurnPublisher{}
+	runner, err := hook.Compile(hook.Set{
+		PolicyRevision: "turn-order-hook-test-v1",
+		Guards: []hook.Guard{{
+			Operation: hook.OperationTurn,
+			Check: func(context.Context, hook.Call) error {
+				return hook.Deny("turn_blocked", "private policy reason")
+			},
+		}},
+		Around: []hook.Around{{
+			Operation: hook.OperationTurn,
+			Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+				publisher.appendOrder("turn.begin")
+				return ctx, func(hook.Result) { publisher.appendOrder("turn.finish") }
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("hook.Compile: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	instance, err := newWithConfig(ctx, mustID(t), mustID(t), Provenance{}, publisher, runtimeConfig{
+		Client: &hookProbeClient{}, Model: testModel(), Hooks: runner,
+		DrainTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("newWithConfig: %v", err)
+	}
+	inputID := mustID(t)
+	instance.Commands <- command.UserInput{Header: command.Header{CommandID: inputID}}
+	blockUntilEvents(t, &publisher.recordingPublisher, func(values []event.Event) bool {
+		for _, value := range values {
+			if rejected, ok := value.(event.TurnRejected); ok && rejected.Cause.CommandID == inputID {
+				return true
+			}
+		}
+		return false
+	})
+	deadline := time.Now().Add(time.Second)
+	for len(publisher.orderSnapshot()) < 3 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	got := publisher.orderSnapshot()
+	want := []string{"turn.begin", "turn.rejected", "turn.finish"}
+	if len(got) != len(want) {
+		t.Fatalf("order = %v, want %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("order = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestTurnAndStepHooksPropagateDerivedContextsToDurableBoundaries(t *testing.T) {
+	t.Parallel()
+	boundary := newHookContextBoundary()
+	runner, err := hook.Compile(hook.Set{Around: []hook.Around{
+		{
+			Operation: hook.OperationTurn,
+			Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+				return context.WithValue(ctx, hookBoundaryContextKey{}, "turn"), nil
+			},
+		},
+		{
+			Operation: hook.OperationStep,
+			Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+				return context.WithValue(ctx, hookBoundaryContextKey{}, "step"), nil
+			},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("hook.Compile: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	instance, err := newWithConfig(ctx, mustID(t), mustID(t), Provenance{}, boundary, runtimeConfig{
+		Client: &fakeLLM{chunks: []content.Chunk{textChunk("done")}}, Model: testModel(),
+		Hooks: runner, DrainTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("newWithConfig: %v", err)
+	}
+	instance.Commands <- command.UserInput{
+		Header: command.Header{CommandID: mustID(t)},
+		Blocks: []content.Block{&content.TextBlock{Text: "go"}},
+	}
+	blockUntilEvents(t, &boundary.recordingPublisher, func(values []event.Event) bool {
+		for _, value := range values {
+			if value.EndsTurn() {
+				return true
+			}
+		}
+		return false
+	})
+	tests := []struct {
+		name string
+		want string
+	}{
+		{name: "turn_started", want: "turn"},
+		{name: "step_done", want: "step"},
+		{name: "turn_terminal", want: "turn"},
+	}
+	for _, test := range tests {
+		observed, ok := boundary.observed(test.name)
+		if !ok {
+			t.Fatalf("%s context was not observed", test.name)
+		}
+		if got := observed.marker; got != test.want {
+			t.Fatalf("%s marker = %v, want %q", test.name, got, test.want)
+		}
+		if err := observed.err; err != nil {
+			t.Fatalf("%s context err = %v, want live observation context", test.name, err)
+		}
 	}
 }
 

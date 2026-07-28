@@ -141,6 +141,9 @@ func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st 
 		Cause:     cfg.cause,
 		Inference: &hook.InferenceData{Request: &cfg.req},
 	}
+	if cfg.hooks.Handles(hook.OperationInference) {
+		call = hook.CloneCall(call)
+	}
 	hookCtx, finish, startErr := cfg.hooks.Start(ctx, call)
 	if startErr != nil {
 		st.status = stepFailed

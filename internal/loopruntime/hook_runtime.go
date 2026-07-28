@@ -34,7 +34,7 @@ func (e *operationHookPanicError) Error() string {
 }
 
 func safeHookError(operation hook.Operation, err error) error {
-	_, denied := hook.AsDenial(err)
+	_, denied := classifyHookError(err)
 	return &operationHookError{Operation: operation, Denied: denied}
 }
 
@@ -43,21 +43,33 @@ func safeHookError(operation hook.Operation, err error) error {
 // context after producing that success. Cancellation is classified from err,
 // because actor ownership cleanup may cancel ctx before a durable finish runs.
 func hookOutcome(_ context.Context, err error) hook.Outcome {
+	outcome, _ := classifyHookError(err)
+	return outcome
+}
+
+func classifyHookError(err error) (outcome hook.Outcome, denied bool) {
+	outcome = hook.OutcomeFailed
+	defer func() {
+		if recover() != nil {
+			outcome = hook.OutcomeFailed
+			denied = false
+		}
+	}()
 	if err == nil {
-		return hook.OutcomeCompleted
+		return hook.OutcomeCompleted, false
 	}
 	if _, denied := hook.AsDenial(err); denied {
-		return hook.OutcomeDenied
+		return hook.OutcomeDenied, true
 	}
 	var guardErr *hook.GuardError
 	if errors.As(err, &guardErr) {
-		return hook.OutcomeFailed
+		return hook.OutcomeFailed, false
 	}
 	if errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded) {
-		return hook.OutcomeCanceled
+		return hook.OutcomeCanceled, false
 	}
-	return hook.OutcomeFailed
+	return hook.OutcomeFailed, false
 }
 
 func finishHook(
@@ -69,12 +81,45 @@ func finishHook(
 	if finish == nil {
 		return
 	}
+	endedAt := time.Now()
+	if endedAt.Before(call.StartedAt) {
+		endedAt = call.StartedAt
+	}
 	finish(hook.Result{
 		Call:    call,
-		EndedAt: time.Now(),
+		EndedAt: endedAt,
 		Outcome: outcome,
 		Err:     err,
 	})
+}
+
+type operationHookScope struct {
+	call     hook.Call
+	finish   hook.FinishFunc
+	finished bool
+}
+
+func (s *operationHookScope) Finish(outcome hook.Outcome, err error) {
+	if s == nil || s.finished {
+		return
+	}
+	s.finished = true
+	finishHook(s.finish, s.call, outcome, err)
+}
+
+type turnStartHookFailure struct {
+	err      error
+	complete func()
+}
+
+func (e *turnStartHookFailure) Error() string { return e.err.Error() }
+
+func completeTurnStartHook(err error) {
+	failure, ok := err.(*turnStartHookFailure)
+	if !ok || failure.complete == nil {
+		return
+	}
+	failure.complete()
 }
 
 func hookNow(now func() time.Time) time.Time {

@@ -18,14 +18,15 @@ import (
 type inferenceHookContextKey struct{}
 
 type hookProbeClient struct {
-	mu       sync.Mutex
-	calls    int
-	context  context.Context
-	request  inference.Request
-	openErr  error
-	nextErr  error
-	panicNow bool
-	empty    bool
+	mu           sync.Mutex
+	calls        int
+	context      context.Context
+	request      inference.Request
+	openErr      error
+	nextErr      error
+	panicNow     bool
+	empty        bool
+	mutateNested string
 }
 
 func (*hookProbeClient) Invoke(context.Context, inference.Request) (*inference.Response, error) {
@@ -41,7 +42,11 @@ func (c *hookProbeClient) Stream(ctx context.Context, request inference.Request)
 	openErr := c.openErr
 	nextErr := c.nextErr
 	empty := c.empty
+	mutateNested := c.mutateNested
 	c.mu.Unlock()
+	if mutateNested != "" {
+		request.Messages[0].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text = mutateNested
+	}
 	if panicNow {
 		panic("provider panic detail must stay private")
 	}
@@ -62,6 +67,34 @@ func (c *hookProbeClient) Stream(ctx context.Context, request inference.Request)
 		}
 		return nil, io.EOF
 	}, nil), nil
+}
+
+func TestInferenceHooksFinishRetainsFrozenRequestWhenProviderMutatesItsRequest(t *testing.T) {
+	t.Parallel()
+	client := &hookProbeClient{mutateNested: "provider mutation"}
+	request := inference.Request{
+		Model: testModel(),
+		Messages: content.AgenticMessages{&content.UserMessage{Message: content.Message{
+			Role:   content.RoleUser,
+			Blocks: []content.Block{&content.TextBlock{Text: "frozen input"}},
+		}}},
+	}
+	var finished hook.Result
+	runner := compileInferenceHook(t, nil, func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+		return ctx, func(result hook.Result) { finished = result }
+	})
+
+	result := runStep(context.Background(), stepConfig{
+		req: request, client: client, emit: func(event.Event) {}, hooks: runner,
+	}, 1, newTestStep(t, 0))
+
+	if result.terminal != nil {
+		t.Fatalf("terminal = %T, want success", result.terminal)
+	}
+	got := finished.Inference.Request.Messages[0].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text
+	if got != "frozen input" {
+		t.Fatalf("finish request text = %q, want frozen input", got)
+	}
 }
 
 func (c *hookProbeClient) snapshot() (int, context.Context, inference.Request) {

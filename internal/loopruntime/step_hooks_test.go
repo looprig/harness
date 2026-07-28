@@ -10,6 +10,82 @@ import (
 	"github.com/looprig/harness/pkg/hook"
 )
 
+func TestStepHooksAdmissionPanicFinishesFailedBeforeRethrow(t *testing.T) {
+	t.Parallel()
+	var finishes []hook.Result
+	runner, err := hook.Compile(hook.Set{Around: []hook.Around{{
+		Operation: hook.OperationStep,
+		Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+			return ctx, func(result hook.Result) { finishes = append(finishes, result) }
+		},
+	}}})
+	if err != nil {
+		t.Fatalf("hook.Compile: %v", err)
+	}
+	cfg, state, _ := newTurnFixture(
+		[]content.Block{&content.TextBlock{Text: "go"}}, nil, ToolSet{},
+		&fakeLLM{chunks: []content.Chunk{textChunk("unused")}}, nil,
+	)
+	cfg.hooks = runner
+	cfg.admit = func(context.Context) (func(), error) {
+		panic("private admission panic")
+	}
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("runTurn did not rethrow admission panic")
+			}
+		}()
+		_ = runTurn(context.Background(), cfg, state)
+	}()
+
+	if len(finishes) != 1 || finishes[0].Outcome != hook.OutcomeFailed {
+		t.Fatalf("finishes = %#v, want exactly one failed result", finishes)
+	}
+	if finishes[0].Err == nil || finishes[0].Err.Error() == "private admission panic" {
+		t.Fatalf("finish error = %v, want redacted panic error", finishes[0].Err)
+	}
+}
+
+func TestStepHooksCommitPanicFinishesFailedBeforeRethrow(t *testing.T) {
+	t.Parallel()
+	var finishes []hook.Result
+	runner, err := hook.Compile(hook.Set{Around: []hook.Around{{
+		Operation: hook.OperationStep,
+		Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+			return ctx, func(result hook.Result) { finishes = append(finishes, result) }
+		},
+	}}})
+	if err != nil {
+		t.Fatalf("hook.Compile: %v", err)
+	}
+	cfg, state, _ := newTurnFixture(
+		[]content.Block{&content.TextBlock{Text: "go"}}, nil, ToolSet{},
+		&fakeLLM{chunks: []content.Chunk{textChunk("answer")}}, nil,
+	)
+	cfg.hooks = runner
+	cfg.commit = func(context.Context, turnCommit) error {
+		panic("private commit panic")
+	}
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("runTurn did not rethrow commit panic")
+			}
+		}()
+		_ = runTurn(context.Background(), cfg, state)
+	}()
+
+	if len(finishes) != 1 || finishes[0].Outcome != hook.OutcomeFailed {
+		t.Fatalf("finishes = %#v, want exactly one failed result", finishes)
+	}
+	if finishes[0].Err == nil || finishes[0].Err.Error() == "private commit panic" {
+		t.Fatalf("finish error = %v, want redacted panic error", finishes[0].Err)
+	}
+}
+
 func TestStepHooksWrapInferenceAndDurableCommit(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex

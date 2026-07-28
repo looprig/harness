@@ -538,9 +538,12 @@ type loopState struct {
 	hasContext        bool
 	contextTracker    contextTracker
 	contextGeneration uint64
-	turnHookCall      hook.Call
-	turnHookFinish    hook.FinishFunc
-	turnHookCtx       context.Context
+	// turnHookCtx is the hook-derived observation parent, not the cancellable
+	// active-turn child. The actor uses it after runTurn hands back and cancels its
+	// child so terminal durability retains hook values without a false cancellation.
+	turnHookCall   hook.Call
+	turnHookFinish hook.FinishFunc
+	turnHookCtx    context.Context
 
 	// effective is the loop's CURRENT turn-affecting configuration (mode/model/effort/
 	// system/tools). startTurn captures a copy of it into the per-turn turnConfig, so a
@@ -625,7 +628,10 @@ func cancelReasonFor(terminal event.Event) event.CancelReason {
 // StepDone event to emit at the same actor-owned point. ack is buffered(1); the
 // actor closes it after committing+emitting so the parked runTurn unblocks. The
 // turn goroutine selects on ack AND turnCtx.Done so an Interrupt/Shutdown frees it.
+// ctx is the Step-derived observation context used by the actor for the durable
+// StepDone/TurnFoldedInto boundary; it is never reconstructed from ambient state.
 type commitRequest struct {
+	ctx    context.Context
 	commit turnCommit
 	ack    chan<- error
 }
@@ -736,36 +742,36 @@ func runLoop(cfg loopConfig, state loopState) {
 			slog.Error("loop event publish to session fan-in failed", "error", err)
 		}
 	}
-	publishTurnStarted := func(ev event.TurnStarted, capability TurnStartCapability) (bool, error) {
+	publishTurnStarted := func(publishCtx context.Context, ev event.TurnStarted, capability TurnStartCapability) (bool, error) {
 		if capability == nil {
-			err := cfg.events.PublishEventChecked(ctx, ev)
+			err := cfg.events.PublishEventChecked(publishCtx, ev)
 			return err == nil, err
 		}
-		return capability.PublishTurnStarted(ctx, ev)
+		return capability.PublishTurnStarted(publishCtx, ev)
 	}
-	commitStampedBoundary := func(stamped event.Event) error {
+	commitStampedBoundary := func(commitCtx context.Context, stamped event.Event) error {
 		if boundary, ok := cfg.events.(executionBoundary); ok {
-			return boundary.CommitBoundary(ctx, stamped)
+			return boundary.CommitBoundary(commitCtx, stamped)
 		}
-		return cfg.events.PublishEventChecked(ctx, stamped)
+		return cfg.events.PublishEventChecked(commitCtx, stamped)
 	}
-	commitStampedContextBoundary := func(stamped event.Event) (bool, error) {
+	commitStampedContextBoundary := func(commitCtx context.Context, stamped event.Event) (bool, error) {
 		if boundary, ok := cfg.events.(contextExecutionBoundary); ok {
-			return boundary.CommitContextBoundary(ctx, stamped)
+			return boundary.CommitContextBoundary(commitCtx, stamped)
 		}
 		if boundary, ok := cfg.events.(executionBoundary); ok {
-			err := boundary.CommitBoundary(ctx, stamped)
+			err := boundary.CommitBoundary(commitCtx, stamped)
 			return err == nil, err
 		}
-		err := cfg.events.PublishEventChecked(ctx, stamped)
+		err := cfg.events.PublishEventChecked(commitCtx, stamped)
 		return err == nil, err
 	}
-	commitBoundary := func(ev event.Event) (event.Event, error) {
+	commitBoundary := func(commitCtx context.Context, ev event.Event) (event.Event, error) {
 		stamped, err := stamp(ev)
 		if err != nil {
 			return nil, err
 		}
-		return stamped, commitStampedBoundary(stamped)
+		return stamped, commitStampedBoundary(commitCtx, stamped)
 	}
 
 	// publishAcceptance is the narrow transactional publication path for managed
@@ -1218,7 +1224,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		commit := func(cctx context.Context, tc turnCommit) error {
 			ack := make(chan error, 1)
-			req := commitRequest{commit: tc, ack: ack}
+			req := commitRequest{ctx: cctx, commit: tc, ack: ack}
 			select {
 			case commits <- req:
 			case <-cctx.Done():
@@ -1400,8 +1406,13 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		turnHookCtx, turnHookFinish, hookErr := config.Hooks.Start(ctx, turnCall)
 		if hookErr != nil {
-			finishHook(turnHookFinish, turnCall, hookOutcome(ctx, hookErr), hookErr)
-			return uuid.UUID{}, safeHookError(hook.OperationTurn, hookErr)
+			safeErr := safeHookError(hook.OperationTurn, hookErr)
+			return uuid.UUID{}, &turnStartHookFailure{
+				err: safeErr,
+				complete: func() {
+					finishHook(turnHookFinish, turnCall, hookOutcome(ctx, hookErr), hookErr)
+				},
+			}
 		}
 		stamped, err := stamp(started)
 		if err != nil {
@@ -1414,7 +1425,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			finishHook(turnHookFinish, turnCall, hook.OutcomeFailed, err)
 			return uuid.UUID{}, err
 		}
-		committed, publishErr := publishTurnStarted(started, capability)
+		committed, publishErr := publishTurnStarted(turnHookCtx, started, capability)
 		if !committed {
 			finishHook(turnHookFinish, turnCall, hookOutcome(turnHookCtx, publishErr), publishErr)
 			return uuid.UUID{}, publishErr
@@ -1429,7 +1440,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		turnCtx, base := installActiveTurn(turnHookCtx, turnID, qi)
 		state.turnHookCall = turnCall
 		state.turnHookFinish = turnHookFinish
-		state.turnHookCtx = turnCtx
+		state.turnHookCtx = turnHookCtx
 		idx := state.turnIndex
 		cancel := state.cancelTurn
 		if publishErr != nil {
@@ -1702,6 +1713,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				} else {
 					returnEntry(next, event.CancelTurnFailed, uuid.UUID{})
 				}
+				completeTurnStartHook(err)
 				return false
 			}
 			return true
@@ -1895,7 +1907,11 @@ func runLoop(cfg loopConfig, state loopState) {
 		endedTurnID := state.turnID
 		// The terminal publish must still carry this turn's correlation IDs (stamped by
 		// publish from state.turnID), so clear them only afterward.
-		_, boundaryErr := commitBoundary(result.terminal)
+		commitCtx := state.turnHookCtx
+		if commitCtx == nil {
+			commitCtx = ctx
+		}
+		_, boundaryErr := commitBoundary(commitCtx, result.terminal)
 		if boundaryErr != nil {
 			slog.Error("turn boundary commit failed", "error", boundaryErr)
 		}
@@ -2722,6 +2738,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				} else {
 					returnEntry(next, event.CancelTurnFailed, uuid.UUID{})
 				}
+				completeTurnStartHook(err)
 				returnQueuedInbox(event.CancelTurnFailed, uuid.UUID{})
 				emitLoopIdle()
 			}
@@ -2763,7 +2780,11 @@ func runLoop(cfg loopConfig, state loopState) {
 			}
 			committed := false
 			if boundaryErr == nil {
-				committed, boundaryErr = commitStampedContextBoundary(stampedBoundary)
+				commitCtx := req.ctx
+				if commitCtx == nil {
+					commitCtx = ctx
+				}
+				committed, boundaryErr = commitStampedContextBoundary(commitCtx, stampedBoundary)
 			}
 			if committed {
 				state.msgs = append(state.msgs, req.commit.Messages...)
@@ -2812,7 +2833,11 @@ func runLoop(cfg loopConfig, state loopState) {
 				// wedged there and would never have produced a terminal anyway.
 				select {
 				case result := <-internal:
-					_, boundaryErr := commitBoundary(result.terminal)
+					commitCtx := state.turnHookCtx
+					if commitCtx == nil {
+						commitCtx = ctx
+					}
+					_, boundaryErr := commitBoundary(commitCtx, result.terminal)
 					if boundaryErr != nil {
 						slog.Error("turn boundary commit failed during loop cancellation", "error", boundaryErr)
 					}
