@@ -36,6 +36,89 @@ type compactionHookPublisher struct {
 	terminalDerived bool
 }
 
+type blockingCompactionRejectionPublisher struct {
+	*recordingPublisher
+	entered chan struct{}
+	release chan struct{}
+	failErr error
+	once    sync.Once
+}
+
+func (p *blockingCompactionRejectionPublisher) PublishEventChecked(ctx context.Context, value event.Event) error {
+	if _, rejected := value.(event.CompactionRejected); rejected {
+		p.once.Do(func() { close(p.entered) })
+		<-p.release
+		if p.failErr != nil {
+			return p.failErr
+		}
+	}
+	return p.recordingPublisher.PublishEventChecked(ctx, value)
+}
+
+type blockingCanceledCompactor struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingCanceledCompactor) CompactAndFinalize(
+	context.Context,
+	loop.CompactionInput,
+	func(context.Context, CompactionOutcome) error,
+) error {
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+	return context.Canceled
+}
+
+type nestedCompactionMarkerKey string
+
+type nestedContextCompactor struct {
+	sawParent     bool
+	sawCompaction bool
+	summary       *content.UserMessage
+}
+
+func (c *nestedContextCompactor) CompactAndFinalize(
+	ctx context.Context,
+	input loop.CompactionInput,
+	finalize func(context.Context, CompactionOutcome) error,
+) error {
+	c.sawParent = ctx.Value(nestedCompactionMarkerKey("parent")) == "parent"
+	c.sawCompaction = ctx.Value(nestedCompactionMarkerKey("compaction")) == "compaction"
+	return finalize(ctx, CompactionOutcome{Value: &loop.CompactionOutput{
+		Basis: input.Basis, Model: input.Model, RequestFingerprint: input.RequestFingerprint,
+		Summary: cloneUserMessage(c.summary),
+	}})
+}
+
+type nestedContextPublisher struct {
+	*recordingPublisher
+	mu             sync.Mutex
+	startedNested  bool
+	terminalNested bool
+}
+
+func (p *nestedContextPublisher) PublishEventChecked(ctx context.Context, value event.Event) error {
+	nested := ctx.Value(nestedCompactionMarkerKey("parent")) == "parent" &&
+		ctx.Value(nestedCompactionMarkerKey("compaction")) == "compaction"
+	p.mu.Lock()
+	switch value.(type) {
+	case event.CompactionStarted:
+		p.startedNested = nested
+	case event.CompactionCommitted, event.CompactionRejected:
+		p.terminalNested = nested
+	}
+	p.mu.Unlock()
+	return p.recordingPublisher.PublishEventChecked(ctx, value)
+}
+
+func (p *nestedContextPublisher) snapshot() (bool, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.startedNested, p.terminalNested
+}
+
 func (p *compactionHookPublisher) PublishEventChecked(ctx context.Context, value event.Event) error {
 	p.mu.Lock()
 	switch value.(type) {
@@ -243,6 +326,136 @@ func TestCompactionHooksCancellationFinishesCanceledOnce(t *testing.T) {
 	case duplicate := <-finished:
 		t.Fatalf("duplicate finish = %#v", duplicate)
 	case <-time.After(25 * time.Millisecond):
+	}
+}
+
+func TestCompactionHooksActiveTurnCancellationWaitsForDurableRejection(t *testing.T) {
+	finished := make(chan hook.Result, 2)
+	recorder := &recordingPublisher{}
+	publisher := &blockingCompactionRejectionPublisher{
+		recordingPublisher: recorder,
+		entered:            make(chan struct{}),
+		release:            make(chan struct{}),
+	}
+	compactor := &blockingCanceledCompactor{started: make(chan struct{}), release: make(chan struct{})}
+	actor := newActiveTurnCompactionHooksActor(t, publisher, compactor, hook.Set{Around: []hook.Around{{
+		Operation: hook.OperationCompaction,
+		Begin: func(context.Context, hook.Call) (context.Context, hook.FinishFunc) {
+			// Deliberately detach. Runner must restore parent cancellation.
+			return context.Background(), func(result hook.Result) { finished <- result }
+		},
+	}}})
+
+	startTurn(t, actor, recorder, textBlocks("cancel active compaction"))
+	select {
+	case <-compactor.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active-turn compaction did not start")
+	}
+	ack := make(chan bool, 1)
+	actor.PriorityCommandSink() <- command.Interrupt{Header: command.Header{CommandID: uuid.UUID{0xc4}}, Ack: ack}
+	if !<-ack {
+		t.Fatal("interrupt did not cancel the active turn")
+	}
+	select {
+	case <-publisher.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("canonical CompactionRejected append did not start")
+	}
+	select {
+	case result := <-finished:
+		t.Fatalf("finish before durable rejection = %#v", result)
+	default:
+	}
+	close(publisher.release)
+	result := awaitCompactionHookFinish(t, finished)
+	if result.Outcome != hook.OutcomeCanceled || !errors.Is(result.Err, context.Canceled) {
+		t.Fatalf("finish = %#v, want canceled after durable rejection", result)
+	}
+	close(compactor.release)
+}
+
+func TestCompactionHooksCanceledFinalizationFailureCorrectsOutcomeToFailed(t *testing.T) {
+	finished := make(chan hook.Result, 2)
+	recorder := &recordingPublisher{}
+	publisher := &blockingCompactionRejectionPublisher{
+		recordingPublisher: recorder,
+		entered:            make(chan struct{}),
+		release:            make(chan struct{}),
+		failErr:            errors.New("canonical rejection append failed"),
+	}
+	compactor := &blockingCanceledCompactor{started: make(chan struct{}), release: make(chan struct{})}
+	actor := newActiveTurnCompactionHooksActor(t, publisher, compactor, hook.Set{Around: []hook.Around{{
+		Operation: hook.OperationCompaction,
+		Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+			return ctx, func(result hook.Result) { finished <- result }
+		},
+	}}})
+
+	startTurn(t, actor, recorder, textBlocks("fail cancellation finalization"))
+	select {
+	case <-compactor.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active-turn compaction did not start")
+	}
+	ack := make(chan bool, 1)
+	actor.PriorityCommandSink() <- command.Interrupt{Header: command.Header{CommandID: uuid.UUID{0xc5}}, Ack: ack}
+	if !<-ack {
+		t.Fatal("interrupt did not cancel the active turn")
+	}
+	select {
+	case <-publisher.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("canonical CompactionRejected append did not start")
+	}
+	select {
+	case result := <-finished:
+		t.Fatalf("finish before failed finalization resolves = %#v", result)
+	default:
+	}
+	close(publisher.release)
+	result := awaitCompactionHookFinish(t, finished)
+	if result.Outcome != hook.OutcomeFailed {
+		t.Fatalf("finish = %#v, want finalization failure to override pending cancellation", result)
+	}
+	close(compactor.release)
+}
+
+func TestCompactionHooksActiveTurnInheritsOriginContextThroughCanonicalBoundary(t *testing.T) {
+	recorder := &recordingPublisher{}
+	publisher := &nestedContextPublisher{recordingPublisher: recorder}
+	compactor := &nestedContextCompactor{summary: validFinalizationSummary()}
+	var compactionSawParent bool
+	hooks := hook.Set{Around: []hook.Around{
+		{
+			// Post-Step measurement runs after Step Finish, so Turn is the correct
+			// still-live parent operation for Compaction.
+			Operation: hook.OperationTurn,
+			Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+				return context.WithValue(ctx, nestedCompactionMarkerKey("parent"), "parent"), nil
+			},
+		},
+		{
+			Operation: hook.OperationCompaction,
+			Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+				compactionSawParent = ctx.Value(nestedCompactionMarkerKey("parent")) == "parent"
+				return context.WithValue(ctx, nestedCompactionMarkerKey("compaction"), "compaction"), nil
+			},
+		},
+	}}
+	actor := newActiveTurnCompactionHooksActor(t, publisher, compactor, hooks)
+	startTurn(t, actor, recorder, textBlocks("nested context"))
+	if terminal := drainToTerminal(t, recorder); reflect.TypeOf(terminal) != reflect.TypeOf(event.TurnDone{}) {
+		t.Fatalf("terminal = %T, want TurnDone", terminal)
+	}
+	if !compactionSawParent || !compactor.sawParent || !compactor.sawCompaction {
+		t.Fatalf(
+			"nested contexts = begin:%v compactor(parent:%v compaction:%v)",
+			compactionSawParent, compactor.sawParent, compactor.sawCompaction,
+		)
+	}
+	if started, terminal := publisher.snapshot(); !started || !terminal {
+		t.Fatalf("canonical publication contexts = started:%v terminal:%v, want nested markers", started, terminal)
 	}
 }
 
@@ -486,6 +699,55 @@ func newCompactionHooksActor(
 	})
 	if err != nil {
 		t.Fatalf("newRestoredWithConfig() error = %v", err)
+	}
+	return actor
+}
+
+func newActiveTurnCompactionHooksActor(
+	t *testing.T,
+	publisher eventPublisher,
+	compactor Compactor,
+	set hook.Set,
+) *Loop {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	hooks := compileRuntimeHooks(t, set)
+	capability := contextTestCapability(contextcount.CountQualityExactLocal)
+	counter := &sequenceContextCounter{
+		capability: capability,
+		counts:     []content.TokenCount{40, 65, 20, 25},
+	}
+	settings := contextAdmissionSettings{
+		ReservedOutput: 20, CompactAt: 8_000, RearmBelow: 6_000,
+		CountTimeout: time.Second, Automatic: true,
+	}
+	executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
+		Compactor: compactor, Counter: counter, CounterCapability: capability,
+		InferenceCapability: contextTestInferenceCapability(), Settings: settings, MaxSummaryTokens: 10,
+	})
+	if err != nil {
+		t.Fatalf("newCompactionExecutor() error = %v", err)
+	}
+	runtimeModel := testModel()
+	runtimeModel.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+	actor, err := newWithConfig(
+		ctx, uuid.UUID{0xc1}, uuid.UUID{0xc2}, Provenance{}, publisher,
+		runtimeConfig{
+			Client: &scriptedLLM{scripts: [][]content.Chunk{{textChunk("terminal response")}}},
+			Model:  runtimeModel, System: "stable system", AgentName: "compactor", Hooks: hooks,
+			ContextCounter: counter, CounterCapability: capability,
+			InferenceCapability: contextTestInferenceCapability(), DrainTimeout: 200 * time.Millisecond,
+			Compaction: &loop.CompactionPolicy{
+				Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact,
+				CompactAt: 8_000, RearmBelow: 6_000, ReservedOutput: 20,
+				MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
+			},
+			compactionSink: executor,
+		},
+	)
+	if err != nil {
+		t.Fatalf("newWithConfig() error = %v", err)
 	}
 	return actor
 }

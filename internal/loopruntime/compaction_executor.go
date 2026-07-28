@@ -184,7 +184,6 @@ func (e *compactionExecutor) AwaitCompaction(ctx context.Context, attemptID even
 		rejected := rejectedCompactionResult(event.CompactRejectCanceled)
 		rejected.Proposal.hookScope = run.scope
 		run.scope.setTerminal(hook.OutcomeCanceled, context.Canceled, nil)
-		run.scope.finishTerminal()
 		return rejected, nil
 	}
 }
