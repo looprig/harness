@@ -131,7 +131,7 @@ func (c *workspaceCoordinator) acquire(ctx context.Context, w *waiter) (tool.Wor
 
 	select {
 	case <-w.ready:
-		return &grantedPermit{coord: c, w: w}, nil
+		return c.finishReadyAcquire(ctx, w)
 	case <-ctx.Done():
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -149,6 +149,23 @@ func (c *workspaceCoordinator) acquire(ctx context.Context, w *waiter) (tool.Wor
 		c.wakeLocked()
 		return nil, &AcquireCanceledError{Cause: ctx.Err()}
 	}
+}
+
+// finishReadyAcquire completes the ready side of Acquire's select. Cancellation
+// must be checked again because ready and ctx.Done can become selectable together;
+// if cancellation won the race before the caller observed ready, release the
+// otherwise-stranded grant and report the typed cancellation.
+func (c *workspaceCoordinator) finishReadyAcquire(
+	ctx context.Context,
+	w *waiter,
+) (tool.WorkspacePermit, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		c.releaseLocked(w)
+		return nil, &AcquireCanceledError{Cause: ctxErr}
+	}
+	return &grantedPermit{coord: c, w: w}, nil
 }
 
 // Healthy reports lease health, delegating to the injected LeaseHealth (nil ⇒ nil).

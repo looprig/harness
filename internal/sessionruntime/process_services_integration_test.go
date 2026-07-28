@@ -147,6 +147,7 @@ type processIntegrationConstruction struct {
 	resources   map[string]*processIntegrationResourceState
 	definitions map[string]int
 	coordinator tool.WorkspaceLifetimeCoordinator
+	workspace   string
 }
 
 type processIntegrationCapture struct {
@@ -217,6 +218,7 @@ func (c *processIntegrationCapture) observeDefinition(
 	name string,
 	shared *processIntegrationResource,
 	coordinator tool.WorkspaceLifetimeCoordinator,
+	workspace string,
 ) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -231,19 +233,25 @@ func (c *processIntegrationCapture) observeDefinition(
 	if construction.coordinator == nil {
 		construction.coordinator = coordinator
 	}
+	if construction.workspace == "" {
+		construction.workspace = workspace
+	}
 	return nil
 }
 
-func (c *processIntegrationCapture) lifetimeCoordinator(
+func (c *processIntegrationCapture) lifetimeBindings(
 	generation int,
-) (tool.WorkspaceLifetimeCoordinator, error) {
+) (tool.WorkspaceLifetimeCoordinator, string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	construction := c.constructions[generation]
 	if construction == nil || construction.coordinator == nil {
-		return nil, fmt.Errorf("process integration: construction %d has no lifetime coordinator", generation)
+		return nil, "", fmt.Errorf("process integration: construction %d has no lifetime coordinator", generation)
 	}
-	return construction.coordinator, nil
+	if construction.workspace == "" {
+		return nil, "", fmt.Errorf("process integration: construction %d has no workspace root", generation)
+	}
+	return construction.coordinator, construction.workspace, nil
 }
 
 func (c *processIntegrationCapture) assertActivated(t *testing.T, generation int) {
@@ -370,7 +378,13 @@ func processIntegrationDefinition(
 			if !ok {
 				return nil, fmt.Errorf("process integration: %q received unexpected shared resource %T", name, sharedRaw)
 			}
-			if err := capture.observeDefinition(shared.generation, name, shared, lifetime); err != nil {
+			if err := capture.observeDefinition(
+				shared.generation,
+				name,
+				shared,
+				lifetime,
+				bindings.Workspace.Root,
+			); err != nil {
 				return nil, err
 			}
 
@@ -464,13 +478,14 @@ func TestProcessServicesIntegrationNewRestoreAndLease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CheckpointWorkspace() error = %v", err)
 	}
-	coordinator, err := capture.lifetimeCoordinator(1)
+	coordinator, workspaceRoot, err := capture.lifetimeBindings(1)
 	if err != nil {
 		t.Fatal(err)
 	}
+	scopedWritePath := filepath.Join(workspaceRoot, "process-integration-output.txt")
 	lifetime, err := coordinator.AcquireLifetime(
 		ctx,
-		tool.NewWorkspaceAccess(tool.WorkspaceAccessBroadWrite, nil, nil),
+		tool.NewWorkspaceAccess(tool.WorkspaceAccessScopedWrite, []string{scopedWritePath}, nil),
 	)
 	if err != nil {
 		t.Fatalf("AcquireLifetime() error = %v", err)

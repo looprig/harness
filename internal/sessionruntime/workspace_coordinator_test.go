@@ -494,6 +494,42 @@ func TestWorkspaceCoordinatorCancelBeforeEnqueue(t *testing.T) {
 	}
 }
 
+// A cancellation that precedes a raced grant must win even when Acquire observes
+// ready first. Exercise that ready-path completion directly so the regression does
+// not depend on the runtime's random choice between two selectable channels.
+func TestWorkspaceCoordinatorReadyPathRejectsCancellationBeforeGrant(t *testing.T) {
+	t.Parallel()
+	c := newWorkspaceCoordinator(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &waiter{
+		class: classPathMutation,
+		ready: make(chan struct{}),
+	}
+
+	cancel()
+	c.mu.Lock()
+	c.activateLocked(w)
+	w.granted = true
+	close(w.ready)
+	c.mu.Unlock()
+
+	permit, err := c.finishReadyAcquire(ctx, w)
+	if permit != nil {
+		t.Fatal("ready-path completion returned a permit after cancellation")
+	}
+	var canceled *AcquireCanceledError
+	if !errors.As(err, &canceled) {
+		t.Fatalf("ready-path completion error = %T, want *AcquireCanceledError", err)
+	}
+	if shared, exclusive := c.counts(); shared != 0 || exclusive {
+		t.Fatalf(
+			"after raced permit release counts = (shared %d, exclusive %v), want (0, false)",
+			shared,
+			exclusive,
+		)
+	}
+}
+
 func TestWorkspaceCoordinatorHealthy(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("lease down")
