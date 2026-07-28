@@ -128,6 +128,7 @@ func assertReconstruct(t *testing.T, raw []byte) {
 func isTypedEventError(err error) bool {
 	var (
 		unknownEvent *event.UnknownEventTypeError
+		unsupported  *event.UnsupportedSchemaError
 		decode       *event.EventDecodeError
 		limit        *event.EventLimitError
 		invalid      *event.InvalidEventError
@@ -137,6 +138,7 @@ func isTypedEventError(err error) bool {
 		unknownBlock *content.UnknownBlockTypeError
 	)
 	return errors.As(err, &unknownEvent) ||
+		errors.As(err, &unsupported) ||
 		errors.As(err, &decode) ||
 		errors.As(err, &limit) ||
 		errors.As(err, &invalid) ||
