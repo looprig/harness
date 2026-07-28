@@ -432,7 +432,9 @@ Test:
 Use small real classifier stubs to specify the focused interface from design
 §9. Construction must reject nil, typed nil, duplicates, current-loop models,
 background definitions, missing structured output, and descriptor/revision
-drift.
+drift. Evidence-tool policy validation is added to this same registry in Task 7
+after the Hustle descriptor can represent it; do not invent placeholder
+metadata in `pkg/gate`.
 
 **Step 3: Verify RED**
 
@@ -443,15 +445,139 @@ Expected: compile failure.
 Keep the policy evaluator pure:
 
 ```go
+const MaxPermissionReviewRationaleBytes = 2048
+const MaxPermissionReviewPolicyRevisionBytes = 128
+const MaxPermissionClassifierRevisionBytes = 128
+
+type PermissionAssessment struct {
+    Basis          ReviewBasis
+    Risk           ReviewRisk
+    Authorization  ReviewAuthorization
+    Categories     []ReviewRiskCategory
+    Recommendation ReviewRecommendation
+    Rationale      string
+}
+
+type PermissionReviewPolicy struct {
+    Revision             string
+    MaximumAutoRisk      ReviewRisk
+    MinimumAuthorization map[ReviewRisk]ReviewAuthorization
+    AbsoluteHuman        []ReviewRiskCategory
+    MaterialTruncation   ReviewTruncationMask
+}
+
+func NewPermissionReviewPolicy(
+    revision string,
+    maximum ReviewRisk,
+    minimum map[ReviewRisk]ReviewAuthorization,
+    absoluteHuman []ReviewRiskCategory,
+    material ReviewTruncationMask,
+) (PermissionReviewPolicy, error)
+
+func DefaultPermissionReviewPolicy(
+    revision string,
+) (PermissionReviewPolicy, error)
+
 func EvaluatePermissionAssessment(
     policy PermissionReviewPolicy,
     subject PermissionReviewSubject,
     assessment PermissionAssessment,
 ) ReviewDecision
+
+type PermissionAssessmentOutcome struct {
+    Applicable bool
+    Status     ReviewStatus
+    Assessment PermissionAssessment
+}
+
+func CombinePermissionAssessments(
+    policy PermissionReviewPolicy,
+    subject PermissionReviewSubject,
+    outcomes []PermissionAssessmentOutcome,
+) ReviewDecision
 ```
 
 `ReviewDecision` is not a `GateResponse` and exposes no action string. It can
-only report eligibility plus a bounded reason.
+only report `Eligible bool` plus a closed, bounded `ReviewDecisionReason`. Its
+reason domain distinguishes eligible, invalid policy, invalid assessment,
+basis mismatch, recommendation, risk ceiling, authorization, absolute-human
+category, material truncation, no applicable classifier, and non-allow
+classifier status. It never carries classifier errors or rationale.
+
+Policy requirements:
+
+- the default is the design §10 matrix: low→unknown, medium→unknown,
+  high→medium, with maximum high; critical is never eligible;
+- a custom policy is complete for low/medium/high, uses only supported enum
+  keys/values and truncation bits, has unique categories, and owns cloned
+  slices/maps;
+- maximum risk may tighten to medium or low but may not relax to critical;
+- high-risk minimum authorization may tighten above medium but never relax
+  below medium;
+- consumer absolute-human categories and material-truncation bits only add
+  restrictions;
+- any bit already present in `subject.Context.Truncation.Material` always
+  blocks eligibility; `MaterialTruncation` selects additional applied bits and
+  the default additional mask is zero;
+- evaluation revalidates the policy so mutation of its exported map after
+  construction fails closed;
+- policy revision is non-empty, bounded, valid UTF-8, and exactly equals the
+  subject's gate-policy revision.
+
+Assessment requirements:
+
+- basis exactly equals the subject basis, including digest;
+- risk, authorization, recommendation, and categories use the closed domains;
+- categories are unique and bounded;
+- rationale is valid UTF-8, at most
+  `MaxPermissionReviewRationaleBytes`, and non-empty after trimming for every
+  non-low assessment;
+- rationale is never returned in a decision; and
+- a model `allow` that violates local policy becomes a non-eligible decision.
+
+Conjunction requirements:
+
+- an outcome is non-applicable only when `Applicable` is false and status is
+  `not_applicable`;
+- an applicable outcome is considered only when status is `allowed`;
+- any failed/timed-out/cancelled/stale/needs-human/inconsistent status fails
+  the entire conjunction;
+- at least one classifier must be applicable; and
+- every applicable assessment must be individually eligible.
+
+Define and register:
+
+```go
+type PermissionClassifier interface {
+    Name() hustle.Name
+    Revision() string
+    Definition() hustle.Definition
+    Applies(PermissionReviewSubject) bool
+    MarshalInput(PermissionReviewSubject) (json.RawMessage, error)
+    ValidateResult(
+        PermissionReviewSubject,
+        hustle.Result,
+    ) (PermissionAssessment, error)
+}
+
+type PermissionClassifierSet struct {
+    // unexported immutable ordered storage
+}
+
+func NewPermissionClassifierSet(
+    classifiers ...PermissionClassifier,
+) (PermissionClassifierSet, error)
+
+func (s PermissionClassifierSet) Classifiers() []PermissionClassifier
+```
+
+The constructor preserves order and clones the slice. It rejects zero
+classifiers, nil/typed-nil implementations, invalid or duplicate names,
+duplicate revisions, blank/oversized/non-UTF-8 revisions, zero definitions,
+non-blocking participation, non-named model sources, missing structured output,
+name mismatch, and classifier revision mismatch with the definition
+descriptor's declared policy revision. It must not call `Applies`,
+`MarshalInput`, or `ValidateResult` during registration.
 
 **Step 5: Run GREEN and commit**
 
@@ -588,6 +714,8 @@ git commit -m "feat(hustle): define bounded evidence tool loops"
 - Modify: `pkg/hustle/definition.go`
 - Create: `pkg/hustle/evidence.go`
 - Create: `pkg/hustle/evidence_test.go`
+- Modify: `pkg/gate/reviewer.go`
+- Modify: `pkg/gate/reviewer_test.go`
 - Modify: `internal/sessionruntime/hustle.go`
 - Modify: `internal/sessionruntime/hustle_test.go`
 
@@ -602,7 +730,9 @@ Tests must prove:
 - schema and description digests contribute to bound identity;
 - build/schema drift fails session construction;
 - typed nil tools fail; and
-- tool-less definitions do not build a toolset.
+- tool-less definitions do not build a toolset;
+- a registered permission classifier must declare a non-empty evidence-tool
+  policy revision whose descriptor identity survives binding.
 
 **Step 2: Verify RED**
 
@@ -620,7 +750,8 @@ Run `pkg/hustle` and focused `internal/sessionruntime` construction tests.
 
 ```bash
 git add pkg/hustle internal/sessionruntime/hustle.go \
-  internal/sessionruntime/hustle_test.go
+  internal/sessionruntime/hustle_test.go pkg/gate/reviewer.go \
+  pkg/gate/reviewer_test.go
 git commit -m "feat(hustle): bind fingerprinted evidence tools"
 ```
 
