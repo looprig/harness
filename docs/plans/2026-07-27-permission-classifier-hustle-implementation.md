@@ -169,14 +169,37 @@ type ReviewContextEntry struct {
     Truncated bool
 }
 
+type ReviewContext struct {
+    Coordinates        identity.Coordinates
+    ContextRevision    string
+    WorkspaceRoot      string
+    WorkingDirectory   string
+    RetryReason        string
+    SecurityCeiling    string
+    GatePolicyRevision string
+    Entries            []ReviewContextEntry
+    Truncation         ReviewTruncation
+}
+
 type ReviewContextPolicy struct {
     Revision             string
     MaxBytes             int
+    MaxEstimatedTokens   int
     MaxEntries           int
     MaxUserEntryBytes    int
     MaxAgentEntryBytes   int
     MaxToolEntryBytes    int
+    MaxBlockBytes        int
     MaxActiveActionBytes int
+}
+
+type ReviewTruncationMask uint16
+
+type ReviewTruncation struct {
+    Applied        ReviewTruncationMask
+    Material       ReviewTruncationMask
+    OmittedEntries int
+    OmittedBytes   int
 }
 ```
 
@@ -185,6 +208,17 @@ defensive cloning, UTF-8-safe prefix/suffix truncation, stable omission
 markers, retention of current user intent, retention of the active assistant
 tool request, exact limits, one-byte-over limits, and material-truncation
 classification.
+
+Close the wire values:
+
+- origins: `user`, `assistant`, `tool`, `runtime`, `external`, `omission`;
+- kinds: `user_message`, `assistant_message`, `assistant_tool_request`,
+  `tool_result`, `runtime_context`, `external_content`, `omission`; and
+- accept only the corresponding origin/kind pair for each kind.
+
+Add complete-value parse tests for both enums. Unknown, blank, mismatched, or
+invalid UTF-8 entries fail with the bounded non-echoing review validation
+error from Task 1.
 
 **Step 2: Verify RED**
 
@@ -196,8 +230,34 @@ Keep raw `content.AgenticMessages` out of the public review domain. Accept
 already-labeled builder entries and return an immutable value. The loop adapter
 will own conversion from conversation types in Phase 4.
 
-The builder must reject invalid UTF-8 and zero/negative limits and must never
-silently omit an entry.
+Implement:
+
+```go
+func BuildReviewContext(
+    input ReviewContext,
+    policy ReviewContextPolicy,
+) (ReviewContext, error)
+
+func (c ReviewContext) Clone() ReviewContext
+```
+
+`BuildReviewContext` validates the non-zero coordinate quartet, non-empty
+context/policy revisions, workspace root, working directory, security ceiling,
+and gate-policy revision. It rejects invalid UTF-8 and zero/negative limits.
+It treats the final user-message entry as current intent and the final
+assistant-tool-request entry as the active action. Both must remain represented;
+construction rejects input missing either one so the caller leaves review
+ineligible. If the active action alone exceeds its explicit limit, construction
+also fails.
+
+Apply per-entry limits before total limits. Truncated text keeps a deterministic
+UTF-8-safe prefix and suffix separated by a fixed marker. Entry-count or total
+budget omission inserts one fixed typed omission entry containing bounded
+counts, never source content. Estimate tokens with one documented deterministic
+integer rule rather than a model tokenizer. `ReviewTruncation.Applied` records
+every applied limit; `Material` includes loss of current intent, active action,
+security posture, or required evidence. The returned value owns a cloned entry
+slice. The builder must never silently omit or mutate an input entry.
 
 **Step 4: Add fuzz coverage**
 
