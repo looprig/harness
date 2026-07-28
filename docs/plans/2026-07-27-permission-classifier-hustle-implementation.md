@@ -878,6 +878,12 @@ Test:
 - hashes change for every behavioral field; and
 - prompt-only/tool-less compaction fixtures remain byte-identical.
 
+Hard catalog limits are 64 definitions, 128 produced concrete tools, 64 bytes
+per concrete tool name, 4 KiB per description, 1 MiB per schema, and 4 MiB
+aggregate model-facing name/description/compact-schema bytes. Test every exact
+and one-over boundary. Evidence-policy revision must be valid UTF-8, NUL-free,
+non-empty, at most 128 bytes, and already trimmed.
+
 **Step 2: Verify RED**
 
 Expected: compile failure.
@@ -919,6 +925,11 @@ Tests must prove:
 - delegate bindings are absent;
 - built tools match frozen produced names;
 - `ToolInfo` is non-nil, valid, uniquely named, and has valid JSON schema;
+- tool schemas satisfy `inference.ValidateOutputSchema`'s bounded portable
+  root-object subset, rejecting duplicate members, invalid/unknown keywords or
+  types, excessive nesting, and excessive properties;
+- the complete bound catalog respects the hard per-field/cardinality/aggregate
+  metadata limits from Task 6;
 - schema and description digests contribute to bound identity;
 - build/schema drift fails session construction;
 - typed nil tools fail; and

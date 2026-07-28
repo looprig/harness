@@ -695,10 +695,19 @@ The definition descriptor adds:
 - tool-loop limits; and
 - a marker that structured output with tools is required.
 
+Evidence catalogs have hard construction bounds independent of loop execution:
+at most 64 tool definitions, at most 128 produced concrete tools, at most 64
+bytes per concrete tool name, at most 4 KiB per description, at most 1 MiB per
+schema, and at most 4 MiB across all concrete names, descriptions, and compact
+schemas. Evidence-policy revisions are canonical trimmed UTF-8 without NUL.
+
 The descriptor never contains raw schemas or descriptions. Bound construction
 builds the concrete tools, validates their `ToolInfo`, computes canonical schema
-digests, and verifies the built set matches frozen metadata. Any drift fails
-session construction before a review can run.
+digests, and verifies the built set matches frozen metadata. Tool argument
+schemas must satisfy the same bounded portable JSON Schema subset used by the
+inference layer, including duplicate-key, keyword, depth, property-count, and
+root-object validation. Any drift or schema failure stops session construction
+before a review can run.
 
 ### 12.3 Model capability
 
