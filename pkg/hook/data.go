@@ -90,7 +90,7 @@ type CompactionData struct {
 }
 
 // ToolCallData describes the semantic tool-call operation, including permission
-// resolution and terminal preview data.
+// resolution and its normalized terminal result.
 type ToolCallData struct {
 	// ToolExecutionID is the runtime-minted identity for this attempted call.
 	ToolExecutionID uuid.UUID
@@ -106,6 +106,9 @@ type ToolCallData struct {
 	PermissionEffect event.PermissionDecisionEffect
 	// PermissionReason is the bounded decision reason.
 	PermissionReason string
+	// Result is the normalized terminal tool result, including pre-execution
+	// failures, when the semantic call has completed.
+	Result *tool.ToolResult
 	// ResultPreview is the bounded terminal tool-output preview.
 	ResultPreview string
 	// IsError reports whether the semantic call ended in an error.

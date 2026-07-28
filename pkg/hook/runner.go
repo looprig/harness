@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"time"
 )
 
 var (
@@ -21,6 +22,43 @@ type Runner struct {
 type registeredFinish struct {
 	index  int
 	finish FinishFunc
+}
+
+type isolatedObserverContext struct {
+	derived  context.Context
+	fallback context.Context
+}
+
+func (c *isolatedObserverContext) Deadline() (time.Time, bool) {
+	if deadline, exists, ok := contextDeadline(c.derived); ok {
+		return deadline, exists
+	}
+	deadline, exists, _ := contextDeadline(c.fallback)
+	return deadline, exists
+}
+
+func (c *isolatedObserverContext) Done() <-chan struct{} {
+	if done, ok := contextDone(c.derived); ok {
+		return done
+	}
+	done, _ := contextDone(c.fallback)
+	return done
+}
+
+func (c *isolatedObserverContext) Err() error {
+	if err, ok := contextErr(c.derived); ok {
+		return err
+	}
+	err, _ := contextErr(c.fallback)
+	return err
+}
+
+func (c *isolatedObserverContext) Value(key any) any {
+	if value, ok := contextValue(c.derived, key); ok {
+		return value
+	}
+	value, _ := contextValue(c.fallback, key)
+	return value
 }
 
 type parentPreservingContext struct {
@@ -103,7 +141,8 @@ func (r *Runner) Start(
 		}
 		if next == nil {
 			logObservationFailure("hook: begin callback returned nil context", snapshot.Operation, index)
-		} else {
+		} else if !sameContext(ctx, next) {
+			next = &isolatedObserverContext{derived: next, fallback: ctx}
 			var release func()
 			next, release = preserveParentCancellation(ctx, next)
 			if release != nil {
@@ -305,6 +344,57 @@ func finishAround(finish FinishFunc, result Result) (panicked bool) {
 	}()
 	finish(CloneResult(result))
 	return false
+}
+
+func contextDeadline(ctx context.Context) (deadline time.Time, exists bool, ok bool) {
+	defer func() {
+		if recover() != nil {
+			deadline = time.Time{}
+			exists = false
+			ok = false
+		}
+	}()
+	deadline, exists = ctx.Deadline()
+	return deadline, exists, true
+}
+
+func contextDone(ctx context.Context) (done <-chan struct{}, ok bool) {
+	defer func() {
+		if recover() != nil {
+			done = nil
+			ok = false
+		}
+	}()
+	return ctx.Done(), true
+}
+
+func contextErr(ctx context.Context) (err error, ok bool) {
+	defer func() {
+		if recover() != nil {
+			err = nil
+			ok = false
+		}
+	}()
+	return ctx.Err(), true
+}
+
+func contextValue(ctx context.Context, key any) (value any, ok bool) {
+	defer func() {
+		if recover() != nil {
+			value = nil
+			ok = false
+		}
+	}()
+	return ctx.Value(key), true
+}
+
+func sameContext(left context.Context, right context.Context) (same bool) {
+	defer func() {
+		if recover() != nil {
+			same = false
+		}
+	}()
+	return left == right
 }
 
 func logObservationFailure(message string, operation Operation, callbackIndex int) {

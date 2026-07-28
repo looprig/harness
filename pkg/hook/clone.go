@@ -88,6 +88,7 @@ func cloneToolCallData(data *ToolCallData) *ToolCallData {
 	}
 	cloned := *data
 	cloned.ArgsJSON = cloneRawMessage(data.ArgsJSON)
+	cloned.Result = cloneToolResult(data.Result)
 	return &cloned
 }
 

@@ -96,15 +96,16 @@ func TestToolHooks_GuardPrecedesResolutionAndDenialIsAudited(t *testing.T) {
 	}
 }
 
-func TestToolHooks_InternalGuardFailureIsRedacted(t *testing.T) {
+func TestToolHooks_InternalGuardFailureRedactsOutputsButPreservesFinishError(t *testing.T) {
 	t.Parallel()
 	const secret = "database-password"
+	guardFailure := errors.New(secret)
 	finished := make(chan hook.Result, 1)
 	hooks := compileRuntimeHooks(t, hook.Set{
 		PolicyRevision: "broken-v1",
 		Guards: []hook.Guard{{
 			Operation: hook.OperationToolCall,
-			Check:     func(context.Context, hook.Call) error { return errors.New(secret) },
+			Check:     func(context.Context, hook.Call) error { return guardFailure },
 		}},
 		Around: []hook.Around{{
 			Operation: hook.OperationToolCall,
@@ -124,8 +125,8 @@ func TestToolHooks_InternalGuardFailureIsRedacted(t *testing.T) {
 		t.Fatalf("result = %q, want exact redacted hook failure %q", got, errToolHookFailure)
 	}
 	hookResult := <-finished
-	if hookResult.Err == nil || strings.Contains(hookResult.Err.Error(), secret) {
-		t.Fatalf("hook finish error = %v, want redacted non-nil error", hookResult.Err)
+	if !errors.Is(hookResult.Err, guardFailure) {
+		t.Fatalf("hook finish error = %v, want original guard failure in trusted result", hookResult.Err)
 	}
 }
 
@@ -198,6 +199,14 @@ func TestToolHooks_CallAndExecutionNestAndPropagateContexts(t *testing.T) {
 	}
 	if callFinish.Outcome != hook.OutcomeCompleted || callFinish.ToolCall.ResultPreview != "ok" || callFinish.ToolCall.IsError {
 		t.Fatalf("tool-call finish = %+v", callFinish)
+	}
+	if callFinish.ToolCall.Result == nil {
+		t.Fatalf("tool-call finish has no full terminal Result: %+v", callFinish.ToolCall)
+	}
+	if resultText(result{
+		Content: callFinish.ToolCall.Result.Content,
+	}) != "ok" {
+		t.Fatalf("tool-call full result = %#v, want independently owned ok result", callFinish.ToolCall.Result)
 	}
 	if callFinish.ToolCall.Summary != "T safe summary" {
 		t.Fatalf("tool-call summary = %q, want safe audited summary", callFinish.ToolCall.Summary)

@@ -138,6 +138,9 @@ type turnConfig struct {
 	// terminal). StepDone is NOT emitted here — it is emitted by the actor at the
 	// commit point.
 	emit func(event.Event)
+	// emitContext is the context-carrying peer used by tool/gate events so
+	// JournalAppend hooks inherit their active operation context.
+	emitContext eventEmitter
 
 	// afterDrain is a test-only seam (nil in production) invoked by foldPending after
 	// drainPending returns the batch but before the first TurnFoldedInto commit. See
@@ -449,6 +452,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// without disturbing the StepID set here. This is the seam where the active
 		// step's id is known (st.id), keeping the runner ignorant of step identity.
 		stepEmit := stepStampingEmit(cfg.emit, st.id)
+		stepEmitContext := stepStampingContextEmit(cfg.emitContext, st.id)
 		// Inject the running step's coordinates so every tool in the batch can read
 		// its OWN provenance via ProvenanceFrom(ctx) — the Subagent tool passes this
 		// as the `parent` when spawning a sub-loop. This is the one seam where all
@@ -463,6 +467,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			GateRegistrations: cfg.gateReg,
 			IDGen:             cfg.idGen,
 			Emit:              stepEmit,
+			EmitContext:       stepEmitContext,
 			Hooks:             cfg.hooks,
 			Coordinates: identitydomain.Coordinates{
 				SessionID: identity.sessionID,

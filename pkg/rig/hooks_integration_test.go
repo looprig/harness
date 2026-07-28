@@ -214,10 +214,12 @@ func TestHooksIntegrationNativeOperationNestingAndPermission(t *testing.T) {
 	}
 
 	answered := false
+	var permissionEventID string
 	for {
 		select {
 		case delivery := <-sub.Events():
 			if _, ok := delivery.Event.(event.PermissionRequested); ok {
+				permissionEventID = delivery.Event.EventHeader().EventID.String()
 				lister, ok := live.(interface {
 					ListGates(context.Context) []gate.Gate
 				})
@@ -260,6 +262,29 @@ terminal:
 	assertHookIntegrationParent(t, entries, hook.OperationGateWait, hook.OperationToolCall)
 	assertHookIntegrationParent(t, entries, hook.OperationToolExecution, hook.OperationToolCall)
 	assertHookIntegrationJournalContext(t, entries)
+	assertHookIntegrationJournalParent(t, entries, permissionEventID, hook.OperationToolCall)
+}
+
+func assertHookIntegrationJournalParent(
+	t *testing.T,
+	entries []hookIntegrationEntry,
+	recordID string,
+	parent hook.Operation,
+) {
+	t.Helper()
+	if recordID == "" {
+		t.Fatal("target durable event has no record id")
+	}
+	for _, entry := range entries {
+		if entry.phase != "begin" || entry.op != hook.OperationJournalAppend || entry.id != recordID {
+			continue
+		}
+		if len(entry.stack) >= 2 && entry.stack[len(entry.stack)-2] == parent {
+			return
+		}
+		t.Fatalf("journal append %q stack = %v, want immediate parent %v", recordID, entry.stack, parent)
+	}
+	t.Fatalf("journal append %q was not observed", recordID)
 }
 
 func assertHookIntegrationRegistrationOrder(t *testing.T, entries []hookIntegrationEntry) {

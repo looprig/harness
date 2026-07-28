@@ -119,6 +119,18 @@ func TestGateHooks_RequestUserInputUsesDerivedContextOnlyForWait(t *testing.T) {
 	reg := <-gateReg
 	reg.ack <- gateInstallAck{gateID: gateID}
 	<-emitCh
+	var abandoned gateRegistration
+	select {
+	case abandoned = <-gateReg:
+	case err := <-done:
+		t.Fatalf("RequestUserInput returned %v before unregistering the canceled gate", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("RequestUserInput did not unregister the hook-canceled gate")
+	}
+	if abandoned.abandonID != gateID {
+		t.Fatalf("abandoned gate = %v, want %v", abandoned.abandonID, gateID)
+	}
+	abandoned.ack <- gateInstallAck{gateID: gateID}
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("RequestUserInput error = %v, want hook-derived cancellation", err)
 	}
@@ -175,6 +187,53 @@ func TestGateHooks_PermissionWaitCapturesApproval(t *testing.T) {
 		got.GateWait.Answer.Action != string(gatedomain.ApprovalApprove) ||
 		got.GateWait.Answer.Source.Kind != gatedomain.ResponseFromUser {
 		t.Fatalf("permission GateWait finish = %+v", got)
+	}
+}
+
+func TestGateHooks_PermissionWaitDerivedCancellationUnregistersGate(t *testing.T) {
+	t.Parallel()
+	base := &fakeRunTool{name: "T", output: "must not run"}
+	base.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status", false), nil, nil
+	}
+	finished := make(chan hook.Result, 1)
+	hooks := compileRuntimeHooks(t, hook.Set{Around: []hook.Around{{
+		Operation: hook.OperationGateWait,
+		Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+			waitCtx, cancel := context.WithCancel(ctx)
+			cancel()
+			return waitCtx, func(result hook.Result) { finished <- result }
+		},
+	}}})
+	gateReg := make(chan gateRegistration)
+	gateID := newCallID(t)
+	abandoned := make(chan gatedomain.ID, 1)
+	go func() {
+		reg := <-gateReg
+		reg.ack <- gateInstallAck{gateID: gateID}
+		closeRequest := <-gateReg
+		abandoned <- closeRequest.abandonID
+		closeRequest.ack <- gateInstallAck{gateID: closeRequest.abandonID}
+	}()
+	runtime := hookBatchRuntime(hooks, func(event.Event) {})
+	runtime.GateRegistrations = gateReg
+	tools := ToolSet{
+		Access:   interactiveEvaluator(t, gatedomain.AccessGated, &recordingRuleWriter{}, &recordingIssuer{}),
+		Registry: []tool.InvokableTool{base},
+	}
+
+	results := RunBatch(context.Background(), []content.ToolUseBlock{
+		{ID: "use", Name: "T", Input: []byte(`{}`)},
+	}, tools, runtime)
+
+	if len(results) != 1 || !results[0].IsError {
+		t.Fatalf("results = %+v, want canceled permission failure", results)
+	}
+	if got := <-abandoned; got != gateID {
+		t.Fatalf("abandoned gate = %v, want %v", got, gateID)
+	}
+	if got := <-finished; got.Outcome != hook.OutcomeCanceled {
+		t.Fatalf("GateWait outcome = %v, want canceled", got.Outcome)
 	}
 }
 

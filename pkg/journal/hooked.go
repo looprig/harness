@@ -21,6 +21,10 @@ type appendFuncJournal struct {
 	append AppendFunc
 }
 
+type appendPanicError struct{}
+
+func (*appendPanicError) Error() string { return "journal: append panicked" }
+
 func (j *appendFuncJournal) Append(ctx context.Context, record JournalRecord) (uint64, error) {
 	return j.append(ctx, record)
 }
@@ -63,6 +67,17 @@ func HookMiddleware(runner *hook.Runner, sessionID uuid.UUID) AppendMiddleware {
 			if startErr != nil {
 				return next(ctx, record)
 			}
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					finish(hook.Result{
+						Call:    call,
+						EndedAt: time.Now(),
+						Outcome: hook.OutcomeFailed,
+						Err:     &appendPanicError{},
+					})
+					panic(recovered)
+				}
+			}()
 			seq, err := next(hookCtx, record)
 			outcome := hook.OutcomeCompleted
 			switch {

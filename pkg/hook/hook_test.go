@@ -405,7 +405,9 @@ func TestCloneCallOwnsReferenceBackedData(t *testing.T) {
 		{Operation: OperationCompaction, Compaction: &CompactionData{
 			Input: compactionInput, Output: compactionOutput,
 		}},
-		{Operation: OperationToolCall, ToolCall: &ToolCallData{ArgsJSON: json.RawMessage(`{"raw":true}`)}},
+		{Operation: OperationToolCall, ToolCall: &ToolCallData{
+			ArgsJSON: json.RawMessage(`{"raw":true}`), Result: toolResult,
+		}},
 		{Operation: OperationGateWait, GateWait: &GateWaitData{Answer: gateAnswer}},
 		{Operation: OperationToolExecution, ToolExecution: &ToolExecutionData{
 			ArgsJSON: json.RawMessage(`{"exec":true}`), Result: toolResult,
@@ -469,8 +471,10 @@ func TestCloneCallOwnsReferenceBackedData(t *testing.T) {
 	}
 
 	clones[3].ToolCall.ArgsJSON[0] = '['
-	if string(calls[3].ToolCall.ArgsJSON) != `{"raw":true}` {
-		t.Fatal("tool-call clone aliases JSON")
+	clones[3].ToolCall.Result.Content[0].(*content.DocumentBlock).Data[0] = 'X'
+	if string(calls[3].ToolCall.ArgsJSON) != `{"raw":true}` ||
+		string(toolResult.Content[0].(*content.DocumentBlock).Data) != "payload" {
+		t.Fatal("tool-call clone aliases JSON or result blocks")
 	}
 	clones[4].GateWait.Answer.Values["answer"] = "changed"
 	if gateAnswer.Values["answer"] != "yes" {

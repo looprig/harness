@@ -335,6 +335,49 @@ func TestWithHooksObserverPanicsDoNotChangeAppend(t *testing.T) {
 	}
 }
 
+func TestWithHooksDelegatePanicFinishesAndRethrows(t *testing.T) {
+	t.Parallel()
+
+	panicValue := &struct{ secret string }{secret: "delegate-secret"}
+	var finished hook.Result
+	var delegated context.Context
+	runner, err := hook.Compile(hook.Set{Around: []hook.Around{{
+		Operation: hook.OperationJournalAppend,
+		Begin: func(context.Context, hook.Call) (context.Context, hook.FinishFunc) {
+			return context.Background(), func(result hook.Result) { finished = result }
+		},
+	}}})
+	if err != nil {
+		t.Fatalf("hook.Compile: %v", err)
+	}
+	appendWithHooks := HookMiddleware(runner, fixedUUID(0xc2))(func(ctx context.Context, _ JournalRecord) (uint64, error) {
+		delegated = ctx
+		panic(panicValue)
+	})
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_, _ = appendWithHooks(
+			parent,
+			NewFenceRecord(fixedUUID(0xc2), LeaseFence{Epoch: 10}),
+		)
+	}()
+
+	if recovered != panicValue {
+		t.Fatalf("recovered panic = %#v, want original %#v", recovered, panicValue)
+	}
+	if finished.Outcome != hook.OutcomeFailed || finished.Err == nil ||
+		finished.Err.Error() != "journal: append panicked" {
+		t.Fatalf("finish = %#v, want failed bounded panic result", finished)
+	}
+	if delegated == nil || delegated.Err() != context.Canceled {
+		t.Fatalf("delegated context error = %v, want cleanup cancellation", delegated.Err())
+	}
+}
+
 func TestWithHooksPreservesNilJournalForCheckedComposition(t *testing.T) {
 	t.Parallel()
 

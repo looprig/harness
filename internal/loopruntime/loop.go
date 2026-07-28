@@ -733,15 +733,19 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		return stamped, nil
 	}
-	publish := func(ev event.Event) {
+	publishContext := func(publishCtx context.Context, ev event.Event) {
 		stamped, err := stamp(ev)
 		if err != nil {
 			return
 		}
-		if err := cfg.events.PublishEvent(ctx, stamped); err != nil {
+		if publishCtx == nil {
+			publishCtx = ctx
+		}
+		if err := cfg.events.PublishEvent(publishCtx, stamped); err != nil {
 			slog.Error("loop event publish to session fan-in failed", "error", err)
 		}
 	}
+	publish := func(ev event.Event) { publishContext(ctx, ev) }
 	publishTurnStarted := func(publishCtx context.Context, ev event.TurnStarted, capability TurnStartCapability) (bool, error) {
 		if capability == nil {
 			err := cfg.events.PublishEventChecked(publishCtx, ev)
@@ -940,8 +944,7 @@ func runLoop(cfg loopConfig, state loopState) {
 						outcome = hook.OutcomeDenied
 					}
 				}
-				safeErr := safeHookError(hook.OperationCompaction, hookErr)
-				scope.setTerminal(outcome, safeErr, nil)
+				scope.setTerminal(outcome, hookErr, nil)
 				rejected := rejectedCompactionResult(reason)
 				rejected.Proposal.hookScope = scope
 				disposition.preRejected = &rejected
@@ -1369,6 +1372,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			commit:                  commit,
 			drainPending:            drainPending,
 			emit:                    publish,
+			emitContext:             publishContext,
 			afterDrain:              config.afterDrain,
 			afterContextReplacement: config.afterContextReplacement,
 		}
@@ -2343,17 +2347,33 @@ func runLoop(cfg loopConfig, state loopState) {
 				return
 			}
 		case reg := <-gateReg:
+			if !reg.abandonID.IsZero() {
+				if _, open := state.pendingGates[reg.abandonID]; open {
+					delete(state.pendingGates, reg.abandonID)
+					reg.ack <- gateInstallAck{
+						gateID: reg.abandonID,
+						err:    cfg.gates.CloseGate(reg.ctx, reg.abandonID, gatedomain.CloseAbandoned),
+					}
+				} else {
+					reg.ack <- gateInstallAck{gateID: reg.abandonID}
+				}
+				break
+			}
 			callID := reg.toolExecutionID()
-			gateID, err := cfg.gates.PrepareGateOpen(ctx, state.id, reg.gate, reg.payload)
+			gateCtx := reg.ctx
+			if gateCtx == nil {
+				gateCtx = ctx
+			}
+			gateID, err := cfg.gates.PrepareGateOpen(gateCtx, state.id, reg.gate, reg.payload)
 			if err != nil {
 				reg.ack <- gateInstallAck{err: err}
 				break
 			}
 			state.pendingGates[gateID] = pendingGate{reply: reg.reply, kind: reg.kind}
 			route := gatedomain.Route{GateID: gateID, LoopID: state.id, ToolExecutionID: callID}
-			if err := cfg.gates.ActivateGate(ctx, gateID, route); err != nil {
+			if err := cfg.gates.ActivateGate(gateCtx, gateID, route); err != nil {
 				delete(state.pendingGates, gateID)
-				_ = cfg.gates.CloseGate(ctx, gateID, gatedomain.CloseAbandoned)
+				_ = cfg.gates.CloseGate(gateCtx, gateID, gatedomain.CloseAbandoned)
 				reg.ack <- gateInstallAck{gateID: gateID, err: err}
 				break
 			}

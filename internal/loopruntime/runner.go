@@ -142,12 +142,15 @@ type resolved struct {
 }
 
 // BatchRuntime carries the runtime-owned services and attribution shared by one
-// batch. Zero values are safe: UUID generation defaults to uuid.New, event
+// batch. EmitContext is preferred when the caller can preserve operation
+// context; Emit remains the context-free compatibility seam used by focused
+// tests. Zero values are safe: UUID generation defaults to uuid.New, event
 // emission is discarded, and a nil hook runner is a no-op.
 type BatchRuntime struct {
 	GateRegistrations chan<- gateRegistration
 	IDGen             func() (uuid.UUID, error)
 	Emit              func(event.Event)
+	EmitContext       eventEmitter
 	Hooks             *hook.Runner
 	Coordinates       identity.Coordinates
 	AgentName         identity.AgentName
@@ -175,13 +178,18 @@ func RunBatch(
 	if runtime.IDGen == nil {
 		runtime.IDGen = uuid.New
 	}
-	if runtime.Emit == nil {
-		runtime.Emit = func(event.Event) {}
+	emitContext := runtime.EmitContext
+	if emitContext == nil {
+		emit := runtime.Emit
+		if emit == nil {
+			emit = func(event.Event) {}
+		}
+		emitContext = func(_ context.Context, value event.Event) { emit(value) }
 	}
 	// safeEmit serializes all event emission so the caller's emit need not be
 	// concurrent-safe (the parallel executor calls Completed from many goroutines).
 	var emitMu sync.Mutex
-	safeEmit := func(ev event.Event) {
+	safeEmit := func(ctx context.Context, ev event.Event) {
 		emitMu.Lock()
 		defer emitMu.Unlock()
 		defer func() {
@@ -189,7 +197,7 @@ func RunBatch(
 				panic(runtimeInvariantPanic{value: recovered})
 			}
 		}()
-		runtime.Emit(ev)
+		emitContext(ctx, ev)
 	}
 
 	rs := make([]*resolved, len(calls))
@@ -238,7 +246,7 @@ func RunBatch(
 	// requested call (including pre-execution failures) gets a Started, and every
 	// Started precedes every Completed so the TUI groups the batch race-free.
 	for _, r := range rs {
-		safeEmit(event.ToolCallStarted{ToolExecutionID: r.callID, ToolName: r.block.Name, Summary: r.summary})
+		safeEmit(r.ctx, event.ToolCallStarted{ToolExecutionID: r.callID, ToolName: r.block.Name, Summary: r.summary})
 	}
 
 	// Each call owns final[i] by index: serial and parallel goroutines each write a
@@ -250,8 +258,8 @@ func RunBatch(
 	complete := func(i int, resolvedCall *resolved, callResult result) {
 		final[i] = callResult
 		preview, isErr := previewOf(callResult)
-		safeEmit(event.ToolCallCompleted{ToolExecutionID: callResult.ToolExecutionID, IsError: isErr, ResultPreview: preview})
-		resolvedCall.finish(preview, isErr)
+		safeEmit(resolvedCall.ctx, event.ToolCallCompleted{ToolExecutionID: callResult.ToolExecutionID, IsError: isErr, ResultPreview: preview})
+		resolvedCall.finish(callResult)
 	}
 
 	// Pre-execution failures complete immediately, in the Started order. executable
@@ -333,10 +341,10 @@ func newResolved(
 	}()
 	if hookErr != nil {
 		if denial, denied := hook.AsDenial(hookErr); denied {
-			r.terminalErr = denial
+			r.terminalErr = hookErr
 			r.fail(errToolHookDeniedPrefix + denial.Reason)
 		} else {
-			r.terminalErr = safeHookError(hook.OperationToolCall, hookErr)
+			r.terminalErr = hookErr
 			r.fail(errToolHookFailure)
 		}
 		return r
@@ -424,7 +432,7 @@ func resolveAccessSafely(
 	r *resolved,
 	ts ToolSet,
 	gateReg chan<- gateRegistration,
-	emit func(event.Event),
+	emit eventEmitter,
 ) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -450,8 +458,9 @@ func (r *resolved) failWith(msg string, err error) {
 	r.terminalErr = err
 }
 
-func (r *resolved) finish(preview string, isErr bool) {
+func (r *resolved) finish(terminal result) {
 	r.finishOnce.Do(func() {
+		preview, isErr := previewOf(terminal)
 		if r.hookPreview != "" {
 			preview = r.hookPreview
 		}
@@ -459,6 +468,7 @@ func (r *resolved) finish(preview string, isErr bool) {
 		call.ToolCall.Summary = r.summary
 		call.ToolCall.PermissionEffect = r.permissionEffect
 		call.ToolCall.PermissionReason = r.permissionReason
+		call.ToolCall.Result = &tool.ToolResult{Content: append([]content.Block(nil), terminal.Content...)}
 		call.ToolCall.ResultPreview = preview
 		call.ToolCall.IsError = isErr
 		outcome := hook.OutcomeCompleted
@@ -475,7 +485,7 @@ func (r *resolved) finishInvariantFailure() {
 		return
 	}
 	r.failWith(errToolDependencyFailed, &operationHookPanicError{Operation: hook.OperationToolCall})
-	r.finish(errToolDependencyFailed, true)
+	r.finish(errResult(r, errToolDependencyFailed))
 }
 
 // lookupTool resolves a tool by its Info(ctx).Name. Returns nil for an unknown
@@ -558,11 +568,11 @@ func resolveAccess(
 	r *resolved,
 	ts ToolSet,
 	gateReg chan<- gateRegistration,
-	emit func(event.Event),
+	emit eventEmitter,
 ) error {
 	if ts.Access == nil {
 		// No access gate wired → fail-secure: deny rather than fall through.
-		emitAccessDecided(r, event.PermissionEffectDeny, "access_gate_missing", emit)
+		emitAccessDecided(ctx, r, event.PermissionEffectDeny, "access_gate_missing", emit)
 		r.fail(errPermissionDenied)
 		return nil
 	}
@@ -579,20 +589,20 @@ func resolveAccess(
 		slog.Warn("loop: access authorization failed; failing call fail-closed (not executed)",
 			"tool", boundedDiagnostic(r.block.Name), "error", boundedDiagnostic(safeErrorText(err)))
 		if !r.prompted {
-			emitAccessDecided(r, event.PermissionEffectDeny, "access_error", emit)
+			emitAccessDecided(ctx, r, event.PermissionEffectDeny, "access_error", emit)
 		}
 		r.fail(errPermissionDenied)
 		return err
 	}
 	if !resolution.Approved {
 		if !r.prompted {
-			emitAccessDecided(r, event.PermissionEffectDeny, "access_denied", emit)
+			emitAccessDecided(ctx, r, event.PermissionEffectDeny, "access_denied", emit)
 		}
 		r.fail(errPermissionDenied)
 		return nil
 	}
 	if !r.prompted {
-		emitAccessDecided(r, event.PermissionEffectApprove, "access_evaluated", emit)
+		emitAccessDecided(ctx, r, event.PermissionEffectApprove, "access_evaluated", emit)
 	}
 	// Fresh grants issued for THIS call travel on the prepared execution
 	// contract (never an ambient ctx carrier, never a durable record).
@@ -602,10 +612,16 @@ func resolveAccess(
 
 // emitAccessDecided emits the redacted non-gated decision audit (an interactive
 // prompt path emits PermissionRequested instead).
-func emitAccessDecided(r *resolved, effect event.PermissionDecisionEffect, reason string, emit func(event.Event)) {
+func emitAccessDecided(
+	ctx context.Context,
+	r *resolved,
+	effect event.PermissionDecisionEffect,
+	reason string,
+	emit eventEmitter,
+) {
 	r.permissionEffect = effect
 	r.permissionReason = reason
-	emit(event.PermissionDecided{
+	emit(ctx, event.PermissionDecided{
 		ToolExecutionID: r.callID,
 		Effect:          effect,
 		Reason:          reason,
@@ -622,7 +638,7 @@ func emitAccessDecided(r *resolved, effect event.PermissionDecisionEffect, reaso
 func approvalRequesterFor(
 	r *resolved,
 	gateReg chan<- gateRegistration,
-	emit func(event.Event),
+	emit eventEmitter,
 ) loop.ApprovalRequestFunc {
 	return func(ctx context.Context, prompt gatedomain.ApprovalPrompt) (gatedomain.ApprovalAction, error) {
 		r.prompted = true
@@ -637,7 +653,7 @@ func approvalRequesterFor(
 		payload := gatedomain.PermissionPayload{Request: displayed}
 
 		select {
-		case gateReg <- gateRegistration{gate: g, payload: payload, callID: r.callID, reply: reply, kind: gatePermission, ack: ack}:
+		case gateReg <- gateRegistration{ctx: ctx, gate: g, payload: payload, callID: r.callID, reply: reply, kind: gatePermission, ack: ack}:
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
@@ -653,7 +669,7 @@ func approvalRequesterFor(
 
 		// Install-before-emit: only now is the gate guaranteed installed, so the
 		// matching Approve/Deny cannot be dropped on a race.
-		emit(event.PermissionRequested{ToolExecutionID: r.callID, Request: displayed})
+		emit(ctx, event.PermissionRequested{ToolExecutionID: r.callID, Request: displayed})
 
 		g.ID = installed.gateID
 		waitCtx, waitCall, finishWait, waitErr := startGateWaitWithRunner(ctx, r.hookCall, g, r.hooks)
@@ -678,8 +694,15 @@ func approvalRequesterFor(
 			}
 			return action, err
 		case <-waitCtx.Done():
-			finishGateWait(finishWait, waitCall, nil, waitCtx.Err())
-			return "", waitCtx.Err()
+			waitErr := waitCtx.Err()
+			if ctx.Err() == nil {
+				if err := abandonInstalledGate(ctx, waitCtx, gateReg, installed.gateID); err != nil {
+					finishGateWait(finishWait, waitCall, nil, err)
+					return "", err
+				}
+			}
+			finishGateWait(finishWait, waitCall, nil, waitErr)
+			return "", waitErr
 		}
 	}
 }
@@ -734,7 +757,7 @@ func execute(
 	executable []indexedResolved,
 	ts ToolSet,
 	runtime BatchRuntime,
-	emit func(event.Event),
+	emit eventEmitter,
 	complete func(int, *resolved, result),
 ) {
 	var serial, parallel []indexedResolved
@@ -813,9 +836,9 @@ func runOne(
 	r *resolved,
 	ts ToolSet,
 	runtime BatchRuntime,
-	emit func(event.Event),
+	emit eventEmitter,
 ) (res result) {
-	ctx2 := WithPreparedCall(withGateReg(withEmit(withToolUseID(withCallID(ctx, r.callID), r.block.ID), emit), runtime.GateRegistrations), r.prepared)
+	ctx2 := WithPreparedCall(withGateReg(withContextEmit(withToolUseID(withCallID(ctx, r.callID), r.block.ID), emit), runtime.GateRegistrations), r.prepared)
 	ctx2 = WithUserInputRequester(ctx2, RequestUserInput)
 	ctx2 = withOperationHookRuntime(ctx2, operationHookRuntime{
 		hooks: runtime.Hooks, coordinates: runtime.Coordinates,

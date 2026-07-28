@@ -1,6 +1,8 @@
 package loopruntime
 
 import (
+	"context"
+
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 )
@@ -273,6 +275,15 @@ func stampStepID(ev event.Event, stepID uuid.UUID) event.Event {
 // tool/gate events without ever depending on the step.
 func stepStampingEmit(emit func(event.Event), stepID uuid.UUID) func(event.Event) {
 	return func(ev event.Event) { emit(stampStepID(ev, stepID)) }
+}
+
+func stepStampingContextEmit(emit eventEmitter, stepID uuid.UUID) eventEmitter {
+	if emit == nil {
+		return nil
+	}
+	return func(ctx context.Context, ev event.Event) {
+		emit(ctx, stampStepID(ev, stepID))
+	}
 }
 
 // fillTurnScoped fills SessionID + LoopID + TurnID for a header-less turn-scoped

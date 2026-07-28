@@ -18,6 +18,13 @@ import (
 
 type runnerContextKey string
 
+type panickingObserverContext struct{}
+
+func (panickingObserverContext) Deadline() (time.Time, bool) { panic("observer deadline") }
+func (panickingObserverContext) Done() <-chan struct{}       { panic("observer done") }
+func (panickingObserverContext) Err() error                  { panic("observer err") }
+func (panickingObserverContext) Value(any) any               { panic("observer value") }
+
 func validRunnerCall() Call {
 	return Call{
 		Operation: OperationToolCall,
@@ -239,6 +246,63 @@ func TestRunnerDetachedBeginPreservesParentCancellationAndDeadline(t *testing.T)
 			}
 			finish(Result{Call: call, Outcome: OutcomeCompleted})
 		})
+	}
+}
+
+func TestRunnerIsolatesPanicsFromObserverReturnedContext(t *testing.T) {
+	t.Parallel()
+
+	key := runnerContextKey("parent")
+	parent := context.WithValue(context.Background(), key, "kept")
+	var secondBegin, guardCalled, finishCalled atomic.Bool
+	runner, err := Compile(Set{
+		PolicyRevision: "hostile-context-v1",
+		Around: []Around{
+			{
+				Operation: OperationToolCall,
+				Begin: func(context.Context, Call) (context.Context, FinishFunc) {
+					return panickingObserverContext{}, func(Result) { finishCalled.Store(true) }
+				},
+			},
+			{
+				Operation: OperationToolCall,
+				Begin: func(ctx context.Context, _ Call) (context.Context, FinishFunc) {
+					secondBegin.Store(true)
+					if got := ctx.Value(key); got != "kept" {
+						t.Errorf("fallback parent value = %v, want kept", got)
+					}
+					return ctx, nil
+				},
+			},
+		},
+		Guards: []Guard{{
+			Operation: OperationToolCall,
+			Check: func(ctx context.Context, _ Call) error {
+				guardCalled.Store(true)
+				if got := ctx.Value(key); got != "kept" {
+					t.Errorf("guard fallback parent value = %v, want kept", got)
+				}
+				return nil
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, finish, startErr := runner.Start(parent, validRunnerCall())
+	if startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	if !secondBegin.Load() || !guardCalled.Load() {
+		t.Fatalf("callbacks ran: second begin=%v guard=%v, want both", secondBegin.Load(), guardCalled.Load())
+	}
+	if got := ctx.Value(key); got != "kept" {
+		t.Fatalf("returned context fallback value = %v, want kept", got)
+	}
+	finish(validRunnerResult())
+	if !finishCalled.Load() {
+		t.Fatal("finish registered before hostile context did not run")
 	}
 }
 

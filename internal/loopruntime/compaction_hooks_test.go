@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"reflect"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -690,6 +689,7 @@ func TestCompactionHooksSuccessfulFinalizerReplayDoesNotDoubleFinish(t *testing.
 
 func TestCompactionHooksDenialUsesExistingRedactedRejectionWithoutCompactor(t *testing.T) {
 	const secret = "do-not-export-hook-policy-detail"
+	guardDenial := hook.Deny("policy.compaction", secret)
 	finished := make(chan hook.Result, 1)
 	recorder := &recordingPublisher{}
 	hooks := compileRuntimeHooks(t, hook.Set{
@@ -697,7 +697,7 @@ func TestCompactionHooksDenialUsesExistingRedactedRejectionWithoutCompactor(t *t
 		Guards: []hook.Guard{{
 			Operation: hook.OperationCompaction,
 			Check: func(context.Context, hook.Call) error {
-				return hook.Deny("policy.compaction", secret)
+				return guardDenial
 			},
 		}},
 		Around: []hook.Around{{
@@ -715,9 +715,9 @@ func TestCompactionHooksDenialUsesExistingRedactedRejectionWithoutCompactor(t *t
 	waitForCompactionHookTerminal(t, recorder, commandID)
 
 	result := awaitCompactionHookFinish(t, finished)
-	if result.Outcome != hook.OutcomeDenied || result.Err == nil ||
-		strings.Contains(result.Err.Error(), secret) {
-		t.Fatalf("finish = %#v, want redacted denial", result)
+	denial, denied := hook.AsDenial(result.Err)
+	if result.Outcome != hook.OutcomeDenied || !denied || denial.Reason != secret {
+		t.Fatalf("finish = %#v, want original trusted denial", result)
 	}
 	if calls, _ := compactor.snapshot(); calls != 0 {
 		t.Fatalf("compactor calls = %d, want 0", calls)
@@ -740,13 +740,14 @@ func TestCompactionHooksDenialUsesExistingRedactedRejectionWithoutCompactor(t *t
 
 func TestCompactionHooksInternalGuardFailureFailsClosedAndRedactsDetails(t *testing.T) {
 	const secret = "internal-hook-secret"
+	guardFailure := errors.New(secret)
 	finished := make(chan hook.Result, 1)
 	recorder := &recordingPublisher{}
 	hooks := compileRuntimeHooks(t, hook.Set{
 		PolicyRevision: "fail-v1",
 		Guards: []hook.Guard{{
 			Operation: hook.OperationCompaction,
-			Check:     func(context.Context, hook.Call) error { return errors.New(secret) },
+			Check:     func(context.Context, hook.Call) error { return guardFailure },
 		}},
 		Around: []hook.Around{{
 			Operation: hook.OperationCompaction,
@@ -762,9 +763,8 @@ func TestCompactionHooksInternalGuardFailureFailsClosedAndRedactsDetails(t *test
 	waitForCompactionHookTerminal(t, recorder, commandID)
 
 	result := awaitCompactionHookFinish(t, finished)
-	if result.Outcome != hook.OutcomeFailed || result.Err == nil ||
-		strings.Contains(result.Err.Error(), secret) {
-		t.Fatalf("finish = %#v, want redacted internal failure", result)
+	if result.Outcome != hook.OutcomeFailed || !errors.Is(result.Err, guardFailure) {
+		t.Fatalf("finish = %#v, want original trusted internal failure", result)
 	}
 	if calls, _ := compactor.snapshot(); calls != 0 {
 		t.Fatalf("compactor calls = %d, want 0", calls)

@@ -193,6 +193,36 @@ func TestLoopGateActivationFailureRemovesLocalBlocker(t *testing.T) {
 	}
 }
 
+func TestLoopGateAbandonmentClosesAndDeregisters(t *testing.T) {
+	t.Parallel()
+	callID := newCallID(t)
+	gateID := newCallID(t)
+	registrar := &gateRegistrarPublisher{gateID: gateID}
+	l, _ := newLoopWithGateRegistrar(t, registrar)
+	reply := registerGate(t, l, callID, gateUserInput)
+	ack := make(chan gateInstallAck, 1)
+
+	l.gateReg <- gateRegistration{
+		ctx:       context.Background(),
+		abandonID: gateID,
+		ack:       ack,
+	}
+	if got := <-ack; got.err != nil || got.gateID != gateID {
+		t.Fatalf("gate abandonment ack = %+v, want gateID %v and nil error", got, gateID)
+	}
+	if len(registrar.closed) != 1 || registrar.closed[0] != gateID {
+		t.Fatalf("closed gates = %+v, want [%v]", registrar.closed, gateID)
+	}
+
+	l.Commands <- command.ProvideUserInput{
+		GateRoute: command.GateRoute{GateID: gateID, ToolExecutionID: callID},
+		Answer:    "late",
+	}
+	if _, ok := recvReply(t, reply, 200*time.Millisecond); ok {
+		t.Fatal("gate reply delivered after abandonment")
+	}
+}
+
 func TestLoopGateRoutesByGateIDAfterActivation(t *testing.T) {
 	t.Parallel()
 	callID := newCallID(t)

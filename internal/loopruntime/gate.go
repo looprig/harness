@@ -67,12 +67,16 @@ func (nopGateRegistrar) CloseGate(context.Context, gatedomain.ID, gatedomain.Clo
 // kind} under the minted GateID, activates the public gate, then acks to signal
 // install-before-emit.
 type gateRegistration struct {
-	gate    gatedomain.Gate
-	payload gatedomain.Payload
-	callID  uuid.UUID
-	reply   chan<- command.Command
-	kind    gateKind
-	ack     chan<- gateInstallAck
+	ctx context.Context
+	// abandonID makes this an actor-owned removal request rather than an open
+	// request. The same synchronous channel preserves ordering with registration.
+	abandonID gatedomain.ID
+	gate      gatedomain.Gate
+	payload   gatedomain.Payload
+	callID    uuid.UUID
+	reply     chan<- command.Command
+	kind      gateKind
+	ack       chan<- gateInstallAck
 }
 
 type gateInstallAck struct {
@@ -117,6 +121,8 @@ type operationHookRuntime struct {
 	cause       identity.Cause
 }
 
+type eventEmitter func(context.Context, event.Event)
+
 func withOperationHookRuntime(ctx context.Context, runtime operationHookRuntime) context.Context {
 	return context.WithValue(ctx, operationHookRuntimeKey{}, runtime)
 }
@@ -129,6 +135,10 @@ func operationHooksFromContext(ctx context.Context) operationHookRuntime {
 // withEmit returns a child ctx carrying the per-turn emit func. The runner injects
 // it per tool call; EmitFromContext / RequestUserInput read it back.
 func withEmit(ctx context.Context, emit func(event.Event)) context.Context {
+	return context.WithValue(ctx, emitKey{}, emit)
+}
+
+func withContextEmit(ctx context.Context, emit eventEmitter) context.Context {
 	return context.WithValue(ctx, emitKey{}, emit)
 }
 
@@ -167,8 +177,14 @@ func gateRegFromContext(ctx context.Context) (chan<- gateRegistration, bool) {
 // tools call this; it is the only sanctioned way for a tool in tools/ to emit an
 // event without depending on the loop internals.
 func EmitFromContext(ctx context.Context) (func(event.Event), bool) {
-	v, ok := ctx.Value(emitKey{}).(func(event.Event))
-	return v, ok
+	switch emit := ctx.Value(emitKey{}).(type) {
+	case eventEmitter:
+		return func(value event.Event) { emit(ctx, value) }, true
+	case func(event.Event):
+		return emit, true
+	default:
+		return nil, false
+	}
 }
 
 // GateContextMissing identifies which injected ctx value RequestUserInput could
@@ -230,7 +246,7 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 	// Register synchronously, ctx-aware: no wedge if the actor is gone or the turn
 	// is cancelled.
 	select {
-	case gateReg <- gateRegistration{gate: g, payload: payload, callID: callID, reply: reply, kind: gateUserInput, ack: ack}:
+	case gateReg <- gateRegistration{ctx: ctx, gate: g, payload: payload, callID: callID, reply: reply, kind: gateUserInput, ack: ack}:
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
@@ -276,8 +292,40 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 		finishGateWait(finishWait, waitCall, answer, nil)
 		return pui.Answer, nil
 	case <-waitCtx.Done():
-		finishGateWait(finishWait, waitCall, nil, waitCtx.Err())
-		return "", waitCtx.Err()
+		waitErr := waitCtx.Err()
+		if ctx.Err() == nil {
+			if err := abandonInstalledGate(ctx, waitCtx, gateReg, installed.gateID); err != nil {
+				finishGateWait(finishWait, waitCall, nil, err)
+				return "", err
+			}
+		}
+		finishGateWait(finishWait, waitCall, nil, waitErr)
+		return "", waitErr
+	}
+}
+
+func abandonInstalledGate(
+	lifetimeCtx context.Context,
+	operationCtx context.Context,
+	gateReg chan<- gateRegistration,
+	gateID gatedomain.ID,
+) error {
+	ack := make(chan gateInstallAck, 1)
+	request := gateRegistration{
+		ctx:       context.WithoutCancel(operationCtx),
+		abandonID: gateID,
+		ack:       ack,
+	}
+	select {
+	case gateReg <- request:
+	case <-lifetimeCtx.Done():
+		return lifetimeCtx.Err()
+	}
+	select {
+	case result := <-ack:
+		return result.err
+	case <-lifetimeCtx.Done():
+		return lifetimeCtx.Err()
 	}
 }
 

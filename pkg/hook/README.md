@@ -102,6 +102,11 @@ Raw messages, arguments, results, and errors may contain sensitive data:
 redaction is mandatory before logging, telemetry export, or another trust
 boundary.
 
+On terminal `ToolCall` results, `ToolCall.Result` contains the full normalized
+tool result, including pre-execution failures; `ResultPreview` remains the
+bounded display projection. On terminal `ToolExecution` results,
+`ToolExecution.Result` contains only the approved invocation's result.
+
 ## Hooks versus events
 
 Hooks surround attempts and can propagate context before an outcome is known.
@@ -113,6 +118,11 @@ state reconstruction.
 opening fences. Restore does not replay historical operations or historical
 appends through hooks. A restored session uses the newly supplied immutable
 runner for its opening fence and all new work.
+
+Durable appends initiated inside an operation inherit that operation's derived
+context. If a `GateWait` observer cancels only its derived wait context, Harness
+removes and closes the already-installed gate before the blocked tool call can
+continue.
 
 Operation hooks are native-loop semantics. Foreign loop builders do not receive
 the runner and therefore do not produce native `Turn`, `Step`, `Inference`,
