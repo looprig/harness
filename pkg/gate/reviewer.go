@@ -127,6 +127,10 @@ type PermissionClassifierSet struct {
 	ordered []PermissionClassifier
 }
 
+// MaxPermissionClassifierNameBytes bounds the stable audit identity stored in
+// registry and event records.
+const MaxPermissionClassifierNameBytes = 128
+
 // PermissionClassifierValidationReason is the bounded registry rejection
 // domain. Rejected classifier metadata is never included in the error.
 type PermissionClassifierValidationReason string
@@ -147,6 +151,54 @@ func (*PermissionClassifierValidationError) Error() string {
 	return "gate: invalid permission classifier registration"
 }
 
+// PermissionClassifierNameValidationError reports a rejected classifier audit
+// name without echoing the untrusted value.
+type PermissionClassifierNameValidationError struct{}
+
+func (*PermissionClassifierNameValidationError) Error() string {
+	return "gate: invalid permission classifier name"
+}
+
+// ValidatePermissionClassifierName applies the stricter canonical name
+// contract shared by permission-classifier registries and durable audit events.
+func ValidatePermissionClassifierName(name hustle.Name) error {
+	value := string(name)
+	if !utf8.ValidString(value) ||
+		value == "" ||
+		strings.TrimSpace(value) != value ||
+		strings.IndexByte(value, 0) >= 0 ||
+		len(value) > MaxPermissionClassifierNameBytes ||
+		name.Validate() != nil {
+		return &PermissionClassifierNameValidationError{}
+	}
+	return nil
+}
+
+type frozenPermissionClassifier struct {
+	source     PermissionClassifier
+	name       hustle.Name
+	revision   string
+	definition hustle.Definition
+}
+
+func (c *frozenPermissionClassifier) Name() hustle.Name             { return c.name }
+func (c *frozenPermissionClassifier) Revision() string              { return c.revision }
+func (c *frozenPermissionClassifier) Definition() hustle.Definition { return c.definition }
+func (c *frozenPermissionClassifier) Applies(subject PermissionReviewSubject) bool {
+	return c.source.Applies(subject)
+}
+func (c *frozenPermissionClassifier) MarshalInput(
+	subject PermissionReviewSubject,
+) (json.RawMessage, error) {
+	return c.source.MarshalInput(subject)
+}
+func (c *frozenPermissionClassifier) ValidateResult(
+	subject PermissionReviewSubject,
+	result hustle.Result,
+) (PermissionAssessment, error) {
+	return c.source.ValidateResult(subject, result)
+}
+
 // NewPermissionClassifierSet validates metadata without executing classifier
 // applicability, serialization, or result parsing behavior.
 func NewPermissionClassifierSet(
@@ -155,21 +207,22 @@ func NewPermissionClassifierSet(
 	if len(classifiers) == 0 {
 		return PermissionClassifierSet{}, classifierSetError(0, PermissionClassifierInvalid)
 	}
-	ordered := append([]PermissionClassifier(nil), classifiers...)
-	names := make(map[hustle.Name]struct{}, len(ordered))
-	revisions := make(map[string]struct{}, len(ordered))
-	for index, classifier := range ordered {
+	ordered := make([]PermissionClassifier, 0, len(classifiers))
+	names := make(map[hustle.Name]struct{}, len(classifiers))
+	revisions := make(map[string]struct{}, len(classifiers))
+	for index, classifier := range classifiers {
 		if nilPermissionClassifier(classifier) {
 			return PermissionClassifierSet{}, classifierSetError(index, PermissionClassifierInvalid)
 		}
 		name := classifier.Name()
-		if err := name.Validate(); err != nil {
+		revision := classifier.Revision()
+		definition := classifier.Definition()
+		if err := ValidatePermissionClassifierName(name); err != nil {
 			return PermissionClassifierSet{}, classifierSetError(index, PermissionClassifierInvalid)
 		}
 		if _, duplicate := names[name]; duplicate {
 			return PermissionClassifierSet{}, classifierSetError(index, PermissionClassifierDuplicate)
 		}
-		revision := classifier.Revision()
 		if strings.TrimSpace(revision) == "" ||
 			!utf8.ValidString(revision) ||
 			len(revision) > MaxPermissionClassifierRevisionBytes {
@@ -178,7 +231,6 @@ func NewPermissionClassifierSet(
 		if _, duplicate := revisions[revision]; duplicate {
 			return PermissionClassifierSet{}, classifierSetError(index, PermissionClassifierDuplicate)
 		}
-		definition := classifier.Definition()
 		descriptor := definition.Descriptor()
 		if err := descriptor.Validate(); err != nil ||
 			descriptor.Participation != hustle.ParticipationBlocking ||
@@ -192,6 +244,12 @@ func NewPermissionClassifierSet(
 		}
 		names[name] = struct{}{}
 		revisions[revision] = struct{}{}
+		ordered = append(ordered, &frozenPermissionClassifier{
+			source:     classifier,
+			name:       name,
+			revision:   revision,
+			definition: definition,
+		})
 	}
 	return PermissionClassifierSet{ordered: ordered}, nil
 }

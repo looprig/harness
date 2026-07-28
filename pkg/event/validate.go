@@ -286,6 +286,9 @@ func validatePermissionReviewCompleted(e PermissionReviewCompleted) error {
 		if _, ok := gate.ParseReviewRisk(string(e.Risk)); !ok {
 			return invalidPermissionReview(name, FieldRisk)
 		}
+		if e.Status == gate.ReviewStatusAllowed && e.Risk == gate.ReviewRiskCritical {
+			return invalidPermissionReview(name, FieldRisk)
+		}
 		if _, ok := gate.ParseReviewAuthorization(string(e.Authorization)); !ok {
 			return invalidPermissionReview(name, FieldAuthorization)
 		}
@@ -329,7 +332,7 @@ func validatePermissionReviewMetadata(
 	if gateID.IsZero() {
 		return &InvalidEventError{Event: name, Field: FieldGateID, Rule: RuleRequired}
 	}
-	if classifier.Validate() != nil {
+	if gate.ValidatePermissionClassifierName(classifier) != nil {
 		return invalidPermissionReview(name, FieldClassifier)
 	}
 	if !utf8.ValidString(revision) ||

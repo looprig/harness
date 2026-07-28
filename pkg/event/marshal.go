@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -360,6 +361,9 @@ func mergeEnvelope(name string, payload []byte) ([]byte, error) {
 func UnmarshalEvent(data []byte) (Event, error) {
 	if len(data) > maxEventBytes {
 		return nil, &EventLimitError{Got: len(data), Max: maxEventBytes}
+	}
+	if !utf8.Valid(data) {
+		return nil, &EventDecodeError{Cause: errors.New("invalid UTF-8 event envelope")}
 	}
 	if err := rejectDuplicateJSONKeys(data); err != nil {
 		return nil, &EventDecodeError{Cause: err}

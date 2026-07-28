@@ -21,6 +21,8 @@ func FuzzPermissionReviewEvent(f *testing.F) {
 	f.Add([]byte(`{"type":"PermissionReviewStarted","type":"PermissionReviewCompleted","v":1}`))
 	f.Add([]byte(`{"type":"PermissionReviewCompleted","v":1,"status":"future"}`))
 	f.Add([]byte(`{"type":"PermissionReviewCompleted","v":1,"categories":[`))
+	f.Add(append([]byte(`{"type":"PermissionReviewStarted","v":1,"classifier":"`), []byte{0xff, '"', '}'}...))
+	f.Add(append([]byte(`{"type":"PermissionReviewCompleted","v":1,"classifier":"`), []byte{0xfe, '"', '}'}...))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		ev, err := UnmarshalEvent(data)

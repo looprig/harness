@@ -207,6 +207,13 @@ func TestPermissionReviewCompletedStatusValidation(t *testing.T) {
 			},
 		},
 		{
+			name: "allowed critical risk",
+			mutate: func(e *PermissionReviewCompleted) {
+				e.Risk = gate.ReviewRiskCritical
+			},
+			field: FieldRisk,
+		},
+		{
 			name: "allowed with every category",
 			mutate: func(e *PermissionReviewCompleted) {
 				e.Categories = allPermissionReviewCategories()
@@ -401,6 +408,40 @@ func TestPermissionReviewCompletedMetadataValidation(t *testing.T) {
 			rule:   RuleInvalid,
 		},
 		{
+			name: "classifier at limit",
+			mutate: func(e *PermissionReviewCompleted) {
+				e.Classifier = hustle.Name(strings.Repeat("n", gate.MaxPermissionClassifierNameBytes))
+			},
+		},
+		{
+			name: "classifier over limit",
+			mutate: func(e *PermissionReviewCompleted) {
+				e.Classifier = hustle.Name(strings.Repeat("n", gate.MaxPermissionClassifierNameBytes+1))
+			},
+			field: FieldClassifier,
+			rule:  RuleInvalid,
+		},
+		{
+			name:   "classifier leading whitespace",
+			mutate: func(e *PermissionReviewCompleted) { e.Classifier = " command-safety" },
+			field:  FieldClassifier,
+			rule:   RuleInvalid,
+		},
+		{
+			name:   "classifier nul",
+			mutate: func(e *PermissionReviewCompleted) { e.Classifier = "command\x00safety" },
+			field:  FieldClassifier,
+			rule:   RuleInvalid,
+		},
+		{
+			name: "classifier invalid utf8",
+			mutate: func(e *PermissionReviewCompleted) {
+				e.Classifier = hustle.Name(string([]byte{0xff}))
+			},
+			field: FieldClassifier,
+			rule:  RuleInvalid,
+		},
+		{
 			name:   "invalid revision",
 			mutate: func(e *PermissionReviewCompleted) { e.ClassifierRevision = " " },
 			field:  FieldClassifierRevision,
@@ -572,6 +613,38 @@ func TestPermissionReviewCodecAllowsAdditiveUnknownFields(t *testing.T) {
 	}
 	if !bytes.Equal(remarshal, original) {
 		t.Errorf("known projection changed after unknown field:\n got: %s\nwant: %s", remarshal, original)
+	}
+}
+
+func TestUnmarshalEventRejectsInvalidUTF8BeforeJSONReplacement(t *testing.T) {
+	t.Parallel()
+	first := []byte(`{"type":"PermissionReviewStarted","v":1,"classifier":"`)
+	first = append(first, 0xff)
+	first = append(first, []byte(`"}`)...)
+	second := []byte(`{"type":"PermissionReviewStarted","v":1,"classifier":"`)
+	second = append(second, 0xfe)
+	second = append(second, []byte(`"}`)...)
+
+	var messages []string
+	for _, data := range [][]byte{first, second} {
+		ev, err := UnmarshalEvent(data)
+		if err == nil {
+			t.Fatal("UnmarshalEvent(invalid UTF-8) error = nil")
+		}
+		if ev != nil {
+			t.Fatalf("UnmarshalEvent(invalid UTF-8) event = %#v, want nil", ev)
+		}
+		var decodeErr *EventDecodeError
+		if !errors.As(err, &decodeErr) {
+			t.Fatalf("UnmarshalEvent(invalid UTF-8) error = %T, want *EventDecodeError", err)
+		}
+		if len(err.Error()) > 256 {
+			t.Fatalf("error length = %d, want bounded", len(err.Error()))
+		}
+		messages = append(messages, err.Error())
+	}
+	if messages[0] != messages[1] {
+		t.Fatalf("invalid byte errors = %q and %q, want same non-echoing domain", messages[0], messages[1])
 	}
 }
 

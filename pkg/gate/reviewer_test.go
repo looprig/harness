@@ -29,14 +29,26 @@ type permissionClassifierStub struct {
 	name       hustle.Name
 	revision   string
 	definition hustle.Definition
+	nameCalls  int
+	revCalls   int
+	defCalls   int
 	applies    int
 	marshals   int
 	validates  int
 }
 
-func (s *permissionClassifierStub) Name() hustle.Name             { return s.name }
-func (s *permissionClassifierStub) Revision() string              { return s.revision }
-func (s *permissionClassifierStub) Definition() hustle.Definition { return s.definition }
+func (s *permissionClassifierStub) Name() hustle.Name {
+	s.nameCalls++
+	return s.name
+}
+func (s *permissionClassifierStub) Revision() string {
+	s.revCalls++
+	return s.revision
+}
+func (s *permissionClassifierStub) Definition() hustle.Definition {
+	s.defCalls++
+	return s.definition
+}
 func (s *permissionClassifierStub) Applies(gate.PermissionReviewSubject) bool {
 	s.applies++
 	return true
@@ -61,16 +73,204 @@ func TestPermissionClassifierSetPreservesOrderAndDoesNotExecute(t *testing.T) {
 	}
 	input[0] = second
 	got := set.Classifiers()
-	if len(got) != 2 || got[0] != first || got[1] != second {
+	if len(got) != 2 ||
+		got[0].Name() != "first" ||
+		got[1].Name() != "second" {
 		t.Fatalf("Classifiers() = %#v, want original order", got)
 	}
 	got[0] = second
-	if next := set.Classifiers(); next[0] != first {
+	if next := set.Classifiers(); next[0].Name() != "first" {
 		t.Fatal("Classifiers() aliases registry slice")
 	}
 	if first.applies != 0 || first.marshals != 0 || first.validates != 0 ||
 		second.applies != 0 || second.marshals != 0 || second.validates != 0 {
 		t.Fatal("registry executed classifier behavior")
+	}
+}
+
+func TestValidatePermissionClassifierName(t *testing.T) {
+	t.Parallel()
+	atLimit := hustle.Name(strings.Repeat("n", gate.MaxPermissionClassifierNameBytes))
+	tests := []struct {
+		name    string
+		value   hustle.Name
+		wantErr bool
+	}{
+		{name: "ordinary", value: "command-safety"},
+		{name: "exact byte limit", value: atLimit},
+		{name: "empty", value: "", wantErr: true},
+		{name: "leading whitespace", value: " command-safety", wantErr: true},
+		{name: "trailing whitespace", value: "command-safety ", wantErr: true},
+		{name: "nul", value: "command\x00safety", wantErr: true},
+		{name: "reserved", value: "_looprig.private", wantErr: true},
+		{
+			name:    "over byte limit",
+			value:   hustle.Name(strings.Repeat("n", gate.MaxPermissionClassifierNameBytes+1)),
+			wantErr: true,
+		},
+		{name: "invalid utf8 ff", value: hustle.Name(string([]byte{0xff})), wantErr: true},
+		{name: "invalid utf8 fe", value: hustle.Name(string([]byte{0xfe})), wantErr: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := gate.ValidatePermissionClassifierName(tt.value)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidatePermissionClassifierName() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil {
+				if len(err.Error()) > 128 {
+					t.Fatalf("error length = %d, want bounded", len(err.Error()))
+				}
+				if strings.Contains(err.Error(), string(tt.value)) && tt.value != "" {
+					t.Fatalf("error %q echoes rejected classifier name", err)
+				}
+			}
+		})
+	}
+}
+
+func TestValidatePermissionClassifierNameInvalidUTF8DoesNotCollide(t *testing.T) {
+	t.Parallel()
+	first := hustle.Name(string([]byte{0xff}))
+	second := hustle.Name(string([]byte{0xfe}))
+	if first == second {
+		t.Fatal("test setup collapsed distinct invalid byte strings")
+	}
+	firstErr := gate.ValidatePermissionClassifierName(first)
+	secondErr := gate.ValidatePermissionClassifierName(second)
+	if firstErr == nil || secondErr == nil {
+		t.Fatalf("errors = (%v, %v), want two rejections", firstErr, secondErr)
+	}
+	if firstErr.Error() != secondErr.Error() {
+		t.Fatalf("errors = (%q, %q), want one bounded non-echoing domain", firstErr, secondErr)
+	}
+}
+
+func TestPermissionClassifierSetFreezesMetadataAndDelegatesBehavior(t *testing.T) {
+	t.Parallel()
+	source := validPermissionClassifier(t, "original", "revision-1")
+	originalDefinition := source.definition
+	set, err := gate.NewPermissionClassifierSet(source)
+	if err != nil {
+		t.Fatalf("NewPermissionClassifierSet() error = %v", err)
+	}
+	if source.nameCalls != 1 || source.revCalls != 1 || source.defCalls != 1 {
+		t.Fatalf(
+			"metadata calls = name:%d revision:%d definition:%d, want exactly once each",
+			source.nameCalls,
+			source.revCalls,
+			source.defCalls,
+		)
+	}
+
+	source.name = "mutated"
+	source.revision = "revision-2"
+	source.definition = validPermissionDefinition(
+		t,
+		"mutated",
+		"revision-2",
+		hustle.ParticipationBackground,
+		false,
+		true,
+	)
+
+	registered := set.Classifiers()[0]
+	if got := registered.Name(); got != "original" {
+		t.Fatalf("Name() = %q, want frozen original", got)
+	}
+	if got := registered.Revision(); got != "revision-1" {
+		t.Fatalf("Revision() = %q, want frozen revision-1", got)
+	}
+	if got := registered.Definition().Descriptor(); got != originalDefinition.Descriptor() {
+		t.Fatalf("Definition().Descriptor() = %#v, want frozen %#v", got, originalDefinition.Descriptor())
+	}
+	if source.nameCalls != 1 || source.revCalls != 1 || source.defCalls != 1 {
+		t.Fatalf(
+			"registry view reread source metadata: name:%d revision:%d definition:%d",
+			source.nameCalls,
+			source.revCalls,
+			source.defCalls,
+		)
+	}
+
+	if !registered.Applies(gate.PermissionReviewSubject{}) {
+		t.Fatal("Applies() = false, want delegated true")
+	}
+	if _, err := registered.MarshalInput(gate.PermissionReviewSubject{}); err != nil {
+		t.Fatalf("MarshalInput() error = %v", err)
+	}
+	if _, err := registered.ValidateResult(gate.PermissionReviewSubject{}, hustle.Result{}); err != nil {
+		t.Fatalf("ValidateResult() error = %v", err)
+	}
+	if source.applies != 1 || source.marshals != 1 || source.validates != 1 {
+		t.Fatalf(
+			"behavior calls = applies:%d marshals:%d validates:%d, want delegated once each",
+			source.applies,
+			source.marshals,
+			source.validates,
+		)
+	}
+}
+
+func TestPermissionClassifierSetFreezesDefinitionDescriptor(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		mutated func(*testing.T) hustle.Definition
+	}{
+		{
+			name: "participation",
+			mutated: func(t *testing.T) hustle.Definition {
+				return validPermissionDefinition(
+					t, "original", "revision-1", hustle.ParticipationBackground, false, true,
+				)
+			},
+		},
+		{
+			name: "model source",
+			mutated: func(t *testing.T) hustle.Definition {
+				return validPermissionDefinition(
+					t, "original", "revision-1", hustle.ParticipationBlocking, true, true,
+				)
+			},
+		},
+		{
+			name: "output schema",
+			mutated: func(t *testing.T) hustle.Definition {
+				return validPermissionDefinition(
+					t, "original", "revision-1", hustle.ParticipationBlocking, false, false,
+				)
+			},
+		},
+		{
+			name: "policy revision",
+			mutated: func(t *testing.T) hustle.Definition {
+				return validPermissionDefinition(
+					t, "original", "revision-2", hustle.ParticipationBlocking, false, true,
+				)
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			source := validPermissionClassifier(t, "original", "revision-1")
+			want := source.definition.Descriptor()
+			set, err := gate.NewPermissionClassifierSet(source)
+			if err != nil {
+				t.Fatalf("NewPermissionClassifierSet() error = %v", err)
+			}
+			source.definition = tt.mutated(t)
+			if got := set.Classifiers()[0].Definition().Descriptor(); got != want {
+				t.Fatalf("frozen descriptor = %#v, want %#v", got, want)
+			}
+			if source.defCalls != 1 {
+				t.Fatalf("Definition() source calls = %d, want 1", source.defCalls)
+			}
+		})
 	}
 }
 
