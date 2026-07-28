@@ -200,6 +200,61 @@ func (e *OutputError) Error() string {
 
 func (e *OutputError) Unwrap() error { return e.Cause }
 
+// ToolResponseFailureReason is a closed, security-safe classification for an
+// invalid structured-output-with-tools response. Values describe only the
+// response shape; they never retain provider-controlled content.
+type ToolResponseFailureReason string
+
+const (
+	ToolResponseFailureInvalidShape       ToolResponseFailureReason = "invalid_shape"
+	ToolResponseFailureFinishReason       ToolResponseFailureReason = "finish_reason"
+	ToolResponseFailureUnknownTool        ToolResponseFailureReason = "unknown_tool"
+	ToolResponseFailureMalformedArguments ToolResponseFailureReason = "malformed_arguments"
+	ToolResponseFailureMissingCallID      ToolResponseFailureReason = "missing_call_id"
+	ToolResponseFailureDuplicateCallID    ToolResponseFailureReason = "duplicate_call_id"
+	ToolResponseFailureMixed              ToolResponseFailureReason = "mixed_response"
+	ToolResponseFailureDuplicateTerminal  ToolResponseFailureReason = "duplicate_terminal"
+	ToolResponseFailureInvalidTerminal    ToolResponseFailureReason = "invalid_terminal"
+	ToolResponseFailureTooLarge           ToolResponseFailureReason = "too_large"
+)
+
+// Valid reports whether the reason is a recognized response-shape failure.
+func (r ToolResponseFailureReason) Valid() bool {
+	switch r {
+	case ToolResponseFailureInvalidShape,
+		ToolResponseFailureFinishReason,
+		ToolResponseFailureUnknownTool,
+		ToolResponseFailureMalformedArguments,
+		ToolResponseFailureMissingCallID,
+		ToolResponseFailureDuplicateCallID,
+		ToolResponseFailureMixed,
+		ToolResponseFailureDuplicateTerminal,
+		ToolResponseFailureInvalidTerminal,
+		ToolResponseFailureTooLarge:
+		return true
+	default:
+		return false
+	}
+}
+
+// ToolResponseError reports one bounded response-shape classification. It
+// deliberately has no cause or caller-controlled metadata.
+type ToolResponseError struct {
+	Reason ToolResponseFailureReason
+}
+
+// Valid reports whether the error contains exactly one recognized reason.
+func (e *ToolResponseError) Valid() bool {
+	return e != nil && e.Reason.Valid()
+}
+
+func (e *ToolResponseError) Error() string {
+	if e.Valid() {
+		return "hustleruntime: invalid tool response (" + string(e.Reason) + ")"
+	}
+	return "hustleruntime: invalid tool response"
+}
+
 // CallbackPanicError is the redacted recovery product for a consumer callback.
 // It deliberately retains no panic value.
 type CallbackPanicError struct {
