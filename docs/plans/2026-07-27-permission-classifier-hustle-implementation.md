@@ -23,19 +23,22 @@ For every numbered task:
    failure before production code.
 4. The subagent implements the minimum GREEN behavior, refactors only while
    green, runs the owning package suite, self-reviews, and commits.
-5. Dispatch a fresh specification-compliance reviewer.
-6. Send every finding back to the same implementer; repeat until approved.
-7. Dispatch a fresh code-quality/security reviewer using
-   `superpowers:requesting-code-review`.
-8. Fix Critical and Important findings and re-review until approved.
-9. Mark the task complete only after both reviews approve.
+5. Record the commit and continue to the next task in the same phase without an
+   independent task-level review.
 
-At each phase boundary, additionally dispatch one fresh reviewer for the entire
-phase diff against:
+At each phase boundary:
 
-- `docs/plans/2026-07-27-permission-classifier-hustle-design.md`;
-- the phase acceptance list below; and
-- the Codex Guardian parity table in design §5.
+1. Dispatch one fresh specification-compliance reviewer for the entire phase
+   diff against:
+   - `docs/plans/2026-07-27-permission-classifier-hustle-design.md`;
+   - every task requirement in the phase;
+   - the phase acceptance list below; and
+   - the Codex Guardian parity table in design §5.
+2. Send every finding to an implementation subagent and repeat spec review
+   until approved.
+3. Dispatch one fresh code-quality/security reviewer using
+   `superpowers:requesting-code-review` for the entire phase diff.
+4. Fix every Critical and Important finding and re-review until approved.
 
 Do not start the next phase with open findings.
 
