@@ -1,12 +1,16 @@
 package tool_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sync"
 	"testing"
@@ -57,6 +61,249 @@ func TestDelegateStatusDoneAliasesCompleted(t *testing.T) {
 
 	if tool.DelegateStatusDone != tool.DelegateStatusCompleted {
 		t.Fatalf("DelegateStatusDone = %d, want alias value %d", tool.DelegateStatusDone, tool.DelegateStatusCompleted)
+	}
+}
+
+func TestReadWorkspaceBindingIsStructurallyReadOnly(t *testing.T) {
+	t.Parallel()
+
+	bindingType := reflect.TypeOf(tool.ReadWorkspaceBinding{})
+	if bindingType.NumField() != 1 {
+		t.Fatalf("ReadWorkspaceBinding fields = %d, want exactly Root", bindingType.NumField())
+	}
+	field := bindingType.Field(0)
+	if field.Name != "Root" || field.Type.Kind() != reflect.String || !field.IsExported() {
+		t.Fatalf("ReadWorkspaceBinding field = %#v, want exported Root string", field)
+	}
+}
+
+func TestEvidenceDefinitionReceivesOnlyReadWorkspaceBinding(t *testing.T) {
+	t.Parallel()
+
+	bindings := validBindings()
+	bindings.ReadWorkspace = &tool.ReadWorkspaceBinding{Root: "/canonical/workspace"}
+	var got tool.Bindings
+	definition := tool.NewEvidenceDefinition(
+		"workspace-status",
+		tool.RequiresWorkspaceRead,
+		[]tool.ToolInfo{{Name: "workspace-status", Desc: "read status", Schema: json.RawMessage(`{"type":"object"}`)}},
+		func(_ context.Context, bound tool.Bindings) ([]tool.InvokableTool, error) {
+			got = bound
+			return []tool.InvokableTool{&reportedNameTool{info: &tool.ToolInfo{Name: "workspace-status"}}}, nil
+		},
+	)
+
+	if _, err := definition.Build(context.Background(), bindings); err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if got.SessionID != bindings.SessionID || got.LoopID != bindings.LoopID {
+		t.Fatalf("factory coordinates = (%s, %s), want (%s, %s)", got.SessionID, got.LoopID, bindings.SessionID, bindings.LoopID)
+	}
+	if got.ReadWorkspace == nil || got.ReadWorkspace.Root != "/canonical/workspace" {
+		t.Fatalf("factory ReadWorkspace = %#v, want canonical root", got.ReadWorkspace)
+	}
+	if got.ReadWorkspace == bindings.ReadWorkspace {
+		t.Fatal("factory received caller's ReadWorkspaceBinding pointer")
+	}
+	if got.Workspace != nil || got.Delegate != nil || got.ExtraTools != nil {
+		t.Fatalf("factory received forbidden capabilities: Workspace=%v Delegate=%v ExtraTools=%v", got.Workspace, got.Delegate, got.ExtraTools)
+	}
+	got.ReadWorkspace.Root = "/mutated"
+	if bindings.ReadWorkspace.Root != "/canonical/workspace" {
+		t.Fatalf("factory mutation changed caller root to %q", bindings.ReadWorkspace.Root)
+	}
+}
+
+func TestReadWorkspaceRequirementValidatesAndAttenuatesBindings(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		requirement tool.Requirements
+		change      func(*tool.Bindings)
+		wantMissing tool.Requirements
+		wantField   string
+		wantRead    bool
+	}{
+		{name: "required binding", requirement: tool.RequiresWorkspaceRead, wantRead: true},
+		{name: "missing binding", requirement: tool.RequiresWorkspaceRead, change: func(b *tool.Bindings) { b.ReadWorkspace = nil }, wantMissing: tool.RequiresWorkspaceRead},
+		{name: "blank root", requirement: tool.RequiresWorkspaceRead, change: func(b *tool.Bindings) { b.ReadWorkspace.Root = " " }, wantField: "read_workspace.root"},
+		{name: "relative root", requirement: tool.RequiresWorkspaceRead, change: func(b *tool.Bindings) { b.ReadWorkspace.Root = "workspace" }, wantField: "read_workspace.root"},
+		{name: "unclean root", requirement: tool.RequiresWorkspaceRead, change: func(b *tool.Bindings) { b.ReadWorkspace.Root = "/workspace/../other" }, wantField: "read_workspace.root"},
+		{name: "extra binding omitted", change: func(*tool.Bindings) {}, wantRead: false},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			bindings := validBindings()
+			bindings.ReadWorkspace = &tool.ReadWorkspaceBinding{Root: "/workspace"}
+			if tt.change != nil {
+				tt.change(&bindings)
+			}
+			var got tool.Bindings
+			definition := tool.NewDefinition("custom", tt.requirement, func(_ context.Context, bound tool.Bindings) ([]tool.InvokableTool, error) {
+				got = bound
+				return []tool.InvokableTool{&definitionTool{}}, nil
+			})
+			_, err := definition.Build(context.Background(), bindings)
+			if tt.wantMissing != 0 {
+				var missing *tool.MissingBindingError
+				if !errors.As(err, &missing) || missing.Requirement != tt.wantMissing {
+					t.Fatalf("Build() error = %T %v, want missing %v", err, err, tt.wantMissing)
+				}
+				return
+			}
+			if tt.wantField != "" {
+				var invalid *tool.InvalidBindingsError
+				if !errors.As(err, &invalid) || invalid.Field != tt.wantField {
+					t.Fatalf("Build() error = %T %v, want field %q", err, err, tt.wantField)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Build() error = %v", err)
+			}
+			if (got.ReadWorkspace != nil) != tt.wantRead {
+				t.Fatalf("factory ReadWorkspace present = %t, want %t", got.ReadWorkspace != nil, tt.wantRead)
+			}
+		})
+	}
+}
+
+func TestEvidenceDefinitionFreezesToolInfos(t *testing.T) {
+	t.Parallel()
+
+	schema := json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}}}`)
+	infos := []tool.ToolInfo{
+		{Name: "status", Desc: "read status", Schema: schema},
+		{Name: "diff", Desc: "read diff", Schema: json.RawMessage(`{"type":"object"}`)},
+	}
+	definition := tool.NewEvidenceDefinition("git-evidence", tool.RequiresWorkspaceRead, infos, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{
+			&reportedNameTool{info: &tool.ToolInfo{Name: "diff"}},
+			&reportedNameTool{info: &tool.ToolInfo{Name: "status"}},
+		}, nil
+	})
+	infos[0].Name = "drift"
+	infos[0].Desc = "drift"
+	schema[0] = '['
+
+	if got, want := definition.ProducedToolNames(), []string{"status", "diff"}; !equalStrings(got, want) {
+		t.Fatalf("ProducedToolNames() = %q, want %q", got, want)
+	}
+	first := definition.ToolInfos()
+	if len(first) != 2 || first[0].Name != "status" || first[0].Desc != "read status" ||
+		!bytes.Equal(first[0].Schema, json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}}}`)) {
+		t.Fatalf("ToolInfos() = %#v, want frozen metadata", first)
+	}
+	first[0].Name = "output-drift"
+	first[0].Schema[0] = '['
+	second := definition.ToolInfos()
+	if second[0].Name != "status" || second[0].Schema[0] != '{' {
+		t.Fatalf("ToolInfos() after caller mutation = %#v, want independent deep clone", second)
+	}
+}
+
+func TestToolInfoCloneOwnsSchema(t *testing.T) {
+	t.Parallel()
+
+	original := tool.ToolInfo{Name: "status", Desc: "read status", Schema: json.RawMessage(`{"type":"object"}`)}
+	clone := original.Clone()
+	clone.Name = "changed"
+	clone.Schema[0] = '['
+	if original.Name != "status" || original.Schema[0] != '{' {
+		t.Fatalf("Clone() shared state with original: %#v", original)
+	}
+}
+
+func TestToolInfoClonePreservesNilAndEmptySchema(t *testing.T) {
+	t.Parallel()
+
+	if clone := (tool.ToolInfo{}).Clone(); clone.Schema != nil {
+		t.Fatalf("nil schema cloned as %#v, want nil", clone.Schema)
+	}
+	clone := (tool.ToolInfo{Schema: json.RawMessage{}}).Clone()
+	if clone.Schema == nil {
+		t.Fatal("non-nil empty schema cloned as nil")
+	}
+}
+
+func TestDefinitionStaticToolInfoValidation(t *testing.T) {
+	t.Parallel()
+
+	valid := tool.ToolInfo{Name: "status", Desc: "read status", Schema: json.RawMessage(`{"type":"object"}`)}
+	tests := []struct {
+		name  string
+		infos []tool.ToolInfo
+		field string
+	}{
+		{name: "empty catalog", field: "tool_infos"},
+		{name: "blank name", infos: []tool.ToolInfo{{Name: " ", Desc: valid.Desc, Schema: valid.Schema}}, field: "tool_infos.name"},
+		{name: "noncanonical name", infos: []tool.ToolInfo{{Name: " status ", Desc: valid.Desc, Schema: valid.Schema}}, field: "tool_infos.name"},
+		{name: "duplicate name", infos: []tool.ToolInfo{valid, valid}, field: "tool_infos.name"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			definition := tool.NewEvidenceDefinition("evidence", 0, tt.infos, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+				return []tool.InvokableTool{&reportedNameTool{info: &tool.ToolInfo{Name: "status"}}}, nil
+			})
+			_, err := definition.Build(context.Background(), validBindings())
+			var invalid *tool.InvalidDefinitionError
+			if !errors.As(err, &invalid) || invalid.Field != tt.field {
+				t.Fatalf("Build() error = %T %v, want invalid field %q", err, err, tt.field)
+			}
+		})
+	}
+}
+
+func TestEvidenceDefinitionRejectsMutationCapabilities(t *testing.T) {
+	t.Parallel()
+
+	tests := []tool.Requirements{
+		tool.RequiresWorkspace,
+		tool.RequiresDelegateController,
+		tool.RequiresWorkspaceRead | tool.RequiresWorkspace,
+	}
+	for _, requirements := range tests {
+		requirements := requirements
+		t.Run(fmt.Sprintf("requirements_%d", requirements), func(t *testing.T) {
+			t.Parallel()
+			called := false
+			definition := tool.NewEvidenceDefinition(
+				"status",
+				requirements,
+				[]tool.ToolInfo{{Name: "status"}},
+				func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+					called = true
+					return []tool.InvokableTool{&reportedNameTool{info: &tool.ToolInfo{Name: "status"}}}, nil
+				},
+			)
+			_, err := definition.Build(context.Background(), validBindings())
+			var invalid *tool.InvalidDefinitionError
+			if !errors.As(err, &invalid) || invalid.Field != "evidence_requirements" {
+				t.Fatalf("Build() error = %T %v, want invalid evidence requirements", err, err)
+			}
+			if called {
+				t.Fatal("factory called with mutation-capable evidence requirements")
+			}
+		})
+	}
+}
+
+func TestNormalDefinitionsHaveNoStaticToolInfos(t *testing.T) {
+	t.Parallel()
+
+	definitions := []tool.Definition{
+		tool.NewDefinition("custom", 0, nil),
+		tool.NewBundleDefinition("bundle", []string{"a", "b"}, 0, nil),
+	}
+	for _, definition := range definitions {
+		if infos := definition.ToolInfos(); infos != nil {
+			t.Fatalf("%s ToolInfos() = %#v, want nil", definition.Name(), infos)
+		}
 	}
 }
 

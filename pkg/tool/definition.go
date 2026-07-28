@@ -1,7 +1,9 @@
 package tool
 
 import (
+	"bytes"
 	"context"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
@@ -9,6 +11,12 @@ import (
 
 	"github.com/looprig/core/uuid"
 )
+
+// Clone returns an independent copy of i, including owned schema bytes.
+func (i ToolInfo) Clone() ToolInfo {
+	i.Schema = bytes.Clone(i.Schema)
+	return i
+}
 
 // Requirements is the set of runtime capabilities a Definition needs before it
 // can build concrete tools.
@@ -19,7 +27,10 @@ const (
 	RequiresWorkspace Requirements = 1 << iota
 	// RequiresDelegateController marks definitions that build delegation tools.
 	RequiresDelegateController
-	knownRequirements = RequiresWorkspace | RequiresDelegateController
+	// RequiresWorkspaceRead marks definitions that only need the canonical
+	// workspace root for read-only evidence collection.
+	RequiresWorkspaceRead
+	knownRequirements = RequiresWorkspace | RequiresDelegateController | RequiresWorkspaceRead
 )
 
 // WorkspaceOperation identifies the scope of a workspace mutation permit.
@@ -184,14 +195,23 @@ type WorkspaceBinding struct {
 	Observations WorkspaceObservations
 }
 
+// ReadWorkspaceBinding is the structurally read-only workspace capability
+// supplied to evidence definitions. Root is absolute, clean, and canonicalized
+// by the consumer before Build. This type intentionally exposes no mutation,
+// observation, delegation, gate, grant, or control capability.
+type ReadWorkspaceBinding struct {
+	Root string
+}
+
 // Bindings contains session-specific runtime capabilities supplied to a
 // Definition. SessionID and LoopID must be non-zero. Definitions retain no
 // Bindings between Build calls.
 type Bindings struct {
-	SessionID uuid.UUID
-	LoopID    uuid.UUID
-	Workspace *WorkspaceBinding
-	Delegate  DelegateController
+	SessionID     uuid.UUID
+	LoopID        uuid.UUID
+	Workspace     *WorkspaceBinding
+	ReadWorkspace *ReadWorkspaceBinding
+	Delegate      DelegateController
 	// ExtraTools are additional tool definitions the LOOP appends to every mode's
 	// toolset at Bind, beyond the definition's own WithTools. The composition root uses
 	// it to inject a derived, definition-scoped tool (the delegation Subagent tool) into
@@ -205,6 +225,7 @@ type Bindings struct {
 type Definition interface {
 	Name() string
 	ProducedToolNames() []string
+	ToolInfos() []ToolInfo
 	Requirements() Requirements
 	Build(context.Context, Bindings) ([]InvokableTool, error)
 	definition()
@@ -219,8 +240,10 @@ type Factory func(context.Context, Bindings) ([]InvokableTool, error)
 type factoryDefinition struct {
 	name          string
 	producedNames []string
+	toolInfos     []ToolInfo
 	requirements  Requirements
 	factory       Factory
+	evidence      bool
 }
 
 // NewDefinition returns an immutable, factory-backed definition. Validation is
@@ -242,12 +265,40 @@ func NewBundleDefinition(name string, producedToolNames []string, requirements R
 	}
 }
 
+// NewEvidenceDefinition returns a sealed definition with immutable, model-facing
+// metadata and a capability set limited to RequiresWorkspaceRead. Produced tool
+// names are derived from infos so the two declarations cannot drift.
+//
+// Validation is performed by Build, matching NewDefinition and
+// NewBundleDefinition's declarative construction behavior.
+func NewEvidenceDefinition(name string, requirements Requirements, infos []ToolInfo, factory Factory) Definition {
+	frozen := cloneToolInfos(infos)
+	producedNames := make([]string, len(frozen))
+	for i := range frozen {
+		producedNames[i] = frozen[i].Name
+	}
+	return &factoryDefinition{
+		name:          name,
+		producedNames: producedNames,
+		toolInfos:     frozen,
+		requirements:  requirements,
+		factory:       factory,
+		evidence:      true,
+	}
+}
+
 func (d *factoryDefinition) Name() string { return d.name }
 
 // ProducedToolNames returns a defensive copy of the stable concrete tool names
 // this definition's factory produces.
 func (d *factoryDefinition) ProducedToolNames() []string {
 	return append([]string(nil), d.producedNames...)
+}
+
+// ToolInfos returns an independent deep copy of frozen model-facing metadata.
+// Ordinary definitions return nil because their metadata remains runtime-only.
+func (d *factoryDefinition) ToolInfos() []ToolInfo {
+	return cloneToolInfos(d.toolInfos)
 }
 
 func (d *factoryDefinition) Requirements() Requirements { return d.requirements }
@@ -268,6 +319,14 @@ func (d *factoryDefinition) Build(ctx context.Context, bindings Bindings) ([]Inv
 	}
 	if unknown := d.requirements &^ knownRequirements; unknown != 0 {
 		return nil, &InvalidRequirementsError{Unknown: unknown}
+	}
+	if d.evidence {
+		if d.requirements&^RequiresWorkspaceRead != 0 {
+			return nil, &InvalidDefinitionError{Field: "evidence_requirements"}
+		}
+		if err := validateStaticToolInfos(d.toolInfos); err != nil {
+			return nil, err
+		}
 	}
 	declared, err := normalizeDeclaredToolNames(d.producedNames)
 	if err != nil {
@@ -321,6 +380,35 @@ func normalizeDeclaredToolNames(names []string) ([]string, error) {
 	return normalized, nil
 }
 
+func cloneToolInfos(infos []ToolInfo) []ToolInfo {
+	if infos == nil {
+		return nil
+	}
+	cloned := make([]ToolInfo, len(infos))
+	for i := range infos {
+		cloned[i] = infos[i].Clone()
+	}
+	return cloned
+}
+
+func validateStaticToolInfos(infos []ToolInfo) error {
+	if len(infos) == 0 {
+		return &InvalidDefinitionError{Field: "tool_infos"}
+	}
+	seen := make(map[string]struct{}, len(infos))
+	for i := range infos {
+		name := infos[i].Name
+		if name == "" || strings.TrimSpace(name) != name {
+			return &InvalidDefinitionError{Field: "tool_infos.name"}
+		}
+		if _, exists := seen[name]; exists {
+			return &InvalidDefinitionError{Field: "tool_infos.name"}
+		}
+		seen[name] = struct{}{}
+	}
+	return nil
+}
+
 func normalizedBuiltToolNames(ctx context.Context, built []InvokableTool) ([]string, error) {
 	normalized := make([]string, len(built))
 	seen := make(map[string]struct{}, len(built))
@@ -364,6 +452,10 @@ func attenuateBindings(requirements Requirements, bindings Bindings) Bindings {
 		workspace := *bindings.Workspace
 		attenuated.Workspace = &workspace
 	}
+	if requirements&RequiresWorkspaceRead != 0 {
+		readWorkspace := *bindings.ReadWorkspace
+		attenuated.ReadWorkspace = &readWorkspace
+	}
 	if requirements&RequiresDelegateController != 0 {
 		attenuated.Delegate = bindings.Delegate
 	}
@@ -389,6 +481,15 @@ func validateBindings(requirements Requirements, bindings Bindings) error {
 		}
 		if err := bindings.Workspace.Coordinator.Healthy(); err != nil {
 			return &InvalidBindingsError{Field: "workspace.coordinator", Cause: err}
+		}
+	}
+	if requirements&RequiresWorkspaceRead != 0 {
+		if bindings.ReadWorkspace == nil {
+			return &MissingBindingError{Requirement: RequiresWorkspaceRead}
+		}
+		root := bindings.ReadWorkspace.Root
+		if strings.TrimSpace(root) == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root {
+			return &InvalidBindingsError{Field: "read_workspace.root"}
 		}
 	}
 	if requirements&RequiresDelegateController != 0 && nilDelegateController(bindings.Delegate) {
@@ -458,6 +559,8 @@ func (e *MissingBindingError) Error() string {
 		name = "workspace"
 	case RequiresDelegateController:
 		name = "delegate controller"
+	case RequiresWorkspaceRead:
+		name = "read workspace"
 	default:
 		name = strconv.Itoa(int(e.Requirement))
 	}
