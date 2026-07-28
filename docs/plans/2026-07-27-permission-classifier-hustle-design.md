@@ -335,6 +335,9 @@ for:
 
 Canonicalization rejects invalid JSON, duplicate object fields, unknown wire
 versions, unsupported enum values, and non-canonical identifiers.
+The strict v1 decoder also rejects JSON `null` for every scalar, object, and
+array member—including optional strings whose canonical value may be empty—
+before Go zero-value conversion can erase the distinction.
 
 ### 8.3 Context snapshot
 
@@ -396,6 +399,12 @@ Context policy has separate limits for:
 - individual block bytes; and
 - active action bytes.
 
+“Total encoded bytes” means the exact byte length of the canonical private
+JSON projection of the complete `ReviewContext`, including coordinates, root
+metadata, entries, and truncation metadata. It is not merely the sum of entry
+content. The context builder and subject wire share this projection so budget
+and digest representations cannot drift.
+
 Truncation preserves both prefix and suffix when useful and emits an explicit
 typed omission entry. It never silently drops content.
 
@@ -405,6 +414,14 @@ input bound, review is ineligible and the human gate remains open.
 Truncation does not automatically forbid approval. Local policy declares which
 omissions are material. Missing active action, current user intent, security
 posture, or required evidence is always material and prevents auto-approval.
+
+The v1 omission marker carries bounded counts but no omitted-kind inventory.
+At an untrusted subject-wire boundary, v1 therefore treats every omission as
+material; a later revision may safely distinguish non-material omission only
+with additional typed, validated provenance. The final active assistant tool
+request is never truncatable. Every other truncated entry must carry the fixed
+prefix/suffix marker and a material bit whenever its authority kind can contain
+current intent or required evidence.
 
 ### 8.5 Subject
 

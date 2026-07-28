@@ -264,6 +264,21 @@ every applied limit; `Material` includes loss of current intent, active action,
 security posture, or required evidence. The returned value owns a cloned entry
 slice. The builder must never silently omit or mutate an input entry.
 
+`MaxBytes` measures the exact `encoding/json` byte length of one private
+snake-case projection of the complete returned `ReviewContext`: coordinates,
+all root metadata, entries, and truncation metadata. It is not a sum of entry
+content. Define that projection with the context task and reuse it in the
+subject v1 wire so the two representations cannot drift. Oversized immutable
+root metadata fails closed when no valid omission can satisfy the bound.
+The deterministic token estimate remains
+`ceil(sum(entry content bytes)/4)` as specified above.
+
+Because the v1 omission marker records counts but no trustworthy omitted-kind
+inventory, every omission is conservatively material in v1. A future wire
+revision may distinguish non-material omission only by adding a typed,
+validated inventory. Strict subject validation requires the budget bits for an
+omission to appear in both `Applied` and `Material`.
+
 **Step 4: Add fuzz coverage**
 
 Fuzz arbitrary UTF-8/invalid byte boundaries and limits. Assert output remains
@@ -363,6 +378,12 @@ stored digest. It wraps strict-JSON scanner/decoder failures in the bounded
 non-echoing review validation error rather than returning attacker-controlled
 JSON keys or contents.
 
+Before typed conversion it also verifies that every required scalar and
+container member has its exact JSON kind. JSON `null` is rejected for strings,
+booleans, integers, objects, and arrays, including optional strings whose
+canonical value may otherwise be empty. Add a null mutation test for every
+field family and nested level.
+
 Implement conceptually:
 
 ```go
@@ -383,6 +404,18 @@ input, computes the digest, and returns the stamped subject.
 `SubjectDigest` recomputes from an otherwise valid subject while ignoring its
 stored digest; the strict decoder separately requires the stored value to equal
 that recomputation.
+
+Strict built-context validation accepts only values the v1 builder can emit:
+
+- the final assistant tool request is present and never truncated;
+- every truncated entry contains exactly one fixed truncation marker with
+  non-empty UTF-8 prefix and suffix;
+- truncated current-user, tool-result, runtime, external, and earlier
+  assistant-tool-request entries have the corresponding applied bit marked
+  material;
+- one omission marker has positive counters and matching budget bits in both
+  `Applied` and `Material`; and
+- masks/counters/markers cannot underreport one another.
 
 **Step 4: Add fuzz seeds and invariants**
 
