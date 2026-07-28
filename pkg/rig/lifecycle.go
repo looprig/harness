@@ -23,7 +23,7 @@ func (r *Rig) NewSession(ctx context.Context, opts ...SessionOption) (session.Se
 func (r *Rig) newSession(ctx context.Context, seed workspacestore.Ref) (session.SessionController, error) {
 	runtime, err := r.lifecycle.NewSession(ctx, seed)
 	if err != nil {
-		return nil, mapRunError(err)
+		return nil, mapLifecycleError(err)
 	}
 	return runtime, nil
 }
@@ -31,12 +31,16 @@ func (r *Rig) newSession(ctx context.Context, seed workspacestore.Ref) (session.
 func (r *Rig) RestoreSession(ctx context.Context, id uuid.UUID) (session.SessionController, error) {
 	runtime, err := r.lifecycle.RestoreSession(ctx, id)
 	if err != nil {
-		return nil, err
+		return nil, mapLifecycleError(err)
 	}
 	return runtime, nil
 }
 
-func mapRunError(err error) error {
+func mapLifecycleError(err error) error {
+	var unsupported *sessionruntime.ProcessServicesUnsupportedError
+	if errors.As(err, &unsupported) {
+		return &LifecycleError{Kind: LifecycleProcessNotificationsUnsupported, Cause: err}
+	}
 	var run *sessionruntime.NewSessionError
 	if !errors.As(err, &run) {
 		return &LifecycleError{Kind: LifecycleSessionFailed, Cause: err}

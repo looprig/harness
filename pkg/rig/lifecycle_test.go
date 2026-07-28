@@ -243,6 +243,36 @@ func TestNewSessionFailureStagesReleaseAcquiredResourcesInReverse(t *testing.T) 
 	}
 }
 
+func TestMapLifecycleErrorProcessNotificationsUnsupported(t *testing.T) {
+	unsupported := &sessionruntime.ProcessServicesUnsupportedError{Engine: loop.EngineForeignClaude}
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "new session wrapper", err: &sessionruntime.NewSessionError{
+			Kind:  sessionruntime.NewSessionRuntimeFailed,
+			Cause: unsupported,
+		}},
+		{name: "restore direct", err: unsupported},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := mapLifecycleError(tt.err)
+			var lifecycleErr *LifecycleError
+			if !errors.As(err, &lifecycleErr) {
+				t.Fatalf("mapLifecycleError() = %T %v, want public LifecycleError", err, err)
+			}
+			if lifecycleErr.Kind != LifecycleProcessNotificationsUnsupported {
+				t.Fatalf("LifecycleError.Kind = %q, want %q",
+					lifecycleErr.Kind, LifecycleProcessNotificationsUnsupported)
+			}
+			if !errors.Is(err, unsupported) {
+				t.Fatalf("mapLifecycleError() = %v, want wrapped unsupported cause", err)
+			}
+		})
+	}
+}
+
 func lifecycleStoreWithLeaser(t *testing.T, leaser storage.Leaser) *sessionstore.Store {
 	t.Helper()
 	backend := memstore.New()
