@@ -1,8 +1,10 @@
 package rig
 
 import (
+	"context"
 	"strings"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/internal/sessionruntime"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hook"
@@ -227,6 +229,15 @@ func Define(options ...Option) (*Rig, error) {
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleFingerprint(fingerprint))
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleManifest(manifest))
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleHooks(state.compiledHooks))
+	if state.resourceStorageProvider != nil {
+		provider := state.resourceStorageProvider
+		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleSessionResourceStorage(
+			func(ctx context.Context, id uuid.UUID) (string, string, error) {
+				storage, err := provider.StorageForSession(ctx, id)
+				return storage.Path, storage.Identity, err
+			},
+		))
+	}
 	primerNames := make([]identity.AgentName, len(state.primers))
 	for i, name := range state.primers {
 		primerNames[i] = identity.AgentName(name)

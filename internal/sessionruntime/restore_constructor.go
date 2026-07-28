@@ -127,6 +127,9 @@ func restoreTopologySession(
 		return nil, &RestoreError{Kind: RestoreContextDone, Cause: ctx.Err()}
 	default:
 	}
+	if err := validateProcessServiceEngines(topology); err != nil {
+		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: err}
+	}
 	// Allocate the one restored-session lifetime up front. Until successful transfer
 	// into Session, every exit below owns cancellation (lease/replay/bind/check/append/
 	// build failures included). Bind and the live Session receive this exact context.
@@ -219,6 +222,7 @@ func restoreTopologySession(
 	// coordinator) once resolved below. recordErrored releases the root lease BEFORE the
 	// session lease (LIFO) so a failed restore never strands root-lease ownership.
 	var resolved *resolvedPlacement
+	var resources *sessionResources
 	recordErrored := func(restoreErr error) (*Session, error) {
 		runRestoreFailureCleanup(constructionAbortTimeout, func(appendCtx context.Context) {
 			_ = appendRestoreEvent(appendCtx, j, factory, event.RestoreErrored{
@@ -226,6 +230,9 @@ func restoreTopologySession(
 				Err:    restoreErr,
 			})
 		}, func() {
+			if resources != nil {
+				_ = resources.Shutdown(context.Background())
+			}
 			releaseResolvedRoot(context.Background(), resolved)
 			releaseLease(lease)
 		})
@@ -381,6 +388,23 @@ func restoreTopologySession(
 		resolved = r
 		withResolvedPlacement(resolved)(probe)
 	}
+	if topologyRequiresProcessServices(topology) {
+		workspaceRoot := ""
+		if resolved != nil {
+			workspaceRoot = resolved.root
+		}
+		resources, err = resolveSessionResources(
+			ctx,
+			sessionID,
+			probe.resourceStorageResolver,
+			workspaceRoot,
+			true,
+		)
+		if err != nil {
+			return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: err})
+		}
+		withSessionResources(resources)(probe)
+	}
 
 	var manager *delegationManager
 	if probe.runtimeCatalogProvider != nil {
@@ -408,7 +432,7 @@ func restoreTopologySession(
 	if newPath {
 		planAllowMismatch = true
 	}
-	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, planAllowMismatch, contextDisposition, manager, probe.newWorkspaceBinding)
+	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, planAllowMismatch, contextDisposition, manager, probe.newWorkspaceBinding, resources)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -540,6 +564,9 @@ func restoreTopologySession(
 		// below) so its Shutdown stops+joins it before SessionStopped and lease release.
 		leaseOpts = append(leaseOpts, withOffloadGCRunner(gcRunner))
 	}
+	if resources != nil {
+		leaseOpts = append(leaseOpts, withSessionResources(resources))
+	}
 	// Recover the foreign session id from the root loop's events. Prebound adapters
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
@@ -584,6 +611,11 @@ func restoreTopologySession(
 	backgroundPlan, err := manager.planRestoredBackgroundRequests(s, allRecords, all, crashClosures)
 	if err != nil {
 		return abortAccepted(s, &RestoreError{Kind: RestoreReplayFailed, Cause: err})
+	}
+	if resources != nil {
+		if err := resources.Activate(ctx, tool.SessionResourceServices{}); err != nil {
+			return abortAccepted(s, &RestoreError{Kind: RestoreLoopFailed, Cause: err})
+		}
 	}
 	// RestoreDone is the commit point: every loop is bound, crash-closed, built,
 	// attached, and the active selection has been validated before this append.
@@ -695,7 +727,7 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 // unknown (children of a single-definition run). It is the single Bind of each loop,
 // performed inside the restore lease. It returns the ordered plans and the active plan, or a
 // typed error the caller records as a RestoreErrored.
-func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
+func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, wsBind func() *tool.WorkspaceBinding, resources *sessionResources) ([]loopPlan, loopPlan, error) {
 	plans := make([]loopPlan, 0, len(starts))
 	activeIndex := -1
 	for _, started := range starts {
@@ -714,7 +746,11 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 			// invents a missing definition here).
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: started.AgentName}}
 		}
-		bindings := tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)}
+		processBinding, processErr := processBindingFor(definition, resources)
+		if processErr != nil {
+			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: processErr}
+		}
+		bindings := tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), Process: processBinding, ExtraTools: delegateExtraTools(definition, manager)}
 		bound, bindErr := definition.Bind(sessionCtx, bindings)
 		if bindErr != nil {
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: bindErr}

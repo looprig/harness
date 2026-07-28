@@ -185,6 +185,11 @@ type Session struct {
 	// §22.4's "stale live cancellation handles do not survive restore".
 	review reviewLifecycle
 
+	// resources is the one session-private registry shared by every process-enabled
+	// loop binding in this live construction.
+	resources               *sessionResources
+	resourceStorageResolver SessionResourceStorageResolver
+
 	// limits are the in-session agent-spawn safety caps NewLoop enforces (depth +
 	// quota). Defaulted in newSession (withDefaults) so the live values are always
 	// positive caps, and overridable via WithLimits. Read under loopsMu inside NewLoop's
@@ -511,7 +516,7 @@ func (s *Session) abortConstructionAfter(cause error, appendTerminal func(contex
 			loopDrains = append(loopDrains, handle.backend.DoneChan())
 		}
 	}
-	needsOwner := appendTerminal != nil || s.wsRootRelease != nil || s.leaseRelease != nil
+	needsOwner := appendTerminal != nil || s.resources != nil || s.wsRootRelease != nil || s.leaseRelease != nil
 	if !needsOwner {
 		waitConstructionPhases(abortCtx, hubDrain, checkpointDrain, loopDrains)
 		return
@@ -531,6 +536,9 @@ func (s *Session) abortConstructionAfter(cause error, appendTerminal func(contex
 			<-checkpointDrain
 		}
 		waitConstructionDrains(context.Background(), loopDrains)
+		if s.resources != nil {
+			_ = s.resources.Shutdown(context.Background())
+		}
 		// Lease hooks are accepted by the Session before construction starts. Once
 		// accepted, this is their sole teardown owner: root then session, exactly once.
 		s.releaseRootLease(context.Background())
@@ -1348,7 +1356,12 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			release()
 			return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
 		}
-		bindings = tool.Bindings{SessionID: s.sessionID, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)}
+		processBinding, bindingErr := processBindingFor(cfg, s.resources)
+		if bindingErr != nil {
+			release()
+			return uuid.UUID{}, bindingErr
+		}
+		bindings = tool.Bindings{SessionID: s.sessionID, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), Process: processBinding, ExtraTools: delegateExtraTools(cfg, s.delegation)}
 		bound, err = cfg.Bind(s.sessionCtx, bindings)
 		if err != nil {
 			release()
@@ -1939,7 +1952,11 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		if mintErr != nil {
 			return abort(&SessionError{Kind: SessionLoopIDGenerationFailed, Cause: mintErr})
 		}
-		bindings := tool.Bindings{SessionID: id, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)}
+		processBinding, bindingErr := processBindingFor(definition, s.resources)
+		if bindingErr != nil {
+			return abort(bindingErr)
+		}
+		bindings := tool.Bindings{SessionID: id, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), Process: processBinding, ExtraTools: delegateExtraTools(definition, s.delegation)}
 		bound, bindErr := definition.Bind(sessionCtx, bindings)
 		if bindErr != nil {
 			return abort(bindErr)
@@ -2533,7 +2550,7 @@ func (s *Session) shutdown() error {
 	// runtime begins its own drain, so in-flight classifier calls observe
 	// cancellation as early as possible.
 	s.shutdownPermissionReviews()
-	failures := make([]error, 0, 6)
+	failures := make([]error, 0, 7)
 	failures = append(failures, s.closeHustles(shutdownRoot, timeouts.hustle))
 	targets, sendErr := s.sendLoopShutdowns(shutdownRoot, snapshot, timeouts.loopSend)
 	failures = append(failures, sendErr)
@@ -2544,6 +2561,9 @@ func (s *Session) shutdown() error {
 	// component therefore cannot suppress checkpoint, durable-stop, or lease cleanup.
 	s.stopOffloadGC()
 	failures = append(failures, s.stopCheckpoints(shutdownRoot, timeouts.checkpoint))
+	if s.resources != nil {
+		failures = append(failures, s.resources.Shutdown(shutdownRoot))
+	}
 	failures = append(failures, s.stopHub(shutdownRoot, timeouts.hub))
 	s.releaseRootLease(shutdownRoot)
 	s.releaseLease(shutdownRoot)

@@ -311,6 +311,16 @@ func (d Definition) Description() string {
 	return d.state.description
 }
 
+// Engine returns the immutable backend selected for this definition. Composition
+// roots use this bind-free view to reject unsupported capability combinations
+// before any tool factory can run.
+func (d Definition) Engine() Engine {
+	if d.state == nil {
+		return EngineNative
+	}
+	return d.state.engine
+}
+
 // Delegates returns a defensive copy of the definition's allowed delegate names.
 func (d Definition) Delegates() []identity.AgentName {
 	if d.state == nil {

@@ -3,13 +3,22 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/storage/memstore"
 )
 
 type testSessionResource struct {
@@ -67,6 +76,28 @@ func (c *signalingContext) Done() <-chan struct{} {
 type sessionResourceResult struct {
 	resource tool.SessionResource
 	err      error
+}
+
+type orderedSessionResource struct {
+	mu         *sync.Mutex
+	order      *[]string
+	onActivate func()
+	shutdown   atomic.Int32
+}
+
+func (r *orderedSessionResource) Activate(context.Context, tool.SessionResourceServices) error {
+	r.mu.Lock()
+	*r.order = append(*r.order, "activate")
+	r.mu.Unlock()
+	if r.onActivate != nil {
+		r.onActivate()
+	}
+	return nil
+}
+
+func (r *orderedSessionResource) Shutdown(context.Context) error {
+	r.shutdown.Add(1)
+	return nil
 }
 
 func TestSessionResourcesGetOrCreateSingleFlight(t *testing.T) {
@@ -151,6 +182,246 @@ func TestSessionResourcesCreationFailureCanRetry(t *testing.T) {
 	if got != nil || !errors.Is(err, errSessionResourceNil) {
 		t.Fatalf("typed-nil GetOrCreate() = (%v, %v), want (nil, %v)", got, err, errSessionResourceNil)
 	}
+}
+
+func TestRestorePlanningAndLiveBindingsShareResourceRegistry(t *testing.T) {
+	var registriesMu sync.Mutex
+	var registries []tool.SessionResourceRegistry
+	definition := processResourceDefinition(t, loop.EngineNative, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+		registriesMu.Lock()
+		registries = append(registries, bindings.Process.Registry)
+		registriesMu.Unlock()
+		_, err := bindings.Process.Registry.GetOrCreate(context.Background(), "shared", func(string) (tool.SessionResource, error) {
+			return &testSessionResource{}, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []tool.InvokableTool{primerTestTool{name: "process"}}, nil
+	})
+	store := processResourceStore(t)
+	root := filepath.Join(t.TempDir(), "resources")
+	lifecycle, err := newTestLifecycle(
+		definition,
+		store,
+		WithLifecycleSessionResourceStorage(func(context.Context, uuid.UUID) (string, string, error) {
+			return root, "stable-owner", nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewTopologyLifecycle() error = %v", err)
+	}
+
+	live, err := lifecycle.NewSession(context.Background(), "")
+	if err != nil {
+		t.Fatalf("NewSession() error = %v", err)
+	}
+	id := live.SessionID()
+	if err := live.Shutdown(context.Background()); err != nil {
+		t.Fatalf("new Shutdown() error = %v", err)
+	}
+	restored, err := lifecycle.RestoreSession(context.Background(), id)
+	if err != nil {
+		t.Fatalf("RestoreSession() error = %v", err)
+	}
+	defer func() {
+		if err := restored.Shutdown(context.Background()); err != nil {
+			t.Errorf("restored Shutdown() error = %v", err)
+		}
+	}()
+
+	registriesMu.Lock()
+	got := append([]tool.SessionResourceRegistry(nil), registries...)
+	registriesMu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("captured registries = %d, want new and restore", len(got))
+	}
+	if got[0] == got[1] {
+		t.Fatal("new and restored live constructions unexpectedly share one registry")
+	}
+	if restored.resources != got[1] {
+		t.Fatalf("restored Session registry = %p, planning registry = %p", restored.resources, got[1])
+	}
+	restored.loopsMu.RLock()
+	handle := restored.loops[restored.activeLoopID]
+	restored.loopsMu.RUnlock()
+	if handle == nil || handle.bindings.Process == nil || handle.bindings.Process.Registry != got[1] {
+		t.Fatal("restored live loop did not retain the planning registry")
+	}
+}
+
+func TestRestoreDoesNotPublishBeforeResourceBridgeActivation(t *testing.T) {
+	var orderMu sync.Mutex
+	var order []string
+	var sessionID uuid.UUID
+	var loopID uuid.UUID
+	var store *sessionstore.Store
+	var restoring atomic.Bool
+	definition := processResourceDefinition(t, loop.EngineNative, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+		sessionID = bindings.SessionID
+		loopID = bindings.LoopID
+		orderMu.Lock()
+		order = append(order, "bind")
+		orderMu.Unlock()
+		_, err := bindings.Process.Registry.GetOrCreate(context.Background(), "ordered", func(string) (tool.SessionResource, error) {
+			return &orderedSessionResource{
+				mu:    &orderMu,
+				order: &order,
+				onActivate: func() {
+					tail := restoreEventTail(t, store, sessionID, loopID)
+					var started, done bool
+					for _, candidate := range tail {
+						switch candidate.(type) {
+						case event.RestoreStarted:
+							started = true
+						case event.RestoreDone:
+							done = true
+						}
+					}
+					if restoring.Load() {
+						if !started {
+							t.Fatal("resource activated before durable RestoreStarted")
+						}
+						if done {
+							t.Fatal("resource activated after durable RestoreDone")
+						}
+					}
+				},
+			}, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []tool.InvokableTool{primerTestTool{name: "process"}}, nil
+	})
+	store = processResourceStore(t)
+	root := filepath.Join(t.TempDir(), "resources")
+	lifecycle, err := newTestLifecycle(
+		definition,
+		store,
+		WithLifecycleSessionResourceStorage(func(context.Context, uuid.UUID) (string, string, error) {
+			return root, "stable-owner", nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewTopologyLifecycle() error = %v", err)
+	}
+	live, err := lifecycle.NewSession(context.Background(), "")
+	if err != nil {
+		t.Fatalf("NewSession() error = %v", err)
+	}
+	id := live.SessionID()
+	if err := live.Shutdown(context.Background()); err != nil {
+		t.Fatalf("new Shutdown() error = %v", err)
+	}
+	orderMu.Lock()
+	order = nil
+	orderMu.Unlock()
+	restoring.Store(true)
+
+	restored, err := lifecycle.RestoreSession(context.Background(), id)
+	if err != nil {
+		t.Fatalf("RestoreSession() error = %v", err)
+	}
+	defer func() {
+		if err := restored.Shutdown(context.Background()); err != nil {
+			t.Errorf("Shutdown() error = %v", err)
+		}
+	}()
+	orderMu.Lock()
+	got := append([]string(nil), order...)
+	orderMu.Unlock()
+	if len(got) != 2 || got[0] != "bind" || got[1] != "activate" {
+		t.Fatalf("restore resource order = %v, want [bind activate]", got)
+	}
+}
+
+func TestForeignLoopRejectsProcessServices(t *testing.T) {
+	var factoryCalls atomic.Int32
+	definition := processResourceDefinition(t, loop.EngineForeignClaude, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		factoryCalls.Add(1)
+		return []tool.InvokableTool{primerTestTool{name: "process"}}, nil
+	})
+	lifecycle, err := newTestLifecycle(
+		definition,
+		processResourceStore(t),
+		WithLifecycleSessionResourceStorage(func(context.Context, uuid.UUID) (string, string, error) {
+			return filepath.Join(t.TempDir(), "resources"), "stable-owner", nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewTopologyLifecycle() error = %v", err)
+	}
+
+	live, err := lifecycle.NewSession(context.Background(), "")
+	var unsupported *ProcessServicesUnsupportedError
+	if live != nil || !errors.As(err, &unsupported) {
+		t.Fatalf("NewSession() = (%v, %T %v), want process_notifications_unsupported", live, err, err)
+	}
+	if got := factoryCalls.Load(); got != 0 {
+		t.Fatalf("foreign process factory calls = %d, want zero", got)
+	}
+}
+
+func TestResourceStorageAnchorRejectsSymlinkAndOversize(t *testing.T) {
+	root := t.TempDir()
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New() error = %v", err)
+	}
+	validAnchor := fmt.Sprintf("{\"version\":1,\"session_id\":%q,\"identity\":\"owner\"}\n", id.String())
+	target := filepath.Join(root, "target")
+	if err := os.WriteFile(target, []byte(validAnchor), 0o600); err != nil {
+		t.Fatalf("WriteFile(target) error = %v", err)
+	}
+	anchor := filepath.Join(root, sessionResourceAnchorName)
+	if err := os.Symlink(target, anchor); err != nil {
+		t.Fatalf("Symlink() error = %v", err)
+	}
+	var storageErr *SessionResourceStorageError
+	if err := validateSessionResourceAnchor(anchor, id, "owner"); !errors.As(err, &storageErr) ||
+		storageErr.Kind != SessionResourceStorageAnchorCorrupt {
+		t.Fatalf("symlink anchor error = %T %v, want anchor_corrupt", err, err)
+	}
+	if err := os.Remove(anchor); err != nil {
+		t.Fatalf("Remove(anchor) error = %v", err)
+	}
+	if err := os.WriteFile(anchor, []byte(validAnchor+strings.Repeat(" ", 1025)), 0o600); err != nil {
+		t.Fatalf("WriteFile(oversize) error = %v", err)
+	}
+	storageErr = nil
+	if err := validateSessionResourceAnchor(anchor, id, "owner"); !errors.As(err, &storageErr) ||
+		storageErr.Kind != SessionResourceStorageAnchorCorrupt {
+		t.Fatalf("oversize anchor error = %T %v, want anchor_corrupt", err, err)
+	}
+}
+
+func processResourceDefinition(
+	t *testing.T,
+	engine loop.Engine,
+	factory tool.Factory,
+) loop.Definition {
+	t.Helper()
+	processes := tool.NewDefinition("process", tool.RequiresProcessServices, factory)
+	definition, err := loop.Define(
+		loop.WithName(identity.AgentName("agent")),
+		loop.WithInference(&stubLLM{}, validModel("model")),
+		loop.WithTools(processes),
+		loop.WithEngine(engine),
+	)
+	if err != nil {
+		t.Fatalf("loop.Define() error = %v", err)
+	}
+	return definition
+}
+
+func processResourceStore(t *testing.T) *sessionstore.Store {
+	t.Helper()
+	store, err := sessionstore.Open(memstore.New())
+	if err != nil {
+		t.Fatalf("sessionstore.Open() error = %v", err)
+	}
+	return store
 }
 
 func TestSessionResourcesShutdownWinsCreationRace(t *testing.T) {

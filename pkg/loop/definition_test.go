@@ -63,6 +63,34 @@ func TestDefineValidation(t *testing.T) {
 	}
 }
 
+func TestDefinitionEngineIsImmutableAndBindFree(t *testing.T) {
+	t.Parallel()
+	native, err := Define(
+		WithName("native"),
+		WithInference(&fakeLLM{}, testModel()),
+	)
+	if err != nil {
+		t.Fatalf("Define(native) error = %v", err)
+	}
+	foreign, err := Define(
+		WithName("foreign"),
+		WithInference(&fakeLLM{}, testModel()),
+		WithEngine(EngineForeignClaude),
+	)
+	if err != nil {
+		t.Fatalf("Define(foreign) error = %v", err)
+	}
+	if got := (Definition{}).Engine(); got != EngineNative {
+		t.Fatalf("zero Definition Engine() = %v, want native", got)
+	}
+	if got := native.Engine(); got != EngineNative {
+		t.Fatalf("native Engine() = %v, want native", got)
+	}
+	if got := foreign.Engine(); got != EngineForeignClaude {
+		t.Fatalf("foreign Engine() = %v, want foreign Claude", got)
+	}
+}
+
 func TestDefineRequiresDurableModelKey(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

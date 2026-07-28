@@ -13,6 +13,7 @@ import (
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -205,6 +206,24 @@ type Lifecycle struct {
 	// field doc comment (session.go) for why.
 	permissionReviewObservationVerifier           gate.EvidenceObservationVerifier
 	permissionReviewObservationVerifierConfigured bool
+
+	// resourceStorage resolves the private durable root shared by process tools
+	// for one session identity. It is invoked only for topologies that declare
+	// RequiresProcessServices.
+	resourceStorage SessionResourceStorageResolver
+}
+
+// SessionResourceStorageResolver is the narrow lifecycle seam adapted from the
+// public rig provider. It returns a durable root and provider-owned identity for
+// the supplied non-zero session ID.
+type SessionResourceStorageResolver func(context.Context, uuid.UUID) (root, identity string, err error)
+
+// WithLifecycleSessionResourceStorage captures the durable process-resource
+// storage resolver for both new and restored live constructions.
+func WithLifecycleSessionResourceStorage(resolve SessionResourceStorageResolver) LifecycleOption {
+	return func(lifecycle *Lifecycle) {
+		lifecycle.resourceStorage = resolve
+	}
 }
 
 // HustleLimits is sessionruntime's narrow, rig-independent copy of the hustle
@@ -593,6 +612,9 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 		return nil, &NewSessionError{Kind: NewSessionContextDone, Cause: ctx.Err()}
 	default:
 	}
+	if err := validateProcessServiceEngines(r.topology); err != nil {
+		return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
+	}
 
 	sid, err := uuid.New()
 	if err != nil {
@@ -700,11 +722,29 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 		opts = append(opts, withResolvedPlacement(resolved))
 	}
 
+	var resources *sessionResources
+	if topologyRequiresProcessServices(r.topology) {
+		workspaceRoot := ""
+		if resolved != nil {
+			workspaceRoot = resolved.root
+		}
+		resources, err = resolveSessionResources(ctx, sid, r.resourceStorage, workspaceRoot, false)
+		if err != nil {
+			releaseResolvedRoot(ctx, resolved)
+			releaseLease(lease)
+			return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
+		}
+		opts = append(opts, withSessionResources(resources))
+	}
+
 	// Seeding (design §"Seeding"): materialize the seed BEFORE constructing the session so
 	// it lands in the (empty) root and becomes the first workspace checkpoint. Valid only
 	// for per-session and an EMPTY exclusive root; never shared; the ref must resolve.
 	if seed != "" {
 		if err := r.placement.materializeSeed(ctx, resolved, seed); err != nil {
+			if resources != nil {
+				_ = resources.Shutdown(context.Background())
+			}
 			releaseResolvedRoot(ctx, resolved)
 			releaseLease(lease)
 			return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
@@ -719,6 +759,9 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 		// abortConstruction). Earlier failures release here; the runner was never started,
 		// so stopping it only halts its (not-yet-built) ticker.
 		if !constructionCleanupOwned(err) {
+			if resources != nil {
+				_ = resources.Shutdown(context.Background())
+			}
 			if gcRunner != nil {
 				gcRunner.Stop()
 			}
@@ -726,6 +769,15 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 			releaseLease(lease)
 		}
 		return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
+	}
+	if resources != nil {
+		if err := resources.Activate(ctx, tool.SessionResourceServices{}); err != nil {
+			s.abortConstruction(err)
+			return nil, &NewSessionError{
+				Kind:  NewSessionRuntimeFailed,
+				Cause: &constructionCleanupOwnedError{cause: err},
+			}
+		}
 	}
 	// Gate prepare records retain their private journal encoding; public open/resolve
 	// transitions use the checked hub path so live subscribers see them as well.
@@ -779,6 +831,9 @@ func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session,
 	}
 	if r.permissionReviewObservationVerifierConfigured {
 		opts = append(opts, withPermissionReviewObservationVerifier(r.permissionReviewObservationVerifier))
+	}
+	if r.resourceStorage != nil {
+		opts = append(opts, withSessionResourceStorageResolver(r.resourceStorage))
 	}
 	if r.frozenFingerprint != nil {
 		opts = append(opts, WithFingerprint(*r.frozenFingerprint))

@@ -4,14 +4,29 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
+)
+
+const (
+	maxSessionResourcePathBytes     = 4096
+	maxSessionResourceIdentityBytes = 256
+	sessionResourceAnchorName       = ".harness-session-resource-v1.json"
+	sessionResourceAnchorVersion    = 1
 )
 
 var (
@@ -20,6 +35,341 @@ var (
 	errSessionResourceFactory  = errors.New("session: resource factory is nil")
 	errSessionResourceNil      = errors.New("session: resource factory returned nil")
 )
+
+// SessionResourceStorageErrorKind classifies fail-closed durable root and
+// identity-anchor validation failures.
+type SessionResourceStorageErrorKind string
+
+const (
+	SessionResourceStorageInvalid          SessionResourceStorageErrorKind = "invalid"
+	SessionResourceStorageUnavailable      SessionResourceStorageErrorKind = "unavailable"
+	SessionResourceStorageIdentityMismatch SessionResourceStorageErrorKind = "identity_mismatch"
+	SessionResourceStorageAnchorMissing    SessionResourceStorageErrorKind = "anchor_missing"
+	SessionResourceStorageAnchorCorrupt    SessionResourceStorageErrorKind = "anchor_corrupt"
+	SessionResourceStorageWorkspaceOverlap SessionResourceStorageErrorKind = "workspace_overlap"
+)
+
+// SessionResourceStorageError preserves a stable classification while wrapping
+// provider and filesystem causes.
+type SessionResourceStorageError struct {
+	Kind  SessionResourceStorageErrorKind
+	Path  string
+	Cause error
+}
+
+func (e *SessionResourceStorageError) Error() string {
+	message := "session: resource storage " + string(e.Kind)
+	if e.Path != "" {
+		message += ": " + e.Path
+	}
+	if e.Cause != nil {
+		message += ": " + e.Cause.Error()
+	}
+	return message
+}
+
+func (e *SessionResourceStorageError) Unwrap() error { return e.Cause }
+
+// ProcessServicesUnsupportedError rejects process-enabled definitions on
+// engines whose lifecycle events cannot be published by Harness.
+type ProcessServicesUnsupportedError struct {
+	Engine loop.Engine
+}
+
+func (e *ProcessServicesUnsupportedError) Error() string {
+	return "session: process_notifications_unsupported"
+}
+
+type sessionResourceAnchor struct {
+	Version   int    `json:"version"`
+	SessionID string `json:"session_id"`
+	Identity  string `json:"identity"`
+}
+
+func topologyRequiresProcessServices(topology Topology) bool {
+	for _, definition := range topology.Definitions {
+		if definition.ToolRequirements()&tool.RequiresProcessServices != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func validateProcessServiceEngines(topology Topology) error {
+	for _, definition := range topology.Definitions {
+		if definition.ToolRequirements()&tool.RequiresProcessServices != 0 &&
+			definition.Engine() != loop.EngineNative {
+			return &ProcessServicesUnsupportedError{Engine: definition.Engine()}
+		}
+	}
+	return nil
+}
+
+func resolveSessionResources(
+	ctx context.Context,
+	id uuid.UUID,
+	resolve SessionResourceStorageResolver,
+	workspaceRoot string,
+	restore bool,
+) (*sessionResources, error) {
+	if id.IsZero() {
+		return nil, &SessionResourceStorageError{Kind: SessionResourceStorageInvalid}
+	}
+	if resolve == nil {
+		return nil, &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable}
+	}
+	root, identity, err := resolve(ctx, id)
+	if err != nil {
+		return nil, &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Cause: err}
+	}
+	root, err = canonicalSessionResourceRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateSessionResourceIdentity(identity); err != nil {
+		return nil, err
+	}
+	if workspaceRoot != "" {
+		workspace, canonicalErr := filepath.Abs(workspaceRoot)
+		if canonicalErr != nil {
+			return nil, &SessionResourceStorageError{Kind: SessionResourceStorageInvalid, Path: workspaceRoot, Cause: canonicalErr}
+		}
+		workspace = filepath.Clean(workspace)
+		if evaluated, evaluateErr := filepath.EvalSymlinks(workspace); evaluateErr == nil {
+			workspace = filepath.Clean(evaluated)
+		}
+		if pathsOverlap(root, workspace) {
+			return nil, &SessionResourceStorageError{Kind: SessionResourceStorageWorkspaceOverlap, Path: root}
+		}
+	}
+	if err := establishSessionResourceRoot(root, !restore); err != nil {
+		return nil, err
+	}
+	if err := ensureSessionResourceAnchor(root, id, identity, restore); err != nil {
+		return nil, err
+	}
+	return newSessionResources(root), nil
+}
+
+func canonicalSessionResourceRoot(root string) (string, error) {
+	if root == "" || len(root) > maxSessionResourcePathBytes || !utf8.ValidString(root) ||
+		strings.TrimSpace(root) != root || containsControlRune(root) {
+		return "", &SessionResourceStorageError{Kind: SessionResourceStorageInvalid, Path: root}
+	}
+	absolute, err := filepath.Abs(root)
+	if err != nil {
+		return "", &SessionResourceStorageError{Kind: SessionResourceStorageInvalid, Path: root, Cause: err}
+	}
+	absolute = filepath.Clean(absolute)
+	existing := absolute
+	var suffix []string
+	for {
+		_, statErr := os.Lstat(existing)
+		if statErr == nil {
+			break
+		}
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return "", &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: existing, Cause: statErr}
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			return "", &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: absolute, Cause: statErr}
+		}
+		suffix = append(suffix, filepath.Base(existing))
+		existing = parent
+	}
+	evaluated, err := filepath.EvalSymlinks(existing)
+	if err != nil {
+		return "", &SessionResourceStorageError{Kind: SessionResourceStorageInvalid, Path: existing, Cause: err}
+	}
+	for i := len(suffix) - 1; i >= 0; i-- {
+		evaluated = filepath.Join(evaluated, suffix[i])
+	}
+	evaluated = filepath.Clean(evaluated)
+	if len(evaluated) > maxSessionResourcePathBytes {
+		return "", &SessionResourceStorageError{Kind: SessionResourceStorageInvalid, Path: evaluated}
+	}
+	return evaluated, nil
+}
+
+func establishSessionResourceRoot(root string, create bool) error {
+	if create {
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: err}
+		}
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		if !create && errors.Is(err, os.ErrNotExist) {
+			return &SessionResourceStorageError{Kind: SessionResourceStorageAnchorMissing, Path: root}
+		}
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: err}
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageInvalid, Path: root}
+	}
+	return nil
+}
+
+func validateSessionResourceIdentity(identity string) error {
+	if identity == "" || len(identity) > maxSessionResourceIdentityBytes ||
+		!utf8.ValidString(identity) || strings.TrimSpace(identity) != identity ||
+		containsControlRune(identity) {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageInvalid}
+	}
+	return nil
+}
+
+func containsControlRune(value string) bool {
+	for _, candidate := range value {
+		if unicode.IsControl(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathsOverlap(left, right string) bool {
+	relative, err := filepath.Rel(left, right)
+	if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return true
+	}
+	relative, err = filepath.Rel(right, left)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func ensureSessionResourceAnchor(root string, id uuid.UUID, identity string, restore bool) error {
+	anchorPath := filepath.Join(root, sessionResourceAnchorName)
+	info, err := os.Lstat(anchorPath)
+	switch {
+	case err == nil:
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+			return &SessionResourceStorageError{Kind: SessionResourceStorageAnchorCorrupt, Path: anchorPath}
+		}
+		return validateSessionResourceAnchor(anchorPath, id, identity)
+	case !errors.Is(err, os.ErrNotExist):
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: anchorPath, Cause: err}
+	case restore:
+		return &SessionResourceStorageError{Kind: SessionResourceStorageAnchorMissing, Path: anchorPath}
+	}
+
+	payload, err := json.Marshal(sessionResourceAnchor{
+		Version: sessionResourceAnchorVersion, SessionID: id.String(), Identity: identity,
+	})
+	if err != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageInvalid, Cause: err}
+	}
+	payload = append(payload, '\n')
+	temporary, err := os.CreateTemp(root, ".harness-session-resource-anchor-*")
+	if err != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: err}
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: temporaryPath, Cause: err}
+	}
+	if _, err := temporary.Write(payload); err != nil {
+		_ = temporary.Close()
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: temporaryPath, Cause: err}
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: temporaryPath, Cause: err}
+	}
+	if err := temporary.Close(); err != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: temporaryPath, Cause: err}
+	}
+	if err := os.Link(temporaryPath, anchorPath); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return validateSessionResourceAnchor(anchorPath, id, identity)
+		}
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: anchorPath, Cause: err}
+	}
+	directory, err := os.Open(root)
+	if err != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: err}
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: syncErr}
+	}
+	if closeErr != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: closeErr}
+	}
+	return nil
+}
+
+func validateSessionResourceAnchor(path string, id uuid.UUID, identity string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return &SessionResourceStorageError{Kind: SessionResourceStorageAnchorMissing, Path: path}
+		}
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: path, Cause: err}
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
+		info.Mode().Perm()&0o077 != 0 || info.Size() <= 0 || info.Size() > 1024 {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageAnchorCorrupt, Path: path}
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: path, Cause: err}
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: path, Cause: err}
+	}
+	if !os.SameFile(info, openedInfo) || !openedInfo.Mode().IsRegular() ||
+		openedInfo.Mode().Perm()&0o077 != 0 || openedInfo.Size() != info.Size() {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageAnchorCorrupt, Path: path}
+	}
+	decoder := json.NewDecoder(io.LimitReader(file, 1025))
+	decoder.DisallowUnknownFields()
+	var anchor sessionResourceAnchor
+	if err := decoder.Decode(&anchor); err != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageAnchorCorrupt, Path: path, Cause: err}
+	}
+	if anchor.Version != sessionResourceAnchorVersion || anchor.SessionID == "" || anchor.Identity == "" {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageAnchorCorrupt, Path: path}
+	}
+	if anchor.SessionID != id.String() || anchor.Identity != identity {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageIdentityMismatch, Path: path}
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageAnchorCorrupt, Path: path, Cause: err}
+	}
+	return nil
+}
+
+func withSessionResources(resources *sessionResources) Option {
+	return func(session *Session) {
+		session.resources = resources
+	}
+}
+
+func withSessionResourceStorageResolver(resolve SessionResourceStorageResolver) Option {
+	return func(session *Session) {
+		session.resourceStorageResolver = resolve
+	}
+}
+
+func processBindingFor(definition loop.Definition, resources *sessionResources) (*tool.ProcessBinding, error) {
+	if definition.ToolRequirements()&tool.RequiresProcessServices == 0 {
+		return nil, nil
+	}
+	if definition.Engine() != loop.EngineNative {
+		return nil, &ProcessServicesUnsupportedError{Engine: definition.Engine()}
+	}
+	if resources == nil {
+		return nil, &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable}
+	}
+	return &tool.ProcessBinding{Registry: resources}, nil
+}
 
 // sessionResources is the session-private implementation of the public resource
 // registry. Its storage root is fixed at construction and every key maps to a
