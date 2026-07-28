@@ -42,6 +42,7 @@ const (
 	keyPermissionReviewEvidence        singletonKey = "permission_review_evidence"
 	keyPermissionReviewSecurityCeiling singletonKey = "permission_review_security_ceiling"
 	keyPermissionReviewObservations    singletonKey = "permission_review_observations"
+	keySessionResourceStorage          singletonKey = "session_resource_storage"
 )
 
 // WithPermissionClassifiers installs the already-validated, ordered permission

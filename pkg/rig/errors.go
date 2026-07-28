@@ -23,6 +23,8 @@ const (
 	DefinitionUnusedHustleLimits              DefinitionErrorKind = "unused_hustle_limits"
 	DefinitionInvalidHustleLimits             DefinitionErrorKind = "invalid_hustle_limits"
 	DefinitionInvalidHooks                    DefinitionErrorKind = "invalid_hooks"
+	DefinitionMissingResourceStorage          DefinitionErrorKind = "missing_resource_storage"
+	DefinitionInvalidResourceStorage          DefinitionErrorKind = "invalid_resource_storage"
 	DefinitionMissingCompactionHustle         DefinitionErrorKind = "missing_compaction_hustle"
 	DefinitionIncompatibleCompactionHustle    DefinitionErrorKind = "incompatible_compaction_hustle"
 	DefinitionInvalidPermissionClassifiers    DefinitionErrorKind = "invalid_permission_classifiers"
