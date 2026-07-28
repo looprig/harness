@@ -335,6 +335,9 @@ for:
 
 Canonicalization rejects invalid JSON, duplicate object fields, unknown wire
 versions, unsupported enum values, and non-canonical identifiers.
+Every private-wire object has an exact canonical key set. Case variants are not
+aliases: a canonical key plus `encoding/json`-equivalent case variant is
+rejected rather than allowed to shadow the canonical value.
 The strict v1 decoder also rejects JSON `null` for every scalar, object, and
 array member—including optional strings whose canonical value may be empty—
 before Go zero-value conversion can erase the distinction.
@@ -363,7 +366,9 @@ second private common-subject digest with only those two fields neutralized.
 That digest proves every outcome covers the same gate, tool execution, complete
 request, context, gate policy, and security ceiling while allowing different
 classifier revisions. Assessment-to-subject validation always retains the full
-classifier-specific basis comparison.
+classifier-specific basis comparison. Neutralization uses a fixed non-growing
+wire representation, so a valid subject at the 1 MiB ceiling cannot become
+unusable solely because its classifier revision was replaced for comparison.
 
 ### 8.3 Context snapshot
 
@@ -457,6 +462,9 @@ constraint that triggered omission.
 
 Truncation preserves both prefix and suffix when useful and emits an explicit
 typed omission entry. It never silently drops content.
+If source content that must be truncated already contains the reserved fixed
+truncation marker, construction fails closed instead of emitting an ambiguous
+entry that strict subject validation cannot accept.
 
 The active prepared request is not truncated. If it exceeds the classifier's
 input bound, review is ineligible and the human gate remains open.

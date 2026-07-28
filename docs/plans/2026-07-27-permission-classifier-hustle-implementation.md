@@ -216,6 +216,9 @@ defensive cloning, UTF-8-safe prefix/suffix truncation, stable omission
 markers, retention of current user intent, retention of the active assistant
 tool request, exact limits, one-byte-over limits, and material-truncation
 classification.
+Add an adversarial source entry that already contains the reserved truncation
+marker and requires truncation. The builder must fail closed with a bounded
+non-echoing error rather than emit a value the strict subject boundary rejects.
 
 Close the wire values:
 
@@ -409,6 +412,11 @@ stored digest. It wraps strict-JSON scanner/decoder failures in the bounded
 non-echoing review validation error rather than returning attacker-controlled
 JSON keys or contents.
 
+Every object must contain exactly its canonical keys. Reject unknown keys and
+case-variant aliases at root and every nested object, including a canonical key
+plus an `encoding/json` case-insensitive variant that would otherwise overwrite
+the decoded struct field.
+
 Before typed conversion it also verifies that every required scalar and
 container member has its exact JSON kind. JSON `null` is rejected for strings,
 booleans, integers, objects, and arrays, including optional strings whose
@@ -467,11 +475,13 @@ Strict built-context validation accepts only values the v1 builder can emit:
 
 Add a private common-subject digest for conjunction. It uses the same complete
 canonical v1 projection but replaces only classifier revision and subject
-digest with fixed neutral values. Subjects with different classifier revisions
+digest with fixed, non-growing neutral values. Subjects with different classifier revisions
 must have different full subject digests and the same common digest when every
 other field is identical; mutating any gate/tool/request/context/policy/security
 field changes the common digest. Invalid UTF-8 raw JSON or typed request strings
 returns a zero subject/digest before `encoding/json` can replace bytes.
+Add a near-1 MiB subject whose short classifier revision keeps its canonical
+wire valid and prove common-digest construction does not grow it past the cap.
 
 **Step 4: Add fuzz seeds and invariants**
 
