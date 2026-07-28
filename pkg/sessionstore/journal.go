@@ -28,6 +28,8 @@ const appendTimeout = 5 * time.Second
 // content-addressed offload blobs: a blob lands at "sessions/<uuid>/blobs/<sha>".
 const blobsInfix = "/blobs/"
 
+var errOpeningAppendMiddleware = errors.New("sessionstore: opening append middleware must delegate exactly once")
+
 // NilLeaseError reports that a Store constructor (OpenJournal or OpenObjectGC) was
 // handed a nil lease. The lease is a required dependency (DIP): the composition root
 // acquires it via AcquireLease and passes it in. The constructor fails closed with
@@ -80,6 +82,19 @@ var _ journal.SessionJournal = (*sessionJournal)(nil)
 // only once it commits is the journal ready to accept Appends. The lease is a
 // required dependency (DIP): a nil lease fails closed with *NilLeaseError.
 func (s *Store) OpenJournal(ctx context.Context, id uuid.UUID, lease journal.Lease) (journal.SessionJournal, error) {
+	return s.OpenJournalWithOpeningAppend(ctx, id, lease, nil)
+}
+
+// OpenJournalWithOpeningAppend is OpenJournal with middleware around the
+// ownership fence append. The middleware sees the fence while it is still part
+// of journal construction; the journal is returned only after that append
+// commits and ready is set. Later appends are not decorated by this seam.
+func (s *Store) OpenJournalWithOpeningAppend(
+	ctx context.Context,
+	id uuid.UUID,
+	lease journal.Lease,
+	middleware journal.AppendMiddleware,
+) (journal.SessionJournal, error) {
 	if lease == nil {
 		return nil, &NilLeaseError{SessionID: id}
 	}
@@ -113,8 +128,34 @@ func (s *Store) OpenJournal(ctx context.Context, id uuid.UUID, lease journal.Lea
 	fence := journal.NewFenceRecord(id, journal.LeaseFence{Epoch: lease.Epoch()})
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if _, err := j.writeLocked(ctx, fence); err != nil {
-		return nil, err
+	delegations := 0
+	var fenceSeq uint64
+	var fenceErr error
+	appendOpening := journal.AppendFunc(func(appendCtx context.Context, _ journal.JournalRecord) (uint64, error) {
+		delegations++
+		if delegations != 1 {
+			return 0, errOpeningAppendMiddleware
+		}
+		// The middleware may derive context but cannot substitute the ownership
+		// record: construction always commits this exact fence.
+		fenceSeq, fenceErr = j.writeLocked(appendCtx, fence)
+		return fenceSeq, fenceErr
+	})
+	if middleware != nil {
+		appendOpening = middleware(appendOpening)
+	}
+	if appendOpening == nil {
+		return nil, errOpeningAppendMiddleware
+	}
+	// The middleware's returned pair is deliberately ignored. Open derives its
+	// result only from the guarded real append, so a decorator cannot suppress
+	// an error or fabricate a successful fence sequence.
+	_, _ = appendOpening(ctx, fence)
+	if delegations != 1 {
+		return nil, errOpeningAppendMiddleware
+	}
+	if fenceErr != nil {
+		return nil, fenceErr
 	}
 	j.ready = true
 	return j, nil

@@ -9,10 +9,20 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 )
 
-type hookedJournal struct {
-	journal   SessionJournal
-	hooks     *hook.Runner
-	sessionID uuid.UUID
+// AppendFunc is one journal append operation.
+type AppendFunc func(context.Context, JournalRecord) (uint64, error)
+
+// AppendMiddleware decorates one AppendFunc. Implementations must invoke next
+// synchronously exactly once with the supplied record and return its exact
+// sequence and error.
+type AppendMiddleware func(next AppendFunc) AppendFunc
+
+type appendFuncJournal struct {
+	append AppendFunc
+}
+
+func (j *appendFuncJournal) Append(ctx context.Context, record JournalRecord) (uint64, error) {
+	return j.append(ctx, record)
 }
 
 // WithHooks observes each durable append while preserving the journal's result.
@@ -20,52 +30,82 @@ func WithHooks(j SessionJournal, runner *hook.Runner, sessionID uuid.UUID) Sessi
 	if j == nil {
 		return nil
 	}
-	return &hookedJournal{journal: j, hooks: runner, sessionID: sessionID}
+	middleware := HookMiddleware(runner, sessionID)
+	if middleware == nil {
+		return j
+	}
+	return &appendFuncJournal{append: middleware(j.Append)}
 }
 
-func (j *hookedJournal) Append(ctx context.Context, record JournalRecord) (uint64, error) {
-	call := hook.Call{
-		Operation:   hook.OperationJournalAppend,
-		StartedAt:   time.Now(),
-		Coordinates: identity.Coordinates{SessionID: j.sessionID},
-		JournalAppend: &hook.JournalAppendData{
-			Family:   recordFamily(record),
-			RecordID: record.IdempotencyID(),
-		},
+// HookMiddleware observes safe, classifiable journal records with runner.
+// Records whose metadata cannot be derived without panicking bypass observation
+// and delegate unchanged.
+func HookMiddleware(runner *hook.Runner, sessionID uuid.UUID) AppendMiddleware {
+	if !runner.Handles(hook.OperationJournalAppend) {
+		return nil
 	}
-	hookCtx, finish, startErr := j.hooks.Start(ctx, call)
-	if startErr != nil {
-		hookCtx = ctx
-		finish = func(hook.Result) {}
+	return func(next AppendFunc) AppendFunc {
+		return func(ctx context.Context, record JournalRecord) (uint64, error) {
+			family, recordID, observable := describeRecord(record)
+			if !observable {
+				return next(ctx, record)
+			}
+			call := hook.Call{
+				Operation:   hook.OperationJournalAppend,
+				StartedAt:   time.Now(),
+				Coordinates: identity.Coordinates{SessionID: sessionID},
+				JournalAppend: &hook.JournalAppendData{
+					Family:   family,
+					RecordID: recordID,
+				},
+			}
+			hookCtx, finish, startErr := runner.Start(ctx, call)
+			if startErr != nil {
+				return next(ctx, record)
+			}
+			seq, err := next(hookCtx, record)
+			outcome := hook.OutcomeCompleted
+			switch {
+			case err == nil:
+				outcome = hook.OutcomeCompleted
+			case ctx.Err() != nil || hookCtx.Err() != nil:
+				outcome = hook.OutcomeCanceled
+			default:
+				outcome = hook.OutcomeFailed
+			}
+			finish(hook.Result{
+				Call:    call,
+				EndedAt: time.Now(),
+				Outcome: outcome,
+				Err:     err,
+			})
+			return seq, err
+		}
 	}
-	seq, err := j.journal.Append(hookCtx, record)
-	outcome := hook.OutcomeCompleted
-	switch {
-	case hookCtx.Err() != nil:
-		outcome = hook.OutcomeCanceled
-	case err != nil:
-		outcome = hook.OutcomeFailed
-	}
-	finish(hook.Result{
-		Call:    call,
-		EndedAt: time.Now(),
-		Outcome: outcome,
-		Err:     err,
-	})
-	return seq, err
 }
 
-func recordFamily(record JournalRecord) hook.RecordFamily {
+func describeRecord(record JournalRecord) (family hook.RecordFamily, recordID string, ok bool) {
+	if record == nil {
+		return "", "", false
+	}
+	defer func() {
+		if recover() != nil {
+			family = ""
+			recordID = ""
+			ok = false
+		}
+	}()
 	switch record.(type) {
 	case EventRecord, *EventRecord:
-		return hook.RecordEvent
+		family = hook.RecordEvent
 	case CommandRecord, *CommandRecord:
-		return hook.RecordCommand
+		family = hook.RecordCommand
 	case GatePreparedRecord, *GatePreparedRecord:
-		return hook.RecordGatePrepared
+		family = hook.RecordGatePrepared
 	case FenceRecord, *FenceRecord:
-		return hook.RecordFence
+		family = hook.RecordFence
 	default:
-		panic("journal: unknown sealed record family")
+		return "", "", false
 	}
+	return family, record.IdempotencyID(), true
 }

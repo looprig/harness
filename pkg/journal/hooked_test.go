@@ -15,16 +15,20 @@ import (
 )
 
 type hookedRecordingJournal struct {
-	mu      sync.Mutex
-	records []JournalRecord
-	seq     uint64
-	err     error
+	mu       sync.Mutex
+	records  []JournalRecord
+	seq      uint64
+	err      error
+	onAppend func(context.Context, JournalRecord)
 }
 
-func (j *hookedRecordingJournal) Append(_ context.Context, record JournalRecord) (uint64, error) {
+func (j *hookedRecordingJournal) Append(ctx context.Context, record JournalRecord) (uint64, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.records = append(j.records, record)
+	if j.onAppend != nil {
+		j.onAppend(ctx, record)
+	}
 	return j.seq, j.err
 }
 
@@ -135,11 +139,30 @@ func TestWithHooksPreservesAppendTerminalAndClassifiesOutcome(t *testing.T) {
 		name        string
 		ctx         context.Context
 		err         error
+		begin       func(context.Context) context.Context
 		wantOutcome hook.Outcome
 	}{
 		{name: "success", ctx: context.Background(), wantOutcome: hook.OutcomeCompleted},
 		{name: "failure", ctx: context.Background(), err: appendErr, wantOutcome: hook.OutcomeFailed},
 		{name: "canceled wins over failure", ctx: canceledContext(), err: appendErr, wantOutcome: hook.OutcomeCanceled},
+		{
+			name: "original cancellation survives observer context replacement",
+			ctx:  canceledContext(),
+			err:  appendErr,
+			begin: func(context.Context) context.Context {
+				return context.Background()
+			},
+			wantOutcome: hook.OutcomeCanceled,
+		},
+		{
+			name: "observer derived cancellation wins over failure",
+			ctx:  context.Background(),
+			err:  appendErr,
+			begin: func(context.Context) context.Context {
+				return canceledContext()
+			},
+			wantOutcome: hook.OutcomeCanceled,
+		},
 	}
 	for _, testCase := range tests {
 		testCase := testCase
@@ -149,6 +172,9 @@ func TestWithHooksPreservesAppendTerminalAndClassifiesOutcome(t *testing.T) {
 			runner, err := hook.Compile(hook.Set{Around: []hook.Around{{
 				Operation: hook.OperationJournalAppend,
 				Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+					if testCase.begin != nil {
+						ctx = testCase.begin(ctx)
+					}
 					return ctx, func(result hook.Result) { got = result }
 				},
 			}}})
@@ -164,6 +190,115 @@ func TestWithHooksPreservesAppendTerminalAndClassifiesOutcome(t *testing.T) {
 			}
 			if got.Outcome != testCase.wantOutcome || !errors.Is(got.Err, testCase.err) {
 				t.Fatalf("result = %#v, want outcome %v and err %v", got, testCase.wantOutcome, testCase.err)
+			}
+		})
+	}
+}
+
+func TestWithHooksSuccessfulAppendIsCompletedDespiteCancellation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		context  func() (context.Context, context.CancelFunc)
+		delegate func(context.CancelFunc) func(context.Context, JournalRecord)
+	}{
+		{
+			name: "already canceled",
+			context: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, cancel
+			},
+		},
+		{
+			name: "delegate races cancellation with successful return",
+			context: func() (context.Context, context.CancelFunc) {
+				return context.WithCancel(context.Background())
+			},
+			delegate: func(cancel context.CancelFunc) func(context.Context, JournalRecord) {
+				return func(context.Context, JournalRecord) { cancel() }
+			},
+		},
+	}
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := testCase.context()
+			defer cancel()
+			var result hook.Result
+			runner, err := hook.Compile(hook.Set{Around: []hook.Around{{
+				Operation: hook.OperationJournalAppend,
+				Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+					return ctx, func(got hook.Result) { result = got }
+				},
+			}}})
+			if err != nil {
+				t.Fatalf("hook.Compile: %v", err)
+			}
+			delegate := &hookedRecordingJournal{seq: 37}
+			if testCase.delegate != nil {
+				delegate.onAppend = testCase.delegate(cancel)
+			}
+
+			seq, err := WithHooks(delegate, runner, fixedUUID(0xb2)).Append(
+				ctx,
+				NewFenceRecord(fixedUUID(0xb2), LeaseFence{Epoch: 4}),
+			)
+			if err != nil || seq != 37 {
+				t.Fatalf("Append = (%d, %v), want (37, nil)", seq, err)
+			}
+			if result.Outcome != hook.OutcomeCompleted {
+				t.Fatalf("Outcome = %v, want Completed for successful delegate", result.Outcome)
+			}
+		})
+	}
+}
+
+func TestWithHooksInvalidRecordPreservesDelegateResult(t *testing.T) {
+	t.Parallel()
+
+	delegateErr := &RecordKindError{}
+	var nilEvent *EventRecord
+	var nilCommand *CommandRecord
+	var nilGate *GatePreparedRecord
+	var nilFence *FenceRecord
+	tests := []struct {
+		name   string
+		record JournalRecord
+	}{
+		{name: "nil interface", record: nil},
+		{name: "typed nil event", record: nilEvent},
+		{name: "typed nil command", record: nilCommand},
+		{name: "typed nil gate", record: nilGate},
+		{name: "typed nil fence", record: nilFence},
+		{name: "zero event", record: EventRecord{}},
+		{name: "zero command", record: CommandRecord{}},
+	}
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			var began int
+			runner, err := hook.Compile(hook.Set{Around: []hook.Around{{
+				Operation: hook.OperationJournalAppend,
+				Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+					began++
+					return ctx, nil
+				},
+			}}})
+			if err != nil {
+				t.Fatalf("hook.Compile: %v", err)
+			}
+			delegate := &hookedRecordingJournal{seq: 83, err: delegateErr}
+
+			seq, err := WithHooks(delegate, runner, fixedUUID(0xb3)).Append(context.Background(), testCase.record)
+			if seq != 83 || err != delegateErr {
+				t.Fatalf("Append = (%d, %v), want exact (83, %v)", seq, err, delegateErr)
+			}
+			if began != 0 {
+				t.Fatalf("hook began %d times for unsafe metadata, want 0", began)
 			}
 		})
 	}
@@ -209,6 +344,22 @@ func TestWithHooksPreservesNilJournalForCheckedComposition(t *testing.T) {
 	}
 	if got := WithHooks(nil, runner, fixedUUID(0xd1)); got != nil {
 		t.Fatalf("WithHooks(nil) = %T, want nil so checked appenders reject bad wiring", got)
+	}
+}
+
+func TestWithHooksReturnsDelegateWhenJournalAppendIsUnregistered(t *testing.T) {
+	t.Parallel()
+
+	runner, err := hook.Compile(hook.Set{})
+	if err != nil {
+		t.Fatalf("hook.Compile: %v", err)
+	}
+	delegate := &hookedRecordingJournal{}
+	if got := WithHooks(delegate, runner, fixedUUID(0xd2)); got != delegate {
+		t.Fatalf("WithHooks(empty runner) = %T, want original delegate", got)
+	}
+	if middleware := HookMiddleware(runner, fixedUUID(0xd2)); middleware != nil {
+		t.Fatal("HookMiddleware(empty runner) is non-nil")
 	}
 }
 

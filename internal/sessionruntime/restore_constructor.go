@@ -151,7 +151,12 @@ func restoreTopologySession(
 	if err != nil {
 		return nil, &RestoreError{Kind: RestoreLeaseFailed, Cause: err}
 	}
-	j, err := store.OpenJournal(ctx, sessionID, lease)
+	j, err := store.OpenJournalWithOpeningAppend(
+		ctx,
+		sessionID,
+		lease,
+		journal.HookMiddleware(probe.hooks, sessionID),
+	)
 	if err != nil {
 		releaseLease(lease)
 		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}

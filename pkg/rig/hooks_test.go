@@ -110,11 +110,20 @@ func TestCompiledHooksReachNewAndRestoredSessionJournals(t *testing.T) {
 	if appends.Load() == 0 {
 		t.Fatal("NewSession journal did not receive compiled hooks")
 	}
+	familiesMu.Lock()
+	if got := countHookFamily(families, hook.RecordFence); got != 1 {
+		familiesMu.Unlock()
+		t.Fatalf("NewSession opening fence hook count = %d, want 1", got)
+	}
+	familiesMu.Unlock()
 	if err := live.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
 
 	beforeRestore := appends.Load()
+	familiesMu.Lock()
+	families = nil
+	familiesMu.Unlock()
 	restored, err := defined.RestoreSession(context.Background(), sessionID)
 	if err != nil {
 		t.Fatalf("RestoreSession: %v", err)
@@ -124,6 +133,10 @@ func TestCompiledHooksReachNewAndRestoredSessionJournals(t *testing.T) {
 		t.Fatal("RestoreSession journal did not receive compiled hooks")
 	}
 	familiesMu.Lock()
+	if got := countHookFamily(families, hook.RecordFence); got != 1 {
+		familiesMu.Unlock()
+		t.Fatalf("RestoreSession opening fence hook count = %d, want 1", got)
+	}
 	families = nil
 	familiesMu.Unlock()
 	if _, err := restored.Submit(context.Background(), []content.Block{&content.TextBlock{Text: "observe restored command"}}); err != nil {
@@ -137,6 +150,16 @@ func TestCompiledHooksReachNewAndRestoredSessionJournals(t *testing.T) {
 		}
 	}
 	t.Fatal("restored session command appender did not use the hooked journal")
+}
+
+func countHookFamily(families []hook.RecordFamily, want hook.RecordFamily) int {
+	var count int
+	for _, family := range families {
+		if family == want {
+			count++
+		}
+	}
+	return count
 }
 
 func TestAroundCallbacksDoNotChangeManifest(t *testing.T) {

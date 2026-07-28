@@ -58,7 +58,7 @@ func (r *Runner) Start(
 	if err := ValidateCall(call); err != nil {
 		return ctx, nil, err
 	}
-	if !r.matches(call.Operation) {
+	if !r.Handles(call.Operation) {
 		return ctx, func(Result) {}, nil
 	}
 	snapshot := CloneCall(call)
@@ -119,7 +119,13 @@ func (r *Runner) Start(
 	return ctx, finish, nil
 }
 
-func (r *Runner) matches(operation Operation) bool {
+// Handles reports whether the compiled runner has a guard or observer for
+// operation. It is nil-safe and lets operation boundaries skip snapshot and
+// clock work when no callback can run.
+func (r *Runner) Handles(operation Operation) bool {
+	if r == nil {
+		return false
+	}
 	for _, around := range r.around {
 		if around.Operation == operation {
 			return true

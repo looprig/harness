@@ -72,6 +72,40 @@ func TestCompileValidatesAndClonesSet(t *testing.T) {
 	}
 }
 
+func TestRunnerHandlesReportsCompiledRegistrations(t *testing.T) {
+	t.Parallel()
+
+	around, err := Compile(Set{Around: []Around{{
+		Operation: OperationJournalAppend,
+		Begin: func(ctx context.Context, _ Call) (context.Context, FinishFunc) {
+			return ctx, nil
+		},
+	}}})
+	if err != nil {
+		t.Fatalf("Compile around: %v", err)
+	}
+	guard, err := Compile(Set{
+		PolicyRevision: "turn-v1",
+		Guards: []Guard{{
+			Operation: OperationTurn,
+			Check:     func(context.Context, Call) error { return nil },
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Compile guard: %v", err)
+	}
+	var nilRunner *Runner
+	if !around.Handles(OperationJournalAppend) || around.Handles(OperationTurn) {
+		t.Fatal("around runner registration query mismatch")
+	}
+	if !guard.Handles(OperationTurn) || guard.Handles(OperationJournalAppend) {
+		t.Fatal("guard runner registration query mismatch")
+	}
+	if nilRunner.Handles(OperationJournalAppend) {
+		t.Fatal("nil runner reported a registration")
+	}
+}
+
 func TestRunnerOrdersBeginsGuardsAndFinishesWithContextChaining(t *testing.T) {
 	t.Parallel()
 

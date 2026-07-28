@@ -386,7 +386,12 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	if err != nil {
 		return nil, &NewSessionError{Kind: NewSessionLeaseFailed, Cause: err}
 	}
-	j, err := r.store.OpenJournal(ctx, sid, lease)
+	j, err := r.store.OpenJournalWithOpeningAppend(
+		ctx,
+		sid,
+		lease,
+		journal.HookMiddleware(r.hooks, sid),
+	)
 	if err != nil {
 		releaseLease(lease)
 		return nil, &NewSessionError{Kind: NewSessionJournalFailed, Cause: err}

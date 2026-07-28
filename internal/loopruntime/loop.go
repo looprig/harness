@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	gatedomain "github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -52,6 +53,12 @@ type Loop struct {
 	// defensive clone. It is the restore-verification + dormant-snapshot read primitive
 	// (see Snapshot). The actor is the sole reader, selecting on it alongside commands.
 	snapshots chan<- snapshotRequest
+
+	// hooks retains the immutable runner installed in the actor configuration.
+	// The actor executes from loopConfig.cfg; retaining the same pointer on the
+	// handle makes native/foreign construction isolation inspectable without
+	// exposing hook configuration through loop.Backend.
+	hooks *hook.Runner
 }
 
 // CommandSink returns the actor's command input.
@@ -450,7 +457,14 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		}
 	}
 	go runLoop(lc, state)
-	return &Loop{Commands: commands, Done: done, priorityCommands: priorityCommands, gateReg: gateReg, snapshots: snapshots}, nil
+	return &Loop{
+		Commands:         commands,
+		Done:             done,
+		priorityCommands: priorityCommands,
+		gateReg:          gateReg,
+		snapshots:        snapshots,
+		hooks:            cfg.Hooks,
+	}, nil
 }
 
 type loopStatus int
