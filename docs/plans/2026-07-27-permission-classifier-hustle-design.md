@@ -702,12 +702,24 @@ schema, and at most 4 MiB across all concrete names, descriptions, and compact
 schemas. Evidence-policy revisions are canonical trimmed UTF-8 without NUL.
 
 The descriptor never contains raw schemas or descriptions. Bound construction
-builds the concrete tools, validates their `ToolInfo`, computes canonical schema
-digests, and verifies the built set matches frozen metadata. Tool argument
-schemas must satisfy the same bounded portable JSON Schema subset used by the
-inference layer, including duplicate-key, keyword, depth, property-count, and
-root-object validation. Any drift or schema failure stops session construction
-before a review can run.
+freezes model-facing `ToolInfo` metadata declared by each evidence definition
+and includes versioned, domain-separated catalog digests in descriptor and rig
+identity. Tool argument schemas must satisfy the same bounded portable JSON
+Schema subset used by the inference layer, including duplicate-key, keyword,
+depth, property-count, and root-object validation.
+
+Concrete tools are built for each review invocation using its originating
+session and loop identity, never the session's construction-time active loop.
+Every build validates the concrete `ToolInfo` against the frozen static
+metadata before inference. Static metadata drift changes topology/restore
+identity; factory drift under unchanged metadata fails that review closed.
+
+Evidence definitions use a dedicated read-only workspace requirement and
+receive a `ReadWorkspaceBinding` containing only the canonical root needed for
+read evidence. The binding type has no mutation coordinator, observations,
+delegate controller, extra tools, session, gate, rule, grant, or loop-control
+capability. Generic mutation-capable `RequiresWorkspace` definitions are
+invalid in evidence policies.
 
 ### 12.3 Model capability
 
@@ -1220,6 +1232,10 @@ Rig identity covers:
 Restore compares the complete identity. A mismatch follows the existing rig
 configuration mismatch policy. It never silently resumes with a different
 reviewer.
+
+Every evidence-policy, catalog, produced-name, concrete-tool, and rig projection
+uses an explicit versioned domain label and length-delimited or typed canonical
+encoding. Raw SHA-256 of an unlabelled value is not an identity boundary.
 
 ## 22. Testing strategy
 

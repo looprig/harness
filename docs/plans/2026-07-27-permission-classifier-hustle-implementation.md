@@ -909,6 +909,8 @@ git commit -m "feat(hustle): define bounded evidence tool loops"
 
 **Files:**
 
+- Modify: `pkg/tool/definition.go`
+- Modify: `pkg/tool/definition_test.go`
 - Modify: `pkg/hustle/definition.go`
 - Create: `pkg/hustle/evidence.go`
 - Create: `pkg/hustle/evidence_test.go`
@@ -921,7 +923,13 @@ git commit -m "feat(hustle): define bounded evidence tool loops"
 
 Tests must prove:
 
-- workspace-required definitions receive only workspace bindings;
+- evidence definitions declare frozen model-facing `ToolInfo` metadata whose
+  names exactly match produced names;
+- read-workspace-required definitions receive only
+  `tool.ReadWorkspaceBinding`;
+- generic mutation-capable workspace requirements are rejected and the
+  evidence factory cannot structurally reach `WorkspaceCoordinator`,
+  observations, delegate, or extra tools;
 - delegate bindings are absent;
 - built tools match frozen produced names;
 - `ToolInfo` is non-nil, valid, uniquely named, and has valid JSON schema;
@@ -930,8 +938,13 @@ Tests must prove:
   types, excessive nesting, and excessive properties;
 - the complete bound catalog respects the hard per-field/cardinality/aggregate
   metadata limits from Task 6;
-- schema and description digests contribute to bound identity;
-- build/schema drift fails session construction;
+- schema and description digests contribute to descriptor and rig topology
+  identity before persistence/restore;
+- static description/schema changes alter topology identity independently;
+- each concrete build is run-scoped to the invocation's originating session and
+  loop, including root, changed-active, and child-loop cases;
+- concrete build/schema/description drift from frozen metadata fails the review
+  before inference;
 - typed nil tools fail; and
 - tool-less definitions do not build a toolset;
 - a registered permission classifier must declare a non-empty evidence-tool
@@ -941,9 +954,15 @@ Tests must prove:
 
 **Step 3: Extend Hustle bindings narrowly**
 
-Add only the workspace/read collaborators needed to build evidence tools.
-Never pass the session, gate registrar, loop controller, rule writer, grant
-issuer, or delegate controller.
+Add `tool.RequiresWorkspaceRead`, a sealed evidence-definition constructor with
+frozen `ToolInfo`, and `tool.ReadWorkspaceBinding` containing only the canonical
+root. `hustle.Definition.Bind` freezes configuration and model resolution but
+does not build evidence tools. The sealed bound definition exposes a
+run-scoped evidence bind method that requires the originating session/loop and
+read-only workspace binding, builds concrete tools, and compares them to frozen
+metadata. Never pass `tool.WorkspaceBinding`, session, gate registrar, loop
+controller, rule writer, grant issuer, observations, extra tools, or delegate
+controller.
 
 **Step 4: Run GREEN**
 
@@ -974,6 +993,11 @@ git commit -m "feat(hustle): bind fingerprinted evidence tools"
 Mutate one field at a time: tool policy revision, produced tool name, schema
 digest, each loop bound, review policy revision, and classifier order. Every
 mutation must alter topology/config identity.
+
+Use explicit versioned domain labels for evidence definition, produced-name,
+bound-tool, classifier, and rig projections. Add drift guards so changing or
+removing a domain/version changes identity and unlabelled raw hashes cannot be
+substituted.
 
 **Step 2: Verify RED**
 
@@ -1070,6 +1094,11 @@ Use real tiny prepared tools to prove:
 - prepared artifact is delivered to the tool;
 - result content is paired and byte bounded; and
 - panic becomes a bounded internal failure.
+
+Build the bound evidence catalog at the start of each invocation using
+`request.Cause` session/loop identity and a read-only workspace binding.
+Changed-active and child-loop invocations must reach factories with their own
+originating loop, never the session construction loop.
 
 **Step 2: Verify RED**
 
