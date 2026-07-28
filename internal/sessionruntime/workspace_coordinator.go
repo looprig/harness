@@ -2,7 +2,9 @@ package sessionruntime
 
 import (
 	"context"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/looprig/harness/pkg/tool"
@@ -12,23 +14,19 @@ import (
 // coordinator (design §"Native checkpoint boundary and workspace gate" and
 // §"File-tool optimistic concurrency and binding"). ONE workspaceCoordinator is
 // shared by every primer and delegate loop in a session; it hands out mutation
-// permits that realize the exclusion model:
+// permits and background-process lifetime leases that realize the exclusion model:
 //
 //   - A PathMutation permit is SHARED across DIFFERENT canonical paths (many run
-//     concurrently) but EXCLUSIVE on the SAME canonical path (cross-loop per-path
-//     serialization — a loop's private observation map only serializes WITHIN a
-//     loop, so the coordinator's path permit is what serializes the same real file
-//     across loops).
+//     concurrently) but EXCLUSIVE against overlapping canonical path/tree scopes.
 //   - A WholeMutation permit (Bash and other unknown-path mutators) is EXCLUSIVE
-//     against every PathMutation and every other exclusive permit.
-//   - A Checkpoint permit is the exclusive snapshot/restore gate — semantically
-//     identical exclusion to WholeMutation, distinguished only so a checkpoint actor
-//     names its intent (the boundary Task 15 consumes).
+//     against every mutation and writable lifetime lease.
+//   - A Checkpoint permit is the snapshot/restore gate. It excludes mutations and
+//     writable lifetime leases while remaining compatible with read-only lifetimes.
+//   - A scoped lifetime writer excludes overlapping path/scoped writers, while a
+//     broad lifetime writer excludes every mutating operation.
 //
-// FAIRNESS / STARVATION-FREEDOM: once an exclusive acquirer is waiting, NEW shared
-// acquirers queue behind it (writer preference) — the wake scan stops at the first
-// exclusive waiter, so no unbounded stream of path mutations can starve a pending
-// checkpoint or Bash.
+// FAIRNESS / STARVATION-FREEDOM: a newer waiter never jumps ahead of an older
+// conflicting writer. Disjoint scoped operations may proceed concurrently.
 //
 // CANCELLATION: Acquire is ctx-aware. A ctx that is done before or during the wait
 // returns a typed *AcquireCanceledError and removes the waiter from the queue (or, if
@@ -42,13 +40,18 @@ type LeaseHealth interface {
 	Healthy() error
 }
 
-// permitClass is the coordinator's internal exclusion class. PathMutation maps to
-// classShared; WholeMutation and Checkpoint both map to classExclusive.
+// permitClass is the coordinator's internal exclusion class. The public
+// WorkspaceOperation values remain unchanged; lifetime classes are a separate
+// capability and never overload an operation value.
 type permitClass uint8
 
 const (
-	classShared    permitClass = iota // a path mutation: shared session mode, per-path exclusive
-	classExclusive                    // whole-workspace / checkpoint: exclusive against all
+	classPathMutation permitClass = iota
+	classWholeMutation
+	classCheckpoint
+	classLifetimeRead
+	classLifetimeScopedWrite
+	classLifetimeBroadWrite
 )
 
 // waiter is one queued Acquire. ready is closed exactly once, under the coordinator
@@ -57,7 +60,7 @@ const (
 // a data race.
 type waiter struct {
 	class   permitClass
-	path    string
+	scopes  []string
 	ready   chan struct{}
 	granted bool
 }
@@ -69,16 +72,16 @@ type workspaceCoordinator struct {
 	health LeaseHealth
 
 	mu          sync.Mutex
-	sharedCount int                 // active PathMutation permits (all paths)
-	heldPaths   map[string]struct{} // canonical paths currently held by an active shared permit
-	exclusive   bool                // an exclusive permit is currently held
-	queue       []*waiter           // FIFO of ungranted acquirers
+	sharedCount int                  // active PathMutation permits (all paths)
+	exclusive   bool                 // an active whole/checkpoint permit
+	active      map[*waiter]struct{} // every active mutation/lifetime permit
+	queue       []*waiter            // FIFO of ungranted acquirers
 }
 
 // newWorkspaceCoordinator returns a session-scoped coordinator whose Healthy
 // delegates to health (nil ⇒ always healthy).
 func newWorkspaceCoordinator(health LeaseHealth) *workspaceCoordinator {
-	return &workspaceCoordinator{health: health, heldPaths: make(map[string]struct{})}
+	return &workspaceCoordinator{health: health, active: make(map[*waiter]struct{})}
 }
 
 // Acquire blocks until the requested permit is granted or ctx is done. A done ctx
@@ -89,11 +92,38 @@ func (c *workspaceCoordinator) Acquire(ctx context.Context, operation tool.Works
 	if err != nil {
 		return nil, err
 	}
+	scopes := []string(nil)
+	if class == classPathMutation {
+		scopes = []string{canonicalPath}
+	}
+	return c.acquire(ctx, &waiter{
+		class:  class,
+		scopes: scopes,
+		ready:  make(chan struct{}),
+	})
+}
+
+// AcquireLifetime reserves a prepared process's authoritative workspace access
+// until the returned permit is released. Read-only leases coexist with every
+// operation. Scoped and broad writes participate in the same FIFO conflict
+// queue as structured mutations and checkpoints.
+func (c *workspaceCoordinator) AcquireLifetime(ctx context.Context, access tool.WorkspaceAccess) (tool.WorkspacePermit, error) {
+	class, scopes, err := classifyLifetimeAccess(access)
+	if err != nil {
+		return nil, err
+	}
+	return c.acquire(ctx, &waiter{
+		class:  class,
+		scopes: scopes,
+		ready:  make(chan struct{}),
+	})
+}
+
+func (c *workspaceCoordinator) acquire(ctx context.Context, w *waiter) (tool.WorkspacePermit, error) {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, &AcquireCanceledError{Cause: ctxErr}
 	}
 
-	w := &waiter{class: class, path: canonicalPath, ready: make(chan struct{})}
 	c.mu.Lock()
 	c.queue = append(c.queue, w)
 	c.wakeLocked()
@@ -129,41 +159,47 @@ func (c *workspaceCoordinator) Healthy() error {
 	return c.health.Healthy()
 }
 
-// wakeLocked grants every currently-grantable waiter from the front of the queue.
-// It is the SOLE grant point, called under mu after every enqueue and every release.
+// wakeLocked grants every currently-grantable waiter. It is the SOLE grant
+// point, called under mu after every enqueue, cancellation, and release.
 //
-// Writer preference (starvation-freedom): the scan stops at the first exclusive
-// waiter — either granting it (when it is at head-of-line and no permit is active) or
-// returning — so nothing behind an exclusive waiter is granted, and no new shared
-// acquirer (appended at the back) can jump ahead of a pending exclusive.
-//
-// Different-path concurrency: a shared waiter whose path is currently held is SKIPPED
-// (i++), letting a later different-path shared waiter proceed; the skipped waiter is
-// granted by a later wake when its path frees (it remains the earliest waiter for
-// that path, so it is never starved).
+// FIFO writer preference is conflict-aware: a waiter cannot jump ahead of an
+// older queued waiter it conflicts with. Disjoint path/scoped writers may still
+// proceed, and read-only lifetime leases may coexist with a queued or active
+// checkpoint because they cannot mutate the snapshot.
 func (c *workspaceCoordinator) wakeLocked() {
 	i := 0
 	for i < len(c.queue) {
 		w := c.queue[i]
-		if w.class == classExclusive {
-			if i == 0 && c.sharedCount == 0 && !c.exclusive {
-				c.exclusive = true
-				c.grantLocked(0, w)
-				// exclusive is now held, so nothing else can be granted this pass.
-				return
-			}
-			return
-		}
-		if c.exclusive {
-			return
-		}
-		if _, busy := c.heldPaths[w.path]; busy {
+		if !c.grantableLocked(i, w) {
 			i++
 			continue
 		}
-		c.heldPaths[w.path] = struct{}{}
-		c.sharedCount++
+		c.activateLocked(w)
 		c.grantLocked(i, w)
+	}
+}
+
+func (c *workspaceCoordinator) grantableLocked(index int, candidate *waiter) bool {
+	for active := range c.active {
+		if waitersConflict(active, candidate) {
+			return false
+		}
+	}
+	for i := 0; i < index; i++ {
+		if waitersConflict(c.queue[i], candidate) {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *workspaceCoordinator) activateLocked(w *waiter) {
+	c.active[w] = struct{}{}
+	switch w.class {
+	case classPathMutation:
+		c.sharedCount++
+	case classWholeMutation, classCheckpoint:
+		c.exclusive = true
 	}
 }
 
@@ -178,14 +214,14 @@ func (c *workspaceCoordinator) grantLocked(index int, w *waiter) {
 // releaseLocked returns a granted permit's resources and re-runs the wake scan. The
 // caller holds mu. It is idempotent at the permit boundary via grantedPermit's Once.
 func (c *workspaceCoordinator) releaseLocked(w *waiter) {
+	delete(c.active, w)
 	switch w.class {
-	case classExclusive:
+	case classWholeMutation, classCheckpoint:
 		c.exclusive = false
-	case classShared:
+	case classPathMutation:
 		if c.sharedCount > 0 {
 			c.sharedCount--
 		}
-		delete(c.heldPaths, w.path)
 	}
 	c.wakeLocked()
 }
@@ -227,15 +263,115 @@ func classifyOperation(operation tool.WorkspaceOperation, path string) (permitCl
 		if path == "" {
 			return 0, &WorkspacePathError{Operation: operation, Reason: "a path mutation requires a non-empty canonical path"}
 		}
-		return classShared, nil
-	case tool.WorkspaceOperationWholeMutation, tool.WorkspaceOperationCheckpoint:
+		return classPathMutation, nil
+	case tool.WorkspaceOperationWholeMutation:
 		if path != "" {
 			return 0, &WorkspacePathError{Operation: operation, Reason: "a whole-workspace operation requires an empty canonical path"}
 		}
-		return classExclusive, nil
+		return classWholeMutation, nil
+	case tool.WorkspaceOperationCheckpoint:
+		if path != "" {
+			return 0, &WorkspacePathError{Operation: operation, Reason: "a whole-workspace operation requires an empty canonical path"}
+		}
+		return classCheckpoint, nil
 	default:
 		return 0, &InvalidWorkspaceOperationError{Operation: operation}
 	}
+}
+
+func classifyLifetimeAccess(access tool.WorkspaceAccess) (permitClass, []string, error) {
+	writePaths := access.WritePaths()
+	writeTrees := access.WriteTrees()
+	switch access.Kind {
+	case tool.WorkspaceAccessReadOnly:
+		if len(writePaths) != 0 || len(writeTrees) != 0 {
+			return 0, nil, &WorkspaceLifetimeAccessError{
+				Kind:   access.Kind,
+				Reason: "read-only access must not declare write scopes",
+			}
+		}
+		return classLifetimeRead, nil, nil
+	case tool.WorkspaceAccessBroadWrite:
+		if len(writePaths) != 0 || len(writeTrees) != 0 {
+			return 0, nil, &WorkspaceLifetimeAccessError{
+				Kind:   access.Kind,
+				Reason: "broad-write access must not declare scoped paths",
+			}
+		}
+		return classLifetimeBroadWrite, nil, nil
+	case tool.WorkspaceAccessScopedWrite:
+		if len(writePaths)+len(writeTrees) == 0 {
+			return 0, nil, &WorkspaceLifetimeAccessError{
+				Kind:   access.Kind,
+				Reason: "scoped-write access requires at least one write scope",
+			}
+		}
+	default:
+		return 0, nil, &WorkspaceLifetimeAccessError{
+			Kind:   access.Kind,
+			Reason: "unrecognized workspace access kind",
+		}
+	}
+
+	scopes := make([]string, 0, len(writePaths)+len(writeTrees))
+	for _, scope := range writePaths {
+		if err := validateLifetimeScope(scope); err != nil {
+			return 0, nil, err
+		}
+		scopes = append(scopes, scope)
+	}
+	for _, scope := range writeTrees {
+		if err := validateLifetimeScope(scope); err != nil {
+			return 0, nil, err
+		}
+		scopes = append(scopes, scope)
+	}
+	return classLifetimeScopedWrite, scopes, nil
+}
+
+func validateLifetimeScope(scope string) error {
+	if scope == "" || !filepath.IsAbs(scope) || filepath.Clean(scope) != scope {
+		return &WorkspaceLifetimeAccessError{
+			Kind:   tool.WorkspaceAccessScopedWrite,
+			Reason: "write scopes must be absolute canonical paths",
+		}
+	}
+	return nil
+}
+
+func waitersConflict(left, right *waiter) bool {
+	if left.class == classLifetimeRead || right.class == classLifetimeRead {
+		return false
+	}
+	if globalWorkspaceWriter(left.class) || globalWorkspaceWriter(right.class) {
+		return true
+	}
+	for _, leftScope := range left.scopes {
+		for _, rightScope := range right.scopes {
+			if workspaceScopesOverlap(leftScope, rightScope) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func globalWorkspaceWriter(class permitClass) bool {
+	switch class {
+	case classWholeMutation, classCheckpoint, classLifetimeBroadWrite:
+		return true
+	default:
+		return false
+	}
+}
+
+func workspaceScopesOverlap(left, right string) bool {
+	relative, err := filepath.Rel(left, right)
+	if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return true
+	}
+	relative, err = filepath.Rel(right, left)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 // AcquireCanceledError reports that an Acquire returned because its ctx was done
@@ -269,4 +405,16 @@ func (e *WorkspacePathError) Error() string {
 	return "sessionruntime: invalid workspace permit path: " + e.Reason
 }
 
+// WorkspaceLifetimeAccessError reports an invalid authoritative access summary.
+// Invalid and non-canonical scope sets fail secure without enqueuing a waiter.
+type WorkspaceLifetimeAccessError struct {
+	Kind   tool.WorkspaceAccessKind
+	Reason string
+}
+
+func (e *WorkspaceLifetimeAccessError) Error() string {
+	return "sessionruntime: invalid workspace lifetime access: " + e.Reason
+}
+
 var _ tool.WorkspaceCoordinator = (*workspaceCoordinator)(nil)
+var _ tool.WorkspaceLifetimeCoordinator = (*workspaceCoordinator)(nil)

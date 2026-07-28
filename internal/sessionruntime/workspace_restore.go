@@ -42,9 +42,11 @@ func (s *Session) RestoreWorkspace(ctx context.Context, ref workspacestore.Ref) 
 	if err := s.restoreAdmissible(); err != nil {
 		return err
 	}
-	// Exclusive restore permit: drains active managed mutations and blocks new ones, so the
-	// swap sees no cooperative writer. It is the control-plane, idle-time exclusion the
-	// design mandates; the caller invokes it while idle.
+	// Exclusive restore permit: drains active managed mutations and writable
+	// background-process lifetime leases, then blocks new ones, so the swap sees no
+	// cooperative writer. Read-only lifetime leases remain compatible with the
+	// snapshot. It is the control-plane, idle-time exclusion the design mandates;
+	// the caller invokes it while idle.
 	permit, err := s.wsCoordinator.Acquire(ctx, tool.WorkspaceOperationCheckpoint, "")
 	if err != nil {
 		return &WorkspaceRestoreError{Kind: WorkspaceRestorePermitFailed, Cause: err}

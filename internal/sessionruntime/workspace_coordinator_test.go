@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"testing"
@@ -52,6 +53,147 @@ func mustAcquire(t *testing.T, c *workspaceCoordinator, op tool.WorkspaceOperati
 		t.Fatalf("Acquire(%v, %q) error = %v", op, path, err)
 	}
 	return p
+}
+
+func mustAcquireLifetime(t *testing.T, c *workspaceCoordinator, access tool.WorkspaceAccess) tool.WorkspacePermit {
+	t.Helper()
+	p, err := c.AcquireLifetime(context.Background(), access)
+	if err != nil {
+		t.Fatalf("AcquireLifetime(%v) error = %v", access.Kind, err)
+	}
+	return p
+}
+
+type workspacePermitResult struct {
+	permit tool.WorkspacePermit
+	err    error
+}
+
+func acquireAsync(c *workspaceCoordinator, op tool.WorkspaceOperation, path string) <-chan workspacePermitResult {
+	result := make(chan workspacePermitResult, 1)
+	go func() {
+		permit, err := c.Acquire(context.Background(), op, path)
+		result <- workspacePermitResult{permit: permit, err: err}
+	}()
+	return result
+}
+
+func acquireLifetimeAsync(c *workspaceCoordinator, access tool.WorkspaceAccess) <-chan workspacePermitResult {
+	result := make(chan workspacePermitResult, 1)
+	go func() {
+		permit, err := c.AcquireLifetime(context.Background(), access)
+		result <- workspacePermitResult{permit: permit, err: err}
+	}()
+	return result
+}
+
+func mustReceivePermit(t *testing.T, result <-chan workspacePermitResult) tool.WorkspacePermit {
+	t.Helper()
+	got := <-result
+	if got.err != nil {
+		t.Fatalf("workspace permit acquisition error = %v", got.err)
+	}
+	if got.permit == nil {
+		t.Fatal("workspace permit acquisition returned nil permit without error")
+	}
+	return got.permit
+}
+
+func lifetimeWorkspacePath(elements ...string) string {
+	root := string(filepath.Separator)
+	if runtime.GOOS == "windows" {
+		root = `C:\`
+	}
+	parts := append([]string{root, "ws"}, elements...)
+	return filepath.Join(parts...)
+}
+
+func TestWorkspaceCoordinatorLifetimeAcquireValidation(t *testing.T) {
+	t.Parallel()
+	canonical := lifetimeWorkspacePath("a")
+	nonCanonical := canonical + string(filepath.Separator) + ".."
+	tests := []struct {
+		name    string
+		access  tool.WorkspaceAccess
+		wantErr bool
+	}{
+		{
+			name:   "read only",
+			access: tool.NewWorkspaceAccess(tool.WorkspaceAccessReadOnly, nil, nil),
+		},
+		{
+			name:   "scoped path",
+			access: tool.NewWorkspaceAccess(tool.WorkspaceAccessScopedWrite, []string{canonical}, nil),
+		},
+		{
+			name:   "scoped tree",
+			access: tool.NewWorkspaceAccess(tool.WorkspaceAccessScopedWrite, nil, []string{canonical}),
+		},
+		{
+			name:   "broad write",
+			access: tool.NewWorkspaceAccess(tool.WorkspaceAccessBroadWrite, nil, nil),
+		},
+		{
+			name:    "invalid kind",
+			access:  tool.NewWorkspaceAccess(tool.WorkspaceAccessKind(0), nil, nil),
+			wantErr: true,
+		},
+		{
+			name:    "read only with scope",
+			access:  tool.NewWorkspaceAccess(tool.WorkspaceAccessReadOnly, []string{canonical}, nil),
+			wantErr: true,
+		},
+		{
+			name:    "broad write with scope",
+			access:  tool.NewWorkspaceAccess(tool.WorkspaceAccessBroadWrite, nil, []string{canonical}),
+			wantErr: true,
+		},
+		{
+			name:    "scoped write empty",
+			access:  tool.NewWorkspaceAccess(tool.WorkspaceAccessScopedWrite, nil, nil),
+			wantErr: true,
+		},
+		{
+			name:    "relative scope",
+			access:  tool.NewWorkspaceAccess(tool.WorkspaceAccessScopedWrite, []string{filepath.Join("ws", "a")}, nil),
+			wantErr: true,
+		},
+		{
+			name:    "non canonical path",
+			access:  tool.NewWorkspaceAccess(tool.WorkspaceAccessScopedWrite, []string{nonCanonical}, nil),
+			wantErr: true,
+		},
+		{
+			name:    "non canonical tree",
+			access:  tool.NewWorkspaceAccess(tool.WorkspaceAccessScopedWrite, nil, []string{nonCanonical}),
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := newWorkspaceCoordinator(nil)
+			permit, err := c.AcquireLifetime(context.Background(), tt.access)
+			if tt.wantErr {
+				if permit != nil {
+					t.Fatal("AcquireLifetime returned permit with invalid access")
+				}
+				var accessErr *WorkspaceLifetimeAccessError
+				if !errors.As(err, &accessErr) {
+					t.Fatalf("AcquireLifetime error = %T, want *WorkspaceLifetimeAccessError", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("AcquireLifetime error = %v", err)
+			}
+			if permit == nil {
+				t.Fatal("AcquireLifetime returned nil permit without error")
+			}
+			permit.Release()
+		})
+	}
 }
 
 func TestWorkspaceCoordinatorAcquireValidation(t *testing.T) {
@@ -420,4 +562,216 @@ func TestWorkspaceCoordinatorConcurrentStress(t *testing.T) {
 	if shared, exclusive := c.counts(); shared != 0 || exclusive || c.queued() != 0 {
 		t.Fatalf("after stress counts = (shared %d, exclusive %v, queued %d), want all zero/false", shared, exclusive, c.queued())
 	}
+}
+
+func TestWorkspaceCoordinatorReadLifetimeConcurrentWithPathMutation(t *testing.T) {
+	t.Parallel()
+	c := newWorkspaceCoordinator(nil)
+	lifetime := mustAcquireLifetime(t, c, tool.NewWorkspaceAccess(tool.WorkspaceAccessReadOnly, nil, nil))
+	mutation := mustAcquire(t, c, tool.WorkspaceOperationPathMutation, "/ws/a")
+	mutation.Release()
+	lifetime.Release()
+}
+
+func TestWorkspaceCoordinatorReadLifetimeConcurrentWithCheckpoint(t *testing.T) {
+	t.Parallel()
+	c := newWorkspaceCoordinator(nil)
+	lifetime := mustAcquireLifetime(t, c, tool.NewWorkspaceAccess(tool.WorkspaceAccessReadOnly, nil, nil))
+	checkpoint := mustAcquire(t, c, tool.WorkspaceOperationCheckpoint, "")
+	checkpoint.Release()
+	lifetime.Release()
+}
+
+func TestWorkspaceCoordinatorScopedLifetimeTreeBlocksDescendantMutation(t *testing.T) {
+	t.Parallel()
+	c := newWorkspaceCoordinator(nil)
+	lifetime := mustAcquireLifetime(t, c, tool.NewWorkspaceAccess(
+		tool.WorkspaceAccessScopedWrite,
+		nil,
+		[]string{lifetimeWorkspacePath("a")},
+	))
+	granted := acquireAsync(c, tool.WorkspaceOperationPathMutation, lifetimeWorkspacePath("a", "file"))
+	awaitQueued(t, c, 1)
+	select {
+	case result := <-granted:
+		t.Fatalf("descendant mutation completed while scoped lifetime tree was held: %v", result.err)
+	default:
+	}
+	lifetime.Release()
+	mustReceivePermit(t, granted).Release()
+}
+
+func TestWorkspaceCoordinatorScopedLifetimePathBlocksAncestorMutation(t *testing.T) {
+	t.Parallel()
+	c := newWorkspaceCoordinator(nil)
+	lifetime := mustAcquireLifetime(t, c, tool.NewWorkspaceAccess(
+		tool.WorkspaceAccessScopedWrite,
+		[]string{lifetimeWorkspacePath("a", "file")},
+		nil,
+	))
+	granted := acquireAsync(c, tool.WorkspaceOperationPathMutation, lifetimeWorkspacePath("a"))
+	awaitQueued(t, c, 1)
+	select {
+	case result := <-granted:
+		t.Fatalf("ancestor mutation completed while scoped lifetime path was held: %v", result.err)
+	default:
+	}
+	lifetime.Release()
+	mustReceivePermit(t, granted).Release()
+}
+
+func TestWorkspaceCoordinatorScopedLifetimeDisjointMutationConcurrent(t *testing.T) {
+	t.Parallel()
+	c := newWorkspaceCoordinator(nil)
+	lifetime := mustAcquireLifetime(t, c, tool.NewWorkspaceAccess(
+		tool.WorkspaceAccessScopedWrite,
+		nil,
+		[]string{lifetimeWorkspacePath("a")},
+	))
+	mutation := mustAcquire(t, c, tool.WorkspaceOperationPathMutation, lifetimeWorkspacePath("b"))
+	mutation.Release()
+	lifetime.Release()
+}
+
+func TestWorkspaceCoordinatorBroadLifetimeBlocksEveryMutation(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		op   tool.WorkspaceOperation
+		path string
+	}{
+		{name: "path", op: tool.WorkspaceOperationPathMutation, path: lifetimeWorkspacePath("a")},
+		{name: "whole", op: tool.WorkspaceOperationWholeMutation},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := newWorkspaceCoordinator(nil)
+			lifetime := mustAcquireLifetime(t, c, tool.NewWorkspaceAccess(tool.WorkspaceAccessBroadWrite, nil, nil))
+			granted := acquireAsync(c, tt.op, tt.path)
+			awaitQueued(t, c, 1)
+			select {
+			case result := <-granted:
+				t.Fatalf("%s mutation completed while broad lifetime lease was held: %v", tt.name, result.err)
+			default:
+			}
+			lifetime.Release()
+			mustReceivePermit(t, granted).Release()
+		})
+	}
+}
+
+func TestWorkspaceCoordinatorWritableLifetimeBlocksCheckpoint(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		access tool.WorkspaceAccess
+	}{
+		{
+			name: "scoped",
+			access: tool.NewWorkspaceAccess(
+				tool.WorkspaceAccessScopedWrite,
+				nil,
+				[]string{lifetimeWorkspacePath("a")},
+			),
+		},
+		{
+			name:   "broad",
+			access: tool.NewWorkspaceAccess(tool.WorkspaceAccessBroadWrite, nil, nil),
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := newWorkspaceCoordinator(nil)
+			lifetime := mustAcquireLifetime(t, c, tt.access)
+			granted := acquireAsync(c, tool.WorkspaceOperationCheckpoint, "")
+			awaitQueued(t, c, 1)
+			select {
+			case result := <-granted:
+				t.Fatalf("checkpoint completed while writable lifetime lease was held: %v", result.err)
+			default:
+			}
+			lifetime.Release()
+			mustReceivePermit(t, granted).Release()
+		})
+	}
+}
+
+func TestWorkspaceCoordinatorWaitingCheckpointBeatsNewerWritableLifetime(t *testing.T) {
+	t.Parallel()
+	c := newWorkspaceCoordinator(nil)
+	active := mustAcquireLifetime(t, c, tool.NewWorkspaceAccess(
+		tool.WorkspaceAccessScopedWrite,
+		nil,
+		[]string{lifetimeWorkspacePath("a")},
+	))
+
+	checkpointGrant := acquireAsync(c, tool.WorkspaceOperationCheckpoint, "")
+	awaitQueued(t, c, 1)
+
+	newerGrant := acquireLifetimeAsync(c, tool.NewWorkspaceAccess(
+		tool.WorkspaceAccessScopedWrite,
+		nil,
+		[]string{lifetimeWorkspacePath("b")},
+	))
+	awaitQueued(t, c, 2)
+
+	active.Release()
+	checkpoint := mustReceivePermit(t, checkpointGrant)
+	select {
+	case result := <-newerGrant:
+		t.Fatalf("newer writable lifetime lease completed ahead of waiting checkpoint: %v", result.err)
+	default:
+	}
+	checkpoint.Release()
+	mustReceivePermit(t, newerGrant).Release()
+}
+
+func TestWorkspaceCoordinatorCanceledLifetimeWaiterRemovedAndSuccessorWakes(t *testing.T) {
+	t.Parallel()
+	c := newWorkspaceCoordinator(nil)
+	active := mustAcquireLifetime(t, c, tool.NewWorkspaceAccess(
+		tool.WorkspaceAccessScopedWrite,
+		nil,
+		[]string{lifetimeWorkspacePath("a")},
+	))
+
+	checkpointCtx, cancelCheckpoint := context.WithCancel(context.Background())
+	checkpointErr := make(chan error, 1)
+	go func() {
+		_, err := c.Acquire(checkpointCtx, tool.WorkspaceOperationCheckpoint, "")
+		checkpointErr <- err
+	}()
+	awaitQueued(t, c, 1)
+
+	successorGrant := acquireLifetimeAsync(c, tool.NewWorkspaceAccess(
+		tool.WorkspaceAccessScopedWrite,
+		nil,
+		[]string{lifetimeWorkspacePath("b")},
+	))
+	awaitQueued(t, c, 2)
+
+	cancelCheckpoint()
+	var canceled *AcquireCanceledError
+	if err := <-checkpointErr; !errors.As(err, &canceled) {
+		t.Fatalf("checkpoint Acquire error = %T, want *AcquireCanceledError", err)
+	}
+	successor := mustReceivePermit(t, successorGrant)
+	awaitQueued(t, c, 0)
+	active.Release()
+	successor.Release()
+}
+
+func TestWorkspaceCoordinatorLifetimeReleaseIdempotent(t *testing.T) {
+	t.Parallel()
+	c := newWorkspaceCoordinator(nil)
+	lifetime := mustAcquireLifetime(t, c, tool.NewWorkspaceAccess(tool.WorkspaceAccessBroadWrite, nil, nil))
+	lifetime.Release()
+	lifetime.Release()
+
+	checkpoint := mustAcquire(t, c, tool.WorkspaceOperationCheckpoint, "")
+	checkpoint.Release()
 }

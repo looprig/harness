@@ -75,6 +75,15 @@ type WorkspaceCoordinator interface {
 	Healthy() error
 }
 
+// WorkspaceLifetimeCoordinator is the optional long-lived workspace
+// coordination capability implemented by a WorkspaceCoordinator that can
+// reserve a prepared process's authoritative access for its complete lifetime.
+// AcquireLifetime blocks until the access is compatible with every active
+// mutation and lifetime reservation, or ctx is done.
+type WorkspaceLifetimeCoordinator interface {
+	AcquireLifetime(ctx context.Context, access WorkspaceAccess) (WorkspacePermit, error)
+}
+
 // FileObservation is the private concurrency token standard file tools keep for one
 // canonical path. It never appears in model output, events, or audit summaries.
 type FileObservation struct {
