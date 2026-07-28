@@ -66,10 +66,13 @@ func (nopGateRegistrar) CloseGate(context.Context, gatedomain.ID, gatedomain.Clo
 type gateRegistration struct {
 	gate    gatedomain.Gate
 	payload gatedomain.Payload
-	callID  uuid.UUID
-	reply   chan<- command.Command
-	kind    gateKind
-	ack     chan<- gateInstallAck
+	// reviewContext is a live-only defensive clone for permission review. The
+	// actor never copies it into gate payloads, events, or journal records.
+	reviewContext gatedomain.ReviewContext
+	callID        uuid.UUID
+	reply         chan<- command.Command
+	kind          gateKind
+	ack           chan<- gateInstallAck
 }
 
 type gateInstallAck struct {

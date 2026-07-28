@@ -417,9 +417,13 @@ func approvalRequesterFor(
 		ack := make(chan gateInstallAck, 1)
 		g := stampGateSubjectProvenance(ctx, permissionGate(r.callID, displayed))
 		payload := gatedomain.PermissionPayload{Request: displayed}
+		reviewContext, _ := permissionReviewContextFromContext(ctx)
 
 		select {
-		case gateReg <- gateRegistration{gate: g, payload: payload, callID: r.callID, reply: reply, kind: gatePermission, ack: ack}:
+		case gateReg <- gateRegistration{
+			gate: g, payload: payload, reviewContext: reviewContext.Clone(),
+			callID: r.callID, reply: reply, kind: gatePermission, ack: ack,
+		}:
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}

@@ -48,6 +48,11 @@ type turnState struct {
 
 	toolIterations int
 	toolCalls      int
+
+	// derivedUserPrefix counts the leading messages in msgs that were generated
+	// by context replacement rather than authored by a human. They remain useful
+	// review evidence but can never establish user authority.
+	derivedUserPrefix int
 }
 
 // newTurnState builds a fresh turnState with its identity (copied from the loop)
@@ -140,6 +145,11 @@ type turnConfig struct {
 
 	// afterContextReplacement is the test-only peer of runtimeConfig's seam.
 	afterContextReplacement func()
+
+	// reviewContext enables live-only permission-review capture for this turn.
+	// Nil preserves the ordinary loop path. A non-nil invalid configuration
+	// fails the tool step before access evaluation.
+	reviewContext *reviewContextConfiguration
 }
 
 // turnCommit is one commit request: the finalized step group to append to
@@ -219,7 +229,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 	if cfg.admit == nil {
 		cfg.admit = func(context.Context) (func(), error) { return func() {}, nil }
 	}
-	identity := turnIdentity{sessionID: ts.sessionID, loopID: ts.loopID, turnID: ts.id}
+	turnIDs := turnIdentity{sessionID: ts.sessionID, loopID: ts.loopID, turnID: ts.id}
 	defs := toolDefs(ctx, cfg.tools.Registry)
 	outputPlan, err := resolveTurnOutput(cfg.model, cfg.output, defs)
 	if err != nil {
@@ -268,7 +278,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		if err != nil {
 			slog.Error("step id generation failed; stamping StepDone with zero StepID", "error", err)
 		}
-		st := newStepState(identity.sessionID, identity.loopID, identity.turnID, stepID, stepIdx)
+		st := newStepState(turnIDs.sessionID, turnIDs.loopID, turnIDs.turnID, stepID, stepIdx)
 
 		releaseAdmission := cfg.firstAdmission
 		cfg.firstAdmission = nil
@@ -393,10 +403,35 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// three ids are unambiguously the running step's (st.id is this step's id),
 		// so we wrap once at the batch boundary rather than per-tool in the runner.
 		batchCtx := WithProvenance(ctx, Provenance{
-			LoopID: identity.loopID,
-			TurnID: identity.turnID,
+			LoopID: turnIDs.loopID,
+			TurnID: turnIDs.turnID,
 			StepID: st.id,
 		})
+		if cfg.reviewContext != nil {
+			derivedPrefix := ts.derivedUserPrefix
+			if derivedPrefix < 0 || derivedPrefix > len(ts.msgs) {
+				return event.TurnFailed{TurnIndex: ts.index, Err: &reviewContextCaptureError{Field: "derived_context"}}
+			}
+			review, reviewErr := capturePermissionReviewContext(reviewContextCapture{
+				Coordinates: identity.Coordinates{
+					SessionID: turnIDs.sessionID,
+					LoopID:    turnIDs.loopID,
+					TurnID:    turnIDs.turnID,
+					StepID:    st.id,
+				},
+				Base:        cfg.base,
+				Retained:    ts.msgs[:derivedPrefix],
+				Staged:      ts.msgs[derivedPrefix:],
+				Active:      aiMsg,
+				RuntimeTail: runtimeTail,
+				Metadata:    cfg.reviewContext.Metadata,
+				Policy:      cfg.reviewContext.Policy,
+			})
+			if reviewErr != nil {
+				return event.TurnFailed{TurnIndex: ts.index, Err: reviewErr}
+			}
+			batchCtx = withPermissionReviewContext(batchCtx, review)
+		}
 		results := RunBatch(batchCtx, toolUses, cfg.tools, cfg.gateReg, cfg.idGen, stepEmit)
 		if ctx.Err() != nil {
 			// A cancelled batch's results are discarded; the step never completes, so

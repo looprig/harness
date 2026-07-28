@@ -85,4 +85,5 @@ type turnContextReplacement struct {
 func applyTurnContextReplacement(config *turnConfig, state *turnState, replacement turnContextReplacement) {
 	config.base = content.AgenticMessages{}
 	state.msgs = content.AgenticMessages{cloneUserMessage(replacement.Summary)}
+	state.derivedUserPrefix = 1
 }
