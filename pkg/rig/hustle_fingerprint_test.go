@@ -117,7 +117,13 @@ func rigEvidencePolicy(name string) hustle.EvidenceToolPolicy {
 			MaxResultBytes: 1024, MaxEvidenceBytes: 2048,
 		},
 		Definitions: []tool.Definition{
-			tool.NewDefinition("definition-"+name, tool.RequiresWorkspace, nil),
+			tool.NewEvidenceDefinition(
+				"definition-"+name, tool.RequiresWorkspaceRead,
+				[]tool.ToolInfo{{
+					Name: name, Desc: "Read " + name + " evidence",
+					Schema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+				}}, nil,
+			),
 		},
 	}
 }
@@ -192,10 +198,36 @@ func TestPermissionReviewTopologyFingerprintSensitivity(t *testing.T) {
 			}()), secondClassifier), policy: "review-policy-v1"},
 		{name: "produced tool metadata", set: rigPermissionClassifierSet(t,
 			defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("changed")), secondClassifier), policy: "review-policy-v1"},
+		{name: "static tool description", set: rigPermissionClassifierSet(t,
+			defineRigPermissionClassifier(t, "alpha", func() hustle.EvidenceToolPolicy {
+				value := baseEvidence.Clone()
+				value.Definitions[0] = tool.NewEvidenceDefinition(
+					"definition-status", tool.RequiresWorkspaceRead,
+					[]tool.ToolInfo{{
+						Name: "status", Desc: "Changed static evidence description",
+						Schema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+					}}, nil,
+				)
+				return value
+			}()), secondClassifier), policy: "review-policy-v1"},
+		{name: "static tool schema", set: rigPermissionClassifierSet(t,
+			defineRigPermissionClassifier(t, "alpha", func() hustle.EvidenceToolPolicy {
+				value := baseEvidence.Clone()
+				value.Definitions[0] = tool.NewEvidenceDefinition(
+					"definition-status", tool.RequiresWorkspaceRead,
+					[]tool.ToolInfo{{
+						Name: "status", Desc: "Read status evidence",
+						Schema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`),
+					}}, nil,
+				)
+				return value
+			}()), secondClassifier), policy: "review-policy-v1"},
 		{name: "definition requirements metadata", set: rigPermissionClassifierSet(t,
 			defineRigPermissionClassifier(t, "alpha", func() hustle.EvidenceToolPolicy {
 				value := baseEvidence.Clone()
-				value.Definitions[0] = tool.NewDefinition("definition-status", 0, nil)
+				value.Definitions[0] = tool.NewEvidenceDefinition(
+					"definition-status", 0, value.Definitions[0].ToolInfos(), nil,
+				)
 				return value
 			}()), secondClassifier), policy: "review-policy-v1"},
 		{name: "output schema digest", set: rigPermissionClassifierSet(t,
@@ -242,6 +274,24 @@ func TestPermissionReviewTopologyFingerprintSensitivity(t *testing.T) {
 				t.Fatalf("topology revision unchanged: %q", got)
 			}
 		})
+	}
+}
+
+func TestClassifierEvidenceProjectionDomainsAreVersioned(t *testing.T) {
+	t.Parallel()
+	for name, testCase := range map[string]struct{ got, want string }{
+		"hustle topology": {
+			hustleTopologyDigestDomain,
+			"looprig/rig/hustle-topology/v1",
+		},
+		"permission review": {
+			permissionReviewTopologyDigestDomain,
+			"looprig/rig/permission-review-topology/v1",
+		},
+	} {
+		if testCase.got != testCase.want {
+			t.Fatalf("%s domain = %q, want %q", name, testCase.got, testCase.want)
+		}
 	}
 }
 

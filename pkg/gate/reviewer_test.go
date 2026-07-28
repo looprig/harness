@@ -527,8 +527,12 @@ func permissionEvidencePolicy() hustle.EvidenceToolPolicy {
 			MaxRounds: 1, MaxCalls: 1, MaxCallsPerRound: 1,
 			MaxResultBytes: 1024, MaxEvidenceBytes: 1024,
 		},
-		Definitions: []tool.Definition{tool.NewDefinition(
+		Definitions: []tool.Definition{tool.NewEvidenceDefinition(
 			"permission-evidence", 0,
+			[]tool.ToolInfo{{
+				Name: "permission-evidence", Desc: "read permission evidence",
+				Schema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+			}},
 			func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 				return []tool.InvokableTool{&permissionEvidenceTool{}}, nil
 			},

@@ -15,6 +15,11 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 )
 
+const (
+	hustleTopologyDigestDomain           = "looprig/rig/hustle-topology/v1"
+	permissionReviewTopologyDigestDomain = "looprig/rig/permission-review-topology/v1"
+)
+
 // ConfigFingerprintFields are immutable rig-level behavior inputs that are not part
 // of a loop.Definition. Define freezes them for both session creation and restoration.
 type ConfigFingerprintFields struct {
@@ -355,8 +360,7 @@ func canonicalPermissionReviewMaterial(
 	baseTopologyRevision string,
 	review permissionReviewFingerprint,
 ) []byte {
-	const encodingDomain string = "looprig/rig/permission-review-topology/v1"
-	material := appendCanonicalString(nil, encodingDomain)
+	material := appendCanonicalString(nil, permissionReviewTopologyDigestDomain)
 	material = appendCanonicalString(material, baseTopologyRevision)
 	material = appendCanonicalString(material, review.reviewPolicyRevision)
 	material = binary.BigEndian.AppendUint64(material, uint64(len(review.classifiers)))
@@ -419,7 +423,6 @@ type hustleTopologyRow struct {
 }
 
 func canonicalHustleTopologyMaterial(legacyRevision string, rows []hustleTopologyRow, limits HustleLimits) []byte {
-	const encodingDomain string = "looprig/rig/hustle-topology/v1"
 	ordered := append([]hustleTopologyRow(nil), rows...)
 	sort.Slice(ordered, func(i, j int) bool {
 		if ordered[i].Name == ordered[j].Name {
@@ -427,7 +430,7 @@ func canonicalHustleTopologyMaterial(legacyRevision string, rows []hustleTopolog
 		}
 		return ordered[i].Name < ordered[j].Name
 	})
-	material := appendCanonicalString(nil, encodingDomain)
+	material := appendCanonicalString(nil, hustleTopologyDigestDomain)
 	material = appendCanonicalString(material, legacyRevision)
 	material = binary.BigEndian.AppendUint64(material, uint64(len(ordered)))
 	for _, row := range ordered {

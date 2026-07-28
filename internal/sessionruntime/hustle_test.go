@@ -269,7 +269,13 @@ func sessionEvidenceDefinition(
 				MaxResultBytes: 1024, MaxEvidenceBytes: 1024,
 			},
 			Definitions: []tool.Definition{
-				tool.NewDefinition("workspace-status", tool.RequiresWorkspace, factory),
+				tool.NewEvidenceDefinition(
+					"workspace-status", tool.RequiresWorkspaceRead,
+					[]tool.ToolInfo{{
+						Name: "workspace-status", Desc: "read workspace status",
+						Schema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+					}}, factory,
+				),
 			},
 		}),
 	)
@@ -294,10 +300,10 @@ func TestSessionBindsEvidenceToolsWithOriginAndAttenuatedWorkspace(t *testing.T)
 		if bindings.SessionID != sessionID || bindings.LoopID != loopID {
 			t.Fatalf("tool bindings IDs = %v/%v, want %v/%v", bindings.SessionID, bindings.LoopID, sessionID, loopID)
 		}
-		if bindings.Workspace == nil || bindings.Workspace.Root != workspaceRoot {
-			t.Fatalf("workspace binding = %#v", bindings.Workspace)
+		if bindings.ReadWorkspace == nil || bindings.ReadWorkspace.Root != workspaceRoot {
+			t.Fatalf("read workspace binding = %#v", bindings.ReadWorkspace)
 		}
-		if bindings.Delegate != nil || bindings.ExtraTools != nil {
+		if bindings.Workspace != nil || bindings.Delegate != nil || bindings.ExtraTools != nil {
 			t.Fatalf("evidence binding was not attenuated: %#v", bindings)
 		}
 		return []tool.InvokableTool{concrete}, nil

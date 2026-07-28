@@ -126,9 +126,99 @@ func validEvidenceToolPolicy() EvidenceToolPolicy {
 			MaxEvidenceBytes: 8192,
 		},
 		Definitions: []tool.Definition{
-			tool.NewDefinition("workspace-status", tool.RequiresWorkspace, nil),
-			tool.NewBundleDefinition("git-evidence", []string{"git-diff", "git-status"}, tool.RequiresWorkspace, nil),
+			testEvidenceDefinition("workspace-status", tool.RequiresWorkspaceRead, []string{"workspace-status"}, nil),
+			testEvidenceDefinition("git-evidence", tool.RequiresWorkspaceRead, []string{"git-diff", "git-status"}, nil),
 		},
+	}
+}
+
+func testEvidenceDefinition(name string, requirements tool.Requirements, names []string, factory tool.Factory) tool.Definition {
+	infos := make([]tool.ToolInfo, len(names))
+	for i, produced := range names {
+		infos[i] = tool.ToolInfo{
+			Name:   produced,
+			Desc:   "Read-only evidence for " + produced,
+			Schema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`),
+		}
+	}
+	return tool.NewEvidenceDefinition(name, requirements, infos, factory)
+}
+
+func TestEvidenceToolPolicyRejectsDefinitionsWithoutFrozenToolInfos(t *testing.T) {
+	t.Parallel()
+	policy := validEvidenceToolPolicy()
+	policy.Definitions[0] = tool.NewDefinition("workspace-status", 0, nil)
+	_, err := Define(append(validEvidenceOptionsWithoutPolicy(), WithEvidenceTools(policy))...)
+	if err == nil {
+		t.Fatal("Define() error = nil, want ordinary definition rejected")
+	}
+}
+
+func TestEvidenceToolCatalogIdentityIncludesStaticModelFacingMetadataAndLoopPolicy(t *testing.T) {
+	t.Parallel()
+	define := func(policy EvidenceToolPolicy) Definition {
+		definition, err := Define(append(validEvidenceOptionsWithoutPolicy(), WithEvidenceTools(policy))...)
+		if err != nil {
+			t.Fatalf("Define(): %v", err)
+		}
+		return definition
+	}
+	base := validEvidenceToolPolicy()
+	baseDefinition := define(base)
+	baseDescriptor := baseDefinition.Descriptor()
+
+	tests := []struct {
+		name   string
+		mutate func(*EvidenceToolPolicy)
+	}{
+		{name: "static description", mutate: func(policy *EvidenceToolPolicy) {
+			policy.Definitions[0] = tool.NewEvidenceDefinition(
+				"workspace-status", tool.RequiresWorkspaceRead,
+				[]tool.ToolInfo{{
+					Name: "workspace-status", Desc: "Different read-only evidence",
+					Schema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`),
+				}}, nil,
+			)
+		}},
+		{name: "static schema", mutate: func(policy *EvidenceToolPolicy) {
+			policy.Definitions[0] = tool.NewEvidenceDefinition(
+				"workspace-status", tool.RequiresWorkspaceRead,
+				[]tool.ToolInfo{{
+					Name: "workspace-status", Desc: "Read-only evidence for workspace-status",
+					Schema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"integer"}},"required":["path"],"additionalProperties":false}`),
+				}}, nil,
+			)
+		}},
+		{name: "loop limit", mutate: func(policy *EvidenceToolPolicy) { policy.Limits.MaxRounds++ }},
+	}
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			changed := base.Clone()
+			testCase.mutate(&changed)
+			got := define(changed)
+			if got.Descriptor().EvidenceToolDefinitionsSHA256 == baseDescriptor.EvidenceToolDefinitionsSHA256 {
+				t.Fatal("evidence definition catalog digest did not change")
+			}
+			if got.PolicyRevision() == baseDefinition.PolicyRevision() {
+				t.Fatal("hustle policy digest did not change")
+			}
+		})
+	}
+}
+
+func TestEvidenceIdentityDomainsAreVersioned(t *testing.T) {
+	t.Parallel()
+	for name, testCase := range map[string]struct{ got, want string }{
+		"policy":         {evidencePolicyDigestDomain, "looprig/hustle/evidence-policy/v1"},
+		"definitions":    {evidenceDefinitionCatalogDigestDomain, "looprig/hustle/evidence-definition-catalog/v1"},
+		"produced names": {evidenceProducedNamesDigestDomain, "looprig/hustle/evidence-produced-names/v1"},
+		"bound tool":     {boundEvidenceToolDigestDomain, "looprig/hustle/bound-evidence-tool/v1"},
+	} {
+		if testCase.got != testCase.want {
+			t.Fatalf("%s domain = %q, want %q", name, testCase.got, testCase.want)
+		}
 	}
 }
 
@@ -291,7 +381,7 @@ func TestEvidenceToolPolicyNameByteBoundaries(t *testing.T) {
 		wantErr        bool
 	}{
 		{name: "exact ASCII definition and produced name", definitionName: exactASCII, producedName: exactASCII},
-		{name: "exact UTF-8 bytes", definitionName: exactUTF8, producedName: exactUTF8},
+		{name: "nonportable UTF-8 tool name", definitionName: exactUTF8, producedName: exactUTF8, wantErr: true},
 		{name: "definition name one byte over", definitionName: overUTF8, producedName: "produced", wantErr: true},
 		{name: "produced name one byte over", definitionName: "definition", producedName: overUTF8, wantErr: true},
 	}
@@ -299,9 +389,9 @@ func TestEvidenceToolPolicyNameByteBoundaries(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 			policy := validEvidenceToolPolicy()
-			policy.Definitions = []tool.Definition{
-				tool.NewBundleDefinition(testCase.definitionName, []string{testCase.producedName}, tool.RequiresWorkspace, nil),
-			}
+			policy.Definitions = []tool.Definition{testEvidenceDefinition(
+				testCase.definitionName, tool.RequiresWorkspaceRead, []string{testCase.producedName}, nil,
+			)}
 			_, err := Define(append(validEvidenceOptionsWithoutPolicy(), WithEvidenceTools(policy))...)
 			if (err != nil) != testCase.wantErr {
 				t.Fatalf("Define() error = %v, wantErr %v", err, testCase.wantErr)
@@ -317,10 +407,10 @@ func evidenceDefinitions(definitionCount, producedPerDefinition int) []tool.Defi
 		for producedIndex := range producedPerDefinition {
 			produced[producedIndex] = fmt.Sprintf("tool-%03d-%03d", definitionIndex, producedIndex)
 		}
-		definitions[definitionIndex] = tool.NewBundleDefinition(
+		definitions[definitionIndex] = testEvidenceDefinition(
 			fmt.Sprintf("definition-%03d", definitionIndex),
+			tool.RequiresWorkspaceRead,
 			produced,
-			tool.RequiresWorkspace,
 			nil,
 		)
 	}
@@ -470,16 +560,16 @@ func TestEvidenceToolsDescriptorIsSecretFreeAndIdentityComplete(t *testing.T) {
 		{name: "result bytes", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxResultBytes++ }},
 		{name: "evidence bytes", mutate: func(p *EvidenceToolPolicy) { p.Limits.MaxEvidenceBytes++ }},
 		{name: "definition name", mutate: func(p *EvidenceToolPolicy) {
-			p.Definitions[0] = tool.NewDefinition("workspace-tree", tool.RequiresWorkspace, nil)
+			p.Definitions[0] = testEvidenceDefinition("workspace-tree", tool.RequiresWorkspaceRead, []string{"workspace-status"}, nil)
 		}},
 		{name: "definition requirements", mutate: func(p *EvidenceToolPolicy) {
-			p.Definitions[0] = tool.NewDefinition("workspace-status", 0, nil)
+			p.Definitions[0] = testEvidenceDefinition("workspace-status", 0, []string{"workspace-status"}, nil)
 		}},
 		{name: "produced name", mutate: func(p *EvidenceToolPolicy) {
-			p.Definitions[1] = tool.NewBundleDefinition("git-evidence", []string{"git-diff", "git-log"}, tool.RequiresWorkspace, nil)
+			p.Definitions[1] = testEvidenceDefinition("git-evidence", tool.RequiresWorkspaceRead, []string{"git-diff", "git-log"}, nil)
 		}},
 		{name: "produced name order", mutate: func(p *EvidenceToolPolicy) {
-			p.Definitions[1] = tool.NewBundleDefinition("git-evidence", []string{"git-status", "git-diff"}, tool.RequiresWorkspace, nil)
+			p.Definitions[1] = testEvidenceDefinition("git-evidence", tool.RequiresWorkspaceRead, []string{"git-status", "git-diff"}, nil)
 		}},
 		{name: "definition order", mutate: func(p *EvidenceToolPolicy) {
 			p.Definitions[0], p.Definitions[1] = p.Definitions[1], p.Definitions[0]

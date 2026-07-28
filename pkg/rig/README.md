@@ -143,15 +143,17 @@ revision and the classifiers in registration order. Each classifier row carries
 only frozen, secret-free identity: classifier name and revision, its complete
 definition digest, structured-output digest/revision, evidence definition and
 produced-name digests, and every evidence-loop bound. Classifier order is
-significant because combination is ordered. Raw prompts, schemas,
-descriptions, model clients and credentials, workspace paths, live review
-subjects, and runtime-bound tool objects are never serialized into this
-projection. Concrete evidence tools still validate and freeze their schema and
-description identity during session construction; metadata drift fails
-construction rather than changing the rig fingerprint after persistence has
-started. Automatic classifier-definition registration deliberately routes this
-through the same Hustle binding path as every other evidence-enabled
-definition.
+significant because combination is ordered. Evidence policies accept only
+sealed `tool.NewEvidenceDefinition` definitions with frozen `ToolInfo`
+metadata. Canonical static descriptions and compact portable schemas contribute
+to the evidence catalog digest, so either can change topology identity before a
+session is persisted or restored. The fingerprint stores only those versioned
+digests: raw prompts, schemas, descriptions, model clients and credentials,
+workspace paths, live review subjects, and runtime-bound tool objects are never
+serialized into it. At concrete binding, each tool's twice-read metadata must
+exactly match the frozen static name, description, and schema; drift fails
+closed. Automatic classifier-definition registration deliberately routes this
+through the same Hustle binding path as every other evidence-enabled definition.
 
 Omitting both permission-review options preserves the pre-classifier
 fingerprint and gate behavior byte-for-byte. There is no implicit classifier

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"math"
@@ -40,6 +41,13 @@ const (
 	// MaxEvidenceToolPolicyRevisionBytes bounds the canonical policy revision
 	// by encoded UTF-8 bytes.
 	MaxEvidenceToolPolicyRevisionBytes = 128
+)
+
+const (
+	evidencePolicyDigestDomain            = "looprig/hustle/evidence-policy/v1"
+	evidenceDefinitionCatalogDigestDomain = "looprig/hustle/evidence-definition-catalog/v1"
+	evidenceProducedNamesDigestDomain     = "looprig/hustle/evidence-produced-names/v1"
+	boundEvidenceToolDigestDomain         = "looprig/hustle/bound-evidence-tool/v1"
 )
 
 // Name is the stable registration name of one hustle definition.
@@ -525,6 +533,7 @@ func validateEvidenceToolPolicy(policy EvidenceToolPolicy) error {
 	definitionNames := make(map[string]struct{}, len(policy.Definitions))
 	producedNames := make(map[string]struct{}, min(MaxEvidenceProducedToolNames, len(policy.Definitions)))
 	producedNameCount := 0
+	metadataBytes := 0
 	for index, definition := range policy.Definitions {
 		if nilToolDefinition(definition) {
 			return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "]")
@@ -537,12 +546,16 @@ func validateEvidenceToolPolicy(policy EvidenceToolPolicy) error {
 			return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].name")
 		}
 		definitionNames[name] = struct{}{}
-		if definition.Requirements()&^tool.RequiresWorkspace != 0 {
+		if definition.Requirements()&^tool.RequiresWorkspaceRead != 0 {
 			return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].requirements")
 		}
 		names := definition.ProducedToolNames()
+		infos := definition.ToolInfos()
 		if len(names) == 0 {
 			return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].produced_tool_names")
+		}
+		if len(infos) == 0 || len(infos) != len(names) {
+			return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].tool_infos")
 		}
 		if len(names) > MaxEvidenceProducedToolNames-producedNameCount {
 			return invalidEvidenceTools("produced_tool_names")
@@ -556,6 +569,17 @@ func validateEvidenceToolPolicy(policy EvidenceToolPolicy) error {
 				return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].produced_tool_names[" + strconv.Itoa(nameIndex) + "]")
 			}
 			producedNames[producedName] = struct{}{}
+			canonicalSchema, err := validateEvidenceToolInfo(infos[nameIndex])
+			if err != nil || infos[nameIndex].Name != producedName {
+				return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].tool_infos[" + strconv.Itoa(nameIndex) + "]")
+			}
+			for _, size := range []int{len(infos[nameIndex].Name), len(infos[nameIndex].Desc), len(canonicalSchema)} {
+				var withinLimit bool
+				metadataBytes, withinLimit = addEvidenceMetadataBytes(metadataBytes, size)
+				if !withinLimit {
+					return invalidEvidenceTools("tool_metadata")
+				}
+			}
 		}
 	}
 	return nil
@@ -712,30 +736,56 @@ func freezeDefinition(options *definitionOptions) (Definition, error) {
 }
 
 func digestEvidenceToolPolicy(policy EvidenceToolPolicy) ([sha256.Size]byte, [sha256.Size]byte, error) {
-	type definitionMetadata struct {
-		Name          string            `json:"name"`
-		ProducedNames []string          `json:"produced_names"`
-		Requirements  tool.Requirements `json:"requirements"`
-	}
-	metadata := make([]definitionMetadata, len(policy.Definitions))
-	names := make([][]string, len(policy.Definitions))
-	for index, definition := range policy.Definitions {
+	definitions := appendCanonicalString(nil, evidenceDefinitionCatalogDigestDomain)
+	definitions = appendCanonicalString(definitions, policy.Revision)
+	definitions = appendToolLoopLimits(definitions, policy.Limits)
+	definitions = binary.BigEndian.AppendUint64(definitions, uint64(len(policy.Definitions)))
+	names := appendCanonicalString(nil, evidenceProducedNamesDigestDomain)
+	names = binary.BigEndian.AppendUint64(names, uint64(len(policy.Definitions)))
+	for _, definition := range policy.Definitions {
 		produced := definition.ProducedToolNames()
-		metadata[index] = definitionMetadata{
-			Name: definition.Name(), ProducedNames: append([]string(nil), produced...),
-			Requirements: definition.Requirements(),
+		infos := definition.ToolInfos()
+		if len(produced) == 0 || len(produced) != len(infos) {
+			return [sha256.Size]byte{}, [sha256.Size]byte{}, &RevisionError{}
 		}
-		names[index] = append([]string(nil), produced...)
+		definitions = appendCanonicalString(definitions, definition.Name())
+		definitions = binary.BigEndian.AppendUint64(definitions, uint64(definition.Requirements()))
+		definitions = binary.BigEndian.AppendUint64(definitions, uint64(len(infos)))
+		names = binary.BigEndian.AppendUint64(names, uint64(len(produced)))
+		for index := range infos {
+			canonicalSchema, err := validateEvidenceToolInfo(infos[index])
+			if err != nil || infos[index].Name != produced[index] {
+				return [sha256.Size]byte{}, [sha256.Size]byte{}, &RevisionError{Cause: err}
+			}
+			definitions = appendCanonicalString(definitions, produced[index])
+			definitions = appendCanonicalString(definitions, infos[index].Desc)
+			definitions = appendCanonicalBytes(definitions, canonicalSchema)
+			names = appendCanonicalString(names, produced[index])
+		}
 	}
-	encodedMetadata, err := json.Marshal(metadata)
-	if err != nil {
-		return [sha256.Size]byte{}, [sha256.Size]byte{}, &RevisionError{Cause: err}
-	}
-	encodedNames, err := json.Marshal(names)
-	if err != nil {
-		return [sha256.Size]byte{}, [sha256.Size]byte{}, &RevisionError{Cause: err}
-	}
-	return sha256.Sum256(encodedMetadata), sha256.Sum256(encodedNames), nil
+	return sha256.Sum256(definitions), sha256.Sum256(names), nil
+}
+
+func appendToolLoopLimits(material []byte, limits ToolLoopLimits) []byte {
+	material = appendCanonicalInt(material, limits.MaxRounds)
+	material = appendCanonicalInt(material, limits.MaxCalls)
+	material = appendCanonicalInt(material, limits.MaxCallsPerRound)
+	material = appendCanonicalInt(material, limits.MaxResultBytes)
+	return appendCanonicalInt(material, limits.MaxEvidenceBytes)
+}
+
+func appendCanonicalString(material []byte, value string) []byte {
+	return appendCanonicalBytes(material, []byte(value))
+}
+
+func appendCanonicalBytes(material, value []byte) []byte {
+	material = binary.BigEndian.AppendUint64(material, uint64(len(value)))
+	return append(material, value...)
+}
+
+func appendCanonicalInt(material []byte, value int) []byte {
+	// #nosec G115 -- validated non-negative policy values fit into int64.
+	return binary.BigEndian.AppendUint64(material, uint64(value))
 }
 
 // digestOutputPolicy hashes the deterministic, secret-free identity of every
@@ -777,6 +827,11 @@ func digestDescriptorPolicy(descriptor DefinitionDescriptor) (string, error) {
 	encoded, err := json.Marshal(descriptor)
 	if err != nil {
 		return "", &RevisionError{Cause: err}
+	}
+	if descriptor.EvidenceToolPolicyRevision != "" {
+		material := appendCanonicalString(nil, evidencePolicyDigestDomain)
+		material = appendCanonicalBytes(material, encoded)
+		encoded = material
 	}
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:]), nil

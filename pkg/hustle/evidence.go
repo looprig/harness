@@ -102,26 +102,38 @@ func bindEvidenceTools(
 	}
 	built := make([]tool.InvokableTool, 0)
 	declared := make([]string, 0)
+	staticInfos := make([]tool.ToolInfo, 0)
 	for _, definition := range policy.Definitions {
 		if nilToolDefinition(definition) {
 			return nil, invalidEvidenceBind(nil)
 		}
 		names := definition.ProducedToolNames()
-		if len(names) == 0 || len(names) > MaxEvidenceProducedToolNames-len(declared) {
+		infos := definition.ToolInfos()
+		if len(names) == 0 || len(infos) != len(names) ||
+			len(names) > MaxEvidenceProducedToolNames-len(declared) {
 			return nil, invalidEvidenceBind(nil)
 		}
-		for _, name := range names {
-			if !canonicalEvidenceToolName(name) {
+		for index, name := range names {
+			if !canonicalEvidenceToolName(name) || infos[index].Name != name {
 				return nil, invalidEvidenceBind(nil)
 			}
+			canonicalSchema, err := validateEvidenceToolInfo(infos[index])
+			if err != nil {
+				return nil, invalidEvidenceBind(err)
+			}
+			infos[index].Schema = canonicalSchema
 		}
 		declared = append(declared, names...)
+		staticInfos = append(staticInfos, infos...)
 		toolBindings := tool.Bindings{
 			SessionID: bindings.SessionID,
 			LoopID:    bindings.LoopID,
 		}
-		if definition.Requirements()&tool.RequiresWorkspace != 0 {
-			toolBindings.Workspace = bindings.Workspace
+		if definition.Requirements()&tool.RequiresWorkspaceRead != 0 {
+			if bindings.Workspace == nil {
+				return nil, invalidEvidenceBind(nil)
+			}
+			toolBindings.ReadWorkspace = &tool.ReadWorkspaceBinding{Root: bindings.Workspace.Root}
 		}
 		tools, err := definition.Build(ctx, toolBindings)
 		if err != nil {
@@ -162,6 +174,12 @@ func bindEvidenceTools(
 			return nil, invalidEvidenceBind(err)
 		}
 		if info.Name != declared[index] || !canonicalEvidenceToolName(info.Name) {
+			return nil, invalidEvidenceBind(nil)
+		}
+		expected := staticInfos[index]
+		if info.Name != expected.Name ||
+			info.Desc != expected.Desc ||
+			!bytes.Equal(canonicalSchema, expected.Schema) {
 			return nil, invalidEvidenceBind(nil)
 		}
 		if _, duplicate := seen[info.Name]; duplicate {
@@ -232,16 +250,14 @@ func addEvidenceMetadataBytes(total, size int) (int, bool) {
 }
 
 func digestBoundEvidenceTool(name, description string, schema []byte) ([sha256.Size]byte, error) {
-	projection := struct {
-		Name        string          `json:"name"`
-		Description string          `json:"description"`
-		Schema      json.RawMessage `json:"schema"`
-	}{Name: name, Description: description, Schema: schema}
-	encoded, err := json.Marshal(projection)
-	if err != nil {
-		return [sha256.Size]byte{}, err
+	if !canonicalEvidenceToolName(name) || !utf8.ValidString(description) || !utf8.Valid(schema) {
+		return [sha256.Size]byte{}, invalidEvidenceBind(nil)
 	}
-	return sha256.Sum256(encoded), nil
+	material := appendCanonicalString(nil, boundEvidenceToolDigestDomain)
+	material = appendCanonicalString(material, name)
+	material = appendCanonicalString(material, description)
+	material = appendCanonicalBytes(material, schema)
+	return sha256.Sum256(material), nil
 }
 
 func nilEvidenceTool(value tool.InvokableTool) bool {
