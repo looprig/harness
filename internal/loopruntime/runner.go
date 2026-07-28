@@ -61,7 +61,7 @@ const (
 	errToolHookDeniedPrefix = "error: tool call denied: "
 	errToolHookFailure      = "error: internal: tool call blocked by hook"
 	errToolCanceled         = "error: tool call canceled"
-	errToolPanicRedacted    = "error: tool panicked"
+	errToolPanicRedacted    = "error: tool panicked" // #nosec G101 -- fixed redacted error text, not a credential
 	errToolDependencyFailed = "error: internal: tool call failed"
 )
 
