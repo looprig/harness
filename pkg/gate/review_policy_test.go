@@ -331,15 +331,18 @@ func TestPermissionReviewAssessmentValidationAndPolicy(t *testing.T) {
 			a.Basis = s.Basis
 		}, reason: gate.ReviewDecisionMaterialTruncation},
 		{name: "additional material", mutate: func(s *gate.PermissionReviewSubject, a *gate.PermissionAssessment, p *gate.PermissionReviewPolicy) {
-			s.Context.Truncation.Applied = gate.ReviewTruncationToolEntry
-			s.Context.Entries = append(s.Context.Entries, gate.ReviewContextEntry{Origin: gate.ReviewContextOriginTool, Kind: gate.ReviewContextKindToolResult, Content: "cut", Truncated: true})
+			s.Context.Truncation.Applied = gate.ReviewTruncationAssistantEntry
+			s.Context.Entries = append([]gate.ReviewContextEntry{{
+				Origin: gate.ReviewContextOriginAssistant, Kind: gate.ReviewContextKindAssistantMessage,
+				Content: "p\n…[review context truncated]…\ns", Truncated: true,
+			}}, s.Context.Entries...)
 			digest, err := gate.SubjectDigest(*s)
 			if err != nil {
 				panic(err)
 			}
 			s.Basis.SubjectDigest = digest
 			a.Basis = s.Basis
-			p.MaterialTruncation = gate.ReviewTruncationToolEntry
+			p.MaterialTruncation = gate.ReviewTruncationAssistantEntry
 		}, reason: gate.ReviewDecisionMaterialTruncation},
 	}
 	for _, tt := range tests {
@@ -358,6 +361,34 @@ func TestPermissionReviewAssessmentValidationAndPolicy(t *testing.T) {
 				t.Fatal("decision reason leaked rationale")
 			}
 		})
+	}
+}
+
+func TestPermissionReviewAssessmentCannotStampMalformedContext(t *testing.T) {
+	t.Parallel()
+
+	subject := validPermissionReviewSubject(t)
+	subject.Context.Entries[0].Content =
+		"prefix\n…[review context truncated]…\nsuffix"
+	subject.Context.Entries[0].Truncated = true
+	subject.Context.Truncation.Applied = gate.ReviewTruncationUserEntry
+	digest, err := gate.SubjectDigest(subject)
+	if err == nil {
+		subject.Basis.SubjectDigest = digest
+	}
+	assessment := validPermissionAssessment(
+		subject,
+		gate.ReviewRiskLow,
+		gate.ReviewAuthorizationUnknown,
+		gate.ReviewAllow,
+	)
+	got := gate.EvaluatePermissionAssessment(
+		mustDefaultPermissionReviewPolicy(t, "gate-policy-v1"),
+		subject,
+		assessment,
+	)
+	if got.Eligible || got.Reason != gate.ReviewDecisionInvalidAssessment {
+		t.Fatalf("decision = %#v, want invalid assessment", got)
 	}
 }
 

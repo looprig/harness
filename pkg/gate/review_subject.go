@@ -167,11 +167,11 @@ func validateBuiltReviewContext(context ReviewContext) error {
 		return reviewContextError(ReviewValidationFieldContext, ReviewValidationOutOfBounds)
 	}
 
-	currentUser := false
-	activeAction := false
+	currentUser := -1
+	activeAction := -1
 	omissions := 0
 	truncatedEntries := 0
-	for _, entry := range context.Entries {
+	for index, entry := range context.Entries {
 		if !utf8.ValidString(string(entry.Origin)) ||
 			!utf8.ValidString(string(entry.Kind)) ||
 			!utf8.ValidString(entry.Content) ||
@@ -180,12 +180,14 @@ func validateBuiltReviewContext(context ReviewContext) error {
 		}
 		switch entry.Kind {
 		case ReviewContextKindUserMessage:
-			currentUser = true
+			currentUser = index
 		case ReviewContextKindAssistantToolRequest:
-			activeAction = true
+			activeAction = index
 		case ReviewContextKindOmission:
 			omissions++
 			if entry.Truncated ||
+				context.Truncation.OmittedEntries <= 0 ||
+				context.Truncation.OmittedBytes <= 0 ||
 				entry.Content != reviewContextOmissionMarker(
 					context.Truncation.OmittedEntries,
 					context.Truncation.OmittedBytes,
@@ -195,18 +197,31 @@ func validateBuiltReviewContext(context ReviewContext) error {
 		}
 		if entry.Truncated {
 			truncatedEntries++
-			if context.Truncation.Applied&reviewTruncationMaskForEntry(entry) == 0 {
+			entryMask := reviewTruncationMaskForEntry(entry)
+			exercised := context.Truncation.Applied & entryMask
+			markerIndex := strings.Index(entry.Content, reviewContextTruncationMarker)
+			if exercised == 0 ||
+				markerIndex <= 0 ||
+				markerIndex+len(reviewContextTruncationMarker) >= len(entry.Content) ||
+				strings.Count(entry.Content, reviewContextTruncationMarker) != 1 ||
+				materialReviewContextKind(entry.Kind) &&
+					context.Truncation.Material&exercised == 0 {
 				return reviewContextError(ReviewValidationFieldContextEntry, ReviewValidationInvalid)
 			}
 		}
 	}
-	if !currentUser || !activeAction {
+	if currentUser < 0 || activeAction < 0 {
 		return reviewContextError(ReviewValidationFieldContextEntry, ReviewValidationRequired)
+	}
+	if context.Entries[activeAction].Truncated {
+		return reviewContextError(ReviewValidationFieldContextEntry, ReviewValidationInvalid)
 	}
 	hasOmissions := context.Truncation.OmittedEntries > 0
 	hasBudgetTruncation := context.Truncation.Applied&reviewBudgetTruncationMask != 0
 	if (omissions == 1) != hasOmissions ||
 		hasBudgetTruncation != hasOmissions ||
+		context.Truncation.Material&reviewBudgetTruncationMask !=
+			context.Truncation.Applied&reviewBudgetTruncationMask ||
 		!hasOmissions && context.Truncation.OmittedBytes != 0 ||
 		omissions > 1 ||
 		truncatedEntries > 0 && context.Truncation.Applied == 0 ||

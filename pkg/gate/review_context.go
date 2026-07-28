@@ -1,6 +1,8 @@
 package gate
 
 import (
+	"encoding/json"
+	"math"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -228,8 +230,8 @@ func BuildReviewContext(input ReviewContext, policy ReviewContextPolicy) (Review
 			}
 		}
 	}
-	boundedEntries, budgetTruncation, err := applyReviewContextBudgets(
-		output.Entries,
+	boundedOutput, err := applyReviewContextBudgets(
+		output,
 		currentUser,
 		activeAction,
 		policy,
@@ -237,12 +239,7 @@ func BuildReviewContext(input ReviewContext, policy ReviewContextPolicy) (Review
 	if err != nil {
 		return ReviewContext{}, err
 	}
-	output.Entries = boundedEntries
-	output.Truncation.Applied |= budgetTruncation.Applied
-	output.Truncation.Material |= budgetTruncation.Material
-	output.Truncation.OmittedEntries = budgetTruncation.OmittedEntries
-	output.Truncation.OmittedBytes = budgetTruncation.OmittedBytes
-	return output, nil
+	return boundedOutput, nil
 }
 
 func validateReviewContextRoot(input ReviewContext, policy ReviewContextPolicy) error {
@@ -401,24 +398,40 @@ func truncateReviewContextContent(content string, limit int) (string, error) {
 }
 
 func applyReviewContextBudgets(
-	entries []ReviewContextEntry,
+	context ReviewContext,
 	currentUser int,
 	activeAction int,
 	policy ReviewContextPolicy,
-) ([]ReviewContextEntry, ReviewTruncation, error) {
-	initialFailures := reviewContextBudgetFailures(len(entries), reviewContextContentBytes(entries), policy)
+) (ReviewContext, error) {
+	initialFailures, err := reviewContextBudgetFailures(context, policy)
+	if err != nil {
+		return ReviewContext{}, err
+	}
 	if initialFailures == 0 {
-		return entries, ReviewTruncation{}, nil
+		return context, nil
 	}
 
-	keep := make([]bool, len(entries))
+	keep := make([]bool, len(context.Entries))
 	keep[currentUser] = true
 	keep[activeAction] = true
-	requiredBytes := len(entries[currentUser].Content) + len(entries[activeAction].Content)
-	omittedEntries := len(entries) - 2
-	omittedBytes := reviewContextContentBytes(entries) - requiredBytes
+	requiredBytes, ok := checkedReviewContextAdd(
+		len(context.Entries[currentUser].Content),
+		len(context.Entries[activeAction].Content),
+	)
+	if !ok {
+		return ReviewContext{}, reviewContextError(
+			ReviewValidationFieldContextPolicy,
+			ReviewValidationOutOfBounds,
+		)
+	}
+	totalContentBytes, err := reviewContextContentBytes(context.Entries)
+	if err != nil {
+		return ReviewContext{}, err
+	}
+	omittedEntries := len(context.Entries) - 2
+	omittedBytes := totalContentBytes - requiredBytes
 	if omittedEntries == 0 {
-		return nil, ReviewTruncation{}, reviewContextError(
+		return ReviewContext{}, reviewContextError(
 			ReviewValidationFieldContextPolicy,
 			ReviewValidationOutOfBounds,
 		)
@@ -426,66 +439,164 @@ func applyReviewContextBudgets(
 
 	marker := reviewContextOmissionMarker(omittedEntries, omittedBytes)
 	if len(marker) > policy.MaxBlockBytes {
-		return nil, ReviewTruncation{}, reviewContextError(
+		return ReviewContext{}, reviewContextError(
 			ReviewValidationFieldContextPolicy,
 			ReviewValidationOutOfBounds,
 		)
 	}
-	baseFailures := reviewContextBudgetFailures(3, requiredBytes+len(marker), policy)
-	if baseFailures != 0 {
-		return nil, ReviewTruncation{}, reviewContextError(
+	applied := initialFailures
+	base := reviewContextBudgetCandidate(
+		context,
+		keep,
+		marker,
+		applied,
+		omittedEntries,
+		omittedBytes,
+	)
+	baseFailures, err := reviewContextBudgetFailures(base, policy)
+	if err != nil || baseFailures != 0 {
+		return ReviewContext{}, reviewContextError(
 			ReviewValidationFieldContextPolicy,
 			ReviewValidationOutOfBounds,
 		)
 	}
 
-	applied := initialFailures
-	keptOptional := 0
-	keptOptionalBytes := 0
-	for i := len(entries) - 1; i >= 0; i-- {
+	for i := len(context.Entries) - 1; i >= 0; i-- {
 		if keep[i] {
 			continue
 		}
 		candidateOmittedEntries := omittedEntries - 1
-		candidateOmittedBytes := omittedBytes - len(entries[i].Content)
+		if candidateOmittedEntries <= 0 {
+			break
+		}
+		candidateOmittedBytes := omittedBytes - len(context.Entries[i].Content)
 		candidateMarker := reviewContextOmissionMarker(candidateOmittedEntries, candidateOmittedBytes)
-		candidateCount := 2 + keptOptional + 1 + 1
-		candidateBytes := requiredBytes + keptOptionalBytes + len(entries[i].Content) + len(candidateMarker)
-		failures := reviewContextBudgetFailures(candidateCount, candidateBytes, policy)
 		if len(candidateMarker) > policy.MaxBlockBytes {
-			failures |= ReviewTruncationBlock
+			applied |= ReviewTruncationBlock
+			break
+		}
+		candidateKeep := append([]bool(nil), keep...)
+		candidateKeep[i] = true
+		candidate := reviewContextBudgetCandidate(
+			context,
+			candidateKeep,
+			candidateMarker,
+			applied,
+			candidateOmittedEntries,
+			candidateOmittedBytes,
+		)
+		failures, candidateErr := reviewContextBudgetFailures(candidate, policy)
+		if candidateErr != nil {
+			return ReviewContext{}, candidateErr
 		}
 		if failures != 0 {
 			applied |= failures
 			break
 		}
-		keep[i] = true
-		keptOptional++
-		keptOptionalBytes += len(entries[i].Content)
+		keep = candidateKeep
 		omittedEntries = candidateOmittedEntries
 		omittedBytes = candidateOmittedBytes
 		marker = candidateMarker
 	}
 
 	if omittedEntries <= 0 {
-		return nil, ReviewTruncation{}, reviewContextError(
+		return ReviewContext{}, reviewContextError(
 			ReviewValidationFieldContextPolicy,
 			ReviewValidationInvalid,
 		)
 	}
-	output := make([]ReviewContextEntry, 0, len(entries)-omittedEntries+1)
-	markerInserted := false
-	materialOmitted := false
+	output := reviewContextBudgetCandidate(
+		context,
+		keep,
+		marker,
+		applied,
+		omittedEntries,
+		omittedBytes,
+	)
+	finalFailures, err := reviewContextBudgetFailures(output, policy)
+	if err != nil || finalFailures != 0 {
+		return ReviewContext{}, reviewContextError(
+			ReviewValidationFieldContextPolicy,
+			ReviewValidationOutOfBounds,
+		)
+	}
+	return output, nil
+}
+
+func reviewContextBudgetFailures(
+	context ReviewContext,
+	policy ReviewContextPolicy,
+) (ReviewTruncationMask, error) {
+	var failures ReviewTruncationMask
+	if len(context.Entries) > policy.MaxEntries {
+		failures |= ReviewTruncationEntryCount
+	}
+	encodedSize, err := permissionReviewContextEncodedSize(context)
+	if err != nil {
+		return 0, err
+	}
+	if encodedSize > policy.MaxBytes {
+		failures |= ReviewTruncationTotalBytes
+	}
+	contentBytes, err := reviewContextContentBytes(context.Entries)
+	if err != nil {
+		return 0, err
+	}
+	// Estimated tokens are deliberately deterministic: ceil(all entry content
+	// bytes / 4). This is a stable bound, not a model-specific tokenizer.
+	estimatedTokens := contentBytes / 4
+	if contentBytes%4 != 0 {
+		if estimatedTokens == math.MaxInt {
+			return 0, reviewContextError(
+				ReviewValidationFieldContextPolicy,
+				ReviewValidationOutOfBounds,
+			)
+		}
+		estimatedTokens++
+	}
+	if estimatedTokens > policy.MaxEstimatedTokens {
+		failures |= ReviewTruncationEstimatedTokens
+	}
+	return failures, nil
+}
+
+func reviewContextContentBytes(entries []ReviewContextEntry) (int, error) {
+	total := 0
 	for i := range entries {
+		var ok bool
+		total, ok = checkedReviewContextAdd(total, len(entries[i].Content))
+		if !ok {
+			return 0, reviewContextError(
+				ReviewValidationFieldContextPolicy,
+				ReviewValidationOutOfBounds,
+			)
+		}
+	}
+	return total, nil
+}
+
+func reviewContextOmissionMarker(entries int, bytes int) string {
+	return "omitted_entries=" + strconv.Itoa(entries) + " omitted_bytes=" + strconv.Itoa(bytes)
+}
+
+func reviewContextBudgetCandidate(
+	context ReviewContext,
+	keep []bool,
+	marker string,
+	applied ReviewTruncationMask,
+	omittedEntries int,
+	omittedBytes int,
+) ReviewContext {
+	output := context.Clone()
+	output.Entries = make([]ReviewContextEntry, 0, len(context.Entries)-omittedEntries+1)
+	markerInserted := false
+	for i := range context.Entries {
 		if keep[i] {
-			output = append(output, entries[i])
+			output.Entries = append(output.Entries, context.Entries[i])
 			continue
 		}
-		if materialReviewContextKind(entries[i].Kind) {
-			materialOmitted = true
-		}
 		if !markerInserted {
-			output = append(output, ReviewContextEntry{
+			output.Entries = append(output.Entries, ReviewContextEntry{
 				Origin:  ReviewContextOriginOmission,
 				Kind:    ReviewContextKindOmission,
 				Content: marker,
@@ -493,45 +604,29 @@ func applyReviewContextBudgets(
 			markerInserted = true
 		}
 	}
-	truncation := ReviewTruncation{
-		Applied:        applied,
-		OmittedEntries: omittedEntries,
-		OmittedBytes:   omittedBytes,
-	}
-	if materialOmitted {
-		truncation.Material = applied
-	}
-	return output, truncation, nil
+	output.Truncation.Applied |= applied
+	// V1 omission carries no kind inventory. Every exercised omission budget is
+	// therefore material so cleared metadata can never manufacture eligibility.
+	output.Truncation.Material |= applied
+	output.Truncation.OmittedEntries = omittedEntries
+	output.Truncation.OmittedBytes = omittedBytes
+	return output
 }
 
-func reviewContextBudgetFailures(
-	entryCount int,
-	contentBytes int,
-	policy ReviewContextPolicy,
-) ReviewTruncationMask {
-	var failures ReviewTruncationMask
-	if entryCount > policy.MaxEntries {
-		failures |= ReviewTruncationEntryCount
+func permissionReviewContextEncodedSize(context ReviewContext) (int, error) {
+	data, err := json.Marshal(permissionReviewContextToWire(context))
+	if err != nil || len(data) > MaxPermissionReviewSubjectWireBytes {
+		return 0, reviewContextError(
+			ReviewValidationFieldContextPolicy,
+			ReviewValidationOutOfBounds,
+		)
 	}
-	if contentBytes > policy.MaxBytes {
-		failures |= ReviewTruncationTotalBytes
-	}
-	// Estimated tokens are deliberately deterministic: ceil(all entry content
-	// bytes / 4). This is a stable bound, not a model-specific tokenizer.
-	if (contentBytes+3)/4 > policy.MaxEstimatedTokens {
-		failures |= ReviewTruncationEstimatedTokens
-	}
-	return failures
+	return len(data), nil
 }
 
-func reviewContextContentBytes(entries []ReviewContextEntry) int {
-	total := 0
-	for i := range entries {
-		total += len(entries[i].Content)
+func checkedReviewContextAdd(left int, right int) (int, bool) {
+	if left < 0 || right < 0 || left > math.MaxInt-right {
+		return 0, false
 	}
-	return total
-}
-
-func reviewContextOmissionMarker(entries int, bytes int) string {
-	return "omitted_entries=" + strconv.Itoa(entries) + " omitted_bytes=" + strconv.Itoa(bytes)
+	return left + right, true
 }

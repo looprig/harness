@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"bytes"
 	"reflect"
 	"testing"
 )
@@ -15,6 +16,9 @@ func FuzzPermissionReviewSubjectWire(f *testing.F) {
 	f.Add([]byte("null"))
 	f.Add([]byte(`{"version":"permission_review_subject.v1","version":"duplicate"}`))
 	f.Add([]byte(`{"attacker_secret_key":"attacker_secret_value"}`))
+	f.Add(bytes.Replace(valid, []byte(`"summary":"run git status"`), []byte(`"summary":null`), 1))
+	f.Add(bytes.Replace(valid, []byte(`"truncated":false`), []byte(`"truncated":null`), 1))
+	f.Add(bytes.Replace(valid, []byte(`"omitted_entries":0`), []byte(`"omitted_entries":null`), 1))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		got, err := unmarshalPermissionReviewSubject(data)

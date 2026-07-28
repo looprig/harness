@@ -3,7 +3,9 @@ package gate
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -78,6 +80,12 @@ func TestReviewSubjectWireRejectsUntrustedInput(t *testing.T) {
 		{name: "unsupported kind", data: replaceWire(valid, `"kind":"user_message"`, `"kind":"attacker"`)},
 		{name: "unsupported mask", data: replaceWire(valid, `"applied":0`, `"applied":32768`)},
 		{name: "negative counter", data: replaceWire(valid, `"omitted_entries":0`, `"omitted_entries":-1`)},
+		{name: "fraction integer", data: replaceWire(valid, `"expires_at_unix_milli":1800000000000`, `"expires_at_unix_milli":1.5`)},
+		{name: "exponent integer", data: replaceWire(valid, `"expires_at_unix_milli":1800000000000`, `"expires_at_unix_milli":1e3`)},
+		{name: "out of range integer", data: replaceWire(valid, `"expires_at_unix_milli":1800000000000`, `"expires_at_unix_milli":9223372036854775808`)},
+		{name: "string as boolean", data: replaceWire(valid, `"truncated":false`, `"truncated":"false"`)},
+		{name: "integer as boolean", data: replaceWire(valid, `"truncated":false`, `"truncated":0`)},
+		{name: "boolean as string", data: replaceWire(valid, `"summary":"run git status"`, `"summary":false`)},
 		{name: "missing user", data: replaceWire(valid, `"origin":"user"`, `"origin":"assistant"`)},
 	}
 	for _, tt := range tests {
@@ -132,6 +140,110 @@ func TestReviewSubjectWireRejectsMissingZeroValuedField(t *testing.T) {
 	}
 }
 
+func TestReviewSubjectWireRejectsNullForEveryScalarFamily(t *testing.T) {
+	t.Parallel()
+
+	subject := validPermissionReviewSubject(t)
+	basis := subject.Basis
+	basis.SubjectDigest = [32]byte{}
+	request := subject.Request.Clone()
+	request.ToolName = ""
+	request.Summary = ""
+	request.ExecutionID = ""
+	request.Command = ""
+	request.WorkingDirectory = ""
+	request.ExpiresAtUnixMilli = 0
+	request.Requirements[0].Kind = "filesystem.read"
+	request.Requirements[0].Scope = ""
+	request.Requirements[0].GrantClass = ""
+	request.Requirements[0].GrantTarget = ""
+	request.Requirements[0].Candidates[0].Kind = "filesystem.read"
+	request.Requirements[0].Candidates[0].GrantClass = ""
+	request.Requirements[0].Candidates[0].GrantTarget = ""
+	context := subject.Context.Clone()
+	context.RetryReason = ""
+	subject, err := NewPermissionReviewSubject(basis, request, context)
+	if err != nil {
+		t.Fatalf("NewPermissionReviewSubject(zero scalars) error = %v", err)
+	}
+	valid, err := marshalPermissionReviewSubject(subject)
+	if err != nil {
+		t.Fatalf("marshalPermissionReviewSubject() error = %v", err)
+	}
+	if _, err := unmarshalPermissionReviewSubject(valid); err != nil {
+		t.Fatalf("canonical empty/false/zero primitives rejected: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		path []string
+	}{
+		{name: "root version", path: []string{"version"}},
+		{name: "root gate kind", path: []string{"gate_kind"}},
+		{name: "root basis", path: []string{"basis"}},
+		{name: "root request", path: []string{"request"}},
+		{name: "root context", path: []string{"context"}},
+		{name: "basis gate id", path: []string{"basis", "gate_id"}},
+		{name: "basis tool execution id", path: []string{"basis", "tool_execution_id"}},
+		{name: "basis subject digest", path: []string{"basis", "subject_digest"}},
+		{name: "basis context revision", path: []string{"basis", "context_revision"}},
+		{name: "basis gate policy revision", path: []string{"basis", "gate_policy_revision"}},
+		{name: "basis classifier revision", path: []string{"basis", "classifier_revision"}},
+		{name: "basis security ceiling", path: []string{"basis", "security_ceiling"}},
+		{name: "request tool name empty", path: []string{"request", "tool_name"}},
+		{name: "request summary empty", path: []string{"request", "summary"}},
+		{name: "request execution id empty", path: []string{"request", "execution_id"}},
+		{name: "request command empty", path: []string{"request", "command"}},
+		{name: "request working directory empty", path: []string{"request", "working_directory"}},
+		{name: "request expiry zero", path: []string{"request", "expires_at_unix_milli"}},
+		{name: "request requirements", path: []string{"request", "requirements"}},
+		{name: "requirement kind", path: []string{"request", "requirements", "0", "kind"}},
+		{name: "requirement scope empty", path: []string{"request", "requirements", "0", "scope"}},
+		{name: "requirement match", path: []string{"request", "requirements", "0", "match"}},
+		{name: "requirement description", path: []string{"request", "requirements", "0", "description"}},
+		{name: "requirement grant class empty", path: []string{"request", "requirements", "0", "grant_class"}},
+		{name: "requirement grant target empty", path: []string{"request", "requirements", "0", "grant_target"}},
+		{name: "requirement candidates", path: []string{"request", "requirements", "0", "candidates"}},
+		{name: "candidate kind", path: []string{"request", "requirements", "0", "candidates", "0", "kind"}},
+		{name: "candidate match", path: []string{"request", "requirements", "0", "candidates", "0", "match"}},
+		{name: "candidate description", path: []string{"request", "requirements", "0", "candidates", "0", "description"}},
+		{name: "candidate grant class empty", path: []string{"request", "requirements", "0", "candidates", "0", "grant_class"}},
+		{name: "candidate grant target empty", path: []string{"request", "requirements", "0", "candidates", "0", "grant_target"}},
+		{name: "context coordinates", path: []string{"context", "coordinates"}},
+		{name: "context session id", path: []string{"context", "coordinates", "session_id"}},
+		{name: "context loop id", path: []string{"context", "coordinates", "loop_id"}},
+		{name: "context turn id", path: []string{"context", "coordinates", "turn_id"}},
+		{name: "context step id", path: []string{"context", "coordinates", "step_id"}},
+		{name: "context revision", path: []string{"context", "context_revision"}},
+		{name: "context workspace root", path: []string{"context", "workspace_root"}},
+		{name: "context working directory", path: []string{"context", "working_directory"}},
+		{name: "context retry reason empty", path: []string{"context", "retry_reason"}},
+		{name: "context security ceiling", path: []string{"context", "security_ceiling"}},
+		{name: "context gate policy revision", path: []string{"context", "gate_policy_revision"}},
+		{name: "context entries", path: []string{"context", "entries"}},
+		{name: "context truncation", path: []string{"context", "truncation"}},
+		{name: "entry origin", path: []string{"context", "entries", "0", "origin"}},
+		{name: "entry kind", path: []string{"context", "entries", "0", "kind"}},
+		{name: "entry content", path: []string{"context", "entries", "0", "content"}},
+		{name: "entry truncated false", path: []string{"context", "entries", "0", "truncated"}},
+		{name: "truncation applied zero", path: []string{"context", "truncation", "applied"}},
+		{name: "truncation material zero", path: []string{"context", "truncation", "material"}},
+		{name: "truncation omitted entries zero", path: []string{"context", "truncation", "omitted_entries"}},
+		{name: "truncation omitted bytes zero", path: []string{"context", "truncation", "omitted_bytes"}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			mutated := replaceReviewWirePathWithNull(t, valid, tt.path)
+			got, err := unmarshalPermissionReviewSubject(mutated)
+			if err == nil || !reflect.DeepEqual(got, PermissionReviewSubject{}) {
+				t.Fatalf("unmarshalPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+			}
+		})
+	}
+}
+
 func TestReviewSubjectDigestKnownFixture(t *testing.T) {
 	t.Parallel()
 
@@ -139,6 +251,100 @@ func TestReviewSubjectDigestKnownFixture(t *testing.T) {
 	const want = "d3143d47f3e68cd386b0e28d7d701633feec42651cce18bea8237b06b90d0e08"
 	if got := hex.EncodeToString(subject.Basis.SubjectDigest[:]); got != want {
 		t.Fatalf("digest = %s, want %s", got, want)
+	}
+}
+
+func TestReviewContextMaxBytesIncludesCompleteCanonicalProjection(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*ReviewContext)
+	}{
+		{name: "context revision", mutate: func(c *ReviewContext) {
+			c.ContextRevision = strings.Repeat("r", 1024)
+		}},
+		{name: "workspace root", mutate: func(c *ReviewContext) {
+			c.WorkspaceRoot = "/" + strings.Repeat("r", 1024)
+			c.WorkingDirectory = c.WorkspaceRoot
+		}},
+		{name: "working directory", mutate: func(c *ReviewContext) {
+			c.WorkingDirectory = c.WorkspaceRoot + "/" + strings.Repeat("r", 1024)
+		}},
+		{name: "retry reason", mutate: func(c *ReviewContext) {
+			c.RetryReason = strings.Repeat("r", 1024)
+		}},
+		{name: "security ceiling", mutate: func(c *ReviewContext) {
+			c.SecurityCeiling = strings.Repeat("r", 1024)
+		}},
+		{name: "gate policy revision", mutate: func(c *ReviewContext) {
+			c.GatePolicyRevision = strings.Repeat("r", 1024)
+		}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			input := validPermissionReviewSubject(t).Context
+			input.Entries[0].Content = "u"
+			input.Entries[1].Content = "a"
+			tt.mutate(&input)
+			policy := reviewContextWireTestPolicy()
+			policy.MaxBytes = canonicalReviewContextSize(t, input) - 1
+			got, err := BuildReviewContext(input, policy)
+			if err == nil || !reflect.DeepEqual(got, ReviewContext{}) {
+				t.Fatalf("BuildReviewContext() = (%#v, %v), want zero, error", got, err)
+			}
+		})
+	}
+}
+
+func TestReviewContextMaxBytesExactCanonicalBoundary(t *testing.T) {
+	t.Parallel()
+
+	input := validPermissionReviewSubject(t).Context
+	policy := reviewContextWireTestPolicy()
+	exact := canonicalReviewContextSize(t, input)
+	policy.MaxBytes = exact
+	got, err := BuildReviewContext(input, policy)
+	if err != nil {
+		t.Fatalf("BuildReviewContext(exact) error = %v", err)
+	}
+	if size := canonicalReviewContextSize(t, got); size != exact || size > policy.MaxBytes {
+		t.Fatalf("canonical size = %d, want %d and <= %d", size, exact, policy.MaxBytes)
+	}
+
+	policy.MaxBytes = exact - 1
+	over, err := BuildReviewContext(input, policy)
+	if err == nil || !reflect.DeepEqual(over, ReviewContext{}) {
+		t.Fatalf("BuildReviewContext(one over) = (%#v, %v), want zero, error", over, err)
+	}
+}
+
+func canonicalReviewContextSize(t testing.TB, context ReviewContext) int {
+	t.Helper()
+	subject := validPermissionReviewSubject(t)
+	subject.Context = context
+	data, err := json.Marshal(
+		permissionReviewSubjectToWire(subject, zeroPermissionReviewDigestHex).Context,
+	)
+	if err != nil {
+		t.Fatalf("json.Marshal(context projection) error = %v", err)
+	}
+	return len(data)
+}
+
+func reviewContextWireTestPolicy() ReviewContextPolicy {
+	return ReviewContextPolicy{
+		Revision:             "review-policy-v1",
+		MaxBytes:             MaxPermissionReviewSubjectWireBytes,
+		MaxEstimatedTokens:   MaxPermissionReviewSubjectWireBytes,
+		MaxEntries:           32,
+		MaxUserEntryBytes:    4096,
+		MaxAgentEntryBytes:   4096,
+		MaxToolEntryBytes:    4096,
+		MaxBlockBytes:        4096,
+		MaxActiveActionBytes: 4096,
 	}
 }
 
@@ -213,4 +419,52 @@ func reorderReviewSubjectRoot(t *testing.T, data []byte) []byte {
 	}
 	rest := compact[len(prefix):]
 	return append(append([]byte("{"), rest[:len(rest)-1]...), []byte(`,"version":"permission_review_subject.v1"}`)...)
+}
+
+func replaceReviewWirePathWithNull(
+	t testing.TB,
+	data []byte,
+	path []string,
+) []byte {
+	t.Helper()
+	mutated := replaceReviewWireRawPathWithNull(t, json.RawMessage(data), path)
+	return []byte(mutated)
+}
+
+func replaceReviewWireRawPathWithNull(
+	t testing.TB,
+	raw json.RawMessage,
+	path []string,
+) json.RawMessage {
+	t.Helper()
+	if len(path) == 0 {
+		return json.RawMessage("null")
+	}
+	if index, err := strconv.Atoi(path[0]); err == nil {
+		var values []json.RawMessage
+		if err := json.Unmarshal(raw, &values); err != nil ||
+			index < 0 || index >= len(values) {
+			t.Fatalf("invalid array path %v", path)
+		}
+		values[index] = replaceReviewWireRawPathWithNull(t, values[index], path[1:])
+		data, err := json.Marshal(values)
+		if err != nil {
+			t.Fatalf("json.Marshal(array path) error = %v", err)
+		}
+		return data
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		t.Fatalf("invalid object path %v: %v", path, err)
+	}
+	child, ok := object[path[0]]
+	if !ok {
+		t.Fatalf("missing object path %v", path)
+	}
+	object[path[0]] = replaceReviewWireRawPathWithNull(t, child, path[1:])
+	data, err := json.Marshal(object)
+	if err != nil {
+		t.Fatalf("json.Marshal(object path) error = %v", err)
+	}
+	return data
 }

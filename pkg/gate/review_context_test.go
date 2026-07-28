@@ -486,19 +486,27 @@ func TestReviewContextEntryBudgetRetainsRequiredAndRecentContext(t *testing.T) {
 	}
 }
 
-func TestReviewContextTotalByteBudgetUsesContentBytes(t *testing.T) {
+func TestReviewContextTotalByteBudgetUsesCanonicalContextBytes(t *testing.T) {
 	t.Parallel()
 
 	input := budgetReviewContext(30)
 	policy := validReviewContextPolicy()
-	policy.MaxBytes = 80
+	policy.MaxEntries = 4
+	entryBounded, err := gate.BuildReviewContext(input, policy)
+	if err != nil {
+		t.Fatalf("BuildReviewContext(entry bound) error = %v", err)
+	}
+	entryBounded.Truncation.Applied = gate.ReviewTruncationTotalBytes
+	entryBounded.Truncation.Material = gate.ReviewTruncationTotalBytes
+	policy.MaxEntries = 32
+	policy.MaxBytes = canonicalContextBytes(t, entryBounded)
 
 	got, err := gate.BuildReviewContext(input, policy)
 	if err != nil {
 		t.Fatalf("BuildReviewContext() error = %v", err)
 	}
-	if contentBytes(got.Entries) > policy.MaxBytes {
-		t.Fatalf("content bytes = %d, want <= %d", contentBytes(got.Entries), policy.MaxBytes)
+	if size := canonicalContextBytes(t, got); size > policy.MaxBytes {
+		t.Fatalf("canonical bytes = %d, want <= %d", size, policy.MaxBytes)
 	}
 	assertBudgetedReviewContext(t, got, gate.ReviewTruncationTotalBytes, 2, 60, []gate.ReviewContextKind{
 		gate.ReviewContextKindOmission,
@@ -554,7 +562,22 @@ func TestReviewContextBudgetFailsWhenRequiredEntriesAndMarkerCannotFit(t *testin
 		mutate func(*gate.ReviewContextPolicy)
 	}{
 		{name: "entry count", mutate: func(p *gate.ReviewContextPolicy) { p.MaxEntries = 2 }},
-		{name: "bytes", mutate: func(p *gate.ReviewContextPolicy) { p.MaxBytes = 40 }},
+		{name: "bytes", mutate: func(p *gate.ReviewContextPolicy) {
+			input := budgetReviewContext(30)
+			input.Entries = []gate.ReviewContextEntry{
+				{
+					Origin: gate.ReviewContextOriginOmission, Kind: gate.ReviewContextKindOmission,
+					Content: "omitted_entries=3 omitted_bytes=90",
+				},
+				input.Entries[3],
+				input.Entries[4],
+			}
+			input.Truncation.Applied = gate.ReviewTruncationTotalBytes
+			input.Truncation.Material = gate.ReviewTruncationTotalBytes
+			input.Truncation.OmittedEntries = 3
+			input.Truncation.OmittedBytes = 90
+			p.MaxBytes = canonicalContextBytes(t, input) - 1
+		}},
 		{name: "tokens", mutate: func(p *gate.ReviewContextPolicy) { p.MaxEstimatedTokens = 10 }},
 	}
 	for _, tt := range tests {
@@ -575,7 +598,15 @@ func TestReviewContextBudgetingIsDeterministicAndDoesNotMutateInput(t *testing.T
 	input := budgetReviewContext(30)
 	original := input.Clone()
 	policy := validReviewContextPolicy()
-	policy.MaxBytes = 80
+	policy.MaxEntries = 4
+	entryBounded, err := gate.BuildReviewContext(input, policy)
+	if err != nil {
+		t.Fatalf("BuildReviewContext(entry bound) error = %v", err)
+	}
+	entryBounded.Truncation.Applied = gate.ReviewTruncationTotalBytes
+	entryBounded.Truncation.Material = gate.ReviewTruncationTotalBytes
+	policy.MaxEntries = 32
+	policy.MaxBytes = canonicalContextBytes(t, entryBounded)
 	first, err := gate.BuildReviewContext(input, policy)
 	if err != nil {
 		t.Fatalf("first BuildReviewContext() error = %v", err)
@@ -652,19 +683,25 @@ func TestReviewContextCombinedBudgetsRecordEveryExercisedLimit(t *testing.T) {
 	input := budgetReviewContext(30)
 	policy := validReviewContextPolicy()
 	policy.MaxEntries = 4
-	policy.MaxBytes = 80
+	entryBounded, err := gate.BuildReviewContext(input, policy)
+	if err != nil {
+		t.Fatalf("BuildReviewContext(entry bound) error = %v", err)
+	}
+	want := gate.ReviewTruncationEntryCount | gate.ReviewTruncationTotalBytes
+	entryBounded.Truncation.Applied = want
+	entryBounded.Truncation.Material = want
+	policy.MaxBytes = canonicalContextBytes(t, entryBounded)
 
 	got, err := gate.BuildReviewContext(input, policy)
 	if err != nil {
 		t.Fatalf("BuildReviewContext() error = %v", err)
 	}
-	want := gate.ReviewTruncationEntryCount | gate.ReviewTruncationTotalBytes
 	if got.Truncation.Applied != want || got.Truncation.Material != want {
 		t.Errorf("Truncation = %#v, want Applied and Material %#x", got.Truncation, want)
 	}
 }
 
-func TestReviewContextOmittingOnlyAssistantNarrativeIsNonMaterial(t *testing.T) {
+func TestReviewContextV1OmissionIsAlwaysMaterial(t *testing.T) {
 	t.Parallel()
 
 	input := validReviewContext()
@@ -675,7 +712,20 @@ func TestReviewContextOmittingOnlyAssistantNarrativeIsNonMaterial(t *testing.T) 
 		Content: strings.Repeat("a", 100),
 	}}, input.Entries...)
 	policy := validReviewContextPolicy()
-	policy.MaxBytes = 60
+	expected := input.Clone()
+	expected.Entries = []gate.ReviewContextEntry{
+		{
+			Origin: gate.ReviewContextOriginOmission, Kind: gate.ReviewContextKindOmission,
+			Content: "omitted_entries=1 omitted_bytes=100",
+		},
+		input.Entries[1],
+		input.Entries[2],
+	}
+	expected.Truncation.Applied = gate.ReviewTruncationTotalBytes
+	expected.Truncation.Material = gate.ReviewTruncationTotalBytes
+	expected.Truncation.OmittedEntries = 1
+	expected.Truncation.OmittedBytes = 100
+	policy.MaxBytes = canonicalContextBytes(t, expected)
 
 	got, err := gate.BuildReviewContext(input, policy)
 	if err != nil {
@@ -684,8 +734,8 @@ func TestReviewContextOmittingOnlyAssistantNarrativeIsNonMaterial(t *testing.T) 
 	if got.Truncation.Applied != gate.ReviewTruncationTotalBytes {
 		t.Errorf("Applied = %#x, want total bytes", got.Truncation.Applied)
 	}
-	if got.Truncation.Material != 0 {
-		t.Errorf("Material = %#x, want zero for assistant narrative only", got.Truncation.Material)
+	if got.Truncation.Material != gate.ReviewTruncationTotalBytes {
+		t.Errorf("Material = %#x, want total bytes for conservative v1 omission", got.Truncation.Material)
 	}
 }
 
@@ -862,6 +912,15 @@ func contentBytes(entries []gate.ReviewContextEntry) int {
 
 func estimatedReviewTokens(entries []gate.ReviewContextEntry) int {
 	return (contentBytes(entries) + 3) / 4
+}
+
+func canonicalContextBytes(t testing.TB, context gate.ReviewContext) int {
+	t.Helper()
+	size, err := gate.CanonicalReviewContextSizeForTest(context)
+	if err != nil {
+		t.Fatalf("canonical context size error = %v", err)
+	}
+	return size
 }
 
 func assertReviewBuildRejected(t *testing.T, input gate.ReviewContext, policy gate.ReviewContextPolicy) {

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/looprig/core/uuid"
@@ -205,13 +206,6 @@ func permissionReviewSubjectToWire(
 			GrantTarget: requirement.GrantTarget, Candidates: candidates,
 		}
 	}
-	entries := make([]permissionReviewEntryV1, len(subject.Context.Entries))
-	for i, entry := range subject.Context.Entries {
-		entries[i] = permissionReviewEntryV1{
-			Origin: string(entry.Origin), Kind: string(entry.Kind),
-			Content: entry.Content, Truncated: entry.Truncated,
-		}
-	}
 	return permissionReviewSubjectWireV1{
 		Version:  permissionReviewSubjectWireVersion,
 		GateKind: permissionReviewSubjectWireKind,
@@ -229,26 +223,37 @@ func permissionReviewSubjectToWire(
 			ExpiresAtUnixMilli: subject.Request.ExpiresAtUnixMilli,
 			Requirements:       requirements,
 		},
-		Context: permissionReviewContextV1{
-			Coordinates: permissionReviewCoordinatesV1{
-				SessionID: subject.Context.Coordinates.SessionID.String(),
-				LoopID:    subject.Context.Coordinates.LoopID.String(),
-				TurnID:    subject.Context.Coordinates.TurnID.String(),
-				StepID:    subject.Context.Coordinates.StepID.String(),
-			},
-			ContextRevision:    subject.Context.ContextRevision,
-			WorkspaceRoot:      subject.Context.WorkspaceRoot,
-			WorkingDirectory:   subject.Context.WorkingDirectory,
-			RetryReason:        subject.Context.RetryReason,
-			SecurityCeiling:    subject.Context.SecurityCeiling,
-			GatePolicyRevision: subject.Context.GatePolicyRevision,
-			Entries:            entries,
-			Truncation: permissionReviewTruncationV1{
-				Applied:        uint16(subject.Context.Truncation.Applied),
-				Material:       uint16(subject.Context.Truncation.Material),
-				OmittedEntries: subject.Context.Truncation.OmittedEntries,
-				OmittedBytes:   subject.Context.Truncation.OmittedBytes,
-			},
+		Context: permissionReviewContextToWire(subject.Context),
+	}
+}
+
+func permissionReviewContextToWire(context ReviewContext) permissionReviewContextV1 {
+	entries := make([]permissionReviewEntryV1, len(context.Entries))
+	for i, entry := range context.Entries {
+		entries[i] = permissionReviewEntryV1{
+			Origin: string(entry.Origin), Kind: string(entry.Kind),
+			Content: entry.Content, Truncated: entry.Truncated,
+		}
+	}
+	return permissionReviewContextV1{
+		Coordinates: permissionReviewCoordinatesV1{
+			SessionID: context.Coordinates.SessionID.String(),
+			LoopID:    context.Coordinates.LoopID.String(),
+			TurnID:    context.Coordinates.TurnID.String(),
+			StepID:    context.Coordinates.StepID.String(),
+		},
+		ContextRevision:    context.ContextRevision,
+		WorkspaceRoot:      context.WorkspaceRoot,
+		WorkingDirectory:   context.WorkingDirectory,
+		RetryReason:        context.RetryReason,
+		SecurityCeiling:    context.SecurityCeiling,
+		GatePolicyRevision: context.GatePolicyRevision,
+		Entries:            entries,
+		Truncation: permissionReviewTruncationV1{
+			Applied:        uint16(context.Truncation.Applied),
+			Material:       uint16(context.Truncation.Material),
+			OmittedEntries: context.Truncation.OmittedEntries,
+			OmittedBytes:   context.Truncation.OmittedBytes,
 		},
 	}
 }
@@ -401,10 +406,26 @@ func validatePermissionReviewWireShape(
 	if err != nil {
 		return err
 	}
-	if _, err := requireReviewWireObject(root["basis"], []string{
+	if err := requireReviewWireStrings(root, "version", "gate_kind"); err != nil {
+		return err
+	}
+	basis, err := requireReviewWireObject(root["basis"], []string{
 		"gate_id", "tool_execution_id", "subject_digest", "context_revision",
 		"gate_policy_revision", "classifier_revision", "security_ceiling",
-	}); err != nil {
+	})
+	if err != nil {
+		return err
+	}
+	if err := requireReviewWireStrings(
+		basis,
+		"gate_id",
+		"tool_execution_id",
+		"subject_digest",
+		"context_revision",
+		"gate_policy_revision",
+		"classifier_revision",
+		"security_ceiling",
+	); err != nil {
 		return err
 	}
 	request, err := requireReviewWireObject(root["request"], []string{
@@ -412,6 +433,19 @@ func validatePermissionReviewWireShape(
 		"expires_at_unix_milli", "requirements",
 	})
 	if err != nil {
+		return err
+	}
+	if err := requireReviewWireStrings(
+		request,
+		"tool_name",
+		"summary",
+		"execution_id",
+		"command",
+		"working_directory",
+	); err != nil {
+		return err
+	}
+	if err := requireReviewWireInteger(request["expires_at_unix_milli"]); err != nil {
 		return err
 	}
 	requirements, err := requireReviewWireArray(request["requirements"])
@@ -426,14 +460,36 @@ func validatePermissionReviewWireShape(
 		if err != nil {
 			return err
 		}
+		if err := requireReviewWireStrings(
+			requirement,
+			"kind",
+			"scope",
+			"match",
+			"description",
+			"grant_class",
+			"grant_target",
+		); err != nil {
+			return err
+		}
 		candidates, err := requireReviewWireArray(requirement["candidates"])
 		if err != nil {
 			return err
 		}
 		for _, rawCandidate := range candidates {
-			if _, err := requireReviewWireObject(rawCandidate, []string{
+			candidate, err := requireReviewWireObject(rawCandidate, []string{
 				"kind", "match", "description", "grant_class", "grant_target",
-			}); err != nil {
+			})
+			if err != nil {
+				return err
+			}
+			if err := requireReviewWireStrings(
+				candidate,
+				"kind",
+				"match",
+				"description",
+				"grant_class",
+				"grant_target",
+			); err != nil {
 				return err
 			}
 		}
@@ -446,9 +502,30 @@ func validatePermissionReviewWireShape(
 	if err != nil {
 		return err
 	}
-	if _, err := requireReviewWireObject(context["coordinates"], []string{
+	if err := requireReviewWireStrings(
+		context,
+		"context_revision",
+		"workspace_root",
+		"working_directory",
+		"retry_reason",
+		"security_ceiling",
+		"gate_policy_revision",
+	); err != nil {
+		return err
+	}
+	coordinates, err := requireReviewWireObject(context["coordinates"], []string{
 		"session_id", "loop_id", "turn_id", "step_id",
-	}); err != nil {
+	})
+	if err != nil {
+		return err
+	}
+	if err := requireReviewWireStrings(
+		coordinates,
+		"session_id",
+		"loop_id",
+		"turn_id",
+		"step_id",
+	); err != nil {
 		return err
 	}
 	entries, err := requireReviewWireArray(context["entries"])
@@ -456,16 +533,34 @@ func validatePermissionReviewWireShape(
 		return err
 	}
 	for _, rawEntry := range entries {
-		if _, err := requireReviewWireObject(rawEntry, []string{
+		entry, err := requireReviewWireObject(rawEntry, []string{
 			"origin", "kind", "content", "truncated",
-		}); err != nil {
+		})
+		if err != nil {
+			return err
+		}
+		if err := requireReviewWireStrings(entry, "origin", "kind", "content"); err != nil {
+			return err
+		}
+		if err := requireReviewWireBool(entry["truncated"]); err != nil {
 			return err
 		}
 	}
-	if _, err := requireReviewWireObject(context["truncation"], []string{
+	truncation, err := requireReviewWireObject(context["truncation"], []string{
 		"applied", "material", "omitted_entries", "omitted_bytes",
-	}); err != nil {
+	})
+	if err != nil {
 		return err
+	}
+	for _, key := range []string{
+		"applied",
+		"material",
+		"omitted_entries",
+		"omitted_bytes",
+	} {
+		if err := requireReviewWireInteger(truncation[key]); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -498,4 +593,48 @@ func requireReviewWireArray(data []byte) ([]json.RawMessage, error) {
 		return nil, reviewSubjectError(ReviewValidationFieldWire, ReviewValidationInvalid)
 	}
 	return values, nil
+}
+
+func requireReviewWireStrings(
+	object map[string]json.RawMessage,
+	keys ...string,
+) error {
+	for _, key := range keys {
+		if err := requireReviewWireString(object[key]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func requireReviewWireString(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '"' {
+		return reviewSubjectError(ReviewValidationFieldWire, ReviewValidationInvalid)
+	}
+	var value string
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return reviewSubjectError(ReviewValidationFieldWire, ReviewValidationInvalid)
+	}
+	return nil
+}
+
+func requireReviewWireBool(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if !bytes.Equal(trimmed, []byte("true")) &&
+		!bytes.Equal(trimmed, []byte("false")) {
+		return reviewSubjectError(ReviewValidationFieldWire, ReviewValidationInvalid)
+	}
+	return nil
+}
+
+func requireReviewWireInteger(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return reviewSubjectError(ReviewValidationFieldWire, ReviewValidationInvalid)
+	}
+	if _, err := strconv.ParseInt(string(trimmed), 10, 64); err != nil {
+		return reviewSubjectError(ReviewValidationFieldWire, ReviewValidationInvalid)
+	}
+	return nil
 }

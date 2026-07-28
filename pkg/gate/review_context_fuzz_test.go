@@ -97,8 +97,12 @@ func FuzzReviewContextBuildBoundsAndDeterminism(f *testing.F) {
 		if len(first.Entries) > policy.MaxEntries {
 			t.Fatalf("entries = %d, want <= %d", len(first.Entries), policy.MaxEntries)
 		}
-		if contentBytes(first.Entries) > policy.MaxBytes {
-			t.Fatalf("content bytes = %d, want <= %d", contentBytes(first.Entries), policy.MaxBytes)
+		canonicalBytes, sizeErr := gate.CanonicalReviewContextSizeForTest(first)
+		if sizeErr != nil {
+			t.Fatalf("canonical context size error = %v", sizeErr)
+		}
+		if canonicalBytes > policy.MaxBytes {
+			t.Fatalf("canonical bytes = %d, want <= %d", canonicalBytes, policy.MaxBytes)
 		}
 		if estimatedReviewTokens(first.Entries) > policy.MaxEstimatedTokens {
 			t.Fatalf("estimated tokens = %d, want <= %d", estimatedReviewTokens(first.Entries), policy.MaxEstimatedTokens)

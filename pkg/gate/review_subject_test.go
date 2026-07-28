@@ -152,6 +152,111 @@ func TestPermissionReviewSubjectRejectsInvalidBuiltContext(t *testing.T) {
 	}
 }
 
+func TestPermissionReviewSubjectRejectsImpossibleTruncationMetadata(t *testing.T) {
+	t.Parallel()
+
+	const marker = "\n…[review context truncated]…\n"
+	truncated := func(content string) string {
+		return "prefix" + marker + content
+	}
+	tests := []struct {
+		name   string
+		mutate func(*gate.ReviewContext)
+	}{
+		{name: "final active action truncated", mutate: func(c *gate.ReviewContext) {
+			c.Entries[1].Content = truncated("suffix")
+			c.Entries[1].Truncated = true
+			c.Truncation.Applied = gate.ReviewTruncationAssistantEntry
+			c.Truncation.Material = gate.ReviewTruncationAssistantEntry
+		}},
+		{name: "current user material clear", mutate: func(c *gate.ReviewContext) {
+			c.Entries[0].Content = truncated("suffix")
+			c.Entries[0].Truncated = true
+			c.Truncation.Applied = gate.ReviewTruncationUserEntry
+		}},
+		{name: "tool result material clear", mutate: func(c *gate.ReviewContext) {
+			c.Entries = append([]gate.ReviewContextEntry{{
+				Origin: gate.ReviewContextOriginTool, Kind: gate.ReviewContextKindToolResult,
+				Content: truncated("suffix"), Truncated: true,
+			}}, c.Entries...)
+			c.Truncation.Applied = gate.ReviewTruncationToolEntry
+		}},
+		{name: "runtime context material clear", mutate: func(c *gate.ReviewContext) {
+			c.Entries = append([]gate.ReviewContextEntry{{
+				Origin: gate.ReviewContextOriginRuntime, Kind: gate.ReviewContextKindRuntimeContext,
+				Content: truncated("suffix"), Truncated: true,
+			}}, c.Entries...)
+			c.Truncation.Applied = gate.ReviewTruncationBlock
+		}},
+		{name: "external content material clear", mutate: func(c *gate.ReviewContext) {
+			c.Entries = append([]gate.ReviewContextEntry{{
+				Origin: gate.ReviewContextOriginExternal, Kind: gate.ReviewContextKindExternalContent,
+				Content: truncated("suffix"), Truncated: true,
+			}}, c.Entries...)
+			c.Truncation.Applied = gate.ReviewTruncationBlock
+		}},
+		{name: "earlier tool request material clear", mutate: func(c *gate.ReviewContext) {
+			c.Entries = append([]gate.ReviewContextEntry{{
+				Origin: gate.ReviewContextOriginAssistant, Kind: gate.ReviewContextKindAssistantToolRequest,
+				Content: truncated("suffix"), Truncated: true,
+			}}, c.Entries...)
+			c.Truncation.Applied = gate.ReviewTruncationAssistantEntry
+		}},
+		{name: "truncated without marker", mutate: func(c *gate.ReviewContext) {
+			c.Entries[0].Truncated = true
+			c.Truncation.Applied = gate.ReviewTruncationUserEntry
+			c.Truncation.Material = gate.ReviewTruncationUserEntry
+		}},
+		{name: "truncated with two markers", mutate: func(c *gate.ReviewContext) {
+			c.Entries[0].Content = "prefix" + marker + "middle" + marker + "suffix"
+			c.Entries[0].Truncated = true
+			c.Truncation.Applied = gate.ReviewTruncationUserEntry
+			c.Truncation.Material = gate.ReviewTruncationUserEntry
+		}},
+		{name: "truncated without prefix", mutate: func(c *gate.ReviewContext) {
+			c.Entries[0].Content = marker + "suffix"
+			c.Entries[0].Truncated = true
+			c.Truncation.Applied = gate.ReviewTruncationUserEntry
+			c.Truncation.Material = gate.ReviewTruncationUserEntry
+		}},
+		{name: "truncated without suffix", mutate: func(c *gate.ReviewContext) {
+			c.Entries[0].Content = "prefix" + marker
+			c.Entries[0].Truncated = true
+			c.Truncation.Applied = gate.ReviewTruncationUserEntry
+			c.Truncation.Material = gate.ReviewTruncationUserEntry
+		}},
+		{name: "omission budget material clear", mutate: func(c *gate.ReviewContext) {
+			c.Entries = append([]gate.ReviewContextEntry{{
+				Origin: gate.ReviewContextOriginOmission, Kind: gate.ReviewContextKindOmission,
+				Content: "omitted_entries=1 omitted_bytes=5",
+			}}, c.Entries...)
+			c.Truncation.Applied = gate.ReviewTruncationEntryCount
+			c.Truncation.OmittedEntries = 1
+			c.Truncation.OmittedBytes = 5
+		}},
+		{name: "omission with zero counters", mutate: func(c *gate.ReviewContext) {
+			c.Entries = append([]gate.ReviewContextEntry{{
+				Origin: gate.ReviewContextOriginOmission, Kind: gate.ReviewContextKindOmission,
+				Content: "omitted_entries=0 omitted_bytes=0",
+			}}, c.Entries...)
+			c.Truncation.Applied = gate.ReviewTruncationEntryCount
+			c.Truncation.Material = gate.ReviewTruncationEntryCount
+		}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			basis, request, context := validPermissionReviewSubjectInput()
+			tt.mutate(&context)
+			got, err := gate.NewPermissionReviewSubject(basis, request, context)
+			if err == nil || !reflect.DeepEqual(got, gate.PermissionReviewSubject{}) {
+				t.Fatalf("NewPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+			}
+		})
+	}
+}
+
 func TestPermissionReviewSubjectErrorsDoNotEchoContents(t *testing.T) {
 	t.Parallel()
 
