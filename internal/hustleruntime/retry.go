@@ -35,6 +35,10 @@ func classifyRetryFailure(err error) retryFailureClass {
 		responseErr.Reason == ToolResponseFailureInvalidTerminal {
 		return retryFailureRecoverableTerminal
 	}
+	outputErr, ok := err.(*OutputError)
+	if ok && hustle.IsRecoverableTerminalValidationError(outputErr.Cause) {
+		return retryFailureRecoverableTerminal
+	}
 	return retryFailureNone
 }
 

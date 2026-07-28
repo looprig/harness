@@ -1220,12 +1220,24 @@ terminal parse errors. Verify no retry for every forbidden class in design
 §12.6. Assert the second attempt starts from immutable input with no first
 attempt evidence and remains inside the original deadline.
 
+Add the narrow classifier-adapter seam
+`NewRecoverableTerminalValidationError() error` and its typed predicate. Keep
+the concrete marker private, cause-free, and fixed-text. Do not add a generic
+retryable wrapper. Prove a strict fake codec marks duplicate, unknown, and
+missing terminal fields and gets one retry. Prove basis mismatch, valid
+`needs_human` and deny decisions, arbitrary validator errors, callback panic,
+wrong stage/reason, cancellation, deadline, controller shutdown, finalizer
+failure, poison, evidence/capability/bounds/tool failures, and the zero policy
+do not retry. A second marked failure must stop with no decoder text or
+provider output retained.
+
 **Step 2: Verify RED**
 
 **Step 3: Implement bounded policy**
 
 Keep retry opt-in on the definition/reviewer policy so existing compaction does
-not change behavior.
+not change behavior. Recognize the adapter marker only after `ValidateResult`
+at `StageOutput`/`ReasonInvalidOutput`, and normalize it before retention.
 
 **Step 4: Run GREEN and commit**
 

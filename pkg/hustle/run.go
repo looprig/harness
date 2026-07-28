@@ -77,6 +77,32 @@ func (p RetryPolicy) Valid() bool {
 	return p == RetryPolicyNone || p == RetryPolicyClassifiedOnce
 }
 
+const recoverableTerminalValidationMessage = "hustle: recoverable malformed terminal output"
+
+// recoverableTerminalValidationError is intentionally private so consumers
+// cannot attach arbitrary causes or provider output to the retry marker.
+type recoverableTerminalValidationError struct{}
+
+func (*recoverableTerminalValidationError) Error() string {
+	return recoverableTerminalValidationMessage
+}
+
+// NewRecoverableTerminalValidationError returns the sealed marker a strict
+// classifier adapter may return when terminal decoding or wire-shape
+// validation is malformed but safe to retry. It must not be used for domain
+// decisions, basis mismatches, unsafe results, or operational failures.
+func NewRecoverableTerminalValidationError() error {
+	return &recoverableTerminalValidationError{}
+}
+
+// IsRecoverableTerminalValidationError reports whether err contains the
+// package-owned malformed-terminal marker. Matching is typed and never
+// inspects error text.
+func IsRecoverableTerminalValidationError(err error) bool {
+	_, ok := err.(*recoverableTerminalValidationError)
+	return ok
+}
+
 // ReasonAllowed reports whether reason is a valid durable classification for
 // stage. The closed matrix prevents impossible stage/reason audit records.
 func ReasonAllowed(stage Stage, reason ReasonCode) bool {

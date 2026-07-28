@@ -796,6 +796,24 @@ deadline for:
 - a classified transient inference failure; or
 - a recoverable malformed terminal output.
 
+For adapter-owned terminal decoding and strict wire-shape validation,
+`pkg/hustle` exposes `NewRecoverableTerminalValidationError`. Its concrete
+type is private, it accepts no cause, and its error text is fixed and bounded.
+The paired exact-type predicate neither follows wrappers nor matches by
+substring, so arbitrary errors cannot emulate the marker through error text or
+a custom `As` method. The runtime recognizes this marker only when
+`ValidateResult` fails at `StageOutput` with `ReasonInvalidOutput` under
+`RetryPolicyClassifiedOnce`. It normalizes the marker back to a fresh fixed
+package-owned value before retaining the failure, so provider output and
+adapter error text cannot escape through the exhausted second attempt.
+
+The marker is exclusively a syntax/shape signal: duplicate, unknown, missing,
+or otherwise invalid terminal wire fields may use it. A basis mismatch,
+`needs_human`, deny/unsafe semantic result, arbitrary validator error, callback
+panic, or any other domain or operational failure must not use it. A marker at
+another stage or reason does not make that failure retryable. The zero retry
+policy remains single-attempt even when a validator returns the marker.
+
 It does not retry:
 
 - context cancellation;
@@ -809,7 +827,10 @@ It does not retry:
 - session shutdown.
 
 Retry restarts from the immutable subject. It does not preserve partially
-trusted evidence from the failed attempt.
+trusted evidence from the failed attempt. Both attempts share the original
+deadline. Session/controller shutdown and finalizer failure cannot enter the
+retry path. A second recoverable malformed result terminates with the fixed
+bounded classification; there is no retry loop.
 
 ## 13. Evidence-tool security
 

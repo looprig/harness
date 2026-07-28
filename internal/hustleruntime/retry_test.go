@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,6 +86,263 @@ func TestShouldRetryRequiresExplicitPolicyFirstAttemptAndLiveBudget(t *testing.T
 	if shouldRetry(hustle.RetryPolicyClassifiedOnce, 0, nil, validatorRun, false) {
 		t.Fatal("transient-looking validator failure retried")
 	}
+	malformedValidatorRun := &RunError{
+		Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference,
+		Cause: &OutputError{Cause: hustle.NewRecoverableTerminalValidationError()},
+	}
+	if shouldRetry(hustle.RetryPolicyClassifiedOnce, 0, nil, malformedValidatorRun, false) {
+		t.Fatal("terminal-validation marker at inference stage retried")
+	}
+	malformedInternalRun := &RunError{
+		Stage: hustle.StageOutput, ReasonCode: hustle.ReasonInternal,
+		Cause: &OutputError{Cause: hustle.NewRecoverableTerminalValidationError()},
+	}
+	if shouldRetry(hustle.RetryPolicyClassifiedOnce, 0, nil, malformedInternalRun, false) {
+		t.Fatal("terminal-validation marker with internal reason retried")
+	}
+}
+
+func TestStrictClassifierValidatorRetriesRecoverableWireShapeFailures(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		malformed string
+	}{
+		{name: "duplicate field", malformed: `{"decision":"approve","decision":"approve"}`},
+		{name: "unknown field", malformed: `{"decision":"approve","extra":true}`},
+		{name: "missing field", malformed: `{"reason":"safe"}`},
+	}
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			sessionID, loopID := mustRuntimeTestID(t), mustRuntimeTestID(t)
+			responses := []string{testCase.malformed, `{"decision":"approve"}`}
+			client := &runtimeTestClient{invoke: func(context.Context, inference.Request) (*inference.Response, error) {
+				response := responses[0]
+				responses = responses[1:]
+				return terminalEvidenceResponse(response, nil), nil
+			}}
+			definition := runtimeRetryEvidenceDefinition(t, client, time.Second, func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
+				return []tool.InvokableTool{newPreparedEvidenceTool("workspace_read", "ok")}, nil
+			})
+			controller := runtimeEvidenceController(t, sessionID, definition)
+			err := controller.RunAndFinalize(
+				context.Background(),
+				runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID),
+				strictClassifierWireValidator,
+				noOpFinalizer,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client.invocations.Load() != 2 {
+				t.Fatalf("invocations = %d, want one retry", client.invocations.Load())
+			}
+		})
+	}
+}
+
+func TestClassifierValidatorRetryBoundaryIsClosed(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		output    string
+		validator ValidateResult
+	}{
+		{name: "domain needs human", output: `{"decision":"needs_human"}`, validator: strictClassifierWireValidator},
+		{name: "domain deny", output: `{"decision":"deny"}`, validator: strictClassifierWireValidator},
+		{name: "basis mismatch", output: `{"decision":"approve"}`, validator: func(context.Context, hustle.Result) error {
+			return errors.New("basis_mismatch")
+		}},
+		{name: "arbitrary validator error", output: `{"decision":"approve"}`, validator: func(context.Context, hustle.Result) error {
+			return errors.New("decoder says retry")
+		}},
+		{name: "validator panic", output: `{"decision":"approve"}`, validator: func(context.Context, hustle.Result) error {
+			panic("provider output secret")
+		}},
+	}
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			sessionID, loopID := mustRuntimeTestID(t), mustRuntimeTestID(t)
+			client := &runtimeTestClient{invoke: func(context.Context, inference.Request) (*inference.Response, error) {
+				return terminalEvidenceResponse(testCase.output, nil), nil
+			}}
+			definition := runtimeRetryEvidenceDefinition(t, client, time.Second, func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
+				return []tool.InvokableTool{newPreparedEvidenceTool("workspace_read", "ok")}, nil
+			})
+			controller := runtimeEvidenceController(t, sessionID, definition)
+			_ = controller.RunAndFinalize(
+				context.Background(),
+				runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID),
+				testCase.validator,
+				noOpFinalizer,
+			)
+			if client.invocations.Load() != 1 {
+				t.Fatalf("invocations = %d, want no retry", client.invocations.Load())
+			}
+		})
+	}
+}
+
+func TestSecondRecoverableValidatorFailureStopsWithBoundedCause(t *testing.T) {
+	t.Parallel()
+
+	sessionID, loopID := mustRuntimeTestID(t), mustRuntimeTestID(t)
+	client := &runtimeTestClient{invoke: func(context.Context, inference.Request) (*inference.Response, error) {
+		return terminalEvidenceResponse(`{"decision":"approve","decoder_secret":"sensitive"}`, nil), nil
+	}}
+	definition := runtimeRetryEvidenceDefinition(t, client, time.Second, func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{newPreparedEvidenceTool("workspace_read", "ok")}, nil
+	})
+	controller := runtimeEvidenceController(t, sessionID, definition)
+	err := controller.RunAndFinalize(
+		context.Background(),
+		runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID),
+		func(context.Context, hustle.Result) error {
+			return hustle.NewRecoverableTerminalValidationError()
+		},
+		noOpFinalizer,
+	)
+	if client.invocations.Load() != 2 {
+		t.Fatalf("invocations = %d, want exactly two", client.invocations.Load())
+	}
+	if err == nil || strings.Contains(err.Error(), "sensitive") {
+		t.Fatalf("error = %v, want bounded classification without decoder/output text", err)
+	}
+	var runErr *RunError
+	if !errors.As(err, &runErr) {
+		t.Fatalf("error = %T %v, want RunError", err, err)
+	}
+	outputErr, ok := runErr.Cause.(*OutputError)
+	if !ok || !hustle.IsRecoverableTerminalValidationError(outputErr.Cause) {
+		t.Fatalf("cause = %T %v, want fixed recoverable terminal marker", runErr.Cause, runErr.Cause)
+	}
+}
+
+func TestRecoverableValidatorMarkerDoesNotEnableZeroRetryPolicy(t *testing.T) {
+	t.Parallel()
+
+	sessionID, loopID := mustRuntimeTestID(t), mustRuntimeTestID(t)
+	client := &runtimeTestClient{invoke: func(context.Context, inference.Request) (*inference.Response, error) {
+		return terminalEvidenceResponse(`{"unexpected":true}`, nil), nil
+	}}
+	definition := runtimeEvidenceDefinition(
+		t,
+		client,
+		runtimeEvidenceModel(),
+		func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
+			return []tool.InvokableTool{newPreparedEvidenceTool("workspace_read", "ok")}, nil
+		},
+		hustle.ToolLoopLimits{
+			MaxRounds: 2, MaxCalls: 2, MaxCallsPerRound: 1,
+			MaxResultBytes: 1024, MaxEvidenceBytes: 2048,
+		},
+	)
+	controller := runtimeEvidenceController(t, sessionID, definition)
+	_ = controller.RunAndFinalize(
+		context.Background(),
+		runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID),
+		func(context.Context, hustle.Result) error {
+			return hustle.NewRecoverableTerminalValidationError()
+		},
+		noOpFinalizer,
+	)
+	if client.invocations.Load() != 1 {
+		t.Fatalf("invocations = %d, want zero-policy single attempt", client.invocations.Load())
+	}
+}
+
+func TestRetryEnabledRunDoesNotRetrySessionShutdown(t *testing.T) {
+	t.Parallel()
+
+	sessionID, loopID := mustRuntimeTestID(t), mustRuntimeTestID(t)
+	invoked := make(chan struct{})
+	client := &runtimeTestClient{invoke: func(ctx context.Context, _ inference.Request) (*inference.Response, error) {
+		close(invoked)
+		<-ctx.Done()
+		return nil, &failure.NetworkError{Err: ctx.Err()}
+	}}
+	definition := runtimeRetryEvidenceDefinition(t, client, time.Second, func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{newPreparedEvidenceTool("workspace_read", "ok")}, nil
+	})
+	controller := runtimeEvidenceController(t, sessionID, definition)
+	request := runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID)
+	result := make(chan error, 1)
+	go func() {
+		result <- controller.RunAndFinalize(context.Background(), request, acceptResult, noOpFinalizer)
+	}()
+	<-invoked
+	if err := controller.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	err := <-result
+	var runErr *RunError
+	if !errors.As(err, &runErr) || runErr.ReasonCode != hustle.ReasonCanceled {
+		t.Fatalf("error = %T %v, want canceled run", err, err)
+	}
+	if client.invocations.Load() != 1 {
+		t.Fatalf("invocations = %d, want no shutdown retry", client.invocations.Load())
+	}
+	<-controller.Drained()
+}
+
+func TestRetryEnabledRunDoesNotRetryFinalizerFailure(t *testing.T) {
+	t.Parallel()
+
+	sessionID, loopID := mustRuntimeTestID(t), mustRuntimeTestID(t)
+	finalizerCause := errors.New("finalizer failure")
+	client := &runtimeTestClient{invoke: func(context.Context, inference.Request) (*inference.Response, error) {
+		return terminalEvidenceResponse(`{"decision":"approve"}`, nil), nil
+	}}
+	definition := runtimeRetryEvidenceDefinition(t, client, time.Second, func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{newPreparedEvidenceTool("workspace_read", "ok")}, nil
+	})
+	controller := runtimeEvidenceController(t, sessionID, definition)
+	err := controller.RunAndFinalize(
+		context.Background(),
+		runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID),
+		strictClassifierWireValidator,
+		func(context.Context, hustle.Outcome) error { return finalizerCause },
+	)
+	var finalizerErr *FinalizerError
+	if !errors.As(err, &finalizerErr) || !errors.Is(err, finalizerCause) {
+		t.Fatalf("error = %T %v, want finalizer failure", err, err)
+	}
+	if client.invocations.Load() != 1 {
+		t.Fatalf("invocations = %d, want no finalizer retry", client.invocations.Load())
+	}
+}
+
+func strictClassifierWireValidator(_ context.Context, result hustle.Result) error {
+	decoder := json.NewDecoder(strings.NewReader(string(result.Output)))
+	seenDecision := false
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return hustle.NewRecoverableTerminalValidationError()
+	}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return hustle.NewRecoverableTerminalValidationError()
+		}
+		if key != "decision" || seenDecision {
+			return hustle.NewRecoverableTerminalValidationError()
+		}
+		seenDecision = true
+		var decision string
+		if err := decoder.Decode(&decision); err != nil {
+			return hustle.NewRecoverableTerminalValidationError()
+		}
+	}
+	if _, err := decoder.Token(); err != nil || !seenDecision {
+		return hustle.NewRecoverableTerminalValidationError()
+	}
+	return nil
 }
 
 func TestClassifiedRetryRestartsFromImmutableInputAndFreshEvidenceCatalog(t *testing.T) {

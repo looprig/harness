@@ -1,6 +1,8 @@
 package hustle
 
 import (
+	"errors"
+	"fmt"
 	"strconv"
 	"testing"
 )
@@ -109,6 +111,31 @@ func TestRetryPolicyIsClosedAndZeroDisabled(t *testing.T) {
 	for _, policy := range []RetryPolicy{RetryPolicy(2), RetryPolicy(255)} {
 		if policy.Valid() {
 			t.Fatalf("RetryPolicy(%d).Valid() = true, want false", policy)
+		}
+	}
+}
+
+func TestRecoverableTerminalValidationErrorIsSealedAndBounded(t *testing.T) {
+	t.Parallel()
+
+	marker := NewRecoverableTerminalValidationError()
+	if marker == nil {
+		t.Fatal("NewRecoverableTerminalValidationError() = nil")
+	}
+	if got, want := marker.Error(), "hustle: recoverable malformed terminal output"; got != want {
+		t.Fatalf("marker error = %q, want %q", got, want)
+	}
+	if !IsRecoverableTerminalValidationError(marker) {
+		t.Fatal("marker was not recognized")
+	}
+	for _, err := range []error{
+		nil,
+		errors.New("hustle: recoverable malformed terminal output"),
+		fmt.Errorf("adapter context: %w", marker),
+		fmt.Errorf("recoverable: %w", errors.New("decoder secret")),
+	} {
+		if IsRecoverableTerminalValidationError(err) {
+			t.Fatalf("ordinary error %v was recognized as marker", err)
 		}
 	}
 }

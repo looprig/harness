@@ -316,6 +316,7 @@ func (r *runtimeController) executeSingle(ctx context.Context, definition hustle
 			reason = hustle.ReasonInternal
 			r.reportFault(panicErr)
 		}
+		err = normalizeValidatorError(err)
 		return hustle.Result{}, runtime, usage, executionError(name, runID, hustle.StageOutput, reason, executionCtx, &OutputError{Cause: err})
 	}
 	if err := executionCtx.Err(); err != nil {
@@ -490,6 +491,7 @@ func (r *runtimeController) executeEvidenceAttempt(
 					reason = hustle.ReasonInternal
 					r.reportFault(panicErr)
 				}
+				err = normalizeValidatorError(err)
 				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, reason, executionCtx, &OutputError{Cause: err})
 			}
 			if err := executionCtx.Err(); err != nil {
@@ -734,6 +736,13 @@ func callValidator(ctx context.Context, validate ValidateResult, result hustle.R
 		}
 	}()
 	return validate(ctx, result)
+}
+
+func normalizeValidatorError(err error) error {
+	if hustle.IsRecoverableTerminalValidationError(err) {
+		return hustle.NewRecoverableTerminalValidationError()
+	}
+	return err
 }
 
 func executionError(name hustle.Name, runID hustle.RunID, stage hustle.Stage, reason hustle.ReasonCode, ctx context.Context, cause error) *RunError {
