@@ -593,18 +593,45 @@ git commit -m "feat(gate): validate and combine classifier assessments"
 
 - Create: `pkg/event/permission_review.go`
 - Create: `pkg/event/permission_review_test.go`
+- Create: `pkg/event/permission_review_fuzz_test.go`
 - Modify: `pkg/event/validate.go`
 - Modify: `pkg/event/validate_internal_test.go`
 - Modify: `pkg/event/marshal.go`
 - Modify: `pkg/event/marshal_test.go`
+- Modify: `pkg/event/header_test.go`
 - Modify: `pkg/event/doc.go`
 
 **Step 1: Write failing event validation and codec tests**
 
-Specify the two events from design §16.2. Assert:
+Specify the two events from design §16.2:
 
-- correct enduring/private-or-public visibility chosen explicitly;
-- complete coordinates;
+```go
+type PermissionReviewStarted struct {
+    // enduring, loopScoped, Header
+    GateID             gate.ID
+    ToolExecutionID    uuid.UUID
+    Classifier         hustle.Name
+    ClassifierRevision string
+}
+
+type PermissionReviewCompleted struct {
+    // enduring, loopScoped, Header
+    GateID             gate.ID
+    ToolExecutionID    uuid.UUID
+    Classifier         hustle.Name
+    ClassifierRevision string
+    Status             gate.ReviewStatus
+    Risk               gate.ReviewRisk
+    Authorization      gate.ReviewAuthorization
+    Categories         []gate.ReviewRiskCategory
+    AutoApproved       bool
+}
+```
+
+Assert:
+
+- both are enduring, internal, loop-scoped, non-terminal events;
+- both require the full session/loop/turn/step coordinate quartet;
 - valid gate/tool/classifier/revision fields;
 - status-dependent fields;
 - bounded unique categories;
@@ -613,6 +640,29 @@ Specify the two events from design §16.2. Assert:
 - event union drift guards updated; and
 - reflection/JSON confirms there is no command, context, evidence, output,
   prompt, rationale, credential, rule, or grant field.
+
+Validation is exact:
+
+- visibility must be `Internal`;
+- gate ID, tool execution ID, classifier name, and classifier revision are
+  required;
+- classifier name uses `hustle.Name.Validate`; revision is valid UTF-8,
+  non-blank, and at most `gate.MaxPermissionClassifierRevisionBytes`;
+- completed status must be one of the closed `gate.ReviewStatus` values;
+- `allowed` requires valid risk and authorization, valid unique categories,
+  and `AutoApproved=true`;
+- `needs_human` requires valid risk and authorization, valid unique categories,
+  and `AutoApproved=false`; and
+- `not_applicable`, `timed_out`, `failed`, `cancelled`, and `stale` require
+  zero risk/authorization, no categories, and `AutoApproved=false`.
+
+The wire uses exact discriminators `PermissionReviewStarted` and
+`PermissionReviewCompleted` and snake-case field names. Add both types to every
+sealed-union/class/scope/terminal/visibility/identity/marshal/decode drift guard.
+The existing event envelope's additive unknown-field compatibility remains
+unchanged; do not make the global decoder stricter as part of this task.
+Add fuzz seeds for both discriminators and assert decode never panics; every
+successful decode validates and remarshal/redecode is a fixed point.
 
 **Step 2: Verify RED**
 
