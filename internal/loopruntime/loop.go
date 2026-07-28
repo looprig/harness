@@ -538,6 +538,9 @@ type loopState struct {
 	hasContext        bool
 	contextTracker    contextTracker
 	contextGeneration uint64
+	turnHookCall      hook.Call
+	turnHookFinish    hook.FinishFunc
+	turnHookCtx       context.Context
 
 	// effective is the loop's CURRENT turn-affecting configuration (mode/model/effort/
 	// system/tools). startTurn captures a copy of it into the per-turn turnConfig, so a
@@ -1106,12 +1109,12 @@ func runLoop(cfg loopConfig, state loopState) {
 	// derived turn ctx and the defensive base clone the per-turn goroutine reads.
 	// This is the live-commit half of starting a turn (distinct from
 	// assembling the per-turn turnConfig).
-	installActiveTurn := func(turnID uuid.UUID, qi queuedInput) (context.Context, content.AgenticMessages) {
+	installActiveTurn := func(parentCtx context.Context, turnID uuid.UUID, qi queuedInput) (context.Context, content.AgenticMessages) {
 		state.turnIndex++
 		state.turnID = turnID
 		state.causationID = qi.inputID
 		state.status = loopRunning
-		turnCtx, cancel := context.WithCancel(ctx)
+		turnCtx, cancel := context.WithCancel(parentCtx)
 		state.cancelTurn = cancel
 
 		// base is a defensive deep clone of pre-turn history, taken BEFORE the
@@ -1273,6 +1276,9 @@ func runLoop(cfg loopConfig, state loopState) {
 			tools:                   state.effective.tools,
 			output:                  cloneOutputSchema(config.Output),
 			client:                  config.Client,
+			hooks:                   config.Hooks,
+			agentName:               config.AgentName,
+			now:                     config.now,
 			gateReg:                 gateReg,
 			idGen:                   config.idGen,
 			admit:                   admit,
@@ -1319,17 +1325,36 @@ func runLoop(cfg loopConfig, state loopState) {
 			TurnIndex: state.turnIndex + 1,
 			Message:   cloneUserMessage(qi.msg),
 		}
+		turnCall := hook.Call{
+			Operation:   hook.OperationTurn,
+			StartedAt:   hookNow(config.now),
+			Coordinates: started.Coordinates,
+			AgentName:   config.AgentName,
+			Cause:       started.Cause,
+			Turn: &hook.TurnData{
+				Index: started.TurnIndex,
+				Input: started.Message,
+			},
+		}
+		turnHookCtx, turnHookFinish, hookErr := config.Hooks.Start(ctx, turnCall)
+		if hookErr != nil {
+			finishHook(turnHookFinish, turnCall, hookOutcome(ctx, hookErr), hookErr)
+			return uuid.UUID{}, safeHookError(hook.OperationTurn, hookErr)
+		}
 		stamped, err := stamp(started)
 		if err != nil {
+			finishHook(turnHookFinish, turnCall, hook.OutcomeFailed, err)
 			return uuid.UUID{}, err
 		}
 		started = stamped.(event.TurnStarted)
 		mutation, err := preflightContextMutation(state.contextTracker, state.contextGeneration, started.EventID, contextMutationHistory)
 		if err != nil {
+			finishHook(turnHookFinish, turnCall, hook.OutcomeFailed, err)
 			return uuid.UUID{}, err
 		}
 		committed, publishErr := publishTurnStarted(started, capability)
 		if !committed {
+			finishHook(turnHookFinish, turnCall, hookOutcome(turnHookCtx, publishErr), publishErr)
 			return uuid.UUID{}, publishErr
 		}
 		mutation.commit(&state.contextTracker, &state.contextGeneration)
@@ -1339,7 +1364,10 @@ func runLoop(cfg loopConfig, state loopState) {
 			idleCompaction = nil
 			finalizeIdleCompactionRejection(preparation, event.CompactRejectStaleBasis)
 		}
-		turnCtx, base := installActiveTurn(turnID, qi)
+		turnCtx, base := installActiveTurn(turnHookCtx, turnID, qi)
+		state.turnHookCall = turnCall
+		state.turnHookFinish = turnHookFinish
+		state.turnHookCtx = turnCtx
 		idx := state.turnIndex
 		cancel := state.cancelTurn
 		if publishErr != nil {
@@ -1353,6 +1381,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		ts := newTurnState(state.sessionID, state.id, turnID, idx, state.causationID, qi.msg)
 		turnCfg := buildTurnConfig(base, firstAdmission)
+		turnCfg.cause = started.Cause
 
 		go func() {
 			defer cancel()
@@ -1767,6 +1796,21 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		return startNextQueued(endedTurnID)
 	}
+	finishActiveTurnHook := func(terminal event.Event, boundaryErr error) {
+		turnErr := terminalHookError(terminal)
+		if boundaryErr != nil {
+			turnErr = boundaryErr
+		}
+		finishHook(
+			state.turnHookFinish,
+			state.turnHookCall,
+			hookOutcome(state.turnHookCtx, turnErr),
+			turnErr,
+		)
+		state.turnHookCall = hook.Call{}
+		state.turnHookFinish = nil
+		state.turnHookCtx = nil
+	}
 
 	// handleTurnResult is the actor's response to a turn goroutine's terminal
 	// hand-back (the `case result := <-internal` select arm, extracted so the select
@@ -1793,6 +1837,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		if boundaryErr != nil {
 			slog.Error("turn boundary commit failed", "error", boundaryErr)
 		}
+		finishActiveTurnHook(result.terminal, boundaryErr)
 		state.turnID = uuid.UUID{}
 		state.causationID = uuid.UUID{}
 		// A finished turn must not leave stale gates: the parked runners have already
@@ -2692,12 +2737,15 @@ func runLoop(cfg loopConfig, state loopState) {
 				// wedged there and would never have produced a terminal anyway.
 				select {
 				case result := <-internal:
-					if _, err := commitBoundary(result.terminal); err != nil {
-						slog.Error("turn boundary commit failed during loop cancellation", "error", err)
+					_, boundaryErr := commitBoundary(result.terminal)
+					if boundaryErr != nil {
+						slog.Error("turn boundary commit failed during loop cancellation", "error", boundaryErr)
 					}
+					finishActiveTurnHook(result.terminal, boundaryErr)
 				case <-time.After(config.DrainTimeout):
 					slog.Error("turn goroutine did not drain after ctx cancel; detaching",
 						"timeout", config.DrainTimeout)
+					finishActiveTurnHook(nil, ctx.Err())
 				}
 			}
 			// Defensive: the loop is exiting, but drop any gates so no detached path
