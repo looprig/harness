@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
@@ -151,6 +153,60 @@ func WithGateCaps(caps GateCaps) Option {
 	return func(s *Session) {
 		s.gateCaps = caps
 	}
+}
+
+// withPermissionReview configures the session-wide permission-classifier
+// registry and review policy, mirroring withSessionHustles
+// (internal/sessionruntime/hustle.go) for automatic permission review rather
+// than compaction/summarization Hustles. It is private: wiring a real
+// classifier set from a consumer's rig.WithPermissionClassifiers call into
+// this option is Task 16/Phase 6 work, not this seam's.
+//
+// A zero classifiers set (the default when this option is never applied)
+// leaves StartPermissionReview a no-op, so any session that does not opt in
+// keeps the exact pre-Task-14 gate lifecycle.
+func withPermissionReview(classifiers gate.PermissionClassifierSet, policy gate.PermissionReviewPolicy) Option {
+	return func(s *Session) {
+		s.permissionClassifiers = classifiers
+		s.permissionReviewPolicy = policy
+	}
+}
+
+// StartPermissionReview implements the loop actor's private permissionReviewStarter
+// seam (internal/loopruntime/gate.go): the ONLY thing the actor calls, inline
+// and fire-and-forget, after a gatePermission registration activates and the
+// runner has been acked (design §14.2/§14.3). It MUST return promptly — the
+// actor never wraps this call in a goroutine of its own, so classifier
+// inference is moved onto a fresh goroutine here (`go adapter.review(...)`)
+// before this method returns.
+//
+// StartPermissionReview no-ops (starts no review) whenever:
+//   - no permission classifiers are configured for this session
+//     (s.permissionClassifiers is the zero PermissionClassifierSet); or
+//   - the session's shared Hustle runtime is not yet bound
+//     (s.hustleController == nil — cannot happen once a session has finished
+//     construction, but is checked rather than assumed); or
+//   - the classifier/policy configuration itself is invalid
+//     (newPermissionReviewAdapter's own validation).
+//
+// Every one of those is a "nothing to review" outcome, never a denial or an
+// approval: this method has no path to RespondGate at all (see
+// permissionReviewAdapter's type doc), so the human gate this handoff
+// accompanies is always preserved regardless of what happens here.
+func (s *Session) StartPermissionReview(ctx context.Context, req loopruntime.PermissionReviewRequest) {
+	if len(s.permissionClassifiers.Classifiers()) == 0 {
+		return
+	}
+	if s.hustleController == nil {
+		return
+	}
+	adapter, err := newPermissionReviewAdapter(s.hustleController, s.permissionClassifiers, s.permissionReviewPolicy)
+	if err != nil {
+		slog.Warn("sessionruntime: permission review adapter misconfigured; starting no review",
+			"gate_id", req.GateID, "error", err)
+		return
+	}
+	go adapter.review(ctx, req)
 }
 
 // PrepareGateOpen durably commits the public envelope plus private payload as a

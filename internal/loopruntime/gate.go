@@ -39,6 +39,61 @@ type gateRegistrar interface {
 	CloseGate(ctx context.Context, id gatedomain.ID, reason gatedomain.CloseReason) error
 }
 
+// PermissionReviewRequest is the live-only handoff the actor gives a session's
+// review starter once a permission gate's GateOpened has committed and the
+// runner has been acked (design §14.3). It carries exactly what a classifier
+// needs to build a PermissionReviewSubject and nothing a durable record or
+// event may not: no raw tool arguments beyond what the human-facing gate
+// already displays, and no token or grant material. ReviewContext already
+// carries the loop/session/turn/step coordinates plus the gate policy
+// revision and security ceiling in effect when the batch was captured
+// (internal/loopruntime/review_context.go); a zero ReviewContext
+// (ContextRevision == "") means no live review was configured for this turn,
+// and a review starter must treat that as "nothing to review" rather than
+// guessing at defaults.
+type PermissionReviewRequest struct {
+	GateID          gatedomain.ID
+	ToolExecutionID uuid.UUID
+	Request         tool.Request
+	ReviewContext   gatedomain.ReviewContext
+}
+
+// permissionReviewStarter is the narrow, private seam a session-side adapter
+// implements to begin asynchronous permission-classifier review after a
+// gatePermission registration activates. It is obtained via the same optional
+// type-assertion pattern as gateRegistrar (NewLoop's `events.(gateRegistrar)`):
+// a publisher that does not implement it simply never starts review, which
+// keeps every headless/test path that predates this seam unchanged.
+//
+// StartPermissionReview MUST return promptly. The actor calls it inline, on
+// its own single-threaded event-loop goroutine, and does not wrap the call in
+// a goroutine of its own — the contract is "kick off async work and return",
+// not "compute a result". An implementation that blocks on classifier
+// inference here blocks the whole loop actor; the session-side adapter is
+// responsible for moving inference onto its own goroutine before returning.
+type permissionReviewStarter interface {
+	StartPermissionReview(ctx context.Context, req PermissionReviewRequest)
+}
+
+// permissionRequestFromPayload narrows a gate.Payload to the displayed
+// tool.Request a gatePermission registration always carries. A payload that is
+// not a PermissionPayload (or a nil one) reports false rather than a zero
+// Request the caller could mistake for a genuinely empty prepared request —
+// fail-closed: no valid payload means no review starts.
+func permissionRequestFromPayload(payload gatedomain.Payload) (tool.Request, bool) {
+	switch v := payload.(type) {
+	case gatedomain.PermissionPayload:
+		return v.Request, true
+	case *gatedomain.PermissionPayload:
+		if v == nil {
+			return tool.Request{}, false
+		}
+		return v.Request, true
+	default:
+		return tool.Request{}, false
+	}
+}
+
 type nopGateRegistrar struct{}
 
 func (nopGateRegistrar) PrepareGateOpen(_ context.Context, _ uuid.UUID, g gatedomain.Gate, _ gatedomain.Payload) (gatedomain.ID, error) {

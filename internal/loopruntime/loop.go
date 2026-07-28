@@ -149,6 +149,14 @@ type loopConfig struct {
 	// only an eventPublisher use nopGateRegistrar.
 	gates gateRegistrar
 
+	// reviewStarter is the session-owned permission-review seam (nil unless the
+	// events publisher also implements permissionReviewStarter). The actor calls
+	// it, fire-and-forget, immediately after a gatePermission registration
+	// activates — see the gateReg case in runLoop. A nil reviewStarter (headless
+	// mode, or a publisher that never opted in) starts no review, preserving the
+	// exact pre-Task-14 gate lifecycle.
+	reviewStarter permissionReviewStarter
+
 	// bound is the immutable loop definition the actor validates a SetLoopMode against
 	// (resolving the target mode's model/effort/tools/instructions). It is nil for the
 	// raw-config test path (newWithConfig): a nil bound has no predeclared modes, so every
@@ -342,6 +350,10 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	if !ok {
 		gates = nopGateRegistrar{}
 	}
+	// reviewStarter is optional: most events publishers (headless mode, or a
+	// session build without permission classifiers configured) do not implement
+	// it, and a failed assertion simply leaves it nil.
+	reviewStarter, _ := events.(permissionReviewStarter)
 	commands := make(chan command.Command)
 	priorityCommands := make(chan command.Command, compactionPriorityCommandCapacity)
 	contextRequests := make(chan contextMeasureRequest)
@@ -377,6 +389,7 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		events:           events,
 		eventFactory:     cfg.eventFactory,
 		gates:            gates,
+		reviewStarter:    reviewStarter,
 		bound:            bound,
 	}
 	state := newLoopState(sessionID, loopID, parent)
@@ -2176,6 +2189,24 @@ func runLoop(cfg loopConfig, state loopState) {
 				break
 			}
 			reg.ack <- gateInstallAck{gateID: gateID}
+
+			// Automatic review begins only after GateOpened has committed and the
+			// runner has been acked (design §14.2/§14.3): the human can answer
+			// immediately, there is no invisible review-only wait, and activation
+			// failure (handled above, before the ack) can never start a review.
+			// StartPermissionReview must return promptly — the actor calls it
+			// inline and moves on to the next select iteration without waiting on
+			// classifier inference.
+			if reg.kind == gatePermission && cfg.reviewStarter != nil {
+				if req, ok := permissionRequestFromPayload(reg.payload); ok {
+					cfg.reviewStarter.StartPermissionReview(ctx, PermissionReviewRequest{
+						GateID:          gateID,
+						ToolExecutionID: callID,
+						Request:         req,
+						ReviewContext:   reg.reviewContext,
+					})
+				}
+			}
 
 		case req := <-snapshots:
 			// Committed-state query: the actor is the SOLE owner of loopState.msgs +

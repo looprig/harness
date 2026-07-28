@@ -111,6 +111,21 @@ type Session struct {
 	hustleController  *hustleruntime.Controller
 	hustlesBound      bool
 
+	// permissionClassifiers and permissionReviewPolicy are immutable
+	// construction inputs set by withPermissionReview (internal/sessionruntime/
+	// gates.go). A zero PermissionClassifierSet (the default: no classifiers
+	// configured) means StartPermissionReview starts no review — the exact
+	// pre-Task-14 gate lifecycle is unchanged for any session that does not opt
+	// in. Unlike hustleDefinitions/hustleController, there is no separate
+	// "bind" step: StartPermissionReview builds a permissionReviewAdapter
+	// on demand from these fields plus the already-bound s.hustleController,
+	// mirroring compactorFor's on-demand construction (internal/sessionruntime/
+	// compaction_adapter.go) rather than hustleController's eager one, because
+	// review is session-wide (one registry for every loop) rather than
+	// per-loop.
+	permissionClassifiers  gate.PermissionClassifierSet
+	permissionReviewPolicy gate.PermissionReviewPolicy
+
 	// limits are the in-session subagent-spawn safety caps NewLoop enforces (depth +
 	// quota). Defaulted in newSession (withDefaults) so the live values are always
 	// positive caps, and overridable via WithLimits. Read under loopsMu inside NewLoop's
