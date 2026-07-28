@@ -430,6 +430,101 @@ func TestPermissionReviewSubjectRejectsContextBeyondBuilderHardBounds(t *testing
 	}
 }
 
+func TestPermissionReviewSubjectEnforcesReconstructedOriginalEntryCount(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		omittedEntries int
+		wantErr        bool
+	}{
+		{
+			name:           "exact",
+			omittedEntries: gate.MaxReviewContextInputEntries - 2,
+		},
+		{
+			name:           "one over",
+			omittedEntries: gate.MaxReviewContextInputEntries - 1,
+			wantErr:        true,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			basis, request, context := validPermissionReviewSubjectInput()
+			addPermissionReviewOmission(&context, tt.omittedEntries, 0)
+			got, err := gate.NewPermissionReviewSubject(basis, request, context)
+			if tt.wantErr {
+				if err == nil || !reflect.DeepEqual(got, gate.PermissionReviewSubject{}) {
+					t.Fatalf("NewPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+				}
+				assertReviewSubjectOutOfBounds(t, err, gate.ReviewValidationFieldContextEntry)
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewPermissionReviewSubject() exact bound error = %v", err)
+			}
+		})
+	}
+}
+
+func TestPermissionReviewSubjectEnforcesReconstructedOriginalRawInputBytes(t *testing.T) {
+	t.Parallel()
+
+	basis, request, base := validPermissionReviewSubjectInput()
+	// Two omitted entries can genuinely carry the near-4 MiB content total
+	// while each remains within the builder's 2 MiB per-entry input ceiling.
+	const omittedEntries = 2
+	retainedRawBytes := len(base.ContextRevision) +
+		len(base.WorkspaceRoot) +
+		len(base.WorkingDirectory) +
+		len(base.RetryReason) +
+		len(base.SecurityCeiling) +
+		len(base.GatePolicyRevision) +
+		len(base.GatePolicyRevision)
+	for _, entry := range base.Entries {
+		retainedRawBytes += len(entry.Origin) + len(entry.Kind) + len(entry.Content)
+	}
+	minimumOmittedLabelBytes := minimumOriginalReviewContextEntryLabelBytesForTest()
+	exactOmittedBytes := gate.MaxReviewContextInputBytes -
+		retainedRawBytes -
+		minimumOmittedLabelBytes*omittedEntries
+	if exactOmittedBytes <= 0 {
+		t.Fatalf("test setup exact omitted bytes = %d, want positive", exactOmittedBytes)
+	}
+
+	tests := []struct {
+		name         string
+		omittedBytes int
+		wantErr      bool
+	}{
+		{name: "exact", omittedBytes: exactOmittedBytes},
+		{name: "one over", omittedBytes: exactOmittedBytes + 1, wantErr: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			context := base.Clone()
+			addPermissionReviewOmission(&context, omittedEntries, tt.omittedBytes)
+			got, err := gate.NewPermissionReviewSubject(basis, request, context)
+			if tt.wantErr {
+				if err == nil || !reflect.DeepEqual(got, gate.PermissionReviewSubject{}) {
+					t.Fatalf("NewPermissionReviewSubject() = (%#v, %v), want zero, error", got, err)
+				}
+				assertReviewSubjectOutOfBounds(t, err, gate.ReviewValidationFieldContextEntry)
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewPermissionReviewSubject() exact bound error = %v", err)
+			}
+		})
+	}
+}
+
 func TestPermissionReviewSubjectEnforcesEveryContextRootFieldHardBound(t *testing.T) {
 	t.Parallel()
 
@@ -767,4 +862,65 @@ func validPermissionReviewSubjectInput() (gate.ReviewBasis, tool.Request, gate.R
 		SecurityCeiling:    context.SecurityCeiling,
 	}
 	return basis, request, context
+}
+
+func addPermissionReviewOmission(
+	context *gate.ReviewContext,
+	omittedEntries int,
+	omittedBytes int,
+) {
+	context.Entries = append([]gate.ReviewContextEntry{{
+		Origin: gate.ReviewContextOriginOmission,
+		Kind:   gate.ReviewContextKindOmission,
+		Content: "omitted_entries=" + strconv.Itoa(omittedEntries) +
+			" omitted_bytes=" + strconv.Itoa(omittedBytes),
+	}}, context.Entries...)
+	context.Truncation = gate.ReviewTruncation{
+		Applied:        gate.ReviewTruncationEntryCount,
+		Material:       gate.ReviewTruncationEntryCount,
+		OmittedEntries: omittedEntries,
+		OmittedBytes:   omittedBytes,
+	}
+}
+
+func minimumOriginalReviewContextEntryLabelBytesForTest() int {
+	pairs := []struct {
+		origin gate.ReviewContextOrigin
+		kind   gate.ReviewContextKind
+	}{
+		{gate.ReviewContextOriginUser, gate.ReviewContextKindUserMessage},
+		{gate.ReviewContextOriginAssistant, gate.ReviewContextKindAssistantMessage},
+		{gate.ReviewContextOriginAssistant, gate.ReviewContextKindAssistantToolRequest},
+		{gate.ReviewContextOriginTool, gate.ReviewContextKindToolResult},
+		{gate.ReviewContextOriginRuntime, gate.ReviewContextKindRuntimeContext},
+		{gate.ReviewContextOriginExternal, gate.ReviewContextKindExternalContent},
+	}
+	minimum := len(pairs[0].origin) + len(pairs[0].kind)
+	for _, pair := range pairs[1:] {
+		size := len(pair.origin) + len(pair.kind)
+		if size < minimum {
+			minimum = size
+		}
+	}
+	return minimum
+}
+
+func assertReviewSubjectOutOfBounds(
+	t *testing.T,
+	err error,
+	wantField gate.ReviewValidationField,
+) {
+	t.Helper()
+
+	var validationErr *gate.ReviewValidationError
+	if !errors.As(err, &validationErr) ||
+		validationErr.Field != wantField ||
+		validationErr.Reason != gate.ReviewValidationOutOfBounds {
+		t.Fatalf(
+			"error = %#v, want field %q reason %q",
+			validationErr,
+			wantField,
+			gate.ReviewValidationOutOfBounds,
+		)
+	}
 }

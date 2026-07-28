@@ -182,6 +182,10 @@ func validateBuiltReviewContext(context ReviewContext) error {
 		context.RetryReason,
 		context.SecurityCeiling,
 		context.GatePolicyRevision,
+		// BuildReviewContext preflights policy.Revision separately. The built
+		// context binds that revision as GatePolicyRevision, so account for
+		// the original policy input here as well.
+		context.GatePolicyRevision,
 	}
 	totalInputBytes := 0
 	for _, value := range rootText {
@@ -237,25 +241,27 @@ func validateBuiltReviewContext(context ReviewContext) error {
 				ReviewValidationOutOfBounds,
 			)
 		}
-		for _, size := range []int{
-			len(entry.Origin),
-			len(entry.Kind),
-			len(entry.Content),
-		} {
-			var ok bool
-			totalInputBytes, ok = checkedReviewContextAdd(totalInputBytes, size)
-			if !ok || totalInputBytes > MaxReviewContextInputBytes {
-				return reviewContextError(
-					ReviewValidationFieldContextEntry,
-					ReviewValidationOutOfBounds,
-				)
-			}
-		}
 		if !utf8.ValidString(string(entry.Origin)) ||
 			!utf8.ValidString(string(entry.Kind)) ||
 			!utf8.ValidString(entry.Content) ||
 			!validReviewContextPair(entry.Origin, entry.Kind) {
 			return reviewContextError(ReviewValidationFieldContextEntry, ReviewValidationInvalid)
+		}
+		if entry.Kind != ReviewContextKindOmission {
+			for _, size := range []int{
+				len(entry.Origin),
+				len(entry.Kind),
+				len(entry.Content),
+			} {
+				var ok bool
+				totalInputBytes, ok = checkedReviewContextAdd(totalInputBytes, size)
+				if !ok || totalInputBytes > MaxReviewContextInputBytes {
+					return reviewContextError(
+						ReviewValidationFieldContextEntry,
+						ReviewValidationOutOfBounds,
+					)
+				}
+			}
 		}
 		switch entry.Kind {
 		case ReviewContextKindUserMessage:
@@ -312,7 +318,93 @@ func validateBuiltReviewContext(context ReviewContext) error {
 			(context.Truncation.Material != 0 || hasOmissions || truncatedEntries > 0) {
 		return reviewContextError(ReviewValidationFieldContext, ReviewValidationInvalid)
 	}
+	if err := validateReconstructedReviewContextInputBounds(
+		context,
+		omissions,
+		totalInputBytes,
+	); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateReconstructedReviewContextInputBounds(
+	context ReviewContext,
+	omissions int,
+	retainedInputBytes int,
+) error {
+	retainedEntries := len(context.Entries) - omissions
+	originalEntries, ok := checkedReviewContextAdd(
+		retainedEntries,
+		context.Truncation.OmittedEntries,
+	)
+	if !ok || originalEntries > MaxReviewContextInputEntries {
+		return reviewContextError(
+			ReviewValidationFieldContextEntry,
+			ReviewValidationOutOfBounds,
+		)
+	}
+
+	originalInputBytes, ok := checkedReviewContextAdd(
+		retainedInputBytes,
+		context.Truncation.OmittedBytes,
+	)
+	if !ok || originalInputBytes > MaxReviewContextInputBytes {
+		return reviewContextError(
+			ReviewValidationFieldContextEntry,
+			ReviewValidationOutOfBounds,
+		)
+	}
+	minimumLabelBytes, ok := minimumOriginalReviewContextEntryLabelBytes()
+	if !ok {
+		return reviewContextError(
+			ReviewValidationFieldContextEntry,
+			ReviewValidationInvalid,
+		)
+	}
+	for omitted := 0; omitted < context.Truncation.OmittedEntries; omitted++ {
+		originalInputBytes, ok = checkedReviewContextAdd(
+			originalInputBytes,
+			minimumLabelBytes,
+		)
+		if !ok || originalInputBytes > MaxReviewContextInputBytes {
+			return reviewContextError(
+				ReviewValidationFieldContextEntry,
+				ReviewValidationOutOfBounds,
+			)
+		}
+	}
+	return nil
+}
+
+func minimumOriginalReviewContextEntryLabelBytes() (int, bool) {
+	pairs := [...]struct {
+		origin ReviewContextOrigin
+		kind   ReviewContextKind
+	}{
+		{ReviewContextOriginUser, ReviewContextKindUserMessage},
+		{ReviewContextOriginAssistant, ReviewContextKindAssistantMessage},
+		{ReviewContextOriginAssistant, ReviewContextKindAssistantToolRequest},
+		{ReviewContextOriginTool, ReviewContextKindToolResult},
+		{ReviewContextOriginRuntime, ReviewContextKindRuntimeContext},
+		{ReviewContextOriginExternal, ReviewContextKindExternalContent},
+	}
+	minimum := 0
+	for _, pair := range pairs {
+		if !validReviewContextPair(pair.origin, pair.kind) ||
+			pair.origin == ReviewContextOriginOmission ||
+			pair.kind == ReviewContextKindOmission {
+			return 0, false
+		}
+		size, ok := checkedReviewContextAdd(len(pair.origin), len(pair.kind))
+		if !ok {
+			return 0, false
+		}
+		if minimum == 0 || size < minimum {
+			minimum = size
+		}
+	}
+	return minimum, minimum > 0
 }
 
 const reviewBudgetTruncationMask = ReviewTruncationEntryCount |
