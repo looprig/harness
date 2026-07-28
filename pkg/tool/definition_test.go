@@ -397,14 +397,6 @@ func (*delegateStub) Execute(context.Context, tool.DelegateRequest) (tool.Delega
 	return tool.DelegateResult{}, nil
 }
 
-type sessionResourceStub struct{}
-
-func (*sessionResourceStub) Activate(context.Context, tool.SessionResourceServices) error {
-	return nil
-}
-
-func (*sessionResourceStub) Shutdown(context.Context) error { return nil }
-
 type sessionResourceRegistryStub struct{}
 
 func (*sessionResourceRegistryStub) GetOrCreate(

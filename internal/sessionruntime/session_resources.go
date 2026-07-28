@@ -287,17 +287,26 @@ func ensureSessionResourceAnchor(root string, id uuid.UUID, identity string, res
 		}
 		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: anchorPath, Cause: err}
 	}
-	directory, err := os.Open(root)
+	rootHandle, err := os.OpenRoot(root)
 	if err != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: err}
+	}
+	directory, err := rootHandle.Open(".")
+	if err != nil {
+		_ = rootHandle.Close()
 		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: err}
 	}
 	syncErr := directory.Sync()
 	closeErr := directory.Close()
+	rootCloseErr := rootHandle.Close()
 	if syncErr != nil {
 		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: syncErr}
 	}
 	if closeErr != nil {
 		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: closeErr}
+	}
+	if rootCloseErr != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: root, Cause: rootCloseErr}
 	}
 	return nil
 }
@@ -314,7 +323,12 @@ func validateSessionResourceAnchor(path string, id uuid.UUID, identity string) e
 		info.Mode().Perm()&0o077 != 0 || info.Size() <= 0 || info.Size() > 1024 {
 		return &SessionResourceStorageError{Kind: SessionResourceStorageAnchorCorrupt, Path: path}
 	}
-	file, err := os.Open(path)
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: path, Cause: err}
+	}
+	defer root.Close()
+	file, err := root.Open(filepath.Base(path))
 	if err != nil {
 		return &SessionResourceStorageError{Kind: SessionResourceStorageUnavailable, Path: path, Cause: err}
 	}
@@ -516,7 +530,9 @@ func (r *sessionResources) GetOrCreate(
 		activateHere := r.finishCreation(key, entry, resource, createErr)
 		if activateHere {
 			activateErr := entry.activate(ctx, r.servicesForActivation())
-			r.finishActivation(entry, activateErr, ctx)
+			if finishErr := r.finishActivation(entry, activateErr, ctx); finishErr != nil {
+				return nil, finishErr
+			}
 		}
 		return r.awaitResource(ctx, entry)
 	}
