@@ -512,9 +512,11 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// every accepted inbox entry (ctx-cancellable), append each to the staged turn
 		// AFTER the tool results, and commit a TurnFoldedInto for it. A no-tool final
 		// answer (handled above) never reaches here, so folding cannot extend a turn
-		// past the model's final answer.
+		// past the model's final answer. The Step scope is already finished above:
+		// fold under the still-active Turn context so a finish callback that releases
+		// its derived Step context cannot cancel or mis-parent TurnFoldedInto.
 		stagedBeforeFold := len(ts.msgs)
-		if ferr := foldPending(stepCtx, cfg, &ts); ferr != nil {
+		if ferr := foldPending(ctx, cfg, &ts); ferr != nil {
 			// The drain or a fold commit was cancelled (Interrupt/Shutdown) before it
 			// completed: treat as interrupt. Committed steps + any already-committed
 			// folds stay in loopState.msgs; the actor returns the rest of the inbox and
