@@ -411,10 +411,13 @@ Strict built-context validation accepts only values the v1 builder can emit:
 - every truncated entry contains exactly one fixed truncation marker with
   non-empty UTF-8 prefix and suffix;
 - truncated current-user, tool-result, runtime, external, and earlier
-  assistant-tool-request entries have the corresponding applied bit marked
-  material;
-- one omission marker has positive counters and matching budget bits in both
-  `Applied` and `Material`; and
+  assistant-tool-request entries have every exercised compatible applied bit
+  marked material;
+- every non-budget applied bit is explained by at least one truncated entry,
+  and the active-action bit is never valid in a successfully built subject;
+- one omission marker has a positive omitted-entry count, an exact nonnegative
+  omitted-byte count, and matching budget bits in both `Applied` and
+  `Material`; and
 - masks/counters/markers cannot underreport one another.
 
 **Step 4: Add fuzz seeds and invariants**

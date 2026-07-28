@@ -421,7 +421,10 @@ material; a later revision may safely distinguish non-material omission only
 with additional typed, validated provenance. The final active assistant tool
 request is never truncatable. Every other truncated entry must carry the fixed
 prefix/suffix marker and a material bit whenever its authority kind can contain
-current intent or required evidence.
+current intent or required evidence. Every applied non-budget mask bit must be
+explained by an actual truncated entry; the active-action bit cannot appear in
+a successfully built v1 context. Omission requires a positive entry count, but
+its exact omitted-byte count may be zero when omitted entries were empty.
 
 ### 8.5 Subject
 
