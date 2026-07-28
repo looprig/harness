@@ -183,7 +183,7 @@ func (e *compactionExecutor) AwaitCompaction(ctx context.Context, attemptID even
 		e.mu.Unlock()
 		rejected := rejectedCompactionResult(event.CompactRejectCanceled)
 		rejected.Proposal.hookScope = run.scope
-		run.scope.setTerminal(hook.OutcomeCanceled, context.Canceled, nil)
+		run.scope.sealExecutorTerminal(hook.OutcomeCanceled, context.Canceled, nil)
 		return rejected, nil
 	}
 }
@@ -202,7 +202,7 @@ func (e *compactionExecutor) execute(
 		panicErr := &operationHookPanicError{Operation: hook.OperationCompaction}
 		rejected := rejectedCompactionResultWithError(event.CompactRejectInternal, panicErr)
 		rejected.Proposal.hookScope = scope
-		scope.setTerminal(hook.OutcomeFailed, panicErr, nil)
+		scope.setExecutorTerminal(hook.OutcomeFailed, panicErr, nil)
 		completed = compactionExecutionResult{outcome: rejected}
 	}()
 	if input == nil {
@@ -241,7 +241,7 @@ func setCompactionScopeTerminal(scope *compactionHookScope, ctx context.Context,
 	}
 	if result.Disposition == contextCompactionAwaitCommitted && result.Proposal.Success != nil {
 		success := result.Proposal.Success
-		scope.setTerminal(hook.OutcomeCompleted, nil, &loop.CompactionOutput{
+		scope.setExecutorTerminal(hook.OutcomeCompleted, nil, &loop.CompactionOutput{
 			Basis: scope.call.Compaction.Input.Basis, Model: success.Model,
 			RequestFingerprint: success.RequestFingerprint, Summary: cloneUserMessage(success.Summary),
 		})
@@ -252,13 +252,13 @@ func setCompactionScopeTerminal(scope *compactionHookScope, ctx context.Context,
 		if err == nil {
 			err = context.Canceled
 		}
-		scope.setTerminal(hook.OutcomeCanceled, err, nil)
+		scope.setExecutorTerminal(hook.OutcomeCanceled, err, nil)
 		return
 	}
 	if err == nil {
 		err = &compactionOperationError{Reason: result.Proposal.RejectReason}
 	}
-	scope.setTerminal(hookOutcome(ctx, err), err, nil)
+	scope.setExecutorTerminal(hookOutcome(ctx, err), err, nil)
 }
 
 func cloneCompactionHookInput(value *loop.CompactionInput) *loop.CompactionInput {

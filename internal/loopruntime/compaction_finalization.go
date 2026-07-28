@@ -118,6 +118,11 @@ type compactionHookScope struct {
 	err     error
 	output  *loop.CompactionOutput
 	once    sync.Once
+
+	// executorSealed transfers terminal-field ownership away from the executor
+	// goroutine after AwaitCompaction chooses cancellation. Actor/finalizer
+	// corrections remain authoritative until Finish runs.
+	executorSealed bool
 }
 
 func (s *compactionHookScope) setTerminal(outcome hook.Outcome, err error, output *loop.CompactionOutput) {
@@ -126,6 +131,40 @@ func (s *compactionHookScope) setTerminal(outcome hook.Outcome, err error, outpu
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.outcome = outcome
+	s.err = err
+	s.output = cloneCompactionHookOutput(output)
+}
+
+func (s *compactionHookScope) setExecutorTerminal(
+	outcome hook.Outcome,
+	err error,
+	output *loop.CompactionOutput,
+) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.executorSealed {
+		return
+	}
+	s.outcome = outcome
+	s.err = err
+	s.output = cloneCompactionHookOutput(output)
+}
+
+func (s *compactionHookScope) sealExecutorTerminal(
+	outcome hook.Outcome,
+	err error,
+	output *loop.CompactionOutput,
+) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.executorSealed = true
 	s.outcome = outcome
 	s.err = err
 	s.output = cloneCompactionHookOutput(output)

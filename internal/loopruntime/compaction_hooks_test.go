@@ -61,6 +61,50 @@ type blockingCanceledCompactor struct {
 	once    sync.Once
 }
 
+type lateCanceledCompactorMode uint8
+
+const (
+	lateCanceledReturnNil lateCanceledCompactorMode = iota + 1
+	lateCanceledFinalizeSuccess
+	lateCanceledReturnError
+	lateCanceledPanic
+)
+
+type lateCanceledCompactor struct {
+	mode    lateCanceledCompactorMode
+	started chan struct{}
+	release chan struct{}
+	exited  chan struct{}
+	once    sync.Once
+}
+
+func (c *lateCanceledCompactor) CompactAndFinalize(
+	_ context.Context,
+	input loop.CompactionInput,
+	finalize func(context.Context, CompactionOutcome) error,
+) error {
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+	defer close(c.exited)
+	switch c.mode {
+	case lateCanceledReturnNil:
+		return nil
+	case lateCanceledFinalizeSuccess:
+		// Hostile/buggy compactors may ignore the canceled invocation context and
+		// attempt a successful finalization from a detached context.
+		return finalize(context.Background(), CompactionOutcome{Value: &loop.CompactionOutput{
+			Basis: input.Basis, Model: input.Model, RequestFingerprint: input.RequestFingerprint,
+			Summary: validFinalizationSummary(),
+		}})
+	case lateCanceledReturnError:
+		return errors.New("late private compactor failure")
+	case lateCanceledPanic:
+		panic("late private compactor panic")
+	default:
+		panic("unknown late compactor mode")
+	}
+}
+
 func (c *blockingCanceledCompactor) CompactAndFinalize(
 	context.Context,
 	loop.CompactionInput,
@@ -419,6 +463,89 @@ func TestCompactionHooksCanceledFinalizationFailureCorrectsOutcomeToFailed(t *te
 		t.Fatalf("finish = %#v, want finalization failure to override pending cancellation", result)
 	}
 	close(compactor.release)
+}
+
+func TestCompactionHooksCanceledAwaitSealsOutcomeAgainstLateCompactor(t *testing.T) {
+	tests := []struct {
+		name        string
+		mode        lateCanceledCompactorMode
+		appendErr   error
+		wantOutcome hook.Outcome
+	}{
+		{name: "nil without finalize", mode: lateCanceledReturnNil, wantOutcome: hook.OutcomeCanceled},
+		{name: "late success", mode: lateCanceledFinalizeSuccess, wantOutcome: hook.OutcomeCanceled},
+		{name: "late failure", mode: lateCanceledReturnError, wantOutcome: hook.OutcomeCanceled},
+		{name: "late panic", mode: lateCanceledPanic, wantOutcome: hook.OutcomeCanceled},
+		{
+			name: "late success cannot hide canonical append failure", mode: lateCanceledFinalizeSuccess,
+			appendErr: errors.New("canonical rejection unavailable"), wantOutcome: hook.OutcomeFailed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			finished := make(chan hook.Result, 2)
+			recorder := &recordingPublisher{}
+			publisher := &blockingCompactionRejectionPublisher{
+				recordingPublisher: recorder,
+				entered:            make(chan struct{}),
+				release:            make(chan struct{}),
+				failErr:            tt.appendErr,
+			}
+			compactor := &lateCanceledCompactor{
+				mode: tt.mode, started: make(chan struct{}), release: make(chan struct{}), exited: make(chan struct{}),
+			}
+			actor := newActiveTurnCompactionHooksActor(t, publisher, compactor, hook.Set{Around: []hook.Around{{
+				Operation: hook.OperationCompaction,
+				Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+					return ctx, func(result hook.Result) { finished <- result }
+				},
+			}}})
+
+			startTurn(t, actor, recorder, textBlocks("seal canceled compaction"))
+			select {
+			case <-compactor.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("active-turn compaction did not start")
+			}
+			ack := make(chan bool, 1)
+			actor.PriorityCommandSink() <- command.Interrupt{
+				Header: command.Header{CommandID: uuid.UUID{0xc6}}, Ack: ack,
+			}
+			if !<-ack {
+				t.Fatal("interrupt did not cancel the active turn")
+			}
+			select {
+			case <-publisher.entered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("canonical CompactionRejected append did not start")
+			}
+
+			close(compactor.release)
+			select {
+			case <-compactor.exited:
+			case <-time.After(2 * time.Second):
+				t.Fatal("late compactor did not exit")
+			}
+			select {
+			case result := <-finished:
+				t.Fatalf("finish before durable rejection = %#v", result)
+			default:
+			}
+			close(publisher.release)
+			result := awaitCompactionHookFinish(t, finished)
+			if result.Outcome != tt.wantOutcome || result.Compaction.Output != nil {
+				t.Fatalf("finish = %#v, want outcome %v without output", result, tt.wantOutcome)
+			}
+			if tt.wantOutcome == hook.OutcomeCanceled && !errors.Is(result.Err, context.Canceled) {
+				t.Fatalf("finish error = %v, want cancellation", result.Err)
+			}
+			select {
+			case duplicate := <-finished:
+				t.Fatalf("duplicate finish = %#v", duplicate)
+			case <-time.After(25 * time.Millisecond):
+			}
+		})
+	}
 }
 
 func TestCompactionHooksActiveTurnInheritsOriginContextThroughCanonicalBoundary(t *testing.T) {
