@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	hustleTopologyDigestDomain           = "looprig/rig/hustle-topology/v1"
-	permissionReviewTopologyDigestDomain = "looprig/rig/permission-review-topology/v1"
+	hustleTopologyDigestDomain                 = "looprig/rig/hustle-topology/v1"
+	permissionReviewTopologyDigestDomain       = "looprig/rig/permission-review-topology/v1"
+	permissionClassifierProjectionDigestDomain = "looprig/rig/permission-classifier-projection/v1"
 )
 
 // ConfigFingerprintFields are immutable rig-level behavior inputs that are not part
@@ -360,28 +361,54 @@ func canonicalPermissionReviewMaterial(
 	baseTopologyRevision string,
 	review permissionReviewFingerprint,
 ) []byte {
-	material := appendCanonicalString(nil, permissionReviewTopologyDigestDomain)
+	return canonicalPermissionReviewMaterialWithDomains(
+		baseTopologyRevision,
+		review,
+		permissionReviewTopologyDigestDomain,
+		permissionClassifierProjectionDigestDomain,
+	)
+}
+
+func canonicalPermissionReviewMaterialWithDomains(
+	baseTopologyRevision string,
+	review permissionReviewFingerprint,
+	reviewDomain string,
+	classifierDomain string,
+) []byte {
+	material := appendCanonicalString(nil, reviewDomain)
 	material = appendCanonicalString(material, baseTopologyRevision)
 	material = appendCanonicalString(material, review.reviewPolicyRevision)
 	material = binary.BigEndian.AppendUint64(material, uint64(len(review.classifiers)))
-	for _, row := range review.classifiers {
-		material = appendCanonicalString(material, string(row.name))
-		material = appendCanonicalString(material, row.revision)
-		material = appendCanonicalString(material, row.definitionPolicyRevision)
-		material = appendCanonicalString(material, row.outputSchemaName)
-		material = append(material, row.outputSchemaSHA256[:]...)
-		material = appendCanonicalString(material, row.structuredOutputRevision)
-		material = appendCanonicalString(material, row.evidenceToolPolicyRevision)
-		material = append(material, row.evidenceToolDefinitionsSHA256[:]...)
-		material = append(material, row.evidenceProducedNamesSHA256[:]...)
-		material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxRounds))
-		material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxCalls))
-		material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxCallsPerRound))
-		material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxResultBytes))
-		material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxEvidenceBytes))
-		material = appendCanonicalInt64(material, int64(row.evidenceToolDefinitionCount))
+	for index, row := range review.classifiers {
+		rowMaterial := canonicalPermissionClassifierMaterial(classifierDomain, index, row)
+		rowDigest := sha256.Sum256(rowMaterial)
+		material = appendCanonicalBytes(material, rowDigest[:])
 	}
 	return material
+}
+
+func canonicalPermissionClassifierMaterial(
+	domain string,
+	order int,
+	row permissionClassifierFingerprint,
+) []byte {
+	material := appendCanonicalString(nil, domain)
+	material = appendCanonicalInt64(material, int64(order))
+	material = appendCanonicalString(material, string(row.name))
+	material = appendCanonicalString(material, row.revision)
+	material = appendCanonicalString(material, row.definitionPolicyRevision)
+	material = appendCanonicalString(material, row.outputSchemaName)
+	material = appendCanonicalBytes(material, row.outputSchemaSHA256[:])
+	material = appendCanonicalString(material, row.structuredOutputRevision)
+	material = appendCanonicalString(material, row.evidenceToolPolicyRevision)
+	material = appendCanonicalBytes(material, row.evidenceToolDefinitionsSHA256[:])
+	material = appendCanonicalBytes(material, row.evidenceProducedNamesSHA256[:])
+	material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxRounds))
+	material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxCalls))
+	material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxCallsPerRound))
+	material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxResultBytes))
+	material = appendCanonicalInt64(material, int64(row.evidenceToolLimits.MaxEvidenceBytes))
+	return appendCanonicalInt64(material, int64(row.evidenceToolDefinitionCount))
 }
 
 func topologyRevisionWithHustles(definitions []loop.Definition, primers []string, active string, hustles []hustle.Definition, limits HustleLimits) string {
@@ -447,6 +474,10 @@ func canonicalHustleTopologyMaterial(legacyRevision string, rows []hustleTopolog
 }
 
 func appendCanonicalString(material []byte, value string) []byte {
+	return appendCanonicalBytes(material, []byte(value))
+}
+
+func appendCanonicalBytes(material []byte, value []byte) []byte {
 	material = binary.BigEndian.AppendUint64(material, uint64(len(value)))
 	return append(material, value...)
 }

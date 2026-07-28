@@ -288,9 +288,71 @@ func TestClassifierEvidenceProjectionDomainsAreVersioned(t *testing.T) {
 			permissionReviewTopologyDigestDomain,
 			"looprig/rig/permission-review-topology/v1",
 		},
+		"permission classifier": {
+			permissionClassifierProjectionDigestDomain,
+			"looprig/rig/permission-classifier-projection/v1",
+		},
 	} {
 		if testCase.got != testCase.want {
 			t.Fatalf("%s domain = %q, want %q", name, testCase.got, testCase.want)
+		}
+	}
+}
+
+func TestPermissionReviewFingerprintDomainsIndependentlyChangeIdentity(t *testing.T) {
+	t.Parallel()
+	classifier := defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("status"))
+	review, err := permissionReviewFingerprintFrom(
+		rigPermissionClassifierSet(t, classifier),
+		"review-policy-v1",
+	)
+	if err != nil {
+		t.Fatalf("permissionReviewFingerprintFrom: %v", err)
+	}
+
+	currentMaterial := canonicalPermissionReviewMaterialWithDomains(
+		"base",
+		*review,
+		permissionReviewTopologyDigestDomain,
+		permissionClassifierProjectionDigestDomain,
+	)
+	if production := canonicalPermissionReviewMaterial("base", *review); !bytes.Equal(production, currentMaterial) {
+		t.Fatal("production permission review material does not use both current domains")
+	}
+	current := hexSHA256Bytes(currentMaterial)
+	changedOuter := hexSHA256Bytes(canonicalPermissionReviewMaterialWithDomains(
+		"base",
+		*review,
+		"looprig/rig/permission-review-topology/v2",
+		permissionClassifierProjectionDigestDomain,
+	))
+	changedClassifier := hexSHA256Bytes(canonicalPermissionReviewMaterialWithDomains(
+		"base",
+		*review,
+		permissionReviewTopologyDigestDomain,
+		"looprig/rig/permission-classifier-projection/v2",
+	))
+	removedClassifier := hexSHA256Bytes(canonicalPermissionReviewMaterialWithDomains(
+		"base",
+		*review,
+		permissionReviewTopologyDigestDomain,
+		"",
+	))
+	substitutedClassifier := hexSHA256Bytes(canonicalPermissionReviewMaterialWithDomains(
+		"base",
+		*review,
+		permissionReviewTopologyDigestDomain,
+		hustleTopologyDigestDomain,
+	))
+
+	for name, changed := range map[string]string{
+		"outer domain":                  changedOuter,
+		"classifier domain":             changedClassifier,
+		"removed classifier domain":     removedClassifier,
+		"substituted classifier domain": substitutedClassifier,
+	} {
+		if changed == current {
+			t.Fatalf("%s did not change permission review identity: %q", name, changed)
 		}
 	}
 }
