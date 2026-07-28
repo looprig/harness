@@ -494,6 +494,142 @@ func TestEvidenceRunnerEnforcesPerResultAndAggregateEncodedByteBounds(t *testing
 	assertEvidenceFailure(t, run(len(encoded), len(encoded)*2-1, 2), EvidenceFailureEvidenceTooLarge)
 }
 
+func TestEvidenceRunnerStopsBeforeLaterCallWhenAggregateIsExhausted(t *testing.T) {
+	t.Parallel()
+	candidate := newPreparedEvidenceTool("workspace_read", "bounded evidence")
+	encoded, err := content.MarshalBlocks(candidate.result.Content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := newTestEvidenceRunner(t, &evidenceAccessStub{access: gate.AccessAllow}, []uuid.UUID{
+		mustRuntimeTestID(t), mustRuntimeTestID(t),
+	})
+	_, err = runner.run(context.Background(),
+		[]hustle.BoundEvidenceTool{boundEvidenceRuntimeTool(t, candidate)},
+		[]evidenceToolCall{
+			{id: "first", name: "workspace_read", input: json.RawMessage(`{}`)},
+			{id: "second", name: "workspace_read", input: json.RawMessage(`{}`)},
+		},
+		hustle.ToolLoopLimits{
+			MaxResultBytes:   len(encoded) + 100,
+			MaxEvidenceBytes: len(encoded),
+		},
+	)
+	assertEvidenceFailure(t, err, EvidenceFailureEvidenceTooLarge)
+	if prepares, runs := candidate.counts(); prepares != 1 || runs != 1 {
+		t.Fatalf("work after aggregate exhaustion = prepare:%d run:%d, want 1,1", prepares, runs)
+	}
+}
+
+func TestEvidenceRunnerRejectsZeroRemainingBeforeCall(t *testing.T) {
+	t.Parallel()
+	candidate := newPreparedEvidenceTool("workspace_read", "bounded evidence")
+	runner := newTestEvidenceRunner(t, &evidenceAccessStub{access: gate.AccessAllow}, []uuid.UUID{
+		mustRuntimeTestID(t),
+	})
+	_, err := runner.run(context.Background(),
+		[]hustle.BoundEvidenceTool{boundEvidenceRuntimeTool(t, candidate)},
+		[]evidenceToolCall{{id: "first", name: "workspace_read", input: json.RawMessage(`{}`)}},
+		hustle.ToolLoopLimits{MaxResultBytes: 1024, MaxEvidenceBytes: 0},
+	)
+	assertEvidenceFailure(t, err, EvidenceFailureEvidenceTooLarge)
+	if prepares, runs := candidate.counts(); prepares != 0 || runs != 0 {
+		t.Fatalf("zero remaining performed work = prepare:%d run:%d", prepares, runs)
+	}
+}
+
+func TestEvidenceOwnedValuesArePreflightedBeforeCloneOrEncode(t *testing.T) {
+	t.Parallel()
+	validID := mustRuntimeTestID(t)
+	request := validEvidenceRequest("workspace_read", validID, evidenceReadKind, validID.String())
+	request.Requirements = make([]tool.Requirement, maxEvidenceRequestRequirements+1)
+	cloned := false
+	_, err := ownPreparedEvidenceRequest(request, func(tool.Request) tool.Request {
+		cloned = true
+		return tool.Request{}
+	})
+	assertEvidenceFailure(t, err, EvidenceFailureInvalidRequest)
+	if cloned {
+		t.Fatal("oversized request cloned before preflight")
+	}
+
+	blocks := make([]content.Block, maxEvidenceResultBlocks+1)
+	for i := range blocks {
+		blocks[i] = &content.TextBlock{Text: "x"}
+	}
+	encoded := false
+	_, _, err = ownEvidenceResultWithEncoder(
+		&tool.ToolResult{Content: blocks}, 1<<20, 1<<20,
+		func([]content.Block) ([]byte, error) {
+			encoded = true
+			return nil, nil
+		},
+	)
+	assertEvidenceFailure(t, err, EvidenceFailureInvalidResult)
+	if encoded {
+		t.Fatal("oversized result encoded before preflight")
+	}
+}
+
+func TestEvidenceOwnedValueHardBoundsExactAndOneOver(t *testing.T) {
+	t.Parallel()
+	validID := mustRuntimeTestID(t)
+	makeRequest := func(fieldBytes int) tool.Request {
+		request := validEvidenceRequest("workspace_read", validID, evidenceReadKind, validID.String())
+		request.Requirements[0].Description = strings.Repeat("x", fieldBytes)
+		return request
+	}
+	if _, err := ownPreparedEvidenceRequest(makeRequest(maxEvidenceRequestFieldBytes), tool.Request.Clone); err != nil {
+		t.Fatalf("exact request field bound: %v", err)
+	}
+	_, err := ownPreparedEvidenceRequest(makeRequest(maxEvidenceRequestFieldBytes+1), tool.Request.Clone)
+	assertEvidenceFailure(t, err, EvidenceFailureInvalidRequest)
+
+	exact := tool.TextResult(strings.Repeat("x", maxEvidenceResultFieldBytes))
+	if err := preflightEvidenceResult(exact.Content, maxEvidenceResultFieldBytes); err != nil {
+		t.Fatalf("exact result field bound: %v", err)
+	}
+	oneOver := tool.TextResult(strings.Repeat("x", maxEvidenceResultFieldBytes+1))
+	assertEvidenceFailure(t, preflightEvidenceResult(oneOver.Content, maxEvidenceResultFieldBytes+1), EvidenceFailureResultTooLarge)
+
+	field := strings.Repeat("x", maxEvidenceRequestFieldBytes)
+	aggregateRequest := tool.Request{
+		ToolName: field, Summary: field, ExecutionID: field,
+		Command: field, WorkingDirectory: field,
+		Requirements: []tool.Requirement{
+			{Kind: field, Scope: field, Match: field, Description: field, GrantClass: field, GrantTarget: field},
+			{Kind: field, Scope: field, Match: field, Description: field, GrantClass: field},
+		},
+	}
+	if err := preflightEvidenceRequest(aggregateRequest); err != nil {
+		t.Fatalf("exact request aggregate bound: %v", err)
+	}
+	aggregateRequest.Requirements[1].GrantTarget = "x"
+	assertEvidenceFailure(t, preflightEvidenceRequest(aggregateRequest), EvidenceFailureInvalidRequest)
+
+	largeResultField := strings.Repeat("x", maxEvidenceResultFieldBytes)
+	exactAggregate := make([]content.Block, maxEvidenceResultContentBytes/maxEvidenceResultFieldBytes)
+	for i := range exactAggregate {
+		exactAggregate[i] = &content.TextBlock{Text: largeResultField}
+	}
+	if err := preflightEvidenceResult(exactAggregate, maxEvidenceResultContentBytes); err != nil {
+		t.Fatalf("exact result aggregate bound: %v", err)
+	}
+	aggregateOneOver := append(exactAggregate, &content.TextBlock{Text: "x"})
+	assertEvidenceFailure(t, preflightEvidenceResult(aggregateOneOver, maxEvidenceResultContentBytes+1), EvidenceFailureResultTooLarge)
+}
+
+func TestEvidenceResultPreflightRejectsTypedNilAndUnsupportedBlocks(t *testing.T) {
+	t.Parallel()
+	var typedNil *content.TextBlock
+	for _, blocks := range [][]content.Block{
+		{typedNil},
+		{&content.ImageBlock{}},
+	} {
+		assertEvidenceFailure(t, preflightEvidenceResult(blocks, 1024), EvidenceFailureInvalidResult)
+	}
+}
+
 func TestEvidenceRunnerCancellationAndPanicsAreRedacted(t *testing.T) {
 	t.Parallel()
 	const secret = "never-echo-panic-or-error"

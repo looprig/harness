@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
@@ -549,6 +551,182 @@ func TestEvidenceExecutionValidatorFailurePublishesNoIntermediateEvidence(t *tes
 	}
 	if _, ok := events[1].(event.HustleFailed); !ok {
 		t.Fatalf("event[1] = %T, want failed", events[1])
+	}
+}
+
+type evidenceAmbientContextKey struct{}
+
+type contextCheckingEvidenceTool struct {
+	*preparedEvidenceTool
+	check func(context.Context, bool)
+}
+
+func (t *contextCheckingEvidenceTool) Info(ctx context.Context) (*tool.ToolInfo, error) {
+	t.check(ctx, false)
+	return t.preparedEvidenceTool.Info(ctx)
+}
+
+func (t *contextCheckingEvidenceTool) PrepareCall(ctx context.Context, id uuid.UUID, args string) (tool.Request, tool.PreparedArtifact, error) {
+	t.check(ctx, false)
+	return t.preparedEvidenceTool.PrepareCall(ctx, id, args)
+}
+
+func (t *contextCheckingEvidenceTool) InvokableRun(ctx context.Context, args string) (*tool.ToolResult, error) {
+	t.check(ctx, true)
+	return t.preparedEvidenceTool.InvokableRun(ctx, args)
+}
+
+type contextCheckingContainment struct {
+	check func(context.Context, bool)
+}
+
+func (c contextCheckingContainment) VerifyEvidenceContainment(ctx context.Context, _ EvidenceContainmentPolicy, _ tool.Request) error {
+	c.check(ctx, false)
+	return nil
+}
+
+func TestEvidenceExecutionStripsAmbientContextAuthority(t *testing.T) {
+	t.Parallel()
+	sessionID, loopID := mustRuntimeTestID(t), mustRuntimeTestID(t)
+	callerDeadline := time.Now().Add(time.Second).Round(0)
+	ambient := loop.WithPreparedCall(context.Background(), tool.PreparedCall{
+		ExecutionID: mustRuntimeTestID(t),
+	})
+	caller, cancel := context.WithDeadline(
+		context.WithValue(ambient, evidenceAmbientContextKey{}, "ambient-authority"),
+		callerDeadline,
+	)
+	defer cancel()
+
+	var checks atomic.Int32
+	check := func(ctx context.Context, wantPrepared bool) {
+		if got := ctx.Value(evidenceAmbientContextKey{}); got != nil {
+			t.Errorf("ambient context value reached evidence callback: %v", got)
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok || !deadline.Equal(callerDeadline) {
+			t.Errorf("deadline = (%v,%t), want exact %v", deadline, ok, callerDeadline)
+		}
+		_, prepared := loop.PreparedCallFromContext(ctx)
+		if prepared != wantPrepared {
+			t.Errorf("prepared call visible = %t, want %t", prepared, wantPrepared)
+		}
+		checks.Add(1)
+	}
+	evidence := &contextCheckingEvidenceTool{
+		preparedEvidenceTool: newPreparedEvidenceTool("workspace_read", "safe"),
+		check:                check,
+	}
+	invocation := 0
+	client := &runtimeTestClient{invoke: func(ctx context.Context, _ inference.Request) (*inference.Response, error) {
+		check(ctx, false)
+		invocation++
+		if invocation == 1 {
+			return oneEvidenceCallResponse("call-a"), nil
+		}
+		return terminalEvidenceResponse(`{"summary":"allow"}`, nil), nil
+	}}
+	definition := runtimeEvidenceDefinition(t, client, runtimeEvidenceModel(), func(ctx context.Context, _ tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
+		check(ctx, false)
+		return []tool.InvokableTool{evidence}, nil
+	}, hustle.ToolLoopLimits{
+		MaxRounds: 2, MaxCalls: 1, MaxCallsPerRound: 1,
+		MaxResultBytes: 1024, MaxEvidenceBytes: 2048,
+	})
+	factory := event.NewFactory(uuid.New, func() time.Time { return time.Unix(123, 0).UTC() })
+	controller, err := New(context.Background(), Config{
+		Blocking: LaneLimits{Concurrent: 1, Queued: 2}, Background: LaneLimits{Concurrent: 1, Queued: 2},
+		Runtime: &RuntimeConfig{
+			SessionID: sessionID, Definitions: []hustle.BoundDefinition{definition},
+			AuditTimeout: time.Second, FinalizationTimeout: time.Second, WorkerDrainTimeout: time.Second,
+			Stamper: factory, Audit: &runtimeTestAudit{}, Faults: &runtimeTestFaults{}, Activity: &runtimeTestActivity{},
+			Evidence: &EvidenceRuntimeConfig{
+				Access:       &evidenceAccessStub{access: gate.AccessAllow},
+				Containment:  contextCheckingContainment{check: check},
+				AllowedKinds: []string{evidenceReadKind}, ReadWorkspace: &tool.ReadWorkspaceBinding{Root: "/workspace"},
+				SecurityCeiling: "read-only", NewExecutionID: uuid.New,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = controller.RunAndFinalize(caller, runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID), func(ctx context.Context, _ hustle.Result) error {
+		check(ctx, false)
+		return nil
+	}, noOpFinalizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := checks.Load(); got < 7 {
+		t.Fatalf("context checks = %d, want model/factory/preparer/containment/tool/model/validator", got)
+	}
+}
+
+func TestSanitizedEvidenceContextPreservesCancellationCauseAndDeadline(t *testing.T) {
+	t.Parallel()
+	deadline := time.Now().Add(time.Hour).Round(0)
+	parent, cancelDeadline := context.WithDeadline(context.Background(), deadline)
+	defer cancelDeadline()
+	parent, cancelCause := context.WithCancelCause(parent)
+	ctx, cleanup := newEvidenceAttemptContext(parent)
+	defer cleanup()
+	if got, ok := ctx.Deadline(); !ok || !got.Equal(deadline) {
+		t.Fatalf("deadline = (%v,%t), want exact %v", got, ok, deadline)
+	}
+	sentinel := errors.New("caller cancellation cause")
+	cancelCause(sentinel)
+	<-ctx.Done()
+	if !errors.Is(context.Cause(ctx), sentinel) || !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("cancellation = err:%v cause:%v, want caller cause", ctx.Err(), context.Cause(ctx))
+	}
+}
+
+func TestEvidenceExecutionOwnsProviderMessageBeforeBlockingTool(t *testing.T) {
+	t.Parallel()
+	sessionID, loopID := mustRuntimeTestID(t), mustRuntimeTestID(t)
+	blocking := &blockingEvidenceTool{
+		preparedEvidenceTool: newPreparedEvidenceTool("workspace_read", "safe"),
+		started:              make(chan struct{}),
+		release:              make(chan struct{}),
+	}
+	first := oneEvidenceCallResponse("call-original")
+	invocation := 0
+	client := &runtimeTestClient{invoke: func(_ context.Context, request inference.Request) (*inference.Response, error) {
+		invocation++
+		if invocation == 1 {
+			return first, nil
+		}
+		assistant, ok := request.Messages[1].(*content.AIMessage)
+		if !ok || len(assistant.Blocks) != 1 {
+			t.Fatalf("paired assistant message = %#v", request.Messages)
+		}
+		call, ok := assistant.Blocks[0].(*content.ToolUseBlock)
+		if !ok || call.ID != "call-original" || call.Name != "workspace_read" ||
+			string(call.Input) != `{"path":"file"}` {
+			t.Fatalf("owned provider call = %#v, want original", assistant.Blocks[0])
+		}
+		return terminalEvidenceResponse(`{"summary":"allow"}`, nil), nil
+	}}
+	definition := runtimeEvidenceDefinition(t, client, runtimeEvidenceModel(), func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{blocking}, nil
+	}, hustle.ToolLoopLimits{
+		MaxRounds: 2, MaxCalls: 1, MaxCallsPerRound: 1,
+		MaxResultBytes: 1024, MaxEvidenceBytes: 2048,
+	})
+	controller := runtimeEvidenceController(t, sessionID, definition)
+	done := make(chan error, 1)
+	go func() {
+		done <- controller.RunAndFinalize(context.Background(), runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID), acceptResult, noOpFinalizer)
+	}()
+	<-blocking.started
+	call := first.Message.Blocks[0].(*content.ToolUseBlock)
+	call.ID = "mutated"
+	call.Name = "mutated"
+	call.Input[0] = '['
+	close(blocking.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 

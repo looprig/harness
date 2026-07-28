@@ -335,8 +335,10 @@ func (r *runtimeController) executeWithEvidence(
 ) (hustle.Result, event.ModelRuntime, *content.Usage, *RunError) {
 	executionCtx, cancel := r.newExecutionContext(ctx, definition.Timeout())
 	defer cancel()
+	evidenceCtx, cleanupEvidenceCtx := newEvidenceAttemptContext(executionCtx)
+	defer cleanupEvidenceCtx()
 	plan, runtime, runErr := r.prepareEvidenceExecution(
-		executionCtx, definition, runRequest, runID, input,
+		evidenceCtx, definition, runRequest, runID, input,
 	)
 	if runErr != nil {
 		return hustle.Result{}, runtime, nil, runErr
@@ -344,14 +346,14 @@ func (r *runtimeController) executeWithEvidence(
 	var aggregate *content.Usage
 	for attempt := 0; ; attempt++ {
 		result, usage, runErr := r.executeEvidenceAttempt(
-			executionCtx, definition, runRequest, runID, plan, validate,
+			evidenceCtx, definition, runRequest, runID, plan, validate,
 		)
 		var usageErr error
 		aggregate, usageErr = addUsage(aggregate, usage)
 		if usageErr != nil {
 			return hustle.Result{}, runtime, aggregate, executionError(
 				runRequest.Name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput,
-				executionCtx, &OutputError{Cause: usageErr},
+				evidenceCtx, &OutputError{Cause: usageErr},
 			)
 		}
 		if runErr == nil {
@@ -359,7 +361,7 @@ func (r *runtimeController) executeWithEvidence(
 			return result, runtime, aggregate, nil
 		}
 		if !shouldRetry(
-			definition.RetryPolicy(), attempt, executionCtx.Err(), runErr,
+			definition.RetryPolicy(), attempt, evidenceCtx.Err(), runErr,
 			r.owner.isPoisoned(),
 		) {
 			return hustle.Result{}, runtime, aggregate, runErr
@@ -436,7 +438,6 @@ func (r *runtimeController) executeEvidenceAttempt(
 	if err != nil {
 		return hustle.Result{}, nil, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 	}
-
 	var aggregate *content.Usage
 	rounds, calls, evidenceBytes := 0, 0, 0
 	seenCallIDs := make(map[string]struct{})
@@ -499,6 +500,13 @@ func (r *runtimeController) executeEvidenceAttempt(
 			}
 			return result, aggregate, nil
 		case evidenceToolResponse:
+			// The provider response is borrowed. Own the validated assistant
+			// message before preparation, authorization, or execution gives
+			// another collaborator a chance to mutate it.
+			assistant, err := ownAIMessage(providerMessage)
+			if err != nil {
+				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
+			}
 			if len(response.calls) > plan.policy.Limits.MaxCallsPerRound {
 				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureCallsPerRoundExceeded))
 			}
@@ -514,13 +522,11 @@ func (r *runtimeController) executeEvidenceAttempt(
 				seenCallIDs[call.id] = struct{}{}
 			}
 			remaining := plan.policy.Limits.MaxEvidenceBytes - evidenceBytes
+			if remaining <= 0 {
+				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureEvidenceTooLarge))
+			}
 			roundLimits := plan.policy.Limits
 			roundLimits.MaxEvidenceBytes = remaining
-			if roundLimits.MaxEvidenceBytes < roundLimits.MaxResultBytes {
-				// Preserve the independent per-result bound. Aggregate bytes
-				// are checked from the defensively encoded results below.
-				roundLimits.MaxEvidenceBytes = roundLimits.MaxResultBytes
-			}
 			results, err := r.runEvidence(executionCtx, runID, catalog, response.calls, roundLimits)
 			if err != nil {
 				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
@@ -533,10 +539,6 @@ func (r *runtimeController) executeEvidenceAttempt(
 				}
 				evidenceBytes += len(encoded)
 				remaining -= len(encoded)
-			}
-			assistant, err := ownAIMessage(providerMessage)
-			if err != nil {
-				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 			}
 			inferenceRequest.Messages = append(inferenceRequest.Messages, assistant)
 			for _, result := range results {

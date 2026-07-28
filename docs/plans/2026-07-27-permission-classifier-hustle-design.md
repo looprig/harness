@@ -871,11 +871,31 @@ independently owned views, so a preparer or verifier retaining a slice cannot
 rewrite another collaborator's authorization input. The opaque
 `PreparedArtifact` remains the preparer's authoritative per-call value.
 
+Before that first clone, the runtime performs an allocation-light structural
+preflight over the borrowed request: at most 128 requirements, no reusable
+candidates, at most 64 KiB in any request string, and at most 1 MiB across all
+request strings. Before encoding or cloning a tool result, it accepts only
+non-nil text blocks, at most 4,096 blocks, at most 1 MiB per text block, and at
+most 20 MiB of text in aggregate. Checked arithmetic is used throughout. The
+raw result content must also fit both the independent per-result limit and the
+true remaining aggregate evidence budget before encoding; the encoded form is
+then checked against both limits exactly. Unknown block types, typed nils, and
+any one-over structure fail closed with a bounded error that contains no
+request or result content.
+
 Invocation-scoped evidence catalog binding and evidence execution both run in
 controller-owned, buffered workers under the original single deadline. A
 worker panic is redacted and fault-reported. A collaborator that ignores
 cancellation beyond `WorkerDrainTimeout` poisons both admission lanes and no
 new evidence worker is admitted.
+
+All evidence-attempt callbacks run under a value-empty context rooted outside
+the caller/session value tree. It preserves the original cancellation cause
+and exact deadline through a bounded `context.AfterFunc` bridge that is stopped
+when the attempt ends. Only the exact `InvokableRun` subcall receives a fresh
+`PreparedCall` value; model resolution, inference, catalog factories,
+preparation, containment, validation, and other callbacks cannot observe
+ambient loop, gate, requester, provenance, or prior prepared-call values.
 
 ### 13.2 Initial evidence capabilities
 

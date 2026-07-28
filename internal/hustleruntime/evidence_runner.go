@@ -13,6 +13,16 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 )
 
+const (
+	maxEvidenceRequestRequirements = 128
+	maxEvidenceRequestCandidates   = 0
+	maxEvidenceRequestFieldBytes   = 64 << 10
+	maxEvidenceRequestBytes        = 1 << 20
+	maxEvidenceResultBlocks        = 4096
+	maxEvidenceResultFieldBytes    = 1 << 20
+	maxEvidenceResultContentBytes  = 20 << 20
+)
+
 // evidenceToolResult is one defensively owned provider-call/result pair.
 type evidenceToolResult struct {
 	callID  string
@@ -113,9 +123,11 @@ func (r *evidenceRunner) run(
 		nilEvidenceRuntimeValue(reflect.ValueOf(r.containment)) ||
 		!validEvidenceContainmentPolicy(r.policy) || r.newExecutionID == nil ||
 		len(r.allowedKinds) == 0 || len(catalog) == 0 || len(calls) == 0 ||
-		limits.MaxResultBytes <= 0 || limits.MaxEvidenceBytes <= 0 ||
-		limits.MaxResultBytes > limits.MaxEvidenceBytes {
+		limits.MaxResultBytes <= 0 || limits.MaxEvidenceBytes < 0 {
 		return nil, evidenceError(EvidenceFailureInvalidBinding)
+	}
+	if limits.MaxEvidenceBytes == 0 {
+		return nil, evidenceError(EvidenceFailureEvidenceTooLarge)
 	}
 	if failure := evidenceContextFailure(ctx); failure != nil {
 		return nil, failure
@@ -131,6 +143,10 @@ func (r *evidenceRunner) run(
 	results := make([]evidenceToolResult, 0, len(calls))
 	evidenceBytes := 0
 	for index, call := range calls {
+		remaining := limits.MaxEvidenceBytes - evidenceBytes
+		if remaining <= 0 {
+			return nil, evidenceError(EvidenceFailureEvidenceTooLarge)
+		}
 		if failure := evidenceContextFailure(ctx); failure != nil {
 			return nil, failure
 		}
@@ -165,14 +181,14 @@ func (r *evidenceRunner) run(
 		if err != nil {
 			return nil, err
 		}
-		owned, encodedBytes, err := ownEvidenceResult(result)
+		owned, encodedBytes, err := ownEvidenceResult(result, limits.MaxResultBytes, remaining)
 		if err != nil {
 			return nil, err
 		}
 		if encodedBytes > limits.MaxResultBytes {
 			return nil, evidenceError(EvidenceFailureResultTooLarge)
 		}
-		if evidenceBytes > limits.MaxEvidenceBytes-encodedBytes {
+		if encodedBytes > remaining {
 			return nil, evidenceError(EvidenceFailureEvidenceTooLarge)
 		}
 		evidenceBytes += encodedBytes
@@ -253,7 +269,10 @@ func prepareEvidenceCall(
 	// Take ownership before any other collaborator can observe the prepared
 	// request. A preparer retaining its returned slice cannot mutate the
 	// authoritative request used for authorization or execution.
-	request = request.Clone()
+	request, err = ownPreparedEvidenceRequest(request, tool.Request.Clone)
+	if err != nil {
+		return tool.Request{}, nil, err
+	}
 	if failure := evidenceContextFailure(ctx); failure != nil {
 		return tool.Request{}, nil, failure
 	}
@@ -347,19 +366,131 @@ func executeEvidenceCall(
 	return result, nil
 }
 
-func ownEvidenceResult(result *tool.ToolResult) ([]content.Block, int, error) {
+func ownPreparedEvidenceRequest(
+	request tool.Request,
+	clone func(tool.Request) tool.Request,
+) (tool.Request, error) {
+	if err := preflightEvidenceRequest(request); err != nil {
+		return tool.Request{}, err
+	}
+	return clone(request), nil
+}
+
+func preflightEvidenceRequest(request tool.Request) error {
+	if len(request.Requirements) > maxEvidenceRequestRequirements {
+		return evidenceError(EvidenceFailureInvalidRequest)
+	}
+	total := 0
+	add := func(value string) bool {
+		if len(value) > maxEvidenceRequestFieldBytes ||
+			total > maxEvidenceRequestBytes-len(value) {
+			return false
+		}
+		total += len(value)
+		return true
+	}
+	for _, value := range []string{
+		request.ToolName, request.Summary, request.ExecutionID,
+		request.Command, request.WorkingDirectory,
+	} {
+		if !add(value) {
+			return evidenceError(EvidenceFailureInvalidRequest)
+		}
+	}
+	for _, requirement := range request.Requirements {
+		if len(requirement.Candidates) > maxEvidenceRequestCandidates {
+			return evidenceError(EvidenceFailureForbiddenCapability)
+		}
+		for _, value := range []string{
+			requirement.Kind, requirement.Scope, requirement.Match,
+			requirement.Description, requirement.GrantClass, requirement.GrantTarget,
+		} {
+			if !add(value) {
+				return evidenceError(EvidenceFailureInvalidRequest)
+			}
+		}
+	}
+	return nil
+}
+
+func ownEvidenceResult(
+	result *tool.ToolResult,
+	maxResultBytes int,
+	remainingEvidenceBytes int,
+) ([]content.Block, int, error) {
+	return ownEvidenceResultWithEncoder(
+		result, maxResultBytes, remainingEvidenceBytes, content.MarshalBlocks,
+	)
+}
+
+func ownEvidenceResultWithEncoder(
+	result *tool.ToolResult,
+	maxResultBytes int,
+	remainingEvidenceBytes int,
+	encode func([]content.Block) ([]byte, error),
+) ([]content.Block, int, error) {
 	if result == nil || len(result.Content) == 0 {
 		return nil, 0, evidenceError(EvidenceFailureInvalidResult)
 	}
-	encoded, err := content.MarshalBlocks(result.Content)
+	if maxResultBytes <= 0 || remainingEvidenceBytes <= 0 {
+		return nil, 0, evidenceError(EvidenceFailureEvidenceTooLarge)
+	}
+	if err := preflightEvidenceResultBounds(
+		result.Content, maxResultBytes, remainingEvidenceBytes,
+	); err != nil {
+		return nil, 0, err
+	}
+	encoded, err := encode(result.Content)
 	if err != nil {
 		return nil, 0, evidenceError(EvidenceFailureInvalidResult)
+	}
+	if len(encoded) > maxResultBytes {
+		return nil, 0, evidenceError(EvidenceFailureResultTooLarge)
+	}
+	if len(encoded) > remainingEvidenceBytes {
+		return nil, 0, evidenceError(EvidenceFailureEvidenceTooLarge)
 	}
 	owned, err := content.UnmarshalBlocks(encoded)
 	if err != nil || len(owned) == 0 {
 		return nil, 0, evidenceError(EvidenceFailureInvalidResult)
 	}
 	return owned, len(encoded), nil
+}
+
+func preflightEvidenceResult(blocks []content.Block, configuredBytes int) error {
+	return preflightEvidenceResultBounds(blocks, configuredBytes, configuredBytes)
+}
+
+func preflightEvidenceResultBounds(
+	blocks []content.Block,
+	maxResultBytes int,
+	remainingEvidenceBytes int,
+) error {
+	if len(blocks) == 0 || len(blocks) > maxEvidenceResultBlocks {
+		return evidenceError(EvidenceFailureInvalidResult)
+	}
+	total := 0
+	for _, block := range blocks {
+		text, ok := block.(*content.TextBlock)
+		if !ok || text == nil {
+			return evidenceError(EvidenceFailureInvalidResult)
+		}
+		size := len(text.Text)
+		if size > maxEvidenceResultFieldBytes {
+			return evidenceError(EvidenceFailureResultTooLarge)
+		}
+		if total > maxEvidenceResultContentBytes-size {
+			return evidenceError(EvidenceFailureResultTooLarge)
+		}
+		total += size
+		if total > maxResultBytes {
+			return evidenceError(EvidenceFailureResultTooLarge)
+		}
+		if total > remainingEvidenceBytes {
+			return evidenceError(EvidenceFailureEvidenceTooLarge)
+		}
+	}
+	return nil
 }
 
 func evidenceContextFailure(ctx context.Context) error {
