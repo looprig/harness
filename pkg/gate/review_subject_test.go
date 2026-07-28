@@ -164,6 +164,85 @@ func TestPermissionReviewSubjectRejectsInvalidUTF8GrantFreeOptionalFieldsWithout
 	}
 }
 
+func TestPermissionReviewSubjectRejectsRequestHardBoundsWithZeroResults(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*tool.Request)
+	}{
+		{
+			name: "requirements one over",
+			mutate: func(request *tool.Request) {
+				request.Requirements = make(
+					[]tool.Requirement,
+					gate.MaxPermissionReviewRequestRequirements+1,
+				)
+			},
+		},
+		{
+			name: "aggregate candidates one over",
+			mutate: func(request *tool.Request) {
+				request.Requirements = []tool.Requirement{
+					{Candidates: make([]tool.RuleCandidate, gate.MaxPermissionReviewRequestCandidates/2)},
+					{Candidates: make([]tool.RuleCandidate, gate.MaxPermissionReviewRequestCandidates/2+1)},
+				}
+			},
+		},
+		{
+			name: "single string one over",
+			mutate: func(request *tool.Request) {
+				request.Command = strings.Repeat(
+					"x",
+					gate.MaxPermissionReviewRequestStringBytes+1,
+				)
+			},
+		},
+		{
+			name: "aggregate strings one over",
+			mutate: func(request *tool.Request) {
+				request.ToolName = strings.Repeat(
+					"x",
+					gate.MaxPermissionReviewRequestInputBytes/2,
+				)
+				request.Summary = strings.Repeat(
+					"y",
+					gate.MaxPermissionReviewRequestInputBytes/2+1,
+				)
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			basis, request, context := validPermissionReviewSubjectInput()
+			tt.mutate(&request)
+
+			got, err := gate.NewPermissionReviewSubject(basis, request, context)
+			if err == nil || !reflect.DeepEqual(got, gate.PermissionReviewSubject{}) {
+				t.Fatalf(
+					"NewPermissionReviewSubject() = (%#v, %v), want zero, error",
+					got,
+					err,
+				)
+			}
+			if len(err.Error()) > 128 ||
+				strings.Contains(err.Error(), strings.Repeat("x", 64)) ||
+				strings.Contains(err.Error(), strings.Repeat("y", 64)) {
+				t.Fatalf("error = %q, want bounded and non-echoing", err)
+			}
+
+			digest, digestErr := gate.SubjectDigest(gate.PermissionReviewSubject{
+				Basis: basis, Request: request, Context: context,
+			})
+			if digestErr == nil || digest != ([32]byte{}) {
+				t.Fatalf("SubjectDigest() = (%x, %v), want zero, error", digest, digestErr)
+			}
+		})
+	}
+}
+
 func TestPermissionReviewSubjectRejectsInvalidBuiltContext(t *testing.T) {
 	t.Parallel()
 

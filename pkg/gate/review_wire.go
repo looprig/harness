@@ -205,6 +205,12 @@ func permissionReviewCommonSubjectDigest(
 }
 
 func permissionReviewSubjectDigest(subject PermissionReviewSubject) ([32]byte, error) {
+	if reason := permissionReviewRequestPreflightReason(subject.Request); reason != "" {
+		return [32]byte{}, reviewSubjectError(ReviewValidationFieldRequest, reason)
+	}
+	if err := preflightPermissionReviewContextProjection(subject.Context); err != nil {
+		return [32]byte{}, err
+	}
 	wire := permissionReviewSubjectToWire(subject, zeroPermissionReviewDigestHex)
 	data, err := json.Marshal(wire)
 	if err != nil || len(data) > MaxPermissionReviewSubjectWireBytes {

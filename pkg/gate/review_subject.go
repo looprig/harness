@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"math"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
@@ -17,6 +18,15 @@ const (
 )
 
 const ReviewValidationMismatch ReviewValidationReason = "mismatch"
+
+// Hard request-input bounds constrain work before any request is cloned,
+// validated, or projected onto the canonical subject wire.
+const (
+	MaxPermissionReviewRequestRequirements = 4096
+	MaxPermissionReviewRequestCandidates   = 4096
+	MaxPermissionReviewRequestStringBytes  = 1 << 20
+	MaxPermissionReviewRequestInputBytes   = 1 << 20
+)
 
 // ReviewBasis binds a classifier decision to one exact live permission
 // request and the policy revisions under which it was reviewed.
@@ -49,6 +59,16 @@ func NewPermissionReviewSubject(
 			ReviewValidationFieldDigest,
 			ReviewValidationReserved,
 		)
+	}
+	if reason := permissionReviewRequestPreflightReason(request); reason != "" {
+		return PermissionReviewSubject{}, reviewSubjectError(
+			ReviewValidationFieldRequest,
+			reason,
+		)
+	}
+	// Validate the original context before Clone allocates its entry slice.
+	if err := validateBuiltReviewContext(context); err != nil {
+		return PermissionReviewSubject{}, err
 	}
 	subject := PermissionReviewSubject{
 		Basis:   basis,
@@ -101,10 +121,10 @@ func validatePermissionReviewSubject(subject PermissionReviewSubject) error {
 			return reviewSubjectError(ReviewValidationFieldBasis, ReviewValidationInvalid)
 		}
 	}
-	if err := tool.ValidateRequest(subject.Request); err != nil {
-		return reviewSubjectError(ReviewValidationFieldRequest, ReviewValidationInvalid)
+	if reason := permissionReviewRequestPreflightReason(subject.Request); reason != "" {
+		return reviewSubjectError(ReviewValidationFieldRequest, reason)
 	}
-	if !validPermissionReviewRequestUTF8(subject.Request) {
+	if err := tool.ValidateRequest(subject.Request); err != nil {
 		return reviewSubjectError(ReviewValidationFieldRequest, ReviewValidationInvalid)
 	}
 	if subject.Request.ExecutionID != "" {
@@ -126,20 +146,36 @@ func validatePermissionReviewSubject(subject PermissionReviewSubject) error {
 	return nil
 }
 
-func validPermissionReviewRequestUTF8(request tool.Request) bool {
-	for _, value := range []string{
+func permissionReviewRequestPreflightReason(request tool.Request) ReviewValidationReason {
+	if len(request.Requirements) > MaxPermissionReviewRequestRequirements {
+		return ReviewValidationOutOfBounds
+	}
+	totalInputBytes := 0
+	for _, value := range [...]string{
 		request.ToolName,
 		request.Summary,
 		request.ExecutionID,
 		request.Command,
 		request.WorkingDirectory,
 	} {
-		if !utf8.ValidString(value) {
-			return false
+		reason := addPermissionReviewRequestString(&totalInputBytes, value)
+		if reason != "" {
+			return reason
 		}
 	}
-	for _, requirement := range request.Requirements {
-		for _, value := range []string{
+
+	totalCandidates := 0
+	for index := range request.Requirements {
+		requirement := &request.Requirements[index]
+		var ok bool
+		totalCandidates, ok = checkedPermissionReviewRequestAdd(
+			totalCandidates,
+			len(requirement.Candidates),
+		)
+		if !ok || totalCandidates > MaxPermissionReviewRequestCandidates {
+			return ReviewValidationOutOfBounds
+		}
+		for _, value := range [...]string{
 			requirement.Kind,
 			requirement.Scope,
 			requirement.Match,
@@ -147,25 +183,124 @@ func validPermissionReviewRequestUTF8(request tool.Request) bool {
 			requirement.GrantClass,
 			requirement.GrantTarget,
 		} {
-			if !utf8.ValidString(value) {
-				return false
+			reason := addPermissionReviewRequestString(&totalInputBytes, value)
+			if reason != "" {
+				return reason
 			}
 		}
+
 		for _, candidate := range requirement.Candidates {
-			for _, value := range []string{
+			for _, value := range [...]string{
 				candidate.Kind,
 				candidate.Match,
 				candidate.Description,
 				candidate.GrantClass,
 				candidate.GrantTarget,
 			} {
-				if !utf8.ValidString(value) {
-					return false
+				reason := addPermissionReviewRequestString(&totalInputBytes, value)
+				if reason != "" {
+					return reason
 				}
 			}
 		}
 	}
-	return true
+	return ""
+}
+
+func addPermissionReviewRequestString(
+	totalInputBytes *int,
+	value string,
+) ReviewValidationReason {
+	if !utf8.ValidString(value) {
+		return ReviewValidationInvalid
+	}
+	if len(value) > MaxPermissionReviewRequestStringBytes {
+		return ReviewValidationOutOfBounds
+	}
+	total, ok := checkedPermissionReviewRequestAdd(*totalInputBytes, len(value))
+	if !ok || total > MaxPermissionReviewRequestInputBytes {
+		return ReviewValidationOutOfBounds
+	}
+	*totalInputBytes = total
+	return ""
+}
+
+func checkedPermissionReviewRequestAdd(left int, right int) (int, bool) {
+	if left < 0 || right < 0 || left > math.MaxInt-right {
+		return 0, false
+	}
+	return left + right, true
+}
+
+func preflightPermissionReviewContextProjection(context ReviewContext) error {
+	if len(context.Entries) > MaxReviewContextInputEntries {
+		return reviewContextError(
+			ReviewValidationFieldContextEntry,
+			ReviewValidationOutOfBounds,
+		)
+	}
+	totalInputBytes := 0
+	for _, value := range [...]string{
+		context.ContextRevision,
+		context.WorkspaceRoot,
+		context.WorkingDirectory,
+		context.RetryReason,
+		context.SecurityCeiling,
+		context.GatePolicyRevision,
+	} {
+		if !utf8.ValidString(value) {
+			return reviewContextError(
+				ReviewValidationFieldContext,
+				ReviewValidationInvalid,
+			)
+		}
+		if len(value) > MaxReviewContextRootFieldBytes {
+			return reviewContextError(
+				ReviewValidationFieldContext,
+				ReviewValidationOutOfBounds,
+			)
+		}
+		var ok bool
+		totalInputBytes, ok = checkedReviewContextAdd(totalInputBytes, len(value))
+		if !ok || totalInputBytes > MaxReviewContextInputBytes {
+			return reviewContextError(
+				ReviewValidationFieldContext,
+				ReviewValidationOutOfBounds,
+			)
+		}
+	}
+	for index := range context.Entries {
+		entry := &context.Entries[index]
+		if !utf8.ValidString(string(entry.Origin)) ||
+			!utf8.ValidString(string(entry.Kind)) ||
+			!utf8.ValidString(entry.Content) {
+			return reviewContextError(
+				ReviewValidationFieldContextEntry,
+				ReviewValidationInvalid,
+			)
+		}
+		if len(entry.Content) > MaxReviewContextEntryInputBytes {
+			return reviewContextError(
+				ReviewValidationFieldContextEntry,
+				ReviewValidationOutOfBounds,
+			)
+		}
+		for _, size := range [...]int{
+			len(entry.Origin),
+			len(entry.Kind),
+			len(entry.Content),
+		} {
+			var ok bool
+			totalInputBytes, ok = checkedReviewContextAdd(totalInputBytes, size)
+			if !ok || totalInputBytes > MaxReviewContextInputBytes {
+				return reviewContextError(
+					ReviewValidationFieldContextEntry,
+					ReviewValidationOutOfBounds,
+				)
+			}
+		}
+	}
+	return nil
 }
 
 func validateBuiltReviewContext(context ReviewContext) error {
