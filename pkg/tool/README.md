@@ -59,9 +59,9 @@ rather than shared task memory.
   start of evaluation and at both durable codec boundaries.
 - **Optional capability interfaces** — `Sequential` (must not run
   concurrently with other calls in the batch), `ReadGuard` consumer,
-  `DelegateController` requirement, etc. The runner probes for each via
-  type assertion; a tool implementing none is still a valid
-  `InvokableTool`.
+  `DelegateController` requirement, generic asynchronous process contracts,
+  etc. The runner probes for each via type assertion; a tool implementing none
+  is still a valid `InvokableTool`.
 
 ## How to use
 
@@ -142,6 +142,38 @@ The standard tool implementations live in
 [`looprig/tools`](https://github.com/looprig/tools); a consumer wires
 those factories and binds a `gate.Evaluator` (and a sandbox) at the
 composition root.
+
+### Asynchronous processes
+
+`AsyncProcessRunner` is the shell-agnostic, enforcement-capable seam for
+supervised processes. `PrepareProcess` validates grants and reserves enforcement
+resources without spawning. The caller reads the returned preparation's
+authoritative `WorkspaceAccess`, acquires a matching lifetime workspace lease,
+and then calls its single-use `Start`. `WorkspaceAccess` keeps its path slices
+private: construct it with `NewWorkspaceAccess`, and read defensive copies
+through `WritePaths` and `WriteTrees`. Closing an unstarted preparation releases
+its reservation.
+
+The `Start` context governs setup through handoff only. The returned `Process`
+lives independently until wait, close, its deadline, or runner shutdown.
+Process deadlines are opt-in: a zero `ProcessRequest.Deadline` means no process
+deadline and is never replaced by a runner default. Session or runner shutdown
+still terminates the process.
+
+`Process.StreamMode` distinguishes stream topology without fallback ambiguity.
+Pipe mode exposes distinct stdout and stderr readers. PTY mode exposes combined
+terminal bytes on stdout and a non-nil, closed-empty stderr; unavailable PTY
+support fails preparation or start instead of falling back to pipes. Process
+methods other than `Wait` are concurrency-safe; the supervisor is the sole
+caller of `Wait` and calls it exactly once. Returned stdin supports concurrent
+writes and close: close is idempotent, delivers EOF at most once, and makes
+later writes fail.
+
+`ProcessResult` carries a typed terminal reason and timestamps but never an OS
+PID; model-facing handles belong to the supervising tools module. A process may
+optionally implement `ProcessActivitySource`. Every activity invalidates the
+complete bound observation cache, malformed activity is conservatively broad,
+and the activity channel closes before `Wait` returns.
 
 ## Sibling packages
 
