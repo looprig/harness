@@ -31,12 +31,15 @@ type SessionResourceStorageProvider interface {
 // used by session-owned resources.
 func WithSessionResourceStorage(provider SessionResourceStorageProvider) Option {
 	return func(state *definitionState) error {
+		if state.seen[keySessionResourceStorage] {
+			return &DefinitionError{Kind: DefinitionDuplicateOption, Name: string(keySessionResourceStorage)}
+		}
 		if nilSessionResourceStorageProvider(provider) {
 			return &DefinitionError{Kind: DefinitionInvalidResourceStorage}
 		}
-		return singleton(keySessionResourceStorage, func(state *definitionState) {
-			state.resourceStorageProvider = provider
-		})(state)
+		state.seen[keySessionResourceStorage] = true
+		state.resourceStorageProvider = provider
+		return nil
 	}
 }
 

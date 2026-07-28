@@ -51,13 +51,27 @@ func TestRigRejectsTypedNilResourceStorageProvider(t *testing.T) {
 func TestRigRejectsDuplicateResourceStorageProvider(t *testing.T) {
 	t.Parallel()
 
-	_, err := Define(
-		WithSessionResourceStorage(&resourceStorageProviderStub{}),
-		WithSessionResourceStorage(&resourceStorageProviderStub{}),
-	)
-	var target *DefinitionError
-	if !errors.As(err, &target) || target.Kind != DefinitionDuplicateOption {
-		t.Fatalf("Define() error = %T %v, want duplicate-option DefinitionError", err, err)
+	tests := []struct {
+		name   string
+		second SessionResourceStorageProvider
+	}{
+		{name: "valid", second: &resourceStorageProviderStub{}},
+		{name: "nil", second: nil},
+		{name: "typed nil", second: (*resourceStorageProviderStub)(nil)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := Define(
+				WithSessionResourceStorage(&resourceStorageProviderStub{}),
+				WithSessionResourceStorage(tt.second),
+			)
+			var target *DefinitionError
+			if !errors.As(err, &target) || target.Kind != DefinitionDuplicateOption {
+				t.Fatalf("Define() error = %T %v, want duplicate-option DefinitionError", err, err)
+			}
+		})
 	}
 }
 
