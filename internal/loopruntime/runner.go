@@ -421,7 +421,7 @@ func approvalRequesterFor(
 
 		select {
 		case gateReg <- gateRegistration{
-			gate: g, payload: payload, reviewContext: reviewContext.Clone(),
+			gate: g, payload: payload, reviewContext: reviewContext,
 			callID: r.callID, reply: reply, kind: gatePermission, ack: ack,
 		}:
 		case <-ctx.Done():
