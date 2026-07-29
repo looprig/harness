@@ -725,7 +725,10 @@ func TestPermissionReviewAdapterNeverLeaksSecretsIntoDurableEvents(t *testing.T)
 // subject/command/context content in its MarshalInput error text; reviewOne's
 // slog.Warn call for this path must not repeat that text.
 func TestPermissionReviewAdapterMarshalInputFailureNeverLeaksErrorText(t *testing.T) {
-	t.Parallel()
+	// Deliberately NOT t.Parallel(): captureSlogDefault swaps the process-wide
+	// slog default for the duration of this test; running concurrently with
+	// another test that also redirects the default risks this test's own log
+	// line landing in a different test's buffer instead of this one's.
 	const markerMarshalErr = "SECRET-MARSHALINPUT-MARKER-6af0e1"
 
 	classifier := newValidReviewClassifier(t, "marshal-fail-classifier", "rev-1", true)

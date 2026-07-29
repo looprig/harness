@@ -2,6 +2,7 @@ package sessionruntime
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -429,6 +430,246 @@ func TestReviewBreakerClearOnlyRespondsToTerminalTurnEvents(t *testing.T) {
 
 	if s.reviewBreakerAllows(coords) {
 		t.Fatal("a non-terminal event cleared the breaker state")
+	}
+}
+
+// --- Session-scoped circuit breaker ---------------------------------------
+//
+// Design §18 requires bounded counters "per-turn AND per-session" for the
+// same four signals. The per-turn counters above are cleared at every
+// TurnDone/TurnFailed/TurnInterrupted (clearReviewTurnState), so a pattern
+// spread across many distinct turns — each individually below the per-turn
+// threshold — never trips the turn-scoped breaker. The session-scoped
+// counters below mirror the turn-scoped shape exactly but are never cleared
+// by turn completion; they only accumulate (bounded) for the session's whole
+// lifetime, and a session-level trip is a stronger signal than a turn-level
+// one: it makes every current AND future gate in the session human-only, not
+// just the tripping turn's.
+
+// breakerSessionCoords builds coordinates sharing sessionID across distinct
+// turns, mirroring breakerCoords but letting a test hold SessionID fixed
+// while turnID varies (breakerCoords mints a fresh random SessionID every
+// call, which would defeat session-scoped accumulation entirely).
+func breakerSessionCoords(sessionID, turnID, loopID uuid.UUID) identity.Coordinates {
+	return identity.Coordinates{SessionID: sessionID, LoopID: loopID, TurnID: turnID, StepID: mustUUID()}
+}
+
+// TestReviewSessionBreakerAccumulatesAcrossTurnCompletion proves (a): the
+// session-scoped counter keeps counting across multiple DISTINCT turns even
+// though each turn's own per-turn counter is cleared at turn completion —
+// exactly the cross-turn pattern design §18 requires and the pre-existing
+// per-turn-only counters could never catch.
+func TestReviewSessionBreakerAccumulatesAcrossTurnCompletion(t *testing.T) {
+	t.Parallel()
+	s := &Session{}
+	withPermissionReviewBreaker(reviewCircuitBreakerLimits{
+		Session: reviewSessionCircuitBreakerLimits{MaxConsecutiveNeedsHuman: 3},
+	})(s)
+	sessionID, loopID := mustUUID(), mustUUID()
+
+	for i := 0; i < 2; i++ {
+		turnID := mustUUID()
+		coords := breakerSessionCoords(sessionID, turnID, loopID)
+		s.observePermissionReviewOutcome(coords, reviewBreakerOutcome{Reason: gate.ReviewDecisionRecommendation})
+		// Turn completes: its OWN counters are wiped, but the session-scoped
+		// counter must survive.
+		s.clearReviewTurnState(event.TurnDone{Header: event.Header{Coordinates: coords}})
+
+		s.review.mu.Lock()
+		_, turnTracked := s.review.turns[turnID]
+		sessionCount := s.review.session.consecutiveNeedsHuman
+		s.review.mu.Unlock()
+		if turnTracked {
+			t.Fatalf("turn %d counters survived TurnDone", i)
+		}
+		if want := i + 1; sessionCount != want {
+			t.Fatalf("session consecutiveNeedsHuman = %d after turn %d, want %d", sessionCount, i, want)
+		}
+	}
+
+	// A third, still distinct turn crosses the shared threshold (3) purely
+	// from session-scoped accumulation — no single turn ever saw more than
+	// one needs-human outcome.
+	finalTurn := mustUUID()
+	finalCoords := breakerSessionCoords(sessionID, finalTurn, loopID)
+	s.observePermissionReviewOutcome(finalCoords, reviewBreakerOutcome{Reason: gate.ReviewDecisionRecommendation})
+	if s.reviewBreakerAllows(finalCoords) {
+		t.Fatal("session-scoped counter did not trip after accumulating across 3 distinct turns")
+	}
+}
+
+// TestReviewSessionBreakerTripsIndependentlyFromTurnBreaker proves (b): the
+// session-scoped trip is a DISTINCT flag from any turn-scoped trip — with no
+// turn-scoped threshold configured at all, a turn's own counters can
+// structurally never trip, yet the session-scoped counters (a genuinely
+// separate configuration surface, reviewCircuitBreakerLimits.Session) still
+// trip once their own threshold is crossed across turns.
+func TestReviewSessionBreakerTripsIndependentlyFromTurnBreaker(t *testing.T) {
+	t.Parallel()
+	s := &Session{}
+	withPermissionReviewBreaker(reviewCircuitBreakerLimits{
+		Session: reviewSessionCircuitBreakerLimits{MaxInvalidOrFailed: 2},
+	})(s)
+	sessionID, loopID := mustUUID(), mustUUID()
+
+	var lastCoords identity.Coordinates
+	for i := 0; i < 2; i++ {
+		turnID := mustUUID()
+		coords := breakerSessionCoords(sessionID, turnID, loopID)
+		lastCoords = coords
+		s.observePermissionReviewOutcome(coords, reviewBreakerOutcome{Reason: gate.ReviewDecisionClassifierStatus})
+
+		s.review.mu.Lock()
+		turnCounters := s.review.turns[turnID]
+		s.review.mu.Unlock()
+		if turnCounters == nil || turnCounters.tripped {
+			t.Fatalf("turn %d counters unexpectedly tripped (turn-scoped and session-scoped must be independent)", i)
+		}
+		s.clearReviewTurnState(event.TurnDone{Header: event.Header{Coordinates: coords}})
+	}
+
+	s.review.mu.Lock()
+	sessionTripped := s.review.session.tripped
+	s.review.mu.Unlock()
+	if !sessionTripped {
+		t.Fatal("session-scoped breaker did not trip despite reaching the shared threshold across turns")
+	}
+	if s.reviewBreakerAllows(lastCoords) {
+		t.Fatal("reviewBreakerAllows() = true after the session-scoped breaker tripped")
+	}
+}
+
+// TestReviewSessionBreakerWarnsExactlyOnce proves (c): a session-level trip
+// emits exactly one bounded warning, distinct from the turn-scoped warning,
+// even as further reviews continue to be observed after the trip.
+func TestReviewSessionBreakerWarnsExactlyOnce(t *testing.T) {
+	// Deliberately NOT t.Parallel(): captureSlogDefault swaps the process-wide
+	// slog default for the duration of this test and asserts an EXACT count of
+	// a fixed (non-random) message substring, so it must not run concurrently
+	// with any other test that might also redirect or write to the default
+	// logger.
+	s := &Session{sessionCtx: context.Background()}
+	withPermissionReviewBreaker(reviewCircuitBreakerLimits{
+		Session: reviewSessionCircuitBreakerLimits{MaxInvalidOrFailed: 1},
+	})(s)
+	sessionID, loopID := mustUUID(), mustUUID()
+
+	logs := captureSlogDefault(t)
+	for i := 0; i < 5; i++ {
+		coords := breakerSessionCoords(sessionID, mustUUID(), loopID)
+		s.observePermissionReviewOutcome(coords, reviewBreakerOutcome{Reason: gate.ReviewDecisionClassifierStatus})
+	}
+
+	const sessionWarnMsg = "permission-review circuit breaker tripped; automatic review disabled for the session"
+	got := strings.Count(logs.String(), sessionWarnMsg)
+	if got != 1 {
+		t.Fatalf("session-level breaker warning count = %d, want exactly 1; logs: %s", got, logs.String())
+	}
+}
+
+// TestReviewSessionBreakerCountersAreBoundedAndSecretFree proves (d): the
+// session-scoped identical-subject digest set is bounded to
+// maxTrackedReviewSubjectDigests distinct digests (the same defensive cap the
+// turn-scoped counters already apply — see trackReviewSubjectLocked) and, by
+// construction of reviewBreakerOutcome/subjectContentDigest, holds only fixed
+// 32-byte digests and small counters — never raw subject content.
+func TestReviewSessionBreakerCountersAreBoundedAndSecretFree(t *testing.T) {
+	t.Parallel()
+	s := &Session{}
+	withPermissionReviewBreaker(reviewCircuitBreakerLimits{
+		Session: reviewSessionCircuitBreakerLimits{MaxIdenticalSubjects: 1 << 20},
+	})(s)
+	sessionID, loopID := mustUUID(), mustUUID()
+
+	for i := 0; i < maxTrackedReviewSubjectDigests+5; i++ {
+		var digest [32]byte
+		digest[0] = byte(i)
+		digest[1] = byte(i >> 8)
+		coords := breakerSessionCoords(sessionID, mustUUID(), loopID)
+		s.observePermissionReviewOutcome(coords, reviewBreakerOutcome{Reason: gate.ReviewDecisionRecommendation, SubjectDigest: digest})
+	}
+
+	s.review.mu.Lock()
+	tracked := len(s.review.session.subjectCounts)
+	s.review.mu.Unlock()
+	if tracked != maxTrackedReviewSubjectDigests {
+		t.Fatalf("session tracked subject digests = %d, want %d (bounded, no unbounded growth)", tracked, maxTrackedReviewSubjectDigests)
+	}
+}
+
+// TestReviewSessionBreakerTripMakesNewTurnHumanOnly proves (e): a
+// session-level trip is NOT scoped to the turn that caused it — it blocks a
+// brand-new turn that never itself contributed a single observation.
+func TestReviewSessionBreakerTripMakesNewTurnHumanOnly(t *testing.T) {
+	t.Parallel()
+	s := &Session{}
+	withPermissionReviewBreaker(reviewCircuitBreakerLimits{
+		Session: reviewSessionCircuitBreakerLimits{MaxInvalidOrFailed: 1},
+	})(s)
+	sessionID, loopID := mustUUID(), mustUUID()
+
+	trippingCoords := breakerSessionCoords(sessionID, mustUUID(), loopID)
+	s.observePermissionReviewOutcome(trippingCoords, reviewBreakerOutcome{Reason: gate.ReviewDecisionClassifierStatus})
+
+	s.review.mu.Lock()
+	sessionTripped := s.review.session.tripped
+	s.review.mu.Unlock()
+	if !sessionTripped {
+		t.Fatal("session-scoped breaker did not trip")
+	}
+
+	freshCoords := breakerSessionCoords(sessionID, mustUUID(), loopID)
+	s.review.mu.Lock()
+	_, freshTurnTracked := s.review.turns[freshCoords.TurnID]
+	s.review.mu.Unlock()
+	if freshTurnTracked {
+		t.Fatal("test setup error: the fresh turn must never have been observed")
+	}
+	if s.reviewBreakerAllows(freshCoords) {
+		t.Fatal("reviewBreakerAllows() = true for a brand-new turn after the session-scoped breaker tripped")
+	}
+}
+
+// TestStartPermissionReviewNoopsWhenSessionBreakerTripped extends
+// TestStartPermissionReviewNoopsWhenBreakerTripped to the session scope:
+// StartPermissionReview must consult BOTH the turn-scoped and session-scoped
+// breaker at its enforcement point, so a session-level trip caused by an
+// EARLIER, different turn still blocks a request for a brand-new turn.
+func TestStartPermissionReviewNoopsWhenSessionBreakerTripped(t *testing.T) {
+	t.Parallel()
+	classifier := newValidReviewClassifier(t, "classifier", "rev-1", true)
+	set, err := gate.NewPermissionClassifierSet(classifier)
+	if err != nil {
+		t.Fatalf("NewPermissionClassifierSet: %v", err)
+	}
+	s := reviewStartSession(t, set)
+	withPermissionReviewBreaker(reviewCircuitBreakerLimits{
+		Session: reviewSessionCircuitBreakerLimits{MaxInvalidOrFailed: 1},
+	})(s)
+
+	// Trip the session-scoped breaker from an unrelated, already-finished turn.
+	trippingCoords := identity.Coordinates{SessionID: s.sessionID, LoopID: mustUUID(), TurnID: mustUUID(), StepID: mustUUID()}
+	s.observePermissionReviewOutcome(trippingCoords, reviewBreakerOutcome{Reason: gate.ReviewDecisionClassifierStatus})
+	s.clearReviewTurnState(event.TurnDone{Header: event.Header{Coordinates: trippingCoords}})
+
+	gateID := mustUUID()
+	req := validReviewRequest(t, gateID, mustUUID())
+	req.ReviewContext.Coordinates.SessionID = s.sessionID // same session, brand-new turn
+	s.gates[gateID] = gateEntry{}
+
+	s.StartPermissionReview(context.Background(), req)
+
+	s.gatesMu.Lock()
+	basis := s.gates[gateID].reviewBasis
+	s.gatesMu.Unlock()
+	if basis != (gate.ReviewBasis{}) {
+		t.Fatalf("reviewBasis = %+v, want zero (session-scoped trip must block a brand-new turn too)", basis)
+	}
+	s.review.mu.Lock()
+	_, active := s.review.cancellations[gateID]
+	s.review.mu.Unlock()
+	if active {
+		t.Fatal("a cancellation handle was armed while the session-scoped breaker is tripped")
 	}
 }
 

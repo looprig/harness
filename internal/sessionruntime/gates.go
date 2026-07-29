@@ -212,10 +212,12 @@ func (s *Session) StartPermissionReview(ctx context.Context, req loopruntime.Per
 	if s.hustleController == nil {
 		return
 	}
-	// Circuit breaker (design §18): a tripped turn starts no further
-	// automatic review at all — no adapter, no cancellation handle, no
-	// reviewBasis stamp — leaving every current and future gate in the turn
-	// human-only, exactly like the "no classifiers configured" no-op above.
+	// Circuit breaker (design §18): a tripped turn OR a tripped session
+	// (reviewBreakerAllows consults both scopes) starts no further automatic
+	// review at all — no adapter, no cancellation handle, no reviewBasis
+	// stamp — leaving every current and future gate human-only, exactly like
+	// the "no classifiers configured" no-op above. A session-scoped trip
+	// blocks EVERY turn in the session, not just the one that tripped it.
 	if !s.reviewBreakerAllows(req.ReviewContext.Coordinates) {
 		return
 	}

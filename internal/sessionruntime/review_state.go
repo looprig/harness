@@ -16,7 +16,8 @@ import (
 
 // review_state.go owns the session's bounded, PURELY in-memory permission-review
 // lifecycle bookkeeping: one cancellation handle per active gate review (design
-// §15) and per-turn circuit-breaker counters (design §18). Nothing declared here
+// §15) and per-turn AND per-session circuit-breaker counters (design §18).
+// Nothing declared here
 // is ever durable and nothing here is restored — a restored *Session is built as
 // a fresh struct literal (restore_constructor.go's buildRestoredSession) that
 // never sets the review field, so it always starts from the zero reviewLifecycle.
@@ -57,6 +58,42 @@ type reviewCircuitBreakerLimits struct {
 	// leaves the loop running — an open human gate already prevents rapid
 	// autonomous retry.
 	InterruptOnTrip bool
+	// Session configures the session-scoped counterpart of the four
+	// thresholds above (design §18: "per-turn AND per-session"). It is a
+	// SEPARATE, independently-configured threshold set, not a shared reuse of
+	// the turn-scoped fields above: the session-scoped counters never reset
+	// at a turn boundary (see reviewSessionCounters), so reusing the same
+	// numeric thresholds would mean any turn-scoped threshold low enough to
+	// trip in a single turn (e.g. 1) also permanently trips the session on
+	// that same first observation — defeating clearReviewTurnState's
+	// "cleared when the turn completes" contract for the turn-scoped breaker
+	// entirely. A zero Session (the default) disables every session-scoped
+	// counter, exactly like a zero top-level field disables its turn-scoped
+	// counterpart: a consumer that only ever configured the turn-scoped
+	// fields above keeps the exact pre-Finding-2 behavior unchanged.
+	Session reviewSessionCircuitBreakerLimits
+}
+
+// reviewSessionCircuitBreakerLimits are the bounded, immutable per-session
+// thresholds design §18 requires, mirroring reviewCircuitBreakerLimits'
+// four counter kinds (InterruptOnTrip has no session-scoped counterpart: it
+// is documented, and tested, as interrupting the tripping TURN's loop
+// subtree specifically — extending it to "interrupt the whole session" is a
+// materially different, undocumented action outside this fix's scope).
+type reviewSessionCircuitBreakerLimits struct {
+	// MaxConsecutiveNeedsHuman is reviewCircuitBreakerLimits.MaxConsecutiveNeedsHuman's
+	// session-scoped counterpart.
+	MaxConsecutiveNeedsHuman int
+	// MaxInvalidOrFailed is reviewCircuitBreakerLimits.MaxInvalidOrFailed's
+	// session-scoped counterpart.
+	MaxInvalidOrFailed int
+	// MaxIdenticalSubjects is reviewCircuitBreakerLimits.MaxIdenticalSubjects's
+	// session-scoped counterpart, bounding a materially identical gated
+	// subject recurring across the WHOLE session rather than one turn.
+	MaxIdenticalSubjects int
+	// MaxStaleResponses is reviewCircuitBreakerLimits.MaxStaleResponses's
+	// session-scoped counterpart.
+	MaxStaleResponses int
 }
 
 // withPermissionReviewBreaker installs the circuit-breaker thresholds a
@@ -142,9 +179,39 @@ type reviewTurnCounters struct {
 	warned                bool
 }
 
+// reviewSessionCounters is the session-scoped counterpart of
+// reviewTurnCounters (design §18: "track per-turn AND per-session bounded
+// counters"). It mirrors the exact same four counter kinds, but unlike
+// reviewTurnCounters it is never cleared by clearReviewTurnState — there is
+// exactly one reviewSessionCounters value for the session's entire lifetime.
+// That is the whole point: a pattern of repeated failures/needs_human spread
+// across many DIFFERENT turns, each individually below the per-turn
+// threshold, is invisible to the turn-scoped counters (cleared at every
+// TurnDone/TurnFailed/TurnInterrupted) but accumulates here.
+//
+// Design §18 describes threshold crossing and a per-turn clear-on-completion
+// rule, but does not separately describe a reset trigger for the
+// session-scoped counters. The safe, fail-closed reading is that they never
+// reset — only grow, bounded — until the session itself ends (a restored
+// *Session always starts a fresh, zero reviewLifecycle; see this file's
+// top-of-file doc comment), matching every other unresolved-ambiguity
+// default in this design: narrowing (more human review), never widening.
+//
+// It never contains subject content — only counts and a bounded set of
+// content-only digests, exactly like reviewTurnCounters.
+type reviewSessionCounters struct {
+	consecutiveNeedsHuman int
+	invalidOrFailed       int
+	staleResponses        int
+	subjectCounts         map[[32]byte]int
+	tripped               bool
+	warned                bool
+}
+
 // reviewLifecycle is the session's bounded, PURELY in-memory permission-review
 // lifecycle state: one cancellation handle per active gate review (design §15)
-// and per-turn circuit-breaker counters (design §18). It is its own type —
+// and per-turn AND per-session circuit-breaker counters (design §18). It is
+// its own type —
 // not folded into gateEntry — because its invariants and lifetime differ:
 // gateEntry is part of the durable-adjacent gate directory (rebuilt on
 // restore); reviewLifecycle is purely live and always starts zero, including
@@ -164,6 +231,12 @@ type reviewLifecycle struct {
 
 	limits reviewCircuitBreakerLimits
 	turns  map[uuid.UUID]*reviewTurnCounters
+
+	// session is the single, session-lifetime reviewSessionCounters value
+	// (design §18's session-scoped counters). Lazily allocated by
+	// reviewSessionCountersLocked on first observation; nil (never trips)
+	// for a session that has never observed a review outcome.
+	session *reviewSessionCounters
 }
 
 // beginPermissionReviewCancellation installs a fresh cancellation handle for
@@ -244,18 +317,25 @@ func (s *Session) shutdownPermissionReviews() {
 }
 
 // reviewBreakerAllows reports whether automatic review may start for the turn
-// coords identifies. It returns true (allow) whenever coords carries no
-// TurnID to scope a breaker against — that can only happen for a
-// degenerate/test caller, and failing open here only ever means "the
-// pre-Task-16 no-breaker behavior applies", never a widened approval, since
-// the breaker can only ever narrow (send more to human), never approve
+// coords identifies. It consults BOTH breaker scopes (design §18): a tripped
+// SESSION-scoped breaker blocks every gate in the session — including one
+// belonging to a turn that never itself contributed a single observation —
+// because a session-level trip is a stronger signal than a turn-level one.
+// Absent a session-scoped trip, it returns true (allow) whenever coords
+// carries no TurnID to scope a turn-level breaker against — that can only
+// happen for a degenerate/test caller, and failing open here only ever means
+// "the pre-Task-16 no-breaker behavior applies", never a widened approval,
+// since the breaker can only ever narrow (send more to human), never approve
 // anything itself.
 func (s *Session) reviewBreakerAllows(coords identity.Coordinates) bool {
+	s.review.mu.Lock()
+	defer s.review.mu.Unlock()
+	if s.review.session != nil && s.review.session.tripped {
+		return false
+	}
 	if coords.TurnID.IsZero() {
 		return true
 	}
-	s.review.mu.Lock()
-	defer s.review.mu.Unlock()
 	counters := s.review.turns[coords.TurnID]
 	return counters == nil || !counters.tripped
 }
@@ -263,47 +343,61 @@ func (s *Session) reviewBreakerAllows(coords identity.Coordinates) bool {
 // observePermissionReviewOutcome implements permissionReviewOutcomeObserver.
 // It is called once per completed review() attempt (never for a review that
 // found no applicable classifier at all — design §18's counters are about
-// REVIEWED-but-rejected/failed attempts, not no-op turns) and updates the
-// turn-scoped circuit-breaker counters, tripping the breaker and emitting
-// exactly one bounded warning the moment any threshold is first crossed.
+// REVIEWED-but-rejected/failed attempts, not no-op turns) and updates BOTH
+// the turn-scoped and the session-scoped circuit-breaker counters, tripping
+// either breaker and emitting its own exactly-one bounded warning the moment
+// its threshold is first crossed. The two scopes are otherwise entirely
+// independent: a turn-scoped trip never marks the session tripped, and a
+// session-scoped trip is checked on every future gate regardless of turn
+// (reviewBreakerAllows).
 func (s *Session) observePermissionReviewOutcome(coords identity.Coordinates, outcome reviewBreakerOutcome) {
 	if coords.TurnID.IsZero() {
 		return
 	}
 	s.review.mu.Lock()
-	counters := s.reviewTurnCountersLocked(coords.TurnID)
+	turnCounters := s.reviewTurnCountersLocked(coords.TurnID)
+	sessionCounters := s.reviewSessionCountersLocked()
 	if outcome.Eligible {
-		counters.consecutiveNeedsHuman = 0
-		counters.invalidOrFailed = 0
+		turnCounters.consecutiveNeedsHuman = 0
+		turnCounters.invalidOrFailed = 0
+		sessionCounters.consecutiveNeedsHuman = 0
+		sessionCounters.invalidOrFailed = 0
 		s.review.mu.Unlock()
 		return
 	}
 	switch {
 	case reviewNeedsHumanReasons[outcome.Reason]:
-		counters.consecutiveNeedsHuman++
+		turnCounters.consecutiveNeedsHuman++
+		sessionCounters.consecutiveNeedsHuman++
 	case reviewInvalidOrFailedReasons[outcome.Reason]:
-		counters.invalidOrFailed++
+		turnCounters.invalidOrFailed++
+		sessionCounters.invalidOrFailed++
 	}
-	s.trackReviewSubjectLocked(counters, outcome.SubjectDigest)
-	s.maybeTripReviewBreakerLocked(coords, counters)
+	s.trackReviewSubjectLocked(turnCounters, outcome.SubjectDigest)
+	s.trackReviewSessionSubjectLocked(sessionCounters, outcome.SubjectDigest)
+	s.maybeTripReviewBreakerLocked(coords, turnCounters)
+	s.maybeTripReviewSessionBreakerLocked(coords, sessionCounters)
 	s.review.mu.Unlock()
 }
 
-// recordPermissionReviewStale increments coords' turn's stale-response
-// counter (design §18's "classifier-originated stale responses"). It is
-// called from respondFromClassifier's drift closure the moment a
-// classifier-originated response is discovered to be stale — the exact
-// moment design §18 wants counted, replacing the pre-Task-16 silent no-op
-// with a silent no-op THAT ALSO counts (the response itself is still dropped
-// exactly as before; only the bookkeeping is new).
+// recordPermissionReviewStale increments coords' turn's AND the session's
+// stale-response counter (design §18's "classifier-originated stale
+// responses"). It is called from respondFromClassifier's drift closure the
+// moment a classifier-originated response is discovered to be stale — the
+// exact moment design §18 wants counted, replacing the pre-Task-16 silent
+// no-op with a silent no-op THAT ALSO counts (the response itself is still
+// dropped exactly as before; only the bookkeeping is new).
 func (s *Session) recordPermissionReviewStale(coords identity.Coordinates) {
 	if coords.TurnID.IsZero() {
 		return
 	}
 	s.review.mu.Lock()
-	counters := s.reviewTurnCountersLocked(coords.TurnID)
-	counters.staleResponses++
-	s.maybeTripReviewBreakerLocked(coords, counters)
+	turnCounters := s.reviewTurnCountersLocked(coords.TurnID)
+	turnCounters.staleResponses++
+	s.maybeTripReviewBreakerLocked(coords, turnCounters)
+	sessionCounters := s.reviewSessionCountersLocked()
+	sessionCounters.staleResponses++
+	s.maybeTripReviewSessionBreakerLocked(coords, sessionCounters)
 	s.review.mu.Unlock()
 }
 
@@ -327,10 +421,37 @@ func (s *Session) reviewTurnCountersLocked(turnID uuid.UUID) *reviewTurnCounters
 	return counters
 }
 
+// reviewSessionCountersLocked returns the session's single
+// reviewSessionCounters value, allocating it on first observation. The
+// caller MUST hold s.review.mu. Unlike reviewTurnCountersLocked there is no
+// per-session cap to enforce (there is only ever one session-scoped counters
+// value per Session, never a map keyed by session).
+func (s *Session) reviewSessionCountersLocked() *reviewSessionCounters {
+	if s.review.session == nil {
+		s.review.session = &reviewSessionCounters{}
+	}
+	return s.review.session
+}
+
 // trackReviewSubjectLocked increments digest's occurrence count for counters,
 // bounded to maxTrackedReviewSubjectDigests distinct digests. The caller MUST
 // hold s.review.mu.
 func (s *Session) trackReviewSubjectLocked(counters *reviewTurnCounters, digest [32]byte) {
+	if counters.subjectCounts == nil {
+		counters.subjectCounts = make(map[[32]byte]int)
+	}
+	if _, seen := counters.subjectCounts[digest]; !seen && len(counters.subjectCounts) >= maxTrackedReviewSubjectDigests {
+		return
+	}
+	counters.subjectCounts[digest]++
+}
+
+// trackReviewSessionSubjectLocked is trackReviewSubjectLocked's
+// session-scoped counterpart: the same bounded-digest-set discipline
+// (maxTrackedReviewSubjectDigests), applied to counters that live for the
+// session's whole lifetime rather than one turn. The caller MUST hold
+// s.review.mu.
+func (s *Session) trackReviewSessionSubjectLocked(counters *reviewSessionCounters, digest [32]byte) {
 	if counters.subjectCounts == nil {
 		counters.subjectCounts = make(map[[32]byte]int)
 	}
@@ -377,6 +498,55 @@ func (s *Session) maybeTripReviewBreakerLocked(coords identity.Coordinates, coun
 // digest has reached the configured identical-subject limit. The caller MUST
 // hold s.review.mu.
 func (s *Session) reviewSubjectThresholdCrossedLocked(counters *reviewTurnCounters, limits reviewCircuitBreakerLimits) bool {
+	if limits.MaxIdenticalSubjects <= 0 {
+		return false
+	}
+	for _, count := range counters.subjectCounts {
+		if count >= limits.MaxIdenticalSubjects {
+			return true
+		}
+	}
+	return false
+}
+
+// maybeTripReviewSessionBreakerLocked is maybeTripReviewBreakerLocked's
+// session-scoped counterpart: it trips the SESSION breaker the first time any
+// configured SESSION threshold (s.review.limits.Session — a separate
+// configuration surface from the turn-scoped thresholds; see
+// reviewCircuitBreakerLimits.Session's doc comment for why they must not be
+// shared) is crossed by the session-lifetime counters, emitting its own
+// exactly-one bounded warning (a distinct warned flag from the turn-scoped
+// counters' own, and a distinct log message) the moment the session breaker
+// is first tripped. A session-scoped trip deliberately does NOT apply
+// InterruptOnTrip: that option is documented (and tested) as interrupting the
+// tripping TURN's loop subtree, and extending it to "interrupt everything in
+// the session" is a materially different, undocumented action outside this
+// fix's scope. The caller MUST hold s.review.mu.
+func (s *Session) maybeTripReviewSessionBreakerLocked(coords identity.Coordinates, counters *reviewSessionCounters) {
+	if counters.tripped {
+		// Already tripped for the session: nothing new to warn about.
+		return
+	}
+	limits := s.review.limits.Session
+	tripped := (limits.MaxConsecutiveNeedsHuman > 0 && counters.consecutiveNeedsHuman >= limits.MaxConsecutiveNeedsHuman) ||
+		(limits.MaxInvalidOrFailed > 0 && counters.invalidOrFailed >= limits.MaxInvalidOrFailed) ||
+		(limits.MaxStaleResponses > 0 && counters.staleResponses >= limits.MaxStaleResponses) ||
+		s.reviewSessionSubjectThresholdCrossedLocked(counters, limits)
+	if !tripped {
+		return
+	}
+	counters.tripped = true
+	if !counters.warned {
+		counters.warned = true
+		slog.WarnContext(s.sessionCtx, "sessionruntime: permission-review circuit breaker tripped; automatic review disabled for the session",
+			"session_id", coords.SessionID)
+	}
+}
+
+// reviewSessionSubjectThresholdCrossedLocked is
+// reviewSubjectThresholdCrossedLocked's session-scoped counterpart. The
+// caller MUST hold s.review.mu.
+func (s *Session) reviewSessionSubjectThresholdCrossedLocked(counters *reviewSessionCounters, limits reviewSessionCircuitBreakerLimits) bool {
 	if limits.MaxIdenticalSubjects <= 0 {
 		return false
 	}
