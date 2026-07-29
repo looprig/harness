@@ -1882,6 +1882,250 @@ and testing it against real filesystem/git evidence tools.
 
 ---
 
+## Addendum — Live review-context capture wiring (pre-Phase-6)
+
+The two addenda above closed the configuration-surface gap and the
+evidence-tool gap, but a third, more fundamental gap remained underneath
+both: Task 13's own capture mechanism (`internal/loopruntime/turn.go`'s
+`turnConfig.reviewContext *reviewContextConfiguration`) had **zero
+non-test assignments anywhere in the codebase**. `internal/loopruntime/
+config.go`'s `runtimeConfig` — the loop-level config every real `Loop` is
+built from — had no field for it at all. A registered classifier's
+`Session.StartPermissionReview` was reachable and structurally correct, but
+was never handed a real `gate.ReviewContext` through an unmodified `Submit()`
+call: every "end-to-end" proof built across Phases 4-6 had bypassed this via
+private-method test seams (`cfg.reviewContext = &reviewContextConfiguration{
+...}` set directly on a hand-built `turnConfig`) or downstream-convergence
+proofs (`s.StartPermissionReview(ctx, validReviewRequest(...))` called
+directly with a hand-built request). Task 24's CodeRig worktree work
+confirmed this as the last remaining hard blocker before a real end-to-end
+corpus run could exist at all. Closed as a third deviation before Phase 6,
+discussed and design-consulted with the user (a Fable second opinion) exactly
+like the two addenda above.
+
+**The auto-derive decision:** if a session has permission classifiers
+registered at all, every Loop it constructs (root or subagent — both funnel
+through `newLoopWithAdmission`) gets live review-context capture turned on
+automatically. No new public rig/consumer-facing option was added.
+"Classifiers registered but capture off" is not a legitimate selective-disable
+state — it is exactly the bug being fixed (a configured reviewer that
+silently never reviews), which violates this codebase's own fail-secure
+discipline (`CLAUDE.md`: "A failed permission check must block the action,
+not fall through"). Selective review-routing, if a consumer ever wants it,
+belongs in the review POLICY layer (`gate.ReviewContextPolicy` /
+`gate.PermissionReviewPolicy`, both already consumer-configurable), not a
+capture on/off switch.
+
+**What was added:**
+
+- `internal/loopruntime`: `runtimeConfig` gained an unexported
+  `reviewContext *reviewContextConfiguration` field, copied verbatim onto
+  every turn's `turnConfig.reviewContext` in `buildTurnConfig` (`loop.go`).
+  New exported (still `internal/`-only, unreachable outside the Harness
+  module — the same visibility precedent `Compactor` already set for the
+  compaction seam) type `ReviewContext` carries the session-facing shape
+  (`WorkspaceRoot`, `WorkingDirectory`, `RetryReason`, `SecurityCeiling`,
+  `GatePolicyRevision`, `Policy gate.ReviewContextPolicy`); its unexported
+  `toInternal()` converts to the private turn-level shape, and a nil receiver
+  converts to nil. `NewInModeWithCompactor` and `NewRestoredWithCompactor`
+  each gained a new trailing `reviewContext *ReviewContext` parameter,
+  mirroring `compactor Compactor`'s existing shape exactly (same "caller
+  supplies a session-owned collaborator that never travels through the bound
+  `loop.Definition`" pattern). `New`/`NewInMode`/`NewRestored` (the
+  pre-existing convenience wrappers) pass `nil`, so every caller that never
+  opts in keeps the exact pre-addendum "capture off" default.
+- **No new `pkg/loop`/`pkg/rig` public API at all.** Investigation confirmed
+  `internal/sessionruntime` already calls `loopruntime.NewInModeWithCompactor`
+  /`NewRestoredWithCompactor` directly (bypassing `pkg/loop`'s public
+  Definition/Option surface entirely for this concern), exactly as
+  `compactor Compactor` already does. Since the auto-derive decision means
+  there is no genuinely consumer-owned piece here (unlike the prior two
+  addenda's one real consumer-owned piece each — a policy, an
+  access/containment pair), the entire wiring is internal-to-Harness.
+- `internal/sessionruntime`: new `Session.loopReviewContext()` (`gates.go`)
+  builds the `*loopruntime.ReviewContext` every loop-construction call site
+  now passes. It returns `nil` whenever `len(s.permissionClassifiers.
+  Classifiers()) == 0` (the existing "classifiers configured" idiom
+  `StartPermissionReview` already uses) — the exact pre-addendum default,
+  proved byte-identical by a dedicated unit test rather than only by
+  inspection. When classifiers ARE configured:
+  - `WorkspaceRoot`/`WorkingDirectory` are both `s.wsRoot` — the same source
+    `hustleEvidenceRuntimeConfig` already uses for `ReadWorkspace.Root` (the
+    second addendum). Harness tracks no per-loop working directory narrower
+    than the workspace root, so the two fields are set equal rather than
+    inventing a distinction Harness has no data for. In practice `s.wsRoot`
+    is guaranteed non-empty here whenever classifiers are configured and
+    session construction succeeded — every classifier's `hustle.Definition`
+    requires evidence tools, and `newHustleController`'s pre-existing
+    fail-closed check already refuses construction without a populated
+    `ReadWorkspace` — so the explicit `s.wsRoot == ""` guard in
+    `loopReviewContext` is defense in depth, not load-bearing (proved
+    separately by `TestLoopReviewContextNilWithoutWorkspaceRoot`).
+  - `GatePolicyRevision` is `s.permissionReviewPolicy.Revision` — the same
+    value the first addendum already wires into the fingerprint and review
+    policy.
+  - `SecurityCeiling` and `Policy` (`gate.ReviewContextPolicy`) have **no
+    existing Harness-level source** — see the dedicated finding below.
+
+**`SecurityCeiling` finding:** investigated and confirmed there is no
+existing computed "effective access posture as a string" anywhere in
+Harness. `pkg/gate`'s own `ReviewBasis.SecurityCeiling`/`hustle.Request.
+SecurityCeiling` doc comments are explicit that the ceiling is captured
+**from** `ReviewContext.SecurityCeiling` at review time, never computed by
+Harness itself, and CodeRig's Task 24 work binds its own containment
+verifier's ceiling to its own `AccessProfile` string ad hoc, at the
+CONSUMER layer — confirming Harness has no first-class formalized
+representation to source from honestly. Task 13's own test fixtures (e.g.
+`"workspace-write; unmet-requirements=true"`) were invented test literals
+with no production source, not a hint at a real computed value. Per the
+explicit "no new public option" decision, `loopReviewContext` uses a fixed,
+documented sentinel (`defaultReviewContextSecurityCeiling =
+"harness-session; ceiling-not-classified"`, `gates.go`) rather than
+inventing a new security classification scheme: it never claims a wider
+access posture than actually configured (a classifier or containment
+verifier treating an unrecognized ceiling as maximally conservative is
+correct), but it is a **known simplification** flagged here for the Phase
+6/7 boundary review to replace with a real Harness-level (or CodeRig-supplied)
+value. Confidence: high that this is honest and non-misleading; low
+confidence that the exact sentinel string is the RIGHT long-term shape —
+that is a design question for Phase 6/7, not this addendum.
+
+**`gate.ReviewContextPolicy` (the context-snapshot budget) finding:**
+a related, independently-discovered gap: `gate.ReviewContextPolicy`
+(`MaxBytes`/`MaxEntries`/per-kind byte caps) is genuinely NEW consumer
+policy design §8.4 always intended a consumer to own, and nothing in
+Harness tracks one at the session level today (it is not part of
+`gate.PermissionReviewPolicy`, and no classifier descriptor field carries
+it). Rather than inventing a new public option to ask for it (out of scope
+per the explicit decision above), `loopReviewContext` installs a fixed,
+conservative `defaultReviewContextPolicy` (`gates.go`): every bound sits
+well inside its corresponding hard cap (`gate.MaxReviewContextInputEntries`
+/ `MaxReviewContextInputBytes` / `MaxReviewContextEntryInputBytes`) with
+margin under the 1 MiB `gate.MaxPermissionReviewSubjectWireBytes` ceiling.
+This is flagged as the same class of known simplification as
+`SecurityCeiling` — a real per-consumer budget is Phase 6/7 work.
+
+**The fail-closed-bounds fix (the Fable-flagged hazard):** before this
+addendum, `runTurn` captured review context unconditionally whenever
+`cfg.reviewContext != nil`, BEFORE knowing whether the current tool batch
+would even open a permission gate — so auto-enabling capture (registering a
+classifier) could turn a previously-succeeding long-conversation turn into a
+`TurnFailed` on a batch with **no** gated/permission tool call at all, purely
+because the hard preflight bounds (`gate.MaxReviewContextInputEntries` = 4096,
+`gate.MaxReviewContextInputBytes` = 4 MiB) were exceeded by conversation size
+alone. Fixed by making capture LAZY and memoized per batch:
+
+- `internal/loopruntime/review_context.go`: new `reviewContextCaptureProvider`
+  (`sync.Once` + `sync/atomic.Bool`) is installed on the batch ctx by
+  `runTurn` (`withPermissionReviewCapture`) but performs NO work at
+  installation time. `reviewContextForApproval(ctx)` — called from
+  `runner.go`'s `approvalRequesterFor`, the one point `gate.Evaluator.
+  Authorize` is about to open a real interactive approval — is the earliest
+  point "does this batch need review" is actually knowable: the loop's
+  public tool-access contract (`pkg/loop.AccessGate`) exposes only
+  `Authorize`, which decides Gated/Allow/Deny internally and dynamically per
+  call, so there is no cheaper static preview available without duplicating
+  access evaluation (and, per this codebase's own Interface Segregation
+  discipline, no reason to widen `AccessGate` just to peek). The provider's
+  `capture()` runs `capturePermissionReviewContext` at most once per batch
+  (memoized); every gate opened in the same batch observes the identical
+  captured context (or the identical failure), each via an independent
+  clone — the exact "one capture, N cloned reads" invariant Task 13's own
+  test (`TestRunTurnClonesOnePrivateReviewContextPerPermissionGate`) already
+  required, now proved to hold under the lazy path too (still passing,
+  unmodified).
+- `runTurn` (`turn.go`) no longer attempts capture inline: it installs the
+  provider, runs `RunBatch`, then asks the provider `failed() (error,
+  attempted bool)` — a call that NEVER triggers capture itself. A batch whose
+  calls never open a gate reports `attempted == false` and the turn proceeds
+  exactly as if review context were never configured; only an
+  **attempted-and-failed** capture turns into `TurnFailed`.
+- `internal/loopruntime/runner.go`'s `RunBatch`: resolving access is already
+  strictly sequential across a batch's calls, before any execution begins.
+  A capture failure surfaces through `resolveAccess`'s existing error path
+  (wrapped in `*gate.EvaluationError` by `Authorize`, unwrapped via
+  `errors.As` to the underlying `*reviewContextCaptureError`) and now aborts
+  the WHOLE batch (`return collectResults(rs)`) rather than only denying the
+  one gated call — this matters because an earlier, NON-gated call in the
+  same batch could otherwise have already resolved Approved before the
+  later call's capture failure was discovered, and would then actually
+  execute in the (unrelated) execute phase despite the turn as a whole being
+  about to fail. Aborting the batch outright preserves the original eager
+  code's "nothing in this batch executes if capture fails" guarantee exactly.
+- The derivedPrefix bounds guard (previously an eager, unconditional check
+  in `turn.go` before slicing `ts.msgs`) moved inside the provider's
+  memoized `capture()` too, so it is likewise never evaluated for a batch
+  that never opens a gate.
+- A byproduct improvement: because the capture check now runs INSIDE
+  `approvalRequesterFor` before `r.prompted` is set, a capture failure still
+  produces a `PermissionDecided` audit event for the denied call (via
+  `resolveAccess`'s existing `!r.prompted` fail path) — the original eager
+  design produced NO audit event at all on a pre-batch capture failure,
+  since `RunBatch` was never even reached.
+
+**Load-bearing tests:**
+
+- `internal/loopruntime/review_context_test.go`:
+  `TestRunTurnSkipsReviewCaptureWhenBatchNeverOpensAPermissionGate` — a batch
+  whose only call resolves `AccessAllow` (never gates) succeeds (`TurnDone`)
+  even though its conversation is deliberately over
+  `gate.MaxReviewContextEntryInputBytes`; capture is provably never
+  attempted (no gate opens, the tool runs). Verified RED against the
+  pre-fix unconditional-capture code (fails with `TurnFailed` there) before
+  the fix landed.
+  `TestRunTurnCapturesAndFailsClosedWhenGatedBatchExceedsHardPreflightBounds`
+  is the companion over the identical over-bound conversation with a
+  genuinely `AccessGated` call: capture IS attempted, fails closed on
+  `input_bounds`, and the turn fails (`TurnFailed`) with the tool never
+  executed and no gate opened — proving the guard is precise ("skip only
+  when no gate opens"), not merely "always skip."
+- `internal/sessionruntime/review_context_capture_test.go`:
+  `TestSubmitCarriesRealReviewContextIntoRegisteredClassifier` is the
+  centerpiece this whole addendum exists to make possible. It registers a
+  real `gate.PermissionClassifier` (a probe whose `Applies` captures the full
+  `gate.PermissionReviewSubject` it receives and always reports itself
+  inapplicable, so no Hustle inference runs — scoping matches the first
+  addendum's `applyProbeClassifier` precedent exactly), builds a real
+  session with a real `gate.NewInteractiveEvaluator` and a genuinely gated
+  tool, and drives it through an entirely unmodified `s.Submit(ctx, ...)`
+  call. It asserts the classifier's captured subject carries a non-empty
+  `ContextRevision`, the session's real `WorkspaceRoot`/`WorkingDirectory`,
+  and — critically — that its `Entries` contain a unique marker string
+  planted in the submitted user message, proving the captured context
+  reflects genuine, real conversation content rather than a stub. Verified
+  load-bearing by temporarily reverting the `session.go` call site to pass
+  `nil` for `reviewContext`: the classifier is then never reached at all
+  (20s timeout — `StartPermissionReview` no-ops on a zero `ReviewContext`
+  per `gate.go`'s own documented contract), not merely reached with an empty
+  context — the strongest form of this proof available.
+  `TestLoopReviewContextNilWithoutClassifiers`,
+  `TestLoopReviewContextNilWithoutWorkspaceRoot`, and
+  `TestLoopReviewContextAutoDerivedWhenClassifiersConfigured` cover
+  `loopReviewContext` directly: the no-classifiers default (regression, not
+  just inspection), the defense-in-depth empty-workspace-root guard, and the
+  auto-derived shape once classifiers are configured.
+
+**Regression evidence:** `go build ./...`, `go vet ./...`, `gofmt -l .`
+(scoped, excludes vendor/worktrees), and `go test -race ./...` all clean
+across two independent full runs. One transient failure in
+`TestDelegateStatusReportsMechanicalState` (`internal/sessionruntime`,
+unrelated subagent-delegation status test, not touched by this addendum's
+diff) was observed once under full-suite parallel load and did not reproduce
+across five isolated runs or two subsequent full-suite runs; treated as a
+pre-existing environmental flake, not a regression from this work.
+
+**What remains deferred:** a real, per-consumer `gate.ReviewContextPolicy`
+and a real Harness- or CodeRig-level `SecurityCeiling` representation are
+both Phase 6/7 work, flagged above as known simplifications rather than
+silently fabricated values. Everything else this addendum set out to prove —
+that a registered classifier's `StartPermissionReview` receives a REAL,
+non-empty `gate.ReviewContext` through a genuine, unmodified `Submit()` call,
+and that this is safe to turn on by default without regressing any
+previously-succeeding long-conversation turn — is now proven, not merely
+structurally plausible.
+
+---
+
 # Phase 6 — Consumer composition in CodeRig
 
 ## Task 23: Create isolated CodeRig worktree and add explicit classifier config
