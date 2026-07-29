@@ -1706,6 +1706,74 @@ written parity table and zero Critical/Important findings.
 
 ---
 
+## Addendum — Rig permission-review consumer wiring (pre-Phase-6)
+
+While preparing Phase 6 it became clear that Task 8 (Phase 2) and Task 16
+(Phase 4) left a real gap between them: Task 8 wired only classifier/policy
+**identity** into `pkg/rig`'s config fingerprint, and Task 16 built the actual
+review machinery (`internal/sessionruntime`'s `withPermissionReview` /
+`withPermissionReviewBreaker` construction-time `Option`s) independently, as
+private session-construction seams with no caller above `sessionruntime`
+itself. Nothing connected the two — a consumer could fully configure
+`rig.WithPermissionClassifiers` + a review policy, get a correct fingerprint,
+and still get zero automatic review at runtime, because the real classifier
+set and policy value never reached a live `Session`. This would have blocked
+Phase 6's CodeRig integration (Task 23/24) from functioning at all, so it was
+closed as a deviation before Phase 6 began, discussed and approved with the
+user (including a second-opinion design consult on the fingerprint-exclusion
+call below).
+
+**What was added:**
+
+- `internal/sessionruntime`: two new exported `LifecycleOption`s,
+  `WithLifecyclePermissionReview(classifiers, policy)` and
+  `WithLifecyclePermissionReviewBreaker(limits PermissionReviewBreakerLimits)`
+  (plus the mirrored `PermissionReviewSessionBreakerLimits` type), threaded
+  into **both** `Lifecycle.NewSession` and `Lifecycle.RestoreSession` via the
+  pre-existing private `withPermissionReview` / `withPermissionReviewBreaker`
+  session-construction `Option`s — the same two-call-site pattern
+  `WithLifecycleHustles` already uses. A `Lifecycle` that never applies either
+  option keeps the exact pre-existing no-review default (proved by a
+  regression test).
+- `pkg/rig`: `WithPermissionReviewPolicyRevision(string)` was deleted and
+  replaced with `WithPermissionReviewPolicy(gate.PermissionReviewPolicy)`,
+  which fails fast (`DefinitionInvalidPermissionReviewPolicy`) on a
+  hand-built, never-constructed policy (added `PermissionReviewPolicy.Sealed()`
+  in `pkg/gate` to make that checkable — a developer-experience improvement
+  only; `EvaluatePermissionAssessment` already failed closed on a zero seal).
+  `permissionReviewFingerprintFrom` now takes the full policy and still folds
+  only `.Revision` into identity, an unchanged wire shape.
+- `pkg/rig`: new `WithPermissionReviewLimits(PermissionReviewLimits)`, the
+  rig-level mirror of the sessionruntime breaker-limits shape. When
+  classifiers are configured and this option is never called, `Define()`
+  resolves a default of `DefaultPermissionReviewBreakerThreshold` (20) on
+  every one of the 8 numeric thresholds; an explicit call always replaces the
+  default wholesale (no per-field merge). Calling it without classifiers
+  configured is a new `DefinitionUnusedPermissionReviewLimits` error,
+  mirroring the existing `DefinitionUnusedHustleLimits` precedent.
+- **Fingerprint-excludes-limits decision:** circuit-breaker limits are
+  deliberately excluded from the rig fingerprint entirely — they are
+  operational tuning, not behavioral identity, so two otherwise-identical
+  rigs that differ only in `WithPermissionReviewLimits` produce byte-identical
+  fingerprints (proved by test). This is a narrower reading than design §21's
+  "circuit-breaker policy" bullet, adopted after the second-opinion consult
+  on this addendum specifically.
+
+**What remains deferred:** wiring `internal/sessionruntime`'s hustle
+controller construction to actually populate
+`hustleruntime.RuntimeConfig.Evidence` is still Task 24 work. Every classifier
+`hustle.Definition` requires an `EvidenceToolPolicy`
+(`gate.NewPermissionClassifierSet`'s own descriptor check), and
+`hustleruntime.New` currently rejects any hustle set containing one without a
+populated `RuntimeConfig.Evidence` — so a classifier-bearing rig cannot yet
+construct a live session end to end. This addendum only wires the
+**configuration surface** (classifiers, policy, and breaker limits reaching a
+real `Session`); making a registered classifier actually run inference and
+resolve a gate is Task 24's job, and its own tests — not this addendum's — are
+what need that working.
+
+---
+
 # Phase 6 — Consumer composition in CodeRig
 
 ## Task 23: Create isolated CodeRig worktree and add explicit classifier config
