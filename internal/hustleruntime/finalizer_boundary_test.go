@@ -17,6 +17,7 @@ import (
 // prove that the adapter neither receives nor stores Session/Shutdown capability.
 var focusedFinalizerAdapterFiles = map[string]struct{}{
 	"internal/sessionruntime/compaction_adapter.go": {},
+	"internal/sessionruntime/review_adapter.go":     {},
 }
 
 func TestProductionRunAndFinalizeConsumersAreFocusedAdapters(t *testing.T) {
