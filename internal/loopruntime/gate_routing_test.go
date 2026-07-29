@@ -101,6 +101,24 @@ func TestPermissionGateOffersExactApprovalActions(t *testing.T) {
 	}
 }
 
+// TestPermissionGateIsRestorable proves the REAL production gate builder
+// (permissionGate, wired into approvalRequesterFor's gateRegistration —
+// runner.go's ONLY permissionGate call site) marks every permission gate
+// Restorable, not just a hand-built restore-test fixture
+// (restore_gates_test.go's buildRestorablePermissionGateStream). Without this,
+// internal/sessionruntime/restore_gates.go's foldRestoredGates gates every
+// real permission gate on openedEvent.Gate.Restorable, which stays false for
+// every gate this package actually opens, so restore always falls back to
+// CloseRestoreUnavailable regardless of gateRestoreHookSupported accepting
+// gate.KindPermission (design §15).
+func TestPermissionGateIsRestorable(t *testing.T) {
+	t.Parallel()
+	g := permissionGate(newCallID(t), tool.Request{ToolName: "Bash", Summary: "echo ok"})
+	if !g.Restorable {
+		t.Fatalf("permissionGate().Restorable = false, want true (production permission gates must restore per design §15)")
+	}
+}
+
 // registerGate sends a gateRegistration through the actor's gateReg seam and waits
 // for the ack (the actor closes it once the gate is installed). It returns the
 // reply channel the actor will route a matching command to. The test acts as the

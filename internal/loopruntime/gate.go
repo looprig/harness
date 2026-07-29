@@ -337,11 +337,12 @@ func stampGateSubjectProvenance(ctx context.Context, g gatedomain.Gate) gatedoma
 // approval actions. It never renders raw tool arguments or token material.
 func permissionGate(callID uuid.UUID, displayed tool.Request) gatedomain.Gate {
 	return gatedomain.Gate{
-		Kind:     gatedomain.KindPermission,
-		Resolver: gatedomain.ResolverLoop,
-		Blocks:   gatedomain.BlocksToolCall,
-		Effect:   gatedomain.EffectResume,
-		Subject:  gatedomain.Subject{ToolExecutionID: callID},
+		Kind:       gatedomain.KindPermission,
+		Resolver:   gatedomain.ResolverLoop,
+		Blocks:     gatedomain.BlocksToolCall,
+		Effect:     gatedomain.EffectResume,
+		Subject:    gatedomain.Subject{ToolExecutionID: callID},
+		Restorable: true,
 		Prompt: gatedomain.Prompt{
 			Title:    "Approve tool call",
 			Body:     renderApprovalBody(displayed),
