@@ -7,6 +7,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreign"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/sessionstore"
@@ -142,6 +143,29 @@ type Lifecycle struct {
 	// session's private hustle controller.
 	hustles      []hustle.Definition
 	hustleLimits HustleLimits
+
+	// permissionReviewClassifiers, permissionReviewPolicy, and
+	// permissionReviewConfigured capture WithLifecyclePermissionReview's
+	// installed classifier set and local decision policy (design §20).
+	// permissionReviewConfigured is the signal NewSession/RestoreSession use
+	// to decide whether to apply withPermissionReview at all: it tracks
+	// whether the OPTION was called, not whether the resulting classifier set
+	// happens to be non-empty, so a bare Lifecycle (the option never called)
+	// applies neither withPermissionReview nor withPermissionReviewBreaker
+	// below, preserving the pre-Task-16 "no permission review configured"
+	// default exactly.
+	permissionReviewClassifiers gate.PermissionClassifierSet
+	permissionReviewPolicy      gate.PermissionReviewPolicy
+	permissionReviewConfigured  bool
+
+	// permissionReviewBreakerLimits and permissionReviewBreakerConfigured
+	// capture WithLifecyclePermissionReviewBreaker's installed circuit-breaker
+	// thresholds (design §18), already converted to the private
+	// reviewCircuitBreakerLimits shape withPermissionReviewBreaker
+	// (review_state.go) consumes. permissionReviewBreakerConfigured mirrors
+	// permissionReviewConfigured's "option called, not value non-zero" signal.
+	permissionReviewBreakerLimits     reviewCircuitBreakerLimits
+	permissionReviewBreakerConfigured bool
 }
 
 // HustleLimits is sessionruntime's narrow, rig-independent copy of the hustle
@@ -163,6 +187,81 @@ func WithLifecycleHustles(definitions []hustle.Definition, limits HustleLimits) 
 	return func(r *Lifecycle) {
 		r.hustles = append([]hustle.Definition(nil), captured...)
 		r.hustleLimits = limits
+	}
+}
+
+// PermissionReviewBreakerLimits are the consumer-configurable bounded
+// per-turn and per-session circuit-breaker thresholds (design §18). A zero
+// value disables the corresponding counter — see reviewCircuitBreakerLimits'
+// doc comment (review_state.go) for why the turn-scoped and session-scoped
+// thresholds are deliberately separate configuration surfaces.
+type PermissionReviewBreakerLimits struct {
+	MaxConsecutiveNeedsHuman int
+	MaxInvalidOrFailed       int
+	MaxIdenticalSubjects     int
+	MaxStaleResponses        int
+	InterruptOnTrip          bool
+	Session                  PermissionReviewSessionBreakerLimits
+}
+
+// PermissionReviewSessionBreakerLimits is PermissionReviewBreakerLimits'
+// session-scoped counterpart (design §18: "track per-turn AND per-session
+// bounded counters"), mirroring reviewSessionCircuitBreakerLimits.
+type PermissionReviewSessionBreakerLimits struct {
+	MaxConsecutiveNeedsHuman int
+	MaxInvalidOrFailed       int
+	MaxIdenticalSubjects     int
+	MaxStaleResponses        int
+}
+
+// toReviewCircuitBreakerLimits converts the consumer-facing shape into the
+// private review_state.go representation withPermissionReviewBreaker
+// consumes. It is a field-for-field copy; the two shapes exist separately so
+// review_state.go's internals stay unexported while this Lifecycle option
+// surface is public.
+func (l PermissionReviewBreakerLimits) toReviewCircuitBreakerLimits() reviewCircuitBreakerLimits {
+	return reviewCircuitBreakerLimits{
+		MaxConsecutiveNeedsHuman: l.MaxConsecutiveNeedsHuman,
+		MaxInvalidOrFailed:       l.MaxInvalidOrFailed,
+		MaxIdenticalSubjects:     l.MaxIdenticalSubjects,
+		MaxStaleResponses:        l.MaxStaleResponses,
+		InterruptOnTrip:          l.InterruptOnTrip,
+		Session: reviewSessionCircuitBreakerLimits{
+			MaxConsecutiveNeedsHuman: l.Session.MaxConsecutiveNeedsHuman,
+			MaxInvalidOrFailed:       l.Session.MaxInvalidOrFailed,
+			MaxIdenticalSubjects:     l.Session.MaxIdenticalSubjects,
+			MaxStaleResponses:        l.Session.MaxStaleResponses,
+		},
+	}
+}
+
+// WithLifecyclePermissionReview installs the registered classifier set and
+// local decision policy every session in this lifecycle uses for automatic
+// permission-gate review (design §20), mirroring WithLifecycleHustles'
+// capture-once-forward-to-both shape. Both NewSession and RestoreSession
+// apply it via the private withPermissionReview Option (gates.go). Omitting
+// this option leaves every session's permissionClassifiers at its zero
+// value, preserving StartPermissionReview's pre-Task-16 no-op default
+// exactly.
+func WithLifecyclePermissionReview(classifiers gate.PermissionClassifierSet, policy gate.PermissionReviewPolicy) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.permissionReviewClassifiers = classifiers
+		r.permissionReviewPolicy = policy
+		r.permissionReviewConfigured = true
+	}
+}
+
+// WithLifecyclePermissionReviewBreaker installs the bounded circuit-breaker
+// thresholds every session in this lifecycle applies to automatic permission
+// review (design §18). Both NewSession and RestoreSession apply it via the
+// private withPermissionReviewBreaker Option (review_state.go). Omitting
+// this option leaves every session's breaker limits at their zero value
+// (every counter disabled), matching withPermissionReviewBreaker's own
+// zero-preserves-behavior default.
+func WithLifecyclePermissionReviewBreaker(limits PermissionReviewBreakerLimits) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.permissionReviewBreakerLimits = limits.toReviewCircuitBreakerLimits()
+		r.permissionReviewBreakerConfigured = true
 	}
 }
 
@@ -408,9 +507,15 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	// The captured base options, then the per-session dependencies. WithSessionID(sid) makes NewSession adopt
 	// the id the journal was already bound to (the journal chicken-and-egg). WithLeaseRelease
 	// hands the session the lease's release hook for its clean-Shutdown teardown.
-	opts := make([]Option, 0, len(r.baseOpts)+6)
+	opts := make([]Option, 0, len(r.baseOpts)+8)
 	opts = append(opts, r.baseOpts...)
 	opts = append(opts, withSessionHustles(r.hustles, r.hustleLimits))
+	if r.permissionReviewConfigured {
+		opts = append(opts, withPermissionReview(r.permissionReviewClassifiers, r.permissionReviewPolicy))
+	}
+	if r.permissionReviewBreakerConfigured {
+		opts = append(opts, withPermissionReviewBreaker(r.permissionReviewBreakerLimits))
+	}
 	opts = append(opts,
 		WithSessionID(sid),
 		WithEventAppender(evAp),
@@ -503,9 +608,15 @@ func releaseResolvedRoot(_ context.Context, resolved *resolvedPlacement) {
 // session with no history, a *RestoreError for a lease/journal/replay failure), never a
 // panic.
 func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session, error) {
-	opts := make([]Option, 0, len(r.baseOpts)+2)
+	opts := make([]Option, 0, len(r.baseOpts)+4)
 	opts = append(opts, r.baseOpts...)
 	opts = append(opts, withSessionHustles(r.hustles, r.hustleLimits))
+	if r.permissionReviewConfigured {
+		opts = append(opts, withPermissionReview(r.permissionReviewClassifiers, r.permissionReviewPolicy))
+	}
+	if r.permissionReviewBreakerConfigured {
+		opts = append(opts, withPermissionReviewBreaker(r.permissionReviewBreakerLimits))
+	}
 	if r.frozenFingerprint != nil {
 		opts = append(opts, WithFingerprint(*r.frozenFingerprint))
 	} else {
