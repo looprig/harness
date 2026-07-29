@@ -96,6 +96,18 @@ func AssessDrift(baseline, candidate ConfigManifest) DriftAssessment {
 	if baseline.PermissionPosture != candidate.PermissionPosture {
 		add(DriftPermission, "posture", baseline.PermissionPosture, candidate.PermissionPosture, DriftWarn)
 	}
+	if baseline.PermissionReviewConfigured != candidate.PermissionReviewConfigured {
+		// Widening (no classifiers -> classifiers configured) must never resume
+		// silently (design §21: never silently resumes with a different
+		// reviewer). Narrowing (classifiers -> none) is fewer automated
+		// decisions, strictly more human control, so it stays Info.
+		severity := DriftInfo
+		if candidate.PermissionReviewConfigured {
+			severity = DriftWarn
+		}
+		add(DriftPermission, "review_configured",
+			boolID(baseline.PermissionReviewConfigured), boolID(candidate.PermissionReviewConfigured), severity)
+	}
 	if baseline.WorkspaceRoot != candidate.WorkspaceRoot {
 		add(DriftWorkspace, "", baseline.WorkspaceRoot, candidate.WorkspaceRoot, DriftWarn)
 	}

@@ -40,6 +40,83 @@ func TestDefaultPolicyDecider(t *testing.T) {
 	}
 }
 
+// TestDefaultPolicyDeciderRejectsSilentPermissionReviewActivation proves the
+// fix for design §21's "never silently resumes with a different reviewer":
+// a restore whose live rig enables permission-review classifiers while the
+// adopted baseline had none configured must NOT auto-accept under the
+// default policy decider. The scenario uses a real event.ConfigManifest pair
+// and event.AssessDrift, not a hand-built DriftAssessment, so it proves the
+// real drift-classification wiring, not just the decider in isolation.
+func TestDefaultPolicyDeciderRejectsSilentPermissionReviewActivation(t *testing.T) {
+	t.Parallel()
+	baseline := event.ConfigManifest{
+		SchemaVersion: event.ManifestSchemaVersion, ModelID: "m", TopologyRev: "topo",
+		PermissionReviewConfigured: false,
+	}
+	candidate := baseline
+	candidate.PermissionReviewConfigured = true
+
+	assessment := event.AssessDrift(baseline, candidate)
+	decision, err := DefaultPolicyDecider{}.DecideRestore(context.Background(), assessment)
+	if err != nil {
+		t.Fatalf("DecideRestore() error = %v", err)
+	}
+	if decision.Accept {
+		t.Fatalf("DefaultPolicyDecider silently accepted permission-review activation on restore: %+v", assessment)
+	}
+
+	// AcceptAllDecider remains the documented, explicit opt-in escape hatch
+	// (WithAllowConfigMismatch's successor seam) — it must still accept.
+	allowed, err := AcceptAllDecider{}.DecideRestore(context.Background(), assessment)
+	if err != nil || !allowed.Accept {
+		t.Fatalf("AcceptAllDecider = (%+v, %v), want unconditional accept for the explicit opt-in", allowed, err)
+	}
+}
+
+// TestDefaultPolicyDeciderPermissionReviewOtherTransitions proves the
+// remaining three transitions do not regress: enabled -> enabled with a
+// different classifier identity, enabled -> disabled, and absent -> absent
+// all still auto-accept under the default policy decider.
+func TestDefaultPolicyDeciderPermissionReviewOtherTransitions(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		baseline event.ConfigManifest
+		modify   func(*event.ConfigManifest)
+	}{
+		{
+			name:     "enabled to enabled different classifier identity",
+			baseline: event.ConfigManifest{SchemaVersion: event.ManifestSchemaVersion, TopologyRev: "topo-a", PermissionReviewConfigured: true},
+			modify:   func(m *event.ConfigManifest) { m.TopologyRev = "topo-b" },
+		},
+		{
+			name:     "enabled to disabled",
+			baseline: event.ConfigManifest{SchemaVersion: event.ManifestSchemaVersion, TopologyRev: "topo", PermissionReviewConfigured: true},
+			modify:   func(m *event.ConfigManifest) { m.PermissionReviewConfigured = false },
+		},
+		{
+			name:     "absent to absent",
+			baseline: event.ConfigManifest{SchemaVersion: event.ManifestSchemaVersion, TopologyRev: "topo"},
+			modify:   func(*event.ConfigManifest) {},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			candidate := tt.baseline
+			tt.modify(&candidate)
+			assessment := event.AssessDrift(tt.baseline, candidate)
+			decision, err := DefaultPolicyDecider{}.DecideRestore(context.Background(), assessment)
+			if err != nil {
+				t.Fatalf("DecideRestore() error = %v", err)
+			}
+			if !decision.Accept {
+				t.Errorf("DefaultPolicyDecider rejected %s: %+v", tt.name, assessment)
+			}
+		})
+	}
+}
+
 func TestAcceptAllDecider(t *testing.T) {
 	t.Parallel()
 	warn := event.DriftAssessment{Changes: []event.DriftChange{

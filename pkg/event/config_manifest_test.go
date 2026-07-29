@@ -16,17 +16,18 @@ func testManifest() ConfigManifest {
 			{Name: "Bash", InputSchemaRev: "cc", OutputSchemaRev: "dd"},
 			{Name: "Read", InputSchemaRev: "ee"},
 		},
-		RuntimeSkills:             true,
-		WorkspaceRoot:             "/repo",
-		WorkspaceTrust:            "trusted",
-		AgentAdapter:              "",
-		PermissionPosture:         "",
-		NativePermissionPolicyRev: "ffff",
-		PermissionStrictness:      3,
-		ConfinementRev:            "gggg",
-		ConfinementStrictness:     2,
-		ExternalCapabilityRev:     "hhhh",
-		AppFields:                 map[string]string{"b": "2", "a": "1"},
+		RuntimeSkills:              true,
+		WorkspaceRoot:              "/repo",
+		WorkspaceTrust:             "trusted",
+		AgentAdapter:               "",
+		PermissionPosture:          "",
+		NativePermissionPolicyRev:  "ffff",
+		PermissionStrictness:       3,
+		PermissionReviewConfigured: true,
+		ConfinementRev:             "gggg",
+		ConfinementStrictness:      2,
+		ExternalCapabilityRev:      "hhhh",
+		AppFields:                  map[string]string{"b": "2", "a": "1"},
 	}
 }
 
@@ -46,6 +47,9 @@ func TestManifestFingerprint(t *testing.T) {
 		}, same: false},
 		{name: "strictness change alters fingerprint", mutate: func(m *ConfigManifest) {
 			m.PermissionStrictness = 1
+		}, same: false},
+		{name: "permission review configured change alters fingerprint", mutate: func(m *ConfigManifest) {
+			m.PermissionReviewConfigured = false
 		}, same: false},
 		{name: "schema version change alters fingerprint", mutate: func(m *ConfigManifest) {
 			m.SchemaVersion = ManifestSchemaVersion + 1
@@ -73,7 +77,7 @@ func TestManifestFingerprintGolden(t *testing.T) {
 		t.Fatalf("fingerprint %q is not lowercase hex sha256", got)
 	}
 	// Frozen on first run; drift here means the canonical encoding changed.
-	const golden = "6dfa05a68de160225451630245e9d7a3ce5e709f39dd376dfc6708bfd4a6da3e"
+	const golden = "836322e9636db88d50a5d6a937d67cac8d1298a2308eed3cadc52b27867d33e2"
 	if golden != "" && got != golden {
 		t.Errorf("canonical encoding drifted: fingerprint = %s, want %s", got, golden)
 	}

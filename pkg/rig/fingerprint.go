@@ -336,6 +336,13 @@ func frozenManifestWithPermissionReview(
 	manifest := frozenManifestWithHustles(
 		fields, definitions, primers, active, hustles, limits,
 	)
+	// PermissionReviewConfigured is the narrow "was ANY permission-review classifier
+	// configured at all" signal AssessDrift needs to classify the disabled->enabled
+	// restore transition (design §21: never silently resume with a different
+	// reviewer). The full classifier/policy identity stays folded into TopologyRev
+	// below, for the SEPARATE purpose of detecting drift among already-enabled
+	// classifiers.
+	manifest.PermissionReviewConfigured = review != nil
 	if review != nil {
 		manifest.TopologyRev = topologyRevisionWithHustlesAndPermissionReview(
 			definitions, primers, active, hustles, limits, review,

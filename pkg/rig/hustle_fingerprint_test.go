@@ -374,6 +374,38 @@ func TestPermissionReviewFingerprintDomainsIndependentlyChangeIdentity(t *testin
 	}
 }
 
+// TestFrozenManifestWithPermissionReviewSetsConfigured proves the manifest field
+// AssessDrift uses to catch the disabled->enabled silent-reviewer-activation bug
+// (design §21) is actually wired from the real rig-level review projection: set
+// only when a review IS configured (review != nil), never derived from anything
+// else, and independent of classifier/policy identity (which stays in TopologyRev).
+func TestFrozenManifestWithPermissionReviewSetsConfigured(t *testing.T) {
+	t.Parallel()
+	definition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
+	fields := ConfigFingerprintFields{AgentKind: "coderig:operator"}
+
+	disabled := frozenManifestWithPermissionReview(
+		fields, []loop.Definition{definition}, []string{"agent"}, "agent", nil, HustleLimits{}, nil,
+	)
+	if disabled.PermissionReviewConfigured {
+		t.Fatal("PermissionReviewConfigured = true with no review configured, want false")
+	}
+
+	classifier := defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("status"))
+	review, err := permissionReviewFingerprintFrom(
+		rigPermissionClassifierSet(t, classifier), rigReviewPolicy(t, "review-policy-v1"),
+	)
+	if err != nil {
+		t.Fatalf("permissionReviewFingerprintFrom: %v", err)
+	}
+	enabled := frozenManifestWithPermissionReview(
+		fields, []loop.Definition{definition}, []string{"agent"}, "agent", nil, HustleLimits{}, review,
+	)
+	if !enabled.PermissionReviewConfigured {
+		t.Fatal("PermissionReviewConfigured = false with a review configured, want true")
+	}
+}
+
 func TestPermissionReviewFingerprintPreservesLegacyIdentityWhenDisabled(t *testing.T) {
 	t.Parallel()
 	definition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))

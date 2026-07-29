@@ -63,9 +63,18 @@ type ConfigManifest struct {
 	PermissionPosture         string          `json:"permission_posture,omitzero"`
 	NativePermissionPolicyRev string          `json:"native_permission_policy_rev,omitzero"`
 	PermissionStrictness      StrictnessLevel `json:"permission_strictness,omitzero"`
-	ConfinementRev            string          `json:"confinement_rev,omitzero"`
-	ConfinementStrictness     StrictnessLevel `json:"confinement_strictness,omitzero"`
-	ExternalCapabilityRev     string          `json:"external_capability_rev,omitzero"`
+	// PermissionReviewConfigured reports only whether ANY permission-review
+	// classifier was registered for this session — never the classifier or
+	// policy identity itself (that stays folded into TopologyRev, for
+	// detecting drift AMONG already-enabled classifiers). It exists so
+	// AssessDrift has a directionally-comparable signal for the one
+	// transition an opaque digest can't distinguish: classifiers going from
+	// unconfigured to configured across a restore, which must never resume
+	// silently (design §21).
+	PermissionReviewConfigured bool            `json:"permission_review_configured,omitzero"`
+	ConfinementRev             string          `json:"confinement_rev,omitzero"`
+	ConfinementStrictness      StrictnessLevel `json:"confinement_strictness,omitzero"`
+	ExternalCapabilityRev      string          `json:"external_capability_rev,omitzero"`
 	// AppFields are application-defined, secret-free compatibility fields.
 	// Canonically encoded in sorted key order.
 	AppFields map[string]string `json:"app_fields,omitzero"`
@@ -116,6 +125,11 @@ func (m ConfigManifest) canonical() []byte {
 	material = appendManifestString(material, m.PermissionPosture)
 	material = appendManifestString(material, m.NativePermissionPolicyRev)
 	material = binary.BigEndian.AppendUint64(material, uint64(m.PermissionStrictness))
+	reviewConfiguredFlag := uint64(0)
+	if m.PermissionReviewConfigured {
+		reviewConfiguredFlag = 1
+	}
+	material = binary.BigEndian.AppendUint64(material, reviewConfiguredFlag)
 	material = appendManifestString(material, m.ConfinementRev)
 	material = binary.BigEndian.AppendUint64(material, uint64(m.ConfinementStrictness))
 	material = appendManifestString(material, m.ExternalCapabilityRev)

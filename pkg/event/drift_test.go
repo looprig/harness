@@ -42,6 +42,9 @@ func TestAssessDrift(t *testing.T) {
 			m.NativePermissionPolicyRev = "x"
 			m.PermissionStrictness = 0 // unknown direction -> fail secure
 		}, wantCategory: DriftPermission, wantSeverity: DriftWarn},
+		{name: "permission review classifiers disabled is info", mutate: func(m *ConfigManifest) {
+			m.PermissionReviewConfigured = false
+		}, wantCategory: DriftPermission, wantSeverity: DriftInfo},
 		{name: "workspace move is warn", mutate: func(m *ConfigManifest) { m.WorkspaceRoot = "/other" },
 			wantCategory: DriftWorkspace, wantSeverity: DriftWarn},
 		{name: "trust mode change is warn", mutate: func(m *ConfigManifest) { m.WorkspaceTrust = "untrusted" },
@@ -71,6 +74,96 @@ func TestAssessDrift(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAssessDriftPermissionReviewConfiguredTransitions proves the four
+// permission-review-classifier-activation transitions design §21 cares about
+// classify correctly: disabled -> enabled is the silent-reviewer-activation
+// bug (must be Warn, requiring explicit accept), the other three transitions
+// must not regress.
+func TestAssessDriftPermissionReviewConfiguredTransitions(t *testing.T) {
+	t.Parallel()
+
+	base := ConfigManifest{SchemaVersion: ManifestSchemaVersion, ModelID: "m", TopologyRev: "topo-a"}
+
+	t.Run("absent to absent is unaffected", func(t *testing.T) {
+		t.Parallel()
+		baseline := base
+		candidate := base
+		assessment := AssessDrift(baseline, candidate)
+		if len(assessment.Changes) != 0 || assessment.AnyWarn() {
+			t.Fatalf("absent->absent produced drift: %+v", assessment)
+		}
+	})
+
+	t.Run("disabled to enabled is warn", func(t *testing.T) {
+		t.Parallel()
+		baseline := base
+		baseline.PermissionReviewConfigured = false
+		candidate := base
+		candidate.PermissionReviewConfigured = true
+		assessment := AssessDrift(baseline, candidate)
+		if !assessment.AnyWarn() {
+			t.Fatalf("disabled->enabled did not warn: %+v", assessment)
+		}
+		found := false
+		for _, change := range assessment.Changes {
+			if change.Category == DriftPermission && change.Field == "review_configured" {
+				found = true
+				if change.Severity != DriftWarn {
+					t.Errorf("severity = %s, want warn", change.Severity)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("no review_configured change reported: %+v", assessment)
+		}
+	})
+
+	t.Run("enabled to enabled with different classifier identity stays info via topology", func(t *testing.T) {
+		t.Parallel()
+		baseline := base
+		baseline.PermissionReviewConfigured = true
+		candidate := base
+		candidate.PermissionReviewConfigured = true
+		candidate.TopologyRev = "topo-b" // identity change folds into TopologyRev today
+		assessment := AssessDrift(baseline, candidate)
+		if assessment.AnyWarn() {
+			t.Fatalf("enabled->enabled identity change unexpectedly warned: %+v", assessment)
+		}
+		if len(assessment.Changes) != 1 || assessment.Changes[0].Category != DriftTopology {
+			t.Fatalf("changes = %+v, want exactly one DriftTopology info change", assessment.Changes)
+		}
+		for _, change := range assessment.Changes {
+			if change.Category == DriftPermission && change.Field == "review_configured" {
+				t.Fatalf("unexpected review_configured change on identity-only drift: %+v", change)
+			}
+		}
+	})
+
+	t.Run("enabled to disabled is not warn", func(t *testing.T) {
+		t.Parallel()
+		baseline := base
+		baseline.PermissionReviewConfigured = true
+		candidate := base
+		candidate.PermissionReviewConfigured = false
+		assessment := AssessDrift(baseline, candidate)
+		if assessment.AnyWarn() {
+			t.Fatalf("enabled->disabled warned: %+v", assessment)
+		}
+		found := false
+		for _, change := range assessment.Changes {
+			if change.Category == DriftPermission && change.Field == "review_configured" {
+				found = true
+				if change.Severity != DriftInfo {
+					t.Errorf("severity = %s, want info", change.Severity)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("no review_configured change reported: %+v", assessment)
+		}
+	})
 }
 
 func TestAssessDriftNoChanges(t *testing.T) {
