@@ -1774,6 +1774,114 @@ what need that working.
 
 ---
 
+## Addendum — Evidence-tool security wiring (pre-Phase-6)
+
+The previous addendum's own "what remains deferred" note named this exact
+gap, and Task 23's CodeRig worktree work confirmed it as a hard blocker:
+`internal/sessionruntime` never populated
+`hustleruntime.RuntimeConfig.Evidence` at all, so **any** session registering
+a permission classifier whose `hustle.Definition` needs evidence tools (which
+is every classifier — `gate.NewPermissionClassifierSet`'s descriptor check
+requires `EvidenceToolPolicyRevision != ""`) failed 100% of the time at
+hustle-controller construction with `hustleruntime.ConfigError{Reason:
+ConfigMissingCollaborator, Field: "runtime.evidence"}`. Closed as a second
+deviation before Phase 6, discussed and design-consulted with the user
+alongside the first addendum.
+
+Closing this gap surfaced a second, independent problem, not just the missing
+wiring: `hustleruntime.EvidenceRuntimeConfig` originally carried a single
+`SecurityCeiling` field meant to be set once at controller construction. Design
+§13.1/§21 require the containment verifier to enforce the security ceiling
+**effective for the one review being evaluated** — and `gates.go`'s
+`respondFromClassifier` doc comment already establishes that a review's
+ceiling is captured once, per review, from the loop's tool-batch-boundary
+snapshot (`internal/loopruntime`, Task 13), not from a session-wide constant.
+A controller-wide `SecurityCeiling` set once at session start would have gone
+silently stale for any review happening later in a long-running session whose
+access posture changed since construction — evidence tools could read against
+a too-loose ceiling for that later review, and while the existing
+`respondFromClassifier` drift check would correctly drop the resulting stale
+*decision*, it cannot undo an evidence file read that already happened under
+the wrong ceiling.
+
+**What was added:**
+
+- `pkg/hustle`: `Request` gained a `SecurityCeiling string` field. Empty means
+  no per-request override — a Hustle without an evidence-tool concept (e.g.
+  compaction) never sets it. `internal/sessionruntime`'s `reviewOne`
+  (`review_adapter.go`) now sets it from the classifier's own frozen
+  `gate.ReviewBasis.SecurityCeiling` on every scheduled classifier run.
+- `internal/hustleruntime`: `EvidenceRuntimeConfig.SecurityCeiling` was
+  removed entirely rather than kept as a session-wide fallback — for
+  permission review the ceiling is always available per-request, so a
+  controller-wide default would have been unused complexity that could mask
+  a caller forgetting to set it. `evidenceRunner.run` now takes
+  `securityCeiling` as a parameter and assembles a fresh
+  `gate.EvidenceContainmentPolicy` on every call from the runner's fixed
+  `readRoot` plus that call's ceiling, instead of reading a policy value
+  stored on the runner at construction.
+  `TestEvidenceRunnerBindsEachRunToItsOwnRequestSecurityCeiling` proves two
+  `RunAndFinalize` calls sharing one `Controller` are bound against two
+  different ceilings; reverting the fix (hardcoding the assembled policy's
+  ceiling) was confirmed to fail that test before landing.
+- `internal/hustleruntime`/`pkg/gate`: `EvidenceAccessEvaluator`,
+  `EvidenceContainmentVerifier`, and `EvidenceContainmentPolicy` moved from
+  `internal/hustleruntime` (unreachable from outside the `harness` module) to
+  the public `pkg/gate`, so an out-of-module consumer (CodeRig, Task 24) can
+  actually name and implement the verifier contract in its own package.
+- `pkg/tool`: new optional capability interface `EvidenceKindDeclarer`
+  (`EvidenceRequirementKinds() []string`), mirroring the existing
+  `Sequential`/`Auditable`/`WriteTarget` probed-by-type-assertion pattern. An
+  evidence `tool.Definition` that implements it lets
+  `internal/hustleruntime.newRuntimeController` fail construction closed with
+  a new typed `*ConfigEvidenceKindError` (naming the offending kind) when a
+  declared `Requirement.Kind` is missing from the consumer's `AllowedKinds`
+  allowlist — a real evidence-tool call's `Requirement.Kind` is otherwise only
+  known dynamically, per call, so this is a best-effort fail-fast for
+  definitions that opt in, layered in front of `authorizeEvidenceRequest`'s
+  unchanged per-call enforcement (the authoritative backstop regardless of
+  whether a definition declares kinds statically).
+- `internal/sessionruntime`: `newHustleController` (`hustle.go`) now always
+  builds a non-nil `RuntimeConfig.Evidence`: `ReadWorkspace` is auto-derived
+  from the session's own existing `s.wsRoot` (no new consumer input — the
+  session already tracks this for workspace checkpointing); `NewExecutionID`
+  is `uuid.New` directly; `Access`/`Containment`/`AllowedKinds` come from the
+  new private `withPermissionReviewEvidence` session `Option`. A session that
+  never applies it keeps those three at their zero value, and
+  `hustleruntime.newRuntimeController`'s pre-existing fail-closed check
+  refuses construction for any classifier that actually needs evidence tools
+  — never a silent permissive default.
+- `internal/sessionruntime`: new exported `LifecycleOption`
+  `WithLifecyclePermissionReviewEvidence(access, containment, allowedKinds)`,
+  threaded into both `NewSession` and `RestoreSession` identically, mirroring
+  `WithLifecyclePermissionReview`'s shape.
+- `pkg/rig`: new `WithPermissionReviewEvidence(access gate.EvidenceAccessEvaluator,
+  containment gate.EvidenceContainmentVerifier, allowedKinds []string) Option`.
+  `Define()` requires it whenever any registered classifier's definition
+  needs evidence tools (`DefinitionMissingPermissionReviewEvidence` if
+  omitted) and rejects it when supplied but unneeded
+  (`DefinitionUnusedPermissionReviewEvidence`), mirroring the existing
+  `MissingHustleLimits`/`UnusedHustleLimits` pairing. Note the option's
+  signature deliberately widened beyond the original sketch discussed with the
+  user (`verifier` + `allowedKinds` only): `Access` is an equally real,
+  independent consumer-owned security boundary (design §13.1's separate
+  "configured access returns `AccessAllow`" bullet, distinct from
+  containment), and Harness has no session-level access source to derive a
+  non-permissive default from — a hardcoded always-allow `Access` would have
+  violated the same "do not silently proceed with a permissive default"
+  requirement the containment verifier is already held to.
+
+**What remains deferred:** CodeRig's actual `gate.EvidenceContainmentVerifier`
+implementation — the real, security-relevant resolve-symlinks/reject-ambiguous-
+scope/enforce-ceiling logic — is Task 24's job, not this addendum's. This
+addendum wires the seam and proves it reaches a live session
+(`TestDefinePermissionReviewSucceedsAndConstructsSessionWithEvidenceOption`
+brings up a full session with a classifier needing evidence tools, using
+stub access/containment implementations); Task 24 owns supplying a real one
+and testing it against real filesystem/git evidence tools.
+
+---
+
 # Phase 6 — Consumer composition in CodeRig
 
 ## Task 23: Create isolated CodeRig worktree and add explicit classifier config
