@@ -179,6 +179,9 @@ func TestDefinePermissionReviewAcceptsMaxLengthRevision(t *testing.T) {
 		WithPermissionClassifiers(set),
 		WithPermissionReviewPolicy(rigReviewPolicy(t, revision)),
 		WithHustleLimits(validHustleLimits()),
+		WithPermissionReviewEvidence(
+			stubPermissionReviewEvidenceAccess{}, stubPermissionReviewEvidenceContainment{}, []string{"filesystem.read"},
+		),
 	)...)
 	if err != nil {
 		t.Fatalf("Define() with max-length review policy revision: %v", err)
@@ -217,6 +220,9 @@ func TestDefinePermissionReviewUsesHustleRegistrationAndBindingPath(t *testing.T
 	base := []Option{
 		WithPermissionClassifiers(set),
 		WithPermissionReviewPolicy(rigReviewPolicy(t, "review-v1")),
+		WithPermissionReviewEvidence(
+			stubPermissionReviewEvidenceAccess{}, stubPermissionReviewEvidenceContainment{}, []string{"filesystem.read"},
+		),
 	}
 	_, err := Define(validRigOptions(t, base...)...)
 	var target *DefinitionError

@@ -23,19 +23,20 @@ type Option func(*definitionState) error
 type singletonKey string
 
 const (
-	keyActivePrimer           singletonKey = "active_primer"
-	keyDelegationLimits       singletonKey = "delegation_limits"
-	keyConfigFingerprint      singletonKey = "config_fingerprint"
-	keyForeignBuilder         singletonKey = "foreign_builders"
-	keyGateCaps               singletonKey = "gate_caps"
-	keyAllowConfigMismatch    singletonKey = "allow_config_mismatch"
-	keyRestoreDecider         singletonKey = "restore_decider"
-	keySnapshots              singletonKey = "snapshots"
-	keyOffloadGC              singletonKey = "offload_gc"
-	keyHustleLimits           singletonKey = "hustle_limits"
-	keyPermissionClassifiers  singletonKey = "permission_classifiers"
-	keyPermissionReviewPolicy singletonKey = "permission_review_policy"
-	keyPermissionReviewLimits singletonKey = "permission_review_limits"
+	keyActivePrimer             singletonKey = "active_primer"
+	keyDelegationLimits         singletonKey = "delegation_limits"
+	keyConfigFingerprint        singletonKey = "config_fingerprint"
+	keyForeignBuilder           singletonKey = "foreign_builders"
+	keyGateCaps                 singletonKey = "gate_caps"
+	keyAllowConfigMismatch      singletonKey = "allow_config_mismatch"
+	keyRestoreDecider           singletonKey = "restore_decider"
+	keySnapshots                singletonKey = "snapshots"
+	keyOffloadGC                singletonKey = "offload_gc"
+	keyHustleLimits             singletonKey = "hustle_limits"
+	keyPermissionClassifiers    singletonKey = "permission_classifiers"
+	keyPermissionReviewPolicy   singletonKey = "permission_review_policy"
+	keyPermissionReviewLimits   singletonKey = "permission_review_limits"
+	keyPermissionReviewEvidence singletonKey = "permission_review_evidence"
 )
 
 // WithPermissionClassifiers installs the already-validated, ordered permission
@@ -150,6 +151,38 @@ func WithPermissionReviewLimits(limits PermissionReviewLimits) Option {
 		state.seen[keyPermissionReviewLimits] = true
 		state.permissionReviewLimits = limits
 		return nil
+	}
+}
+
+// WithPermissionReviewEvidence installs the consumer-supplied read-only
+// evidence-tool access boundary every registered permission classifier's
+// evidence tools run under (design §13.1). access answers the configured
+// access state for one prepared evidence Requirement; containment
+// independently performs the trusted-caller containment check (resolving
+// symlinks, rejecting ambiguous scopes, enforcing the review's own security
+// ceiling); allowedKinds is the explicit consumer-consent allowlist of
+// Requirement.Kind values evidence tools may declare. Both access and
+// containment are read-only, headless, trusted-caller seams — neither
+// receives session, gate, mutation, grant, rule, or loop-control capability
+// (design §13.1's Access/Containment split; Access alone was omitted from
+// the design sketch of this option's signature, but the same fail-closed
+// requirement applies to it: hustleruntime refuses to bind an evidence
+// catalog with a nil Access evaluator exactly as it refuses a nil
+// Containment verifier).
+//
+// Required whenever any registered classifier's definition needs evidence
+// tools; Define fails closed (DefinitionMissingPermissionReviewEvidence) if
+// omitted in that case, and rejects it (DefinitionUnusedPermissionReviewEvidence)
+// when supplied but no registered classifier needs it — mirroring the
+// existing MissingHustleLimits/UnusedHustleLimits "config X requires config
+// Y" pairing already used elsewhere in this file.
+func WithPermissionReviewEvidence(access gate.EvidenceAccessEvaluator, containment gate.EvidenceContainmentVerifier, allowedKinds []string) Option {
+	return func(state *definitionState) error {
+		if access == nil || containment == nil || len(allowedKinds) == 0 {
+			return &DefinitionError{Kind: DefinitionInvalidPermissionReviewEvidence}
+		}
+		frozenKinds := append([]string(nil), allowedKinds...)
+		return singletonCompile(keyPermissionReviewEvidence, sessionruntime.WithLifecyclePermissionReviewEvidence(access, containment, frozenKinds))(state)
 	}
 }
 

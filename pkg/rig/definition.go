@@ -114,6 +114,9 @@ func Define(options ...Option) (*Rig, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validatePermissionReviewEvidence(state); err != nil {
+		return nil, err
+	}
 	if err := validateHustleRegistration(state); err != nil {
 		return nil, err
 	}
@@ -269,6 +272,53 @@ func resolvePermissionReviewLimits(state *definitionState) (*PermissionReviewLim
 			MaxStaleResponses:        DefaultPermissionReviewBreakerThreshold,
 		},
 	}, nil
+}
+
+// validatePermissionReviewEvidence enforces the "config X requires config Y"
+// pairing between WithPermissionReviewEvidence and any registered
+// classifier's evidence-tool need, mirroring
+// resolvePermissionReviewLimits/validateHustleRegistration's own pairing
+// checks:
+//
+//   - at least one registered classifier's Definition needs evidence tools +
+//     WithPermissionReviewEvidence never called: DefinitionMissingPermissionReviewEvidence
+//     (this is the confirmed Task 23 hard blocker's Define()-time guard —
+//     the classifier-registered session that would otherwise fail 100% of
+//     the time at hustle-controller construction now fails earlier, with a
+//     clear cause, at Define()).
+//   - WithPermissionReviewEvidence called but NO registered classifier needs
+//     evidence tools (including no classifiers configured at all):
+//     DefinitionUnusedPermissionReviewEvidence.
+//   - every other combination (both configured and needed, or neither):
+//     no error.
+func validatePermissionReviewEvidence(state *definitionState) error {
+	needed := state.seen[keyPermissionClassifiers] && anyClassifierNeedsEvidence(state.permissionClassifiers)
+	configured := state.seen[keyPermissionReviewEvidence]
+	switch {
+	case needed && !configured:
+		return &DefinitionError{Kind: DefinitionMissingPermissionReviewEvidence}
+	case !needed && configured:
+		return &DefinitionError{Kind: DefinitionUnusedPermissionReviewEvidence}
+	default:
+		return nil
+	}
+}
+
+// anyClassifierNeedsEvidence reports whether any classifier in set has an
+// EvidenceToolPolicy-enabled Definition (hustle.Definition.EvidenceToolPolicy's
+// second, enabled return value). Under gate.NewPermissionClassifierSet's own
+// current descriptor validation (pkg/gate/reviewer.go requires
+// EvidenceToolPolicyRevision != "" for every registered classifier), a
+// non-empty set today always needs evidence — this check is written
+// per-classifier anyway, rather than "len(set.Classifiers()) > 0", so it
+// stays correct without change if that upstream invariant is ever relaxed.
+func anyClassifierNeedsEvidence(set gate.PermissionClassifierSet) bool {
+	for _, classifier := range set.Classifiers() {
+		if _, enabled := classifier.Definition().EvidenceToolPolicy(); enabled {
+			return true
+		}
+	}
+	return false
 }
 
 // lifecyclePermissionReviewBreakerLimits converts the rig-level limits shape
