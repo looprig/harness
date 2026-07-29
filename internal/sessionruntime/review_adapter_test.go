@@ -135,6 +135,14 @@ type reviewClassifierStub struct {
 	marshalErr    error
 	assessment    gate.PermissionAssessment
 	validateErr   error
+
+	// panicApplies/panicMarshalInput, when set, make the corresponding method
+	// panic(panicValue) instead of returning normally — used to prove a
+	// trusted-but-fallible classifier implementation panicking cannot crash
+	// the review goroutine.
+	panicApplies      bool
+	panicMarshalInput bool
+	panicValue        any
 }
 
 func (s *reviewClassifierStub) Name() hustle.Name             { return s.name }
@@ -142,10 +150,16 @@ func (s *reviewClassifierStub) Revision() string              { return s.revisio
 func (s *reviewClassifierStub) Definition() hustle.Definition { return s.definition }
 func (s *reviewClassifierStub) Applies(gate.PermissionReviewSubject) bool {
 	s.appliesCalls++
+	if s.panicApplies {
+		panic(s.panicValue)
+	}
 	return s.applies
 }
 func (s *reviewClassifierStub) MarshalInput(gate.PermissionReviewSubject) (json.RawMessage, error) {
 	s.marshalCalls++
+	if s.panicMarshalInput {
+		panic(s.panicValue)
+	}
 	if s.marshalErr != nil {
 		return nil, s.marshalErr
 	}

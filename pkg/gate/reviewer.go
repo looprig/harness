@@ -185,6 +185,34 @@ func ValidatePermissionClassifierName(name hustle.Name) error {
 	return nil
 }
 
+// PermissionClassifierPanicMethod identifies which trust-boundary method of a
+// registered PermissionClassifier panicked. It exists only to route a
+// recovered panic into a bounded, content-free error — never to convey the
+// panic value itself.
+type PermissionClassifierPanicMethod string
+
+const (
+	PermissionClassifierPanicMarshalInput   PermissionClassifierPanicMethod = "marshal_input"
+	PermissionClassifierPanicValidateResult PermissionClassifierPanicMethod = "validate_result"
+)
+
+// PermissionClassifierPanicError is the redacted recovery product for a panic
+// raised by a registered PermissionClassifier implementation. Classifiers are
+// trusted but not infallible: a buggy implementation can still panic, and a
+// panic on the review goroutine would otherwise crash the whole process
+// rather than just fail the one review. This is the bounded internal failure
+// design's error taxonomy calls "callback panic at a trusted boundary" —
+// it deliberately retains no panic value, since the panic could be an error,
+// a string, or anything else, and could itself carry raw classifier-
+// controlled subject content.
+type PermissionClassifierPanicError struct {
+	Method PermissionClassifierPanicMethod
+}
+
+func (e *PermissionClassifierPanicError) Error() string {
+	return "gate: permission classifier panicked (" + string(e.Method) + ")"
+}
+
 type frozenPermissionClassifier struct {
 	source     PermissionClassifier
 	name       hustle.Name
@@ -195,18 +223,52 @@ type frozenPermissionClassifier struct {
 func (c *frozenPermissionClassifier) Name() hustle.Name             { return c.name }
 func (c *frozenPermissionClassifier) Revision() string              { return c.revision }
 func (c *frozenPermissionClassifier) Definition() hustle.Definition { return c.definition }
+
+// Applies is intentionally NOT recover-wrapped here: PermissionClassifier.Applies
+// returns a bare bool, so this registry boundary has no way to signal "the
+// call panicked" distinctly from an ordinary "not applicable" false without
+// changing the interface every registered classifier implements (which would
+// also let a panic in one classifier masquerade as an ordinary non-applicable
+// result and let a DIFFERENT classifier's allow decide the whole gate — see
+// design §11/§25.4). internal/sessionruntime's reviewOne, which needs and has
+// that three-way distinction (applicable / not-applicable / failed) in the
+// gate.PermissionAssessmentOutcome it builds, recovers this specific call
+// itself instead.
 func (c *frozenPermissionClassifier) Applies(subject PermissionReviewSubject) bool {
 	return c.source.Applies(subject.Clone())
 }
+
 func (c *frozenPermissionClassifier) MarshalInput(
 	subject PermissionReviewSubject,
-) (json.RawMessage, error) {
+) (raw json.RawMessage, err error) {
+	defer func() {
+		if recover() != nil {
+			raw = nil
+			err = &PermissionClassifierPanicError{Method: PermissionClassifierPanicMarshalInput}
+		}
+	}()
 	return c.source.MarshalInput(subject.Clone())
 }
+
+// ValidateResult is recover-wrapped here for defense-in-depth consistency
+// with MarshalInput, even though a panic here is already indirectly caught by
+// internal/hustleruntime's own callValidator recover (this method is invoked
+// from inside a validator closure hustleruntime wraps). Recovering at this
+// registry boundary instead means every caller of a registered
+// PermissionClassifier — not only today's one call site — gets the same
+// bounded-error guarantee, and the resulting error is classified as an
+// ordinary validation failure rather than needing a second typed-error case
+// downstream.
 func (c *frozenPermissionClassifier) ValidateResult(
 	subject PermissionReviewSubject,
 	result hustle.Result,
-) (PermissionAssessment, error) {
+) (assessment PermissionAssessment, err error) {
+	defer func() {
+		if recover() != nil {
+			assessment = PermissionAssessment{}
+			err = &PermissionClassifierPanicError{Method: PermissionClassifierPanicValidateResult}
+		}
+	}()
 	return c.source.ValidateResult(subject.Clone(), result)
 }
 

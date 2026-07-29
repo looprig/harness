@@ -3,6 +3,7 @@ package gate_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -38,6 +39,14 @@ type permissionClassifierStub struct {
 	marshals   int
 	validates  int
 	mutate     func(*gate.PermissionReviewSubject)
+
+	// panicMarshalInput/panicValidateResult, when set, make the corresponding
+	// method panic(panicValue) instead of returning normally — used to prove
+	// frozenPermissionClassifier recovers a panic at this trust boundary
+	// rather than letting it crash the caller's goroutine.
+	panicMarshalInput   bool
+	panicValidateResult bool
+	panicValue          any
 }
 
 func (s *permissionClassifierStub) Name() hustle.Name {
@@ -61,6 +70,9 @@ func (s *permissionClassifierStub) Applies(subject gate.PermissionReviewSubject)
 }
 func (s *permissionClassifierStub) MarshalInput(subject gate.PermissionReviewSubject) (json.RawMessage, error) {
 	s.marshals++
+	if s.panicMarshalInput {
+		panic(s.panicValue)
+	}
 	if s.mutate != nil {
 		s.mutate(&subject)
 	}
@@ -68,6 +80,9 @@ func (s *permissionClassifierStub) MarshalInput(subject gate.PermissionReviewSub
 }
 func (s *permissionClassifierStub) ValidateResult(subject gate.PermissionReviewSubject, _ hustle.Result) (gate.PermissionAssessment, error) {
 	s.validates++
+	if s.panicValidateResult {
+		panic(s.panicValue)
+	}
 	if s.mutate != nil {
 		s.mutate(&subject)
 	}
@@ -565,6 +580,82 @@ func classifierWithDefinitionWithoutEvidence(
 		t.Fatal(err)
 	}
 	return &permissionClassifierStub{name: name, revision: revision, definition: definition}
+}
+
+// TestPermissionClassifierSetRecoversMarshalInputPanic proves the registry
+// boundary — not just the ordinary error return — protects callers from a
+// trusted-but-fallible classifier's MarshalInput panicking: an unrecovered
+// panic here would crash whatever goroutine called through the registered
+// PermissionClassifier, taking down every concurrent session sharing that
+// process. Recovery must also never let the panic VALUE (which could embed
+// raw classifier-controlled subject content) reach the returned error.
+func TestPermissionClassifierSetRecoversMarshalInputPanic(t *testing.T) {
+	t.Parallel()
+	const marker = "secret-marker-marshal-panic-4f19c2"
+	source := validPermissionClassifier(t, "panics-on-marshal", "revision-1")
+	source.panicMarshalInput = true
+	source.panicValue = marker
+	set, err := gate.NewPermissionClassifierSet(source)
+	if err != nil {
+		t.Fatalf("NewPermissionClassifierSet() error = %v", err)
+	}
+	registered := set.Classifiers()[0]
+
+	raw, err := registered.MarshalInput(gate.PermissionReviewSubject{})
+	if err == nil {
+		t.Fatal("MarshalInput() error = nil, want the panic recovered into an error")
+	}
+	if raw != nil {
+		t.Fatalf("MarshalInput() raw = %v, want nil on a recovered panic", raw)
+	}
+	var panicErr *gate.PermissionClassifierPanicError
+	if !errors.As(err, &panicErr) {
+		t.Fatalf("MarshalInput() error = %T, want *gate.PermissionClassifierPanicError", err)
+	}
+	if panicErr.Method != gate.PermissionClassifierPanicMarshalInput {
+		t.Fatalf("Method = %q, want %q", panicErr.Method, gate.PermissionClassifierPanicMarshalInput)
+	}
+	if strings.Contains(err.Error(), marker) {
+		t.Fatalf("error %q leaks the recovered panic value", err)
+	}
+}
+
+// TestPermissionClassifierSetRecoversValidateResultPanic is the
+// defense-in-depth companion to the MarshalInput test above: ValidateResult
+// panics are already indirectly caught by internal/hustleruntime's own
+// callValidator recover, but frozenPermissionClassifier recovers them itself
+// too, so every caller of a registered PermissionClassifier gets the same
+// bounded-error guarantee, not only the one call site inside a Hustle run.
+func TestPermissionClassifierSetRecoversValidateResultPanic(t *testing.T) {
+	t.Parallel()
+	const marker = "secret-marker-validate-panic-9c02af"
+	source := validPermissionClassifier(t, "panics-on-validate", "revision-1")
+	source.panicValidateResult = true
+	source.panicValue = marker
+	set, err := gate.NewPermissionClassifierSet(source)
+	if err != nil {
+		t.Fatalf("NewPermissionClassifierSet() error = %v", err)
+	}
+	registered := set.Classifiers()[0]
+
+	assessment, err := registered.ValidateResult(gate.PermissionReviewSubject{}, hustle.Result{})
+	if err == nil {
+		t.Fatal("ValidateResult() error = nil, want the panic recovered into an error")
+	}
+	if assessment.Basis != (gate.ReviewBasis{}) || assessment.Risk != "" || assessment.Authorization != "" ||
+		len(assessment.Categories) != 0 || assessment.Recommendation != "" || assessment.Rationale != "" {
+		t.Fatalf("ValidateResult() assessment = %#v, want zero value on a recovered panic", assessment)
+	}
+	var panicErr *gate.PermissionClassifierPanicError
+	if !errors.As(err, &panicErr) {
+		t.Fatalf("ValidateResult() error = %T, want *gate.PermissionClassifierPanicError", err)
+	}
+	if panicErr.Method != gate.PermissionClassifierPanicValidateResult {
+		t.Fatalf("Method = %q, want %q", panicErr.Method, gate.PermissionClassifierPanicValidateResult)
+	}
+	if strings.Contains(err.Error(), marker) {
+		t.Fatalf("error %q leaks the recovered panic value", err)
+	}
 }
 
 func permissionClassifierModel() model.Model {

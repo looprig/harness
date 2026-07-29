@@ -376,7 +376,24 @@ func (a *permissionReviewAdapter) reviewOne(ctx context.Context, req loopruntime
 		a.publishReviewCompleted(ctx, req, classifier, gate.ReviewStatusFailed, gate.PermissionAssessment{}, false)
 		return gate.PermissionAssessmentOutcome{Applicable: true, Status: gate.ReviewStatusFailed}
 	}
-	if !classifier.Applies(subject) {
+	applies, paniced := callClassifierApplies(classifier, subject)
+	if paniced {
+		// classifier.Applies returns a bare bool, so — unlike MarshalInput/
+		// ValidateResult, whose (..., error) signatures let pkg/gate's
+		// frozenPermissionClassifier absorb a panic at the registry boundary
+		// without touching the public PermissionClassifier contract — a panic
+		// here has no return-value channel to travel through except this call
+		// site. Treat it as "applicable but failed", never as an ordinary
+		// not-applicable result: an ambiguous applicability determination must
+		// not let a DIFFERENT classifier's allow silently decide the whole
+		// gate (design §11 "a non-applicable classifier contributes nothing"
+		// only holds for a genuine, confidently-determined non-applicability).
+		slog.WarnContext(ctx, "sessionruntime: permission review applicability check panicked; failing classifier closed",
+			"classifier", classifier.Name(), "classifier_revision", classifier.Revision(), "gate_id", req.GateID)
+		a.publishReviewCompleted(ctx, req, classifier, gate.ReviewStatusFailed, gate.PermissionAssessment{}, false)
+		return gate.PermissionAssessmentOutcome{Subject: subject, Applicable: true, Status: gate.ReviewStatusFailed}
+	}
+	if !applies {
 		a.publishReviewCompleted(ctx, req, classifier, gate.ReviewStatusNotApplicable, gate.PermissionAssessment{}, false)
 		return gate.PermissionAssessmentOutcome{Subject: subject, Status: gate.ReviewStatusNotApplicable}
 	}
@@ -442,6 +459,24 @@ func (a *permissionReviewAdapter) reviewOne(ctx context.Context, req loopruntime
 	return gate.PermissionAssessmentOutcome{
 		Subject: subject, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: assessment,
 	}
+}
+
+// callClassifierApplies invokes classifier.Applies(subject) with a local
+// recover so a panicking, trusted-but-fallible classifier implementation
+// cannot crash the goroutine review() runs on (Session.StartPermissionReview
+// spawns review() fire-and-forget, with nothing else on that goroutine to
+// catch an unrecovered panic — an unrecovered panic on ANY goroutine
+// terminates the whole process, not just this one gate's review). paniced=true
+// must be treated by the caller as "applicable but failed", never as an
+// ordinary not-applicable result — see the call site's comment.
+func callClassifierApplies(classifier gate.PermissionClassifier, subject gate.PermissionReviewSubject) (applies bool, paniced bool) {
+	defer func() {
+		if recover() != nil {
+			applies = false
+			paniced = true
+		}
+	}()
+	return classifier.Applies(subject), false
 }
 
 // classifyReviewFailureStatus derives the finer-grained audit status for a

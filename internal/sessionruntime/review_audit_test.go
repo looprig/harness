@@ -754,6 +754,225 @@ func TestPermissionReviewAdapterMarshalInputFailureNeverLeaksErrorText(t *testin
 	}
 }
 
+// --- unrecovered classifier panics must not crash the review goroutine ---
+//
+// Session.StartPermissionReview runs adapter.review on its own goroutine with
+// no recover anywhere above it; an unrecovered panic there would terminate
+// the ENTIRE process, taking down every concurrent session, not just this
+// gate's review. classifier.Applies and classifier.MarshalInput are called
+// directly on that goroutine (reviewOne), so a trusted-but-fallible
+// classifier implementation that panics in either must be recovered and
+// turned into a bounded, content-free ReviewStatusFailed outcome instead.
+
+// TestPermissionReviewAdapterAppliesPanicNeverCrashesAndFailsClassifierClosed
+// proves a panic inside classifier.Applies does not propagate out of
+// adapter.review (if it did, this test's process would crash rather than
+// merely fail), that the panicking classifier's Hustle is never scheduled,
+// that no gate response is ever attempted (the gate must stay human, not be
+// auto-approved by a classifier that just panicked), and that the classifier
+// is audited as failed (not not_applicable — an ambiguous applicability
+// determination is never treated as a confident "does not apply").
+func TestPermissionReviewAdapterAppliesPanicNeverCrashesAndFailsClassifierClosed(t *testing.T) {
+	t.Parallel()
+	classifier := newValidReviewClassifier(t, "classifier", "rev-1", true)
+	classifier.panicApplies = true
+	classifier.panicValue = errors.New("boom: applicability check exploded")
+	set, err := gate.NewPermissionClassifierSet(classifier)
+	if err != nil {
+		t.Fatalf("NewPermissionClassifierSet: %v", err)
+	}
+	runner := &permissionReviewRunnerStub{result: hustle.Result{Output: json.RawMessage(`{}`)}}
+	responder := &permissionReviewResponderStub{}
+	adapter, pub, faults := newAuditTestAdapter(t, runner, set, validReviewPolicy(t), responder)
+
+	gateID := mustUUID()
+	toolExecutionID := mustUUID()
+	req := validReviewRequest(t, gateID, toolExecutionID)
+
+	// If Applies' panic were not recovered, this call would crash the whole
+	// test process rather than return normally.
+	adapter.review(context.Background(), req)
+
+	if classifier.appliesCalls != 1 {
+		t.Fatalf("appliesCalls = %d, want 1", classifier.appliesCalls)
+	}
+	if runner.callCount() != 0 {
+		t.Fatalf("runner calls = %d, want 0 (a classifier whose applicability check panicked must never be scheduled)", runner.callCount())
+	}
+	if len(responder.snapshot()) != 0 {
+		t.Fatalf("responder calls = %d, want 0 (a panic must never let the gate auto-approve)", len(responder.snapshot()))
+	}
+	if len(pub.started()) != 0 {
+		t.Errorf("started events = %d, want 0 (applicability was never confirmed)", len(pub.started()))
+	}
+	completedEvents := pub.completed()
+	if len(completedEvents) != 1 {
+		t.Fatalf("completed events = %d, want 1: %#v", len(completedEvents), completedEvents)
+	}
+	got := completedEvents[0]
+	assertCompletedIdentity(t, got, gateID, toolExecutionID, "classifier", "rev-1")
+	if got.Status != gate.ReviewStatusFailed {
+		t.Errorf("Status = %q, want failed", got.Status)
+	}
+	if got.AutoApproved || got.Risk != "" || got.Authorization != "" || len(got.Categories) != 0 {
+		t.Errorf("failed carried assessment data: %#v", got)
+	}
+	if faults.count() != 0 {
+		t.Errorf("faults = %d, want 0 (a recovered classifier panic is an ordinary expected failure, not an integrity fault)", faults.count())
+	}
+}
+
+// TestPermissionReviewAdapterMarshalInputPanicNeverCrashesOrLeaksMarker is the
+// panic-path companion to TestPermissionReviewAdapterMarshalInputFailureNeverLeaksErrorText:
+// classifier.MarshalInput panicking with a value that embeds raw
+// classifier-controlled content must not crash the review goroutine, and the
+// recovered panic value must never reach a log line or any durably-appended
+// event — matching the exact content-free discipline the ordinary
+// (non-panic) MarshalInput error path already follows.
+func TestPermissionReviewAdapterMarshalInputPanicNeverCrashesOrLeaksMarker(t *testing.T) {
+	// Deliberately NOT t.Parallel(): captureSlogDefault swaps the process-wide
+	// slog default for the duration of this test.
+	const marker = "secret-marker-xyz-marshalinput-panic-7c3e9a"
+
+	classifier := newValidReviewClassifier(t, "classifier", "rev-1", true)
+	classifier.panicMarshalInput = true
+	classifier.panicValue = "secret-marker-xyz-marshalinput-panic-7c3e9a: rm -rf /some/path"
+	set, err := gate.NewPermissionClassifierSet(classifier)
+	if err != nil {
+		t.Fatalf("NewPermissionClassifierSet: %v", err)
+	}
+	runner := &permissionReviewRunnerStub{result: hustle.Result{Output: json.RawMessage(`{}`)}}
+	responder := &permissionReviewResponderStub{}
+	adapter, pub, faults := newAuditTestAdapter(t, runner, set, validReviewPolicy(t), responder)
+
+	logs := captureSlogDefault(t)
+	gateID := mustUUID()
+	toolExecutionID := mustUUID()
+	req := validReviewRequest(t, gateID, toolExecutionID)
+
+	// If MarshalInput's panic were not recovered at the pkg/gate registry
+	// boundary, this call would crash the whole test process.
+	adapter.review(context.Background(), req)
+
+	if strings.Contains(logs.String(), marker) {
+		t.Fatalf("classifier MarshalInput panic value leaked into logs: %s", logs.String())
+	}
+	if runner.callCount() != 0 {
+		t.Fatalf("runner calls = %d, want 0 (a classifier whose input marshal panicked must never be scheduled)", runner.callCount())
+	}
+	if len(responder.snapshot()) != 0 {
+		t.Fatalf("responder calls = %d, want 0 (a panic must never let the gate auto-approve)", len(responder.snapshot()))
+	}
+	_, marshaled := pub.snapshot()
+	for index, data := range marshaled {
+		if bytes.Contains(data, []byte(marker)) {
+			t.Errorf("event[%d] leaks recovered panic marker: %s", index, data)
+		}
+	}
+	completedEvents := pub.completed()
+	if len(completedEvents) != 1 {
+		t.Fatalf("completed events = %d, want 1: %#v", len(completedEvents), completedEvents)
+	}
+	if got := completedEvents[0].Status; got != gate.ReviewStatusFailed {
+		t.Errorf("Status = %q, want failed", got)
+	}
+	if faults.count() != 0 {
+		t.Errorf("faults = %d, want 0 (a recovered classifier panic is an ordinary expected failure, not an integrity fault)", faults.count())
+	}
+}
+
+// TestPermissionReviewAdapterOnePanickingClassifierLeavesOtherClassifierCorrectlyCombined
+// registers two classifiers for the same gate: one panics in Applies, the
+// other applies normally and would, on its own, be eligible to auto-approve.
+// Per design §11's conjunctive combination ("every applicable classifier
+// must produce a locally eligible allow"), a classifier whose own
+// applicability could not be confidently determined must be treated as
+// applicable-but-failed — never as silently not-applicable — so it cannot be
+// excluded from the conjunction and let the OTHER classifier's allow decide
+// the whole gate. The well-behaved classifier must still run to completion
+// (proving one classifier's panic does not take down review of the other),
+// but the combined decision must stay ineligible and the gate must stay
+// human: no classifier-originated response is ever attempted.
+func TestPermissionReviewAdapterOnePanickingClassifierLeavesOtherClassifierCorrectlyCombined(t *testing.T) {
+	t.Parallel()
+	panicking := newValidReviewClassifier(t, "panicking-classifier", "rev-panicking", true)
+	panicking.panicApplies = true
+	panicking.panicValue = "boom"
+
+	wellBehaved := newValidReviewClassifier(t, "well-behaved-classifier", "rev-well-behaved", true)
+	wellBehaved.assessment = gate.PermissionAssessment{
+		Risk: gate.ReviewRiskLow, Authorization: gate.ReviewAuthorizationUnknown,
+		Categories:     []gate.ReviewRiskCategory{gate.ReviewCategoryMutableNetwork},
+		Recommendation: gate.ReviewAllow, Rationale: "low risk, allow",
+	}
+
+	set, err := gate.NewPermissionClassifierSet(panicking, wellBehaved)
+	if err != nil {
+		t.Fatalf("NewPermissionClassifierSet: %v", err)
+	}
+	runner := &permissionReviewRunnerStub{result: hustle.Result{Output: json.RawMessage(`{}`)}}
+	responder := &permissionReviewResponderStub{}
+	adapter, pub, faults := newAuditTestAdapter(t, runner, set, validReviewPolicy(t), responder)
+
+	gateID := mustUUID()
+	toolExecutionID := mustUUID()
+	req := validReviewRequest(t, gateID, toolExecutionID)
+
+	// If the panicking classifier's Applies panic were not recovered, this
+	// call would crash the whole test process before the well-behaved
+	// classifier ever got a chance to run.
+	adapter.review(context.Background(), req)
+
+	if panicking.appliesCalls != 1 {
+		t.Fatalf("panicking.appliesCalls = %d, want 1", panicking.appliesCalls)
+	}
+	// The well-behaved classifier must still be fully reviewed: one
+	// classifier panicking must not take down review of the other.
+	if wellBehaved.appliesCalls != 1 || wellBehaved.marshalCalls != 1 || wellBehaved.validateCalls != 1 {
+		t.Fatalf(
+			"wellBehaved calls = applies:%d marshal:%d validate:%d, want 1/1/1 (unaffected by the other classifier's panic)",
+			wellBehaved.appliesCalls, wellBehaved.marshalCalls, wellBehaved.validateCalls,
+		)
+	}
+	if runner.callCount() != 1 {
+		t.Fatalf("runner calls = %d, want 1 (only the well-behaved classifier is scheduled)", runner.callCount())
+	}
+	// The panicking classifier makes the WHOLE conjunctive decision
+	// ineligible, so the well-behaved classifier's own allow must never be
+	// allowed to auto-approve the gate on its own.
+	if len(responder.snapshot()) != 0 {
+		t.Fatalf("responder calls = %d, want 0 (gate must stay human: one classifier failed closed)", len(responder.snapshot()))
+	}
+
+	completedEvents := pub.completed()
+	if len(completedEvents) != 2 {
+		t.Fatalf("completed events = %d, want 2: %#v", len(completedEvents), completedEvents)
+	}
+	statuses := map[hustle.Name]gate.ReviewStatus{}
+	autoApproved := map[hustle.Name]bool{}
+	for _, ev := range completedEvents {
+		statuses[ev.Classifier] = ev.Status
+		autoApproved[ev.Classifier] = ev.AutoApproved
+	}
+	if got := statuses["panicking-classifier"]; got != gate.ReviewStatusFailed {
+		t.Errorf("panicking-classifier Status = %q, want failed", got)
+	}
+	// The well-behaved classifier's OWN Hustle validated cleanly (Status stays
+	// Allowed), but design §16.2: the combined decision — not this
+	// classifier's own opinion — decides AutoApproved. Since the panicking
+	// classifier made the whole conjunction ineligible, this must never be
+	// audited as an auto-approval.
+	if got := statuses["well-behaved-classifier"]; got != gate.ReviewStatusNeedsHuman {
+		t.Errorf("well-behaved-classifier Status = %q, want needs_human (the combined decision, not this classifier's own allow, decides the outcome)", got)
+	}
+	if autoApproved["panicking-classifier"] || autoApproved["well-behaved-classifier"] {
+		t.Errorf("AutoApproved = %#v, want both false", autoApproved)
+	}
+	if faults.count() != 0 {
+		t.Errorf("faults = %d, want 0", faults.count())
+	}
+}
+
 // --- audit-append failure vs ordinary expected classifier failure ---
 
 // TestPermissionReviewAdapterAuditAppendFailureFaultsSession proves an audit
