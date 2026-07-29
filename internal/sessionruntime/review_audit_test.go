@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +24,21 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 	model "github.com/looprig/inference/model"
 )
+
+// captureSlogDefault redirects the process-wide slog default logger to an
+// in-memory buffer for the calling test's duration, restoring the previous
+// default in cleanup. review_adapter.go/gates.go log through the top-level
+// slog.Warn(Context)/Error(Context) funcs — there is no injected *slog.Logger
+// seam — so swapping the default is the only way a test can observe exactly
+// what those call sites wrote.
+func captureSlogDefault(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return &buf
+}
 
 // This file exercises Task 17 (design §16/§17): permissionReviewAdapter must
 // publish secret-free PermissionReviewStarted/PermissionReviewCompleted audit
@@ -696,6 +713,41 @@ func TestPermissionReviewAdapterNeverLeaksSecretsIntoDurableEvents(t *testing.T)
 				t.Errorf("event[%d] leaks secret marker %q: %s", index, marker, data)
 			}
 		}
+	}
+}
+
+// TestPermissionReviewAdapterMarshalInputFailureNeverLeaksErrorText proves a
+// classifier-controlled MarshalInput failure — an unconstrained error owned
+// entirely by the classifier implementation (unlike
+// gate.NewPermissionReviewSubject's bounded, content-free typed error, or
+// classifyReviewFailureStatus's typed-reason-only classification) — never
+// reaches operational logs verbatim. A classifier could embed raw
+// subject/command/context content in its MarshalInput error text; reviewOne's
+// slog.Warn call for this path must not repeat that text.
+func TestPermissionReviewAdapterMarshalInputFailureNeverLeaksErrorText(t *testing.T) {
+	t.Parallel()
+	const markerMarshalErr = "SECRET-MARSHALINPUT-MARKER-6af0e1"
+
+	classifier := newValidReviewClassifier(t, "marshal-fail-classifier", "rev-1", true)
+	classifier.marshalErr = fmt.Errorf("encode failed near payload %q", markerMarshalErr)
+	set, err := gate.NewPermissionClassifierSet(classifier)
+	if err != nil {
+		t.Fatalf("NewPermissionClassifierSet: %v", err)
+	}
+	policy, err := gate.DefaultPermissionReviewPolicy("gate-policy-rev-1")
+	if err != nil {
+		t.Fatalf("DefaultPermissionReviewPolicy: %v", err)
+	}
+	runner := &permissionReviewRunnerStub{result: hustle.Result{Output: json.RawMessage(`{}`)}}
+	responder := &permissionReviewResponderStub{}
+	adapter, _, _ := newAuditTestAdapter(t, runner, set, policy, responder)
+
+	logs := captureSlogDefault(t)
+	req := validReviewRequest(t, mustUUID(), mustUUID())
+	adapter.review(context.Background(), req)
+
+	if strings.Contains(logs.String(), markerMarshalErr) {
+		t.Fatalf("classifier MarshalInput error text leaked into logs: %s", logs.String())
 	}
 }
 

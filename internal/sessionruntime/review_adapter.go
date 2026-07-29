@@ -259,7 +259,7 @@ func (a *permissionReviewAdapter) review(ctx context.Context, req loopruntime.Pe
 		if basis, reason, ok := classifierApprovalBasis(classifiers, outcomes); ok {
 			responded, err := a.responder.respondFromClassifier(ctx, basis, reason)
 			if err != nil {
-				slog.Warn("sessionruntime: classifier-originated gate response failed",
+				slog.WarnContext(ctx, "sessionruntime: classifier-originated gate response failed",
 					"gate_id", req.GateID, "error", err)
 			}
 			applied = responded
@@ -363,7 +363,7 @@ func (a *permissionReviewAdapter) reviewOne(ctx context.Context, req loopruntime
 	}
 	subject, err := gate.NewPermissionReviewSubject(basis, req.Request, req.ReviewContext)
 	if err != nil {
-		slog.Warn("sessionruntime: permission review subject invalid; failing classifier closed",
+		slog.WarnContext(ctx, "sessionruntime: permission review subject invalid; failing classifier closed",
 			"classifier", classifier.Name(), "gate_id", req.GateID, "error", err)
 		// No valid subject can be constructed for this classifier's slot at
 		// all: leave the outcome's ClassifierRevision empty so it can never
@@ -382,8 +382,15 @@ func (a *permissionReviewAdapter) reviewOne(ctx context.Context, req loopruntime
 	}
 	input, err := classifier.MarshalInput(subject)
 	if err != nil {
-		slog.Warn("sessionruntime: permission review input marshal failed; failing classifier closed",
-			"classifier", classifier.Name(), "gate_id", req.GateID, "error", err)
+		// classifier.MarshalInput is entirely classifier-owned and returns an
+		// unconstrained error (unlike NewPermissionReviewSubject's bounded,
+		// content-free typed error above) — a classifier implementation could
+		// embed raw subject/command/context content in its error text. Log
+		// only the classifier identity, never err itself, matching the
+		// content-free discipline classifyReviewFailureStatus already applies
+		// to every other failure path in this file.
+		slog.WarnContext(ctx, "sessionruntime: permission review input marshal failed; failing classifier closed",
+			"classifier", classifier.Name(), "classifier_revision", classifier.Revision(), "gate_id", req.GateID)
 		a.publishReviewCompleted(ctx, req, classifier, gate.ReviewStatusFailed, gate.PermissionAssessment{}, false)
 		return gate.PermissionAssessmentOutcome{Subject: subject, Applicable: true, Status: gate.ReviewStatusFailed}
 	}
@@ -421,7 +428,7 @@ func (a *permissionReviewAdapter) reviewOne(ctx context.Context, req loopruntime
 			// signal available for classification.
 			runErr = err
 		}
-		slog.Warn("sessionruntime: permission review classifier run failed",
+		slog.WarnContext(ctx, "sessionruntime: permission review classifier run failed",
 			"classifier", classifier.Name(), "gate_id", req.GateID, "error", err)
 	}
 	if !allowed {

@@ -221,7 +221,7 @@ func (s *Session) StartPermissionReview(ctx context.Context, req loopruntime.Per
 	}
 	adapter, err := newPermissionReviewAdapter(s.hustleController, s.permissionClassifiers, s.permissionReviewPolicy, s)
 	if err != nil {
-		slog.Warn("sessionruntime: permission review adapter misconfigured; starting no review",
+		slog.WarnContext(ctx, "sessionruntime: permission review adapter misconfigured; starting no review",
 			"gate_id", req.GateID, "error", err)
 		return
 	}
