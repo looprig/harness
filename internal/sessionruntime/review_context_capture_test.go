@@ -201,6 +201,29 @@ func TestSubmitCarriesRealReviewContextIntoRegisteredClassifier(t *testing.T) {
 		t.Fatal("StartPermissionReview never reached the registered classifier through a real Submit()")
 	}
 
+	// Finding 1 (Phase 6 spec-compliance review): reviewOne's own
+	// publishReviewCompleted(ReviewStatusNotApplicable) call for this
+	// classifier already durably (checked) appends a PermissionReviewCompleted
+	// audit event by the time Applies has run and returned — before this
+	// addendum's fix, that append was ALWAYS rejected at the hub boundary
+	// (Internal-visibility events cannot travel Session.PublishEventChecked's
+	// public-only path), which faults the whole session on the next append.
+	// This test previously reported PASS despite that firing silently
+	// underneath it, because it never checked post-review session-fault
+	// state. Poll briefly: the audit publish races this goroutine's receive
+	// from classifier.captured (both happen inside the same reviewOne call,
+	// synchronously, right after Applies returns).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if err := s.FaultErr(); err != nil {
+			t.Fatalf("session faulted after a completed review: %v (permission-review audit publication must durably succeed, never fault the session)", err)
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
 	if subject.Context.ContextRevision == "" {
 		t.Fatal("captured ReviewContext.ContextRevision is empty; capture was never genuinely attempted")
 	}

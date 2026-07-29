@@ -332,15 +332,21 @@ func (s *Session) StartPermissionReview(ctx context.Context, req loopruntime.Per
 	// newPermissionReviewAdapter collaborator because its absence must never
 	// fail construction.
 	adapter.observer = s
-	// Wire durable (checked) audit publication (design §16, Task 17): s
-	// already implements PublishEventChecked, s.factory already mints every
-	// other durable event's Header, and sessionHustleFaultReporter is the
-	// SAME session fault path Task 14's ordinary Hustle faults use — reused
-	// here rather than duplicated. s.hustleLimits.AuditTimeout is guaranteed
-	// positive by the time s.hustleController is non-nil (hustleruntime.New
-	// rejects a non-positive AuditTimeout at construction), matching the
+	// Wire durable (checked) audit publication (design §16, Task 17, fixed by
+	// the Phase 6 spec-compliance review): s.hub implements
+	// PublishInternalEventChecked — the SAME private audit-record path
+	// s.newHustleController already wires as its Audit collaborator
+	// (hustle.go) for ordinary Hustle lifecycle events — not *Session's
+	// PublishEventChecked, which is the PUBLIC-only path and unconditionally
+	// rejects these Internal-visibility events (permissionReviewAuditPublisher's
+	// doc comment). s.factory already mints every other durable event's
+	// Header, and sessionHustleFaultReporter is the SAME session fault path
+	// Task 14's ordinary Hustle faults use — reused here rather than
+	// duplicated. s.hustleLimits.AuditTimeout is guaranteed positive by the
+	// time s.hustleController is non-nil (hustleruntime.New rejects a
+	// non-positive AuditTimeout at construction), matching the
 	// nil-hustleController guard above.
-	adapter.publisher = s
+	adapter.publisher = s.hub
 	adapter.stamper = s.factory
 	adapter.faults = sessionHustleFaultReporter{session: s}
 	adapter.auditTimeout = s.hustleLimits.AuditTimeout

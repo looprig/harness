@@ -302,6 +302,34 @@ func (h *Hub) PublishInternalEventChecked(ctx context.Context, ev event.Event) e
 	return nil
 }
 
+// isInternalAuditEventType reports whether ev is one of the recognized
+// private audit-only event types: the ONLY types PublishInternalEventChecked
+// may durably append (validateInternalPublication's allowlist), and
+// therefore also the ones validatePublicPublication's denylist must reject
+// on the public-only path. Both switches are derived from this single
+// function so the allow/deny pair cannot silently drift apart — exactly the
+// gap that let PermissionReviewStarted/Completed ship reachable only through
+// the public path (where they were always rejected as Internal-visibility)
+// and never added to the internal allowlist that would have actually
+// accepted them. It matches both value and pointer forms for every type,
+// mirroring the pre-existing Hustle lifecycle coverage — even though
+// review_adapter.go currently only ever publishes the value form, matching
+// both here keeps this helper (and validatePublicPublication's denylist,
+// which has always matched both forms) correct regardless of which form a
+// caller uses.
+func isInternalAuditEventType(ev event.Event) bool {
+	switch ev.(type) {
+	case event.HustleStarted, *event.HustleStarted,
+		event.HustleCompleted, *event.HustleCompleted,
+		event.HustleFailed, *event.HustleFailed,
+		event.PermissionReviewStarted, *event.PermissionReviewStarted,
+		event.PermissionReviewCompleted, *event.PermissionReviewCompleted:
+		return true
+	default:
+		return false
+	}
+}
+
 func validatePublicPublication(ev event.Event) error {
 	if nilEvent(ev) {
 		return &PublishBoundaryError{Reason: PublishBoundaryNilEvent}
@@ -312,10 +340,7 @@ func validatePublicPublication(ev event.Event) error {
 			EventType: fmt.Sprintf("%T", ev),
 		}
 	}
-	switch ev.(type) {
-	case event.HustleStarted, *event.HustleStarted,
-		event.HustleCompleted, *event.HustleCompleted,
-		event.HustleFailed, *event.HustleFailed:
+	if isInternalAuditEventType(ev) {
 		return &PublishBoundaryError{
 			Reason:    PublishBoundaryType,
 			EventType: fmt.Sprintf("%T", ev),
@@ -338,9 +363,7 @@ func (h *Hub) validateInternalPublication(ev event.Event) error {
 	if ev.EventHeader().SessionID != h.sessionID {
 		return &PublishBoundaryError{Reason: PublishBoundarySession, EventType: eventType}
 	}
-	switch ev.(type) {
-	case event.HustleStarted, event.HustleCompleted, event.HustleFailed:
-	default:
+	if !isInternalAuditEventType(ev) {
 		return &PublishBoundaryError{Reason: PublishBoundaryType, EventType: eventType}
 	}
 	if err := event.ValidateEvent(ev); err != nil {

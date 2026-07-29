@@ -49,11 +49,27 @@ type permissionReviewResponder interface {
 
 // permissionReviewAuditPublisher is the checked durable-append seam
 // PermissionReviewStarted/PermissionReviewCompleted flow through (design
-// §16). It is satisfied directly by *Session (PublishEventChecked) — the
-// same transactional publication path public gate transitions already use
-// (gates.go's liveGateAppender).
+// §16). It is satisfied directly by *hub.Hub (PublishInternalEventChecked) —
+// the SAME private audit-record path internal/hustleruntime/audit.go already
+// uses for HustleStarted/Completed/Failed (its Audit collaborator is wired
+// from s.hub directly, not through *Session; StartPermissionReview mirrors
+// that exact wiring for adapter.publisher).
+//
+// This is deliberately NOT PublishEventChecked (the PUBLIC-only path
+// Hub.validatePublicPublication enforces): PermissionReviewStarted/Completed
+// are BOTH Internal-visibility, so publishing them through the public path
+// unconditionally fails at the boundary — which is exactly the Phase 6
+// spec-compliance bug this comment now documents the fix for. Internal
+// publication is safe here for the same reason it is safe for Hustle
+// lifecycle events (Hub.PublishInternalEventChecked's own doc comment): it
+// deliberately bypasses quiescence mutation and subscriber delivery, relying
+// on the event's own activity/blocking state being owned elsewhere. A
+// permission review always runs inside gate evaluation / tool execution,
+// which the session already tracks as active through the ordinary gate and
+// loop lifecycle — there is no quiescence hole, and nothing needs to
+// subscribe to a private audit-only event.
 type permissionReviewAuditPublisher interface {
-	PublishEventChecked(ctx context.Context, ev event.Event) error
+	PublishInternalEventChecked(ctx context.Context, ev event.Event) error
 }
 
 // permissionReviewAuditStamper mints the EventID/CreatedAt for a review
@@ -609,7 +625,7 @@ func (a *permissionReviewAdapter) publish(ctx context.Context, gateID gate.ID, e
 		publishCtx, cancel = context.WithTimeout(publishCtx, a.auditTimeout)
 		defer cancel()
 	}
-	if err := a.publisher.PublishEventChecked(publishCtx, ev); err != nil {
+	if err := a.publisher.PublishInternalEventChecked(publishCtx, ev); err != nil {
 		a.reportAuditFault(ctx, gateID, err)
 	}
 }

@@ -50,12 +50,20 @@ func captureSlogDefault(t *testing.T) *bytes.Buffer {
 // not_applicable) never touches that fault path at all.
 
 // reviewAuditPublisherStub is a permissionReviewAuditPublisher fake that
-// validates and marshals every event exactly as hub.PublishEventChecked does
-// (event.ValidateEvent then event.MarshalEvent), so a test can inspect the
-// REAL wire bytes a durable append would have produced — not just Go struct
-// fields. failWhen, when set, makes matching publishes fail with failErr
-// instead of recording the event, so a test can simulate a selective durable
-// append failure.
+// validates and marshals every event exactly as hub.PublishInternalEventChecked
+// does (event.ValidateEvent then event.MarshalEvent), so a test can inspect
+// the REAL wire bytes a durable append would have produced — not just Go
+// struct fields. failWhen, when set, makes matching publishes fail with
+// failErr instead of recording the event, so a test can simulate a selective
+// durable append failure.
+//
+// This stub deliberately does NOT exercise Hub.validateInternalPublication's
+// own boundary rules (visibility/class/session/type allowlist) — it is a
+// content/behavior fake for review_adapter's OWN logic, not a substitute for
+// the real-Hub boundary coverage in pkg/hub/permission_review_publish_test.go
+// and TestSubmitCarriesRealReviewContextIntoRegisteredClassifier's FaultErr
+// assertion: that is precisely the gap that let the
+// PermissionReviewStarted/Completed allowlist omission ship undetected.
 type reviewAuditPublisherStub struct {
 	mu        sync.Mutex
 	events    []event.Event
@@ -64,7 +72,7 @@ type reviewAuditPublisherStub struct {
 	failErr   error
 }
 
-func (s *reviewAuditPublisherStub) PublishEventChecked(_ context.Context, ev event.Event) error {
+func (s *reviewAuditPublisherStub) PublishInternalEventChecked(_ context.Context, ev event.Event) error {
 	if err := event.ValidateEvent(ev); err != nil {
 		return err
 	}
