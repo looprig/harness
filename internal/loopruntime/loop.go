@@ -265,13 +265,20 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 // mode-selective spawn, so a child begins in the requested mode without a synthetic
 // LoopModeChanged. An unknown mode name fails with the same typed BindError Bind uses.
 func NewInMode(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance, events eventPublisher, bound loop.BoundDefinition, initialMode loop.ModeName) (*Loop, error) {
-	return NewInModeWithCompactor(loopCtx, sessionID, loopID, parent, events, bound, initialMode, nil)
+	return NewInModeWithCompactor(loopCtx, sessionID, loopID, parent, events, bound, initialMode, nil, nil)
 }
 
 // NewInModeWithCompactor is the focused native composition seam for a loop whose
 // definition installs compaction. The caller supplies only the summary capability;
 // loopruntime derives the executor from the bound loop's own counter, capabilities,
 // and policy. Generic hustle selection and coordination remain private.
+//
+// reviewContext mirrors compactor's shape: internal/sessionruntime is the only
+// caller that ever supplies a non-nil value (whenever the session has
+// permission classifiers registered — see Session.loopReviewContext), so it
+// travels as a parameter here rather than through the bound loop.Definition,
+// exactly like compactor does. nil leaves the resulting loop's turns with
+// reviewContext == nil, identical to every caller before this addendum.
 func NewInModeWithCompactor(
 	loopCtx context.Context,
 	sessionID, loopID uuid.UUID,
@@ -280,6 +287,7 @@ func NewInModeWithCompactor(
 	bound loop.BoundDefinition,
 	initialMode loop.ModeName,
 	compactor Compactor,
+	reviewContext *ReviewContext,
 ) (*Loop, error) {
 	cfg, err := configFromBound(bound, initialMode)
 	if err != nil {
@@ -288,6 +296,7 @@ func NewInModeWithCompactor(
 	if err := installCompactionExecutor(loopCtx, &cfg, compactor); err != nil {
 		return nil, err
 	}
+	cfg.reviewContext = reviewContext.toInternal()
 	resolved := initialMode
 	if resolved == "" {
 		resolved = bound.InitialMode()
@@ -1251,6 +1260,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			emit:                    publish,
 			afterDrain:              config.afterDrain,
 			afterContextReplacement: config.afterContextReplacement,
+			reviewContext:           config.reviewContext,
 		}
 	}
 

@@ -1301,7 +1301,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		var compactor loopruntime.Compactor
 		compactor, err = s.compactorFor(bound, loopID)
 		if err == nil {
-			b, err = loopruntime.NewInModeWithCompactor(loopCtx, s.sessionID, loopID, parent, eventTarget, bound, startedMode, compactor)
+			b, err = loopruntime.NewInModeWithCompactor(loopCtx, s.sessionID, loopID, parent, eventTarget, bound, startedMode, compactor, s.loopReviewContext())
 		}
 	default:
 		if s.foreignBuild == nil {

@@ -279,13 +279,13 @@ func TestFocusedCompactionConstructorsRejectTypedNilCompactor(t *testing.T) {
 		{
 			name: "new in mode",
 			call: func(ctx context.Context, sessionID, loopID uuid.UUID, parent Provenance, publisher eventPublisher, bound loop.BoundDefinition, compactor Compactor) (*Loop, error) {
-				return NewInModeWithCompactor(ctx, sessionID, loopID, parent, publisher, bound, "", compactor)
+				return NewInModeWithCompactor(ctx, sessionID, loopID, parent, publisher, bound, "", compactor, nil)
 			},
 		},
 		{
 			name: "new restored",
 			call: func(ctx context.Context, sessionID, loopID uuid.UUID, parent Provenance, publisher eventPublisher, bound loop.BoundDefinition, compactor Compactor) (*Loop, error) {
-				return NewRestoredWithCompactor(ctx, sessionID, loopID, parent, publisher, bound, RestoredState{}, compactor)
+				return NewRestoredWithCompactor(ctx, sessionID, loopID, parent, publisher, bound, RestoredState{}, compactor, nil)
 			},
 		},
 	}

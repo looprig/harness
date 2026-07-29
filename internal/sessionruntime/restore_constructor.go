@@ -56,7 +56,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 		compactor, err = s.compactorFor(bound, started.LoopID)
 		if err == nil {
 			backend, err = loopruntime.NewRestoredWithCompactor(
-				loopCtx, s.sessionID, started.LoopID, parent, s, bound, restoredStateFrom(folded, ri), compactor,
+				loopCtx, s.sessionID, started.LoopID, parent, s, bound, restoredStateFrom(folded, ri), compactor, s.loopReviewContext(),
 			)
 		}
 	default:
@@ -843,7 +843,7 @@ func buildRestoredSession(
 		compactor, err = s.compactorFor(cfg, rootLoopID)
 		if err == nil {
 			l, err = loopruntime.NewRestoredWithCompactor(
-				loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg, restoredStateFrom(folded, ri), compactor,
+				loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg, restoredStateFrom(folded, ri), compactor, s.loopReviewContext(),
 			)
 		}
 	default:

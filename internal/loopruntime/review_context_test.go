@@ -326,6 +326,122 @@ func TestConfiguredReviewCaptureFailureStopsBeforeGateAndTool(t *testing.T) {
 	}
 }
 
+// TestRunTurnSkipsReviewCaptureWhenBatchNeverOpensAPermissionGate proves the
+// precise half of the bounds-guard fix: a batch whose only tool call resolves
+// AccessAllow (never opens an interactive gate) must succeed even though its
+// conversation is far over the hard preflight bound
+// (gate.MaxReviewContextEntryInputBytes) that would fail capture if it were
+// EVER attempted. Auto-enabling capture (registering a classifier) must never
+// turn a previously-succeeding long-conversation turn into a failure on a
+// batch with no gated/permission tool at all.
+func TestRunTurnSkipsReviewCaptureWhenBatchNeverOpensAPermissionGate(t *testing.T) {
+	t.Parallel()
+
+	runTool := &fakeRunTool{name: "T", output: "ok"}
+	runTool.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status", false), nil, nil
+	}
+	tools := resolveToolSetCaps(ToolSet{
+		Access:   interactiveEvaluator(t, gate.AccessAllow, &recordingRuleWriter{}, &recordingIssuer{}),
+		Registry: []tool.InvokableTool{runTool},
+	})
+	client := &scriptedLLM{scripts: [][]content.Chunk{
+		{toolUseChunk(0, "active", "T", `{}`)},
+		{textChunk("done")},
+	}}
+	gateReg := make(chan gateRegistration, 1)
+
+	// Deliberately over the hard per-entry preflight bound: if capture were
+	// ever attempted against this base, it would fail closed.
+	oversizedBase := content.AgenticMessages{
+		reviewUserMessage(strings.Repeat("x", gate.MaxReviewContextEntryInputBytes+1)),
+	}
+	cfg, state, _ := newTurnFixture(
+		[]content.Block{&content.TextBlock{Text: "current request"}},
+		oversizedBase, tools, client, gateReg,
+	)
+	cfg.reviewContext = &reviewContextConfiguration{
+		Metadata: reviewContextMetadata{
+			WorkspaceRoot:      "/workspace",
+			WorkingDirectory:   "/workspace",
+			SecurityCeiling:    "workspace-write; unmet-requirements=true",
+			GatePolicyRevision: "gate-policy-v1",
+		},
+		Policy: testReviewContextPolicy(),
+	}
+
+	terminal := runTurn(context.Background(), cfg, state)
+	if _, ok := terminal.(event.TurnDone); !ok {
+		t.Fatalf("runTurn() terminal = %#v, want TurnDone (a batch with no gated tool call must never attempt review capture)", terminal)
+	}
+	if got := atomic.LoadInt32(&runTool.totalRuns); got != 1 {
+		t.Fatalf("tool runs = %d, want 1 (the non-gated call must execute normally)", got)
+	}
+	select {
+	case <-gateReg:
+		t.Fatal("a permission gate opened even though the access evaluator never gates this call")
+	default:
+	}
+}
+
+// TestRunTurnCapturesAndFailsClosedWhenGatedBatchExceedsHardPreflightBounds is
+// the companion to the test above: a batch whose tool call IS gated (opens a
+// real interactive approval) over the exact same over-bound conversation must
+// attempt capture, fail closed on the hard preflight bound, and fail the
+// whole turn — proving the guard added above is precise ("skip only when no
+// gate opens"), not just "always skip".
+func TestRunTurnCapturesAndFailsClosedWhenGatedBatchExceedsHardPreflightBounds(t *testing.T) {
+	t.Parallel()
+
+	runTool := &fakeRunTool{name: "T", output: "must not run"}
+	runTool.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status", false), nil, nil
+	}
+	tools := resolveToolSetCaps(ToolSet{
+		Access:   interactiveEvaluator(t, gate.AccessGated, &recordingRuleWriter{}, &recordingIssuer{}),
+		Registry: []tool.InvokableTool{runTool},
+	})
+	client := &scriptedLLM{scripts: [][]content.Chunk{{
+		toolUseChunk(0, "active", "T", `{}`),
+	}}}
+	gateReg := make(chan gateRegistration, 1)
+
+	oversizedBase := content.AgenticMessages{
+		reviewUserMessage(strings.Repeat("x", gate.MaxReviewContextEntryInputBytes+1)),
+	}
+	cfg, state, _ := newTurnFixture(
+		[]content.Block{&content.TextBlock{Text: "current request"}},
+		oversizedBase, tools, client, gateReg,
+	)
+	cfg.reviewContext = &reviewContextConfiguration{
+		Metadata: reviewContextMetadata{
+			WorkspaceRoot:      "/workspace",
+			WorkingDirectory:   "/workspace",
+			SecurityCeiling:    "workspace-write; unmet-requirements=true",
+			GatePolicyRevision: "gate-policy-v1",
+		},
+		Policy: testReviewContextPolicy(),
+	}
+
+	terminal := runTurn(context.Background(), cfg, state)
+	failed, ok := terminal.(event.TurnFailed)
+	if !ok {
+		t.Fatalf("runTurn() terminal = %#v, want TurnFailed (a gated batch must attempt capture and fail closed on the hard input bound)", terminal)
+	}
+	var captureErr *reviewContextCaptureError
+	if !errors.As(failed.Err, &captureErr) || captureErr.Field != "input_bounds" {
+		t.Fatalf("TurnFailed.Err = %v, want *reviewContextCaptureError{Field: \"input_bounds\"}", failed.Err)
+	}
+	if got := atomic.LoadInt32(&runTool.totalRuns); got != 0 {
+		t.Fatalf("tool runs = %d, want 0 (tool must not execute after review capture failed closed)", got)
+	}
+	select {
+	case <-gateReg:
+		t.Fatal("permission gate opened after review capture failed closed")
+	default:
+	}
+}
+
 func reviewUserMessage(text string) *content.UserMessage {
 	return &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: text}}}}
 }

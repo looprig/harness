@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"sync"
+	"sync/atomic"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/gate"
@@ -68,6 +70,183 @@ func permissionReviewContextFromContext(ctx context.Context) (gate.ReviewContext
 		return gate.ReviewContext{}, false
 	}
 	return review.Clone(), true
+}
+
+// ReviewContext is the Harness-internal (Go-exported, but still inside the
+// internal/ boundary — unreachable from outside this module) input that turns
+// on live permission-review context capture for every turn a constructed Loop
+// runs. internal/sessionruntime is the only caller: it builds one whenever a
+// session has permission classifiers registered at all (see
+// Session.loopReviewContext), auto-deriving what Harness already knows and
+// sourcing the rest from the session's already-registered review policy. A
+// nil *ReviewContext (the default, threaded by every pre-existing caller)
+// leaves capture off, byte-identical to every Loop built before this
+// addendum. Ordinary tools never see this type: it flows only from
+// sessionruntime, through NewInModeWithCompactor/NewRestoredWithCompactor,
+// into the loop's private runtimeConfig/turnConfig.reviewContext.
+type ReviewContext struct {
+	WorkspaceRoot      string
+	WorkingDirectory   string
+	RetryReason        string
+	SecurityCeiling    string
+	GatePolicyRevision string
+	Policy             gate.ReviewContextPolicy
+}
+
+// toInternal converts the exported, session-facing shape into the private
+// turn-level configuration turnConfig.reviewContext carries. A nil receiver
+// (no review context supplied) converts to nil, preserving the exact
+// pre-addendum "capture off" default.
+func (r *ReviewContext) toInternal() *reviewContextConfiguration {
+	if r == nil {
+		return nil
+	}
+	return &reviewContextConfiguration{
+		Metadata: reviewContextMetadata{
+			WorkspaceRoot:      r.WorkspaceRoot,
+			WorkingDirectory:   r.WorkingDirectory,
+			RetryReason:        r.RetryReason,
+			SecurityCeiling:    r.SecurityCeiling,
+			GatePolicyRevision: r.GatePolicyRevision,
+		},
+		Policy: r.Policy,
+	}
+}
+
+// reviewContextCaptureProvider defers one tool batch's permission-review
+// context capture until a permission gate is genuinely about to open.
+// approvalRequesterFor (gate.go), via reviewContextForApproval, is the
+// earliest point that is knowable: the loop's public tool-access contract
+// (pkg/loop.AccessGate) exposes only Authorize, which decides — internally,
+// dynamically, per call — whether a gate opens at all; there is no cheaper
+// preview available at the batch boundary without duplicating access
+// evaluation. Memoized via sync.Once (+ an atomic "was it ever attempted"
+// flag) so every gate opened within the same batch observes the identical
+// captured context (or the identical failure), and a batch whose calls never
+// reach an open gate NEVER attempts capture at all — so it can never fail the
+// turn on the hard preflight bounds regardless of conversation size.
+type reviewContextCaptureProvider struct {
+	once      sync.Once
+	attempted atomic.Bool
+
+	coordinates   identity.Coordinates
+	base          content.AgenticMessages
+	msgs          content.AgenticMessages
+	derivedPrefix int
+	active        *content.AIMessage
+	runtimeTail   *content.UserMessage
+	metadata      reviewContextMetadata
+	policy        gate.ReviewContextPolicy
+
+	review gate.ReviewContext
+	err    error
+}
+
+// newReviewContextCaptureProvider builds a provider for one tool batch. The
+// raw pre-slice pieces (msgs + derivedPrefix) are carried rather than an
+// already-sliced reviewContextCapture so the derivedPrefix bounds check ALSO
+// stays deferred — a slice with an invalid prefix must never panic, but
+// checking it eagerly (before knowing whether a gate opens) would reintroduce
+// exactly the unconditional-capture hazard this addendum closes.
+func newReviewContextCaptureProvider(
+	coordinates identity.Coordinates,
+	base, msgs content.AgenticMessages,
+	derivedPrefix int,
+	active *content.AIMessage,
+	runtimeTail *content.UserMessage,
+	metadata reviewContextMetadata,
+	policy gate.ReviewContextPolicy,
+) *reviewContextCaptureProvider {
+	return &reviewContextCaptureProvider{
+		coordinates: coordinates, base: base, msgs: msgs, derivedPrefix: derivedPrefix,
+		active: active, runtimeTail: runtimeTail, metadata: metadata, policy: policy,
+	}
+}
+
+// capture runs capturePermissionReviewContext at most once for this batch —
+// on the FIRST call, from whichever gate opens first — and returns an
+// independent clone of the memoized result on every call, so two gates opened
+// in the same batch can never alias or mutate each other's entries. A nil
+// receiver (no review context configured for this turn at all) reports the
+// pre-existing "nothing to review" zero value with no error.
+func (p *reviewContextCaptureProvider) capture() (gate.ReviewContext, error) {
+	if p == nil {
+		return gate.ReviewContext{}, nil
+	}
+	p.once.Do(func() {
+		p.attempted.Store(true)
+		if p.derivedPrefix < 0 || p.derivedPrefix > len(p.msgs) {
+			p.err = &reviewContextCaptureError{Field: "derived_context"}
+			return
+		}
+		p.review, p.err = capturePermissionReviewContext(reviewContextCapture{
+			Coordinates: p.coordinates,
+			Base:        p.base,
+			Retained:    p.msgs[:p.derivedPrefix],
+			Staged:      p.msgs[p.derivedPrefix:],
+			Active:      p.active,
+			RuntimeTail: p.runtimeTail,
+			Metadata:    p.metadata,
+			Policy:      p.policy,
+		})
+	})
+	if p.err != nil {
+		return gate.ReviewContext{}, p.err
+	}
+	return p.review.Clone(), nil
+}
+
+// failed reports whether this batch's capture was actually attempted (a gate
+// genuinely tried to open) and, if so, the error it failed with (nil on
+// success). It never triggers capture itself — a nil receiver, or a provider
+// whose once has never fired, both report attempted=false — which is the
+// entire point of deferring capture in the first place: runTurn can check
+// this AFTER RunBatch returns without ever paying for a capture that no call
+// in the batch needed.
+func (p *reviewContextCaptureProvider) failed() (err error, attempted bool) {
+	if p == nil || !p.attempted.Load() {
+		return nil, false
+	}
+	return p.err, true
+}
+
+// permissionReviewCaptureKey is the ctx key for the lazy, batch-scoped
+// capture provider — distinct from permissionReviewContextKey (which carries
+// an ALREADY-resolved value for the narrower test seam above). Installed once
+// per batch by runTurn; read by reviewContextForApproval the moment a
+// permission gate is genuinely about to open.
+type permissionReviewCaptureKey struct{}
+
+// withPermissionReviewCapture installs this batch's lazy capture provider on
+// ctx. A nil provider (review context not configured for this turn) is a
+// no-op: the batch ctx is returned unchanged, exactly matching the
+// pre-existing "no provider present" ctx shape.
+func withPermissionReviewCapture(ctx context.Context, provider *reviewContextCaptureProvider) context.Context {
+	if provider == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, permissionReviewCaptureKey{}, provider)
+}
+
+func permissionReviewCaptureFromContext(ctx context.Context) (*reviewContextCaptureProvider, bool) {
+	provider, ok := ctx.Value(permissionReviewCaptureKey{}).(*reviewContextCaptureProvider)
+	return provider, ok
+}
+
+// reviewContextForApproval triggers this batch's lazy review-context capture
+// (see reviewContextCaptureProvider) at the one point a permission gate is
+// genuinely about to open — approvalRequesterFor (gate.go) calls this before
+// ever registering the gate. A zero result with a nil error and no provider
+// present means review was never configured for this turn: callers must
+// treat that exactly as before ("nothing to review"). A non-nil error means
+// review WAS configured and its one-per-batch capture attempt failed closed:
+// the caller must refuse to open the gate.
+func reviewContextForApproval(ctx context.Context) (gate.ReviewContext, error) {
+	provider, ok := permissionReviewCaptureFromContext(ctx)
+	if !ok {
+		return gate.ReviewContext{}, nil
+	}
+	return provider.capture()
 }
 
 func capturePermissionReviewContext(input reviewContextCapture) (gate.ReviewContext, error) {

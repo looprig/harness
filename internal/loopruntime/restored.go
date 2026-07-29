@@ -63,12 +63,13 @@ type RestoredState struct {
 // RestoredState (empty Msgs, zero TurnIndex) yields a loop indistinguishable from a
 // freshly New'd one.
 func NewRestored(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance, events eventPublisher, bound loop.BoundDefinition, seed RestoredState) (*Loop, error) {
-	return NewRestoredWithCompactor(loopCtx, sessionID, loopID, parent, events, bound, seed, nil)
+	return NewRestoredWithCompactor(loopCtx, sessionID, loopID, parent, events, bound, seed, nil, nil)
 }
 
 // NewRestoredWithCompactor is the restored counterpart to
 // NewInModeWithCompactor. It installs the focused executor while preserving the
-// restore-folded mode and inference runtime.
+// restore-folded mode and inference runtime. reviewContext mirrors
+// NewInModeWithCompactor's parameter of the same name — see its doc comment.
 func NewRestoredWithCompactor(
 	loopCtx context.Context,
 	sessionID, loopID uuid.UUID,
@@ -77,6 +78,7 @@ func NewRestoredWithCompactor(
 	bound loop.BoundDefinition,
 	seed RestoredState,
 	compactor Compactor,
+	reviewContext *ReviewContext,
 ) (*Loop, error) {
 	// Resolve config at the RESTORED mode (last LoopModeChanged) rather than the definition's
 	// initial mode, so a loop that changed mode before teardown resumes under it. When the
@@ -105,6 +107,7 @@ func NewRestoredWithCompactor(
 	if err := installCompactionExecutor(loopCtx, &cfg, compactor); err != nil {
 		return nil, err
 	}
+	cfg.reviewContext = reviewContext.toInternal()
 	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, bound, modeName, &seed)
 }
 

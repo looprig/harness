@@ -182,4 +182,17 @@ type runtimeConfig struct {
 	// actor after selecting a safe boundary but before priority arbitration. It lets
 	// tests make both bounded command lanes ready without timing sleeps.
 	beforeCompactionBoundary func(compactionBoundaryKind)
+
+	// reviewContext, when non-nil, turns on live-only permission-review
+	// context capture (internal/loopruntime/review_context.go) for every turn
+	// this loop runs: buildTurnConfig copies it onto each turnConfig.reviewContext
+	// unchanged. It is NOT resolved from the bound loop.Definition — no
+	// public pkg/loop/pkg/rig option sets it — because it carries no
+	// consumer-owned policy of its own (see ReviewContext's doc comment):
+	// internal/sessionruntime is the sole caller, threading it in via
+	// NewInModeWithCompactor/NewRestoredWithCompactor's reviewContext
+	// parameter whenever the session has permission classifiers registered.
+	// nil (the default for every pre-existing caller) leaves every turn's
+	// reviewContext nil, byte-identical to before this field existed.
+	reviewContext *reviewContextConfiguration
 }

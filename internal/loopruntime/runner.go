@@ -3,6 +3,7 @@ package loopruntime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -157,8 +158,20 @@ func RunBatch(
 			if ctx.Err() != nil {
 				return collectResults(rs)
 			}
-			// A non-ctx error is fail-closed: resolveAccess has already marked
-			// r.failed (denied), so the call is never executed.
+			var captureErr *reviewContextCaptureError
+			if errors.As(err, &captureErr) {
+				// This batch's review-context capture (see review_context.go)
+				// was attempted and failed closed while opening a permission
+				// gate. Abort the WHOLE batch here, before the emit-Started /
+				// execute phases below: any call already resolved Approved
+				// earlier in this loop (e.g. a non-gated call ahead of the
+				// failing one) must never actually run once the turn is about
+				// to fail — a per-call denial alone would let it execute
+				// despite the turn as a whole failing closed.
+				return collectResults(rs)
+			}
+			// Any other non-ctx error is fail-closed: resolveAccess has
+			// already marked r.failed (denied), so the call is never executed.
 		}
 	}
 
@@ -407,6 +420,18 @@ func approvalRequesterFor(
 	emit func(event.Event),
 ) loop.ApprovalRequestFunc {
 	return func(ctx context.Context, prompt gatedomain.ApprovalPrompt) (gatedomain.ApprovalAction, error) {
+		// Triggered BEFORE r.prompted is set: this is the earliest point a
+		// permission gate is genuinely about to open, so it is also the
+		// earliest (and only) point this batch's lazy review-context capture
+		// (see review_context.go) is attempted. A capture failure here must
+		// refuse the gate exactly like any other fail-closed access error — and
+		// because r.prompted stays false, resolveAccess's fail path still emits
+		// a PermissionDecided audit for this call instead of silently dropping
+		// it.
+		reviewContext, err := reviewContextForApproval(ctx)
+		if err != nil {
+			return "", err
+		}
 		r.prompted = true
 		displayed := displayedRequest(prompt)
 
@@ -417,7 +442,6 @@ func approvalRequesterFor(
 		ack := make(chan gateInstallAck, 1)
 		g := stampGateSubjectProvenance(ctx, permissionGate(r.callID, displayed))
 		payload := gatedomain.PermissionPayload{Request: displayed}
-		reviewContext, _ := permissionReviewContextFromContext(ctx)
 
 		select {
 		case gateReg <- gateRegistration{

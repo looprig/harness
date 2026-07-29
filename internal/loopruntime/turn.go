@@ -407,36 +407,41 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			TurnID: turnIDs.turnID,
 			StepID: st.id,
 		})
+		// reviewCapture is a LAZY, memoized capture provider installed on the
+		// batch ctx: it does NOT attempt review-context capture here. Capture
+		// is deferred until (and only attempted if) a permission gate is
+		// genuinely about to open somewhere inside RunBatch
+		// (reviewContextForApproval, called from approvalRequesterFor) — a
+		// batch whose calls never open a gate never pays the capture cost or
+		// its fail-closed risk, regardless of conversation size.
+		var reviewCapture *reviewContextCaptureProvider
 		if cfg.reviewContext != nil {
-			derivedPrefix := ts.derivedUserPrefix
-			if derivedPrefix < 0 || derivedPrefix > len(ts.msgs) {
-				return event.TurnFailed{TurnIndex: ts.index, Err: &reviewContextCaptureError{Field: "derived_context"}}
-			}
-			review, reviewErr := capturePermissionReviewContext(reviewContextCapture{
-				Coordinates: identity.Coordinates{
+			reviewCapture = newReviewContextCaptureProvider(
+				identity.Coordinates{
 					SessionID: turnIDs.sessionID,
 					LoopID:    turnIDs.loopID,
 					TurnID:    turnIDs.turnID,
 					StepID:    st.id,
 				},
-				Base:        cfg.base,
-				Retained:    ts.msgs[:derivedPrefix],
-				Staged:      ts.msgs[derivedPrefix:],
-				Active:      aiMsg,
-				RuntimeTail: runtimeTail,
-				Metadata:    cfg.reviewContext.Metadata,
-				Policy:      cfg.reviewContext.Policy,
-			})
-			if reviewErr != nil {
-				return event.TurnFailed{TurnIndex: ts.index, Err: reviewErr}
-			}
-			batchCtx = withPermissionReviewContext(batchCtx, review)
+				cfg.base, ts.msgs, ts.derivedUserPrefix, aiMsg, runtimeTail,
+				cfg.reviewContext.Metadata, cfg.reviewContext.Policy,
+			)
+			batchCtx = withPermissionReviewCapture(batchCtx, reviewCapture)
 		}
 		results := RunBatch(batchCtx, toolUses, cfg.tools, cfg.gateReg, cfg.idGen, stepEmit)
 		if ctx.Err() != nil {
 			// A cancelled batch's results are discarded; the step never completes, so
 			// it is not appended/committed and emits no StepDone.
 			return event.TurnInterrupted{TurnIndex: ts.index}
+		}
+		// reviewCapture.failed() never triggers capture itself — it only
+		// reports whether THIS batch's RunBatch call actually attempted it (a
+		// gate genuinely tried to open) and, if so, whether it failed. Only an
+		// attempted-and-failed capture fails the whole turn; a batch that
+		// never opened a gate reports attempted=false here and falls through
+		// exactly as if review context were never configured.
+		if reviewErr, attempted := reviewCapture.failed(); attempted && reviewErr != nil {
+			return event.TurnFailed{TurnIndex: ts.index, Err: reviewErr}
 		}
 		for _, r := range results {
 			trm := toolResultMessage(r)

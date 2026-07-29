@@ -200,6 +200,90 @@ func withPermissionReviewEvidence(access gate.EvidenceAccessEvaluator, containme
 	}
 }
 
+// defaultReviewContextSecurityCeiling is the fixed, non-widening sentinel
+// loopReviewContext stamps into every live ReviewContext's SecurityCeiling
+// field. Harness has no first-class concept of "effective access posture as a
+// string" today — no code anywhere in this module computes one, and CodeRig's
+// Task 24 work binds its OWN containment-verifier ceiling to its OWN
+// AccessProfile string ad hoc, at the consumer layer, confirming Harness
+// itself has nothing to source from honestly. It never claims a wider
+// posture than actually configured: a classifier that treats an unrecognized
+// ceiling as maximally conservative is correct. This is a documented
+// simplification for the Phase 6/7 boundary review to replace with a real
+// value, not an invented security classification scheme.
+const defaultReviewContextSecurityCeiling = "harness-session; ceiling-not-classified"
+
+// defaultReviewContextPolicy is the fixed default gate.ReviewContextPolicy
+// loopReviewContext installs. No consumer-facing surface carries a
+// context-snapshot budget today (this addendum deliberately adds no new
+// public option — see loopReviewContext's doc comment), so these bounds are a
+// conservative, documented default: every field sits well inside its
+// corresponding hard cap (pkg/gate.MaxReviewContextInputEntries /
+// MaxReviewContextInputBytes / MaxReviewContextEntryInputBytes) with margin
+// under the 1 MiB permission-review subject-wire ceiling
+// (gate.MaxPermissionReviewSubjectWireBytes).
+var defaultReviewContextPolicy = gate.ReviewContextPolicy{
+	Revision:             "harness-default-review-context-policy/v1",
+	MaxBytes:             512 << 10,
+	MaxEstimatedTokens:   128 << 10,
+	MaxEntries:           512,
+	MaxUserEntryBytes:    64 << 10,
+	MaxAgentEntryBytes:   64 << 10,
+	MaxToolEntryBytes:    64 << 10,
+	MaxBlockBytes:        64 << 10,
+	MaxActiveActionBytes: 64 << 10,
+}
+
+// loopReviewContext builds the auto-derived, Harness-internal review-context
+// capture configuration every Loop this session constructs receives, once
+// registered permission classifiers make automatic review reachable at all
+// (design §14.1, this addendum). It returns nil (capture stays OFF, exactly
+// as before this addendum) whenever no classifier is configured — a session
+// that never opts into permission review keeps precisely the pre-existing
+// behavior regardless of anything else on the session.
+//
+// A non-empty PermissionClassifierSet forces this ON with NO further consumer
+// input: "classifiers registered but capture off" is not a legitimate
+// selective-disable state — it is exactly the bug this addendum closes (a
+// configured reviewer that silently never reviews). If a consumer ever wants
+// selective review-routing, that belongs in the review POLICY layer
+// (gate.ReviewContextPolicy / gate.PermissionReviewPolicy, both already
+// consumer-configurable), not a capture on/off switch — so this addendum
+// adds NO new public rig/consumer-facing option.
+//
+//   - WorkspaceRoot/WorkingDirectory are auto-derived from the session's own
+//     existing workspace-root tracking (s.wsRoot), the SAME source
+//     hustleEvidenceRuntimeConfig already uses for ReadWorkspace.Root — no
+//     new consumer input. Every classifier's hustle.Definition requires
+//     evidence tools (gate.NewPermissionClassifierSet's own descriptor
+//     check), so newHustleController's pre-existing fail-closed check
+//     already refuses session construction when classifiers are configured
+//     without a populated ReadWorkspace — meaning s.wsRoot is guaranteed
+//     non-empty here whenever classifiers are configured and construction
+//     succeeded; the emptiness guard below is defense in depth, not
+//     load-bearing. Harness tracks no per-loop working directory narrower
+//     than the workspace root, so WorkingDirectory is set to the same value
+//     (a documented simplification, not a fabricated distinction).
+//   - GatePolicyRevision is s.permissionReviewPolicy.Revision — the SAME
+//     value the first addendum already wires into the session's fingerprint
+//     and review policy, not a new source.
+//   - SecurityCeiling and Policy have NO existing Harness-level source (see
+//     defaultReviewContextSecurityCeiling / defaultReviewContextPolicy above
+//     for why each is a documented, bounded, honest default rather than an
+//     invented classification scheme).
+func (s *Session) loopReviewContext() *loopruntime.ReviewContext {
+	if len(s.permissionClassifiers.Classifiers()) == 0 || s.wsRoot == "" {
+		return nil
+	}
+	return &loopruntime.ReviewContext{
+		WorkspaceRoot:      s.wsRoot,
+		WorkingDirectory:   s.wsRoot,
+		SecurityCeiling:    defaultReviewContextSecurityCeiling,
+		GatePolicyRevision: s.permissionReviewPolicy.Revision,
+		Policy:             defaultReviewContextPolicy,
+	}
+}
+
 // StartPermissionReview implements the loop actor's private permissionReviewStarter
 // seam (internal/loopruntime/gate.go): the ONLY thing the actor calls, inline
 // and fire-and-forget, after a gatePermission registration activates and the
