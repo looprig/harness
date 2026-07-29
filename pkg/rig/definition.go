@@ -12,18 +12,19 @@ import (
 )
 
 type definitionState struct {
-	loops                          []loop.Definition
-	hustles                        []hustle.Definition
-	hustleLimits                   HustleLimits
-	primers                        []string
-	activePrimer                   string
-	store                          *sessionstore.Store
-	storeSet                       bool
-	seen                           map[singletonKey]bool
-	lifecycleOptions               []sessionruntime.LifecycleOption
-	fingerprintFields              ConfigFingerprintFields
-	permissionClassifiers          gate.PermissionClassifierSet
-	permissionReviewPolicyRevision string
+	loops                  []loop.Definition
+	hustles                []hustle.Definition
+	hustleLimits           HustleLimits
+	primers                []string
+	activePrimer           string
+	store                  *sessionstore.Store
+	storeSet               bool
+	seen                   map[singletonKey]bool
+	lifecycleOptions       []sessionruntime.LifecycleOption
+	fingerprintFields      ConfigFingerprintFields
+	permissionClassifiers  gate.PermissionClassifierSet
+	permissionReviewPolicy gate.PermissionReviewPolicy
+	permissionReviewLimits PermissionReviewLimits
 	// placements accumulates every workspace placement option. Define enforces at most
 	// one; more than one is a typed rejection.
 	placements     []pendingPlacement
@@ -109,6 +110,10 @@ func Define(options ...Option) (*Rig, error) {
 	if err != nil {
 		return nil, err
 	}
+	permissionReviewLimits, err := resolvePermissionReviewLimits(state)
+	if err != nil {
+		return nil, err
+	}
 	if err := validateHustleRegistration(state); err != nil {
 		return nil, err
 	}
@@ -182,6 +187,16 @@ func Define(options ...Option) (*Rig, error) {
 		}
 		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleSnapshotPolicy(internalPolicy))
 	}
+	if state.seen[keyPermissionClassifiers] {
+		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecyclePermissionReview(
+			state.permissionClassifiers, state.permissionReviewPolicy,
+		))
+		if permissionReviewLimits != nil {
+			lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecyclePermissionReviewBreaker(
+				lifecyclePermissionReviewBreakerLimits(*permissionReviewLimits),
+			))
+		}
+	}
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleFingerprint(fingerprint))
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleManifest(manifest))
 	primerNames := make([]identity.AgentName, len(state.primers))
@@ -197,7 +212,7 @@ func Define(options ...Option) (*Rig, error) {
 
 func resolvePermissionReviewFingerprint(state *definitionState) (*permissionReviewFingerprint, error) {
 	classifiersConfigured := state.seen[keyPermissionClassifiers]
-	policyConfigured := state.seen[keyPermissionReviewPolicyRevision]
+	policyConfigured := state.seen[keyPermissionReviewPolicy]
 	if !classifiersConfigured && !policyConfigured {
 		return nil, nil
 	}
@@ -206,12 +221,72 @@ func resolvePermissionReviewFingerprint(state *definitionState) (*permissionRevi
 	}
 	projection, err := permissionReviewFingerprintFrom(
 		state.permissionClassifiers,
-		state.permissionReviewPolicyRevision,
+		state.permissionReviewPolicy,
 	)
 	if err != nil {
 		return nil, &DefinitionError{Kind: DefinitionInvalidPermissionClassifiers, Cause: err}
 	}
 	return projection, nil
+}
+
+// resolvePermissionReviewLimits resolves the circuit-breaker limits Define()
+// forwards to sessionruntime.WithLifecyclePermissionReviewBreaker.
+//
+//   - classifiers configured + WithPermissionReviewLimits never called:
+//     resolves the default (every one of the 8 numeric thresholds set to
+//     DefaultPermissionReviewBreakerThreshold, InterruptOnTrip false).
+//   - classifiers configured + WithPermissionReviewLimits called: the
+//     explicit value is used verbatim (no per-field merge with the default).
+//   - classifiers NOT configured + WithPermissionReviewLimits never called:
+//     resolves nothing (nil) — no breaker Lifecycle option is ever applied,
+//     preserving the current no-review-configured no-op.
+//   - classifiers NOT configured + WithPermissionReviewLimits called anyway:
+//     a typed DefinitionUnusedPermissionReviewLimits error, mirroring
+//     validateHustleRegistration's DefinitionUnusedHustleLimits precedent.
+func resolvePermissionReviewLimits(state *definitionState) (*PermissionReviewLimits, error) {
+	classifiersConfigured := state.seen[keyPermissionClassifiers]
+	limitsConfigured := state.seen[keyPermissionReviewLimits]
+	if !classifiersConfigured {
+		if limitsConfigured {
+			return nil, &DefinitionError{Kind: DefinitionUnusedPermissionReviewLimits}
+		}
+		return nil, nil
+	}
+	if limitsConfigured {
+		limits := state.permissionReviewLimits
+		return &limits, nil
+	}
+	return &PermissionReviewLimits{
+		MaxConsecutiveNeedsHuman: DefaultPermissionReviewBreakerThreshold,
+		MaxInvalidOrFailed:       DefaultPermissionReviewBreakerThreshold,
+		MaxIdenticalSubjects:     DefaultPermissionReviewBreakerThreshold,
+		MaxStaleResponses:        DefaultPermissionReviewBreakerThreshold,
+		InterruptOnTrip:          false,
+		Session: PermissionReviewSessionLimits{
+			MaxConsecutiveNeedsHuman: DefaultPermissionReviewBreakerThreshold,
+			MaxInvalidOrFailed:       DefaultPermissionReviewBreakerThreshold,
+			MaxIdenticalSubjects:     DefaultPermissionReviewBreakerThreshold,
+			MaxStaleResponses:        DefaultPermissionReviewBreakerThreshold,
+		},
+	}, nil
+}
+
+// lifecyclePermissionReviewBreakerLimits converts the rig-level limits shape
+// into sessionruntime's exported Lifecycle-option shape.
+func lifecyclePermissionReviewBreakerLimits(limits PermissionReviewLimits) sessionruntime.PermissionReviewBreakerLimits {
+	return sessionruntime.PermissionReviewBreakerLimits{
+		MaxConsecutiveNeedsHuman: limits.MaxConsecutiveNeedsHuman,
+		MaxInvalidOrFailed:       limits.MaxInvalidOrFailed,
+		MaxIdenticalSubjects:     limits.MaxIdenticalSubjects,
+		MaxStaleResponses:        limits.MaxStaleResponses,
+		InterruptOnTrip:          limits.InterruptOnTrip,
+		Session: sessionruntime.PermissionReviewSessionBreakerLimits{
+			MaxConsecutiveNeedsHuman: limits.Session.MaxConsecutiveNeedsHuman,
+			MaxInvalidOrFailed:       limits.Session.MaxInvalidOrFailed,
+			MaxIdenticalSubjects:     limits.Session.MaxIdenticalSubjects,
+			MaxStaleResponses:        limits.Session.MaxStaleResponses,
+		},
+	}
 }
 
 func lifecycleHustleLimits(limits HustleLimits) sessionruntime.HustleLimits {

@@ -27,6 +27,7 @@ const (
 	DefinitionInvalidPermissionClassifiers  DefinitionErrorKind = "invalid_permission_classifiers"
 	DefinitionInvalidPermissionReviewPolicy DefinitionErrorKind = "invalid_permission_review_policy"
 	DefinitionIncompletePermissionReview    DefinitionErrorKind = "incomplete_permission_review"
+	DefinitionUnusedPermissionReviewLimits  DefinitionErrorKind = "unused_permission_review_limits"
 )
 
 type DefinitionError struct {

@@ -101,13 +101,14 @@ func TestPermissionReviewOptionsFreezeOrderedClassifierIdentity(t *testing.T) {
 	first := defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("status"))
 	second := defineRigPermissionClassifier(t, "zulu", rigEvidencePolicy("diff"))
 	set := rigPermissionClassifierSet(t, first, second)
+	policy := rigReviewPolicy(t, "review-policy-v1")
 
 	state := &definitionState{seen: make(map[singletonKey]bool)}
 	if err := WithPermissionClassifiers(set)(state); err != nil {
 		t.Fatalf("WithPermissionClassifiers: %v", err)
 	}
-	if err := WithPermissionReviewPolicyRevision("review-policy-v1")(state); err != nil {
-		t.Fatalf("WithPermissionReviewPolicyRevision: %v", err)
+	if err := WithPermissionReviewPolicy(policy)(state); err != nil {
+		t.Fatalf("WithPermissionReviewPolicy: %v", err)
 	}
 	got := state.permissionClassifiers.Classifiers()
 	if len(got) != 2 || got[0].Name() != "alpha" || got[1].Name() != "zulu" {
@@ -118,8 +119,8 @@ func TestPermissionReviewOptionsFreezeOrderedClassifierIdentity(t *testing.T) {
 		state.hustles[1].Name() != "zulu" {
 		t.Fatalf("classifier hustle definitions = %#v", state.hustles)
 	}
-	if state.permissionReviewPolicyRevision != "review-policy-v1" {
-		t.Fatalf("review policy revision = %q", state.permissionReviewPolicyRevision)
+	if state.permissionReviewPolicy.Revision != "review-policy-v1" {
+		t.Fatalf("review policy revision = %q", state.permissionReviewPolicy.Revision)
 	}
 }
 
@@ -136,17 +137,11 @@ func TestPermissionReviewOptionsRejectInvalidAndDuplicateValues(t *testing.T) {
 		{name: "zero classifier set", run: func(state *definitionState) error {
 			return WithPermissionClassifiers(gate.PermissionClassifierSet{})(state)
 		}, kind: DefinitionInvalidPermissionClassifiers},
-		{name: "blank review policy", run: func(state *definitionState) error {
-			return WithPermissionReviewPolicyRevision(" ")(state)
+		{name: "unsealed (hand-built) review policy", run: func(state *definitionState) error {
+			return WithPermissionReviewPolicy(gate.PermissionReviewPolicy{Revision: "review-v1"})(state)
 		}, kind: DefinitionInvalidPermissionReviewPolicy},
-		{name: "invalid utf8 review policy", run: func(state *definitionState) error {
-			return WithPermissionReviewPolicyRevision("policy-\xff")(state)
-		}, kind: DefinitionInvalidPermissionReviewPolicy},
-		{name: "nul review policy", run: func(state *definitionState) error {
-			return WithPermissionReviewPolicyRevision("policy-\x00")(state)
-		}, kind: DefinitionInvalidPermissionReviewPolicy},
-		{name: "overlong review policy", run: func(state *definitionState) error {
-			return WithPermissionReviewPolicyRevision(strings.Repeat("r", gate.MaxPermissionReviewPolicyRevisionBytes+1))(state)
+		{name: "zero review policy", run: func(state *definitionState) error {
+			return WithPermissionReviewPolicy(gate.PermissionReviewPolicy{})(state)
 		}, kind: DefinitionInvalidPermissionReviewPolicy},
 		{name: "classifier duplicate option", run: func(state *definitionState) error {
 			if err := WithPermissionClassifiers(valid)(state); err != nil {
@@ -155,10 +150,10 @@ func TestPermissionReviewOptionsRejectInvalidAndDuplicateValues(t *testing.T) {
 			return WithPermissionClassifiers(valid)(state)
 		}, kind: DefinitionDuplicateOption},
 		{name: "policy duplicate option", run: func(state *definitionState) error {
-			if err := WithPermissionReviewPolicyRevision("review-v1")(state); err != nil {
+			if err := WithPermissionReviewPolicy(rigReviewPolicy(t, "review-v1"))(state); err != nil {
 				return err
 			}
-			return WithPermissionReviewPolicyRevision("review-v2")(state)
+			return WithPermissionReviewPolicy(rigReviewPolicy(t, "review-v2"))(state)
 		}, kind: DefinitionDuplicateOption},
 	}
 	for _, testCase := range tests {
@@ -175,15 +170,18 @@ func TestPermissionReviewOptionsRejectInvalidAndDuplicateValues(t *testing.T) {
 	}
 }
 
-func TestPermissionReviewPolicyRevisionAcceptsExactBound(t *testing.T) {
+func TestDefinePermissionReviewAcceptsMaxLengthRevision(t *testing.T) {
 	t.Parallel()
+	classifier := defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("status"))
+	set := rigPermissionClassifierSet(t, classifier)
 	revision := strings.Repeat("r", gate.MaxPermissionReviewPolicyRevisionBytes)
-	state := &definitionState{seen: make(map[singletonKey]bool)}
-	if err := WithPermissionReviewPolicyRevision(revision)(state); err != nil {
-		t.Fatalf("WithPermissionReviewPolicyRevision(exact bound): %v", err)
-	}
-	if state.permissionReviewPolicyRevision != revision {
-		t.Fatalf("stored revision length = %d, want %d", len(state.permissionReviewPolicyRevision), len(revision))
+	_, err := Define(validRigOptions(t,
+		WithPermissionClassifiers(set),
+		WithPermissionReviewPolicy(rigReviewPolicy(t, revision)),
+		WithHustleLimits(validHustleLimits()),
+	)...)
+	if err != nil {
+		t.Fatalf("Define() with max-length review policy revision: %v", err)
 	}
 }
 
@@ -197,7 +195,7 @@ func TestDefinePermissionReviewRequiresCompleteConfiguration(t *testing.T) {
 		options []Option
 	}{
 		{name: "classifiers without review policy", options: []Option{WithPermissionClassifiers(set)}},
-		{name: "review policy without classifiers", options: []Option{WithPermissionReviewPolicyRevision("review-v1")}},
+		{name: "review policy without classifiers", options: []Option{WithPermissionReviewPolicy(rigReviewPolicy(t, "review-v1"))}},
 	}
 	for _, testCase := range tests {
 		testCase := testCase
@@ -218,7 +216,7 @@ func TestDefinePermissionReviewUsesHustleRegistrationAndBindingPath(t *testing.T
 	set := rigPermissionClassifierSet(t, classifier)
 	base := []Option{
 		WithPermissionClassifiers(set),
-		WithPermissionReviewPolicyRevision("review-v1"),
+		WithPermissionReviewPolicy(rigReviewPolicy(t, "review-v1")),
 	}
 	_, err := Define(validRigOptions(t, base...)...)
 	var target *DefinitionError
@@ -236,6 +234,163 @@ func TestDefinePermissionReviewUsesHustleRegistrationAndBindingPath(t *testing.T
 		)...,
 	)...); !errors.As(err, &target) || target.Kind != DefinitionDuplicateHustle {
 		t.Fatalf("explicit duplicate classifier hustle error = %T %v", err, err)
+	}
+}
+
+// TestWithPermissionReviewLimitsIsSingleton mirrors
+// TestDefineHustleLimitsAreSingleton's shape for the review-breaker
+// counterpart: a second WithPermissionReviewLimits call is always rejected
+// as a duplicate option, regardless of whether the second value is itself
+// otherwise valid (there is no field-level notion of "invalid" for
+// PermissionReviewLimits — every int/bool combination is a legal, if
+// possibly degenerate, threshold set).
+func TestWithPermissionReviewLimitsIsSingleton(t *testing.T) {
+	t.Parallel()
+	state := &definitionState{seen: make(map[singletonKey]bool)}
+	if err := WithPermissionReviewLimits(PermissionReviewLimits{MaxConsecutiveNeedsHuman: 1})(state); err != nil {
+		t.Fatalf("first WithPermissionReviewLimits: %v", err)
+	}
+	var target *DefinitionError
+	if err := WithPermissionReviewLimits(PermissionReviewLimits{MaxConsecutiveNeedsHuman: 2})(state); !errors.As(err, &target) || target.Kind != DefinitionDuplicateOption {
+		t.Fatalf("second WithPermissionReviewLimits error = %T %v, want duplicate option", err, err)
+	}
+}
+
+// TestResolvePermissionReviewLimits proves resolvePermissionReviewLimits'
+// full decision table (definition.go): the DefaultPermissionReviewBreakerThreshold
+// default when classifiers are configured but the option was never called,
+// the explicit value used verbatim (never merged per-field) when it was
+// called, no resolved value at all when classifiers are absent and the
+// option was never called (preserving the current no-breaker default), and
+// a typed DefinitionUnusedPermissionReviewLimits error when the option is
+// called without classifiers.
+func TestResolvePermissionReviewLimits(t *testing.T) {
+	t.Parallel()
+	set := rigPermissionClassifierSet(
+		t, defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("status")),
+	)
+	explicit := PermissionReviewLimits{
+		MaxConsecutiveNeedsHuman: 3, MaxInvalidOrFailed: 4, MaxIdenticalSubjects: 5, MaxStaleResponses: 6,
+		InterruptOnTrip: true,
+		Session:         PermissionReviewSessionLimits{MaxConsecutiveNeedsHuman: 7, MaxInvalidOrFailed: 8, MaxIdenticalSubjects: 9, MaxStaleResponses: 10},
+	}
+	wantDefault := PermissionReviewLimits{
+		MaxConsecutiveNeedsHuman: DefaultPermissionReviewBreakerThreshold,
+		MaxInvalidOrFailed:       DefaultPermissionReviewBreakerThreshold,
+		MaxIdenticalSubjects:     DefaultPermissionReviewBreakerThreshold,
+		MaxStaleResponses:        DefaultPermissionReviewBreakerThreshold,
+		InterruptOnTrip:          false,
+		Session: PermissionReviewSessionLimits{
+			MaxConsecutiveNeedsHuman: DefaultPermissionReviewBreakerThreshold,
+			MaxInvalidOrFailed:       DefaultPermissionReviewBreakerThreshold,
+			MaxIdenticalSubjects:     DefaultPermissionReviewBreakerThreshold,
+			MaxStaleResponses:        DefaultPermissionReviewBreakerThreshold,
+		},
+	}
+
+	t.Run("classifiers configured, limits not called: resolves the default", func(t *testing.T) {
+		t.Parallel()
+		state := &definitionState{seen: make(map[singletonKey]bool)}
+		if err := WithPermissionClassifiers(set)(state); err != nil {
+			t.Fatalf("WithPermissionClassifiers: %v", err)
+		}
+		got, err := resolvePermissionReviewLimits(state)
+		if err != nil {
+			t.Fatalf("resolvePermissionReviewLimits: %v", err)
+		}
+		if got == nil || *got != wantDefault {
+			t.Fatalf("resolvePermissionReviewLimits() = %#v, want %#v", got, wantDefault)
+		}
+	})
+
+	t.Run("classifiers configured, limits called: explicit value used verbatim", func(t *testing.T) {
+		t.Parallel()
+		state := &definitionState{seen: make(map[singletonKey]bool)}
+		if err := WithPermissionClassifiers(set)(state); err != nil {
+			t.Fatalf("WithPermissionClassifiers: %v", err)
+		}
+		if err := WithPermissionReviewLimits(explicit)(state); err != nil {
+			t.Fatalf("WithPermissionReviewLimits: %v", err)
+		}
+		got, err := resolvePermissionReviewLimits(state)
+		if err != nil {
+			t.Fatalf("resolvePermissionReviewLimits: %v", err)
+		}
+		if got == nil || *got != explicit {
+			t.Fatalf("resolvePermissionReviewLimits() = %#v, want the explicit value %#v verbatim", got, explicit)
+		}
+	})
+
+	t.Run("classifiers not configured, limits not called: no resolved value", func(t *testing.T) {
+		t.Parallel()
+		state := &definitionState{seen: make(map[singletonKey]bool)}
+		got, err := resolvePermissionReviewLimits(state)
+		if err != nil {
+			t.Fatalf("resolvePermissionReviewLimits: %v", err)
+		}
+		if got != nil {
+			t.Fatalf("resolvePermissionReviewLimits() = %#v, want nil", got)
+		}
+	})
+
+	t.Run("classifiers not configured, limits called anyway: typed error", func(t *testing.T) {
+		t.Parallel()
+		state := &definitionState{seen: make(map[singletonKey]bool)}
+		if err := WithPermissionReviewLimits(explicit)(state); err != nil {
+			t.Fatalf("WithPermissionReviewLimits: %v", err)
+		}
+		_, err := resolvePermissionReviewLimits(state)
+		var target *DefinitionError
+		if !errors.As(err, &target) || target.Kind != DefinitionUnusedPermissionReviewLimits {
+			t.Fatalf("resolvePermissionReviewLimits() error = %T %v, want DefinitionUnusedPermissionReviewLimits", err, err)
+		}
+	})
+}
+
+// TestDefinePermissionReviewLimitsUnusedWithoutClassifiers proves the same
+// decision through the public Define() entry point (not just the internal
+// resolvePermissionReviewLimits unit above), mirroring
+// DefinitionUnusedHustleLimits' own existing Define()-level coverage in
+// TestDefineHustleValidation's "limits unused" case.
+func TestDefinePermissionReviewLimitsUnusedWithoutClassifiers(t *testing.T) {
+	t.Parallel()
+	_, err := Define(validRigOptions(t, WithPermissionReviewLimits(PermissionReviewLimits{MaxConsecutiveNeedsHuman: 1}))...)
+	var target *DefinitionError
+	if !errors.As(err, &target) || target.Kind != DefinitionUnusedPermissionReviewLimits {
+		t.Fatalf("Define() error = %T %v, want DefinitionUnusedPermissionReviewLimits", err, err)
+	}
+}
+
+// TestDefineForwardsPermissionReviewLifecycleOptionsExactlyOnce mirrors
+// TestDefineForwardsLifecycleHustlesExactlyOnce's AST-based technique: Define()
+// must call sessionruntime.WithLifecyclePermissionReview and
+// sessionruntime.WithLifecyclePermissionReviewBreaker each exactly once.
+func TestDefineForwardsPermissionReviewLifecycleOptionsExactlyOnce(t *testing.T) {
+	t.Parallel()
+	file, err := parser.ParseFile(token.NewFileSet(), "definition.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := map[string]int{}
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		switch selector.Sel.Name {
+		case "WithLifecyclePermissionReview", "WithLifecyclePermissionReviewBreaker":
+			calls[selector.Sel.Name]++
+		}
+		return true
+	})
+	for _, name := range []string{"WithLifecyclePermissionReview", "WithLifecyclePermissionReviewBreaker"} {
+		if calls[name] != 1 {
+			t.Fatalf("%s calls = %d, want exactly 1", name, calls[name])
+		}
 	}
 }
 

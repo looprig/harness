@@ -251,10 +251,19 @@ func (*permissionReviewFingerprintError) Error() string {
 	return "rig: invalid permission review fingerprint"
 }
 
+// permissionReviewFingerprintFrom projects a rig's registered classifier set
+// and local decision policy into the minimal, secret-free identity value
+// folded into the rig fingerprint. Only policy.Revision feeds identity — the
+// design intent (§21: "local decision policy revision", not the full policy
+// value) — so two policies that differ only in risk thresholds/authorization
+// requirements but share a Revision project identically here; the FULL
+// policy value is what actually reaches the runtime via
+// rig.WithPermissionReviewPolicy -> sessionruntime.WithLifecyclePermissionReview.
 func permissionReviewFingerprintFrom(
 	set gate.PermissionClassifierSet,
-	reviewPolicyRevision string,
+	policy gate.PermissionReviewPolicy,
 ) (*permissionReviewFingerprint, error) {
+	reviewPolicyRevision := policy.Revision
 	if !validPermissionReviewPolicyRevision(reviewPolicyRevision) {
 		return nil, &permissionReviewFingerprintError{}
 	}

@@ -23,18 +23,19 @@ type Option func(*definitionState) error
 type singletonKey string
 
 const (
-	keyActivePrimer                   singletonKey = "active_primer"
-	keyDelegationLimits               singletonKey = "delegation_limits"
-	keyConfigFingerprint              singletonKey = "config_fingerprint"
-	keyForeignBuilder                 singletonKey = "foreign_builders"
-	keyGateCaps                       singletonKey = "gate_caps"
-	keyAllowConfigMismatch            singletonKey = "allow_config_mismatch"
-	keyRestoreDecider                 singletonKey = "restore_decider"
-	keySnapshots                      singletonKey = "snapshots"
-	keyOffloadGC                      singletonKey = "offload_gc"
-	keyHustleLimits                   singletonKey = "hustle_limits"
-	keyPermissionClassifiers          singletonKey = "permission_classifiers"
-	keyPermissionReviewPolicyRevision singletonKey = "permission_review_policy_revision"
+	keyActivePrimer           singletonKey = "active_primer"
+	keyDelegationLimits       singletonKey = "delegation_limits"
+	keyConfigFingerprint      singletonKey = "config_fingerprint"
+	keyForeignBuilder         singletonKey = "foreign_builders"
+	keyGateCaps               singletonKey = "gate_caps"
+	keyAllowConfigMismatch    singletonKey = "allow_config_mismatch"
+	keyRestoreDecider         singletonKey = "restore_decider"
+	keySnapshots              singletonKey = "snapshots"
+	keyOffloadGC              singletonKey = "offload_gc"
+	keyHustleLimits           singletonKey = "hustle_limits"
+	keyPermissionClassifiers  singletonKey = "permission_classifiers"
+	keyPermissionReviewPolicy singletonKey = "permission_review_policy"
+	keyPermissionReviewLimits singletonKey = "permission_review_limits"
 )
 
 // WithPermissionClassifiers installs the already-validated, ordered permission
@@ -60,30 +61,96 @@ func WithPermissionClassifiers(classifiers gate.PermissionClassifierSet) Option 
 	}
 }
 
-// WithPermissionReviewPolicyRevision records the immutable local decision
-// policy identity. The policy value itself is wired into the runtime in the
-// later review-integration phase; fingerprints need only this secret-free
-// revision.
-func WithPermissionReviewPolicyRevision(revision string) Option {
+// WithPermissionReviewPolicy installs the immutable local decision policy
+// (design §20) every session forwards into the review runtime. Only the
+// policy's Revision feeds rig identity (permissionReviewFingerprintFrom in
+// fingerprint.go); the full value is what sessionruntime actually applies.
+//
+// A policy that was never built through gate.NewPermissionReviewPolicy or
+// gate.DefaultPermissionReviewPolicy (a hand-built literal
+// gate.PermissionReviewPolicy{}, whose zero seal makes it fail closed at
+// EvaluatePermissionAssessment regardless) is rejected here immediately,
+// rather than silently accepted and left to fail closed later with a
+// confusing runtime symptom. This is a developer-experience improvement:
+// the security property already holds without it.
+func WithPermissionReviewPolicy(policy gate.PermissionReviewPolicy) Option {
 	return func(state *definitionState) error {
-		if state.seen[keyPermissionReviewPolicyRevision] {
-			return &DefinitionError{Kind: DefinitionDuplicateOption, Name: string(keyPermissionReviewPolicyRevision)}
+		if state.seen[keyPermissionReviewPolicy] {
+			return &DefinitionError{Kind: DefinitionDuplicateOption, Name: string(keyPermissionReviewPolicy)}
 		}
-		if !validPermissionReviewPolicyRevision(revision) {
+		if !policy.Sealed() {
 			return &DefinitionError{Kind: DefinitionInvalidPermissionReviewPolicy}
 		}
-		state.seen[keyPermissionReviewPolicyRevision] = true
-		state.permissionReviewPolicyRevision = revision
+		state.seen[keyPermissionReviewPolicy] = true
+		state.permissionReviewPolicy = policy
 		return nil
 	}
 }
 
+// validPermissionReviewPolicyRevision is the defensive, belt-and-suspenders
+// shape check permissionReviewFingerprintFrom (fingerprint.go) applies to a
+// sealed policy's Revision before folding it into rig identity.
 func validPermissionReviewPolicyRevision(revision string) bool {
 	return utf8.ValidString(revision) &&
 		revision != "" &&
 		strings.TrimSpace(revision) == revision &&
 		!strings.ContainsRune(revision, '\x00') &&
 		len(revision) <= gate.MaxPermissionReviewPolicyRevisionBytes
+}
+
+// DefaultPermissionReviewBreakerThreshold is the default numeric
+// circuit-breaker threshold Define() resolves for every turn-scoped and
+// session-scoped counter (resolvePermissionReviewLimits in definition.go)
+// when classifiers are configured but WithPermissionReviewLimits was never
+// explicitly called.
+const DefaultPermissionReviewBreakerThreshold = 20
+
+// PermissionReviewLimits are the consumer-configurable bounded per-turn and
+// per-session circuit-breaker thresholds (design §18) — the rig-level
+// mirror of sessionruntime.PermissionReviewBreakerLimits. They are
+// deliberately EXCLUDED from the rig fingerprint (fingerprint.go): these are
+// operational tuning knobs, not behavioral identity, so two rigs that agree
+// on classifiers and policy but differ only in these thresholds compare
+// equal.
+type PermissionReviewLimits struct {
+	MaxConsecutiveNeedsHuman int
+	MaxInvalidOrFailed       int
+	MaxIdenticalSubjects     int
+	MaxStaleResponses        int
+	InterruptOnTrip          bool
+	Session                  PermissionReviewSessionLimits
+}
+
+// PermissionReviewSessionLimits is PermissionReviewLimits' session-scoped
+// counterpart (design §18: "per-turn AND per-session").
+type PermissionReviewSessionLimits struct {
+	MaxConsecutiveNeedsHuman int
+	MaxInvalidOrFailed       int
+	MaxIdenticalSubjects     int
+	MaxStaleResponses        int
+}
+
+// WithPermissionReviewLimits installs the circuit-breaker thresholds
+// (design §18) applied to automatic permission review. It is only
+// meaningful paired with WithPermissionClassifiers; Define() enforces that
+// pairing (DefinitionUnusedPermissionReviewLimits) rather than this Option,
+// because option application order is not guaranteed (classifiers may be
+// registered before or after this call in the Define() argument list).
+//
+// Omitting this option while classifiers ARE configured resolves a default
+// of DefaultPermissionReviewBreakerThreshold on every one of the 8 numeric
+// thresholds (resolvePermissionReviewLimits, definition.go); an explicit
+// call always replaces that default wholesale — all 8 fields at once, never
+// merged per-field.
+func WithPermissionReviewLimits(limits PermissionReviewLimits) Option {
+	return func(state *definitionState) error {
+		if state.seen[keyPermissionReviewLimits] {
+			return &DefinitionError{Kind: DefinitionDuplicateOption, Name: string(keyPermissionReviewLimits)}
+		}
+		state.seen[keyPermissionReviewLimits] = true
+		state.permissionReviewLimits = limits
+		return nil
+	}
 }
 
 // MaxHustleQueued is the largest configured waiting capacity for either hustle

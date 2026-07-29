@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
@@ -164,6 +165,18 @@ func rigPermissionClassifierSet(t *testing.T, classifiers ...gate.PermissionClas
 	return set
 }
 
+// rigReviewPolicy builds a real, sealed gate.PermissionReviewPolicy carrying
+// the given revision, for tests that previously exercised the
+// revision-only rig API (WithPermissionReviewPolicyRevision).
+func rigReviewPolicy(t *testing.T, revision string) gate.PermissionReviewPolicy {
+	t.Helper()
+	policy, err := gate.DefaultPermissionReviewPolicy(revision)
+	if err != nil {
+		t.Fatalf("gate.DefaultPermissionReviewPolicy(%q): %v", revision, err)
+	}
+	return policy
+}
+
 func TestPermissionReviewTopologyFingerprintSensitivity(t *testing.T) {
 	t.Parallel()
 	loopDefinition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
@@ -173,7 +186,7 @@ func TestPermissionReviewTopologyFingerprintSensitivity(t *testing.T) {
 	secondClassifier := defineRigPermissionClassifier(t, "zulu", rigEvidencePolicy("diff"))
 	baseSet := rigPermissionClassifierSet(t, baseClassifier, secondClassifier)
 	revision := func(set gate.PermissionClassifierSet, reviewPolicyRevision string) string {
-		projection, err := permissionReviewFingerprintFrom(set, reviewPolicyRevision)
+		projection, err := permissionReviewFingerprintFrom(set, rigReviewPolicy(t, reviewPolicyRevision))
 		if err != nil {
 			t.Fatalf("permissionReviewFingerprintFrom: %v", err)
 		}
@@ -308,7 +321,7 @@ func TestPermissionReviewFingerprintDomainsIndependentlyChangeIdentity(t *testin
 	classifier := defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("status"))
 	review, err := permissionReviewFingerprintFrom(
 		rigPermissionClassifierSet(t, classifier),
-		"review-policy-v1",
+		rigReviewPolicy(t, "review-policy-v1"),
 	)
 	if err != nil {
 		t.Fatalf("permissionReviewFingerprintFrom: %v", err)
@@ -399,11 +412,12 @@ func TestPermissionReviewFingerprintMaterialIsDeterministicAndSecretFree(t *test
 	evidence := rigEvidencePolicy("status")
 	classifier := defineRigPermissionClassifier(t, "alpha", evidence)
 	set := rigPermissionClassifierSet(t, classifier)
-	left, err := permissionReviewFingerprintFrom(set, "review-policy-v1")
+	policy := rigReviewPolicy(t, "review-policy-v1")
+	left, err := permissionReviewFingerprintFrom(set, policy)
 	if err != nil {
 		t.Fatalf("permissionReviewFingerprintFrom: %v", err)
 	}
-	right, err := permissionReviewFingerprintFrom(set, "review-policy-v1")
+	right, err := permissionReviewFingerprintFrom(set, policy)
 	if err != nil {
 		t.Fatalf("permissionReviewFingerprintFrom: %v", err)
 	}
@@ -421,6 +435,58 @@ func TestPermissionReviewFingerprintMaterialIsDeterministicAndSecretFree(t *test
 		if bytes.Contains(leftMaterial, forbidden) {
 			t.Fatalf("fingerprint material exposed forbidden raw input %q", forbidden)
 		}
+	}
+}
+
+// TestPermissionReviewLimitsExcludedFromFingerprint proves the explicit
+// design decision (second-opinion consult on this addendum): circuit-breaker
+// limits are operational tuning, not behavioral identity, so two otherwise
+// identical rig configurations that differ ONLY in WithPermissionReviewLimits
+// must produce the exact same frozen fingerprint. It exercises the same
+// resolvePermissionReviewFingerprint + frozenFingerprintWithPermissionReview
+// path Define() itself uses (definition.go), through the full option
+// pipeline (WithPermissionClassifiers/WithPermissionReviewPolicy/
+// WithPermissionReviewLimits), rather than asserting this by function
+// signature inspection alone.
+func TestPermissionReviewLimitsExcludedFromFingerprint(t *testing.T) {
+	t.Parallel()
+	classifier := defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("status"))
+	set := rigPermissionClassifierSet(t, classifier)
+	policy := rigReviewPolicy(t, "review-policy-v1")
+	loopDefinition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
+	hustleLimits := validHustleLimits()
+
+	fingerprintFor := func(limits PermissionReviewLimits) event.ConfigFingerprint {
+		state := &definitionState{seen: make(map[singletonKey]bool)}
+		if err := WithPermissionClassifiers(set)(state); err != nil {
+			t.Fatalf("WithPermissionClassifiers: %v", err)
+		}
+		if err := WithPermissionReviewPolicy(policy)(state); err != nil {
+			t.Fatalf("WithPermissionReviewPolicy: %v", err)
+		}
+		if err := WithPermissionReviewLimits(limits)(state); err != nil {
+			t.Fatalf("WithPermissionReviewLimits: %v", err)
+		}
+		review, err := resolvePermissionReviewFingerprint(state)
+		if err != nil {
+			t.Fatalf("resolvePermissionReviewFingerprint: %v", err)
+		}
+		return frozenFingerprintWithPermissionReview(
+			ConfigFingerprintFields{}, []loop.Definition{loopDefinition}, []string{"agent"}, "agent",
+			state.hustles, hustleLimits, review,
+		)
+	}
+
+	left := fingerprintFor(PermissionReviewLimits{MaxConsecutiveNeedsHuman: 1})
+	right := fingerprintFor(PermissionReviewLimits{
+		MaxConsecutiveNeedsHuman: 99, MaxInvalidOrFailed: 98, MaxIdenticalSubjects: 97, MaxStaleResponses: 96,
+		InterruptOnTrip: true,
+		Session: PermissionReviewSessionLimits{
+			MaxConsecutiveNeedsHuman: 95, MaxInvalidOrFailed: 94, MaxIdenticalSubjects: 93, MaxStaleResponses: 92,
+		},
+	})
+	if left != right {
+		t.Fatalf("fingerprint changed with a different PermissionReviewLimits value:\nleft:  %#v\nright: %#v", left, right)
 	}
 }
 
