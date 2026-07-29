@@ -580,7 +580,7 @@ type contextCheckingContainment struct {
 	check func(context.Context, bool)
 }
 
-func (c contextCheckingContainment) VerifyEvidenceContainment(ctx context.Context, _ EvidenceContainmentPolicy, _ tool.Request) error {
+func (c contextCheckingContainment) VerifyEvidenceContainment(ctx context.Context, _ gate.EvidenceContainmentPolicy, _ tool.Request) error {
 	c.check(ctx, false)
 	return nil
 }
@@ -644,7 +644,7 @@ func TestEvidenceExecutionStripsAmbientContextAuthority(t *testing.T) {
 				Access:       &evidenceAccessStub{access: gate.AccessAllow},
 				Containment:  contextCheckingContainment{check: check},
 				AllowedKinds: []string{evidenceReadKind}, ReadWorkspace: &tool.ReadWorkspaceBinding{Root: "/workspace"},
-				SecurityCeiling: "read-only", NewExecutionID: uuid.New,
+				NewExecutionID: uuid.New,
 			},
 		},
 	})
@@ -854,12 +854,11 @@ func runtimeEvidenceControllerWith(
 			AuditTimeout: timeout, FinalizationTimeout: time.Second, WorkerDrainTimeout: workerDrain,
 			Stamper: factory, Audit: audit, Faults: &runtimeTestFaults{}, Activity: &runtimeTestActivity{},
 			Evidence: &EvidenceRuntimeConfig{
-				Access:          &evidenceAccessStub{access: gate.AccessAllow},
-				Containment:     &evidenceContainmentStub{},
-				AllowedKinds:    []string{evidenceReadKind},
-				ReadWorkspace:   &tool.ReadWorkspaceBinding{Root: "/workspace"},
-				SecurityCeiling: "read-only",
-				NewExecutionID:  uuid.New,
+				Access:         &evidenceAccessStub{access: gate.AccessAllow},
+				Containment:    &evidenceContainmentStub{},
+				AllowedKinds:   []string{evidenceReadKind},
+				ReadWorkspace:  &tool.ReadWorkspaceBinding{Root: "/workspace"},
+				NewExecutionID: uuid.New,
 			},
 		},
 	})
@@ -877,6 +876,7 @@ func runtimeEvidenceRequest(t *testing.T, name hustle.Name, sessionID, loopID uu
 			Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID},
 			CommandID:   mustRuntimeTestID(t),
 		},
-		Input: json.RawMessage(`{"version":1}`),
+		Input:           json.RawMessage(`{"version":1}`),
+		SecurityCeiling: testSecurityCeiling,
 	}
 }

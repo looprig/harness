@@ -129,6 +129,18 @@ type Request struct {
 	Name  Name
 	Cause identity.Cause
 	Input json.RawMessage
+	// SecurityCeiling is the per-invocation evidence-tool containment ceiling
+	// THIS SPECIFIC run's evidence catalog must be bound against (design
+	// §13.1, §21). Empty means no per-request override: a Hustle without an
+	// evidence-tool concept (e.g. compaction) never sets it, and never reaches
+	// the evidence-binding path that would consume it. A permission-review
+	// Hustle always sets it from that review's own frozen basis
+	// (gate.ReviewBasis.SecurityCeiling, captured once at StartPermissionReview
+	// — see internal/sessionruntime/gates.go's respondFromClassifier doc
+	// comment), never a session-wide constant, so a long session's later
+	// review is bound against ITS OWN current ceiling rather than one frozen
+	// at controller construction.
+	SecurityCeiling string
 }
 
 // Result is the validated serialized output and normalized usage.

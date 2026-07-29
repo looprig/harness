@@ -281,6 +281,21 @@ func NewBundleDefinition(name string, producedToolNames []string, requirements R
 	}
 }
 
+// EvidenceKindDeclarer is an optional capability (probed by type assertion,
+// mirroring Sequential/Auditable/WriteTarget) implemented by an evidence
+// Definition that can enumerate — independent of any session, loop, or
+// specific call's arguments — every Requirement.Kind value its built tools
+// may ever produce via CallPreparer.PrepareCall. Evidence-policy
+// construction (internal/hustleruntime) uses it to fail fast when a
+// declared kind is outside the consumer's AllowedKinds allowlist, rather
+// than discovering the mismatch lazily as an EvidenceFailureForbiddenCapability
+// on the tool's first real evidence call. A Definition implementing none of
+// this is still a fully valid evidence definition; its produced kinds are
+// still checked per-call (unchanged).
+type EvidenceKindDeclarer interface {
+	EvidenceRequirementKinds() []string
+}
+
 // NewEvidenceDefinition returns a sealed definition with immutable, model-facing
 // metadata and a capability set limited to RequiresWorkspaceRead. Produced tool
 // names are derived from infos so the two declarations cannot drift.

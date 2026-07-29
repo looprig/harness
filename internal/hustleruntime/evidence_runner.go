@@ -30,25 +30,30 @@ type evidenceToolResult struct {
 	content []content.Block
 }
 
-// evidenceRunner owns only sequential, read-only evidence execution.
+// evidenceRunner owns only sequential, read-only evidence execution. It
+// deliberately holds no SecurityCeiling: readRoot is the fixed canonical
+// workspace root (unchanging for the controller's lifetime), but the ceiling
+// is supplied fresh to every run call from that call's own hustle.Request, so
+// two runs through the same runner (and the same shared Controller) can be
+// bound against two different ceilings — see run's doc comment.
 type evidenceRunner struct {
-	access         evidenceAccessEvaluator
-	containment    evidenceContainmentVerifier
-	policy         EvidenceContainmentPolicy
+	access         gate.EvidenceAccessEvaluator
+	containment    gate.EvidenceContainmentVerifier
+	readRoot       string
 	allowedKinds   map[string]struct{}
-	newExecutionID evidenceExecutionIDFactory
+	newExecutionID EvidenceExecutionIDFactory
 }
 
 func newEvidenceRunner(
-	access evidenceAccessEvaluator,
-	containment evidenceContainmentVerifier,
-	policy EvidenceContainmentPolicy,
+	access gate.EvidenceAccessEvaluator,
+	containment gate.EvidenceContainmentVerifier,
+	readRoot string,
 	allowedKinds []string,
-	newExecutionID evidenceExecutionIDFactory,
+	newExecutionID EvidenceExecutionIDFactory,
 ) (*evidenceRunner, error) {
 	if nilEvidenceRuntimeValue(reflect.ValueOf(access)) ||
 		nilEvidenceRuntimeValue(reflect.ValueOf(containment)) ||
-		!validEvidenceContainmentPolicy(policy) ||
+		!validEvidenceReadRoot(readRoot) ||
 		newExecutionID == nil || len(allowedKinds) == 0 {
 		return nil, evidenceError(EvidenceFailureInvalidBinding)
 	}
@@ -63,18 +68,25 @@ func newEvidenceRunner(
 		allowed[kind] = struct{}{}
 	}
 	return &evidenceRunner{
-		access: access, containment: containment, policy: policy,
+		access: access, containment: containment, readRoot: readRoot,
 		allowedKinds: allowed, newExecutionID: newExecutionID,
 	}, nil
 }
 
-func validEvidenceContainmentPolicy(policy EvidenceContainmentPolicy) bool {
-	return filepath.IsAbs(policy.ReadRoot) &&
-		filepath.Clean(policy.ReadRoot) == policy.ReadRoot &&
-		!strings.ContainsRune(policy.ReadRoot, '\x00') &&
-		policy.SecurityCeiling != "" &&
-		policy.SecurityCeiling == strings.TrimSpace(policy.SecurityCeiling) &&
-		!strings.ContainsRune(policy.SecurityCeiling, '\x00')
+func validEvidenceReadRoot(root string) bool {
+	return filepath.IsAbs(root) &&
+		filepath.Clean(root) == root &&
+		!strings.ContainsRune(root, '\x00')
+}
+
+func validSecurityCeiling(ceiling string) bool {
+	return ceiling != "" &&
+		ceiling == strings.TrimSpace(ceiling) &&
+		!strings.ContainsRune(ceiling, '\x00')
+}
+
+func validEvidenceContainmentPolicy(policy gate.EvidenceContainmentPolicy) bool {
+	return validEvidenceReadRoot(policy.ReadRoot) && validSecurityCeiling(policy.SecurityCeiling)
 }
 
 // bindEvidenceInvocation builds and validates the concrete catalog from the
@@ -113,19 +125,30 @@ func bindEvidenceInvocation(
 	return append([]hustle.BoundEvidenceTool(nil), catalog...), nil
 }
 
+// run authorizes and sequentially executes calls against catalog under the
+// per-call securityCeiling — never a value stored on the receiver. This is
+// the mechanism that lets two RunAndFinalize calls sharing the SAME
+// evidenceRunner (and the same Controller/session) be bound against two
+// DIFFERENT security ceilings: the runner's own readRoot is fixed, but the
+// effective gate.EvidenceContainmentPolicy is assembled fresh from
+// securityCeiling on every call, immediately before authorization, so a
+// stale ceiling from an earlier call can never leak into a later one.
 func (r *evidenceRunner) run(
 	ctx context.Context,
 	catalog []hustle.BoundEvidenceTool,
 	calls []evidenceToolCall,
 	limits hustle.ToolLoopLimits,
+	securityCeiling string,
 ) ([]evidenceToolResult, error) {
 	if r == nil || nilEvidenceRuntimeValue(reflect.ValueOf(r.access)) ||
 		nilEvidenceRuntimeValue(reflect.ValueOf(r.containment)) ||
-		!validEvidenceContainmentPolicy(r.policy) || r.newExecutionID == nil ||
+		!validEvidenceReadRoot(r.readRoot) || !validSecurityCeiling(securityCeiling) ||
+		r.newExecutionID == nil ||
 		len(r.allowedKinds) == 0 || len(catalog) == 0 || len(calls) == 0 ||
 		limits.MaxResultBytes <= 0 || limits.MaxEvidenceBytes < 0 {
 		return nil, evidenceError(EvidenceFailureInvalidBinding)
 	}
+	policy := gate.EvidenceContainmentPolicy{ReadRoot: r.readRoot, SecurityCeiling: securityCeiling}
 	if limits.MaxEvidenceBytes == 0 {
 		return nil, evidenceError(EvidenceFailureEvidenceTooLarge)
 	}
@@ -168,7 +191,7 @@ func (r *evidenceRunner) run(
 			return nil, evidenceError(EvidenceFailureAmbiguousIdentity)
 		}
 		if err := authorizeEvidenceRequest(
-			ctx, r.access, r.containment, r.policy, r.allowedKinds, request,
+			ctx, r.access, r.containment, policy, r.allowedKinds, request,
 		); err != nil {
 			return nil, err
 		}
@@ -202,7 +225,7 @@ func (r *evidenceRunner) run(
 func preflightEvidenceIdentities(
 	calls []evidenceToolCall,
 	byName map[string]hustle.BoundEvidenceTool,
-	newExecutionID evidenceExecutionIDFactory,
+	newExecutionID EvidenceExecutionIDFactory,
 ) ([]uuid.UUID, error) {
 	seenCallIDs := make(map[string]struct{}, len(calls))
 	seenExecutionIDs := make(map[uuid.UUID]struct{}, len(calls))
@@ -281,9 +304,9 @@ func prepareEvidenceCall(
 
 func authorizeEvidenceRequest(
 	ctx context.Context,
-	access evidenceAccessEvaluator,
-	containment evidenceContainmentVerifier,
-	policy EvidenceContainmentPolicy,
+	access gate.EvidenceAccessEvaluator,
+	containment gate.EvidenceContainmentVerifier,
+	policy gate.EvidenceContainmentPolicy,
 	allowedKinds map[string]struct{},
 	request tool.Request,
 ) (err error) {
@@ -319,8 +342,8 @@ func authorizeEvidenceRequest(
 
 func verifyEvidenceContainment(
 	ctx context.Context,
-	containment evidenceContainmentVerifier,
-	policy EvidenceContainmentPolicy,
+	containment gate.EvidenceContainmentVerifier,
+	policy gate.EvidenceContainmentPolicy,
 	request tool.Request,
 ) (err error) {
 	if nilEvidenceRuntimeValue(reflect.ValueOf(containment)) ||

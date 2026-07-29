@@ -81,22 +81,33 @@ func newRuntimeController(sessionCtx context.Context, config RuntimeConfig) (*ru
 	}
 	var runner *evidenceRunner
 	var readWorkspace *tool.ReadWorkspaceBinding
+	evidenceNeeded := false
 	for _, definition := range definitions {
-		if _, enabled := definition.EvidenceToolPolicy(); !enabled {
+		policy, enabled := definition.EvidenceToolPolicy()
+		if !enabled {
 			continue
 		}
+		evidenceNeeded = true
 		if config.Evidence == nil || config.Evidence.ReadWorkspace == nil ||
 			config.Evidence.ReadWorkspace.Root == "" {
 			return nil, &ConfigError{Reason: ConfigMissingCollaborator, Field: "runtime.evidence"}
 		}
+		// Fail-fast (design's "construction, not first tool call" requirement):
+		// any declared Requirement.Kind this definition's evidence tools may
+		// ever produce, that is not present in the consumer's AllowedKinds
+		// allowlist, is rejected here with the offending kind named — never
+		// discovered lazily as an opaque EvidenceFailureForbiddenCapability the
+		// first time a classifier actually calls the tool mid-review.
+		if err := validateEvidenceAllowedKinds(definition.Name(), policy, config.Evidence.AllowedKinds); err != nil {
+			return nil, err
+		}
+	}
+	if evidenceNeeded {
 		var err error
 		runner, err = newEvidenceRunner(
 			config.Evidence.Access,
 			config.Evidence.Containment,
-			EvidenceContainmentPolicy{
-				ReadRoot:        config.Evidence.ReadWorkspace.Root,
-				SecurityCeiling: config.Evidence.SecurityCeiling,
-			},
+			config.Evidence.ReadWorkspace.Root,
 			config.Evidence.AllowedKinds,
 			config.Evidence.NewExecutionID,
 		)
@@ -104,7 +115,6 @@ func newRuntimeController(sessionCtx context.Context, config RuntimeConfig) (*ru
 			return nil, &ConfigError{Reason: ConfigMissingCollaborator, Field: "runtime.evidence"}
 		}
 		readWorkspace = &tool.ReadWorkspaceBinding{Root: config.Evidence.ReadWorkspace.Root}
-		break
 	}
 	executionCtx, cancelExecutions := context.WithCancel(sessionCtx)
 	runtime := &runtimeController{
@@ -118,6 +128,31 @@ func newRuntimeController(sessionCtx context.Context, config RuntimeConfig) (*ru
 	}
 	runtime.newExecutionContext = runtime.executionContextWithTimeout
 	return runtime, nil
+}
+
+// validateEvidenceAllowedKinds fails closed at construction when policy's
+// evidence tool definitions declare (via the optional tool.EvidenceKindDeclarer
+// capability) a Requirement.Kind not present in allowedKinds. Definitions that
+// do not implement EvidenceKindDeclarer are not statically checkable here —
+// their kinds are still enforced per-call by authorizeEvidenceRequest, which
+// remains the authoritative runtime backstop regardless of this check.
+func validateEvidenceAllowedKinds(name hustle.Name, policy hustle.EvidenceToolPolicy, allowedKinds []string) error {
+	allowed := make(map[string]struct{}, len(allowedKinds))
+	for _, kind := range allowedKinds {
+		allowed[kind] = struct{}{}
+	}
+	for _, definition := range policy.Definitions {
+		declarer, ok := definition.(tool.EvidenceKindDeclarer)
+		if !ok {
+			continue
+		}
+		for _, kind := range declarer.EvidenceRequirementKinds() {
+			if _, ok := allowed[kind]; !ok {
+				return &ConfigEvidenceKindError{Name: name, Kind: kind}
+			}
+		}
+	}
+	return nil
 }
 
 func nilRuntimeValue(value reflect.Value) bool {
@@ -397,7 +432,12 @@ func (r *runtimeController) prepareEvidenceExecution(
 	runtime := event.ModelRuntime{Key: binding.Model.Key(), Limits: binding.Model.Limits, Effort: binding.Model.Sampling.Effort}
 	output, outputEnabled := definition.OutputSchema()
 	policy, policyEnabled := definition.EvidenceToolPolicy()
-	if !outputEnabled || !policyEnabled || r.evidenceRunner == nil || r.evidenceWorkspace == nil {
+	// runRequest.SecurityCeiling is required here, not defaulted: this
+	// definition's evidence catalog is bound against THIS run's own ceiling
+	// (see hustle.Request.SecurityCeiling), never a controller-wide constant,
+	// so a caller that enables evidence tools must always supply one.
+	if !outputEnabled || !policyEnabled || r.evidenceRunner == nil || r.evidenceWorkspace == nil ||
+		runRequest.SecurityCeiling == "" {
 		return evidenceExecutionPlan{}, runtime, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, evidenceError(EvidenceFailureInvalidBinding))
 	}
 	tools, knownTools, err := staticEvidenceTools(policy)
@@ -527,7 +567,7 @@ func (r *runtimeController) executeEvidenceAttempt(
 			}
 			roundLimits := plan.policy.Limits
 			roundLimits.MaxEvidenceBytes = remaining
-			results, err := r.runEvidence(executionCtx, runID, catalog, response.calls, roundLimits)
+			results, err := r.runEvidence(executionCtx, runID, catalog, response.calls, roundLimits, runRequest.SecurityCeiling)
 			if err != nil {
 				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, err)
 			}
@@ -611,6 +651,7 @@ func (r *runtimeController) runEvidence(
 	catalog []hustle.BoundEvidenceTool,
 	calls []evidenceToolCall,
 	limits hustle.ToolLoopLimits,
+	securityCeiling string,
 ) ([]evidenceToolResult, error) {
 	done := make(chan evidenceRunResult, 1)
 	go func() {
@@ -621,7 +662,7 @@ func (r *runtimeController) runEvidence(
 				}
 			}
 		}()
-		results, err := r.evidenceRunner.run(ctx, catalog, calls, limits)
+		results, err := r.evidenceRunner.run(ctx, catalog, calls, limits, securityCeiling)
 		done <- evidenceRunResult{results: results, err: err}
 	}()
 	select {

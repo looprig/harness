@@ -32,6 +32,23 @@ func (e *ConfigError) Error() string {
 	return message
 }
 
+// ConfigEvidenceKindError reports that a registered hustle definition's
+// evidence tools may declare a Requirement.Kind the consumer's
+// runtime.evidence.AllowedKinds allowlist does not cover. It is raised at
+// controller CONSTRUCTION (newRuntimeController), not on the definition's
+// first real evidence-tool call, so a missing kind names itself immediately
+// rather than surfacing later as an opaque EvidenceFailureForbiddenCapability
+// deep inside a live classifier review.
+type ConfigEvidenceKindError struct {
+	Name hustle.Name
+	Kind string
+}
+
+func (e *ConfigEvidenceKindError) Error() string {
+	return "hustleruntime: hustle " + string(e.Name) + " evidence tools declare kind " +
+		e.Kind + " not present in runtime.evidence.allowed_kinds"
+}
+
 // AdmissionErrorReason identifies a rejection before lane ownership commits.
 type AdmissionErrorReason string
 

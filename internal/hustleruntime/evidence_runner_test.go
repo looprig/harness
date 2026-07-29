@@ -21,6 +21,13 @@ import (
 
 const evidenceReadKind = "filesystem.read"
 
+// testSecurityCeiling is the per-request ceiling value used by every
+// evidence_runner_test.go/evidence_boundary_test.go case that does not
+// specifically exercise ceiling freshness (see
+// TestEvidenceRunnerBindsEachRunToItsOwnRequestSecurityCeiling in
+// execution_test.go for the one that does).
+const testSecurityCeiling = "read-only"
+
 type evidenceAccessStub struct {
 	access uint8
 	err    error
@@ -207,7 +214,7 @@ func TestEvidenceRunnerPreparesOnceExecutesSequentiallyAndPreservesPreparedArtif
 
 	results, err := runner.run(context.Background(), catalog, calls, hustle.ToolLoopLimits{
 		MaxResultBytes: 1024, MaxEvidenceBytes: 2048,
-	})
+	}, testSecurityCeiling)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +323,7 @@ func TestEvidenceRunnerRejectsUnpreparedUnknownAndAmbiguousCalls(t *testing.T) {
 			runner := newTestEvidenceRunner(t, &evidenceAccessStub{access: gate.AccessAllow}, testCase.ids)
 			_, err := runner.run(context.Background(), testCase.catalog, testCase.calls, hustle.ToolLoopLimits{
 				MaxResultBytes: 1024, MaxEvidenceBytes: 2048,
-			})
+			}, testSecurityCeiling)
 			assertEvidenceFailure(t, err, testCase.want)
 		})
 	}
@@ -347,6 +354,7 @@ func TestEvidenceRunnerRejectsDuplicateMintedIdentityBeforePreparation(t *testin
 			{id: "second", name: "workspace_read", input: json.RawMessage(`{}`)},
 		},
 		hustle.ToolLoopLimits{MaxResultBytes: 1024, MaxEvidenceBytes: 2048},
+		testSecurityCeiling,
 	)
 	assertEvidenceFailure(t, err, EvidenceFailureAmbiguousIdentity)
 	if prepares, runs := candidate.counts(); prepares != 0 || runs != 0 {
@@ -381,6 +389,7 @@ func TestEvidenceRunnerRequiresExactPreparedExecutionIdentity(t *testing.T) {
 				[]hustle.BoundEvidenceTool{boundEvidenceRuntimeTool(t, candidate)},
 				[]evidenceToolCall{{id: "call", name: "workspace_read", input: json.RawMessage(`{}`)}},
 				hustle.ToolLoopLimits{MaxResultBytes: 1024, MaxEvidenceBytes: 2048},
+				testSecurityCeiling,
 			)
 			assertEvidenceFailure(t, err, EvidenceFailureAmbiguousIdentity)
 			if _, runs := candidate.counts(); runs != 0 {
@@ -440,6 +449,7 @@ func TestEvidenceRunnerFailsClosedForAccessAndForbiddenCapabilities(t *testing.T
 				[]hustle.BoundEvidenceTool{boundEvidenceRuntimeTool(t, candidate)},
 				[]evidenceToolCall{{id: "call", name: "workspace_read", input: json.RawMessage(`{}`)}},
 				hustle.ToolLoopLimits{MaxResultBytes: 1024, MaxEvidenceBytes: 2048},
+				testSecurityCeiling,
 			)
 			if testCase.want == "" {
 				if err != nil {
@@ -481,6 +491,7 @@ func TestEvidenceRunnerEnforcesPerResultAndAggregateEncodedByteBounds(t *testing
 			[]hustle.BoundEvidenceTool{boundEvidenceRuntimeTool(t, candidate)},
 			evidenceCalls,
 			hustle.ToolLoopLimits{MaxResultBytes: maxResult, MaxEvidenceBytes: maxEvidence},
+			testSecurityCeiling,
 		)
 		return runErr
 	}
@@ -514,6 +525,7 @@ func TestEvidenceRunnerStopsBeforeLaterCallWhenAggregateIsExhausted(t *testing.T
 			MaxResultBytes:   len(encoded) + 100,
 			MaxEvidenceBytes: len(encoded),
 		},
+		testSecurityCeiling,
 	)
 	assertEvidenceFailure(t, err, EvidenceFailureEvidenceTooLarge)
 	if prepares, runs := candidate.counts(); prepares != 1 || runs != 1 {
@@ -531,6 +543,7 @@ func TestEvidenceRunnerRejectsZeroRemainingBeforeCall(t *testing.T) {
 		[]hustle.BoundEvidenceTool{boundEvidenceRuntimeTool(t, candidate)},
 		[]evidenceToolCall{{id: "first", name: "workspace_read", input: json.RawMessage(`{}`)}},
 		hustle.ToolLoopLimits{MaxResultBytes: 1024, MaxEvidenceBytes: 0},
+		testSecurityCeiling,
 	)
 	assertEvidenceFailure(t, err, EvidenceFailureEvidenceTooLarge)
 	if prepares, runs := candidate.counts(); prepares != 0 || runs != 0 {
@@ -666,6 +679,7 @@ func TestEvidenceRunnerCancellationAndPanicsAreRedacted(t *testing.T) {
 				[]hustle.BoundEvidenceTool{boundEvidenceRuntimeTool(t, candidate)},
 				[]evidenceToolCall{{id: "call", name: "workspace_read", input: json.RawMessage(`{"secret":"` + secret + `"}`)}},
 				hustle.ToolLoopLimits{MaxResultBytes: 1024, MaxEvidenceBytes: 2048},
+				testSecurityCeiling,
 			)
 			assertEvidenceFailure(t, err, testCase.reason)
 			if strings.Contains(err.Error(), secret) {
@@ -759,13 +773,13 @@ func bindSingleRuntimeEvidenceTool(t *testing.T, concrete tool.InvokableTool, in
 	return catalog[0]
 }
 
-func newTestEvidenceRunner(t *testing.T, access evidenceAccessEvaluator, ids []uuid.UUID) *evidenceRunner {
+func newTestEvidenceRunner(t *testing.T, access gate.EvidenceAccessEvaluator, ids []uuid.UUID) *evidenceRunner {
 	t.Helper()
 	index := 0
 	runner, err := newEvidenceRunner(
 		access,
 		&evidenceContainmentStub{},
-		EvidenceContainmentPolicy{ReadRoot: "/workspace", SecurityCeiling: "read-only"},
+		"/workspace",
 		[]string{evidenceReadKind},
 		func() (uuid.UUID, error) {
 			if index >= len(ids) {

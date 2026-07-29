@@ -22,7 +22,7 @@ import (
 type evidenceContainmentStub struct {
 	mu      sync.Mutex
 	calls   int
-	policy  EvidenceContainmentPolicy
+	policy  gate.EvidenceContainmentPolicy
 	request tool.Request
 	err     error
 	panic   bool
@@ -31,7 +31,7 @@ type evidenceContainmentStub struct {
 
 func (s *evidenceContainmentStub) VerifyEvidenceContainment(
 	_ context.Context,
-	policy EvidenceContainmentPolicy,
+	policy gate.EvidenceContainmentPolicy,
 	request tool.Request,
 ) error {
 	s.mu.Lock()
@@ -48,7 +48,7 @@ func (s *evidenceContainmentStub) VerifyEvidenceContainment(
 	return s.err
 }
 
-func (s *evidenceContainmentStub) snapshot() (int, EvidenceContainmentPolicy, tool.Request) {
+func (s *evidenceContainmentStub) snapshot() (int, gate.EvidenceContainmentPolicy, tool.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls, s.policy, s.request.Clone()
@@ -56,7 +56,7 @@ func (s *evidenceContainmentStub) snapshot() (int, EvidenceContainmentPolicy, to
 
 type typedNilEvidenceContainment struct{}
 
-func (*typedNilEvidenceContainment) VerifyEvidenceContainment(context.Context, EvidenceContainmentPolicy, tool.Request) error {
+func (*typedNilEvidenceContainment) VerifyEvidenceContainment(context.Context, gate.EvidenceContainmentPolicy, tool.Request) error {
 	panic("must not verify")
 }
 
@@ -68,7 +68,7 @@ type filesystemEvidenceContainment struct{}
 
 func (*filesystemEvidenceContainment) VerifyEvidenceContainment(
 	_ context.Context,
-	policy EvidenceContainmentPolicy,
+	policy gate.EvidenceContainmentPolicy,
 	request tool.Request,
 ) error {
 	if policy.SecurityCeiling != "read-only" {
@@ -132,7 +132,7 @@ func TestEvidenceRunnerContainsEveryOwnedRequestBeforeAccessAndExecution(t *test
 	runner, err := newEvidenceRunner(
 		access,
 		verifier,
-		EvidenceContainmentPolicy{ReadRoot: "/workspace", SecurityCeiling: "read-only"},
+		"/workspace",
 		[]string{evidenceReadKind},
 		func() (uuid.UUID, error) { return mustRuntimeTestID(t), nil },
 	)
@@ -145,6 +145,7 @@ func TestEvidenceRunnerContainsEveryOwnedRequestBeforeAccessAndExecution(t *test
 		[]hustle.BoundEvidenceTool{boundEvidenceRuntimeTool(t, candidate)},
 		[]evidenceToolCall{{id: "call", name: "workspace_read", input: []byte(`{}`)}},
 		hustle.ToolLoopLimits{MaxResultBytes: 1024, MaxEvidenceBytes: 2048},
+		testSecurityCeiling,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -173,7 +174,7 @@ func TestEvidenceRunnerContainmentFailuresAreClosedAndPrecedeAccess(t *testing.T
 	const secret = "outside-root-or-symlink-secret"
 	tests := []struct {
 		name     string
-		verifier EvidenceContainmentVerifier
+		verifier gate.EvidenceContainmentVerifier
 		want     EvidenceFailureReason
 	}{
 		{name: "outside root", verifier: &evidenceContainmentStub{err: errors.New(secret)}, want: EvidenceFailureContainmentRefused},
@@ -188,7 +189,7 @@ func TestEvidenceRunnerContainmentFailuresAreClosedAndPrecedeAccess(t *testing.T
 			runner, err := newEvidenceRunner(
 				access,
 				testCase.verifier,
-				EvidenceContainmentPolicy{ReadRoot: "/workspace", SecurityCeiling: "read-only"},
+				"/workspace",
 				[]string{evidenceReadKind},
 				func() (uuid.UUID, error) { return mustRuntimeTestID(t), nil },
 			)
@@ -201,6 +202,7 @@ func TestEvidenceRunnerContainmentFailuresAreClosedAndPrecedeAccess(t *testing.T
 				[]hustle.BoundEvidenceTool{boundEvidenceRuntimeTool(t, candidate)},
 				[]evidenceToolCall{{id: "call", name: "workspace_read", input: []byte(`{}`)}},
 				hustle.ToolLoopLimits{MaxResultBytes: 1024, MaxEvidenceBytes: 2048},
+				testSecurityCeiling,
 			)
 			assertEvidenceFailure(t, err, testCase.want)
 			if access.calls != 0 {
@@ -220,14 +222,14 @@ func TestEvidenceRunnerContainmentFailuresAreClosedAndPrecedeAccess(t *testing.T
 func TestEvidenceRunnerRequiresContainmentVerifier(t *testing.T) {
 	t.Parallel()
 
-	for _, verifier := range []EvidenceContainmentVerifier{
+	for _, verifier := range []gate.EvidenceContainmentVerifier{
 		nil,
 		(*typedNilEvidenceContainment)(nil),
 	} {
 		_, err := newEvidenceRunner(
 			&evidenceAccessStub{access: gate.AccessAllow},
 			verifier,
-			EvidenceContainmentPolicy{ReadRoot: "/workspace", SecurityCeiling: "read-only"},
+			"/workspace",
 			[]string{evidenceReadKind},
 			uuid.New,
 		)
@@ -255,21 +257,17 @@ func TestEvidenceRuntimeConfigRequiresCanonicalContainmentPolicy(t *testing.T) {
 		{name: "unclean root", mutate: func(config *EvidenceRuntimeConfig) {
 			config.ReadWorkspace.Root = "/workspace/../workspace"
 		}},
-		{name: "empty ceiling", mutate: func(config *EvidenceRuntimeConfig) {
-			config.SecurityCeiling = ""
-		}},
 	}
 	for _, tt := range tests {
 		testCase := tt
 		t.Run(testCase.name, func(t *testing.T) {
 			config := validRuntimeConfig(t, definition)
 			evidence := &EvidenceRuntimeConfig{
-				Access:          &evidenceAccessStub{access: gate.AccessAllow},
-				Containment:     &evidenceContainmentStub{},
-				AllowedKinds:    []string{evidenceReadKind},
-				ReadWorkspace:   &tool.ReadWorkspaceBinding{Root: "/workspace"},
-				SecurityCeiling: "read-only",
-				NewExecutionID:  uuid.New,
+				Access:         &evidenceAccessStub{access: gate.AccessAllow},
+				Containment:    &evidenceContainmentStub{},
+				AllowedKinds:   []string{evidenceReadKind},
+				ReadWorkspace:  &tool.ReadWorkspaceBinding{Root: "/workspace"},
+				NewExecutionID: uuid.New,
 			}
 			testCase.mutate(evidence)
 			config.Evidence = evidence
@@ -290,13 +288,13 @@ func TestEvidenceRuntimeConfigRequiresCanonicalContainmentPolicy(t *testing.T) {
 func TestEvidenceContainmentPolicyCarriesNoRuntimeAuthority(t *testing.T) {
 	t.Parallel()
 
-	policyType := reflect.TypeOf(EvidenceContainmentPolicy{})
+	policyType := reflect.TypeOf(gate.EvidenceContainmentPolicy{})
 	if policyType.NumField() != 2 ||
 		policyType.Field(0).Name != "ReadRoot" ||
 		policyType.Field(1).Name != "SecurityCeiling" {
-		t.Fatalf("EvidenceContainmentPolicy fields = %#v, want root and ceiling only", policyType)
+		t.Fatalf("gate.EvidenceContainmentPolicy fields = %#v, want root and ceiling only", policyType)
 	}
-	var _ EvidenceContainmentVerifier = (*evidenceContainmentStub)(nil)
+	var _ gate.EvidenceContainmentVerifier = (*evidenceContainmentStub)(nil)
 }
 
 func TestEvidenceContainmentConsumerRejectsOutsideSymlinkAmbiguityAndCeiling(t *testing.T) {
@@ -352,7 +350,7 @@ func TestEvidenceContainmentConsumerRejectsOutsideSymlinkAmbiguityAndCeiling(t *
 			runner, err := newEvidenceRunner(
 				access,
 				&filesystemEvidenceContainment{},
-				EvidenceContainmentPolicy{ReadRoot: root, SecurityCeiling: testCase.ceiling},
+				root,
 				[]string{evidenceReadKind},
 				uuid.New,
 			)
@@ -364,6 +362,7 @@ func TestEvidenceContainmentConsumerRejectsOutsideSymlinkAmbiguityAndCeiling(t *
 				[]hustle.BoundEvidenceTool{boundEvidenceRuntimeTool(t, candidate)},
 				[]evidenceToolCall{{id: "call", name: "workspace_read", input: []byte(`{}`)}},
 				hustle.ToolLoopLimits{MaxResultBytes: 1024, MaxEvidenceBytes: 2048},
+				testCase.ceiling,
 			)
 			if testCase.wantErr {
 				assertEvidenceFailure(t, err, EvidenceFailureContainmentRefused)
@@ -385,7 +384,7 @@ func TestEvidenceWorkerRecoversExecutionIDPanicWithoutLeakingValue(t *testing.T)
 	runner, err := newEvidenceRunner(
 		allowingConcurrentEvidenceAccess{},
 		&evidenceContainmentStub{},
-		EvidenceContainmentPolicy{ReadRoot: "/workspace", SecurityCeiling: "read-only"},
+		"/workspace",
 		[]string{evidenceReadKind},
 		func() (uuid.UUID, error) { panic(secret) },
 	)
@@ -408,6 +407,7 @@ func TestEvidenceWorkerRecoversExecutionIDPanicWithoutLeakingValue(t *testing.T)
 		[]hustle.BoundEvidenceTool{boundEvidenceRuntimeTool(t, candidate)},
 		[]evidenceToolCall{{id: "call", name: "workspace_read", input: []byte(`{}`)}},
 		hustle.ToolLoopLimits{MaxResultBytes: 1024, MaxEvidenceBytes: 2048},
+		testSecurityCeiling,
 	)
 	if results != nil {
 		t.Fatalf("results = %#v, want nil", results)
@@ -442,7 +442,7 @@ func TestEvidenceRunnerConcurrentCallsOnSharedToolOwnPreparedRequests(t *testing
 		&evidenceContainmentStub{verify: func(request tool.Request) {
 			request.Requirements[0].Match = "/outside/mutated"
 		}},
-		EvidenceContainmentPolicy{ReadRoot: "/workspace", SecurityCeiling: "read-only"},
+		"/workspace",
 		[]string{evidenceReadKind},
 		uuid.New,
 	)
@@ -461,6 +461,7 @@ func TestEvidenceRunnerConcurrentCallsOnSharedToolOwnPreparedRequests(t *testing
 				catalog,
 				[]evidenceToolCall{{id: callID, name: "workspace_read", input: []byte(`{}`)}},
 				hustle.ToolLoopLimits{MaxResultBytes: 1024, MaxEvidenceBytes: 2048},
+				testSecurityCeiling,
 			)
 			errs <- runErr
 		}()

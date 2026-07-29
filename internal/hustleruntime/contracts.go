@@ -6,6 +6,7 @@ import (
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -51,14 +52,18 @@ type RuntimeConfig struct {
 }
 
 // EvidenceRuntimeConfig supplies only the headless, read-only capabilities
-// needed by opt-in evidence-tool definitions.
+// needed by opt-in evidence-tool definitions. There is deliberately no
+// controller-wide SecurityCeiling field here: the ceiling is bound PER
+// RunAndFinalize call from that call's own hustle.Request.SecurityCeiling
+// (execution.go), never frozen at controller construction — see
+// hustle.Request.SecurityCeiling's doc comment for why a construction-time
+// constant would be a real staleness bug for a long-running session.
 type EvidenceRuntimeConfig struct {
-	Access          EvidenceAccessEvaluator
-	Containment     EvidenceContainmentVerifier
-	AllowedKinds    []string
-	ReadWorkspace   *tool.ReadWorkspaceBinding
-	SecurityCeiling string
-	NewExecutionID  EvidenceExecutionIDFactory
+	Access         gate.EvidenceAccessEvaluator
+	Containment    gate.EvidenceContainmentVerifier
+	AllowedKinds   []string
+	ReadWorkspace  *tool.ReadWorkspaceBinding
+	NewExecutionID EvidenceExecutionIDFactory
 }
 
 // HeaderStamper mints the identity fields of one internal lifecycle event.
@@ -104,36 +109,11 @@ type ValidateResult func(context.Context, hustle.Result) error
 // Shutdown function, or other generic session-control capability.
 type Finalizer func(context.Context, hustle.Outcome) error
 
-// evidenceAccessEvaluator is the deliberately non-interactive access seam used
-// by the evidence runner. gate.AccessBindings satisfies it without exposing
-// approval, stored-rule, persistence, or grant capabilities.
-type EvidenceAccessEvaluator interface {
-	AccessFor(tool.Requirement) (uint8, error)
-}
-
-type evidenceAccessEvaluator = EvidenceAccessEvaluator
-
-// EvidenceContainmentPolicy is the complete security context exposed to the
-// evidence containment verifier. ReadRoot must be the canonical workspace root;
-// SecurityCeiling is the trusted consumer's effective, non-widenable policy.
-type EvidenceContainmentPolicy struct {
-	ReadRoot        string
-	SecurityCeiling string
-}
-
-// EvidenceContainmentVerifier independently resolves every prepared target,
-// including symlinks and ambiguous scopes, against the canonical read root and
-// enforces the configured security ceiling. It receives no session, gate,
-// mutation, grant, rule, or loop-control capability. Implementations must fail
-// closed when a tool-owned Requirement cannot be mapped unambiguously.
-type EvidenceContainmentVerifier interface {
-	VerifyEvidenceContainment(context.Context, EvidenceContainmentPolicy, tool.Request) error
-}
-
-type evidenceContainmentVerifier = EvidenceContainmentVerifier
-
+// EvidenceExecutionIDFactory mints one candidate identifier for an evidence
+// tool call before authorization. It is a purely internal, Harness-owned seam
+// (uuid.New in production) — never consumer-supplied — so unlike
+// EvidenceAccessEvaluator/EvidenceContainmentVerifier it is not re-exported
+// from pkg/gate.
 type EvidenceExecutionIDFactory func() (uuid.UUID, error)
-
-type evidenceExecutionIDFactory = EvidenceExecutionIDFactory
 
 var withPreparedEvidenceCall = loop.WithPreparedCall
