@@ -31,6 +31,9 @@ Both return a `session.SessionController`, which embeds `session.Session`
 ## How to use
 
 ```go
+reviewPolicy, err := gate.DefaultPermissionReviewPolicy("review-policy-v1")
+if err != nil { /* ... */ }
+
 r, err := rig.Define(
     rig.WithLoops(operatorLoop, reviewerLoop),
     rig.WithPrimers("operator"),
@@ -39,7 +42,8 @@ r, err := rig.Define(
     rig.WithHustles(/* ...optional hustle.Definition values... */...),
     rig.WithHustleLimits(rig.HustleLimits{ /* ... */ }),
     rig.WithPermissionClassifiers(permissionClassifiers),
-    rig.WithPermissionReviewPolicyRevision(permissionReviewPolicy.Revision),
+    rig.WithPermissionReviewPolicy(reviewPolicy),
+    rig.WithPermissionReviewSecurityCeiling("consumer-access-profile/v1"),
     rig.WithForeignBuilders(/* ...foreign.Builder for codex/claude... */...),
     rig.WithGateCaps(rig.GateCaps{MaxOpen: 16, MaxTimeout: 30*time.Second}),
     rig.WithDelegationLimits(rig.DelegationLimits{Depth: 4, Quota: 32}),

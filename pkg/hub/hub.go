@@ -281,10 +281,11 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 	return committed, nil
 }
 
-// PublishInternalEventChecked durably appends one recognized private hustle
-// lifecycle event. It deliberately bypasses quiescence mutation, workspace idle
-// boundaries, and subscriber delivery: the separate hustle activity lease owns the
-// blocking state, while this method owns only the private audit record.
+// PublishInternalEventChecked durably appends one recognized private
+// hustle-lifecycle or permission-review event. It deliberately bypasses
+// quiescence mutation, workspace idle boundaries, and subscriber delivery:
+// the separate hustle activity lease owns the blocking state, while this
+// method owns only the private audit record.
 func (h *Hub) PublishInternalEventChecked(ctx context.Context, ev event.Event) error {
 	if err := h.validateInternalPublication(ev); err != nil {
 		return err

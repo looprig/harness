@@ -193,7 +193,7 @@ func TestPublishInternalEventCheckedRejectsPermissionReviewPointerForm(t *testin
 	// must never be nil: the value form is the only one review_adapter.go
 	// (or hustleruntime/audit.go) ever actually publishes.
 	var boundary *PublishBoundaryError
-	if !errors.As(err, &boundary) || err == nil {
+	if !errors.As(err, &boundary) {
 		t.Fatalf("error = %T %v, want a PublishBoundaryError (pointer form must never be accepted)", err, err)
 	}
 	if appender.callCount() != 0 {
