@@ -205,6 +205,27 @@ func TestPermissionReviewPolicyConstructionAndOwnership(t *testing.T) {
 	}
 }
 
+// TestPermissionReviewPolicySealed proves the Sealed() developer-experience
+// accessor: a hand-built literal PermissionReviewPolicy{} (bypassing
+// NewPermissionReviewPolicy/DefaultPermissionReviewPolicy) reports false, so
+// a consumer boundary (e.g. rig.WithPermissionReviewPolicy) can fail fast at
+// configuration time instead of discovering the same zero seal later at
+// EvaluatePermissionAssessment, which already fails closed on it regardless.
+func TestPermissionReviewPolicySealed(t *testing.T) {
+	t.Parallel()
+	var zero gate.PermissionReviewPolicy
+	if zero.Sealed() {
+		t.Fatal("zero-value PermissionReviewPolicy{}.Sealed() = true, want false")
+	}
+	constructed, err := gate.DefaultPermissionReviewPolicy("policy-v1")
+	if err != nil {
+		t.Fatalf("DefaultPermissionReviewPolicy: %v", err)
+	}
+	if !constructed.Sealed() {
+		t.Fatal("constructor-built PermissionReviewPolicy.Sealed() = false, want true")
+	}
+}
+
 func TestPermissionReviewPolicyRejectsInvalidAndRelaxedValues(t *testing.T) {
 	t.Parallel()
 	validMinimum := func() map[gate.ReviewRisk]gate.ReviewAuthorization {

@@ -148,6 +148,19 @@ func DefaultPermissionReviewPolicy(revision string) (PermissionReviewPolicy, err
 	)
 }
 
+// Sealed reports whether policy was constructed through NewPermissionReviewPolicy
+// or DefaultPermissionReviewPolicy, as opposed to a hand-built literal
+// PermissionReviewPolicy{} that never went through either constructor. It is
+// a convenience for a caller that wants to fail fast at its own
+// configuration boundary rather than discovering the same zero seal later:
+// EvaluatePermissionAssessment already fails closed on an unsealed policy
+// regardless of whether a caller checks Sealed() first, so this method adds
+// no new security enforcement — it only reports the existing invariant
+// earlier and with a clearer symptom.
+func (p PermissionReviewPolicy) Sealed() bool {
+	return p.seal != ([sha256.Size]byte{})
+}
+
 // EvaluatePermissionAssessment validates all public inputs again and applies
 // the local hard ceiling without mutating them.
 func EvaluatePermissionAssessment(
