@@ -2126,6 +2126,127 @@ structurally plausible.
 
 ---
 
+## Addendum — Phase 6 specification-compliance review fixes
+
+A dedicated Phase 6 specification-compliance review of the whole feature
+(all three addenda above, plus the CodeRig consumer wiring) raised three
+findings. All three are fixed here, in this repository only; CodeRig's own
+follow-up is called out per finding where it applies.
+
+**Finding 1 [Important] — audit events silently failed to publish.**
+`PermissionReviewStarted`/`PermissionReviewCompleted` are Internal-visibility
+audit events, but `review_adapter.go` published them through Session's
+public-only `PublishEventChecked`, which `validatePublicPublication`
+unconditionally rejects for non-Public visibility. Every real classifier
+review's audit append therefore failed and, per design's integrity-failure
+handling, faulted the whole session. Fixed by rewiring
+`permissionReviewAuditPublisher` to `Hub.PublishInternalEventChecked` (the
+same path ordinary Hustle lifecycle events already use) and adding both
+event types to `pkg/hub.isInternalAuditEventType`, the single allowlist/
+denylist source both publication paths consult. Commit `9eae9681`.
+
+**Finding 2 [Important] — `SecurityCeiling` was an unconditional sentinel.**
+`gate.ReviewContext`/`ReviewBasis.SecurityCeiling` was stamped from a fixed
+Harness-side sentinel string on every session, so a real consumer's
+`EvidenceContainmentVerifier` — which does an exact-equality check against
+its OWN locally-known ceiling — could never match it: every real
+evidence-tool call failed closed, unconditionally. Fixed by deleting the
+sentinel and adding `WithPermissionReviewSecurityCeiling` (a consumer-owned
+value threaded the same way `WithPermissionReviewEvidence`'s
+Containment/AllowedKinds collaborators already are), with `Define()`-time
+pairing validation. Commit `bed51463`.
+
+**Finding 3 [Important] — enabling permission-review classifiers was
+silently accepted on session restore, contradicting design §21's "never
+silently resumes with a different reviewer."** Permission-review
+classifier/policy identity folded entirely into the generic `TopologyRev`
+fingerprint field (`pkg/rig/fingerprint.go`'s
+`frozenFingerprintWithPermissionReview`/
+`topologyRevisionWithHustlesAndPermissionReview`), which
+`pkg/event/drift.go`'s `AssessDrift` classified as `DriftInfo`
+unconditionally whenever `TopologyRev` differed — not direction-sensitive.
+`pkg/session/decider.go`'s `DefaultPolicyDecider` auto-accepts any
+all-`DriftInfo` assessment with no operator signal. Concretely: a session
+opened with classifiers disabled, the consumer's code redeployed with
+classifiers enabled, the session restored — and it silently started
+auto-reviewing gates the original session-open would have kept 100%
+human-only. CodeRig's own `TestPermissionReviewConfigFingerprintChanges`
+(`internal/app/permission_review_test.go`) explicitly proved and accepted
+this exact behavior as intentional; it documents, in its own comment, that
+it was verified against `pkg/event/drift.go` as it stood before this fix.
+
+Fix: `pkg/event.ConfigManifest` gained a new field,
+`PermissionReviewConfigured bool` (`pkg/event/config_manifest.go`) — the
+narrow "was ANY permission-review classifier configured at all" signal,
+deliberately NOT the classifier/policy identity digest (that stays folded
+into `TopologyRev` for its own, separate purpose: detecting drift among
+already-enabled classifiers). It participates in the canonical fingerprint
+encoding (bumping the golden `TestManifestFingerprintGolden` vector; no
+`ManifestSchemaVersion` bump — the schema is still unreleased/under active
+construction within this same phase, so there is no external persisted
+`SchemaVersion=1` manifest this needs to stay byte-compatible with).
+`pkg/event/drift.go`'s `AssessDrift` gained a direct (non-`assessDirectional`,
+since this is a plain boolean, not a `StrictnessLevel`) comparison on this
+field, in the existing `DriftPermission` category with `Field:
+"review_configured"`:
+
+- `false -> true` (disabled -> enabled): `DriftWarn` — the fix. Requires an
+  explicit accept (`AcceptAllDecider`/the `WithAllowConfigMismatch`
+  successor), never silent.
+- `true -> false` (enabled -> disabled): `DriftInfo` — narrowing (fewer
+  automated decisions, more human control), unchanged from today.
+- `true -> true` with a different classifier/policy identity: no
+  `review_configured` entry at all (both sides equal); the identity change is
+  still visible, still `DriftInfo`, via the pre-existing `TopologyRev`
+  comparison — unchanged, not regressed.
+- `false -> false` (never configured, either side): no entry — the
+  permission-review dimension doesn't exist for the comparison, exactly as
+  before this fix.
+
+`pkg/rig/fingerprint.go`'s `frozenManifestWithPermissionReview` sets
+`manifest.PermissionReviewConfigured = review != nil`, i.e. exactly the same
+condition that already gated whether `TopologyRev` gets the permission-review
+overlay — so a no-review rig's manifest is byte-identical to before (proved
+by the pre-existing `TestPermissionReviewFingerprintPreservesLegacyIdentityWhenDisabled`,
+which still passes unmodified).
+
+Tests: `pkg/event/drift_test.go`'s
+`TestAssessDriftPermissionReviewConfiguredTransitions` drives all four
+transitions above directly against real `ConfigManifest`/`AssessDrift` (plus
+a fifth-transition row folded into the existing `TestAssessDrift` table and a
+fingerprint-sensitivity row in `TestManifestFingerprint`).
+`pkg/session/decider_test.go`'s
+`TestDefaultPolicyDeciderRejectsSilentPermissionReviewActivation` proves
+`DefaultPolicyDecider` rejects the disabled->enabled restore by default
+(and that `AcceptAllDecider`, the documented explicit opt-in, still accepts
+it) through a real `event.AssessDrift` call, not a hand-built
+`DriftAssessment`; `TestDefaultPolicyDeciderPermissionReviewOtherTransitions`
+proves the other three transitions still auto-accept.
+`pkg/rig/hustle_fingerprint_test.go`'s
+`TestFrozenManifestWithPermissionReviewSetsConfigured` proves the rig-level
+wiring itself (not just the manifest/drift layer in isolation).
+
+**CodeRig follow-up (a separate task, not this one):**
+`TestPermissionReviewConfigFingerprintChanges` will need updating once
+CodeRig's `go.mod` picks up a Harness version containing this fix — its
+disabled -> enabled restore cases currently assert acceptance and will now
+observe a rejection (`RestoreRejectedError`) unless CodeRig also wires an
+explicit accept (`WithAllowConfigMismatch` or an equivalent
+`RestoreDecider`). Its same-configuration disabled -> disabled control case
+is unaffected. No other Harness-facing surface changed: `ConfigFingerprint`
+(the legacy, non-manifest type) was deliberately left untouched — it has no
+permission-review concept and none was added, consistent with
+`ConfigFingerprintFields`'s existing documented split between fields carried
+by the legacy fingerprint and fields carried only by the richer
+`ConfigManifest`.
+
+**Regression evidence:** `go build ./...`, `go vet ./...`, `gofmt -l .`
+(scoped, excludes vendor/worktrees) all clean. `go test -race ./...` clean
+across the full module (`pkg/event`, `pkg/session`, `pkg/rig`,
+`internal/sessionruntime`, and every other package).
+
+---
+
 # Phase 6 — Consumer composition in CodeRig
 
 ## Task 23: Create isolated CodeRig worktree and add explicit classifier config
