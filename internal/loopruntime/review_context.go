@@ -64,14 +64,6 @@ func withPermissionReviewContext(ctx context.Context, review gate.ReviewContext)
 	return context.WithValue(ctx, permissionReviewContextKey{}, review.Clone())
 }
 
-func permissionReviewContextFromContext(ctx context.Context) (gate.ReviewContext, bool) {
-	review, ok := ctx.Value(permissionReviewContextKey{}).(gate.ReviewContext)
-	if !ok || review.ContextRevision == "" {
-		return gate.ReviewContext{}, false
-	}
-	return review.Clone(), true
-}
-
 // ReviewContext is the Harness-internal (Go-exported, but still inside the
 // internal/ boundary — unreachable from outside this module) input that turns
 // on live permission-review context capture for every turn a constructed Loop
