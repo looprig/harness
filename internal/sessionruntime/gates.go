@@ -184,6 +184,22 @@ func withPermissionReview(classifiers gate.PermissionClassifierSet, policy gate.
 	}
 }
 
+// withPermissionReviewEvidence configures the session-wide, consumer-supplied
+// evidence-tool access boundary every registered permission classifier's
+// evidence tools authorize against (design §13.1), mirroring
+// withPermissionReview's capture-only shape. It is private: a real
+// access/verifier pair wired from a consumer's rig.WithPermissionReviewEvidence
+// call is Task 24 work, not this seam's. newHustleController (hustle.go)
+// fails construction closed if a registered classifier needs evidence tools
+// but this option was never applied.
+func withPermissionReviewEvidence(access gate.EvidenceAccessEvaluator, containment gate.EvidenceContainmentVerifier, allowedKinds []string) Option {
+	return func(s *Session) {
+		s.permissionReviewEvidenceAccess = access
+		s.permissionReviewEvidenceContainment = containment
+		s.permissionReviewEvidenceAllowedKinds = append([]string(nil), allowedKinds...)
+	}
+}
+
 // StartPermissionReview implements the loop actor's private permissionReviewStarter
 // seam (internal/loopruntime/gate.go): the ONLY thing the actor calls, inline
 // and fire-and-forget, after a gatePermission registration activates and the

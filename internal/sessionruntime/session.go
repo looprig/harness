@@ -126,6 +126,21 @@ type Session struct {
 	permissionClassifiers  gate.PermissionClassifierSet
 	permissionReviewPolicy gate.PermissionReviewPolicy
 
+	// permissionReviewEvidenceAccess, permissionReviewEvidenceContainment, and
+	// permissionReviewEvidenceAllowedKinds are the immutable construction
+	// inputs set by withPermissionReviewEvidence (internal/sessionruntime/
+	// gates.go), forwarded into hustleruntime.RuntimeConfig.Evidence at
+	// hustle-controller construction (hustle.go's newHustleController). They
+	// install the consumer-supplied read-only evidence-tool access boundary
+	// every registered permission classifier's evidence tools authorize
+	// against (design §13.1). All three stay at their zero value for a
+	// session that never opts in — newHustleController then fails
+	// CONSTRUCTION closed (never silently permissive) for any registered
+	// classifier whose definition actually needs evidence tools.
+	permissionReviewEvidenceAccess       gate.EvidenceAccessEvaluator
+	permissionReviewEvidenceContainment  gate.EvidenceContainmentVerifier
+	permissionReviewEvidenceAllowedKinds []string
+
 	// review is the session's bounded, PURELY in-memory permission-review
 	// cancellation-group + circuit-breaker bookkeeping (design §15, §18;
 	// internal/sessionruntime/review_state.go). It is never persisted and

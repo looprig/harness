@@ -6,6 +6,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/internal/hustleruntime"
 	"github.com/looprig/harness/pkg/hustle"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // HustleModelResolveReason classifies an exact current-loop lookup failure.
@@ -239,6 +240,34 @@ func (s *Session) newHustleController(bound []hustle.BoundDefinition) (*hustleru
 			Stamper:            s.factory, Audit: s.hub, Faults: sessionHustleFaultReporter{session: s},
 			Activity:         newHubHustleActivityTracker(s.hub),
 			FinalizerContext: sessionHustleFinalizerContext{session: s},
+			Evidence:         s.hustleEvidenceRuntimeConfig(),
 		},
 	})
+}
+
+// hustleEvidenceRuntimeConfig builds the evidence-tool runtime config every
+// registered hustle's (opt-in) evidence catalog binds against. ReadWorkspace
+// is auto-derived from the session's OWN existing workspace-root tracking
+// (s.wsRoot, populated by withResolvedPlacement/WithWorkspaceCheckpointing —
+// see command_journal.go) — the consumer is never asked for it a second
+// time. NewExecutionID is Harness's own trivial internal factory (uuid.New);
+// it is never consumer-supplied. Access/Containment/AllowedKinds come
+// entirely from the consumer-supplied withPermissionReviewEvidence option
+// (gates.go); when that option was never applied they stay at their zero
+// value, and newRuntimeController (internal/hustleruntime) fails
+// CONSTRUCTION closed — never silently permissive — for any registered
+// hustle whose definition actually needs evidence tools. This value is
+// always non-nil so that fail-closed check is reachable regardless of
+// whether this particular session opted into evidence review at all.
+func (s *Session) hustleEvidenceRuntimeConfig() *hustleruntime.EvidenceRuntimeConfig {
+	evidence := &hustleruntime.EvidenceRuntimeConfig{
+		Access:         s.permissionReviewEvidenceAccess,
+		Containment:    s.permissionReviewEvidenceContainment,
+		AllowedKinds:   append([]string(nil), s.permissionReviewEvidenceAllowedKinds...),
+		NewExecutionID: uuid.New,
+	}
+	if s.wsRoot != "" {
+		evidence.ReadWorkspace = &tool.ReadWorkspaceBinding{Root: s.wsRoot}
+	}
+	return evidence
 }

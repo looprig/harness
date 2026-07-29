@@ -166,6 +166,17 @@ type Lifecycle struct {
 	// permissionReviewConfigured's "option called, not value non-zero" signal.
 	permissionReviewBreakerLimits     reviewCircuitBreakerLimits
 	permissionReviewBreakerConfigured bool
+
+	// permissionReviewEvidenceAccess, permissionReviewEvidenceContainment,
+	// permissionReviewEvidenceAllowedKinds, and
+	// permissionReviewEvidenceConfigured capture
+	// WithLifecyclePermissionReviewEvidence's installed evidence-tool access
+	// boundary (design §13.1), mirroring permissionReviewConfigured's "option
+	// called, not value non-zero" signal.
+	permissionReviewEvidenceAccess       gate.EvidenceAccessEvaluator
+	permissionReviewEvidenceContainment  gate.EvidenceContainmentVerifier
+	permissionReviewEvidenceAllowedKinds []string
+	permissionReviewEvidenceConfigured   bool
 }
 
 // HustleLimits is sessionruntime's narrow, rig-independent copy of the hustle
@@ -262,6 +273,26 @@ func WithLifecyclePermissionReviewBreaker(limits PermissionReviewBreakerLimits) 
 	return func(r *Lifecycle) {
 		r.permissionReviewBreakerLimits = limits.toReviewCircuitBreakerLimits()
 		r.permissionReviewBreakerConfigured = true
+	}
+}
+
+// WithLifecyclePermissionReviewEvidence installs the consumer-supplied
+// read-only evidence-tool access boundary every registered permission
+// classifier's evidence tools authorize against (design §13.1), mirroring
+// WithLifecyclePermissionReview's capture-once-forward-to-both shape. Both
+// NewSession and RestoreSession apply it via the private
+// withPermissionReviewEvidence Option (gates.go). Omitting this option
+// leaves every session's evidence collaborators at their zero value;
+// newHustleController (hustle.go) then fails CONSTRUCTION closed — never
+// silently permissive — for any registered classifier whose definition
+// actually needs evidence tools.
+func WithLifecyclePermissionReviewEvidence(access gate.EvidenceAccessEvaluator, containment gate.EvidenceContainmentVerifier, allowedKinds []string) LifecycleOption {
+	captured := append([]string(nil), allowedKinds...)
+	return func(r *Lifecycle) {
+		r.permissionReviewEvidenceAccess = access
+		r.permissionReviewEvidenceContainment = containment
+		r.permissionReviewEvidenceAllowedKinds = append([]string(nil), captured...)
+		r.permissionReviewEvidenceConfigured = true
 	}
 }
 
@@ -516,6 +547,11 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	if r.permissionReviewBreakerConfigured {
 		opts = append(opts, withPermissionReviewBreaker(r.permissionReviewBreakerLimits))
 	}
+	if r.permissionReviewEvidenceConfigured {
+		opts = append(opts, withPermissionReviewEvidence(
+			r.permissionReviewEvidenceAccess, r.permissionReviewEvidenceContainment, r.permissionReviewEvidenceAllowedKinds,
+		))
+	}
 	opts = append(opts,
 		WithSessionID(sid),
 		WithEventAppender(evAp),
@@ -616,6 +652,11 @@ func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session,
 	}
 	if r.permissionReviewBreakerConfigured {
 		opts = append(opts, withPermissionReviewBreaker(r.permissionReviewBreakerLimits))
+	}
+	if r.permissionReviewEvidenceConfigured {
+		opts = append(opts, withPermissionReviewEvidence(
+			r.permissionReviewEvidenceAccess, r.permissionReviewEvidenceContainment, r.permissionReviewEvidenceAllowedKinds,
+		))
 	}
 	if r.frozenFingerprint != nil {
 		opts = append(opts, WithFingerprint(*r.frozenFingerprint))

@@ -414,6 +414,43 @@ func TestPermissionReviewAdapterReviewSchedulesOnlyApplicableClassifiers(t *test
 	}
 }
 
+// TestPermissionReviewAdapterReviewThreadsSecurityCeilingIntoHustleRequest
+// closes the addendum's remaining gap in the review→evidence path: reviewOne
+// already captured req.ReviewContext.SecurityCeiling into the classifier's
+// gate.ReviewBasis (basis.SecurityCeiling, used for drift detection at
+// respondFromClassifier), but the hustle.Request built for the classifier's
+// own Hustle run never carried it — so even with RuntimeConfig.Evidence
+// correctly wired (hustle.go), a classifier needing evidence tools would
+// still fail every review closed with EvidenceFailureInvalidBinding because
+// hustleruntime's evidence-binding path requires a non-empty per-request
+// ceiling (internal/hustleruntime/execution.go's prepareEvidenceExecution).
+// This proves the runner is called with the SAME ceiling value the basis
+// captured from ReviewContext.
+func TestPermissionReviewAdapterReviewThreadsSecurityCeilingIntoHustleRequest(t *testing.T) {
+	t.Parallel()
+	classifier := newValidReviewClassifier(t, "ceiling-classifier", "rev-ceiling", true)
+	set, err := gate.NewPermissionClassifierSet(classifier)
+	if err != nil {
+		t.Fatalf("NewPermissionClassifierSet: %v", err)
+	}
+	runner := &permissionReviewRunnerStub{result: hustle.Result{Output: json.RawMessage(`{}`)}}
+	adapter, err := newPermissionReviewAdapter(runner, set, validReviewPolicy(t), &permissionReviewResponderStub{})
+	if err != nil {
+		t.Fatalf("newPermissionReviewAdapter: %v", err)
+	}
+
+	req := validReviewRequest(t, mustUUID(), mustUUID())
+	req.ReviewContext.SecurityCeiling = "workspace-write"
+
+	adapter.review(context.Background(), req)
+
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if len(runner.requests) != 1 || runner.requests[0].SecurityCeiling != "workspace-write" {
+		t.Fatalf("scheduled request SecurityCeiling = %#v, want exactly the review's own ReviewContext.SecurityCeiling", runner.requests)
+	}
+}
+
 // TestPermissionReviewAdapterReviewSkipsWhenReviewContextMissing proves the
 // fail-closed default: a zero ReviewContext (ContextRevision == "") means no
 // live review was captured for this turn, so review must schedule nothing.

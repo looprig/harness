@@ -437,6 +437,13 @@ func (a *permissionReviewAdapter) reviewOne(ctx context.Context, req loopruntime
 		Name:  classifier.Name(),
 		Cause: identity.Cause{Coordinates: req.ReviewContext.Coordinates},
 		Input: input,
+		// basis.SecurityCeiling is this review's frozen basis value, captured
+		// once above from req.ReviewContext.SecurityCeiling (design §21) — the
+		// exact per-review ceiling any evidence tools this classifier's Hustle
+		// binds must be authorized against. It is never a session-wide
+		// constant (hustle.Request.SecurityCeiling's doc comment), so a
+		// classifier with no evidence-tool concept simply never reads it.
+		SecurityCeiling: basis.SecurityCeiling,
 	}
 	if err := a.runner.RunAndFinalize(ctx, runRequest, validate, finish); err != nil {
 		if runErr == nil {

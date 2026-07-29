@@ -287,6 +287,71 @@ func TestWithLifecyclePermissionReviewBreakerTripsAtConfiguredThreshold(t *testi
 	})
 }
 
+// TestWithLifecyclePermissionReviewEvidenceThreadsToNewSessionAndRestoreSession
+// proves WithLifecyclePermissionReviewEvidence's access/containment/
+// allowed-kinds installation reaches a real session's
+// permissionReviewEvidence* fields through BOTH NewSession and
+// RestoreSession, mirroring
+// TestWithLifecyclePermissionReviewThreadsToNewSessionAndRestoreSession's
+// shape for the sibling permission-review option.
+func TestWithLifecyclePermissionReviewEvidenceThreadsToNewSessionAndRestoreSession(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		restore bool
+	}{
+		{name: "new session"},
+		{name: "restored session", restore: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store := newRestoreStore(t)
+			definition := restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful")
+
+			var sessionID uuid.UUID
+			if tt.restore {
+				sessionID = runAndShutdown(t, store, definition)
+			}
+
+			access := sessionEvidenceAccessStub{}
+			containment := sessionEvidenceContainmentStub{}
+			kinds := []string{"filesystem.read", "git.read"}
+			lifecycle, err := newTestLifecycle(
+				definition, store,
+				WithLifecyclePermissionReviewEvidence(access, containment, kinds),
+			)
+			if err != nil {
+				t.Fatalf("NewTopologyLifecycle: %v", err)
+			}
+
+			var s *Session
+			if tt.restore {
+				s, err = lifecycle.RestoreSession(context.Background(), sessionID)
+			} else {
+				s, err = lifecycle.NewSession(context.Background(), "")
+			}
+			if err != nil {
+				t.Fatalf("session construction: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+			if s.permissionReviewEvidenceAccess != access {
+				t.Fatalf("permissionReviewEvidenceAccess = %#v, want %#v", s.permissionReviewEvidenceAccess, access)
+			}
+			if s.permissionReviewEvidenceContainment != containment {
+				t.Fatalf("permissionReviewEvidenceContainment = %#v, want %#v", s.permissionReviewEvidenceContainment, containment)
+			}
+			if len(s.permissionReviewEvidenceAllowedKinds) != 2 ||
+				s.permissionReviewEvidenceAllowedKinds[0] != "filesystem.read" ||
+				s.permissionReviewEvidenceAllowedKinds[1] != "git.read" {
+				t.Fatalf("permissionReviewEvidenceAllowedKinds = %v, want %v", s.permissionReviewEvidenceAllowedKinds, kinds)
+			}
+		})
+	}
+}
+
 // TestLifecycleWithNeitherPermissionReviewOptionPreservesNoOpDefault is the
 // regression test for the zero-Lifecycle case: when neither
 // WithLifecyclePermissionReview nor WithLifecyclePermissionReviewBreaker is
