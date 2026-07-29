@@ -297,7 +297,7 @@ func TestRespondFromClassifierDriftFeedsCircuitBreaker(t *testing.T) {
 	basis := racePermissionReviewBasis(s, gateID, callID)
 	basis.ToolExecutionID = mustUUID() // force drift/staleness
 
-	if err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() error = %v, want nil (stale, not a fault)", err)
 	}
 	if c, ok := drainCommand(cmds); ok {

@@ -2,12 +2,15 @@ package sessionruntime
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/looprig/harness/internal/hustleruntime"
 	"github.com/looprig/harness/internal/loopruntime"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
@@ -32,9 +35,60 @@ type permissionReviewHustleRunner interface {
 // package-private, so nothing outside sessionruntime can supply a
 // substitute: a consumer cannot construct an adapter whose "responder" skips
 // the private claim/drift-check path (design §25.2).
+//
+// The bool result distinguishes "the classifier-originated response actually
+// resolved the gate" (true) from every expected no-op — the gate already
+// resolved/closed, or the response arrived stale against the live basis
+// (false, nil error) — from a genuine append failure (false, non-nil error).
+// review() needs this distinction to audit AutoApproved/stale correctly
+// (design §16.2): the GATE's fate decides AutoApproved, never the
+// classifier's own opinion.
 type permissionReviewResponder interface {
-	respondFromClassifier(ctx context.Context, basis gate.ReviewBasis, reason string) error
+	respondFromClassifier(ctx context.Context, basis gate.ReviewBasis, reason string) (bool, error)
 }
+
+// permissionReviewAuditPublisher is the checked durable-append seam
+// PermissionReviewStarted/PermissionReviewCompleted flow through (design
+// §16). It is satisfied directly by *Session (PublishEventChecked) — the
+// same transactional publication path public gate transitions already use
+// (gates.go's liveGateAppender).
+type permissionReviewAuditPublisher interface {
+	PublishEventChecked(ctx context.Context, ev event.Event) error
+}
+
+// permissionReviewAuditStamper mints the EventID/CreatedAt for a review
+// audit event's Header, mirroring every other durable event's Factory.Stamp
+// usage (gates.go's buildGateResolved). Satisfied directly by *event.Factory.
+type permissionReviewAuditStamper interface {
+	Stamp(h event.Header) (event.Header, error)
+}
+
+// permissionReviewFaultReporter is the review adapter's audit-append fault
+// seam. It reuses the EXACT session fault path Task 14's ordinary Hustle
+// faults already use (sessionHustleFaultReporter, internal/sessionruntime/
+// hustle.go) rather than inventing a parallel one: design §17 buckets
+// "durable-event append failure" as an Integrity failure with existing fault
+// semantics. An ordinary expected classifier outcome (needs_human/failed/
+// timed_out/cancelled/stale/not_applicable/allowed) never reaches this seam
+// — only a failure to durably record THAT outcome's own audit event does.
+type permissionReviewFaultReporter interface {
+	ReportFault(ctx context.Context, cause error)
+}
+
+// permissionReviewAuditError wraps an audit-append failure with the gate
+// identity it was auditing, without retaining classifier input, evidence,
+// output, or rationale — the underlying cause is whatever the durable
+// publish path itself already produced (never raw provider/tool content).
+type permissionReviewAuditError struct {
+	GateID gate.ID
+	Cause  error
+}
+
+func (e *permissionReviewAuditError) Error() string {
+	return "sessionruntime: permission review audit append failed"
+}
+
+func (e *permissionReviewAuditError) Unwrap() error { return e.Cause }
 
 // permissionReviewAdapter is the session-wide (not per-loop, unlike
 // compaction) facility that begins classifier review once a permission gate
@@ -55,8 +109,16 @@ type permissionReviewResponder interface {
 // invalid, missing, stale, cancelled, or unknown condition preserves the
 // human gate") holds by construction, not by error handling.
 //
-// Publishing secret-free start/completed events (design §14.3 step 3) is
-// explicitly deferred to Task 17; this adapter does not publish any events.
+// It also publishes secret-free PermissionReviewStarted/PermissionReviewCompleted
+// audit events (design §14.3 step 3, §16): one Started per applicable
+// classifier right before its Hustle is scheduled, and one Completed per
+// classifier covering every terminal status reviewOne/review can produce.
+// Publication uses the SAME optional, assigned-after-construction pattern as
+// observer (see below) — publisher/stamper/faults are all nil-safe no-ops
+// when unset, so every pre-Task-17 direct newPermissionReviewAdapter caller
+// (and every test constructing one without them) keeps working unchanged;
+// only Session.StartPermissionReview, the sole production call site, wires
+// all three.
 type permissionReviewAdapter struct {
 	runner      permissionReviewHustleRunner
 	classifiers gate.PermissionClassifierSet
@@ -68,6 +130,25 @@ type permissionReviewAdapter struct {
 	// permissionReviewOutcomeObserver's doc comment (review_state.go) for why
 	// it is not a newPermissionReviewAdapter parameter.
 	observer permissionReviewOutcomeObserver
+	// publisher/stamper, when both non-nil, are used to durably (checked)
+	// append every PermissionReviewStarted/PermissionReviewCompleted audit
+	// event this adapter produces. Either being nil is a fail-open no-op on
+	// AUDIT PUBLICATION ONLY — it never changes review's gate-response
+	// decisions, matching observer's own optionality rationale.
+	publisher permissionReviewAuditPublisher
+	stamper   permissionReviewAuditStamper
+	// faults, when non-nil, receives ONLY audit-append failures (a Stamp or
+	// PublishEventChecked error) — never an ordinary expected classifier
+	// outcome. See permissionReviewFaultReporter's doc comment.
+	faults permissionReviewFaultReporter
+	// auditTimeout bounds each audit publish call, decoupled from review's
+	// own cancellation (see publish) so a cancelled/timed-out review can
+	// still durably record its OWN "cancelled"/"timed_out" completion event.
+	// Zero (the default for a directly constructed adapter that never wires
+	// it) means unbounded — Session.StartPermissionReview always sets it
+	// from the same s.hustleLimits.AuditTimeout the session's Hustle
+	// controller itself required to be positive at construction.
+	auditTimeout time.Duration
 }
 
 // permissionReviewAdapterField names the collaborator newPermissionReviewAdapter
@@ -172,19 +253,69 @@ func (a *permissionReviewAdapter) review(ctx context.Context, req loopruntime.Pe
 	}
 	decision := gate.CombinePermissionAssessments(a.policy, a.classifiers, outcomes)
 	a.reportBreakerOutcome(req, decision)
-	if !decision.Eligible {
-		return
+
+	applied := false
+	if decision.Eligible {
+		if basis, reason, ok := classifierApprovalBasis(classifiers, outcomes); ok {
+			responded, err := a.responder.respondFromClassifier(ctx, basis, reason)
+			if err != nil {
+				slog.Warn("sessionruntime: classifier-originated gate response failed",
+					"gate_id", req.GateID, "error", err)
+			}
+			applied = responded
+		}
+		// !ok is structurally unreachable given decision.Eligible == true
+		// (eligibility requires at least one applicable+allowed outcome), but
+		// fails closed rather than attempting a response with no evidence to
+		// justify it; applied stays false, so every Allowed classifier below
+		// is still audited (as "stale", never "allowed").
 	}
-	basis, reason, ok := classifierApprovalBasis(classifiers, outcomes)
-	if !ok {
-		// Structurally unreachable given decision.Eligible == true (eligibility
-		// requires at least one applicable+allowed outcome), but fails closed
-		// rather than attempting a response with no evidence to justify it.
-		return
-	}
-	if err := a.responder.respondFromClassifier(ctx, basis, reason); err != nil {
-		slog.Warn("sessionruntime: classifier-originated gate response failed",
-			"gate_id", req.GateID, "error", err)
+	a.publishDeferredCompletions(ctx, req, classifiers, outcomes, decision.Eligible, applied)
+}
+
+// publishDeferredCompletions audits every classifier whose OWN Hustle
+// validated successfully (outcome.Status == gate.ReviewStatusAllowed).
+// reviewOne already audited every other terminal status (not_applicable,
+// failed, timed_out, cancelled) as a side effect of producing that outcome,
+// since those are fully determined per classifier without the combined
+// decision. An Allowed classifier's audit status, by contrast, can only be
+// resolved here (design §16.2):
+//
+//   - "allowed" (AutoApproved=true) only when the whole combined decision was
+//     eligible AND the classifier-originated gate response actually applied.
+//   - "stale" (AutoApproved=false, no risk/authorization/categories) when the
+//     combined decision was eligible but the response was silently dropped —
+//     the GATE's fate decides AutoApproved, never the classifier's own
+//     opinion, even though this classifier's own assessment was itself
+//     eligible.
+//   - "needs_human" whenever the combined decision was NOT eligible,
+//     regardless of which classifier's own assessment (or which OTHER
+//     classifier's non-allowed status) caused that:
+//     gate.CombinePermissionAssessments reports one combined reason, not a
+//     per-classifier attribution, so every individually-allowed classifier
+//     shares the same "the review, collectively, needs a human" audit
+//     status — carrying its OWN risk/authorization/categories, exactly as
+//     design §16.2 permits for needs_human.
+func (a *permissionReviewAdapter) publishDeferredCompletions(
+	ctx context.Context,
+	req loopruntime.PermissionReviewRequest,
+	classifiers []gate.PermissionClassifier,
+	outcomes []gate.PermissionAssessmentOutcome,
+	eligible bool,
+	applied bool,
+) {
+	for index, outcome := range outcomes {
+		if !outcome.Applicable || outcome.Status != gate.ReviewStatusAllowed || index >= len(classifiers) {
+			continue
+		}
+		switch {
+		case eligible && applied:
+			a.publishReviewCompleted(ctx, req, classifiers[index], gate.ReviewStatusAllowed, outcome.Assessment, true)
+		case eligible:
+			a.publishReviewCompleted(ctx, req, classifiers[index], gate.ReviewStatusStale, gate.PermissionAssessment{}, false)
+		default:
+			a.publishReviewCompleted(ctx, req, classifiers[index], gate.ReviewStatusNeedsHuman, outcome.Assessment, false)
+		}
 	}
 }
 
@@ -238,20 +369,32 @@ func (a *permissionReviewAdapter) reviewOne(ctx context.Context, req loopruntime
 		// all: leave the outcome's ClassifierRevision empty so it can never
 		// match this classifier's registered revision, which makes
 		// CombinePermissionAssessments' very first structural check fail the
-		// whole decision closed.
+		// whole decision closed. No PermissionReviewStarted was ever
+		// published (applicability was never even confirmed), but the
+		// attempt is still audited as failed — see the type doc's "no
+		// silent gap" requirement.
+		a.publishReviewCompleted(ctx, req, classifier, gate.ReviewStatusFailed, gate.PermissionAssessment{}, false)
 		return gate.PermissionAssessmentOutcome{Applicable: true, Status: gate.ReviewStatusFailed}
 	}
 	if !classifier.Applies(subject) {
+		a.publishReviewCompleted(ctx, req, classifier, gate.ReviewStatusNotApplicable, gate.PermissionAssessment{}, false)
 		return gate.PermissionAssessmentOutcome{Subject: subject, Status: gate.ReviewStatusNotApplicable}
 	}
 	input, err := classifier.MarshalInput(subject)
 	if err != nil {
 		slog.Warn("sessionruntime: permission review input marshal failed; failing classifier closed",
 			"classifier", classifier.Name(), "gate_id", req.GateID, "error", err)
+		a.publishReviewCompleted(ctx, req, classifier, gate.ReviewStatusFailed, gate.PermissionAssessment{}, false)
 		return gate.PermissionAssessmentOutcome{Subject: subject, Applicable: true, Status: gate.ReviewStatusFailed}
 	}
 
+	// design §14.3 step 3: the start event is published once applicability is
+	// confirmed and the input is ready, strictly before step 4 schedules the
+	// Hustle below.
+	a.publishReviewStarted(ctx, req, classifier)
+
 	var assessment gate.PermissionAssessment
+	var runErr error
 	allowed := false
 	validate := func(_ context.Context, result hustle.Result) error {
 		parsed, validationErr := classifier.ValidateResult(subject, result)
@@ -263,6 +406,7 @@ func (a *permissionReviewAdapter) reviewOne(ctx context.Context, req loopruntime
 	}
 	finish := func(_ context.Context, outcome hustle.Outcome) error {
 		allowed = outcome.Err == nil && outcome.Result != nil
+		runErr = outcome.Err
 		return nil
 	}
 	runRequest := hustle.Request{
@@ -271,15 +415,165 @@ func (a *permissionReviewAdapter) reviewOne(ctx context.Context, req loopruntime
 		Input: input,
 	}
 	if err := a.runner.RunAndFinalize(ctx, runRequest, validate, finish); err != nil {
+		if runErr == nil {
+			// The finalizer above never ran (a pre-ownership admission/preflight
+			// rejection) — RunAndFinalize's own returned error is the only
+			// signal available for classification.
+			runErr = err
+		}
 		slog.Warn("sessionruntime: permission review classifier run failed",
 			"classifier", classifier.Name(), "gate_id", req.GateID, "error", err)
 	}
 	if !allowed {
+		// The combined-decision input (gate.PermissionAssessmentOutcome.Status)
+		// stays the coarse ReviewStatusFailed unconditionally — unchanged from
+		// Task 15/16 — regardless of the finer audit classification below; only
+		// the AUDITED status distinguishes cancelled/timed_out/failed.
+		a.publishReviewCompleted(ctx, req, classifier, classifyReviewFailureStatus(ctx, runErr), gate.PermissionAssessment{}, false)
 		return gate.PermissionAssessmentOutcome{Subject: subject, Applicable: true, Status: gate.ReviewStatusFailed}
 	}
 	return gate.PermissionAssessmentOutcome{
 		Subject: subject, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: assessment,
 	}
+}
+
+// classifyReviewFailureStatus derives the finer-grained audit status for a
+// classifier whose Hustle run did not produce an allowed assessment,
+// distinguishing an outer review-lifecycle cancellation/timeout (design §15
+// — this classifier's own reviewCtx, cancelled by gate resolve/owner close/
+// loop interrupt/session shutdown/policy timeout) from the Hustle runtime's
+// own typed classification (hustleruntime.RunError.ReasonCode /
+// QueueFailureError.Reason) from a generic mechanical failure. It never
+// inspects err's message text — only typed reason codes — so no provider or
+// tool content can leak through this classification.
+func classifyReviewFailureStatus(ctx context.Context, err error) gate.ReviewStatus {
+	if ctx != nil {
+		switch {
+		case errors.Is(ctx.Err(), context.Canceled):
+			return gate.ReviewStatusCancelled
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			return gate.ReviewStatusTimedOut
+		}
+	}
+	var runErr *hustleruntime.RunError
+	if errors.As(err, &runErr) {
+		switch runErr.ReasonCode {
+		case hustle.ReasonCanceled:
+			return gate.ReviewStatusCancelled
+		case hustle.ReasonTimeout:
+			return gate.ReviewStatusTimedOut
+		}
+	}
+	var queueErr *hustleruntime.QueueFailureError
+	if errors.As(err, &queueErr) {
+		switch queueErr.Reason {
+		case hustleruntime.QueueFailureCanceled:
+			return gate.ReviewStatusCancelled
+		case hustleruntime.QueueFailureTimeout:
+			return gate.ReviewStatusTimedOut
+		}
+	}
+	return gate.ReviewStatusFailed
+}
+
+// publishReviewStarted publishes a PermissionReviewStarted for classifier if
+// a.publisher/a.stamper are both configured (see permissionReviewAdapter's
+// type doc); otherwise it is a no-op.
+func (a *permissionReviewAdapter) publishReviewStarted(
+	ctx context.Context,
+	req loopruntime.PermissionReviewRequest,
+	classifier gate.PermissionClassifier,
+) {
+	if a.publisher == nil || a.stamper == nil {
+		return
+	}
+	header, err := a.stamper.Stamp(event.Header{
+		Coordinates:     req.ReviewContext.Coordinates,
+		EventVisibility: event.Internal,
+	})
+	if err != nil {
+		a.reportAuditFault(ctx, req.GateID, err)
+		return
+	}
+	a.publish(ctx, req.GateID, event.PermissionReviewStarted{
+		Header:             header,
+		GateID:             req.GateID,
+		ToolExecutionID:    req.ToolExecutionID,
+		Classifier:         classifier.Name(),
+		ClassifierRevision: classifier.Revision(),
+	})
+}
+
+// publishReviewCompleted publishes a PermissionReviewCompleted for
+// classifier's terminal status if a.publisher/a.stamper are both configured;
+// otherwise it is a no-op. Risk/Authorization/Categories are populated ONLY
+// for allowed/needs_human (design §16.2's validation rules reject them on
+// every other status) — assessment is otherwise ignored by callers passing
+// the zero value for every other status.
+func (a *permissionReviewAdapter) publishReviewCompleted(
+	ctx context.Context,
+	req loopruntime.PermissionReviewRequest,
+	classifier gate.PermissionClassifier,
+	status gate.ReviewStatus,
+	assessment gate.PermissionAssessment,
+	autoApproved bool,
+) {
+	if a.publisher == nil || a.stamper == nil {
+		return
+	}
+	header, err := a.stamper.Stamp(event.Header{
+		Coordinates:     req.ReviewContext.Coordinates,
+		EventVisibility: event.Internal,
+	})
+	if err != nil {
+		a.reportAuditFault(ctx, req.GateID, err)
+		return
+	}
+	completed := event.PermissionReviewCompleted{
+		Header:             header,
+		GateID:             req.GateID,
+		ToolExecutionID:    req.ToolExecutionID,
+		Classifier:         classifier.Name(),
+		ClassifierRevision: classifier.Revision(),
+		Status:             status,
+		AutoApproved:       autoApproved,
+	}
+	if status == gate.ReviewStatusAllowed || status == gate.ReviewStatusNeedsHuman {
+		completed.Risk = assessment.Risk
+		completed.Authorization = assessment.Authorization
+		completed.Categories = append([]gate.ReviewRiskCategory(nil), assessment.Categories...)
+	}
+	a.publish(ctx, req.GateID, completed)
+}
+
+// publish durably (checked) appends ev using a context decoupled from
+// review's own cancellation — context.WithoutCancel, bounded by
+// a.auditTimeout when configured — mirroring hustleruntime's own audit
+// publication (internal/hustleruntime/audit.go's publishAudit): a
+// cancelled/timed-out review must still be able to record ITS OWN audit
+// trail, exactly as respondFromClassifier already races the same
+// reviewCtx for the gate response itself.
+func (a *permissionReviewAdapter) publish(ctx context.Context, gateID gate.ID, ev event.Event) {
+	publishCtx := context.WithoutCancel(ctx)
+	if a.auditTimeout > 0 {
+		var cancel context.CancelFunc
+		publishCtx, cancel = context.WithTimeout(publishCtx, a.auditTimeout)
+		defer cancel()
+	}
+	if err := a.publisher.PublishEventChecked(publishCtx, ev); err != nil {
+		a.reportAuditFault(ctx, gateID, err)
+	}
+}
+
+// reportAuditFault routes an audit-append failure through a.faults (design
+// §17: an Integrity failure keeps existing session fault semantics), when
+// configured. It uses a context decoupled from review's own cancellation for
+// the same reason publish does.
+func (a *permissionReviewAdapter) reportAuditFault(ctx context.Context, gateID gate.ID, cause error) {
+	if a.faults == nil {
+		return
+	}
+	a.faults.ReportFault(context.WithoutCancel(ctx), &permissionReviewAuditError{GateID: gateID, Cause: cause})
 }
 
 // classifierApprovalBasis derives the common ReviewBasis and a stable,

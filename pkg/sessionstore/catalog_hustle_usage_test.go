@@ -10,6 +10,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	model "github.com/looprig/inference/model"
@@ -355,6 +356,89 @@ func TestCatalogLiveAndRepairShareHustleAggregate(t *testing.T) {
 				t.Errorf("Hustles = %#v, want %#v", meta.Hustles, want)
 			}
 		})
+	}
+}
+
+// permissionReviewAuditPair builds a matching PermissionReviewStarted/
+// PermissionReviewCompleted pair — the two Internal-visibility audit events
+// Task 17's permission-review adapter durably appends per classifier
+// (internal/sessionruntime/review_adapter.go). Before Task 17 these two
+// types were defined and validated in isolation (Phase 1); this is their
+// first REAL producer, so foldCatalogHustles/applyEvent must be proven to
+// tolerate them appearing interleaved with Hustle lifecycle events in the
+// SAME session's event stream without corrupting hustle usage aggregation
+// or the catalog fold.
+func permissionReviewAuditPair(sid uuid.UUID, seed byte) (event.PermissionReviewStarted, event.PermissionReviewCompleted) {
+	header := event.Header{
+		Coordinates: identity.Coordinates{
+			SessionID: sid, LoopID: fixedUUID(seed + 1), TurnID: fixedUUID(seed + 2), StepID: fixedUUID(seed + 3),
+		},
+		EventID: fixedUUID(seed + 4), EventVisibility: event.Internal,
+	}
+	gateID := gate.ID(fixedUUID(seed + 5))
+	toolExecutionID := fixedUUID(seed + 6)
+	started := event.PermissionReviewStarted{
+		Header: header, GateID: gateID, ToolExecutionID: toolExecutionID,
+		Classifier: "command-safety", ClassifierRevision: "classifier-rev-1",
+	}
+	completed := event.PermissionReviewCompleted{
+		Header: header, GateID: gateID, ToolExecutionID: toolExecutionID,
+		Classifier: "command-safety", ClassifierRevision: "classifier-rev-1",
+		Status: gate.ReviewStatusNotApplicable,
+	}
+	return started, completed
+}
+
+// TestFoldCatalogHustlesIgnoresPermissionReviewEvents proves
+// PermissionReviewStarted/PermissionReviewCompleted events interleaved among
+// a session's Hustle lifecycle events contribute nothing to hustle usage
+// aggregation (they carry no hustle.RunID or terminal status foldCatalogHustles
+// understands) and never corrupt the aggregate computed from the SAME
+// session's real Hustle pairs.
+func TestFoldCatalogHustlesIgnoresPermissionReviewEvents(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0xb0)
+	descriptor := catalogHustleDescriptor(t, "current", hustle.ModelSourceCurrentLoop, model.ModelKey{})
+	runtime := event.ModelRuntime{Key: model.ModelKey{Provider: "provider", Model: "model"}, Limits: model.ContextLimits{WindowTokens: 100}}
+	usage := content.Usage{InputTokens: 5, OutputTokens: 1}
+	started, completed := catalogHustlePair(sid, descriptor, 0xb1, runtime, &usage, false)
+	reviewStarted, reviewCompleted := permissionReviewAuditPair(sid, 0xc0)
+
+	events := []event.Event{reviewStarted, started, reviewCompleted, completed}
+	got, err := foldCatalogHustles(events)
+	if err != nil {
+		t.Fatalf("foldCatalogHustles() error = %v", err)
+	}
+	want := []HustleUsageAggregate{
+		{Name: "current", ModelSource: hustle.ModelSourceCurrentLoop, Status: hustle.TerminalStatusCompleted, Runs: 1, CumulativeUsage: usage},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("foldCatalogHustles() = %#v, want %#v", got, want)
+	}
+}
+
+// TestApplyEventIgnoresPermissionReviewEvents proves the live catalog fold
+// (applyEvent, UpdateOnEvent's single-event path) treats
+// PermissionReviewStarted/PermissionReviewCompleted as catalog-irrelevant —
+// changed=false, no SessionMeta mutation, no LastJournalSeq advance — exactly
+// like every other event type applyEvent's switch does not name.
+func TestApplyEventIgnoresPermissionReviewEvents(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0xd0)
+	started, completed := permissionReviewAuditPair(sid, 0xd1)
+	meta := SessionMeta{SessionID: sid, LastJournalSeq: 3}
+
+	for _, ev := range []event.Event{started, completed} {
+		updated, changed, err := applyEvent(meta, ev, 4, fixedClock(time.Time{}))
+		if err != nil {
+			t.Fatalf("applyEvent(%T) error = %v", ev, err)
+		}
+		if changed {
+			t.Errorf("applyEvent(%T) changed = true, want false", ev)
+		}
+		if !reflect.DeepEqual(updated, meta) {
+			t.Errorf("applyEvent(%T) mutated meta: got %#v, want unchanged %#v", ev, updated, meta)
+		}
 	}
 }
 

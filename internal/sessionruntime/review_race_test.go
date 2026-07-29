@@ -103,7 +103,7 @@ func TestRespondFromClassifierApprovesAndClosesGate(t *testing.T) {
 	s, app, cmds, gateID, callID := raceGateSession(t)
 	basis := racePermissionReviewBasis(s, gateID, callID)
 
-	if err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() error = %v", err)
 	}
 
@@ -139,7 +139,7 @@ func TestRespondFromClassifierAfterHumanApprovalIsStale(t *testing.T) {
 	}
 	recvCommand(t, cmds)
 
-	if err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() after human approval error = %v, want nil (stale, not a fault)", err)
 	}
 	if c, ok := drainCommand(cmds); ok {
@@ -158,7 +158,7 @@ func TestRespondGateAfterClassifierApprovalIsStale(t *testing.T) {
 	s, app, cmds, gateID, callID := raceGateSession(t)
 	basis := racePermissionReviewBasis(s, gateID, callID)
 
-	if err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() error = %v", err)
 	}
 	recvCommand(t, cmds)
@@ -204,7 +204,7 @@ func TestRespondFromClassifierAndHumanSimultaneousRaceExactlyOneWins(t *testing.
 			}()
 			go func() {
 				defer wg.Done()
-				_ = s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1")
+				_, _ = s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1")
 			}()
 			wg.Wait()
 
@@ -251,12 +251,12 @@ func TestRespondFromClassifierDuplicateIsStale(t *testing.T) {
 	s, app, cmds, gateID, callID := raceGateSession(t)
 	basis := racePermissionReviewBasis(s, gateID, callID)
 
-	if err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() #1 error = %v", err)
 	}
 	recvCommand(t, cmds)
 
-	if err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() #2 error = %v, want nil (stale duplicate, not a fault)", err)
 	}
 	if c, ok := drainCommand(cmds); ok {
@@ -280,7 +280,7 @@ func TestRespondFromClassifierAfterGateCloseIsStale(t *testing.T) {
 		t.Fatalf("CloseGate() error = %v", err)
 	}
 
-	if err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() after CloseGate error = %v, want nil (stale, not a fault)", err)
 	}
 	if c, ok := drainCommand(cmds); ok {
@@ -310,7 +310,7 @@ func TestRespondFromClassifierAfterPolicyTimeoutIsStale(t *testing.T) {
 	}
 	recvCommand(t, cmds)
 
-	if err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() after policy timeout error = %v, want nil (stale, not a fault)", err)
 	}
 	if c, ok := drainCommand(cmds); ok {
@@ -379,7 +379,7 @@ func TestRespondFromClassifierDriftDropsSilently(t *testing.T) {
 			s, app, cmds, gateID, callID := raceGateSession(t)
 			basis := tt.drift(racePermissionReviewBasis(s, gateID, callID))
 
-			if err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+			if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
 				t.Fatalf("respondFromClassifier() error = %v, want nil (drift silently dropped)", err)
 			}
 			if c, ok := drainCommand(cmds); ok {
@@ -509,7 +509,7 @@ waitOpen:
 
 	basis := racePermissionReviewBasis(s, gateID, callID)
 	seedReviewBasis(s, gateID, basis)
-	if err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() error = %v", err)
 	}
 

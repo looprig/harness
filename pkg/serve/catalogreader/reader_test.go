@@ -104,6 +104,27 @@ func sessionStopped(sid uuid.UUID) event.SessionStopped {
 	}}
 }
 
+// permissionReviewCompleted builds a valid, Internal-visibility
+// PermissionReviewCompleted for sid — Task 17's first real producer of this
+// event type. Used to prove ReadJournal filters it out of a public journal
+// page exactly like GatePrepared/HustleStarted already are.
+func permissionReviewCompleted(sid uuid.UUID) event.PermissionReviewCompleted {
+	return event.PermissionReviewCompleted{
+		Header: event.Header{
+			Coordinates: identity.Coordinates{
+				SessionID: sid, LoopID: fixedUUID(0xC3), TurnID: fixedUUID(0xC4), StepID: fixedUUID(0xC5),
+			},
+			EventID:         fixedUUID(0xC0),
+			EventVisibility: event.Internal,
+		},
+		GateID:             gate.ID(fixedUUID(0xC1)),
+		ToolExecutionID:    fixedUUID(0xC2),
+		Classifier:         "command-safety",
+		ClassifierRevision: "classifier-rev-1",
+		Status:             gate.ReviewStatusNotApplicable,
+	}
+}
+
 func hustleStarted(t *testing.T, sid uuid.UUID) event.HustleStarted {
 	t.Helper()
 	definition, err := hustle.Define(
@@ -351,7 +372,9 @@ func TestReaderReadJournal(t *testing.T) {
 	loop := fixedUUID(0x67)
 
 	// Build a ledger holding: SessionStarted, a private GatePreparedRecord (must be
-	// filtered), then two TurnDones. The event replayer yields ONLY the three events.
+	// filtered), a private HustleStarted, a private PermissionReviewCompleted (Task
+	// 17's first real producer of this type), then two TurnDones. The event
+	// replayer yields ONLY the three public events.
 	buildLedger := func(t *testing.T) *sessionstore.Store {
 		st, err := sessionstore.Open(memstore.New())
 		if err != nil {
@@ -368,8 +391,9 @@ func TestReaderReadJournal(t *testing.T) {
 			journal.NewEventRecord(sessionStarted(sid)),                  // seq 2 (after opening fence at 1)
 			journal.NewGatePreparedRecord(prepared, openPayload),         // seq 3 (filtered)
 			journal.NewEventRecord(hustleStarted(t, sid)),                // seq 4 (internal, filtered)
-			journal.NewEventRecord(turnDone(sid, loop, fixedUUID(0x74))), // seq 5
-			journal.NewEventRecord(turnDone(sid, loop, fixedUUID(0x75))), // seq 6
+			journal.NewEventRecord(permissionReviewCompleted(sid)),       // seq 5 (internal, filtered)
+			journal.NewEventRecord(turnDone(sid, loop, fixedUUID(0x74))), // seq 6
+			journal.NewEventRecord(turnDone(sid, loop, fixedUUID(0x75))), // seq 7
 		}
 		for _, rec := range recs {
 			if _, err := j.Append(context.Background(), rec); err != nil {
@@ -391,8 +415,8 @@ func TestReaderReadJournal(t *testing.T) {
 	}{
 		{name: "absent session yields empty done", absent: true, page: serve.JournalPage{From: 0, Limit: 100}, wantCount: 0, wantNext: 0, wantDone: true},
 		{name: "from beginning yields all events done", page: serve.JournalPage{From: 0, Limit: 100}, wantCount: 3, wantFirstSeq: 2, wantNext: 0, wantDone: true, wantNoGate: true},
-		{name: "limit under total not done", page: serve.JournalPage{From: 0, Limit: 2}, wantCount: 2, wantFirstSeq: 2, wantNext: 6, wantDone: false},
-		{name: "from interior sequence", page: serve.JournalPage{From: 4, Limit: 100}, wantCount: 2, wantFirstSeq: 5, wantNext: 0, wantDone: true},
+		{name: "limit under total not done", page: serve.JournalPage{From: 0, Limit: 2}, wantCount: 2, wantFirstSeq: 2, wantNext: 7, wantDone: false},
+		{name: "from interior sequence", page: serve.JournalPage{From: 4, Limit: 100}, wantCount: 2, wantFirstSeq: 6, wantNext: 0, wantDone: true},
 	}
 
 	for _, tt := range tests {
@@ -427,7 +451,8 @@ func TestReaderReadJournal(t *testing.T) {
 			if tt.wantNoGate {
 				for _, se := range page.Events {
 					switch se.Event.(type) {
-					case event.GatePrepared, event.HustleStarted, event.HustleCompleted, event.HustleFailed:
+					case event.GatePrepared, event.HustleStarted, event.HustleCompleted, event.HustleFailed,
+						event.PermissionReviewStarted, event.PermissionReviewCompleted:
 						t.Errorf("private event %T leaked into journal page at seq %d", se.Event, se.JournalSeq)
 					}
 				}

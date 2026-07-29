@@ -85,11 +85,15 @@ func (s *permissionReviewRunnerStub) callCount() int {
 // records every basis+reason it was asked to respond with (so a test can
 // assert whether, and with what evidence, an eligible combined decision
 // reached the classifier-response seam) and can be configured to return an
-// error.
+// error. By default it reports "applied" (the gate was actually resolved)
+// whenever no error is configured, matching production's ordinary success
+// path; forceApplied lets a test simulate the stale no-op (applied=false,
+// err=nil) design §16.2 requires review to audit as "stale".
 type permissionReviewResponderStub struct {
-	mu      sync.Mutex
-	calls   []permissionReviewResponderCall
-	respErr error
+	mu           sync.Mutex
+	calls        []permissionReviewResponderCall
+	respErr      error
+	forceApplied *bool
 }
 
 type permissionReviewResponderCall struct {
@@ -97,11 +101,15 @@ type permissionReviewResponderCall struct {
 	reason string
 }
 
-func (s *permissionReviewResponderStub) respondFromClassifier(_ context.Context, basis gate.ReviewBasis, reason string) error {
+func (s *permissionReviewResponderStub) respondFromClassifier(_ context.Context, basis gate.ReviewBasis, reason string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, permissionReviewResponderCall{basis: basis, reason: reason})
-	return s.respErr
+	applied := s.respErr == nil
+	if s.forceApplied != nil {
+		applied = *s.forceApplied
+	}
+	return applied, s.respErr
 }
 
 func (s *permissionReviewResponderStub) snapshot() []permissionReviewResponderCall {

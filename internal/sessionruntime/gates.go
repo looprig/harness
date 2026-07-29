@@ -230,6 +230,18 @@ func (s *Session) StartPermissionReview(ctx context.Context, req loopruntime.Per
 	// newPermissionReviewAdapter collaborator because its absence must never
 	// fail construction.
 	adapter.observer = s
+	// Wire durable (checked) audit publication (design §16, Task 17): s
+	// already implements PublishEventChecked, s.factory already mints every
+	// other durable event's Header, and sessionHustleFaultReporter is the
+	// SAME session fault path Task 14's ordinary Hustle faults use — reused
+	// here rather than duplicated. s.hustleLimits.AuditTimeout is guaranteed
+	// positive by the time s.hustleController is non-nil (hustleruntime.New
+	// rejects a non-positive AuditTimeout at construction), matching the
+	// nil-hustleController guard above.
+	adapter.publisher = s
+	adapter.stamper = s.factory
+	adapter.faults = sessionHustleFaultReporter{session: s}
+	adapter.auditTimeout = s.hustleLimits.AuditTimeout
 	s.recordPermissionReviewBasis(req)
 	// One cancellation-group context per active gate review (design §15).
 	// reviewCtx's cleanup is the ONLY place its cancellations entry is ever
@@ -896,43 +908,56 @@ func (s *Session) respondGateCore(ctx context.Context, response gate.GateRespons
 // execution, a context/policy/security-ceiling revision no longer matching,
 // or the gate simply being gone/claimed/closed already — makes the response
 // stale, which this method treats as an expected race rather than a fault:
-// it returns nil, exactly like every other non-fault stale-response outcome.
-func (s *Session) respondFromClassifier(ctx context.Context, basis gate.ReviewBasis, reason string) error {
+// it returns (false, nil), exactly like every other non-fault stale-response
+// outcome.
+//
+// The bool result is the review adapter's ONLY way to distinguish "the gate
+// was actually resolved via this classifier-originated response" (true) from
+// every no-op outcome — stale drift, or the gate already gone/claimed
+// (false, nil) — versus a genuine append failure (false, non-nil error);
+// design §16.2 requires this to audit AutoApproved/"stale" correctly, since
+// the GATE's fate decides AutoApproved, never the classifier's own opinion.
+// respondGateCore itself returns nil for BOTH the stale-drift no-op and a
+// genuine success, so drift's closure captures which one happened locally —
+// respondGateCore's own signature is untouched.
+func (s *Session) respondFromClassifier(ctx context.Context, basis gate.ReviewBasis, reason string) (bool, error) {
 	if basis.GateID.IsZero() || reason == "" {
-		return nil
+		return false, nil
 	}
 	response := gate.GateResponse{
 		GateID: basis.GateID,
 		Action: string(gate.ApprovalApprove),
 		Source: gate.ResponseSource{Kind: gate.ResponseFromClassifier, Reason: reason},
 	}
+	stale := false
 	drift := func(entry gateEntry) bool {
 		live := entry.reviewBasis
-		stale := live.ToolExecutionID != basis.ToolExecutionID ||
+		isStale := live.ToolExecutionID != basis.ToolExecutionID ||
 			live.ContextRevision != basis.ContextRevision ||
 			live.SecurityCeiling != basis.SecurityCeiling ||
 			live.GatePolicyRevision != basis.GatePolicyRevision ||
 			s.permissionReviewPolicy.Revision != basis.GatePolicyRevision
-		if stale {
+		if isStale {
 			// design §18: a classifier-originated stale response feeds the
 			// circuit breaker. The response itself is still silently
 			// dropped exactly as before — only the bookkeeping is new.
 			s.recordPermissionReviewStale(entry.coordinates)
+			stale = true
 		}
-		return stale
+		return isStale
 	}
 	err := s.respondGateCore(ctx, response, drift)
 	if err == nil {
-		return nil
+		return !stale, nil
 	}
 	var gateErr *GateError
 	if errors.As(err, &gateErr) && (gateErr.Kind == GateNotFound || gateErr.Kind == GateNotReady) {
 		// The gate was already claimed, resolved, or never existed by the time
 		// this classifier-originated response arrived: an expected race, not a
 		// session fault.
-		return nil
+		return false, nil
 	}
-	return err
+	return false, err
 }
 
 // revertClaiming reverts a gate from claiming back to open after a failed
