@@ -56,11 +56,14 @@ func TestLoopReviewContextNilWithoutWorkspaceRoot(t *testing.T) {
 
 // TestLoopReviewContextAutoDerivedWhenClassifiersConfigured proves the
 // auto-derive decision: once at least one permission classifier is
-// registered, loopReviewContext returns a populated configuration with no
-// further consumer input — WorkspaceRoot/WorkingDirectory sourced from
-// s.wsRoot, GatePolicyRevision from the SAME s.permissionReviewPolicy.Revision
-// the first addendum already wires, and a non-empty SecurityCeiling/Policy
-// (the documented sentinel defaults — see loopReviewContext's doc comment).
+// registered AND a consumer-supplied security ceiling is configured (Finding
+// 2, Phase 6 spec-compliance review — SecurityCeiling is a consumer-owned
+// value Harness cannot originate, so it is no longer an auto-derived field),
+// loopReviewContext returns a populated configuration — WorkspaceRoot/
+// WorkingDirectory sourced from s.wsRoot, GatePolicyRevision from the SAME
+// s.permissionReviewPolicy.Revision the first addendum already wires,
+// SecurityCeiling threaded verbatim from withPermissionReviewSecurityCeiling
+// (NOT a Harness-invented sentinel), and a populated default Policy.
 func TestLoopReviewContextAutoDerivedWhenClassifiersConfigured(t *testing.T) {
 	t.Parallel()
 	classifier := newApplyProbeClassifier(t, "probe-classifier", "probe-rev-1")
@@ -69,7 +72,13 @@ func TestLoopReviewContextAutoDerivedWhenClassifiersConfigured(t *testing.T) {
 		t.Fatalf("NewPermissionClassifierSet: %v", err)
 	}
 	policy := validReviewPolicy(t)
-	s := &Session{permissionClassifiers: set, permissionReviewPolicy: policy, wsRoot: "/managed/workspace"}
+	const ceiling = "consumer-access-profile/read-only-v1"
+	s := &Session{
+		permissionClassifiers:           set,
+		permissionReviewPolicy:          policy,
+		wsRoot:                          "/managed/workspace",
+		permissionReviewSecurityCeiling: ceiling,
+	}
 
 	got := s.loopReviewContext()
 	if got == nil {
@@ -81,11 +90,33 @@ func TestLoopReviewContextAutoDerivedWhenClassifiersConfigured(t *testing.T) {
 	if got.GatePolicyRevision != policy.Revision {
 		t.Fatalf("GatePolicyRevision = %q, want %q", got.GatePolicyRevision, policy.Revision)
 	}
-	if got.SecurityCeiling == "" {
-		t.Fatal("SecurityCeiling is empty, want a documented sentinel value")
+	if got.SecurityCeiling != ceiling {
+		t.Fatalf("SecurityCeiling = %q, want the consumer-supplied %q (not a Harness-invented sentinel)", got.SecurityCeiling, ceiling)
 	}
 	if got.Policy.Revision == "" || got.Policy.MaxBytes <= 0 || got.Policy.MaxEntries <= 0 {
 		t.Fatalf("Policy = %+v, want a populated default gate.ReviewContextPolicy", got.Policy)
+	}
+}
+
+// TestLoopReviewContextNilWithoutSecurityCeiling is the defense-in-depth
+// regression proof mirroring TestLoopReviewContextNilWithoutWorkspaceRoot:
+// classifiers configured and a workspace root present, but NO consumer
+// security ceiling (withPermissionReviewSecurityCeiling never applied),
+// still yields a nil loopReviewContext rather than falling back to any
+// placeholder value. rig.Define() is the loud, primary enforcement for a
+// rig-constructed session (validatePermissionReviewSecurityCeiling in
+// pkg/rig); this is the belt-and-suspenders guard for a directly constructed
+// sessionruntime.Session that bypassed it.
+func TestLoopReviewContextNilWithoutSecurityCeiling(t *testing.T) {
+	t.Parallel()
+	classifier := newApplyProbeClassifier(t, "probe-classifier", "probe-rev-1")
+	set, err := gate.NewPermissionClassifierSet(classifier)
+	if err != nil {
+		t.Fatalf("NewPermissionClassifierSet: %v", err)
+	}
+	s := &Session{permissionClassifiers: set, permissionReviewPolicy: validReviewPolicy(t), wsRoot: "/managed/workspace"}
+	if got := s.loopReviewContext(); got != nil {
+		t.Fatalf("loopReviewContext() = %+v, want nil (no security ceiling configured)", got)
 	}
 }
 
@@ -172,10 +203,12 @@ func TestSubmitCarriesRealReviewContextIntoRegisteredClassifier(t *testing.T) {
 
 	ws := mustWorkspaceStore(t, memstore.New().Blobs)
 	root := t.TempDir()
+	const ceiling = "consumer-access-profile/capture-test-v1"
 
 	s, err := newTestSession(context.Background(), gatedE2EDefinition(t, evaluator, tl),
 		withSessionHustles([]hustle.Definition{testHustleDefinition(t, "unrelated-background-hustle")}, testHustleLimits()),
 		withPermissionReview(set, policy),
+		withPermissionReviewSecurityCeiling(ceiling),
 		WithWorkspaceCheckpointing(ws, root),
 	)
 	if err != nil {
@@ -229,6 +262,16 @@ func TestSubmitCarriesRealReviewContextIntoRegisteredClassifier(t *testing.T) {
 	}
 	if subject.Context.WorkspaceRoot != root || subject.Context.WorkingDirectory != root {
 		t.Fatalf("captured WorkspaceRoot/WorkingDirectory = %q/%q, want both %q", subject.Context.WorkspaceRoot, subject.Context.WorkingDirectory, root)
+	}
+	// Finding 2 (Phase 6 spec-compliance review): the consumer-supplied
+	// ceiling must genuinely reach both ReviewContext.SecurityCeiling and the
+	// classifier's own ReviewBasis.SecurityCeiling — never a Harness-invented
+	// sentinel that could never match a real consumer's own containment check.
+	if subject.Context.SecurityCeiling != ceiling {
+		t.Fatalf("captured ReviewContext.SecurityCeiling = %q, want the consumer-supplied %q", subject.Context.SecurityCeiling, ceiling)
+	}
+	if subject.Basis.SecurityCeiling != ceiling {
+		t.Fatalf("captured ReviewBasis.SecurityCeiling = %q, want the consumer-supplied %q", subject.Basis.SecurityCeiling, ceiling)
 	}
 	if len(subject.Context.Entries) == 0 {
 		t.Fatal("captured ReviewContext has no entries")

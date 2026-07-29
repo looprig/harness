@@ -177,6 +177,18 @@ type Lifecycle struct {
 	permissionReviewEvidenceContainment  gate.EvidenceContainmentVerifier
 	permissionReviewEvidenceAllowedKinds []string
 	permissionReviewEvidenceConfigured   bool
+
+	// permissionReviewSecurityCeiling and
+	// permissionReviewSecurityCeilingConfigured capture
+	// WithLifecyclePermissionReviewSecurityCeiling's installed consumer-owned
+	// effective security posture (design §13.1/§21), mirroring
+	// permissionReviewEvidenceConfigured's "option called, not value
+	// non-zero" signal. Omitting the option leaves every session's
+	// permissionReviewSecurityCeiling at its zero value (empty string) —
+	// never a Harness-invented placeholder — which makes loopReviewContext
+	// (gates.go) return nil (defense in depth).
+	permissionReviewSecurityCeiling           string
+	permissionReviewSecurityCeilingConfigured bool
 }
 
 // HustleLimits is sessionruntime's narrow, rig-independent copy of the hustle
@@ -293,6 +305,25 @@ func WithLifecyclePermissionReviewEvidence(access gate.EvidenceAccessEvaluator, 
 		r.permissionReviewEvidenceContainment = containment
 		r.permissionReviewEvidenceAllowedKinds = append([]string(nil), captured...)
 		r.permissionReviewEvidenceConfigured = true
+	}
+}
+
+// WithLifecyclePermissionReviewSecurityCeiling installs the consumer-supplied
+// effective security posture (design §13.1/§21) every registered permission
+// classifier's ReviewContext/ReviewBasis carries as SecurityCeiling,
+// mirroring WithLifecyclePermissionReviewEvidence's capture-once-forward-to-both
+// shape. Both NewSession and RestoreSession apply it via the private
+// withPermissionReviewSecurityCeiling Option (gates.go). Omitting this
+// option leaves every session's permissionReviewSecurityCeiling at its zero
+// value; loopReviewContext (gates.go) then returns nil for that session
+// (capture stays off) rather than ever falling back to a Harness-invented
+// placeholder — see withPermissionReviewSecurityCeiling's doc comment for
+// why a fixed sentinel is exactly the bug this option exists to close
+// (Finding 2, Phase 6 spec-compliance review).
+func WithLifecyclePermissionReviewSecurityCeiling(ceiling string) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.permissionReviewSecurityCeiling = ceiling
+		r.permissionReviewSecurityCeilingConfigured = true
 	}
 }
 
@@ -552,6 +583,9 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 			r.permissionReviewEvidenceAccess, r.permissionReviewEvidenceContainment, r.permissionReviewEvidenceAllowedKinds,
 		))
 	}
+	if r.permissionReviewSecurityCeilingConfigured {
+		opts = append(opts, withPermissionReviewSecurityCeiling(r.permissionReviewSecurityCeiling))
+	}
 	opts = append(opts,
 		WithSessionID(sid),
 		WithEventAppender(evAp),
@@ -657,6 +691,9 @@ func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session,
 		opts = append(opts, withPermissionReviewEvidence(
 			r.permissionReviewEvidenceAccess, r.permissionReviewEvidenceContainment, r.permissionReviewEvidenceAllowedKinds,
 		))
+	}
+	if r.permissionReviewSecurityCeilingConfigured {
+		opts = append(opts, withPermissionReviewSecurityCeiling(r.permissionReviewSecurityCeiling))
 	}
 	if r.frozenFingerprint != nil {
 		opts = append(opts, WithFingerprint(*r.frozenFingerprint))

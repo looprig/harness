@@ -200,18 +200,33 @@ func withPermissionReviewEvidence(access gate.EvidenceAccessEvaluator, containme
 	}
 }
 
-// defaultReviewContextSecurityCeiling is the fixed, non-widening sentinel
-// loopReviewContext stamps into every live ReviewContext's SecurityCeiling
-// field. Harness has no first-class concept of "effective access posture as a
-// string" today — no code anywhere in this module computes one, and CodeRig's
-// Task 24 work binds its OWN containment-verifier ceiling to its OWN
-// AccessProfile string ad hoc, at the consumer layer, confirming Harness
-// itself has nothing to source from honestly. It never claims a wider
-// posture than actually configured: a classifier that treats an unrecognized
-// ceiling as maximally conservative is correct. This is a documented
-// simplification for the Phase 6/7 boundary review to replace with a real
-// value, not an invented security classification scheme.
-const defaultReviewContextSecurityCeiling = "harness-session; ceiling-not-classified"
+// withPermissionReviewSecurityCeiling configures the session-wide,
+// consumer-supplied effective security posture (design §13.1/§21) every
+// ReviewContext loopReviewContext builds carries as SecurityCeiling, and
+// every classifier's ReviewBasis/ReviewBasis-derived hustle.Request
+// therefore inherits. It is private: the real value, wired from a
+// consumer's rig.WithPermissionReviewSecurityCeiling call, is
+// rig.Define()-time validated (mirroring withPermissionReviewEvidence's own
+// "config X requires config Y" pairing) to be non-empty whenever classifiers
+// are configured — this option's own zero value simply leaves
+// s.permissionReviewSecurityCeiling empty, which loopReviewContext then
+// treats as "review context capture stays off" (defense in depth; the loud
+// failure lives at Define()-time, not here).
+//
+// This deliberately replaces a former Harness-side sentinel constant
+// ("harness-session; ceiling-not-classified") that every session used to
+// stamp unconditionally: SecurityCeiling is architecturally the SAME KIND OF
+// VALUE as permissionReviewEvidenceContainment/permissionReviewEvidenceAllowedKinds
+// above — a consumer-owned concept Harness structurally cannot originate
+// (this module has no first-class "effective access posture" notion) — so a
+// fixed placeholder could never equal a real consumer's own ceiling string,
+// making every evidence-tool containment check that compared against it fail
+// closed 100% of the time (the Phase 6 spec-compliance review's Finding 2).
+func withPermissionReviewSecurityCeiling(ceiling string) Option {
+	return func(s *Session) {
+		s.permissionReviewSecurityCeiling = ceiling
+	}
+}
 
 // defaultReviewContextPolicy is the fixed default gate.ReviewContextPolicy
 // loopReviewContext installs. No consumer-facing surface carries a
@@ -267,18 +282,27 @@ var defaultReviewContextPolicy = gate.ReviewContextPolicy{
 //   - GatePolicyRevision is s.permissionReviewPolicy.Revision — the SAME
 //     value the first addendum already wires into the session's fingerprint
 //     and review policy, not a new source.
-//   - SecurityCeiling and Policy have NO existing Harness-level source (see
-//     defaultReviewContextSecurityCeiling / defaultReviewContextPolicy above
-//     for why each is a documented, bounded, honest default rather than an
-//     invented classification scheme).
+//   - Policy has NO existing Harness-level source (see
+//     defaultReviewContextPolicy above for why it is a documented, bounded,
+//     honest default rather than an invented classification scheme).
+//   - SecurityCeiling is s.permissionReviewSecurityCeiling — a genuinely
+//     consumer-supplied value (withPermissionReviewSecurityCeiling's doc
+//     comment), NOT a Harness-invented default: unlike Policy, Harness must
+//     never guess at this one, because a wrong guess widens (or falsely
+//     narrows) what a consumer's own evidence-containment check compares
+//     against. An empty value here — a session that never opted into
+//     WithPermissionReviewSecurityCeiling — makes this whole method return
+//     nil below rather than stamp a placeholder (defense in depth;
+//     rig.Define() is the loud, primary enforcement for any rig-constructed
+//     session).
 func (s *Session) loopReviewContext() *loopruntime.ReviewContext {
-	if len(s.permissionClassifiers.Classifiers()) == 0 || s.wsRoot == "" {
+	if len(s.permissionClassifiers.Classifiers()) == 0 || s.wsRoot == "" || s.permissionReviewSecurityCeiling == "" {
 		return nil
 	}
 	return &loopruntime.ReviewContext{
 		WorkspaceRoot:      s.wsRoot,
 		WorkingDirectory:   s.wsRoot,
-		SecurityCeiling:    defaultReviewContextSecurityCeiling,
+		SecurityCeiling:    s.permissionReviewSecurityCeiling,
 		GatePolicyRevision: s.permissionReviewPolicy.Revision,
 		Policy:             defaultReviewContextPolicy,
 	}

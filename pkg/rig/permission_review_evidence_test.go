@@ -140,6 +140,7 @@ func TestDefinePermissionReviewSucceedsAndConstructsSessionWithEvidenceOption(t 
 		WithPermissionReviewEvidence(
 			stubPermissionReviewEvidenceAccess{}, stubPermissionReviewEvidenceContainment{}, []string{"filesystem.read"},
 		),
+		WithPermissionReviewSecurityCeiling("consumer-access-profile/v1"),
 		WithSessionWorkspaces(wsStoreT(t), root),
 		WithSnapshots(SnapshotPolicy{}),
 	)...)

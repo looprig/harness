@@ -395,3 +395,86 @@ func TestLifecycleWithNeitherPermissionReviewOptionPreservesNoOpDefault(t *testi
 		t.Fatal("StartPermissionReview did not return promptly for an unconfigured session")
 	}
 }
+
+// TestWithLifecyclePermissionReviewSecurityCeilingThreadsToNewSessionAndRestoreSession
+// proves WithLifecyclePermissionReviewSecurityCeiling's consumer-supplied
+// value reaches a real session's permissionReviewSecurityCeiling field
+// through BOTH NewSession and RestoreSession, mirroring
+// TestWithLifecyclePermissionReviewEvidenceThreadsToNewSessionAndRestoreSession's
+// shape exactly. This is Finding 2 (Phase 6 spec-compliance review): before
+// this option existed, every session stamped a fixed Harness-side sentinel
+// instead of a real consumer value, so evidence-tool containment failed
+// closed 100% of the time in any real consumer.
+func TestWithLifecyclePermissionReviewSecurityCeilingThreadsToNewSessionAndRestoreSession(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		restore bool
+	}{
+		{name: "new session"},
+		{name: "restored session", restore: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store := newRestoreStore(t)
+			definition := restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful")
+
+			var sessionID uuid.UUID
+			if tt.restore {
+				sessionID = runAndShutdown(t, store, definition)
+			}
+
+			const ceiling = "consumer-access-profile/lifecycle-threading-v1"
+			lifecycle, err := newTestLifecycle(
+				definition, store,
+				WithLifecyclePermissionReviewSecurityCeiling(ceiling),
+			)
+			if err != nil {
+				t.Fatalf("NewTopologyLifecycle: %v", err)
+			}
+
+			var s *Session
+			if tt.restore {
+				s, err = lifecycle.RestoreSession(context.Background(), sessionID)
+			} else {
+				s, err = lifecycle.NewSession(context.Background(), "")
+			}
+			if err != nil {
+				t.Fatalf("session construction: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+			if s.permissionReviewSecurityCeiling != ceiling {
+				t.Fatalf("permissionReviewSecurityCeiling = %q, want %q", s.permissionReviewSecurityCeiling, ceiling)
+			}
+		})
+	}
+}
+
+// TestLifecycleWithoutPermissionReviewSecurityCeilingPreservesNoOpDefault is
+// the regression test for the zero-Lifecycle case: when
+// WithLifecyclePermissionReviewSecurityCeiling is never applied, a
+// NewSession-built session keeps permissionReviewSecurityCeiling at its zero
+// value (empty string) — never a placeholder — so loopReviewContext stays
+// nil (defense in depth; see withPermissionReviewSecurityCeiling's doc
+// comment).
+func TestLifecycleWithoutPermissionReviewSecurityCeilingPreservesNoOpDefault(t *testing.T) {
+	t.Parallel()
+	store := newRestoreStore(t)
+	definition := restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful")
+	lifecycle, err := newTestLifecycle(definition, store)
+	if err != nil {
+		t.Fatalf("NewTopologyLifecycle: %v", err)
+	}
+	s, err := lifecycle.NewSession(context.Background(), "")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	if s.permissionReviewSecurityCeiling != "" {
+		t.Fatalf("permissionReviewSecurityCeiling = %q, want empty", s.permissionReviewSecurityCeiling)
+	}
+}

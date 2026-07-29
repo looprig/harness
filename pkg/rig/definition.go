@@ -117,6 +117,9 @@ func Define(options ...Option) (*Rig, error) {
 	if err := validatePermissionReviewEvidence(state); err != nil {
 		return nil, err
 	}
+	if err := validatePermissionReviewSecurityCeiling(state); err != nil {
+		return nil, err
+	}
 	if err := validateHustleRegistration(state); err != nil {
 		return nil, err
 	}
@@ -299,6 +302,36 @@ func validatePermissionReviewEvidence(state *definitionState) error {
 		return &DefinitionError{Kind: DefinitionMissingPermissionReviewEvidence}
 	case !needed && configured:
 		return &DefinitionError{Kind: DefinitionUnusedPermissionReviewEvidence}
+	default:
+		return nil
+	}
+}
+
+// validatePermissionReviewSecurityCeiling enforces the "config X requires
+// config Y" pairing between WithPermissionReviewSecurityCeiling and any
+// registered permission classifier, mirroring
+// validatePermissionReviewEvidence's own pairing check exactly — except
+// keyed on "classifiers configured at all" rather than "a classifier needs
+// evidence tools", because SecurityCeiling flows into every registered
+// classifier's ReviewBasis regardless of whether that classifier declares
+// evidence tools (review_adapter.go's reviewOne stamps
+// basis.SecurityCeiling unconditionally; hustle.Request.SecurityCeiling's
+// own doc comment notes a classifier with no evidence-tool concept simply
+// never reads it):
+//
+//   - at least one classifier registered + WithPermissionReviewSecurityCeiling
+//     never called: DefinitionMissingPermissionReviewSecurityCeiling.
+//   - WithPermissionReviewSecurityCeiling called but no classifiers
+//     registered: DefinitionUnusedPermissionReviewSecurityCeiling.
+//   - every other combination (both configured, or neither): no error.
+func validatePermissionReviewSecurityCeiling(state *definitionState) error {
+	classifiersConfigured := state.seen[keyPermissionClassifiers]
+	ceilingConfigured := state.seen[keyPermissionReviewSecurityCeiling]
+	switch {
+	case classifiersConfigured && !ceilingConfigured:
+		return &DefinitionError{Kind: DefinitionMissingPermissionReviewSecurityCeiling}
+	case !classifiersConfigured && ceilingConfigured:
+		return &DefinitionError{Kind: DefinitionUnusedPermissionReviewSecurityCeiling}
 	default:
 		return nil
 	}

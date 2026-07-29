@@ -141,6 +141,22 @@ type Session struct {
 	permissionReviewEvidenceContainment  gate.EvidenceContainmentVerifier
 	permissionReviewEvidenceAllowedKinds []string
 
+	// permissionReviewSecurityCeiling is the immutable, consumer-supplied
+	// effective security posture (design §13.1/§21) set by
+	// withPermissionReviewSecurityCeiling (internal/sessionruntime/gates.go)
+	// and threaded into every ReviewContext loopReviewContext builds. It is a
+	// consumer-owned concept — the SAME kind of value as
+	// permissionReviewEvidenceContainment/permissionReviewEvidenceAllowedKinds
+	// above — that Harness has no way to originate itself (this module has no
+	// first-class "effective access posture" concept; CodeRig binds its own
+	// AccessProfile name here). Staying empty for a session that never opts
+	// in makes loopReviewContext return nil (defense in depth; the LOUD
+	// failure is rig.Define()-time validation pairing this with
+	// WithPermissionClassifiers, mirroring WithPermissionReviewEvidence's
+	// pairing) rather than silently stamping a placeholder value that can
+	// never equal a real consumer's own ceiling.
+	permissionReviewSecurityCeiling string
+
 	// review is the session's bounded, PURELY in-memory permission-review
 	// cancellation-group + circuit-breaker bookkeeping (design §15, §18;
 	// internal/sessionruntime/review_state.go). It is never persisted and

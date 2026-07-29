@@ -56,6 +56,7 @@ func TestPermissionReviewAuditDurablyPublishesThroughRealHubWithoutFaultingSessi
 	s, err := newTestSession(context.Background(), gatedE2EDefinition(t, evaluator, tl),
 		withSessionHustles([]hustle.Definition{testHustleDefinition(t, "unrelated-background-hustle")}, testHustleLimits()),
 		withPermissionReview(set, policy),
+		withPermissionReviewSecurityCeiling("consumer-access-profile/hub-integration-v1"),
 		WithWorkspaceCheckpointing(ws, root),
 		WithEventAppender(appender),
 	)

@@ -31,6 +31,26 @@ const (
 	DefinitionInvalidPermissionReviewEvidence DefinitionErrorKind = "invalid_permission_review_evidence"
 	DefinitionMissingPermissionReviewEvidence DefinitionErrorKind = "missing_permission_review_evidence"
 	DefinitionUnusedPermissionReviewEvidence  DefinitionErrorKind = "unused_permission_review_evidence"
+
+	// DefinitionInvalidPermissionReviewSecurityCeiling: WithPermissionReviewSecurityCeiling
+	// was called with an empty (or all-whitespace) ceiling string. Rejected at
+	// Define()-time rather than deferred to a later, harder-to-diagnose
+	// review-context-capture failure (gate.ReviewContext's own non-empty
+	// SecurityCeiling validation rule).
+	DefinitionInvalidPermissionReviewSecurityCeiling DefinitionErrorKind = "invalid_permission_review_security_ceiling"
+	// DefinitionMissingPermissionReviewSecurityCeiling: at least one permission
+	// classifier is configured (WithPermissionClassifiers) but
+	// WithPermissionReviewSecurityCeiling was never called. SecurityCeiling is a
+	// consumer-owned value Harness cannot originate (Finding 2, Phase 6
+	// spec-compliance review): a classifier-registered session with no ceiling
+	// would otherwise fail every real evidence-tool containment check closed,
+	// silently, at runtime.
+	DefinitionMissingPermissionReviewSecurityCeiling DefinitionErrorKind = "missing_permission_review_security_ceiling"
+	// DefinitionUnusedPermissionReviewSecurityCeiling: WithPermissionReviewSecurityCeiling
+	// was called but no permission classifier is configured, mirroring
+	// DefinitionUnusedPermissionReviewEvidence's "config X requires config Y"
+	// symmetric check.
+	DefinitionUnusedPermissionReviewSecurityCeiling DefinitionErrorKind = "unused_permission_review_security_ceiling"
 )
 
 type DefinitionError struct {

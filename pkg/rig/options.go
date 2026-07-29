@@ -23,20 +23,21 @@ type Option func(*definitionState) error
 type singletonKey string
 
 const (
-	keyActivePrimer             singletonKey = "active_primer"
-	keyDelegationLimits         singletonKey = "delegation_limits"
-	keyConfigFingerprint        singletonKey = "config_fingerprint"
-	keyForeignBuilder           singletonKey = "foreign_builders"
-	keyGateCaps                 singletonKey = "gate_caps"
-	keyAllowConfigMismatch      singletonKey = "allow_config_mismatch"
-	keyRestoreDecider           singletonKey = "restore_decider"
-	keySnapshots                singletonKey = "snapshots"
-	keyOffloadGC                singletonKey = "offload_gc"
-	keyHustleLimits             singletonKey = "hustle_limits"
-	keyPermissionClassifiers    singletonKey = "permission_classifiers"
-	keyPermissionReviewPolicy   singletonKey = "permission_review_policy"
-	keyPermissionReviewLimits   singletonKey = "permission_review_limits"
-	keyPermissionReviewEvidence singletonKey = "permission_review_evidence"
+	keyActivePrimer                    singletonKey = "active_primer"
+	keyDelegationLimits                singletonKey = "delegation_limits"
+	keyConfigFingerprint               singletonKey = "config_fingerprint"
+	keyForeignBuilder                  singletonKey = "foreign_builders"
+	keyGateCaps                        singletonKey = "gate_caps"
+	keyAllowConfigMismatch             singletonKey = "allow_config_mismatch"
+	keyRestoreDecider                  singletonKey = "restore_decider"
+	keySnapshots                       singletonKey = "snapshots"
+	keyOffloadGC                       singletonKey = "offload_gc"
+	keyHustleLimits                    singletonKey = "hustle_limits"
+	keyPermissionClassifiers           singletonKey = "permission_classifiers"
+	keyPermissionReviewPolicy          singletonKey = "permission_review_policy"
+	keyPermissionReviewLimits          singletonKey = "permission_review_limits"
+	keyPermissionReviewEvidence        singletonKey = "permission_review_evidence"
+	keyPermissionReviewSecurityCeiling singletonKey = "permission_review_security_ceiling"
 )
 
 // WithPermissionClassifiers installs the already-validated, ordered permission
@@ -183,6 +184,46 @@ func WithPermissionReviewEvidence(access gate.EvidenceAccessEvaluator, containme
 		}
 		frozenKinds := append([]string(nil), allowedKinds...)
 		return singletonCompile(keyPermissionReviewEvidence, sessionruntime.WithLifecyclePermissionReviewEvidence(access, containment, frozenKinds))(state)
+	}
+}
+
+// WithPermissionReviewSecurityCeiling installs the consumer-supplied,
+// effective security posture (design §13.1/§21) every registered permission
+// classifier's ReviewContext/ReviewBasis carries as SecurityCeiling, and
+// every evidence-tool containment check (WithPermissionReviewEvidence's
+// Containment collaborator) is run against.
+//
+// SecurityCeiling is architecturally the SAME KIND of value as the
+// Containment/AllowedKinds collaborators WithPermissionReviewEvidence
+// installs — a consumer-owned concept Harness structurally cannot and
+// should not originate (this module has no first-class "effective access
+// posture" notion; CodeRig binds its own AccessProfile name here). It is
+// NOT like a workspace root, which Harness genuinely owns and auto-derives.
+// A plain string, not a provider func: a consumer's ceiling is fixed for the
+// session's lifetime by design (YAGNI — see the design consult this option
+// was written from).
+//
+// Required whenever any permission classifier is registered
+// (WithPermissionClassifiers); Define fails closed
+// (DefinitionMissingPermissionReviewSecurityCeiling) if omitted in that
+// case — before this option existed, every session instead stamped a fixed
+// Harness-side sentinel that could never equal a real consumer's own
+// ceiling, so every real evidence-tool containment check failed closed
+// unconditionally (Finding 2, Phase 6 spec-compliance review). It is
+// rejected (DefinitionUnusedPermissionReviewSecurityCeiling) when supplied
+// but no classifiers are configured, mirroring
+// WithPermissionReviewEvidence's own "config X requires config Y" pairing.
+// An empty (or all-whitespace) ceiling is rejected here, immediately, at
+// Define() time — never deferred to a later, harder-to-diagnose
+// review-context-capture failure (gate.ReviewContext's own non-empty
+// SecurityCeiling validation rule already fails closed on an empty value,
+// but silently and much later).
+func WithPermissionReviewSecurityCeiling(ceiling string) Option {
+	return func(state *definitionState) error {
+		if strings.TrimSpace(ceiling) == "" {
+			return &DefinitionError{Kind: DefinitionInvalidPermissionReviewSecurityCeiling}
+		}
+		return singletonCompile(keyPermissionReviewSecurityCeiling, sessionruntime.WithLifecyclePermissionReviewSecurityCeiling(ceiling))(state)
 	}
 }
 
