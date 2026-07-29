@@ -133,9 +133,23 @@ func foldRestoredGates(records []journal.JournalRecord) restoredGatePlan {
 	return plan
 }
 
+// gateRestoreHookSupported reports whether restore may reinstall an opened,
+// unresolved gate as a live, answerable directory entry rather than closing
+// it CloseRestoreUnavailable. KindPermission is supported (design §15: "the
+// permission gate restores normally... the gate remains answerable by a
+// human"): foldRestoredGates never restores reviewBasis (gateEntry's zero
+// value) or any cancellation handle (reviewLifecycle always starts zero on a
+// fresh Session — see session.go's review field), so a restored permission
+// gate is structurally incapable of receiving a classifier-originated
+// response until a NEW review starts, and design §15 additionally requires
+// that no new review is ever started from restored/guessed context — restore
+// never calls StartPermissionReview. Every other kind remains unsupported
+// pending its own restore design.
 func gateRestoreHookSupported(g gate.Gate) bool {
 	switch g.Kind {
-	case gate.KindPermission, gate.KindAskUser:
+	case gate.KindPermission:
+		return true
+	case gate.KindAskUser:
 		return false
 	default:
 		return false

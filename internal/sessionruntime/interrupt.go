@@ -259,6 +259,13 @@ func (s *Session) runInterrupt(ctx context.Context, selectLocked func() ([]loopS
 	if !ok {
 		return false, nil, &SessionError{Kind: SessionLoopNotFound}
 	}
+	// design §15's third cancellation trigger: the loop or turn is
+	// interrupted. Every active permission review routed to a target loop is
+	// cancelled before fan-out even begins — a no-op for any loop with no
+	// active review.
+	for _, ls := range snapshot {
+		s.cancelPermissionReviewsForLoop(ls.loopID)
+	}
 	var checkpointSweep *interruptCheckpointSweep
 	if s.checkpoints != nil {
 		// Register before fan-out: a fast actor may publish TurnInterrupted and

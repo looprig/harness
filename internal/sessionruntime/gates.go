@@ -212,14 +212,34 @@ func (s *Session) StartPermissionReview(ctx context.Context, req loopruntime.Per
 	if s.hustleController == nil {
 		return
 	}
+	// Circuit breaker (design §18): a tripped turn starts no further
+	// automatic review at all — no adapter, no cancellation handle, no
+	// reviewBasis stamp — leaving every current and future gate in the turn
+	// human-only, exactly like the "no classifiers configured" no-op above.
+	if !s.reviewBreakerAllows(req.ReviewContext.Coordinates) {
+		return
+	}
 	adapter, err := newPermissionReviewAdapter(s.hustleController, s.permissionClassifiers, s.permissionReviewPolicy, s)
 	if err != nil {
 		slog.Warn("sessionruntime: permission review adapter misconfigured; starting no review",
 			"gate_id", req.GateID, "error", err)
 		return
 	}
+	// Optional: the adapter reports one terminal circuit-breaker summary per
+	// review() call through this seam (design §18). It is not a
+	// newPermissionReviewAdapter collaborator because its absence must never
+	// fail construction.
+	adapter.observer = s
 	s.recordPermissionReviewBasis(req)
-	go adapter.review(ctx, req)
+	// One cancellation-group context per active gate review (design §15).
+	// reviewCtx's cleanup is the ONLY place its cancellations entry is ever
+	// removed; every other trigger (gate resolve, owner close, loop/turn
+	// interrupt, session shutdown) only ever calls the stored cancel func.
+	reviewCtx, done := s.beginPermissionReviewCancellation(ctx, req.GateID)
+	go func() {
+		defer done()
+		adapter.review(reviewCtx, req)
+	}()
 }
 
 // recordPermissionReviewBasis stamps the gate directory entry with the
@@ -615,6 +635,7 @@ func (s *Session) CloseGate(ctx context.Context, id gate.ID, reason gate.CloseRe
 		delete(s.gates, id)
 		s.closeGateAnswerSlotLocked(id)
 		s.gatesMu.Unlock()
+		s.cancelPermissionReview(id)
 		return nil
 	case gateOpen:
 		entry.state = gateClaiming
@@ -645,6 +666,9 @@ func (s *Session) CloseGate(ctx context.Context, id gate.ID, reason gate.CloseRe
 	// on a slot nothing will ever write to.
 	s.closeGateAnswerSlotLocked(id)
 	s.gatesMu.Unlock()
+	// The owner closed the gate (design §15's second cancellation trigger). A
+	// no-op for a gate with no active review.
+	s.cancelPermissionReview(id)
 	return nil
 }
 
@@ -835,6 +859,11 @@ func (s *Session) respondGateCore(ctx context.Context, response gate.GateRespons
 	s.stopGateTimerLocked(response.GateID)
 	delete(s.gates, response.GateID)
 	s.gatesMu.Unlock()
+	// The gate has resolved (design §15's first cancellation trigger, which
+	// also covers a policy-timeout response — startGatePolicyTimerLocked
+	// resolves through this exact path). A no-op for a gate with no active
+	// review.
+	s.cancelPermissionReview(response.GateID)
 
 	// Delivery happens after the durable commit and after the entry is gone, so a
 	// host-owned answer and a loop command are both unrepeatable.
@@ -879,11 +908,18 @@ func (s *Session) respondFromClassifier(ctx context.Context, basis gate.ReviewBa
 	}
 	drift := func(entry gateEntry) bool {
 		live := entry.reviewBasis
-		return live.ToolExecutionID != basis.ToolExecutionID ||
+		stale := live.ToolExecutionID != basis.ToolExecutionID ||
 			live.ContextRevision != basis.ContextRevision ||
 			live.SecurityCeiling != basis.SecurityCeiling ||
 			live.GatePolicyRevision != basis.GatePolicyRevision ||
 			s.permissionReviewPolicy.Revision != basis.GatePolicyRevision
+		if stale {
+			// design §18: a classifier-originated stale response feeds the
+			// circuit breaker. The response itself is still silently
+			// dropped exactly as before — only the bookkeeping is new.
+			s.recordPermissionReviewStale(entry.coordinates)
+		}
+		return stale
 	}
 	err := s.respondGateCore(ctx, response, drift)
 	if err == nil {

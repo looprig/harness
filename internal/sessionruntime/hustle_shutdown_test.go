@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/harness/internal/hustleruntime"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
@@ -958,6 +959,43 @@ func TestShutdownNeverDetachesOwnedHustleCleanupAtOuterBudget(t *testing.T) {
 				t.Fatalf("unsafe owned-cleanup teardown order: %v", steps)
 			}
 		})
+	}
+}
+
+// TestShutdownCancelsActivePermissionReviewContext proves design §15's fourth
+// cancellation trigger: a session shutdown cancels every currently active
+// permission-review cancellation-group context, exactly like a gate
+// resolving or its owner closing it. It exercises the cancellation-group
+// primitive directly (beginPermissionReviewCancellation), matching the way
+// review_race_test.go exercises respondFromClassifier directly rather than
+// standing up a real classifier/Hustle pipeline end to end.
+func TestShutdownCancelsActivePermissionReviewContext(t *testing.T) {
+	t.Parallel()
+	sessionID := mustUUID()
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	s := &Session{
+		sessionID: sessionID, sessionCtx: sessionCtx, sessionCancel: sessionCancel,
+		hub: hub.New(sessionID), newID: uuid.New, now: time.Now,
+		loops: map[uuid.UUID]*loopHandle{},
+	}
+	gateID := gate.ID(mustUUID())
+	reviewCtx, done := s.beginPermissionReviewCancellation(context.Background(), gateID)
+	defer done()
+
+	select {
+	case <-reviewCtx.Done():
+		t.Fatal("review context cancelled before Shutdown")
+	default:
+	}
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	select {
+	case <-reviewCtx.Done():
+	default:
+		t.Fatal("Shutdown did not cancel the active permission-review context")
 	}
 }
 

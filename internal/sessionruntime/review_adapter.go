@@ -62,6 +62,12 @@ type permissionReviewAdapter struct {
 	classifiers gate.PermissionClassifierSet
 	policy      gate.PermissionReviewPolicy
 	responder   permissionReviewResponder
+	// observer, when non-nil, receives one terminal circuit-breaker-relevant
+	// summary of each review() call (design §18). It is assigned directly by
+	// Session.StartPermissionReview after construction — see
+	// permissionReviewOutcomeObserver's doc comment (review_state.go) for why
+	// it is not a newPermissionReviewAdapter parameter.
+	observer permissionReviewOutcomeObserver
 }
 
 // permissionReviewAdapterField names the collaborator newPermissionReviewAdapter
@@ -139,6 +145,22 @@ func nilPermissionReviewResponder(value permissionReviewResponder) bool {
 // "" means no review context was captured for this turn (turnConfig.
 // reviewContext was nil — internal/loopruntime/review_context.go), which
 // fails closed as "nothing to review" rather than guessing at defaults.
+// Every classifier's Hustle is scheduled and awaited IN FULL, even once an
+// earlier classifier's outcome has already made the combined decision
+// impossible to reverse (design §15's sixth cancellation trigger: "a
+// conjunction member makes auto-approval impossible and remaining results
+// are not needed for configured audit"). Skipping the remaining classifiers
+// once eligibility is already lost would change gate.CombinePermissionAssessments'
+// outcome-attribution (it requires exactly one outcome per registered
+// classifier to distinguish ReviewDecisionClassifierStatus from
+// ReviewDecisionInvalidAssessment) and there is currently no "configured
+// audit" concept that would tell this adapter whether the remaining results
+// are actually needed. Skipping never widens approval — the gate stays
+// human either way — so this is a deliberately deferred efficiency
+// optimization, not a correctness or security gap; reviewCtx (armed by
+// Session.StartPermissionReview) still lets every OTHER trigger (gate
+// resolve, owner close, loop/turn interrupt, session shutdown) stop a
+// still-running classifier immediately.
 func (a *permissionReviewAdapter) review(ctx context.Context, req loopruntime.PermissionReviewRequest) {
 	if req.ReviewContext.ContextRevision == "" {
 		return
@@ -149,6 +171,7 @@ func (a *permissionReviewAdapter) review(ctx context.Context, req loopruntime.Pe
 		outcomes = append(outcomes, a.reviewOne(ctx, req, classifier))
 	}
 	decision := gate.CombinePermissionAssessments(a.policy, a.classifiers, outcomes)
+	a.reportBreakerOutcome(req, decision)
 	if !decision.Eligible {
 		return
 	}
@@ -163,6 +186,23 @@ func (a *permissionReviewAdapter) review(ctx context.Context, req loopruntime.Pe
 		slog.Warn("sessionruntime: classifier-originated gate response failed",
 			"gate_id", req.GateID, "error", err)
 	}
+}
+
+// reportBreakerOutcome reports one review() call's terminal
+// circuit-breaker-relevant summary to a.observer (design §18), when one is
+// configured. It deliberately skips ReviewDecisionNoApplicableClassifier: no
+// classifier applying at all is not a reviewed-and-rejected/failed attempt —
+// counting it would trip the breaker on ordinary gates that no classifier was
+// ever meant to look at.
+func (a *permissionReviewAdapter) reportBreakerOutcome(req loopruntime.PermissionReviewRequest, decision gate.ReviewDecision) {
+	if a.observer == nil || decision.Reason == gate.ReviewDecisionNoApplicableClassifier {
+		return
+	}
+	a.observer.observePermissionReviewOutcome(req.ReviewContext.Coordinates, reviewBreakerOutcome{
+		SubjectDigest: subjectContentDigest(req.Request),
+		Reason:        decision.Reason,
+		Eligible:      decision.Eligible,
+	})
 }
 
 // reviewOne builds ONE classifier's subject+basis (design §14.3 step 2),

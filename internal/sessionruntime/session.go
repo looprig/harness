@@ -126,6 +126,15 @@ type Session struct {
 	permissionClassifiers  gate.PermissionClassifierSet
 	permissionReviewPolicy gate.PermissionReviewPolicy
 
+	// review is the session's bounded, PURELY in-memory permission-review
+	// cancellation-group + circuit-breaker bookkeeping (design §15, §18;
+	// internal/sessionruntime/review_state.go). It is never persisted and
+	// never restored: a restored session is built as a fresh struct literal
+	// (restore_constructor.go's buildRestoredSession) that never sets this
+	// field, so it always starts from the zero reviewLifecycle — design
+	// §22.4's "stale live cancellation handles do not survive restore".
+	review reviewLifecycle
+
 	// limits are the in-session subagent-spawn safety caps NewLoop enforces (depth +
 	// quota). Defaulted in newSession (withDefaults) so the live values are always
 	// positive caps, and overridable via WithLimits. Read under loopsMu inside NewLoop's
@@ -732,6 +741,7 @@ func (s *Session) PublishEvent(ctx context.Context, ev event.Event) error {
 		return err
 	}
 	s.recordLoopMechanicalState(ev)
+	s.clearReviewTurnState(ev)
 	return nil
 }
 
@@ -744,6 +754,7 @@ func (s *Session) PublishEventChecked(ctx context.Context, ev event.Event) error
 		return err
 	}
 	s.recordLoopMechanicalState(ev)
+	s.clearReviewTurnState(ev)
 	return nil
 }
 
@@ -2224,6 +2235,11 @@ func (s *Session) shutdown() error {
 	s.loopsMu.Unlock()
 	s.activeMu.Unlock()
 	timeouts := s.resolveShutdownTimeouts(snapshot)
+	// design §15's fourth cancellation trigger: the session shuts down. Every
+	// active permission review is signalled to stop before the shared Hustle
+	// runtime begins its own drain, so in-flight classifier calls observe
+	// cancellation as early as possible.
+	s.shutdownPermissionReviews()
 	failures := make([]error, 0, 6)
 	failures = append(failures, s.closeHustles(shutdownRoot, timeouts.hustle))
 	targets, sendErr := s.sendLoopShutdowns(shutdownRoot, snapshot, timeouts.loopSend)

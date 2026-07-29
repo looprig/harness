@@ -138,6 +138,162 @@ func buildGateRestoreStreamWithResolver(t *testing.T, store *sessionstore.Store,
 	return persistedGateStream{sessionID: sessionID, rootLoopID: rootLoopID, lease: lease, gateID: gateID}
 }
 
+// buildRestorablePermissionGateStream is buildGateRestoreStreamWithResolver's
+// counterpart for design §15/§22.4's restore contract: it persists an opened,
+// unresolved KindPermission/ResolverLoop gate marked Restorable, exactly the
+// shape gateRestoreHookSupported now accepts as restorable. It deliberately
+// duplicates rather than parameterizing buildGateRestoreStreamWithResolver so
+// every existing restore_gates_test.go case (none of which ever set
+// Restorable) is provably unaffected by this task's restore change.
+func buildRestorablePermissionGateStream(t *testing.T, store *sessionstore.Store, cfg loop.Definition) persistedGateStream {
+	t.Helper()
+	sessionID := mustSessionID(t)
+	rootLoopID := mustSessionID(t)
+	turnID := mustSessionID(t)
+	stepID := mustSessionID(t)
+	gateID := gate.ID(mustSessionID(t))
+	toolExecID := gate.ID(mustSessionID(t))
+
+	lease := mustAcquireLease(t, store, sessionID)
+	openCtx, openCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer openCancel()
+	j, err := store.OpenJournal(openCtx, sessionID, lease)
+	if err != nil {
+		t.Fatalf("OpenJournal: %v", err)
+	}
+
+	var seq byte
+	stamp := func(coords identity.Coordinates) event.Header {
+		seq++
+		return event.Header{
+			Coordinates: coords,
+			EventID:     uuid.UUID{0xD1, seq},
+			CreatedAt:   time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC),
+		}
+	}
+	appendEvent := func(ev event.Event) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := j.Append(ctx, journal.NewEventRecord(ev)); err != nil {
+			t.Fatalf("append %T: %v", ev, err)
+		}
+	}
+	appendRecord := func(rec journal.JournalRecord) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := j.Append(ctx, rec); err != nil {
+			t.Fatalf("append %T: %v", rec, err)
+		}
+	}
+
+	appendEvent(event.SessionStarted{
+		Header: stamp(identity.Coordinates{SessionID: sessionID}),
+		Config: fingerprintFromDefinition(cfg),
+	})
+	appendEvent(event.LoopStarted{
+		Header: func() event.Header {
+			h := stamp(identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID})
+			h.AgentName = "agent"
+			return h
+		}(),
+		Runtime: runtimeFromFingerprint(fingerprintFromDefinition(cfg)),
+	})
+
+	coords := identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID, TurnID: turnID, StepID: stepID}
+	g := gate.Gate{
+		ID:          gateID,
+		Kind:        gate.KindPermission,
+		Resolver:    gate.ResolverLoop,
+		Blocks:      gate.BlocksToolCall,
+		Effect:      gate.EffectResume,
+		Criticality: gate.GateCritical,
+		Restorable:  true,
+		Subject: gate.Subject{
+			ToolExecutionID: toolExecID,
+			TurnID:          gate.ID(turnID),
+			StepID:          gate.ID(stepID),
+		},
+		Prompt: gate.Prompt{
+			Title: "Approve tool call",
+			Body:  "echo ok",
+			Controls: []gate.Control{
+				{Action: string(gate.ApprovalApprove), Label: "Approve"},
+				{Action: string(gate.ApprovalDeny), Label: "Deny"},
+			},
+		},
+	}
+	preparedEvent := event.GatePrepared{Header: stamp(coords), Gate: g}
+	appendRecord(journal.NewGatePreparedRecord(preparedEvent, gate.OpenPayload{
+		GateID:  gateID,
+		Payload: gate.PermissionPayload{Request: typedGateRequest()},
+	}))
+	appendEvent(event.GateOpened{Header: stamp(coords), Gate: g})
+
+	return persistedGateStream{sessionID: sessionID, rootLoopID: rootLoopID, lease: lease, gateID: gateID}
+}
+
+// TestRestorePermissionGateRestoresOpenAndReviewFree proves design §15's
+// "the permission gate restores normally... the gate remains answerable by a
+// human" together with §22.4's restore-test list: a Restorable, opened,
+// unresolved permission gate comes back OPEN (not CloseRestoreUnavailable),
+// remains answerable by an ordinary human RespondGate, carries a zero
+// reviewBasis (no auto-review replay: nothing was ever recorded against it
+// after restore), and the session's cancellation-group bookkeeping is
+// entirely empty (no stale live cancellation handle survived the restart).
+func TestRestorePermissionGateRestoresOpenAndReviewFree(t *testing.T) {
+	store := newRestoreStore(t)
+	cfg := restoreCfg(&stubLLM{}, "model-x", "be helpful")
+	orig := buildRestorablePermissionGateStream(t, store, cfg)
+	handOver(t, orig.lease)
+
+	s, err := restoreTestSession(context.Background(), cfg, orig.sessionID, store)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	open := s.ListGates(context.Background())
+	if len(open) != 1 || open[0].ID != orig.gateID {
+		t.Fatalf("ListGates() = %+v, want the restored gate open and answerable", open)
+	}
+	if got := countGateResolvedReason(restoredGateResolvedEvents(t, store, orig.sessionID), orig.gateID, gate.CloseRestoreUnavailable); got != 0 {
+		t.Fatalf("restore_unavailable GateResolved count = %d, want 0 (a restorable permission gate must not be closed unavailable)", got)
+	}
+
+	s.gatesMu.Lock()
+	entry, ok := s.gates[orig.gateID]
+	s.gatesMu.Unlock()
+	if !ok {
+		t.Fatal("restored gate missing from directory")
+	}
+	if entry.reviewBasis != (gate.ReviewBasis{}) {
+		t.Fatalf("restored gateEntry.reviewBasis = %+v, want zero (no auto-review replay from restored/guessed context)", entry.reviewBasis)
+	}
+	s.review.mu.Lock()
+	cancellations := len(s.review.cancellations)
+	s.review.mu.Unlock()
+	if cancellations != 0 {
+		t.Fatalf("restored session review.cancellations = %d, want 0 (no stale live cancellation handle survives restore)", cancellations)
+	}
+
+	// "remains answerable by a human": an ordinary RespondGate must succeed
+	// exactly like it would for any other restored open gate.
+	respondCtx, respondCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer respondCancel()
+	if err := s.RespondGate(respondCtx, gate.GateResponse{
+		GateID: orig.gateID,
+		Action: string(gate.ApprovalDeny),
+		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+	}); err != nil {
+		t.Fatalf("RespondGate() on restored permission gate error = %v, want nil (human-answerable)", err)
+	}
+	if got := s.ListGates(context.Background()); len(got) != 0 {
+		t.Fatalf("ListGates() after RespondGate = %+v, want 0 (gate resolved)", got)
+	}
+}
+
 func TestRestoreUnavailableGateResolutionPreservesResolver(t *testing.T) {
 	for _, resolver := range []gate.ResolverKind{gate.ResolverLoop, gate.ResolverSession} {
 		t.Run(string(resolver), func(t *testing.T) {
