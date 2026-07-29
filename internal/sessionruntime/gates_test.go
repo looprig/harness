@@ -1240,3 +1240,46 @@ func TestRespondGateInvalidActionFailsSecure(t *testing.T) {
 	default:
 	}
 }
+
+// TestRespondGateRejectsPublicClassifierSource proves the public RespondGate
+// entry point cannot be used to forge classifier provenance: even though
+// gate.ResponseSource's fields are exported (a caller CAN construct a
+// GateResponse with Source.Kind == gate.ResponseFromClassifier directly, the
+// same way a real caller might attempt it), RespondGate rejects it outright
+// — no claim, no durable append, no dispatch — before it ever reaches the
+// shared claim/response core that the private respondFromClassifier path
+// uses. Only that private method may produce this provenance (design §14.5,
+// §16.3, §25.2).
+func TestRespondGateRejectsPublicClassifierSource(t *testing.T) {
+	t.Parallel()
+	s, app, loopID, cmds := gateSession(t)
+	gateID := prepareAndActivate(t, s, loopID, bashPayload())
+
+	forged := gate.GateResponse{
+		GateID: gateID,
+		Action: string(gate.ApprovalApprove),
+		Source: gate.ResponseSource{Kind: gate.ResponseFromClassifier, Reason: "forged"},
+	}
+	err := s.RespondGate(context.Background(), forged)
+	if err == nil {
+		t.Fatal("RespondGate() error = nil, want rejection of forged classifier source")
+	}
+	var ge *GateError
+	if !errors.As(err, &ge) || ge.Kind != GateActionInvalid {
+		t.Fatalf("RespondGate() error = %v, want *GateError{GateActionInvalid}", err)
+	}
+
+	if len(app.snapshotResolved()) != 0 {
+		t.Errorf("appender recorded %d resolved events, want 0 (forged response must never claim)", len(app.snapshotResolved()))
+	}
+	select {
+	case c := <-cmds:
+		t.Errorf("forged classifier source dispatched a command %T, want none", c)
+	default:
+	}
+
+	got := s.ListGates(context.Background())
+	if len(got) != 1 || got[0].ID != gateID {
+		t.Fatalf("ListGates() = %+v, want the gate still open and answerable", got)
+	}
+}

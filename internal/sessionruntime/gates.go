@@ -39,6 +39,18 @@ type gateEntry struct {
 	payload     gate.Payload
 	coordinates identity.Coordinates
 	state       gateState
+	// reviewBasis is the trusted snapshot of the live permission-review basis
+	// (GateID, ToolExecutionID, ContextRevision, GatePolicyRevision,
+	// SecurityCeiling) captured by StartPermissionReview at the moment
+	// classifier review began for this gate. It is populated independently of
+	// anything a classifier or its Hustle result reports, so
+	// respondFromClassifier can re-derive the CURRENT basis from data the
+	// session itself owns and compare it against the basis a classifier's
+	// eligible assessment was computed against — any divergence (a stale
+	// review, a policy revision that has since moved on, a mismatched tool
+	// execution) is detected here rather than trusted from the caller. Zero
+	// for gates permission review never started on.
+	reviewBasis gate.ReviewBasis
 }
 
 // gateAppender is the STRICT durable append seam for gate prepare/open/resolve.
@@ -200,13 +212,37 @@ func (s *Session) StartPermissionReview(ctx context.Context, req loopruntime.Per
 	if s.hustleController == nil {
 		return
 	}
-	adapter, err := newPermissionReviewAdapter(s.hustleController, s.permissionClassifiers, s.permissionReviewPolicy)
+	adapter, err := newPermissionReviewAdapter(s.hustleController, s.permissionClassifiers, s.permissionReviewPolicy, s)
 	if err != nil {
 		slog.Warn("sessionruntime: permission review adapter misconfigured; starting no review",
 			"gate_id", req.GateID, "error", err)
 		return
 	}
+	s.recordPermissionReviewBasis(req)
 	go adapter.review(ctx, req)
+}
+
+// recordPermissionReviewBasis stamps the gate directory entry with the
+// trusted, session-owned snapshot of the live review basis at the moment
+// review starts. It is a no-op for a gate that is not currently in the
+// directory (already closed, or never prepared) — StartPermissionReview is
+// fire-and-forget, so there is nothing to record a basis against and nothing
+// downstream that would ever read it.
+func (s *Session) recordPermissionReviewBasis(req loopruntime.PermissionReviewRequest) {
+	s.gatesMu.Lock()
+	defer s.gatesMu.Unlock()
+	entry, ok := s.gates[req.GateID]
+	if !ok {
+		return
+	}
+	entry.reviewBasis = gate.ReviewBasis{
+		GateID:             req.GateID,
+		ToolExecutionID:    req.ToolExecutionID,
+		ContextRevision:    req.ReviewContext.ContextRevision,
+		GatePolicyRevision: req.ReviewContext.GatePolicyRevision,
+		SecurityCeiling:    req.ReviewContext.SecurityCeiling,
+	}
+	s.gates[req.GateID] = entry
 }
 
 // PrepareGateOpen durably commits the public envelope plus private payload as a
@@ -728,7 +764,36 @@ func (s *Session) stampGateEvent(coords identity.Coordinates, g gate.Gate) (even
 // A failed append reverts the in-memory claim and leaves the gate answerable.
 // Command dispatch uses s.sessionCtx (not the caller's ctx) so a client
 // disconnect after the durable commit does not cancel delivery.
+//
+// A caller-supplied response whose Source.Kind is gate.ResponseFromClassifier
+// is rejected outright, before any locking or validation: only the private
+// respondFromClassifier method (called exclusively from the permission-review
+// adapter once gate.CombinePermissionAssessments reports eligibility) may
+// produce that provenance. gate.ResponseSource's fields are exported — a
+// public caller CAN construct one with Kind set to ResponseFromClassifier —
+// so this is a runtime, defense-in-depth check rather than a type-system
+// guarantee; respondFromClassifier reaches the shared core below directly and
+// is not subject to it.
 func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) error {
+	if response.Source.Kind == gate.ResponseFromClassifier {
+		return &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+	return s.respondGateCore(ctx, response, nil)
+}
+
+// respondGateCore performs the exactly-once gate claim, durable resolve, and
+// command/answer delivery shared by every gate-response path (human,
+// timeout-policy, and classifier). It is durable-first exactly as RespondGate
+// documents.
+//
+// drift, when non-nil, is evaluated under gatesMu in the SAME critical
+// section that checks the gate is open and claims it — there is no window
+// between the drift check and the claim in which the world could move again.
+// It reports whether the caller's evidence has gone stale; a true result
+// silently no-ops (nil error) rather than reporting a fault, matching design
+// §14.4's "a stale classifier response is an expected race, not a session
+// fault."
+func (s *Session) respondGateCore(ctx context.Context, response gate.GateResponse, drift func(gateEntry) bool) error {
 	s.gatesMu.Lock()
 	entry, ok := s.gates[response.GateID]
 	if !ok {
@@ -738,6 +803,10 @@ func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) e
 	if entry.state != gateOpen {
 		s.gatesMu.Unlock()
 		return &GateError{GateID: response.GateID, Kind: GateNotReady}
+	}
+	if drift != nil && drift(entry) {
+		s.gatesMu.Unlock()
+		return nil
 	}
 	if !validateGateAction(entry.gate, response.Action) {
 		s.gatesMu.Unlock()
@@ -775,6 +844,59 @@ func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) e
 	}
 	_ = s.dispatchGateCommand(entry, translated.cmd)
 	return nil
+}
+
+// respondFromClassifier is the ONLY place in the codebase that may construct
+// a GateResponse carrying gate.ResponseFromClassifier provenance (design
+// §14.5, §16.3, §25.2). It is unexported and called exclusively by the
+// permission-review adapter after gate.CombinePermissionAssessments reports
+// an eligible decision; there is no action parameter because Approve is the
+// only action a classifier-originated response may ever carry — structurally,
+// not by convention.
+//
+// basis is the common ReviewBasis (GateID/ToolExecutionID/ContextRevision/
+// GatePolicyRevision/SecurityCeiling; ClassifierRevision and SubjectDigest are
+// per-classifier and deliberately not part of the comparison) the eligible
+// assessment was computed against. Immediately before claiming the gate —
+// inside the SAME respondGateCore critical section that performs the claim,
+// so there is no TOCTOU window — it is compared against the trusted
+// entry.reviewBasis snapshot StartPermissionReview recorded, AND against the
+// session's CURRENT s.permissionReviewPolicy.Revision (read fresh, not from
+// the snapshot, so a policy revision changing under a long-running review is
+// still caught). Any divergence — the gate having moved to a different tool
+// execution, a context/policy/security-ceiling revision no longer matching,
+// or the gate simply being gone/claimed/closed already — makes the response
+// stale, which this method treats as an expected race rather than a fault:
+// it returns nil, exactly like every other non-fault stale-response outcome.
+func (s *Session) respondFromClassifier(ctx context.Context, basis gate.ReviewBasis, reason string) error {
+	if basis.GateID.IsZero() || reason == "" {
+		return nil
+	}
+	response := gate.GateResponse{
+		GateID: basis.GateID,
+		Action: string(gate.ApprovalApprove),
+		Source: gate.ResponseSource{Kind: gate.ResponseFromClassifier, Reason: reason},
+	}
+	drift := func(entry gateEntry) bool {
+		live := entry.reviewBasis
+		return live.ToolExecutionID != basis.ToolExecutionID ||
+			live.ContextRevision != basis.ContextRevision ||
+			live.SecurityCeiling != basis.SecurityCeiling ||
+			live.GatePolicyRevision != basis.GatePolicyRevision ||
+			s.permissionReviewPolicy.Revision != basis.GatePolicyRevision
+	}
+	err := s.respondGateCore(ctx, response, drift)
+	if err == nil {
+		return nil
+	}
+	var gateErr *GateError
+	if errors.As(err, &gateErr) && (gateErr.Kind == GateNotFound || gateErr.Kind == GateNotReady) {
+		// The gate was already claimed, resolved, or never existed by the time
+		// this classifier-originated response arrived: an expected race, not a
+		// session fault.
+		return nil
+	}
+	return err
 }
 
 // revertClaiming reverts a gate from claiming back to open after a failed

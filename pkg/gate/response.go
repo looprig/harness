@@ -69,6 +69,12 @@ const (
 	ResponseFromPolicy ResponseSourceKind = "policy"
 	// ResponseFromModel records a response supplied by model decision policy.
 	ResponseFromModel ResponseSourceKind = "model"
+	// ResponseFromClassifier records a response the session itself
+	// constructed from an eligible automated permission-classifier
+	// assessment (design §16.3). Only a private session-runtime method may
+	// stamp this source; a public caller's attempt to select it directly is
+	// rejected rather than honored (see internal/sessionruntime.RespondGate).
+	ResponseFromClassifier ResponseSourceKind = "classifier"
 )
 
 // ResponseRequest is the generic action and value payload used to answer a gate.

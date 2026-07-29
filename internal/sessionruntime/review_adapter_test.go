@@ -81,6 +81,35 @@ func (s *permissionReviewRunnerStub) callCount() int {
 	return len(s.requests)
 }
 
+// permissionReviewResponderStub is a permissionReviewResponder fake: it
+// records every basis+reason it was asked to respond with (so a test can
+// assert whether, and with what evidence, an eligible combined decision
+// reached the classifier-response seam) and can be configured to return an
+// error.
+type permissionReviewResponderStub struct {
+	mu      sync.Mutex
+	calls   []permissionReviewResponderCall
+	respErr error
+}
+
+type permissionReviewResponderCall struct {
+	basis  gate.ReviewBasis
+	reason string
+}
+
+func (s *permissionReviewResponderStub) respondFromClassifier(_ context.Context, basis gate.ReviewBasis, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, permissionReviewResponderCall{basis: basis, reason: reason})
+	return s.respErr
+}
+
+func (s *permissionReviewResponderStub) snapshot() []permissionReviewResponderCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]permissionReviewResponderCall(nil), s.calls...)
+}
+
 // reviewClassifierStub is a gate.PermissionClassifier fake: it records how
 // many times each method was called and lets a test control Applies and the
 // two typed results.
@@ -117,12 +146,20 @@ func (s *reviewClassifierStub) MarshalInput(gate.PermissionReviewSubject) (json.
 	}
 	return json.RawMessage(`{}`), nil
 }
-func (s *reviewClassifierStub) ValidateResult(gate.PermissionReviewSubject, hustle.Result) (gate.PermissionAssessment, error) {
+func (s *reviewClassifierStub) ValidateResult(subject gate.PermissionReviewSubject, _ hustle.Result) (gate.PermissionAssessment, error) {
 	s.validateCalls++
 	if s.validateErr != nil {
 		return gate.PermissionAssessment{}, s.validateErr
 	}
-	return s.assessment, nil
+	// A real classifier stamps Basis from the exact subject it was handed
+	// (gate.PermissionAssessment.Basis must equal the subject's Basis for
+	// gate.CombinePermissionAssessments to accept the outcome). The subject's
+	// SubjectDigest is only known once NewPermissionReviewSubject stamps it,
+	// so the stub fills this in here rather than asking every test to
+	// pre-compute it.
+	assessment := s.assessment
+	assessment.Basis = subject.Basis
+	return assessment, nil
 }
 
 // reviewClassifierClient is an inference.Client stub used only to satisfy
@@ -267,23 +304,28 @@ func TestNewPermissionReviewAdapterRejectsInvalidConfiguration(t *testing.T) {
 		t.Fatalf("NewPermissionClassifierSet: %v", err)
 	}
 	validPolicy := validReviewPolicy(t)
+	responder := &permissionReviewResponderStub{}
+	var typedNilResponder *permissionReviewResponderStub
 
 	tests := []struct {
 		name        string
 		runner      permissionReviewHustleRunner
 		classifiers gate.PermissionClassifierSet
 		policy      gate.PermissionReviewPolicy
+		responder   permissionReviewResponder
 		field       permissionReviewAdapterField
 	}{
-		{name: "nil runner", classifiers: validSet, policy: validPolicy, field: permissionReviewAdapterFieldRunner},
-		{name: "typed nil runner", runner: typedNilRunner, classifiers: validSet, policy: validPolicy, field: permissionReviewAdapterFieldRunner},
-		{name: "empty classifiers", runner: runner, policy: validPolicy, field: permissionReviewAdapterFieldClassifiers},
-		{name: "empty policy revision", runner: runner, classifiers: validSet, field: permissionReviewAdapterFieldPolicy},
-		{name: "valid", runner: runner, classifiers: validSet, policy: validPolicy},
+		{name: "nil runner", classifiers: validSet, policy: validPolicy, responder: responder, field: permissionReviewAdapterFieldRunner},
+		{name: "typed nil runner", runner: typedNilRunner, classifiers: validSet, policy: validPolicy, responder: responder, field: permissionReviewAdapterFieldRunner},
+		{name: "empty classifiers", runner: runner, policy: validPolicy, responder: responder, field: permissionReviewAdapterFieldClassifiers},
+		{name: "empty policy revision", runner: runner, classifiers: validSet, responder: responder, field: permissionReviewAdapterFieldPolicy},
+		{name: "nil responder", runner: runner, classifiers: validSet, policy: validPolicy, field: permissionReviewAdapterFieldResponder},
+		{name: "typed nil responder", runner: runner, classifiers: validSet, policy: validPolicy, responder: typedNilResponder, field: permissionReviewAdapterFieldResponder},
+		{name: "valid", runner: runner, classifiers: validSet, policy: validPolicy, responder: responder},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			adapter, err := newPermissionReviewAdapter(tt.runner, tt.classifiers, tt.policy)
+			adapter, err := newPermissionReviewAdapter(tt.runner, tt.classifiers, tt.policy, tt.responder)
 			if tt.field == "" {
 				if err != nil || adapter == nil {
 					t.Fatalf("newPermissionReviewAdapter() = (%v, %v), want valid adapter", adapter, err)
@@ -316,7 +358,7 @@ func TestPermissionReviewAdapterReviewSchedulesOnlyApplicableClassifiers(t *test
 		t.Fatalf("NewPermissionClassifierSet: %v", err)
 	}
 	runner := &permissionReviewRunnerStub{result: hustle.Result{Output: json.RawMessage(`{}`)}}
-	adapter, err := newPermissionReviewAdapter(runner, set, validReviewPolicy(t))
+	adapter, err := newPermissionReviewAdapter(runner, set, validReviewPolicy(t), &permissionReviewResponderStub{})
 	if err != nil {
 		t.Fatalf("newPermissionReviewAdapter: %v", err)
 	}
@@ -361,7 +403,7 @@ func TestPermissionReviewAdapterReviewSkipsWhenReviewContextMissing(t *testing.T
 		t.Fatalf("NewPermissionClassifierSet: %v", err)
 	}
 	runner := &permissionReviewRunnerStub{}
-	adapter, err := newPermissionReviewAdapter(runner, set, validReviewPolicy(t))
+	adapter, err := newPermissionReviewAdapter(runner, set, validReviewPolicy(t), &permissionReviewResponderStub{})
 	if err != nil {
 		t.Fatalf("newPermissionReviewAdapter: %v", err)
 	}
@@ -391,7 +433,7 @@ func TestPermissionReviewAdapterReviewSkipsClassifierWithInvalidBasis(t *testing
 		t.Fatalf("NewPermissionClassifierSet: %v", err)
 	}
 	runner := &permissionReviewRunnerStub{}
-	adapter, err := newPermissionReviewAdapter(runner, set, validReviewPolicy(t))
+	adapter, err := newPermissionReviewAdapter(runner, set, validReviewPolicy(t), &permissionReviewResponderStub{})
 	if err != nil {
 		t.Fatalf("newPermissionReviewAdapter: %v", err)
 	}
@@ -493,7 +535,7 @@ func TestSessionStartPermissionReviewDoesNotWaitForScheduledClassifierRun(t *tes
 	block := make(chan struct{})
 	t.Cleanup(func() { close(block) })
 	runner := &permissionReviewRunnerStub{block: block, result: hustle.Result{Output: json.RawMessage(`{}`)}}
-	adapter, err := newPermissionReviewAdapter(runner, set, validReviewPolicy(t))
+	adapter, err := newPermissionReviewAdapter(runner, set, validReviewPolicy(t), &permissionReviewResponderStub{})
 	if err != nil {
 		t.Fatalf("newPermissionReviewAdapter: %v", err)
 	}
@@ -548,5 +590,85 @@ func TestWithPermissionReviewSetsClassifiersAndPolicy(t *testing.T) {
 	}
 	if s.permissionReviewPolicy.Revision != policy.Revision {
 		t.Fatalf("permissionReviewPolicy.Revision = %q, want %q", s.permissionReviewPolicy.Revision, policy.Revision)
+	}
+}
+
+// TestPermissionReviewAdapterReviewRespondsWhenEligible proves design §14.3
+// steps 6-8 wired end to end at the adapter level: once
+// gate.CombinePermissionAssessments reports an eligible combined decision,
+// review attempts exactly one classifier-originated response, carrying the
+// common basis every applicable classifier's subject shared (with the
+// per-classifier ClassifierRevision/SubjectDigest fields zeroed) and a reason
+// that names the contributing classifier and its revision.
+func TestPermissionReviewAdapterReviewRespondsWhenEligible(t *testing.T) {
+	t.Parallel()
+	classifier := newValidReviewClassifier(t, "classifier", "rev-1", true)
+	classifier.assessment = gate.PermissionAssessment{
+		Risk:           gate.ReviewRiskLow,
+		Authorization:  gate.ReviewAuthorizationUnknown,
+		Recommendation: gate.ReviewAllow,
+		Rationale:      "low risk, allow",
+	}
+	set, err := gate.NewPermissionClassifierSet(classifier)
+	if err != nil {
+		t.Fatalf("NewPermissionClassifierSet: %v", err)
+	}
+	// validReviewRequest stamps GatePolicyRevision "gate-policy-rev-1"; the
+	// review policy's own Revision must equal that exact value for
+	// gate.CombinePermissionAssessments to accept the outcome.
+	policy, err := gate.DefaultPermissionReviewPolicy("gate-policy-rev-1")
+	if err != nil {
+		t.Fatalf("DefaultPermissionReviewPolicy: %v", err)
+	}
+	runner := &permissionReviewRunnerStub{result: hustle.Result{Output: json.RawMessage(`{}`)}}
+	responder := &permissionReviewResponderStub{}
+	adapter, err := newPermissionReviewAdapter(runner, set, policy, responder)
+	if err != nil {
+		t.Fatalf("newPermissionReviewAdapter: %v", err)
+	}
+
+	gateID := mustUUID()
+	toolExecutionID := mustUUID()
+	req := validReviewRequest(t, gateID, toolExecutionID)
+	adapter.review(context.Background(), req)
+
+	calls := responder.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("responder calls = %d, want exactly 1", len(calls))
+	}
+	if calls[0].basis.GateID != gateID || calls[0].basis.ToolExecutionID != toolExecutionID {
+		t.Fatalf("responder basis = %+v, want gate/tool-execution identity to match the request", calls[0].basis)
+	}
+	if calls[0].basis.ClassifierRevision != "" {
+		t.Errorf("responder basis carried a per-classifier ClassifierRevision %q, want the common (zeroed) basis", calls[0].basis.ClassifierRevision)
+	}
+	if calls[0].reason != "classifier@rev-1" {
+		t.Errorf("responder reason = %q, want %q", calls[0].reason, "classifier@rev-1")
+	}
+}
+
+// TestPermissionReviewAdapterReviewNeverRespondsWhenNotEligible proves the
+// converse: any non-eligible combined decision — here, no classifier applies
+// at all — reaches zero responder calls, so the human gate is never touched
+// on this path (design §25.4: every non-allow condition preserves it).
+func TestPermissionReviewAdapterReviewNeverRespondsWhenNotEligible(t *testing.T) {
+	t.Parallel()
+	classifier := newValidReviewClassifier(t, "classifier", "rev-1", false)
+	set, err := gate.NewPermissionClassifierSet(classifier)
+	if err != nil {
+		t.Fatalf("NewPermissionClassifierSet: %v", err)
+	}
+	runner := &permissionReviewRunnerStub{}
+	responder := &permissionReviewResponderStub{}
+	adapter, err := newPermissionReviewAdapter(runner, set, validReviewPolicy(t), responder)
+	if err != nil {
+		t.Fatalf("newPermissionReviewAdapter: %v", err)
+	}
+
+	req := validReviewRequest(t, mustUUID(), mustUUID())
+	adapter.review(context.Background(), req)
+
+	if calls := responder.snapshot(); len(calls) != 0 {
+		t.Fatalf("responder calls = %d, want 0 (no applicable classifier)", len(calls))
 	}
 }
