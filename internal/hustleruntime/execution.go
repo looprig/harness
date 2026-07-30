@@ -372,6 +372,28 @@ func (r *runtimeController) executeWithEvidence(
 	defer cancel()
 	evidenceCtx, cleanupEvidenceCtx := newEvidenceAttemptContext(executionCtx)
 	defer cleanupEvidenceCtx()
+	// evidenceAttemptContext deliberately retains NO values from its parent
+	// (evidence_context.go's own doc comment) — a real isolation boundary,
+	// not an oversight, for the general case of request-scoped values that
+	// should never leak into an evidence-tool call. The design §13.4 (TOCTOU)
+	// ObservationCollector the review adapter attaches to executionCtx
+	// (internal/sessionruntime/review_adapter.go's WithObservationCollector,
+	// called on the ctx it passes into RunAndFinalize, several frames above
+	// this one) is the ONE deliberate exception: it is a write-only,
+	// capability-free accumulator that exists FOR THIS EXACT evidence-call
+	// path (nothing else ever reads it), so re-threading it across this
+	// boundary does not weaken evidenceAttemptContext's isolation guarantee
+	// for anything else. Without this, every target-sensitive evidence
+	// tool's real recorded observation is silently lost the moment it
+	// executes through this real path, and design §13.4's whole pre-approval
+	// recheck (gates.go's verifyPermissionReviewObservations) degrades to
+	// its "nothing was ever recorded" no-op branch — auto-approval would
+	// proceed exactly as if the TOCTOU recheck did not exist, for every real
+	// evidence-tool call, regardless of whether a consumer wired
+	// rig.WithPermissionReviewObservations. WithObservationCollector is a
+	// no-op for the nil collector every non-review Hustle run has, so this
+	// re-attachment changes nothing outside a classifier review.
+	evidenceCtx = WithObservationCollector(evidenceCtx, observationCollectorFromContext(executionCtx))
 	plan, runtime, runErr := r.prepareEvidenceExecution(
 		evidenceCtx, definition, runRequest, runID, input,
 	)

@@ -9,6 +9,7 @@ import (
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 )
 
 // observingEvidenceTool wraps preparedEvidenceTool and additionally
@@ -178,6 +179,73 @@ func TestEvidenceRunnerNoCollectorAttachedIsANoOp(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("run() error = %v, want no collector attached to still succeed", err)
+	}
+}
+
+// TestRunAndFinalizeThreadsObservationCollectorThroughRealEvidenceExecution
+// is a regression test for a genuine cross-cutting gap this addendum's own
+// CodeRig-side end-to-end test (coderig-permission-classifier's
+// TestPermissionReviewObservationSymlinkSwapBlocksAutoApprovalEndToEnd)
+// discovered: every OTHER test in this file attaches the
+// ObservationCollector directly to the ctx passed straight into
+// evidenceRunner.run (bypassing Controller.RunAndFinalize/executeWithEvidence
+// entirely), which is not how a real classifier review attaches one
+// (internal/sessionruntime/review_adapter.go's reviewOne calls
+// WithObservationCollector on the ctx it hands to RunAndFinalize, several
+// call frames above evidenceRunner.run). executeWithEvidence
+// (execution.go) derives its per-attempt context via
+// newEvidenceAttemptContext, which deliberately strips every ambient
+// context value from its caller (see evidence_context.go's own doc comment,
+// and TestEvidenceExecutionStripsAmbientContextAuthority above proving that
+// isolation for an arbitrary key) — including, before execution.go's fix,
+// the ObservationCollector itself, silently discarding every real
+// target-sensitive evidence tool's recorded observation. This test drives
+// the REAL RunAndFinalize -> executeWithEvidence -> evidenceCtx path (no
+// shortcut) and proves the collector attached at the OUTER ctx, exactly
+// where reviewOne attaches it, still receives the observation a real
+// evidence call records.
+func TestRunAndFinalizeThreadsObservationCollectorThroughRealEvidenceExecution(t *testing.T) {
+	t.Parallel()
+
+	sessionID, loopID := mustRuntimeTestID(t), mustRuntimeTestID(t)
+	reporting := &observingEvidenceTool{
+		preparedEvidenceTool: newPreparedEvidenceTool("workspace_read", "ok"),
+		target:               "/workspace/file", token: "hash-real-path", report: true,
+	}
+	invocation := 0
+	client := &runtimeTestClient{invoke: func(_ context.Context, _ inference.Request) (*inference.Response, error) {
+		invocation++
+		if invocation == 1 {
+			return oneEvidenceCallResponse("call-real-path"), nil
+		}
+		return terminalEvidenceResponse(`{"summary":"allow"}`, nil), nil
+	}}
+	definition := runtimeEvidenceDefinition(t, client, runtimeEvidenceModel(), func(_ context.Context, _ tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{reporting}, nil
+	}, hustle.ToolLoopLimits{
+		MaxRounds: 2, MaxCalls: 1, MaxCallsPerRound: 1,
+		MaxResultBytes: 1024, MaxEvidenceBytes: 2048,
+	})
+	controller := runtimeEvidenceController(t, sessionID, definition)
+	request := runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID)
+
+	// Attach the collector to the OUTER ctx passed to RunAndFinalize — the
+	// exact shape review_adapter.go's reviewOne uses in production — never
+	// directly to evidenceRunner.run the way every other test in this file
+	// does.
+	collector := NewObservationCollector()
+	runCtx := WithObservationCollector(context.Background(), collector)
+	err := controller.RunAndFinalize(runCtx, request, func(_ context.Context, _ hustle.Result) error {
+		return nil
+	}, noOpFinalizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := collector.Observations()
+	want := gate.ObservationRequirement{Target: "/workspace/file", Token: "hash-real-path"}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("Observations() = %+v, want [%+v] (collector attached at RunAndFinalize's own ctx, exactly like review_adapter.go, must survive the real evidence-execution path)", got, want)
 	}
 }
 
