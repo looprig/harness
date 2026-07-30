@@ -144,14 +144,20 @@ func TestPermissionReviewPolicyUsesClosedDomainOrdering(t *testing.T) {
 		gate.ReviewAuthorizationMedium,
 		gate.ReviewAuthorizationHigh,
 	}
+	// Exercised against ReviewRiskMedium (not Low): the policy's own shape
+	// validation now requires MinimumAuthorization[Medium] >=
+	// MinimumAuthorization[Low] (in addition to the pre-existing High >=
+	// Medium), so Medium is the risk tier whose minimum can range across the
+	// full authorization domain here while Low (fixed at Unknown, rank 0)
+	// and High (fixed at High, rank 3) stay outside that range.
 	for minimumIndex, minimum := range authorizations {
 		policy, err := gate.NewPermissionReviewPolicy(
 			"gate-policy-v1",
 			gate.ReviewRiskHigh,
 			map[gate.ReviewRisk]gate.ReviewAuthorization{
-				gate.ReviewRiskLow:    minimum,
-				gate.ReviewRiskMedium: gate.ReviewAuthorizationUnknown,
-				gate.ReviewRiskHigh:   gate.ReviewAuthorizationMedium,
+				gate.ReviewRiskLow:    gate.ReviewAuthorizationUnknown,
+				gate.ReviewRiskMedium: minimum,
+				gate.ReviewRiskHigh:   gate.ReviewAuthorizationHigh,
 			},
 			nil,
 			0,
@@ -163,7 +169,7 @@ func TestPermissionReviewPolicyUsesClosedDomainOrdering(t *testing.T) {
 			subject := validPermissionReviewSubject(t)
 			assessment := validPermissionAssessment(
 				subject,
-				gate.ReviewRiskLow,
+				gate.ReviewRiskMedium,
 				authorization,
 				gate.ReviewAllow,
 			)
@@ -267,6 +273,9 @@ func TestPermissionReviewPolicyRejectsInvalidAndRelaxedValues(t *testing.T) {
 		}()},
 		{name: "high less than medium", revision: "r", maximum: gate.ReviewRiskHigh, minimum: map[gate.ReviewRisk]gate.ReviewAuthorization{
 			gate.ReviewRiskLow: gate.ReviewAuthorizationUnknown, gate.ReviewRiskMedium: gate.ReviewAuthorizationHigh, gate.ReviewRiskHigh: gate.ReviewAuthorizationMedium,
+		}},
+		{name: "medium less than low", revision: "r", maximum: gate.ReviewRiskHigh, minimum: map[gate.ReviewRisk]gate.ReviewAuthorization{
+			gate.ReviewRiskLow: gate.ReviewAuthorizationHigh, gate.ReviewRiskMedium: gate.ReviewAuthorizationLow, gate.ReviewRiskHigh: gate.ReviewAuthorizationHigh,
 		}},
 		{name: "duplicate absolute", revision: "r", maximum: gate.ReviewRiskHigh, minimum: validMinimum(), absolute: []gate.ReviewRiskCategory{gate.ReviewCategoryCredentialAccess, gate.ReviewCategoryCredentialAccess}},
 		{name: "invalid absolute", revision: "r", maximum: gate.ReviewRiskHigh, minimum: validMinimum(), absolute: []gate.ReviewRiskCategory{"other"}},

@@ -237,6 +237,14 @@ func validPermissionReviewPolicyShape(policy PermissionReviewPolicy) bool {
 			reviewAuthorizationRank(policy.MinimumAuthorization[ReviewRiskMedium]) {
 		return false
 	}
+	// The same monotonic-ceiling requirement applies one step down: a policy
+	// that demands stronger authorization for Low than for Medium is
+	// internally inverted (nonsensical, even though it is trusted-consumer
+	// configuration only, not attacker-reachable) and must not validate.
+	if reviewAuthorizationRank(policy.MinimumAuthorization[ReviewRiskMedium]) <
+		reviewAuthorizationRank(policy.MinimumAuthorization[ReviewRiskLow]) {
+		return false
+	}
 	for risk := range policy.MinimumAuthorization {
 		if risk != ReviewRiskLow && risk != ReviewRiskMedium && risk != ReviewRiskHigh {
 			return false
