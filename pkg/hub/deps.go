@@ -23,6 +23,24 @@ type eventAppender interface {
 	AppendEvent(ctx context.Context, ev event.Event) (uint64, error)
 }
 
+// eventAppenderResult is the OPTIONAL extension of eventAppender an injected appender
+// may additionally satisfy to report whether ITS OWN durable append produced a NEW
+// frame (Appended=true) or deduplicated an already-durable retry (Appended=false — the
+// underlying durable journal recognized the event's idempotency id as already indexed,
+// e.g. a redelivered checked process-lifecycle publish). The hub type-asserts h.appender
+// for it before applying and delivering an Enduring event's live transition: on
+// Appended=false the publish is treated as an already-completed no-op — no sessionState
+// mutation, no subscriber broadcast — because the event was already applied and
+// delivered by its original, genuinely new append. This preserves the OLD single-method
+// appender surface unweakened (Interface Segregation): an appender written before this
+// extension existed, or one that simply chooses not to implement it, keeps satisfying
+// plain eventAppender and is treated as if every successful append is new — exactly its
+// pre-extension behavior.
+type eventAppenderResult interface {
+	eventAppender
+	AppendEventResult(ctx context.Context, ev event.Event) (seq uint64, appended bool, err error)
+}
+
 // nopEventAppender is the default appender wired into a hub built without an injected
 // one. It persists nothing and never fails, so the hub's fail-secure branch is never
 // taken in no-persistence mode — every Enduring event is delivered exactly as before
@@ -30,6 +48,14 @@ type eventAppender interface {
 type nopEventAppender struct{}
 
 func (nopEventAppender) AppendEvent(context.Context, event.Event) (uint64, error) { return 0, nil }
+
+// AppendEventResult reports Appended=true: the nop appender persists nothing and
+// deduplicates nothing, so every publish it backs is treated as new — headless mode
+// keeps delivering every Enduring event exactly as it did before this extension
+// existed.
+func (nopEventAppender) AppendEventResult(context.Context, event.Event) (uint64, bool, error) {
+	return 0, true, nil
+}
 
 // Option configures an optional hub dependency at construction. The bare
 // New(sessionID) installs the nop appender, a real-clock/real-uuid Factory, and the

@@ -138,9 +138,14 @@ func (h *Hub) unsubscribe(sub *EventSubscription) {
 // order. The precise ordering, honoring the lock rule (no I/O under the hub lock):
 //
 //  1. Ephemeral event: never persisted — fan out only (the unchanged path).
-//  2. Enduring event: appender.AppendEvent(ev) OUTSIDE the lock. On error →
-//     ReportFault, deliver NOTHING, return (do not apply a transition for an event
-//     that did not persist).
+//  2. Enduring event: appender.AppendEvent(ev) OUTSIDE the lock — via
+//     appendEventResult, which also asks an appender that implements the optional
+//     eventAppenderResult extension whether the append durably persisted a NEW frame.
+//     On error → ReportFault, deliver NOTHING, return (do not apply a transition for
+//     an event that did not persist). On a deduplicated retry (Appended=false) →
+//     apply NOTHING and deliver NOTHING; the event was already applied and delivered
+//     by its original, genuinely new append, so this call reports the same success
+//     without repeating either.
 //  3. Under the lock: apply ev's active/phase mutation, which may derive D
 //     (SessionActive/SessionIdle); snapshot the subscriber set. Unlock.
 //  4. If D was derived: mint it (Factory: EventID+CreatedAt) and append it OUTSIDE
@@ -199,7 +204,7 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 	// fail-secure; capture the durable sequence to ride the live delivery.
 	var seq uint64
 	if ev.Class() == event.Enduring {
-		s, err := h.appender.AppendEvent(ctx, ev)
+		s, appended, err := h.appendEventResult(ctx, ev)
 		if err != nil {
 			fault := &SessionPersistenceFault{Event: ev, Cause: err}
 			h.reporter.ReportFault(ctx, fault)
@@ -207,6 +212,14 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 				return false, fault
 			}
 			return false, nil
+		}
+		if !appended {
+			// Deduplicated retry: the underlying journal already indexed this event's
+			// idempotency id under a genuinely new, earlier append, which already
+			// applied its state mutation and delivered it live. Report the same success
+			// this call would have reported had it been the original — but apply
+			// nothing and broadcast nothing a second time.
+			return true, nil
 		}
 		seq = s
 	}
@@ -338,6 +351,22 @@ func isInternalAuditEventType(ev event.Event) bool {
 	default:
 		return false
 	}
+}
+
+// appendEventResult calls the injected appender's optional Appended-reporting
+// extension (eventAppenderResult) when h.appender implements it, and otherwise falls
+// back to the plain AppendEvent surface, treating every successful append as new
+// (appended=true) — the backward-compatible default for every appender written before
+// the extension existed, and for one that simply does not implement it.
+func (h *Hub) appendEventResult(ctx context.Context, ev event.Event) (seq uint64, appended bool, err error) {
+	if r, ok := h.appender.(eventAppenderResult); ok {
+		return r.AppendEventResult(ctx, ev)
+	}
+	seq, err = h.appender.AppendEvent(ctx, ev)
+	if err != nil {
+		return 0, false, err
+	}
+	return seq, true, nil
 }
 
 func validatePublicPublication(ev event.Event) error {
