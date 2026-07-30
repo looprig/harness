@@ -18,6 +18,15 @@ func FuzzClassifyToolResponse(f *testing.F) {
 	f.Add(uint8(3), uint8(3), `{"nested":{"value":1}}`, "duplicate", "workspace.status", int32(-1))
 	f.Add(uint8(1), uint8(2), strings.Repeat(`{"v":`, maxEvidenceJSONDepth+1)+`0`+strings.Repeat(`}`, maxEvidenceJSONDepth+1), "deep", "workspace.status", int32(1<<20))
 	f.Add(uint8(1), uint8(2), `{"value":"`+strings.Repeat("a", 257)+`"}`, strings.Repeat("i", maxProviderCallIDBytes+1), "workspace.status", int32(256))
+	// Structural gap seed: a terminal (structured-output) ToolUseBlock mixed
+	// with an ordinary evidence ToolUseBlock in the same response. None of
+	// the other shapes below construct this exact combination — shape 3
+	// mixes two ordinary calls, shape 4 mixes text with an ordinary call —
+	// so without this seed the mixed-terminal-and-tool rejection path
+	// (ToolResponseFailureMixed) was reachable only via the fixed unit test
+	// TestClassifyToolResponseRejectsInvalidShapesWithoutEcho, never by the
+	// fuzzer itself. See shape case 9 below.
+	f.Add(uint8(9), uint8(2), `{"allowed":true}`, "terminal-1", "workspace.status", int32(256))
 
 	f.Fuzz(func(t *testing.T, shape, finish uint8, raw, id, name string, limit int32) {
 		response := fuzzToolResponse(shape, finish, raw, id, name)
@@ -81,7 +90,7 @@ func fuzzToolResponse(shape, finish uint8, raw, id, name string) *inference.Resp
 
 	input := json.RawMessage(raw)
 	var blocks []content.Block
-	switch shape % 10 {
+	switch shape % 11 {
 	case 0:
 		blocks = []content.Block{&content.TextBlock{Text: raw}}
 	case 1:
@@ -104,6 +113,18 @@ func fuzzToolResponse(shape, finish uint8, raw, id, name string) *inference.Resp
 		blocks = []content.Block{&content.ImageBlock{}}
 	case 8:
 		blocks = []content.Block{&content.ThinkingBlock{Thinking: raw}}
+	case 9:
+		// A terminal (structured-output) ToolUseBlock mixed with an
+		// ordinary evidence ToolUseBlock: neither case 3 (ordinary +
+		// ordinary) nor case 4 (text + ordinary) constructs this specific
+		// combination, so without it classifyToolResponse's
+		// terminalCount>0 && len(ordinary)>0 rejection branch
+		// (ToolResponseFailureMixed) was reachable only from the fixed
+		// unit test, never the fuzzer.
+		blocks = []content.Block{
+			&content.ToolUseBlock{ID: id, Name: inference.StructuredOutputToolName, Input: input},
+			&content.ToolUseBlock{ID: id, Name: name, Input: input},
+		}
 	default:
 		return nil
 	}
