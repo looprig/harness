@@ -250,7 +250,7 @@ func (s *Session) stopSessionResources(root context.Context, timeout time.Durati
 	ctx, cancel := cleanupContext(root, timeout)
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- s.resources.Shutdown(context.Background()) }()
+	go func() { done <- s.resources.Shutdown(context.Background()) }() // #nosec G118 -- deliberately outlives the bounded reporting deadline; see the function doc comment above
 	select {
 	case err := <-done:
 		return err
