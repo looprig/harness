@@ -48,6 +48,12 @@ versions, not the replaces.
                      |  enforcement|                          |           |
                      +-------------+                          +-----------+
 
+                     +-------------+
+                     | classifiers |  permission auto-review classifiers
+                     | (gate.*     |  (prompts, wire codecs, evidence-tool
+                     |  reviewers) |  catalogs, evaluation corpus) over
+                     +-------------+  harness's public pkg/gate + pkg/hustle
+
   Storage backends (each its own module, satisfies storage.Composite):
     looprig/fsstore  · looprig/natsstore · looprig/rclonestore
 ```
@@ -61,6 +67,7 @@ versions, not the replaces.
 | [`looprig/storage`](https://github.com/looprig/storage) | `Ledger`, `Leaser`, `KV`, `Blobs` leaf contracts + in-memory `memstore` + conformance suite | stdlib only |
 | [`looprig/harness`](https://github.com/looprig/harness) (this module) | the agent runtime: `Rig`, `Session`, `Loop`, `Hub`, `Gate`, `Event`, `Command`, `Tool`, durable journal + restore | `core`, `inference`, `storage`, `eval` |
 | [`looprig/eval`](https://github.com/looprig/eval) | the evaluation framework: conversations, evaluators (`exact`/`judge`), rubrics, reports | `core`, `inference` (judge only) |
+| [`looprig/classifiers`](https://github.com/looprig/classifiers) | the permission auto-review classifier product: prompts, wire codecs, deterministic risk/authorization policy, evidence-tool catalogs, and evaluation corpus for `harness`'s `pkg/gate` permission-review domain and `pkg/hustle` tool-use loop. Ships `gate.command-safety` (`pkg/commandsafety`) as its initial classifier | `harness` (public packages only), `core`, `inference` |
 | [`looprig/foreignloops`](https://github.com/looprig/foreignloops) | `codex`, `claude`, and `acp` (Task 5.2) subprocess/protocol backends behind harness's `pkg/foreign` seams | `harness`, `core`, `inference`, `acp` (`acp/client` only, for `driver/acp`) |
 | [`looprig/acp`](https://github.com/looprig/acp) | Agent Client Protocol bridge, split into a stdlib-only wire layer and one harness-facing facade: `acp/protocol` (generated ACP types + JSON-RPC envelope/errors) and `acp/transport/stdio` (NDJSON framing, subprocess spawn/supervision) have **no** harness or core dependency; `acp/client` drives a foreign ACP agent as a typed connection/session runtime (also harness-free — `foreignloops/driver/acp` is the only thing that turns its output into Harness events); `acp/agent` is the sole package that imports harness's public `session`/`event`/`gate`/`loop`/`identity` contracts (plus `core/content`, `core/uuid`) to expose a harness-backed product as an ACP agent through consumer-owned host interfaces, never importing product code | `acp/protocol`, `acp/transport/stdio`, `acp/client`: stdlib only. `acp/agent` only: `harness` (public pkgs), `core` |
 | [`looprig/tools`](https://github.com/looprig/tools) | `bash`, `web`, and the other standard tool implementations + their `CallPreparer` | `harness` (`pkg/tool`), `sandbox` |
@@ -106,6 +113,19 @@ wired at the consumer's composition root.
 - **Eval** — `pkg/evalmigration` is the build-tagged migration proof that the
   legacy harness eval examples re-express cleanly against `looprig/eval`. New
   evaluation code lives in `looprig/eval`, not here.
+- **Permission auto-review classifiers** — `pkg/gate` owns the neutral,
+  mechanism-level review domain (subject/basis/context envelope, local
+  decision policy, evidence-tool access seams, audit events) and `pkg/hustle`
+  owns the bounded tool-use loop a classifier runs inside; `harness` never
+  imports `looprig/classifiers`. `looprig/classifiers` imports only harness's
+  public packages and owns the actual classifiers — prompts, wire codecs,
+  risk policy, evidence-tool catalogs, and evaluation corpus. A consumer
+  imports both and explicitly registers which classifiers to run via
+  `rig.WithPermissionClassifiers`; zero registered classifiers preserves
+  harness's pre-classifier gate behavior exactly. See
+  [`pkg/gate/README.md`](../pkg/gate/README.md#permission-review) for the
+  full enable/disable, evidence-boundary, audit/privacy, policy-tuning, and
+  restore-behavior story.
 - **TUI** — `pkg/serve` and the `Session` contracts are the surface a
   terminal presenter binds against; `looprig/tui` does the rendering.
 

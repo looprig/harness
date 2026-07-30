@@ -44,6 +44,14 @@ r, err := rig.Define(
     rig.WithPermissionClassifiers(permissionClassifiers),
     rig.WithPermissionReviewPolicy(reviewPolicy),
     rig.WithPermissionReviewSecurityCeiling("consumer-access-profile/v1"),
+    // Optional: bounded evidence-tool access for classifiers that gather
+    // read-only evidence. Required whenever any registered classifier's
+    // definition declares evidence tools — see pkg/gate/README.md#evidence-boundaries.
+    rig.WithPermissionReviewEvidence(evidenceAccess, evidenceContainment, allowedEvidenceKinds),
+    // Optional: circuit-breaker thresholds (design §18). Defaults every one
+    // of 8 turn+session counters to rig.DefaultPermissionReviewBreakerThreshold
+    // (20) when omitted but classifiers are configured.
+    rig.WithPermissionReviewLimits(rig.PermissionReviewLimits{ /* ... */ }),
     rig.WithForeignBuilders(/* ...foreign.Builder for codex/claude... */...),
     rig.WithGateCaps(rig.GateCaps{MaxOpen: 16, MaxTimeout: 30*time.Second}),
     rig.WithDelegationLimits(rig.DelegationLimits{Depth: 4, Quota: 32}),
@@ -62,6 +70,33 @@ Restore is the same shape with the session id:
 ```go
 session, err := r.RestoreSession(ctx, priorSessionID)
 ```
+
+`rig.WithPermissionClassifiers`, `WithPermissionReviewPolicy`,
+`WithPermissionReviewEvidence`, and `WithPermissionReviewSecurityCeiling` are
+all supplied at `rig.Define` time above, not per restore — restore itself
+takes no options. Omitting every one of them (the zero-classifier rig) is how
+you disable permission review entirely: it preserves the pre-classifier gate
+behavior byte-for-byte, with no separate on/off flag to flip. See
+[`pkg/gate/README.md`](../gate/README.md#permission-review) for the full
+enable/disable, evidence-boundary, human-fallback, audit/privacy,
+policy-tuning, evaluation-workflow, and restore-behavior story; that
+package — not this one — owns the neutral review domain these options
+configure.
+
+### Restore and a changed permission-review configuration
+
+Restoring a session whose rig now has permission review configured
+differently than when it was opened follows the ordinary configuration-drift
+policy above, with one extra rule specific to this feature: turning
+classifiers on where the session was originally opened with none configured
+is always a rejected `DriftWarn`, never a silent auto-accept, even though the
+rest of that restore's drift might otherwise be all-`Info`. A rig only
+resumes with review newly enabled if it explicitly opted in — with
+`rig.WithRestoreDecider` (preferred: inspect the assessment and accept this
+dimension specifically) or the older, blanket `rig.WithAllowConfigMismatch()`
+(accepts every `Warn`-level drift, not just this one). Turning classifiers
+off, or restoring with the same or a differently-identified classifier set
+that was already enabled before, is unaffected by this rule.
 
 ## Sibling packages
 

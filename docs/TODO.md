@@ -63,6 +63,24 @@ approved design is already linked.
 
 ## Safety and observability
 
+- [x] **Permission auto-review classifier and tool-using Hustles** — a bounded,
+  evidence-gathering classifier can auto-approve a low-risk permission gate once,
+  racing (never blocking) the ordinary human response; every non-eligible outcome
+  leaves the human gate exactly as open as it always was. `pkg/gate` owns the
+  neutral review domain and local decision policy; `pkg/hustle` owns the bounded
+  tool-use loop; the actual classifiers (prompts, wire codecs, evidence-tool
+  catalogs, evaluation corpus) live in the separate `looprig/classifiers` module,
+  which harness never imports. Off by default: zero registered classifiers
+  preserves prior gate behavior byte-for-byte. See
+  [`2026-07-27-permission-classifier-hustle-design.md`](plans/2026-07-27-permission-classifier-hustle-design.md)
+  and [`pkg/gate/README.md`](../pkg/gate/README.md#permission-review) for
+  enable/disable, model capability requirements, evidence boundaries, human
+  fallback, audit/privacy, policy tuning, evaluation workflow, and restore
+  behavior. This directly informs and partially overlaps the
+  "Untrusted-content classification" item below (provenance/classification for
+  tool-triggered risk) without completing it — that item's broader scope
+  (file/web/MCP/delegate-report content classification, independent of
+  permission review) remains open.
 - [ ] **Untrusted-content classification** — classify file contents, command output, web
   results, MCP data, artifacts, and delegate reports as data rather than instructions;
   propagate provenance labels; add prompt-injection detection/policy hooks; and ensure a

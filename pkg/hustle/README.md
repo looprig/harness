@@ -78,16 +78,44 @@ A loop invokes a hustle through the hustle tool (built by the
 composition root) and observes the outcome as a typed event on the
 session stream (`HustleStarted`, `HustleCompleted`, `HustleFailed`).
 
+## Tool-using hustles and model capability requirements
+
+A hustle whose `Definition` carries both an `EvidenceToolPolicy` (bound
+evidence tools) and an `OutputSchema` — the shape a permission-review
+classifier uses — runs a bounded, sequential tool-use loop: the model may
+issue zero or more ordinary evidence-tool calls before returning exactly one
+strict terminal structured result. This requires the resolved `model.Model`
+to report `Caps.Tools`, `Caps.StructuredOutput`, AND
+`Caps.StructuredOutputWithTools` all true; a mismatch fails the hustle before
+inference (`inference.StructuredOutputWithToolsUnsupportedError`) rather than
+degrading to a text response. When such a hustle backs a permission-review
+classifier, that failure is one of the many expected review outcomes that
+leaves the ordinary human gate open — see
+[`pkg/gate/README.md#permission-review`](../gate/README.md#permission-review)
+for the full classifier composition and human-fallback story; this package
+owns only the bounded tool-use loop the classifier runs inside, never the
+review domain itself.
+
 ## Sibling packages
 
 - [`pkg/rig`](../rig/README.md) — `rig.WithHustles` and
-  `rig.WithHustleLimits` register hustles and bound their lanes.
+  `rig.WithHustleLimits` register hustles and bound their lanes;
+  `rig.WithPermissionClassifiers` automatically registers a classifier's
+  own `hustle.Definition` as a blocking Hustle.
+- [`pkg/gate`](../gate/README.md) — the permission-review domain
+  (`gate.PermissionClassifier`, `gate.PermissionReviewSubject`) a
+  classifier's tool-using Hustle serves; owns evidence-boundary
+  (`EvidenceAccessEvaluator`/`EvidenceContainmentVerifier`), audit, and
+  restore semantics for that use case.
 - [`pkg/event`](../event/README.md) — `event.HustleStarted` /
   `HustleCompleted` / `HustleFailed`, the durable lifecycle events.
 - [`pkg/identity`](../identity/README.md) — `identity.AgentName` used by
   the originating loop's binding.
 - `github.com/looprig/inference` — `inference.Client`, `model.Model`,
   `inference.OutputSchema`.
+- `github.com/looprig/classifiers` — the classifier product built on this
+  package's bounded tool-use loop and `pkg/gate`'s review domain. This
+  package never imports it.
 
 ## How it is designed
 
