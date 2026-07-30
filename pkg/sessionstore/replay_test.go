@@ -3,6 +3,8 @@ package sessionstore
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"reflect"
@@ -527,6 +529,52 @@ func TestReplayBlobResolution(t *testing.T) {
 				t.Fatalf("Next() err = %v, want the fail-closed typed error", err)
 			}
 		})
+	}
+}
+
+// TestReplayOffloadedRecordIDMismatchFailsClosed proves baseCursor.resolveBlob
+// verifies the outer blobptr envelope's idempotency id against the resolved inner
+// envelope's id and fails closed with a typed *BlobPointerIDMismatchError when they
+// disagree — even though the blob's CONTENT hashes correctly (so BlobIntegrityError's
+// check alone would not catch it). The writer always stamps the same id on both
+// halves of a real offload, so this scenario is white-box constructed directly
+// against resolveBlob rather than through the ordinary Store/Append path.
+func TestReplayOffloadedRecordIDMismatchFailsClosed(t *testing.T) {
+	t.Parallel()
+	blobs := memstore.New().Blobs
+
+	inner := envelope{V: envelopeVersion, Kind: string(kindEvent), ID: "inner-id", Body: []byte(`{"x":1}`)}
+	innerBytes, err := encodeEnvelope(inner)
+	if err != nil {
+		t.Fatalf("encodeEnvelope(inner) err = %v", err)
+	}
+	sum := sha256.Sum256(innerBytes)
+	shahex := hex.EncodeToString(sum[:])
+	key := "sessions/mismatch-test/blobs/" + shahex
+	if err := blobs.Put(context.Background(), key, bytes.NewReader(innerBytes)); err != nil {
+		t.Fatalf("Blobs.Put() err = %v", err)
+	}
+
+	ptr := blobPointer{Key: key, Size: int64(len(innerBytes)), SHA256: shahex}
+	ptrBody, err := encodeBlobPointer(ptr)
+	if err != nil {
+		t.Fatalf("encodeBlobPointer() err = %v", err)
+	}
+	// The outer pointer carries a DIFFERENT id than the inner envelope it (correctly,
+	// per its content hash) resolves to.
+	outer := envelope{V: envelopeVersion, Kind: string(kindBlobPtr), ID: "outer-id", Body: ptrBody}
+
+	base := &baseCursor{name: "sessions/mismatch-test", blobs: blobs}
+	rec, err := base.resolveBlob(context.Background(), outer, 3)
+	if rec.kind != "" || rec.body != nil || rec.seq != 0 || rec.id != "" {
+		t.Errorf("resolveBlob() = %#v, want zero value on id mismatch", rec)
+	}
+	var mismatch *BlobPointerIDMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("resolveBlob() err = %v, want *BlobPointerIDMismatchError", err)
+	}
+	if mismatch.Seq != 3 || mismatch.Key != key || mismatch.OuterID != "outer-id" || mismatch.InnerID != "inner-id" {
+		t.Errorf("mismatch = %+v, want {Seq:3 Key:%q OuterID:outer-id InnerID:inner-id}", mismatch, key)
 	}
 }
 

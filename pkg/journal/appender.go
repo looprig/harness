@@ -104,8 +104,28 @@ func NewJournalEventAppenderChecked(journal SessionJournal, opts ...AppenderOpti
 // this method's return — the durable append stays strict, the catalog is derivable. On an
 // append failure the catalog is NOT touched (the event did not durably land) and seq 0 is
 // returned alongside the error.
+//
+// When the underlying journal additionally satisfies IdempotentJournal (the optional
+// dedup seam), a redelivered event whose EventID already names a durable record is
+// detected there and reported as AppendResult.Appended=false; this method then
+// returns the ORIGINAL sequence without re-notifying the catalog — a duplicate was
+// already indexed by its first, genuine append, so republishing it a second time
+// would be redundant. A journal that does not implement the optional interface
+// behaves exactly as before (every successful Append notifies the catalog).
 func (a *JournalEventAppender) AppendEvent(ctx context.Context, ev event.Event) (uint64, error) {
-	seq, err := a.journal.Append(ctx, NewEventRecord(ev))
+	rec := NewEventRecord(ev)
+	if idem, ok := a.journal.(IdempotentJournal); ok {
+		result, err := idem.AppendIdempotent(ctx, rec)
+		if err != nil {
+			return 0, err
+		}
+		if !result.Appended {
+			return result.Sequence, nil
+		}
+		_ = a.catalog.UpdateOnEvent(ctx, ev, result.Sequence)
+		return result.Sequence, nil
+	}
+	seq, err := a.journal.Append(ctx, rec)
 	if err != nil {
 		return 0, err
 	}

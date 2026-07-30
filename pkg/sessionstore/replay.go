@@ -48,6 +48,27 @@ func (e *BlobIntegrityError) Error() string {
 		", pointer names " + strconv.Quote(e.Want)
 }
 
+// BlobPointerIDMismatchError reports an offloaded record whose OUTER blobptr
+// envelope's idempotency id does not match the id embedded in the RESOLVED inner
+// envelope. The writer always stamps the exact same id on both halves of an offload
+// (see sessionJournal.offload/frame — both the inline pre-offload envelope and its
+// blobptr stand-in carry rec.IdempotencyID()), so a mismatch means the pointer and the
+// blob it names have drifted apart. Replay fails closed rather than trusting either id
+// blindly — this is the id-integrity counterpart to BlobIntegrityError's content hash
+// check, and matters because a durable idempotency index is keyed by this id.
+type BlobPointerIDMismatchError struct {
+	Seq     uint64
+	Key     string
+	OuterID string
+	InnerID string
+}
+
+func (e *BlobPointerIDMismatchError) Error() string {
+	return "sessionstore: offloaded record at seq " + strconv.FormatUint(e.Seq, 10) +
+		" (blob " + strconv.Quote(e.Key) + ") id mismatch: pointer names " + strconv.Quote(e.OuterID) +
+		", resolved envelope carries " + strconv.Quote(e.InnerID)
+}
+
 // BlobUnavailableError reports that an offloaded record's backing blob could not be
 // fetched: a dangling pointer (the blob is absent — Cause is a
 // *storage.BlobNotFoundError) or any other Blobs.Get / read failure. It fails
@@ -214,11 +235,19 @@ func (r *recordReplayer) Open(ctx context.Context, req journal.ReplayRequest) (j
 }
 
 // resolved is one fully-resolved ledger record: its real (post-blobptr-resolution)
-// envelope kind, its authoritative body bytes, and its ledger sequence.
+// envelope kind, its authoritative body bytes, its ledger sequence, and its
+// idempotency id preserved from the envelope (for an offloaded record, the outer
+// blobptr's id, verified equal to the resolved inner envelope's id — see
+// baseCursor.resolveBlob). id is an internal-replay detail: the typed cursors
+// (EventCursor/RecordCursor) re-derive a decoded record's IdempotencyID() from its
+// payload rather than trusting this field, but it is the join key the idempotency
+// index hydration (pkg/sessionstore/journal.go) relies on to key each ledger entry
+// without a full typed decode.
 type resolved struct {
 	kind kind
 	body []byte
 	seq  uint64
+	id   string
 }
 
 // baseCursor is the shared read + resolve machinery both cursors wrap. It walks one
@@ -272,7 +301,7 @@ func (b *baseCursor) next(ctx context.Context) (resolved, error) {
 	if kind(env.Kind) == kindBlobPtr {
 		return b.resolveBlob(ctx, env, rec.Seq)
 	}
-	return resolved{kind: kind(env.Kind), body: env.Body, seq: rec.Seq}, nil
+	return resolved{kind: kind(env.Kind), body: env.Body, seq: rec.Seq, id: env.ID}, nil
 }
 
 // resolveBlob rehydrates an offloaded record: decode its pointer, fetch the named
@@ -316,7 +345,14 @@ func (b *baseCursor) resolveBlob(ctx context.Context, env envelope, seq uint64) 
 	if kind(inner.Kind) == kindBlobPtr {
 		return resolved{}, &ReplayDecodeError{Seq: seq, Cause: &EnvelopeError{Reason: "nested blobptr offload"}}
 	}
-	return resolved{kind: kind(inner.Kind), body: inner.Body, seq: seq}, nil
+	// The writer always stamps the SAME idempotency id on both the outer blobptr
+	// (env, passed in by the caller) and the inner offloaded envelope it points at.
+	// A mismatch means they have drifted apart — fail closed rather than trust
+	// either half blindly (the id becomes a durable idempotency-index key).
+	if inner.ID != env.ID {
+		return resolved{}, &BlobPointerIDMismatchError{Seq: seq, Key: ptr.Key, OuterID: env.ID, InnerID: inner.ID}
+	}
+	return resolved{kind: kind(inner.Kind), body: inner.Body, seq: seq, id: inner.ID}, nil
 }
 
 // close tears down the underlying ledger cursor. It is idempotent: a second call is

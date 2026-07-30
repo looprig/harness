@@ -360,6 +360,72 @@ func TestJournalCommandAppenderNilJournal(t *testing.T) {
 	}
 }
 
+// idempotentRecordingJournal is a SessionJournal double that ALSO implements
+// IdempotentJournal: it deduplicates by IdempotencyID exactly like the real backend
+// (recording only the FIRST record seen for a given id and reporting Appended=false
+// with the original sequence on a repeat), so AppendEvent's catalog-skip behavior can
+// be unit-tested without a live backend.
+type idempotentRecordingJournal struct {
+	records []JournalRecord
+	seq     uint64
+	seen    map[string]uint64
+}
+
+func newIdempotentRecordingJournal() *idempotentRecordingJournal {
+	return &idempotentRecordingJournal{seen: make(map[string]uint64)}
+}
+
+func (j *idempotentRecordingJournal) Append(ctx context.Context, rec JournalRecord) (uint64, error) {
+	result, err := j.AppendIdempotent(ctx, rec)
+	return result.Sequence, err
+}
+
+func (j *idempotentRecordingJournal) AppendIdempotent(_ context.Context, rec JournalRecord) (AppendResult, error) {
+	id := rec.IdempotencyID()
+	if seq, ok := j.seen[id]; ok {
+		return AppendResult{Sequence: seq, Appended: false}, nil
+	}
+	j.records = append(j.records, rec)
+	j.seq++
+	j.seen[id] = j.seq
+	return AppendResult{Sequence: j.seq, Appended: true}, nil
+}
+
+var _ IdempotentJournal = (*idempotentRecordingJournal)(nil)
+
+// TestJournalAppenderDoesNotRepublishDuplicate proves AppendEvent, layered over a
+// journal that implements the optional IdempotentJournal seam, does not write a
+// second durable frame NOR re-notify the catalog for a redelivered event: the second
+// call returns the ORIGINAL sequence, the underlying journal still holds exactly one
+// record, and the catalog was notified exactly once.
+func TestJournalAppenderDoesNotRepublishDuplicate(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0xA1)
+	ev := event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: fixedUUID(0xA2)}}
+
+	j := newIdempotentRecordingJournal()
+	cat := &recordingCatalog{}
+	app := NewJournalEventAppender(j, WithCatalog(cat))
+
+	seq1, err := app.AppendEvent(context.Background(), ev)
+	if err != nil {
+		t.Fatalf("first AppendEvent() err = %v", err)
+	}
+	seq2, err := app.AppendEvent(context.Background(), ev)
+	if err != nil {
+		t.Fatalf("second (duplicate) AppendEvent() err = %v", err)
+	}
+	if seq1 != seq2 {
+		t.Errorf("duplicate AppendEvent returned seq %d, want the original seq %d", seq2, seq1)
+	}
+	if len(j.records) != 1 {
+		t.Fatalf("underlying journal recorded %d records, want 1 (duplicate must not append a second frame)", len(j.records))
+	}
+	if len(cat.events) != 1 {
+		t.Errorf("catalog notified %d times, want 1 (duplicate must not republish)", len(cat.events))
+	}
+}
+
 // TestJournalEventAppenderNilJournal proves the constructor's nil guard: a nil
 // SessionJournal is a programming error caught at construction (fail loud) rather than
 // a nil-deref at the first append.

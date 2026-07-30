@@ -473,6 +473,7 @@ func TestAppendVerifyErrorMapsToAmbiguous(t *testing.T) {
 		threshold:  defaultOffloadThreshold,
 		ready:      true,
 		trackedTip: 5,
+		idx:        journal.NewIdempotencyIndex(),
 	}
 
 	cmdID := newTestUUID(t)
@@ -497,6 +498,306 @@ func TestAppendVerifyErrorMapsToAmbiguous(t *testing.T) {
 	// The tracked tip stays unadvanced (nothing definitely landed).
 	if j.trackedTip != 5 {
 		t.Errorf("trackedTip = %d, want 5 (unadvanced on ambiguous outcome)", j.trackedTip)
+	}
+}
+
+// TestSessionJournalConcurrentIdenticalIDAppendsOnce covers the concurrent-retry
+// case: N goroutines Append the exact SAME record (same idempotency id, same
+// persisted kind+payload) simultaneously. Exactly one durable frame is written —
+// every caller observes the SAME sequence, and the tip advances by exactly one
+// beyond the opening fence — proving the dedup check and the write it guards are
+// atomic under the serializing lock, not racy.
+func TestSessionJournalConcurrentIdenticalIDAppendsOnce(t *testing.T) {
+	t.Parallel()
+	const n = 16
+	st, err := Open(memstore.New())
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	id := newTestUUID(t)
+	lease, _ := leaseFor(1, id)
+	j, err := st.OpenJournal(context.Background(), id, lease)
+	if err != nil {
+		t.Fatalf("OpenJournal() err = %v", err)
+	}
+
+	cmdID := newTestUUID(t)
+	rec := smallCommand(id, cmdID)
+
+	seqs := make([]uint64, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			seqs[i], errs[i] = j.Append(context.Background(), rec)
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("worker %d Append() err = %v", i, errs[i])
+		}
+		if seqs[i] != seqs[0] {
+			t.Errorf("worker %d seq = %d, want %d (every concurrent identical append shares one sequence)", i, seqs[i], seqs[0])
+		}
+	}
+	tip, err := st.backend.Ledger.Tip(context.Background(), ledgerName(id))
+	if err != nil {
+		t.Fatalf("Tip() err = %v", err)
+	}
+	if tip != 2 { // opening fence (seq 1) + exactly one durable frame for the shared id
+		t.Errorf("Tip() = %d, want 2 (exactly one frame written for the shared id)", tip)
+	}
+}
+
+// TestSessionJournalReopenDeduplicatesEventAndCommand covers the crash-recovery
+// scenario this task exists for: a session's first writer lease is released
+// (simulating a process exit), a FRESH Store facade is constructed over the SAME
+// storage test backend (simulating a new process reopening the session), and its
+// reopened journal hydrates the idempotency index from the durable history BEFORE
+// accepting any append. An identical retry of BOTH an inline event and a
+// blob-offloaded command then returns the ORIGINAL sequence with Appended=false, and
+// durably advances the ledger not at all.
+func TestSessionJournalReopenDeduplicatesEventAndCommand(t *testing.T) {
+	t.Parallel()
+	backend := memstore.New()
+	id := newTestUUID(t)
+
+	st1, err := Open(backend, WithOffloadThreshold(64))
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	lease1, err := st1.AcquireLease(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AcquireLease() err = %v", err)
+	}
+	j1, err := st1.OpenJournal(context.Background(), id, lease1)
+	if err != nil {
+		t.Fatalf("OpenJournal() err = %v", err)
+	}
+
+	evID := newTestUUID(t)
+	evRec := journal.NewEventRecord(event.SessionStarted{
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: id}, EventID: evID},
+	})
+	evSeq1, err := j1.Append(context.Background(), evRec)
+	if err != nil {
+		t.Fatalf("first event Append() err = %v", err)
+	}
+
+	cmdID := newTestUUID(t)
+	cmdRec, _ := largeCommand(id, cmdID)
+	cmdSeq1, err := j1.Append(context.Background(), cmdRec)
+	if err != nil {
+		t.Fatalf("first command Append() err = %v", err)
+	}
+	// Pin that the command really offloaded, so this test genuinely exercises the
+	// blob path, not just the inline one.
+	if env := readEnvelope(t, st1, id, cmdSeq1); env.Kind != string(kindBlobPtr) {
+		t.Fatalf("command record kind = %q, want %q (must offload)", env.Kind, kindBlobPtr)
+	}
+
+	if err := lease1.Release(context.Background()); err != nil {
+		t.Fatalf("Release() err = %v", err)
+	}
+
+	// A fresh Store facade over the SAME backend: simulates a new process.
+	st2, err := Open(backend, WithOffloadThreshold(64))
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	lease2, err := st2.AcquireLease(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AcquireLease() err = %v", err)
+	}
+	j2, err := st2.OpenJournal(context.Background(), id, lease2)
+	if err != nil {
+		t.Fatalf("reopen OpenJournal() err = %v", err)
+	}
+	idem, ok := j2.(journal.IdempotentJournal)
+	if !ok {
+		t.Fatal("reopened journal does not implement journal.IdempotentJournal")
+	}
+
+	tipBeforeRetries, err := st2.backend.Ledger.Tip(context.Background(), ledgerName(id))
+	if err != nil {
+		t.Fatalf("Tip() err = %v", err)
+	}
+
+	evResult, err := idem.AppendIdempotent(context.Background(), evRec)
+	if err != nil {
+		t.Fatalf("retry event AppendIdempotent() err = %v", err)
+	}
+	if evResult.Appended {
+		t.Error("retry event Appended = true, want false (deduplicated)")
+	}
+	if evResult.Sequence != evSeq1 {
+		t.Errorf("retry event Sequence = %d, want original %d", evResult.Sequence, evSeq1)
+	}
+
+	cmdResult, err := idem.AppendIdempotent(context.Background(), cmdRec)
+	if err != nil {
+		t.Fatalf("retry command AppendIdempotent() err = %v", err)
+	}
+	if cmdResult.Appended {
+		t.Error("retry command Appended = true, want false (deduplicated)")
+	}
+	if cmdResult.Sequence != cmdSeq1 {
+		t.Errorf("retry command Sequence = %d, want original %d", cmdResult.Sequence, cmdSeq1)
+	}
+
+	tipAfterRetries, err := st2.backend.Ledger.Tip(context.Background(), ledgerName(id))
+	if err != nil {
+		t.Fatalf("Tip() err = %v", err)
+	}
+	if tipAfterRetries != tipBeforeRetries {
+		t.Errorf("Tip() advanced from %d to %d on deduplicated retries, want unchanged", tipBeforeRetries, tipAfterRetries)
+	}
+}
+
+// TestSessionJournalIdempotencyCollisionFails covers the genuine-collision case: the
+// SAME idempotency id reused for a record whose persisted kind or payload DIFFERS
+// from what is already durable fails closed with a typed
+// *journal.IdempotencyCollisionError rather than being accepted as a duplicate (or
+// silently appended as a second, conflicting record).
+func TestSessionJournalIdempotencyCollisionFails(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		colliding func(id, sharedID uuid.UUID) journal.JournalRecord
+	}{
+		{
+			name: "same kind, different payload",
+			colliding: func(id, sharedID uuid.UUID) journal.JournalRecord {
+				return journal.NewCommandRecord(id, id, command.UserInput{
+					Header: command.Header{CommandID: sharedID},
+					Blocks: []content.Block{&content.TextBlock{Text: "different payload"}},
+				})
+			},
+		},
+		{
+			name: "different kind, same id",
+			colliding: func(id, sharedID uuid.UUID) journal.JournalRecord {
+				return journal.NewEventRecord(event.SessionStarted{
+					Header: event.Header{Coordinates: identity.Coordinates{SessionID: id}, EventID: sharedID},
+				})
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			st, err := Open(memstore.New())
+			if err != nil {
+				t.Fatalf("Open() err = %v", err)
+			}
+			id := newTestUUID(t)
+			lease, _ := leaseFor(1, id)
+			j, err := st.OpenJournal(context.Background(), id, lease)
+			if err != nil {
+				t.Fatalf("OpenJournal() err = %v", err)
+			}
+
+			sharedID := newTestUUID(t)
+			firstSeq, err := j.Append(context.Background(), smallCommand(id, sharedID))
+			if err != nil {
+				t.Fatalf("first Append() err = %v", err)
+			}
+
+			seq, err := j.Append(context.Background(), tt.colliding(id, sharedID))
+			if seq != 0 {
+				t.Errorf("colliding Append() seq = %d, want 0", seq)
+			}
+			var collision *journal.IdempotencyCollisionError
+			if !errors.As(err, &collision) {
+				t.Fatalf("colliding Append() err = %v, want *journal.IdempotencyCollisionError", err)
+			}
+			if collision.ID != sharedID.String() || collision.Seq != firstSeq {
+				t.Errorf("collision = %+v, want {ID:%q Seq:%d}", collision, sharedID.String(), firstSeq)
+			}
+		})
+	}
+}
+
+// TestSessionJournalOffloadedRecordHydratesIdempotencyIndex isolates the
+// offload-specific half of the reopen story: a record that was ONLY ever durably
+// written as a blobptr (its real kind+payload never inline in the ledger) must still
+// be recognized as a duplicate after a reopen — hydration has to resolve the blob
+// (fetch + verify) to compute its real fingerprint, not just read the raw ledger
+// bytes. It also proves hydration does not over-block: a genuinely new record is
+// still accepted afterward.
+func TestSessionJournalOffloadedRecordHydratesIdempotencyIndex(t *testing.T) {
+	t.Parallel()
+	backend := memstore.New()
+	id := newTestUUID(t)
+
+	st1, err := Open(backend, WithOffloadThreshold(32))
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	lease1, err := st1.AcquireLease(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AcquireLease() err = %v", err)
+	}
+	j1, err := st1.OpenJournal(context.Background(), id, lease1)
+	if err != nil {
+		t.Fatalf("OpenJournal() err = %v", err)
+	}
+
+	cmdID := newTestUUID(t)
+	rec, _ := largeCommand(id, cmdID)
+	origSeq, err := j1.Append(context.Background(), rec)
+	if err != nil {
+		t.Fatalf("first Append() err = %v", err)
+	}
+	if env := readEnvelope(t, st1, id, origSeq); env.Kind != string(kindBlobPtr) {
+		t.Fatalf("record kind = %q, want %q (must offload)", env.Kind, kindBlobPtr)
+	}
+	if err := lease1.Release(context.Background()); err != nil {
+		t.Fatalf("Release() err = %v", err)
+	}
+
+	st2, err := Open(backend, WithOffloadThreshold(32))
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	lease2, err := st2.AcquireLease(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AcquireLease() err = %v", err)
+	}
+	j2, err := st2.OpenJournal(context.Background(), id, lease2)
+	if err != nil {
+		t.Fatalf("reopen OpenJournal() err = %v", err)
+	}
+	idem, ok := j2.(journal.IdempotentJournal)
+	if !ok {
+		t.Fatal("reopened journal does not implement journal.IdempotentJournal")
+	}
+
+	result, err := idem.AppendIdempotent(context.Background(), rec)
+	if err != nil {
+		t.Fatalf("retry AppendIdempotent() err = %v", err)
+	}
+	if result.Appended {
+		t.Error("retry Appended = true, want false (the offloaded record must be recognized as a duplicate)")
+	}
+	if result.Sequence != origSeq {
+		t.Errorf("retry Sequence = %d, want original %d", result.Sequence, origSeq)
+	}
+
+	// A genuinely new record is still accepted (hydration must not over-block).
+	newID := newTestUUID(t)
+	newRec, _ := largeCommand(id, newID)
+	newSeq, err := j2.Append(context.Background(), newRec)
+	if err != nil {
+		t.Fatalf("new record Append() err = %v", err)
+	}
+	if newSeq == origSeq {
+		t.Errorf("new record Sequence = %d, collided with the original offloaded record's seq", newSeq)
 	}
 }
 
