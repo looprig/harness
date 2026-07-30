@@ -562,8 +562,25 @@ func (s *Session) notifyProcessCompletion(ctx context.Context, n tool.ProcessCom
 	}
 
 	result := make(chan command.ProcessNotificationResult, 1)
+	// Header.CreatedAt is deliberately left zero (omitzero drops it — see
+	// command.Header's doc) rather than stamped from s.stampNow(), UNLIKE every
+	// other dispatched command. This path uses appendCommandResultChecked, whose
+	// dedup is fingerprint-based over the full marshaled command bytes (24A:
+	// journal.NewFingerprint hashes (kind, body)). A genuine retry of the same
+	// notification — the supervisor redispatching with the SAME CommandID after a
+	// Stopped disposition — carries an identical n but would otherwise be stamped
+	// microseconds apart, producing two DIFFERENT fingerprints for the same
+	// CommandID and misclassifying the retry as a collision instead of a
+	// deduplicated duplicate. Nothing downstream reads ProcessNotification's
+	// Header.CreatedAt (validateProcessNotification only checks Notification;
+	// handleProcessNotification and undeliveredProcessNotifications only read
+	// c.Notification/notification.Notification), so fixing its value to zero is
+	// safe: it makes two calls carrying the same n byte-identical, which is
+	// exactly what the strict checked-append path requires to dedup a real retry
+	// while still failing closed on a genuine collision (a different Notification
+	// reusing the same CommandID still produces a different fingerprint).
 	cmd := command.ProcessNotification{
-		Header:       command.Header{CommandID: n.CommandID, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()},
+		Header:       command.Header{CommandID: n.CommandID, Agency: identity.AgencyMachine},
 		Notification: n,
 		Result:       result,
 	}
