@@ -367,16 +367,17 @@ func foldLoopInference(events []event.Event) restoredInference {
 // the effective config it crashed under.
 func restoredStateFrom(folded foldResult, ri restoredInference) loopruntime.RestoredState {
 	return loopruntime.RestoredState{
-		Msgs:       folded.Msgs,
-		TurnIndex:  folded.TurnIndex,
-		Mode:       ri.Mode,
-		HasMode:    ri.HasMode,
-		Runtime:    ri.Runtime,
-		HasRuntime: ri.HasRuntime,
-		Context:    folded.Context,
-		HasContext: folded.HasContext,
-		Basis:      folded.Basis,
-		HasBasis:   folded.HasBasis,
+		Msgs:          folded.Msgs,
+		DerivedPrefix: folded.DerivedPrefix,
+		TurnIndex:     folded.TurnIndex,
+		Mode:          ri.Mode,
+		HasMode:       ri.HasMode,
+		Runtime:       ri.Runtime,
+		HasRuntime:    ri.HasRuntime,
+		Context:       folded.Context,
+		HasContext:    folded.HasContext,
+		Basis:         folded.Basis,
+		HasBasis:      folded.HasBasis,
 
 		AutomaticBasis:    folded.AutomaticBasis,
 		HasAutomaticBasis: folded.HasAutomaticBasis,
@@ -402,15 +403,23 @@ func restoredStateFrom(folded foldResult, ri restoredInference) loopruntime.Rest
 // The Task 8.3 constructor closes such a turn by synthesizing a TurnInterrupted
 // before resuming, so a resumed loop never observes a half-open turn.
 type foldResult struct {
-	Msgs       content.AgenticMessages
-	TurnIndex  event.TurnIndex
-	OpenTurn   bool
-	Runtime    event.ModelRuntime
-	HasRuntime bool
-	Context    event.ContextMeasurement
-	HasContext bool
-	Basis      event.ContextBasis
-	HasBasis   bool
+	Msgs content.AgenticMessages
+	// DerivedPrefix counts the leading messages in Msgs that are a
+	// compaction-generated summary rather than genuine human-authored
+	// conversation. It is 1 immediately after the last CompactionCommitted
+	// in the folded sequence replaces Msgs with its Summary (a
+	// model-generated *content.UserMessage), and 0 if no compaction has ever
+	// committed — see loopruntime.RestoredState.DerivedPrefix's doc comment
+	// for why this must be threaded through to a restored loop.
+	DerivedPrefix int
+	TurnIndex     event.TurnIndex
+	OpenTurn      bool
+	Runtime       event.ModelRuntime
+	HasRuntime    bool
+	Context       event.ContextMeasurement
+	HasContext    bool
+	Basis         event.ContextBasis
+	HasBasis      bool
 
 	AutomaticBasis    event.ContextBasis
 	HasAutomaticBasis bool
@@ -699,6 +708,7 @@ func foldLoop(events []event.Event) foldResult {
 	// matching content.AgenticMessages' documented empty zero value and the loop's
 	// own freshly-seeded msgs.
 	msgs := content.AgenticMessages{}
+	derivedPrefix := 0
 	var turnIndex event.TurnIndex
 	openTurn := false
 	var runtime event.ModelRuntime
@@ -784,6 +794,11 @@ func foldLoop(events []event.Event) foldResult {
 			}
 		case event.CompactionCommitted:
 			msgs = content.AgenticMessages{e.Summary}
+			// e.Summary is the compaction Hustle's model-generated summary
+			// (wrapped as a *content.UserMessage), not genuine human input,
+			// and it now IS the entirety of msgs — see foldResult.DerivedPrefix's
+			// doc comment.
+			derivedPrefix = 1
 			contextMeasurement = e.PostContext
 			hasContext = true
 			basis = e.PostContext.Basis
@@ -805,7 +820,7 @@ func foldLoop(events []event.Event) foldResult {
 		hasContext = false
 	}
 	return foldResult{
-		Msgs: msgs, TurnIndex: turnIndex, OpenTurn: openTurn,
+		Msgs: msgs, DerivedPrefix: derivedPrefix, TurnIndex: turnIndex, OpenTurn: openTurn,
 		Runtime: runtime, HasRuntime: hasRuntime,
 		Context: contextMeasurement, HasContext: hasContext, Err: foldErr,
 		Basis: basis, HasBasis: hasBasis,

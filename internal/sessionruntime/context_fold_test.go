@@ -89,6 +89,54 @@ func TestFoldLoopCarriesContextBasisWithoutMeasurement(t *testing.T) {
 	}
 }
 
+// TestFoldLoopRecordsDerivedPrefixAfterCompactionCommitted proves the
+// restore-path half of the compaction-summary-authorization-inflation fix:
+// a CompactionCommitted event replaces msgs with a model-generated summary
+// (never something a human typed), so the fold must record that the leading
+// message of the resulting Msgs is derived, not genuine conversation — and
+// restoredStateFrom must carry that through to loopruntime.RestoredState,
+// which seeds loopState.msgsDerivedPrefix on restore. Without this, a
+// restored loop's next turn would clone the summary into its base with no
+// marker at all, and capturePermissionReviewContext would credit it with
+// gate.ReviewContextOriginUser (genuine human authority) — design §8.3's
+// central defense, defeated by a restore.
+func TestFoldLoopRecordsDerivedPrefixAfterCompactionCommitted(t *testing.T) {
+	t.Parallel()
+	turnID := uuid.UUID{1}
+	committed := restoredCommitted(2)
+	events := []event.Event{
+		event.TurnStarted{Header: event.Header{EventID: turnID}, Message: restoredCompactionSummary("earlier human ask")},
+		committed,
+	}
+	folded := foldLoop(events)
+	if folded.Err != nil {
+		t.Fatalf("foldLoop() error = %v", folded.Err)
+	}
+	if folded.DerivedPrefix != 1 {
+		t.Fatalf("folded.DerivedPrefix = %d, want 1 (msgs was just replaced by a compaction summary)", folded.DerivedPrefix)
+	}
+	if len(folded.Msgs) != 1 || folded.Msgs[0] != committed.Summary {
+		t.Fatalf("folded.Msgs = %+v, want exactly [committed.Summary] (CompactionCommitted fully replaces msgs)", folded.Msgs)
+	}
+
+	seed := restoredStateFrom(folded, restoredInference{})
+	if seed.DerivedPrefix != 1 {
+		t.Fatalf("restoredStateFrom().DerivedPrefix = %d, want 1", seed.DerivedPrefix)
+	}
+
+	// A loop that never compacted must seed DerivedPrefix at 0 — no false
+	// positives that would treat genuine committed conversation as derived.
+	uncompacted := foldLoop([]event.Event{
+		event.TurnStarted{Header: event.Header{EventID: turnID}, Message: restoredCompactionSummary("genuine human ask")},
+	})
+	if uncompacted.DerivedPrefix != 0 {
+		t.Fatalf("uncompacted foldLoop().DerivedPrefix = %d, want 0", uncompacted.DerivedPrefix)
+	}
+	if seed := restoredStateFrom(uncompacted, restoredInference{}); seed.DerivedPrefix != 0 {
+		t.Fatalf("uncompacted restoredStateFrom().DerivedPrefix = %d, want 0", seed.DerivedPrefix)
+	}
+}
+
 func TestFoldLoopRestoresOnlyAutomaticAttemptLatch(t *testing.T) {
 	t.Parallel()
 	basis := foldContextMeasurement(7).Basis

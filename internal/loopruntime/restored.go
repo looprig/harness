@@ -25,6 +25,17 @@ type RestoredState struct {
 	Msgs      content.AgenticMessages
 	TurnIndex event.TurnIndex
 
+	// DerivedPrefix counts the leading messages in Msgs that are a
+	// compaction-generated summary rather than genuine human-authored
+	// conversation (folded from the same CompactionCommitted event that
+	// replaces Msgs entirely — sessionruntime's foldLoop). It seeds
+	// loopState.msgsDerivedPrefix (see that field's doc comment for the full
+	// rationale): without it, a restored loop's next turn would clone Msgs
+	// into cfg.base with no marker at all, and capturePermissionReviewContext
+	// would credit a model-generated compaction summary with
+	// gate.ReviewContextOriginUser — genuine human authorization.
+	DerivedPrefix int
+
 	// Mode is the loop's LAST durably-selected mode (folded from LoopModeChanged, last write
 	// wins); HasMode distinguishes "the loop changed mode" (reapply Mode, which may be the
 	// base "") from "the loop never changed mode" (come up under the definition's initial

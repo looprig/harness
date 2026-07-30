@@ -421,6 +421,12 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		// The system prompt is NOT in msgs — it rides cfg.System, sent every turn
 		// — so seeding msgs alone reproduces loopState exactly as it was committed.
 		state.msgs = cloneMessages(seed.Msgs)
+		// Clamped defensively: seed.DerivedPrefix comes from the session's fold
+		// (sessionruntime's foldLoop), which should never produce a value
+		// outside [0, len(Msgs)], but a restore-time seeding path must never
+		// let an out-of-range value make msgsDerivedPrefix slicing panic
+		// downstream (installActiveTurn/capturePermissionReviewContext).
+		state.msgsDerivedPrefix = clampDerivedPrefix(seed.DerivedPrefix, len(state.msgs))
 		state.turnIndex = seed.TurnIndex
 		if seed.HasRuntime {
 			state.runtime = seed.Runtime
@@ -516,6 +522,24 @@ type loopState struct {
 	contextTracker    contextTracker
 	contextGeneration uint64
 
+	// msgsDerivedPrefix counts the leading messages in msgs that were generated
+	// by context replacement (a compaction summary) rather than authored by a
+	// human — the CROSS-TURN, cross-restore counterpart of turnState's own
+	// derivedUserPrefix (turn.go), which only tracks a mid-turn replacement and
+	// resets every new turn. actorContextReplacement.apply
+	// (context_replacement.go) sets this to 1 whenever it replaces msgs with a
+	// compaction summary (a *content.UserMessage the compaction Hustle's model
+	// call produced, never something a human typed); newLoopWithSeed seeds it
+	// from RestoredState.DerivedPrefix on restore. installActiveTurn reads it
+	// at the SAME point it clones msgs into a turn's cfg.base, so
+	// capturePermissionReviewContext (review_context.go) can keep treating a
+	// compaction summary as review evidence without ever crediting it with
+	// gate.ReviewContextOriginUser (genuine human authority) — design §8.3's
+	// central defense, which a turn-scoped-only guard cannot uphold once the
+	// summary survives into a LATER turn's base or a restored loop's seeded
+	// history.
+	msgsDerivedPrefix int
+
 	// effective is the loop's CURRENT turn-affecting configuration (mode/model/effort/
 	// system/tools). startTurn captures a copy of it into the per-turn turnConfig, so a
 	// SetLoopMode/ChangeLoopInference that lands mid-turn never disturbs the running turn —
@@ -563,6 +587,20 @@ type loopState struct {
 // loopID, parent provenance). The session event publisher is a dependency, not
 // state, so it lives in loopConfig — not here. pendingGates is initialized so the
 // actor can route gate commands without a nil-map panic.
+// clampDerivedPrefix bounds a leading-derived-message count to [0, total],
+// defense in depth against an out-of-range value from a restore seed —
+// installActiveTurn/capturePermissionReviewContext slice on this count, so it
+// must never exceed the length of the messages it describes.
+func clampDerivedPrefix(prefix, total int) int {
+	if prefix < 0 {
+		return 0
+	}
+	if prefix > total {
+		return total
+	}
+	return prefix
+}
+
 func newLoopState(sessionID, loopID uuid.UUID, parent Provenance) loopState {
 	return loopState{
 		id:           loopID,
@@ -1080,10 +1118,13 @@ func runLoop(cfg loopConfig, state loopState) {
 	// lifetime is bounded by the loop's, not by any caller's API-call ctx). It then
 	// commits the initial UserMessage into loopState.msgs. TurnStarted's Cause.LoopID carries
 	// qi.triggeredBy: set for a SubagentResult, zero for a UserInput). It returns the
-	// derived turn ctx and the defensive base clone the per-turn goroutine reads.
+	// derived turn ctx, the defensive base clone the per-turn goroutine reads, and
+	// the leading-derived-message count (state.msgsDerivedPrefix) that describes
+	// base — captured at the SAME point as the clone, before qi.msg is appended,
+	// so cfg.baseDerivedPrefix always describes exactly the base it travels with.
 	// This is the live-commit half of starting a turn (distinct from
 	// assembling the per-turn turnConfig).
-	installActiveTurn := func(turnID uuid.UUID, qi queuedInput) (context.Context, content.AgenticMessages) {
+	installActiveTurn := func(turnID uuid.UUID, qi queuedInput) (context.Context, content.AgenticMessages, int) {
 		state.turnIndex++
 		state.turnID = turnID
 		state.causationID = qi.inputID
@@ -1095,6 +1136,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		// initial UserMessage is committed (runTurn reads it
 		// concurrently while the actor keeps appending committed step groups).
 		base := cloneMessages(state.msgs)
+		baseDerivedPrefix := state.msgsDerivedPrefix
 
 		// Loop-owned incremental commit: commit the initial UserMessage and emit
 		// TurnStarted (Message + Cause.CommandID = inputID + InputID = inputID) was
@@ -1102,7 +1144,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		state.msgs = append(state.msgs, qi.msg)
 		state.context = event.ContextMeasurement{}
 		state.hasContext = false
-		return turnCtx, base
+		return turnCtx, base, baseDerivedPrefix
 	}
 
 	// buildTurnConfig assembles the per-turn turnConfig: the static deps (base/model/
@@ -1121,7 +1163,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	//   - emit: the turn goroutine's event emit, publish-only (every loop event reaches
 	//     consumers through the session fan-in). publish never blocks the actor, so the
 	//     turn goroutine cannot be pinned by a slow consumer.
-	buildTurnConfig := func(base content.AgenticMessages, firstAdmission func()) turnConfig {
+	buildTurnConfig := func(base content.AgenticMessages, baseDerivedPrefix int, firstAdmission func()) turnConfig {
 		admit := func(context.Context) (func(), error) { return func() {}, nil }
 		if admission, ok := cfg.events.(executionAdmission); ok {
 			admit = func(ctx context.Context) (func(), error) {
@@ -1244,6 +1286,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		// remaining fields are immutable loop wiring, so they ride the frozen config.
 		return turnConfig{
 			base:                    base,
+			baseDerivedPrefix:       baseDerivedPrefix,
 			runtimeContext:          config.RuntimeContext,
 			model:                   state.effective.model,
 			system:                  state.effective.system,
@@ -1317,7 +1360,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			idleCompaction = nil
 			finalizeIdleCompactionRejection(preparation, event.CompactRejectStaleBasis)
 		}
-		turnCtx, base := installActiveTurn(turnID, qi)
+		turnCtx, base, baseDerivedPrefix := installActiveTurn(turnID, qi)
 		idx := state.turnIndex
 		cancel := state.cancelTurn
 		if publishErr != nil {
@@ -1330,7 +1373,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			return turnID, nil
 		}
 		ts := newTurnState(state.sessionID, state.id, turnID, idx, state.causationID, qi.msg)
-		turnCfg := buildTurnConfig(base, firstAdmission)
+		turnCfg := buildTurnConfig(base, baseDerivedPrefix, firstAdmission)
 
 		go func() {
 			defer cancel()

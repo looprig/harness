@@ -93,10 +93,22 @@ func TestActorContextReplacementResetsCommittedStateAndPreservesQueue(t *testing
 				Summary: cloneUserMessage(success.Summary), PostContext: validFinalizationMeasurement(70),
 			}
 
+			if state.msgsDerivedPrefix != 0 {
+				t.Fatalf("msgsDerivedPrefix before apply = %d, want 0 (fixture seeds genuine committed history)", state.msgsDerivedPrefix)
+			}
+
 			plan.apply(&state, committed)
 
 			if len(state.msgs) != 1 || !reflect.DeepEqual(state.msgs[0], committed.Summary) {
 				t.Fatalf("actor messages = %#v, want only committed summary", state.msgs)
+			}
+			// committed.Summary is a model-generated compaction summary (never
+			// something a human typed) and it now IS the entirety of state.msgs:
+			// apply must mark it derived so a LATER turn's cfg.base (built by
+			// cloning state.msgs) can never be mistaken for genuine committed
+			// conversation by capturePermissionReviewContext (review_context.go).
+			if state.msgsDerivedPrefix != 1 {
+				t.Fatalf("msgsDerivedPrefix after apply = %d, want 1 (msgs was just replaced by a compaction summary)", state.msgsDerivedPrefix)
 			}
 			if state.context != committed.PostContext || !state.hasContext || state.contextTracker.currentBasis() != committed.PostContext.Basis {
 				t.Fatalf("actor context = %+v has=%v basis=%+v, want committed PostContext", state.context, state.hasContext, state.contextTracker.currentBasis())
@@ -121,7 +133,7 @@ func TestTurnContextReplacementResetsOnlyRequestHistory(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			summary := validFinalizationSummary()
-			cfg := turnConfig{base: content.AgenticMessages{replacementTestMessage("old base")}}
+			cfg := turnConfig{base: content.AgenticMessages{replacementTestMessage("old base")}, baseDerivedPrefix: 1}
 			state := turnState{
 				sessionID: uuid.UUID{1}, loopID: uuid.UUID{2}, id: uuid.UUID{3}, index: 4, causationID: uuid.UUID{5},
 				msgs: content.AgenticMessages{replacementTestMessage("old staged")}, usage: content.Usage{InputTokens: 6},
@@ -132,6 +144,15 @@ func TestTurnContextReplacementResetsOnlyRequestHistory(t *testing.T) {
 
 			if len(cfg.base) != 0 {
 				t.Fatalf("turn base = %#v, want empty", cfg.base)
+			}
+			// cfg.baseDerivedPrefix must be reset alongside cfg.base: a stale
+			// nonzero prefix against an empty base is out of range and would
+			// make capturePermissionReviewContext fail closed on every
+			// subsequent gate this turn, rather than simply reflecting that
+			// base's own derived content (if any) is now represented by
+			// state.msgs/state.derivedUserPrefix instead.
+			if cfg.baseDerivedPrefix != 0 {
+				t.Fatalf("turn baseDerivedPrefix = %d, want 0 (reset alongside the now-empty base)", cfg.baseDerivedPrefix)
 			}
 			request := requestMessages(cfg.base, state.msgs, nil)
 			if len(request) != 1 || !reflect.DeepEqual(request[0], summary) {

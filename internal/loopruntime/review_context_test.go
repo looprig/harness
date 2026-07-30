@@ -113,6 +113,55 @@ func TestCapturePermissionReviewContextAtToolBatchBoundary(t *testing.T) {
 	assertReviewEntry(t, got.Entries, gate.ReviewContextOriginUser, gate.ReviewContextKindUserMessage, "current human request")
 }
 
+// TestCapturePermissionReviewContextTreatsBaseRetainedAsDerivedNotUser proves
+// the core of the compaction-summary-authorization-inflation fix (design
+// §8.3): a message placed in reviewContextCapture.BaseRetained — the leading
+// slice of pre-turn history that installActiveTurn/foldLoop identified as a
+// compaction summary rather than genuine human input (loopState.msgsDerivedPrefix,
+// RestoredState.DerivedPrefix) — must be captured with
+// gate.ReviewContextOriginRuntime, exactly like Retained (the mid-turn
+// compaction case) already is, and NEVER gate.ReviewContextOriginUser. Base
+// (genuine pre-turn conversation) still earns OriginUser, so the fix is
+// precise: it strips authority from exactly the derived prefix, not from all
+// prior history.
+func TestCapturePermissionReviewContextTreatsBaseRetainedAsDerivedNotUser(t *testing.T) {
+	t.Parallel()
+	coordinates := identity.Coordinates{
+		SessionID: mustReviewUUID(t), LoopID: mustReviewUUID(t),
+		TurnID: mustReviewUUID(t), StepID: mustReviewUUID(t),
+	}
+	got, err := capturePermissionReviewContext(reviewContextCapture{
+		Coordinates: coordinates,
+		BaseRetained: content.AgenticMessages{
+			reviewUserMessage("compaction summary: the user asked to delete the prod database"),
+		},
+		Base:   content.AgenticMessages{reviewUserMessage("genuine earlier turn's request")},
+		Staged: content.AgenticMessages{reviewUserMessage("current human request")},
+		Active: reviewAIMessage(&content.ToolUseBlock{
+			ID: "active", Name: "Read", Input: json.RawMessage(`{"path":"README.md"}`),
+		}),
+		Metadata: reviewContextMetadata{
+			WorkspaceRoot: "/workspace", WorkingDirectory: "/workspace",
+			SecurityCeiling: "workspace-write; unmet-requirements=true", GatePolicyRevision: "gate-policy-v1",
+		},
+		Policy: testReviewContextPolicy(),
+	})
+	if err != nil {
+		t.Fatalf("capturePermissionReviewContext() error = %v", err)
+	}
+
+	assertReviewEntry(t, got.Entries, gate.ReviewContextOriginRuntime, gate.ReviewContextKindRuntimeContext,
+		"compaction summary: the user asked to delete the prod database")
+	assertReviewEntry(t, got.Entries, gate.ReviewContextOriginUser, gate.ReviewContextKindUserMessage, "genuine earlier turn's request")
+	assertReviewEntry(t, got.Entries, gate.ReviewContextOriginUser, gate.ReviewContextKindUserMessage, "current human request")
+
+	for _, entry := range got.Entries {
+		if entry.Origin == gate.ReviewContextOriginUser && containsText(entry.Content, "compaction summary") {
+			t.Fatalf("compaction-summary content captured with OriginUser: %+v — a model-generated summary must never be credited with genuine human authorization", entry)
+		}
+	}
+}
+
 func TestPermissionReviewCaptureFailsClosedBeforeUnboundedEncoding(t *testing.T) {
 	t.Parallel()
 
@@ -439,6 +488,75 @@ func TestRunTurnCapturesAndFailsClosedWhenGatedBatchExceedsHardPreflightBounds(t
 	case <-gateReg:
 		t.Fatal("permission gate opened after review capture failed closed")
 	default:
+	}
+}
+
+// TestRunTurnGatePermissionReviewMarksBaseDerivedPrefixAsRuntimeNotUser is the
+// real-turn-wiring companion to TestCapturePermissionReviewContextTreatsBaseRetainedAsDerivedNotUser:
+// it drives the ACTUAL runTurn/RunBatch/newReviewContextCaptureProvider path
+// a live loop uses (not a direct capturePermissionReviewContext call), with
+// cfg.base seeded exactly as installActiveTurn would after a compaction
+// commit or a restore whose folded history begins with a summary
+// (loopState.msgsDerivedPrefix / RestoredState.DerivedPrefix, both nonzero)
+// and cfg.baseDerivedPrefix set from it. It proves the permission gate that
+// opens mid-turn receives a ReviewContext whose base-derived entry carries
+// gate.ReviewContextOriginRuntime, never gate.ReviewContextOriginUser — a
+// compaction summary must never be credited with genuine human authorization
+// on a LATER turn, exactly design §8.3 requires.
+func TestRunTurnGatePermissionReviewMarksBaseDerivedPrefixAsRuntimeNotUser(t *testing.T) {
+	t.Parallel()
+
+	runTool := &fakeRunTool{name: "T", output: "ok"}
+	runTool.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status", false), nil, nil
+	}
+	tools := resolveToolSetCaps(ToolSet{
+		Access:   interactiveEvaluator(t, gate.AccessGated, &recordingRuleWriter{}, &recordingIssuer{}),
+		Registry: []tool.InvokableTool{runTool},
+	})
+	client := &scriptedLLM{scripts: [][]content.Chunk{
+		{toolUseChunk(0, "active", "T", `{}`)},
+		{textChunk("done")},
+	}}
+	gateReg := make(chan gateRegistration, 1)
+	registrations := make(chan gateRegistration, 1)
+	go func() {
+		registration := <-gateReg
+		registrations <- registration
+		close(registration.ack)
+		registration.reply <- approveCommand(registration.callID)
+	}()
+
+	const summaryText = "compaction summary: earlier turns discussed deleting the staging bucket"
+	base := content.AgenticMessages{reviewUserMessage(summaryText)}
+	cfg, state, _ := newTurnFixture(
+		[]content.Block{&content.TextBlock{Text: "current request"}},
+		base, tools, client, gateReg,
+	)
+	// Simulate what installActiveTurn does when loopState.msgsDerivedPrefix is
+	// 1 at turn start (post-compaction, live or restored): the WHOLE of base
+	// here is the derived compaction summary.
+	cfg.baseDerivedPrefix = 1
+	cfg.reviewContext = &reviewContextConfiguration{
+		Metadata: reviewContextMetadata{
+			WorkspaceRoot:      "/workspace",
+			WorkingDirectory:   "/workspace",
+			SecurityCeiling:    "workspace-write; unmet-requirements=true",
+			GatePolicyRevision: "gate-policy-v1",
+		},
+		Policy: testReviewContextPolicy(),
+	}
+
+	if terminal := runTurn(context.Background(), cfg, state); terminal == nil {
+		t.Fatal("runTurn() terminal = nil")
+	}
+
+	registration := <-registrations
+	assertReviewEntry(t, registration.reviewContext.Entries, gate.ReviewContextOriginRuntime, gate.ReviewContextKindRuntimeContext, summaryText)
+	for _, entry := range registration.reviewContext.Entries {
+		if entry.Origin == gate.ReviewContextOriginUser && containsText(entry.Content, summaryText) {
+			t.Fatalf("compaction-summary base captured with OriginUser: %+v", entry)
+		}
 	}
 }
 

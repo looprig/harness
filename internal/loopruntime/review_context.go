@@ -33,18 +33,26 @@ type reviewContextConfiguration struct {
 }
 
 // reviewContextCapture is the complete caller-owned state visible at the tool
-// batch boundary. Base contains genuine committed conversation. Retained is
-// generated/derived retained intent (for example a compaction summary), which
-// is evidence but never direct user authority.
+// batch boundary. Base contains genuine committed conversation FROM BEFORE
+// THIS TURN; BaseRetained is the leading slice of that same pre-turn history
+// that is instead generated/derived retained intent (a compaction summary
+// that survived into a later turn's base, or into a restored loop's seeded
+// history — loopState.msgsDerivedPrefix's doc comment). Staged is this
+// turn's own genuine conversation; Retained is generated/derived retained
+// intent produced DURING this turn (a mid-turn compaction summary). Base and
+// BaseRetained / Staged and Retained are the same distinction applied to two
+// different time spans (cross-turn vs. this-turn) — both derived pairs are
+// evidence but never direct user authority.
 type reviewContextCapture struct {
-	Coordinates identity.Coordinates
-	Base        content.AgenticMessages
-	Retained    content.AgenticMessages
-	Staged      content.AgenticMessages
-	Active      *content.AIMessage
-	RuntimeTail *content.UserMessage
-	Metadata    reviewContextMetadata
-	Policy      gate.ReviewContextPolicy
+	Coordinates  identity.Coordinates
+	Base         content.AgenticMessages
+	BaseRetained content.AgenticMessages
+	Retained     content.AgenticMessages
+	Staged       content.AgenticMessages
+	Active       *content.AIMessage
+	RuntimeTail  *content.UserMessage
+	Metadata     reviewContextMetadata
+	Policy       gate.ReviewContextPolicy
 }
 
 type reviewContextCaptureError struct {
@@ -121,28 +129,32 @@ type reviewContextCaptureProvider struct {
 	once      sync.Once
 	attempted atomic.Bool
 
-	coordinates   identity.Coordinates
-	base          content.AgenticMessages
-	msgs          content.AgenticMessages
-	derivedPrefix int
-	active        *content.AIMessage
-	runtimeTail   *content.UserMessage
-	metadata      reviewContextMetadata
-	policy        gate.ReviewContextPolicy
+	coordinates       identity.Coordinates
+	base              content.AgenticMessages
+	baseDerivedPrefix int
+	msgs              content.AgenticMessages
+	derivedPrefix     int
+	active            *content.AIMessage
+	runtimeTail       *content.UserMessage
+	metadata          reviewContextMetadata
+	policy            gate.ReviewContextPolicy
 
 	review gate.ReviewContext
 	err    error
 }
 
 // newReviewContextCaptureProvider builds a provider for one tool batch. The
-// raw pre-slice pieces (msgs + derivedPrefix) are carried rather than an
-// already-sliced reviewContextCapture so the derivedPrefix bounds check ALSO
-// stays deferred — a slice with an invalid prefix must never panic, but
-// checking it eagerly (before knowing whether a gate opens) would reintroduce
-// exactly the unconditional-capture hazard this addendum closes.
+// raw pre-slice pieces (base + baseDerivedPrefix, msgs + derivedPrefix) are
+// carried rather than an already-sliced reviewContextCapture so both
+// derivedPrefix bounds checks ALSO stay deferred — a slice with an invalid
+// prefix must never panic, but checking it eagerly (before knowing whether a
+// gate opens) would reintroduce exactly the unconditional-capture hazard
+// this addendum closes.
 func newReviewContextCaptureProvider(
 	coordinates identity.Coordinates,
-	base, msgs content.AgenticMessages,
+	base content.AgenticMessages,
+	baseDerivedPrefix int,
+	msgs content.AgenticMessages,
 	derivedPrefix int,
 	active *content.AIMessage,
 	runtimeTail *content.UserMessage,
@@ -150,7 +162,8 @@ func newReviewContextCaptureProvider(
 	policy gate.ReviewContextPolicy,
 ) *reviewContextCaptureProvider {
 	return &reviewContextCaptureProvider{
-		coordinates: coordinates, base: base, msgs: msgs, derivedPrefix: derivedPrefix,
+		coordinates: coordinates, base: base, baseDerivedPrefix: baseDerivedPrefix,
+		msgs: msgs, derivedPrefix: derivedPrefix,
 		active: active, runtimeTail: runtimeTail, metadata: metadata, policy: policy,
 	}
 }
@@ -171,15 +184,20 @@ func (p *reviewContextCaptureProvider) capture() (gate.ReviewContext, error) {
 			p.err = &reviewContextCaptureError{Field: "derived_context"}
 			return
 		}
+		if p.baseDerivedPrefix < 0 || p.baseDerivedPrefix > len(p.base) {
+			p.err = &reviewContextCaptureError{Field: "base_derived_context"}
+			return
+		}
 		p.review, p.err = capturePermissionReviewContext(reviewContextCapture{
-			Coordinates: p.coordinates,
-			Base:        p.base,
-			Retained:    p.msgs[:p.derivedPrefix],
-			Staged:      p.msgs[p.derivedPrefix:],
-			Active:      p.active,
-			RuntimeTail: p.runtimeTail,
-			Metadata:    p.metadata,
-			Policy:      p.policy,
+			Coordinates:  p.coordinates,
+			Base:         p.base[p.baseDerivedPrefix:],
+			BaseRetained: p.base[:p.baseDerivedPrefix],
+			Retained:     p.msgs[:p.derivedPrefix],
+			Staged:       p.msgs[p.derivedPrefix:],
+			Active:       p.active,
+			RuntimeTail:  p.runtimeTail,
+			Metadata:     p.metadata,
+			Policy:       p.policy,
 		})
 	})
 	if p.err != nil {
@@ -253,6 +271,10 @@ func capturePermissionReviewContext(input reviewContextCapture) (gate.ReviewCont
 	}
 	entries := make([]gate.ReviewContextEntry, 0, reviewMessageCapacity(input))
 	var err error
+	entries, err = appendReviewMessages(entries, input.BaseRetained, reviewMessageAuthorityDerived)
+	if err != nil {
+		return gate.ReviewContext{}, err
+	}
 	entries, err = appendReviewMessages(entries, input.Base, reviewMessageAuthorityConversation)
 	if err != nil {
 		return gate.ReviewContext{}, err
@@ -324,7 +346,7 @@ func preflightReviewContextCapture(input reviewContextCapture) error {
 		return nil
 	}
 	for _, messages := range []content.AgenticMessages{
-		input.Base, input.Retained, input.Staged,
+		input.BaseRetained, input.Base, input.Retained, input.Staged,
 	} {
 		if err := accumulate(messages); err != nil {
 			return err
@@ -431,7 +453,7 @@ func checkedReviewInputSize(sizes ...int) (int, error) {
 }
 
 func reviewMessageCapacity(input reviewContextCapture) int {
-	return len(input.Base) + len(input.Retained) + len(input.Staged) + 2
+	return len(input.BaseRetained) + len(input.Base) + len(input.Retained) + len(input.Staged) + 2
 }
 
 type reviewMessageAuthority uint8

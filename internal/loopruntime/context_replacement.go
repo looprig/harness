@@ -64,12 +64,23 @@ func prepareActorContextReplacement(
 
 // apply projects the already-durable canonical replacement into actor memory.
 // It deliberately leaves inbox/draining and all turn identity untouched.
+//
+// state.msgsDerivedPrefix is set to 1 here: committed.Summary is a
+// model-generated compaction summary (the compaction Hustle's LLM call
+// output, wrapped as a *content.UserMessage — never something a human
+// typed), and it becomes the ENTIRE new state.msgs. Without this, the next
+// turn's installActiveTurn would clone it into cfg.base with no marker at
+// all, and capturePermissionReviewContext (review_context.go) would credit
+// it with gate.ReviewContextOriginUser — genuine human authorization — for
+// every LATER turn, or after a restore whose folded history begins with
+// this exact summary (see loopState.msgsDerivedPrefix's own doc comment).
 func (p actorContextReplacement) apply(state *loopState, committed event.CompactionCommitted) {
 	tracker := p.tracker
 	tracker.basis = committed.PostContext.Basis
 	tracker.measurement = committed.PostContext
 	tracker.hasMeasurement = true
 	state.msgs = content.AgenticMessages{cloneUserMessage(committed.Summary)}
+	state.msgsDerivedPrefix = 1
 	state.context = committed.PostContext
 	state.hasContext = true
 	state.contextTracker = tracker
@@ -82,8 +93,16 @@ type turnContextReplacement struct {
 // applyTurnContextReplacement is the private turn-goroutine half of the actor
 // handshake. Only request history changes; identity, usage, and tool counters do
 // not.
+//
+// config.baseDerivedPrefix is reset to 0 alongside config.base: base is now
+// empty, and a stale nonzero prefix from turn start would describe a slice
+// that no longer exists (capturePermissionReviewContext's bounds check would
+// then fail closed on every subsequent gate this turn, rather than simply
+// reflecting that base's own derived content — if any — has been folded into
+// state.msgs/state.derivedUserPrefix instead).
 func applyTurnContextReplacement(config *turnConfig, state *turnState, replacement turnContextReplacement) {
 	config.base = content.AgenticMessages{}
+	config.baseDerivedPrefix = 0
 	state.msgs = content.AgenticMessages{cloneUserMessage(replacement.Summary)}
 	state.derivedUserPrefix = 1
 }
