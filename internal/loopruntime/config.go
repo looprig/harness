@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/inference"
@@ -93,6 +94,7 @@ type runtimeConfig struct {
 	Model        model.Model      // secret-free model descriptor (name, endpoint, sampling) — stamped onto every Request; carries NO system prompt and NO secret
 	System       string           // per-agent system prompt — sent on every Request AND hashed into the config fingerprint; the connection secret rides the Client, never here
 	DrainTimeout time.Duration    // optional — bounds the hard-kill wait for a cancelled turn to drain; New defaults it to 5s
+	Hooks        *hook.Runner
 
 	// AgentName is the immutable attribution name the loop runs under (the agent/role
 	// driving it, e.g. "operator"). It is stamped onto the loop's LoopStarted at creation
@@ -195,4 +197,16 @@ type runtimeConfig struct {
 	// nil (the default for every pre-existing caller) leaves every turn's
 	// reviewContext nil, byte-identical to before this field existed.
 	reviewContext *reviewContextConfiguration
+}
+
+// RuntimeDependencies carries native runtime collaborators that are not part
+// of a loop's durable declarative definition.
+type RuntimeDependencies struct {
+	Compactor Compactor
+	Hooks     *hook.Runner
+	// ReviewContext mirrors Compactor's shape: internal/sessionruntime is the
+	// only caller that ever supplies a non-nil value (whenever the session
+	// has permission classifiers registered — see Session.loopReviewContext).
+	// nil leaves the resulting loop's turns with reviewContext == nil.
+	ReviewContext *ReviewContext
 }

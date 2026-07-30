@@ -3,8 +3,8 @@ package event
 import "testing"
 
 func FuzzManifestCanonical(f *testing.F) {
-	f.Add("kind", "model", "root", "tool", "rev", uint8(3))
-	f.Fuzz(func(t *testing.T, kind, model, root, tool, rev string, level uint8) {
+	f.Add("kind", "model", "root", "tool", "rev", "hook-v1", uint8(3))
+	f.Fuzz(func(t *testing.T, kind, model, root, tool, rev, hookRev string, level uint8) {
 		m := ConfigManifest{
 			SchemaVersion:        ManifestSchemaVersion,
 			AgentKind:            kind,
@@ -12,6 +12,7 @@ func FuzzManifestCanonical(f *testing.F) {
 			WorkspaceRoot:        root,
 			Tools:                []ToolManifestEntry{{Name: tool, InputSchemaRev: rev}},
 			PermissionStrictness: StrictnessLevel(level),
+			HookPolicyRev:        hookRev,
 			AppFields:            map[string]string{kind: model},
 		}
 		first, second := m.Fingerprint(), m.Fingerprint()

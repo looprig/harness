@@ -196,7 +196,10 @@ func frozenManifest(fields ConfigFingerprintFields, definitions []loop.Definitio
 		ConfinementRev:            fields.ConfinementRev,
 		ConfinementStrictness:     fields.ConfinementStrictness,
 		ExternalCapabilityRev:     fields.ExternalCapabilityRev,
-		AppFields:                 appFields,
+		// HookPolicyRev is assigned by Define from the compiled hook set. It is
+		// intentionally absent from ConfigFingerprintFields and the legacy
+		// ConfigFingerprint compatibility projection.
+		AppFields: appFields,
 	}
 }
 

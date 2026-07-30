@@ -2,12 +2,15 @@ package loopruntime
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
 	contextcount "github.com/looprig/inference/contextcount"
 	model "github.com/looprig/inference/model"
 )
@@ -100,6 +103,107 @@ func (c compactionPostCount) measurement(basis event.ContextBasis) (event.Contex
 type compactionFinalizationProposal struct {
 	Success      *compactionPreparedSuccess
 	RejectReason event.CompactRejectReason
+	hookScope    *compactionHookScope
+}
+
+// compactionHookScope is the private, live ownership token for one operation
+// callback pair. It never enters an event or any durable projection.
+type compactionHookScope struct {
+	ctx    context.Context
+	call   hook.Call
+	finish hook.FinishFunc
+
+	mu      sync.Mutex
+	outcome hook.Outcome
+	err     error
+	output  *loop.CompactionOutput
+	once    sync.Once
+
+	// executorSealed transfers terminal-field ownership away from the executor
+	// goroutine after AwaitCompaction chooses cancellation. Actor/finalizer
+	// corrections remain authoritative until Finish runs.
+	executorSealed bool
+}
+
+func (s *compactionHookScope) setTerminal(outcome hook.Outcome, err error, output *loop.CompactionOutput) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.outcome = outcome
+	s.err = err
+	s.output = cloneCompactionHookOutput(output)
+}
+
+func (s *compactionHookScope) setExecutorTerminal(
+	outcome hook.Outcome,
+	err error,
+	output *loop.CompactionOutput,
+) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.executorSealed {
+		return
+	}
+	s.outcome = outcome
+	s.err = err
+	s.output = cloneCompactionHookOutput(output)
+}
+
+func (s *compactionHookScope) sealExecutorTerminal(
+	outcome hook.Outcome,
+	err error,
+	output *loop.CompactionOutput,
+) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.executorSealed = true
+	s.outcome = outcome
+	s.err = err
+	s.output = cloneCompactionHookOutput(output)
+}
+
+func (s *compactionHookScope) finishTerminal() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() {
+		s.mu.Lock()
+		call := s.call
+		outcome := s.outcome
+		err := s.err
+		output := cloneCompactionHookOutput(s.output)
+		s.mu.Unlock()
+		if outcome == 0 {
+			outcome = hookOutcome(s.ctx, err)
+		}
+		call.Compaction.Output = output
+		finishHook(s.finish, call, outcome, err)
+	})
+}
+
+func (s *compactionHookScope) finishInfrastructure(err error) {
+	if s == nil {
+		return
+	}
+	s.setTerminal(hookOutcome(s.ctx, err), err, nil)
+	s.finishTerminal()
+}
+
+func cloneCompactionHookOutput(value *loop.CompactionOutput) *loop.CompactionOutput {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	cloned.Summary = cloneUserMessage(value.Summary)
+	return &cloned
 }
 
 func (p compactionFinalizationProposal) validate() error {
@@ -155,9 +259,18 @@ func (f *compactionFinalizer) Finalize(
 	ctx context.Context,
 	attempt compactionAttempt,
 	proposal compactionFinalizationProposal,
-) (event.Event, error) {
+) (terminalResult event.Event, resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			proposal.hookScope.finishInfrastructure(resultErr)
+		}
+	}()
 	if record, ok := f.records[attempt.AttemptID]; ok {
-		return cloneCompactionTerminal(record.event, attempt.AttemptID)
+		terminalResult, resultErr = cloneCompactionTerminal(record.event, attempt.AttemptID)
+		if resultErr == nil {
+			proposal.hookScope.finishTerminal()
+		}
+		return terminalResult, resultErr
 	}
 	if err := proposal.validate(); err != nil {
 		return nil, finalizationError(err, attempt.AttemptID)
@@ -187,6 +300,7 @@ func (f *compactionFinalizer) Finalize(
 		}
 		return returned, err
 	}
+	proposal.hookScope.finishTerminal()
 	return cloneCompactionTerminal(terminal, attempt.AttemptID)
 }
 

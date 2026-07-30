@@ -15,6 +15,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
@@ -52,6 +53,7 @@ type Session struct {
 	sessionCtx               context.Context
 	sessionCancel            context.CancelFunc
 	constructionAbortTimeout time.Duration
+	hooks                    *hook.Runner
 
 	// loopsMu protects loops and activeLoopID. There is no session goroutine, so
 	// session methods serialize registry access with a normal RWMutex.
@@ -1333,7 +1335,16 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		var compactor loopruntime.Compactor
 		compactor, err = s.compactorFor(bound, loopID)
 		if err == nil {
-			b, err = loopruntime.NewInModeWithCompactor(loopCtx, s.sessionID, loopID, parent, eventTarget, bound, startedMode, compactor, s.loopReviewContext())
+			b, err = loopruntime.NewInModeWithRuntime(
+				loopCtx,
+				s.sessionID,
+				loopID,
+				parent,
+				eventTarget,
+				bound,
+				startedMode,
+				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext()},
+			)
 		}
 	default:
 		if s.foreignBuild == nil {

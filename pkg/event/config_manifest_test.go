@@ -28,6 +28,7 @@ func testManifest() ConfigManifest {
 		ConfinementRev:             "gggg",
 		ConfinementStrictness:      2,
 		ExternalCapabilityRev:      "hhhh",
+		HookPolicyRev:              "jjjj",
 		AppFields:                  map[string]string{"b": "2", "a": "1"},
 	}
 }
@@ -53,7 +54,10 @@ func TestManifestFingerprint(t *testing.T) {
 			m.PermissionReviewConfigured = false
 		}, same: false},
 		{name: "permission review policy revision change alters fingerprint", mutate: func(m *ConfigManifest) {
-			m.PermissionReviewPolicyRev = "jjjj"
+			m.PermissionReviewPolicyRev = "kkkk"
+		}, same: false},
+		{name: "hook policy change alters fingerprint", mutate: func(m *ConfigManifest) {
+			m.HookPolicyRev = "other"
 		}, same: false},
 		{name: "schema version change alters fingerprint", mutate: func(m *ConfigManifest) {
 			m.SchemaVersion = ManifestSchemaVersion + 1
@@ -72,6 +76,16 @@ func TestManifestFingerprint(t *testing.T) {
 	}
 }
 
+func TestManifestHookSchemaContract(t *testing.T) {
+	t.Parallel()
+	if ManifestSchemaVersion != 2 {
+		t.Errorf("ManifestSchemaVersion = %d, want 2", ManifestSchemaVersion)
+	}
+	if manifestEncodingDomain != "looprig/config-manifest/v2" {
+		t.Errorf("manifestEncodingDomain = %q, want v2 domain", manifestEncodingDomain)
+	}
+}
+
 // The canonical encoding is a durable contract: this golden vector pins it. If
 // this test ever fails, the encoding changed — that is a manifest schema bump,
 // not a test to update casually.
@@ -81,11 +95,30 @@ func TestManifestFingerprintGolden(t *testing.T) {
 		t.Fatalf("fingerprint %q is not lowercase hex sha256", got)
 	}
 	// Frozen on first run; drift here means the canonical encoding changed.
-	// Bumped for the v2 schema (PermissionReviewPolicyRev added to the
-	// canonical encoding — see ManifestSchemaVersion's doc comment).
-	const golden = "235e46e8ee74310873d9142ce5422d9040f8654b1d2f1c85287c79c3abceafbe"
+	// Regenerated for the true v2 schema, which carries BOTH
+	// PermissionReviewPolicyRev and HookPolicyRev together (see
+	// ManifestSchemaVersion's doc comment) — neither field's original
+	// standalone golden value is correct once both are present.
+	const golden = "21812bba801a58b50aa752f09466b35ea4f8ebd7520c825a49efd79110403c4d"
 	if golden != "" && got != golden {
 		t.Errorf("canonical encoding drifted: fingerprint = %s, want %s", got, golden)
+	}
+}
+
+func TestManifestV1FingerprintCompatibility(t *testing.T) {
+	t.Parallel()
+	manifest := testManifest()
+	manifest.SchemaVersion = 1
+	manifest.HookPolicyRev = ""
+
+	const historical = "6dfa05a68de160225451630245e9d7a3ce5e709f39dd376dfc6708bfd4a6da3e"
+	if got := manifest.Fingerprint(); got != historical {
+		t.Fatalf("schema-v1 fingerprint = %s, want historical %s", got, historical)
+	}
+
+	manifest.HookPolicyRev = "must-not-enter-v1"
+	if got := manifest.Fingerprint(); got != historical {
+		t.Errorf("schema-v1 hook field changed fingerprint to %s, want %s", got, historical)
 	}
 }
 
@@ -132,6 +165,9 @@ func TestManifestFromLegacy(t *testing.T) {
 	}
 	if got.legacyToolPolicyRev != "tp" {
 		t.Errorf("legacyToolPolicyRev = %q, want %q", got.legacyToolPolicyRev, "tp")
+	}
+	if got.HookPolicyRev != "" {
+		t.Errorf("HookPolicyRev = %q, want empty for legacy projection", got.HookPolicyRev)
 	}
 }
 

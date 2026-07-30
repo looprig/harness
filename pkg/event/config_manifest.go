@@ -13,14 +13,21 @@ import (
 // therefore never treats raw fingerprint inequality across schema versions as
 // drift (see AssessDrift) and records a one-time baseline upgrade instead.
 //
-// v2 adds PermissionReviewPolicyRev to the canonical encoding (the
-// review-policy-identity-drift-while-enabled fix).
+// v2 adds both PermissionReviewPolicyRev (the review-policy-identity-drift-
+// while-enabled fix) and HookPolicyRev (the operation-hooks feature) to the
+// canonical encoding. Neither shipped independently — both landed in the
+// same merge before v2 was ever persisted anywhere — so v2 is defined as
+// carrying both fields together, not as two separate single-field bumps.
 const ManifestSchemaVersion uint32 = 2
 
 // manifestEncodingDomain separates manifest digests from every other SHA-256
 // in the system. It is part of the durable contract; never change it without a
 // schema bump.
-const manifestEncodingDomain = "looprig/config-manifest/v1"
+const manifestEncodingDomain = "looprig/config-manifest/v2"
+
+// manifestEncodingDomainV1 preserves verification of fingerprints already
+// persisted before HookPolicyRev extended the canonical schema.
+const manifestEncodingDomainV1 = "looprig/config-manifest/v1"
 
 // ConfigEpoch orders the configurations explicitly adopted within one Session.
 // SessionStarted is epoch 1; each ConfigurationAdopted increments it.
@@ -96,6 +103,7 @@ type ConfigManifest struct {
 	ConfinementRev            string          `json:"confinement_rev,omitzero"`
 	ConfinementStrictness     StrictnessLevel `json:"confinement_strictness,omitzero"`
 	ExternalCapabilityRev     string          `json:"external_capability_rev,omitzero"`
+	HookPolicyRev             string          `json:"hook_policy_rev,omitzero"`
 	// AppFields are application-defined, secret-free compatibility fields.
 	// Canonically encoded in sorted key order.
 	AppFields map[string]string `json:"app_fields,omitzero"`
@@ -113,7 +121,11 @@ func (m ConfigManifest) Fingerprint() string {
 }
 
 func (m ConfigManifest) canonical() []byte {
-	material := appendManifestString(nil, manifestEncodingDomain)
+	domain := manifestEncodingDomain
+	if m.SchemaVersion == 1 {
+		domain = manifestEncodingDomainV1
+	}
+	material := appendManifestString(nil, domain)
 	material = binary.BigEndian.AppendUint64(material, uint64(m.SchemaVersion))
 	material = appendManifestString(material, m.AgentKind)
 	material = appendManifestString(material, m.TopologyRev)
@@ -146,15 +158,29 @@ func (m ConfigManifest) canonical() []byte {
 	material = appendManifestString(material, m.PermissionPosture)
 	material = appendManifestString(material, m.NativePermissionPolicyRev)
 	material = binary.BigEndian.AppendUint64(material, uint64(m.PermissionStrictness))
-	reviewConfiguredFlag := uint64(0)
-	if m.PermissionReviewConfigured {
-		reviewConfiguredFlag = 1
+	if m.SchemaVersion != 1 {
+		// PermissionReviewConfigured/PermissionReviewPolicyRev and HookPolicyRev
+		// all extend the canonical encoding beyond what v1 ever genuinely
+		// carried: v1's own frozen historical fixture (TestManifestV1Fingerprint
+		// Compatibility, TestConfigurationAdoptedV1ReplayFixture) predates both —
+		// permission-review and operation-hooks are two independent features
+		// that each landed on their own branch before this merge, and neither
+		// branch's "v1" ever included the other's field. Gating both together
+		// keeps v1 genuinely immutable regardless of which fields a future v3+
+		// schema adds.
+		reviewConfiguredFlag := uint64(0)
+		if m.PermissionReviewConfigured {
+			reviewConfiguredFlag = 1
+		}
+		material = binary.BigEndian.AppendUint64(material, reviewConfiguredFlag)
+		material = appendManifestString(material, m.PermissionReviewPolicyRev)
 	}
-	material = binary.BigEndian.AppendUint64(material, reviewConfiguredFlag)
-	material = appendManifestString(material, m.PermissionReviewPolicyRev)
 	material = appendManifestString(material, m.ConfinementRev)
 	material = binary.BigEndian.AppendUint64(material, uint64(m.ConfinementStrictness))
 	material = appendManifestString(material, m.ExternalCapabilityRev)
+	if m.SchemaVersion != 1 {
+		material = appendManifestString(material, m.HookPolicyRev)
+	}
 	keys := make([]string, 0, len(m.AppFields))
 	for key := range m.AppFields {
 		keys = append(keys, key)

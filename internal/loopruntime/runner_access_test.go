@@ -426,7 +426,7 @@ func TestRunBatch_InteractiveGateOpensOnceApproveOnce(t *testing.T) {
 		}
 	}()
 
-	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
 	close(gateReg)
 	<-done
 
@@ -483,7 +483,7 @@ func TestRunBatch_ApproveAlwaysPersistsCandidates(t *testing.T) {
 		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Action: gatedomain.ApprovalApproveAlwaysWorkspace}
 	}()
 
-	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
 
 	if len(results) != 1 || results[0].IsError {
 		t.Fatalf("results = %+v, want one success", results)
@@ -518,7 +518,7 @@ func TestRunBatch_UnknownApprovalActionFailsClosed(t *testing.T) {
 		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Action: "Approve always for this session"}
 	}()
 
-	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
 
 	if len(results) != 1 || !results[0].IsError || !strings.Contains(resultText(results[0]), "permission denied") {
 		t.Fatalf("results = %+v, want one permission-denied error", results)

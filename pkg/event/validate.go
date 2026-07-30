@@ -164,6 +164,10 @@ func validateEventIdentity(ev Event) error {
 
 func validateEventBody(ev Event) error {
 	switch e := ev.(type) {
+	case SessionStarted:
+		if !validConfigManifestSchema(e.Manifest, true) {
+			return &InvalidEventError{Event: "SessionStarted", Field: FieldManifest, Rule: RuleInvalid}
+		}
 	case WorkspaceCheckpointed:
 		if e.Consistency != SnapshotQuiescent && e.Consistency != SnapshotFuzzy {
 			return &InvalidEventError{Event: "WorkspaceCheckpointed", Field: FieldConsistency, Rule: RuleInvalid}
@@ -359,11 +363,14 @@ const (
 	maxConfigManifestAppFields = 1024
 	// maxConfigDriftChanges must never reject a drift summary a VALID manifest
 	// comparison can legitimately produce, or a large-but-legitimate change would
-	// brick every restore. A schema-1↔schema-1 assessment can emit one change per
-	// tool (up to maxConfigManifestTools) plus one per app field (up to
-	// maxConfigManifestAppFields) plus the ~dozen scalar-field categories; the +64
-	// covers those scalars with slack. It still bounds a decoded hostile event.
-	maxConfigDriftChanges = maxConfigManifestTools + maxConfigManifestAppFields + 64
+	// brick every restore. A schema-2 assessment can emit one removal and one
+	// addition per bounded collection member when baseline and candidate are
+	// disjoint, plus thirteen manifest scalar-field categories including hook
+	// policy. Restore may append one root-agent-name change after AssessDrift,
+	// so that slot is explicit too. It still bounds a decoded hostile event.
+	maxConfigDriftScalarChanges  = 13
+	maxConfigDriftAgentNameSlots = 1
+	maxConfigDriftChanges        = 2*maxConfigManifestTools + 2*maxConfigManifestAppFields + maxConfigDriftScalarChanges + maxConfigDriftAgentNameSlots
 	// MaxConfigMessageLen and MaxConfigActorLen bound the durable, partly
 	// user-authored audit fields. They are exported so the restore constructor can
 	// TRUNCATE a decider's over-long Message/Actor before building the adoption (a
@@ -398,7 +405,7 @@ func validateConfigurationAdopted(e ConfigurationAdopted) error {
 	if len(e.Actor) > MaxConfigActorLen {
 		return &InvalidEventError{Event: name, Field: FieldActor, Rule: RuleInvalid}
 	}
-	if e.Manifest.SchemaVersion == 0 {
+	if !validConfigManifestSchema(e.Manifest, false) {
 		return &InvalidEventError{Event: name, Field: FieldManifest, Rule: RuleInvalid}
 	}
 	// A persisted manifest's recorded fingerprint must match the manifest itself,
@@ -414,6 +421,22 @@ func validateConfigurationAdopted(e ConfigurationAdopted) error {
 		return &InvalidEventError{Event: name, Field: FieldManifest, Rule: RuleInvalid}
 	}
 	return nil
+}
+
+func validConfigManifestSchema(manifest ConfigManifest, allowLegacy bool) bool {
+	switch manifest.SchemaVersion {
+	case 0:
+		return allowLegacy && manifest.HookPolicyRev == ""
+	case 1:
+		// HookPolicyRev did not exist in schema v1 and is deliberately excluded
+		// from its historical canonical layout. Reject it rather than accepting
+		// policy state that the fingerprint cannot authenticate.
+		return manifest.HookPolicyRev == ""
+	case ManifestSchemaVersion:
+		return true
+	default:
+		return false
+	}
 }
 
 func invalidHustle(name EventName, field FieldName) *InvalidEventError {

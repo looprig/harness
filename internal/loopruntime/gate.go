@@ -3,11 +3,14 @@ package loopruntime
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	gatedomain "github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hook"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -119,8 +122,12 @@ func (nopGateRegistrar) CloseGate(context.Context, gatedomain.ID, gatedomain.Clo
 // kind} under the minted GateID, activates the public gate, then acks to signal
 // install-before-emit.
 type gateRegistration struct {
-	gate    gatedomain.Gate
-	payload gatedomain.Payload
+	ctx context.Context
+	// abandonID makes this an actor-owned removal request rather than an open
+	// request. The same synchronous channel preserves ordering with registration.
+	abandonID gatedomain.ID
+	gate      gatedomain.Gate
+	payload   gatedomain.Payload
 	// reviewContext is a live-only defensive clone for permission review. The
 	// actor never copies it into gate payloads, events, or journal records.
 	reviewContext gatedomain.ReviewContext
@@ -163,10 +170,33 @@ func accepts(kind gateKind, cmd command.Command) bool {
 type emitKey struct{}
 type callIDKey struct{}
 type gateRegKey struct{}
+type operationHookRuntimeKey struct{}
+
+type operationHookRuntime struct {
+	hooks       *hook.Runner
+	coordinates identity.Coordinates
+	agentName   identity.AgentName
+	cause       identity.Cause
+}
+
+type eventEmitter func(context.Context, event.Event)
+
+func withOperationHookRuntime(ctx context.Context, runtime operationHookRuntime) context.Context {
+	return context.WithValue(ctx, operationHookRuntimeKey{}, runtime)
+}
+
+func operationHooksFromContext(ctx context.Context) operationHookRuntime {
+	runtime, _ := ctx.Value(operationHookRuntimeKey{}).(operationHookRuntime)
+	return runtime
+}
 
 // withEmit returns a child ctx carrying the per-turn emit func. The runner injects
 // it per tool call; EmitFromContext / RequestUserInput read it back.
 func withEmit(ctx context.Context, emit func(event.Event)) context.Context {
+	return context.WithValue(ctx, emitKey{}, emit)
+}
+
+func withContextEmit(ctx context.Context, emit eventEmitter) context.Context {
 	return context.WithValue(ctx, emitKey{}, emit)
 }
 
@@ -205,8 +235,14 @@ func gateRegFromContext(ctx context.Context) (chan<- gateRegistration, bool) {
 // tools call this; it is the only sanctioned way for a tool in tools/ to emit an
 // event without depending on the loop internals.
 func EmitFromContext(ctx context.Context) (func(event.Event), bool) {
-	v, ok := ctx.Value(emitKey{}).(func(event.Event))
-	return v, ok
+	switch emit := ctx.Value(emitKey{}).(type) {
+	case eventEmitter:
+		return func(value event.Event) { emit(ctx, value) }, true
+	case func(event.Event):
+		return emit, true
+	default:
+		return nil, false
+	}
 }
 
 // GateContextMissing identifies which injected ctx value RequestUserInput could
@@ -268,7 +304,7 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 	// Register synchronously, ctx-aware: no wedge if the actor is gone or the turn
 	// is cancelled.
 	select {
-	case gateReg <- gateRegistration{gate: g, payload: payload, callID: callID, reply: reply, kind: gateUserInput, ack: ack}:
+	case gateReg <- gateRegistration{ctx: ctx, gate: g, payload: payload, callID: callID, reply: reply, kind: gateUserInput, ack: ack}:
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
@@ -285,18 +321,142 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 	// Install-before-emit: only now is the session gate guaranteed active.
 	emit(event.UserInputRequested{ToolExecutionID: callID, Question: question, Choices: choices})
 
+	g.ID = installed.gateID
+	runtime := operationHooksFromContext(ctx)
+	parentCall := hook.Call{
+		Coordinates: runtime.coordinates,
+		AgentName:   runtime.agentName,
+		Cause:       runtime.cause,
+	}
+	waitCtx, waitCall, finishWait, waitErr := startGateWaitWithRunner(ctx, parentCall, g, runtime.hooks)
+	if waitErr != nil {
+		return "", waitErr
+	}
 	select {
 	case cmd := <-reply:
 		// runLoop already matched by ToolExecutionID + kind; re-validate the ToolExecutionID as cheap
 		// defence in depth, and narrow to the concrete command for the answer.
 		pui, ok := cmd.(command.ProvideUserInput)
 		if !ok || pui.GateToolExecutionID() != callID || (!pui.GateRoute.GateID.IsZero() && pui.GateRoute.GateID != installed.gateID) {
-			return "", &GateReplyMismatchError{ToolExecutionID: callID}
+			err := &GateReplyMismatchError{ToolExecutionID: callID}
+			finishGateWait(finishWait, waitCall, nil, err)
+			return "", err
 		}
+		answer := &gatedomain.Answer{
+			GateID: installed.gateID,
+			Values: map[string]string{"answer": pui.Answer},
+			Source: gateResponseSource(cmd),
+		}
+		finishGateWait(finishWait, waitCall, answer, nil)
 		return pui.Answer, nil
-	case <-ctx.Done():
-		return "", ctx.Err()
+	case <-waitCtx.Done():
+		waitErr := waitCtx.Err()
+		if ctx.Err() == nil {
+			if err := abandonInstalledGate(ctx, waitCtx, gateReg, installed.gateID); err != nil {
+				finishGateWait(finishWait, waitCall, nil, err)
+				return "", err
+			}
+		}
+		finishGateWait(finishWait, waitCall, nil, waitErr)
+		return "", waitErr
 	}
+}
+
+func abandonInstalledGate(
+	lifetimeCtx context.Context,
+	operationCtx context.Context,
+	gateReg chan<- gateRegistration,
+	gateID gatedomain.ID,
+) error {
+	ack := make(chan gateInstallAck, 1)
+	closeCtx, release := operationValuesWithLifetime(operationCtx, lifetimeCtx)
+	defer release()
+	request := gateRegistration{
+		ctx:       closeCtx,
+		abandonID: gateID,
+		ack:       ack,
+	}
+	select {
+	case gateReg <- request:
+	case <-lifetimeCtx.Done():
+		return lifetimeCtx.Err()
+	}
+	select {
+	case result := <-ack:
+		return result.err
+	case <-lifetimeCtx.Done():
+		return lifetimeCtx.Err()
+	}
+}
+
+func operationValuesWithLifetime(
+	operationCtx context.Context,
+	lifetimeCtx context.Context,
+) (context.Context, func()) {
+	values := context.WithoutCancel(operationCtx)
+	linked, cancel := context.WithCancelCause(values)
+	deadlineCancel := func() {}
+	if deadline, ok := lifetimeCtx.Deadline(); ok {
+		linked, deadlineCancel = context.WithDeadlineCause(
+			linked,
+			deadline,
+			context.DeadlineExceeded,
+		)
+	}
+	stopLifetime := context.AfterFunc(lifetimeCtx, func() {
+		cancel(context.Cause(lifetimeCtx))
+	})
+	if lifetimeCtx.Err() != nil {
+		cancel(context.Cause(lifetimeCtx))
+	}
+	return linked, func() {
+		stopLifetime()
+		deadlineCancel()
+		cancel(context.Canceled)
+	}
+}
+
+func gateResponseSource(cmd command.Command) gatedomain.ResponseSource {
+	if cmd.CommandHeader().Agency == identity.AgencyUser {
+		return gatedomain.ResponseSource{Kind: gatedomain.ResponseFromUser}
+	}
+	// Machine agency cannot distinguish policy from model provenance once the
+	// response has been translated onto the loop command wire.
+	return gatedomain.ResponseSource{}
+}
+
+func startGateWaitWithRunner(
+	ctx context.Context,
+	parent hook.Call,
+	g gatedomain.Gate,
+	hooks *hook.Runner,
+) (context.Context, hook.Call, hook.FinishFunc, error) {
+	call := hook.Call{
+		Operation:   hook.OperationGateWait,
+		StartedAt:   time.Now(),
+		Coordinates: parent.Coordinates,
+		AgentName:   parent.AgentName,
+		Cause:       parent.Cause,
+		GateWait: &hook.GateWaitData{
+			GateID:   g.ID,
+			Kind:     g.Kind,
+			Resolver: g.Resolver,
+			Blocks:   g.Blocks,
+			Effect:   g.Effect,
+		},
+	}
+	waitCtx, finish, err := hooks.Start(ctx, call)
+	return waitCtx, call, finish, err
+}
+
+func finishGateWait(
+	finish hook.FinishFunc,
+	call hook.Call,
+	answer *gatedomain.Answer,
+	err error,
+) {
+	call.GateWait.Answer = answer
+	finishHook(finish, call, hookOutcome(context.Background(), err), err)
 }
 
 // GateReplyMismatchError is returned if the command delivered on a gateUserInput

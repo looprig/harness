@@ -7,6 +7,7 @@ import (
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hook"
 )
 
 // recordingEventAppender is an eventAppender double for the hub's REQUIRED durable
@@ -15,6 +16,71 @@ import (
 type recordingEventAppender struct {
 	mu     sync.Mutex
 	events []event.Event
+}
+
+func TestWithHooksStoresCompiledRunner(t *testing.T) {
+	t.Parallel()
+
+	runner, err := hook.Compile(hook.Set{})
+	if err != nil {
+		t.Fatalf("hook.Compile: %v", err)
+	}
+	session := &Session{}
+	WithHooks(runner)(session)
+	if session.hooks != runner {
+		t.Fatalf("Session.hooks = %p, want same immutable runner %p", session.hooks, runner)
+	}
+}
+
+func TestWithLifecycleHooksStoresCompiledRunner(t *testing.T) {
+	t.Parallel()
+
+	runner, err := hook.Compile(hook.Set{})
+	if err != nil {
+		t.Fatalf("hook.Compile: %v", err)
+	}
+	lifecycle := &Lifecycle{}
+	WithLifecycleHooks(runner)(lifecycle)
+	if lifecycle.hooks != runner {
+		t.Fatalf("Lifecycle.hooks = %p, want same immutable runner %p", lifecycle.hooks, runner)
+	}
+}
+
+func TestLifecyclePassesHooksToNewAndRestoredSessions(t *testing.T) {
+	t.Parallel()
+
+	runner, err := hook.Compile(hook.Set{})
+	if err != nil {
+		t.Fatalf("hook.Compile: %v", err)
+	}
+	lifecycle, err := newTestLifecycle(
+		cfg(&stubLLM{}),
+		newRestoreStore(t),
+		WithLifecycleHooks(runner),
+	)
+	if err != nil {
+		t.Fatalf("newTestLifecycle: %v", err)
+	}
+	live, err := lifecycle.NewSession(context.Background(), "")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if live.hooks != runner {
+		t.Fatalf("new Session.hooks = %p, want %p", live.hooks, runner)
+	}
+	sessionID := live.SessionID()
+	if err := live.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	restored, err := lifecycle.RestoreSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("RestoreSession: %v", err)
+	}
+	t.Cleanup(func() { _ = restored.Shutdown(context.Background()) })
+	if restored.hooks != runner {
+		t.Fatalf("restored Session.hooks = %p, want %p", restored.hooks, runner)
+	}
 }
 
 func (r *recordingEventAppender) AppendEvent(_ context.Context, ev event.Event) (uint64, error) {

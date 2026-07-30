@@ -6,11 +6,13 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/hook"
+	identitydomain "github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
@@ -110,13 +112,17 @@ type turnConfig struct {
 	// assembled exactly as before. The provider contract is non-fatal — it never errors.
 	runtimeContext RuntimeContextProvider
 
-	model   model.Model
-	system  string
-	tools   ToolSet
-	output  *inference.OutputSchema
-	client  inference.Client
-	gateReg chan<- gateRegistration
-	idGen   idGenerator
+	model     model.Model
+	system    string
+	tools     ToolSet
+	output    *inference.OutputSchema
+	client    inference.Client
+	hooks     *hook.Runner
+	agentName identitydomain.AgentName
+	cause     identitydomain.Cause
+	now       func() time.Time
+	gateReg   chan<- gateRegistration
+	idGen     idGenerator
 	// admit acquires the session-wide execution read admission for the next inference
 	// step. Required/manual checkpoints hold the writer side through their full durable
 	// critical sequence, so already-queued work on any loop cannot advance.
@@ -151,6 +157,9 @@ type turnConfig struct {
 	// terminal). StepDone is NOT emitted here — it is emitted by the actor at the
 	// commit point.
 	emit func(event.Event)
+	// emitContext is the context-carrying peer used by tool/gate events so
+	// JournalAppend hooks inherit their active operation context.
+	emitContext eventEmitter
 
 	// afterDrain is a test-only seam (nil in production) invoked by foldPending after
 	// drainPending returns the batch but before the first TurnFoldedInto commit. See
@@ -240,6 +249,18 @@ func runStepWithAdmission(
 // The LLM request for each step is built from cfg.base + ts.msgs — never live
 // loopState.msgs — so the already-committed parts are not duplicated.
 func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
+	var activeStepScope *operationHookScope
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if activeStepScope != nil {
+				activeStepScope.Finish(
+					hook.OutcomeFailed,
+					&operationHookPanicError{Operation: hook.OperationStep},
+				)
+			}
+			panic(recovered)
+		}
+	}()
 	if cfg.admit == nil {
 		cfg.admit = func(context.Context) (func(), error) { return func() {}, nil }
 	}
@@ -293,13 +314,45 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			slog.Error("step id generation failed; stamping StepDone with zero StepID", "error", err)
 		}
 		st := newStepState(turnIDs.sessionID, turnIDs.loopID, turnIDs.turnID, stepID, stepIdx)
+		stepCall := hook.Call{
+			Operation: hook.OperationStep,
+			StartedAt: hookNow(cfg.now),
+			Coordinates: identitydomain.Coordinates{
+				SessionID: st.sessionID,
+				LoopID:    st.loopID,
+				TurnID:    st.turnID,
+				StepID:    st.id,
+			},
+			AgentName: cfg.agentName,
+			Cause:     cfg.cause,
+			Step:      &hook.StepData{Index: hook.StepIndex(st.index)},
+		}
+		stepCtx, finishStep, stepStartErr := cfg.hooks.Start(ctx, stepCall)
+		if stepStartErr != nil {
+			finishHook(finishStep, stepCall, hookOutcome(ctx, stepStartErr), stepStartErr)
+			return event.TurnFailed{
+				TurnIndex: ts.index,
+				Err:       safeHookError(hook.OperationStep, stepStartErr),
+			}
+		}
+		stepScope := &operationHookScope{
+			call: stepCall, finish: finishStep,
+		}
+		activeStepScope = stepScope
+		finishStepWith := func(err error) {
+			stepScope.Finish(hookOutcome(stepCtx, err), err)
+			if activeStepScope == stepScope {
+				activeStepScope = nil
+			}
+		}
 
 		releaseAdmission := cfg.firstAdmission
 		cfg.firstAdmission = nil
 		if releaseAdmission == nil {
 			var admitErr error
-			releaseAdmission, admitErr = cfg.admit(ctx)
+			releaseAdmission, admitErr = cfg.admit(stepCtx)
 			if admitErr != nil {
+				finishStepWith(admitErr)
 				if !errors.Is(admitErr, context.Canceled) && !errors.Is(admitErr, context.DeadlineExceeded) {
 					return event.TurnFailed{TurnIndex: ts.index, Err: admitErr}
 				}
@@ -307,7 +360,10 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			}
 		}
 		// runStep owns the LLM cycle: stream → exactly one AIMessage into st.msgs[0].
-		res := runStepWithAdmission(ctx, stepConfig{req: req, client: cfg.client, emit: cfg.emit}, ts.index, st, releaseAdmission)
+		res := runStepWithAdmission(stepCtx, stepConfig{
+			req: req, client: cfg.client, emit: cfg.emit, hooks: cfg.hooks,
+			agentName: cfg.agentName, cause: cfg.cause, now: cfg.now,
+		}, ts.index, st, releaseAdmission)
 		if res.terminal != nil {
 			// A clean native stream with no semantic blocks is still an output-stage
 			// result: finish metadata takes precedence (length/filter/tool_use), while
@@ -318,12 +374,14 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 				empty.Usage = cloneUsage(res.streamResult.Usage)
 				_, _, outputErr := validateNativeStep(empty, res.state.blocks.ToolUses(), res.streamResult)
 				if outputErr != nil {
+					finishStepWith(outputErr)
 					return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
 				}
 			}
 			// The in-flight step never completed: discard it (it was never added to
 			// ts.msgs and never committed) and return the terminal. Committed steps
 			// stay in loopState.msgs.
+			finishStepWith(terminalHookError(res.terminal))
 			return res.terminal
 		}
 		st = res.state
@@ -340,6 +398,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		case outputStrategyNative:
 			canonical, final, outputErr := validateNativeStep(aiMsg, toolUses, res.streamResult)
 			if outputErr != nil {
+				finishStepWith(outputErr)
 				return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
 			}
 			if final {
@@ -356,6 +415,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			rawMessage.Usage = cloneUsage(aiMsg.Usage)
 			canonical, final, outputErr := validateTerminalStep(rawMessage, toolUses, res.streamResult)
 			if outputErr != nil {
+				finishStepWith(outputErr)
 				return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
 			}
 			if final {
@@ -367,6 +427,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 
 		turnUsage, usageErr := addTurnUsage(ts.usage, aiMsg.Usage)
 		if usageErr != nil {
+			finishStepWith(usageErr)
 			return event.TurnFailed{TurnIndex: ts.index, Err: usageErr}
 		}
 		ts.usage = turnUsage
@@ -376,11 +437,13 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// is just the AIMessage. Commit it (actor appends + emits StepDone), then end.
 		if len(toolUses) == 0 {
 			ts.msgs = append(ts.msgs, aiMsg)
-			if cerr := commitStep(ctx, cfg, st); cerr != nil {
+			if cerr := commitStep(stepCtx, cfg, st); cerr != nil {
 				// The commit handshake was cancelled (Interrupt/Shutdown) before the
 				// actor committed/emitted this final step: treat as interrupt.
+				finishStepWith(cerr)
 				return event.TurnInterrupted{TurnIndex: ts.index}
 			}
+			finishStepWith(nil)
 			candidate := turnInferenceRequest(cfg, ts, runtimeTail, outputPlan)
 			if _, measureErr := measureTurnCandidate(ctx, cfg, candidate, runtimeRevision, runtimeTail, false); measureErr != nil {
 				return measureTurnFailure(ctx, ts.index, measureErr)
@@ -394,14 +457,16 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			// The runaway cap fires on this UNCOMPLETED tool step: it is never appended
 			// to ts.msgs and never committed, so no unpaired tool_use survives into
 			// loopState.msgs and no StepDone is emitted for it.
+			limitErr := &event.ToolLimitError{
+				Iterations:    ts.toolIterations,
+				MaxIterations: cfg.tools.MaxToolIterations,
+				Calls:         ts.toolCalls,
+				MaxCalls:      cfg.tools.MaxToolCallsPerTurn,
+			}
+			finishStepWith(limitErr)
 			return event.TurnFailed{
 				TurnIndex: ts.index,
-				Err: &event.ToolLimitError{
-					Iterations:    ts.toolIterations,
-					MaxIterations: cfg.tools.MaxToolIterations,
-					Calls:         ts.toolCalls,
-					MaxCalls:      cfg.tools.MaxToolCallsPerTurn,
-				},
+				Err:       limitErr,
 			}
 		}
 
@@ -411,12 +476,13 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// without disturbing the StepID set here. This is the seam where the active
 		// step's id is known (st.id), keeping the runner ignorant of step identity.
 		stepEmit := stepStampingEmit(cfg.emit, st.id)
+		stepEmitContext := stepStampingContextEmit(cfg.emitContext, st.id)
 		// Inject the running step's coordinates so every tool in the batch can read
 		// its OWN provenance via ProvenanceFrom(ctx) — the Subagent tool passes this
 		// as the `parent` when spawning a sub-loop. This is the one seam where all
 		// three ids are unambiguously the running step's (st.id is this step's id),
 		// so we wrap once at the batch boundary rather than per-tool in the runner.
-		batchCtx := WithProvenance(ctx, Provenance{
+		batchCtx := WithProvenance(stepCtx, Provenance{
 			LoopID: turnIDs.loopID,
 			TurnID: turnIDs.turnID,
 			StepID: st.id,
@@ -431,7 +497,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		var reviewCapture *reviewContextCaptureProvider
 		if cfg.reviewContext != nil {
 			reviewCapture = newReviewContextCaptureProvider(
-				identity.Coordinates{
+				identitydomain.Coordinates{
 					SessionID: turnIDs.sessionID,
 					LoopID:    turnIDs.loopID,
 					TurnID:    turnIDs.turnID,
@@ -442,10 +508,25 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			)
 			batchCtx = withPermissionReviewCapture(batchCtx, reviewCapture)
 		}
-		results := RunBatch(batchCtx, toolUses, cfg.tools, cfg.gateReg, cfg.idGen, stepEmit)
-		if ctx.Err() != nil {
+		results := RunBatch(batchCtx, toolUses, cfg.tools, BatchRuntime{
+			GateRegistrations: cfg.gateReg,
+			IDGen:             cfg.idGen,
+			Emit:              stepEmit,
+			EmitContext:       stepEmitContext,
+			Hooks:             cfg.hooks,
+			Coordinates: identitydomain.Coordinates{
+				SessionID: turnIDs.sessionID,
+				LoopID:    turnIDs.loopID,
+				TurnID:    turnIDs.turnID,
+				StepID:    st.id,
+			},
+			AgentName: cfg.agentName,
+			Cause:     cfg.cause,
+		})
+		if stepCtx.Err() != nil {
 			// A cancelled batch's results are discarded; the step never completes, so
 			// it is not appended/committed and emits no StepDone.
+			finishStepWith(stepCtx.Err())
 			return event.TurnInterrupted{TurnIndex: ts.index}
 		}
 		// reviewCapture.failed() never triggers capture itself — it only
@@ -465,12 +546,14 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// Append the whole group to the staged turn and commit it (actor appends to
 		// loopState.msgs + emits StepDone at the same point).
 		ts.msgs = append(ts.msgs, st.msgs...)
-		if cerr := commitStep(ctx, cfg, st); cerr != nil {
+		if cerr := commitStep(stepCtx, cfg, st); cerr != nil {
 			// The commit handshake was cancelled (Interrupt/Shutdown) before the actor
 			// committed/emitted this completed step: treat as interrupt. Prior steps
 			// already committed stay in loopState.msgs.
+			finishStepWith(cerr)
 			return event.TurnInterrupted{TurnIndex: ts.index}
 		}
+		finishStepWith(nil)
 		candidate := turnInferenceRequest(cfg, ts, runtimeTail, outputPlan)
 		directive, measureErr := measureTurnCandidate(ctx, cfg, candidate, runtimeRevision, runtimeTail, true)
 		if measureErr != nil {
@@ -488,7 +571,9 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// every accepted inbox entry (ctx-cancellable), append each to the staged turn
 		// AFTER the tool results, and commit a TurnFoldedInto for it. A no-tool final
 		// answer (handled above) never reaches here, so folding cannot extend a turn
-		// past the model's final answer.
+		// past the model's final answer. The Step scope is already finished above:
+		// fold under the still-active Turn context so a finish callback that releases
+		// its derived Step context cannot cancel or mis-parent TurnFoldedInto.
 		stagedBeforeFold := len(ts.msgs)
 		if ferr := foldPending(ctx, cfg, &ts); ferr != nil {
 			// The drain or a fold commit was cancelled (Interrupt/Shutdown) before it
@@ -572,14 +657,14 @@ func foldPending(ctx context.Context, cfg turnConfig, ts *turnState) error {
 			Messages: cloneMessages(content.AgenticMessages{qi.msg}),
 			Event: event.TurnFoldedInto{
 				Header: event.Header{
-					Coordinates: identity.Coordinates{
+					Coordinates: identitydomain.Coordinates{
 						SessionID: ts.sessionID,
 						LoopID:    ts.loopID,
 						TurnID:    ts.id,
 					},
-					Cause: identity.Cause{
+					Cause: identitydomain.Cause{
 						CommandID:   qi.inputID,
-						Coordinates: identity.Coordinates{LoopID: qi.triggeredBy},
+						Coordinates: identitydomain.Coordinates{LoopID: qi.triggeredBy},
 						Agency:      qi.agency,
 					},
 				},
@@ -658,7 +743,7 @@ func stepDoneEvent(st stepState) event.StepDone {
 	group := cloneMessages(st.msgs)
 	return event.StepDone{
 		Header: event.Header{
-			Coordinates: identity.Coordinates{
+			Coordinates: identitydomain.Coordinates{
 				SessionID: st.sessionID,
 				LoopID:    st.loopID,
 				TurnID:    st.turnID,

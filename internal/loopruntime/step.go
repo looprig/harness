@@ -3,11 +3,15 @@ package loopruntime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hook"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/inference"
 	stream "github.com/looprig/inference/stream"
 )
@@ -38,9 +42,13 @@ const (
 // TokenDeltas. runtimeConfig/dependencies stay at this boundary; stepState owns one
 // step's messages and block state.
 type stepConfig struct {
-	req    inference.Request
-	client inference.Client
-	emit   func(event.Event)
+	req       inference.Request
+	client    inference.Client
+	emit      func(event.Event)
+	hooks     *hook.Runner
+	agentName identity.AgentName
+	cause     identity.Cause
+	now       func() time.Time
 }
 
 // stepResult is the outcome of runStep: the updated step state, an independently
@@ -119,7 +127,57 @@ func newStepState(sessionID, loopID, turnID, stepID uuid.UUID, index StepIndex) 
 // re-encodes cleanly; the raw executable view (state.blocks.ToolUses) keeps the
 // RAW folded Input so RunBatch detects the invalid JSON and reports it as a
 // pre-execution, model-visible tool-result error.
-func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st stepState) stepResult {
+func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st stepState) (result stepResult) {
+	call := hook.Call{
+		Operation: hook.OperationInference,
+		StartedAt: hookNow(cfg.now),
+		Coordinates: identity.Coordinates{
+			SessionID: st.sessionID,
+			LoopID:    st.loopID,
+			TurnID:    st.turnID,
+			StepID:    st.id,
+		},
+		AgentName: cfg.agentName,
+		Cause:     cfg.cause,
+		Inference: &hook.InferenceData{Request: &cfg.req},
+	}
+	if cfg.hooks.Handles(hook.OperationInference) {
+		call = hook.CloneCall(call)
+	}
+	hookCtx, finish, startErr := cfg.hooks.Start(ctx, call)
+	if startErr != nil {
+		st.status = stepFailed
+		finishHook(finish, call, hookOutcome(ctx, startErr), startErr)
+		return stepResult{
+			state: st,
+			terminal: event.TurnFailed{
+				TurnIndex: turnIndex,
+				Err:       safeHookError(hook.OperationInference, startErr),
+			},
+		}
+	}
+	ctx = hookCtx
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicErr := &operationHookPanicError{Operation: hook.OperationInference}
+			finishHook(finish, call, hook.OutcomeFailed, panicErr)
+			st.status = stepFailed
+			result = stepResult{
+				state: st,
+				terminal: event.TurnFailed{
+					TurnIndex: turnIndex,
+					Err: &event.TurnPanicError{
+						Detail: fmt.Sprintf("%v", recovered),
+					},
+				},
+			}
+			return
+		}
+		call.Inference.AIMessage = inferenceResultMessage(result)
+		call.Inference.StreamResult = result.streamResult
+		err := terminalHookError(result.terminal)
+		finishHook(finish, call, hookOutcome(ctx, err), err)
+	}()
 
 	sr, err := cfg.client.Stream(ctx, cfg.req)
 	if err != nil {
@@ -174,6 +232,14 @@ func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st 
 	st.msgs = content.AgenticMessages{aiMsg}
 	st.status = stepDone
 	return stepResult{state: st, streamResult: streamResult, terminal: nil}
+}
+
+func inferenceResultMessage(result stepResult) *content.AIMessage {
+	if len(result.state.msgs) == 0 {
+		return nil
+	}
+	message, _ := result.state.msgs[0].(*content.AIMessage)
+	return message
 }
 
 // terminalStreamResult retains an independently owned snapshot of all

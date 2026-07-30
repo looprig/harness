@@ -8,6 +8,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/inference"
 	contextcount "github.com/looprig/inference/contextcount"
@@ -44,6 +45,7 @@ type compactionExecutionResult struct {
 type compactionExecutionRun struct {
 	result chan compactionExecutionResult
 	cancel context.CancelFunc
+	scope  *compactionHookScope
 }
 
 type compactionExecutor struct {
@@ -122,7 +124,7 @@ func (e *compactionExecutor) CoordinateCompaction(context.Context, compactionDis
 }
 
 func (e *compactionExecutor) CoordinateCompactionCandidate(
-	_ context.Context,
+	ctx context.Context,
 	disposition compactionDisposition,
 	candidate compactionExecutionCandidate,
 ) error {
@@ -131,19 +133,32 @@ func (e *compactionExecutor) CoordinateCompactionCandidate(
 	}
 	attempt := *disposition.Attempt
 	result := make(chan compactionExecutionResult, 1)
-	runCtx, cancel := context.WithCancel(e.ctx)
+	if disposition.hookScope != nil {
+		ctx = disposition.hookScope.ctx
+	}
+	if ctx == nil {
+		ctx = e.ctx
+	}
+	runCtx, cancel := context.WithCancel(ctx)
 	e.mu.Lock()
 	if _, exists := e.runs[attempt.AttemptID]; exists {
 		e.mu.Unlock()
 		cancel()
 		return &compactionExecutorError{Field: "attempt"}
 	}
-	e.runs[attempt.AttemptID] = compactionExecutionRun{result: result, cancel: cancel}
+	e.runs[attempt.AttemptID] = compactionExecutionRun{result: result, cancel: cancel, scope: disposition.hookScope}
 	e.mu.Unlock()
+	if disposition.preRejected != nil {
+		rejected := *disposition.preRejected
+		rejected.Proposal.hookScope = disposition.hookScope
+		result <- compactionExecutionResult{outcome: rejected}
+		return nil
+	}
 	candidate.Request.Messages = cloneMessages(candidate.Request.Messages)
 	candidate.RuntimeTail = cloneUserMessage(candidate.RuntimeTail)
 	candidate.Transcript = cloneMessages(candidate.Transcript)
-	go func() { result <- e.execute(runCtx, attempt, candidate) }()
+	input := cloneCompactionHookInput(disposition.input)
+	go func() { result <- e.execute(runCtx, attempt, candidate, input, disposition.hookScope) }()
 	return nil
 }
 
@@ -166,19 +181,40 @@ func (e *compactionExecutor) AwaitCompaction(ctx context.Context, attemptID even
 		e.mu.Lock()
 		delete(e.runs, attemptID)
 		e.mu.Unlock()
-		return rejectedCompactionResult(event.CompactRejectCanceled), nil
+		rejected := rejectedCompactionResult(event.CompactRejectCanceled)
+		rejected.Proposal.hookScope = run.scope
+		run.scope.sealExecutorTerminal(hook.OutcomeCanceled, context.Canceled, nil)
+		return rejected, nil
 	}
 }
 
-func (e *compactionExecutor) execute(ctx context.Context, attempt compactionAttempt, candidate compactionExecutionCandidate) compactionExecutionResult {
-	input := loop.CompactionInput{
-		Basis: attempt.Basis, Model: candidate.Measurement.Model,
-		RequestFingerprint: candidate.Measurement.RequestFingerprint,
-		Transcript:         cloneMessages(candidate.Transcript), MaxSummaryTokens: e.config.MaxSummaryTokens,
+func (e *compactionExecutor) execute(
+	ctx context.Context,
+	attempt compactionAttempt,
+	candidate compactionExecutionCandidate,
+	input *loop.CompactionInput,
+	scope *compactionHookScope,
+) (completed compactionExecutionResult) {
+	defer func() {
+		if recover() == nil {
+			return
+		}
+		panicErr := &operationHookPanicError{Operation: hook.OperationCompaction}
+		rejected := rejectedCompactionResultWithError(event.CompactRejectInternal, panicErr)
+		rejected.Proposal.hookScope = scope
+		scope.setExecutorTerminal(hook.OutcomeFailed, panicErr, nil)
+		completed = compactionExecutionResult{outcome: rejected}
+	}()
+	if input == nil {
+		input = &loop.CompactionInput{
+			Basis: attempt.Basis, Model: candidate.Measurement.Model,
+			RequestFingerprint: candidate.Measurement.RequestFingerprint,
+			Transcript:         cloneMessages(candidate.Transcript), MaxSummaryTokens: e.config.MaxSummaryTokens,
+		}
 	}
 	var prepared contextCompactionAwaitResult
 	finalized := false
-	err := e.config.Compactor.CompactAndFinalize(ctx, input, func(finalizeCtx context.Context, outcome CompactionOutcome) error {
+	err := e.config.Compactor.CompactAndFinalize(ctx, *input, func(finalizeCtx context.Context, outcome CompactionOutcome) error {
 		finalized = true
 		prepared = e.prepare(finalizeCtx, attempt, candidate, outcome)
 		return nil
@@ -186,7 +222,52 @@ func (e *compactionExecutor) execute(ctx context.Context, attempt compactionAtte
 	if !finalized {
 		prepared = rejectedCompactionResultWithError(compactionRejectReason(err), err)
 	}
+	prepared.Proposal.hookScope = scope
+	setCompactionScopeTerminal(scope, ctx, prepared)
 	return compactionExecutionResult{outcome: prepared}
+}
+
+type compactionOperationError struct {
+	Reason event.CompactRejectReason
+}
+
+func (e *compactionOperationError) Error() string {
+	return "loopruntime: compaction operation rejected"
+}
+
+func setCompactionScopeTerminal(scope *compactionHookScope, ctx context.Context, result contextCompactionAwaitResult) {
+	if scope == nil {
+		return
+	}
+	if result.Disposition == contextCompactionAwaitCommitted && result.Proposal.Success != nil {
+		success := result.Proposal.Success
+		scope.setExecutorTerminal(hook.OutcomeCompleted, nil, &loop.CompactionOutput{
+			Basis: scope.call.Compaction.Input.Basis, Model: success.Model,
+			RequestFingerprint: success.RequestFingerprint, Summary: cloneUserMessage(success.Summary),
+		})
+		return
+	}
+	err := result.ContinuationError
+	if result.Proposal.RejectReason == event.CompactRejectCanceled {
+		if err == nil {
+			err = context.Canceled
+		}
+		scope.setExecutorTerminal(hook.OutcomeCanceled, err, nil)
+		return
+	}
+	if err == nil {
+		err = &compactionOperationError{Reason: result.Proposal.RejectReason}
+	}
+	scope.setExecutorTerminal(hookOutcome(ctx, err), err, nil)
+}
+
+func cloneCompactionHookInput(value *loop.CompactionInput) *loop.CompactionInput {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	cloned.Transcript = cloneMessages(value.Transcript)
+	return &cloned
 }
 
 func (e *compactionExecutor) prepare(

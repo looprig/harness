@@ -1,6 +1,10 @@
 package event
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"testing"
+)
 
 func TestAssessDrift(t *testing.T) {
 	base := testManifest()
@@ -55,6 +59,8 @@ func TestAssessDrift(t *testing.T) {
 			wantCategory: DriftAdapter, wantSeverity: DriftWarn},
 		{name: "runtime skills flip is warn", mutate: func(m *ConfigManifest) { m.RuntimeSkills = false },
 			wantCategory: DriftRuntimeSkills, wantSeverity: DriftWarn},
+		{name: "hook policy change is warn", mutate: func(m *ConfigManifest) { m.HookPolicyRev = "hook-v2" },
+			wantCategory: DriftHookPolicy, wantSeverity: DriftWarn},
 		{name: "app field change is info", mutate: func(m *ConfigManifest) { m.AppFields["a"] = "x" },
 			wantCategory: DriftApp, wantSeverity: DriftInfo},
 	}
@@ -235,6 +241,110 @@ func TestAssessDriftPermissionReviewConfiguredTransitions(t *testing.T) {
 			t.Fatalf("no review_configured change reported: %+v", assessment)
 		}
 	})
+}
+
+func TestAssessDriftLegacyHookPolicyUpgradeFailsSecure(t *testing.T) {
+	t.Parallel()
+	legacy := ManifestFromLegacy(ConfigFingerprint{ToolPolicyRev: hexSHA256Event("")})
+	candidate := legacy
+	candidate.SchemaVersion = ManifestSchemaVersion
+	candidate.HookPolicyRev = "guard-v1"
+
+	assessment := AssessDrift(legacy, candidate)
+	if !assessment.BaselineUpgrade {
+		t.Fatal("BaselineUpgrade = false, want true")
+	}
+	if len(assessment.Changes) != 1 {
+		t.Fatalf("Changes = %+v, want one hook policy change", assessment.Changes)
+	}
+	change := assessment.Changes[0]
+	if change.Category != DriftHookPolicy || change.Severity != DriftWarn {
+		t.Errorf("change = %+v, want hook policy warn", change)
+	}
+}
+
+func TestConfigDriftBudgetCoversDisjointValidManifests(t *testing.T) {
+	t.Parallel()
+	baseline := ConfigManifest{
+		SchemaVersion:             ManifestSchemaVersion,
+		AgentKind:                 "old-kind",
+		TopologyRev:               "old-topology",
+		ModelID:                   "old-model",
+		SystemPromptRev:           "old-prompt",
+		RuntimeSkills:             false,
+		WorkspaceRoot:             "old-root",
+		WorkspaceTrust:            "old-trust",
+		AgentAdapter:              "old-adapter",
+		PermissionPosture:         "old-posture",
+		NativePermissionPolicyRev: "old-permission",
+		PermissionStrictness:      2,
+		ConfinementRev:            "old-confinement",
+		ConfinementStrictness:     2,
+		ExternalCapabilityRev:     "old-external",
+		HookPolicyRev:             "old-hook",
+		Tools:                     make([]ToolManifestEntry, maxConfigManifestTools),
+		AppFields:                 make(map[string]string, maxConfigManifestAppFields),
+	}
+	candidate := ConfigManifest{
+		SchemaVersion:             ManifestSchemaVersion,
+		AgentKind:                 "new-kind",
+		TopologyRev:               "new-topology",
+		ModelID:                   "new-model",
+		SystemPromptRev:           "new-prompt",
+		RuntimeSkills:             true,
+		WorkspaceRoot:             "new-root",
+		WorkspaceTrust:            "new-trust",
+		AgentAdapter:              "new-adapter",
+		PermissionPosture:         "new-posture",
+		NativePermissionPolicyRev: "new-permission",
+		PermissionStrictness:      3,
+		ConfinementRev:            "new-confinement",
+		ConfinementStrictness:     3,
+		ExternalCapabilityRev:     "new-external",
+		HookPolicyRev:             "new-hook",
+		Tools:                     make([]ToolManifestEntry, maxConfigManifestTools),
+		AppFields:                 make(map[string]string, maxConfigManifestAppFields),
+	}
+	for index := range baseline.Tools {
+		baseline.Tools[index].Name = fmt.Sprintf("old-tool-%04d", index)
+		candidate.Tools[index].Name = fmt.Sprintf("new-tool-%04d", index)
+	}
+	for index := 0; index < maxConfigManifestAppFields; index++ {
+		baseline.AppFields[fmt.Sprintf("old-field-%04d", index)] = "old"
+		candidate.AppFields[fmt.Sprintf("new-field-%04d", index)] = "new"
+	}
+
+	assessment := AssessDrift(baseline, candidate)
+	assessment.Changes = append(assessment.Changes, DriftChange{
+		Category: DriftAgentName,
+		Old:      "old-agent",
+		New:      "new-agent",
+		Severity: DriftWarn,
+	})
+	adoption := ConfigurationAdopted{
+		Header:             fullHeaderSession(),
+		Epoch:              2,
+		AdoptedFingerprint: candidate.Fingerprint(),
+		Manifest:           candidate,
+		Drift:              assessment.Changes,
+		Source:             DecisionSourcePolicy,
+	}
+	if err := ValidateEvent(adoption); err != nil {
+		t.Fatalf("maximum valid drift with agent name rejected: %v (changes=%d budget=%d)",
+			err, len(adoption.Drift), maxConfigDriftChanges)
+	}
+
+	adoption.Drift = append(adoption.Drift, DriftChange{
+		Category: DriftAgentName,
+		Old:      "another-old-agent",
+		New:      "another-new-agent",
+		Severity: DriftWarn,
+	})
+	err := ValidateEvent(adoption)
+	var invalid *InvalidEventError
+	if !errors.As(err, &invalid) || invalid.Field != FieldDrift || invalid.Rule != RuleInvalid {
+		t.Fatalf("one-over-limit error = %T %v, want invalid Drift", err, err)
+	}
 }
 
 func TestAssessDriftNoChanges(t *testing.T) {

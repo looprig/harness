@@ -91,6 +91,29 @@ func NewRestoredWithCompactor(
 	compactor Compactor,
 	reviewContext *ReviewContext,
 ) (*Loop, error) {
+	return NewRestoredWithRuntime(
+		loopCtx,
+		sessionID,
+		loopID,
+		parent,
+		events,
+		bound,
+		seed,
+		RuntimeDependencies{Compactor: compactor, ReviewContext: reviewContext},
+	)
+}
+
+// NewRestoredWithRuntime is the restored counterpart to
+// NewInModeWithRuntime.
+func NewRestoredWithRuntime(
+	loopCtx context.Context,
+	sessionID, loopID uuid.UUID,
+	parent loop.Provenance,
+	events eventPublisher,
+	bound loop.BoundDefinition,
+	seed RestoredState,
+	deps RuntimeDependencies,
+) (*Loop, error) {
 	// Resolve config at the RESTORED mode (last LoopModeChanged) rather than the definition's
 	// initial mode, so a loop that changed mode before teardown resumes under it. When the
 	// loop never changed mode, "" resolves to the initial mode (the pre-change behavior).
@@ -115,10 +138,10 @@ func NewRestoredWithCompactor(
 		cfg.Model.Sampling = cfg.Model.Sampling.Clone()
 		cfg.Model.Sampling.Effort = seed.Runtime.Effort
 	}
-	if err := installCompactionExecutor(loopCtx, &cfg, compactor); err != nil {
+	if err := installRuntimeDependencies(loopCtx, &cfg, deps); err != nil {
 		return nil, err
 	}
-	cfg.reviewContext = reviewContext.toInternal()
+	cfg.reviewContext = deps.ReviewContext.toInternal()
 	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, bound, modeName, &seed)
 }
 

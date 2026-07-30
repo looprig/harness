@@ -102,6 +102,78 @@ func TestConfigurationAdoptedFingerprintMismatchRejected(t *testing.T) {
 	}
 }
 
+func TestConfigurationAdoptedRejectsHookPolicyOnV1Manifest(t *testing.T) {
+	t.Parallel()
+	manifest := testManifest()
+	manifest.SchemaVersion = 1
+	manifest.HookPolicyRev = "hidden-guard"
+	ev := ConfigurationAdopted{
+		Header:             fullHeaderSession(),
+		Epoch:              2,
+		AdoptedFingerprint: manifest.Fingerprint(),
+		Manifest:           manifest,
+		Source:             DecisionSourcePolicy,
+	}
+	err := ValidateEvent(ev)
+	var invalid *InvalidEventError
+	if !errors.As(err, &invalid) || invalid.Field != FieldManifest || invalid.Rule != RuleInvalid {
+		t.Fatalf("ValidateEvent error = %T %v, want invalid Manifest", err, err)
+	}
+}
+
+func TestConfigurationAdoptedRejectsUnknownManifestSchema(t *testing.T) {
+	t.Parallel()
+	manifest := testManifest()
+	manifest.SchemaVersion = ManifestSchemaVersion + 1
+	ev := ConfigurationAdopted{
+		Header:             fullHeaderSession(),
+		Epoch:              2,
+		AdoptedFingerprint: manifest.Fingerprint(),
+		Manifest:           manifest,
+		Source:             DecisionSourcePolicy,
+	}
+	err := ValidateEvent(ev)
+	var invalid *InvalidEventError
+	if !errors.As(err, &invalid) || invalid.Field != FieldManifest || invalid.Rule != RuleInvalid {
+		t.Fatalf("ValidateEvent error = %T %v, want invalid Manifest", err, err)
+	}
+}
+
+func TestSessionStartedRejectsInvalidManifestSchemaState(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		manifest ConfigManifest
+	}{
+		{
+			name: "schema v1 cannot carry hook policy",
+			manifest: ConfigManifest{
+				SchemaVersion: 1,
+				HookPolicyRev: "hidden-guard",
+			},
+		},
+		{
+			name: "unknown schema",
+			manifest: ConfigManifest{
+				SchemaVersion: ManifestSchemaVersion + 1,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := ValidateEvent(SessionStarted{
+				Header:   fullHeaderSession(),
+				Manifest: tt.manifest,
+			})
+			var invalid *InvalidEventError
+			if !errors.As(err, &invalid) || invalid.Field != FieldManifest || invalid.Rule != RuleInvalid {
+				t.Fatalf("ValidateEvent error = %T %v, want invalid Manifest", err, err)
+			}
+		})
+	}
+}
+
 // TestConfigurationAdoptedOverLongActorRejected asserts a decoded adoption whose
 // Actor exceeds MaxConfigActorLen is rejected with FieldActor/RuleInvalid. A live
 // decider can't trip this (the restore constructor truncates), but a hand-crafted

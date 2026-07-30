@@ -1,0 +1,39 @@
+{
+  "type": "ConfigurationAdopted",
+  "v": 1,
+  "session_id": "11111111-1111-1111-1111-111111111111",
+  "event_id": "55555555-5555-5555-5555-555555555555",
+  "epoch": 2,
+  "adopted_fingerprint": "6dfa05a68de160225451630245e9d7a3ce5e709f39dd376dfc6708bfd4a6da3e",
+  "manifest": {
+    "schema_version": 1,
+    "agent_kind": "coderig:operator",
+    "topology_rev": "aaaa",
+    "model_id": "claude-fable-5",
+    "system_prompt_rev": "bbbb",
+    "tools": [
+      {
+        "name": "Bash",
+        "input_schema_rev": "cc",
+        "output_schema_rev": "dd"
+      },
+      {
+        "name": "Read",
+        "input_schema_rev": "ee"
+      }
+    ],
+    "runtime_skills": true,
+    "workspace_root": "/repo",
+    "workspace_trust": "trusted",
+    "native_permission_policy_rev": "ffff",
+    "permission_strictness": 3,
+    "confinement_rev": "gggg",
+    "confinement_strictness": 2,
+    "external_capability_rev": "hhhh",
+    "app_fields": {
+      "b": "2",
+      "a": "1"
+    }
+  },
+  "source": "policy"
+}

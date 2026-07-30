@@ -5,6 +5,7 @@ import (
 
 	"github.com/looprig/harness/internal/sessionruntime"
 	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
@@ -25,6 +26,8 @@ type definitionState struct {
 	permissionClassifiers  gate.PermissionClassifierSet
 	permissionReviewPolicy gate.PermissionReviewPolicy
 	permissionReviewLimits PermissionReviewLimits
+	hooks                  hook.Set
+	compiledHooks          *hook.Runner
 	// placements accumulates every workspace placement option. Define enforces at most
 	// one; more than one is a typed rejection.
 	placements     []pendingPlacement
@@ -32,7 +35,10 @@ type definitionState struct {
 }
 
 // Rig is an immutable design-time assembly that creates and restores sessions.
-type Rig struct{ lifecycle *sessionruntime.Lifecycle }
+type Rig struct {
+	lifecycle *sessionruntime.Lifecycle
+	hooks     *hook.Runner
+}
 
 func Define(options ...Option) (*Rig, error) {
 	state := &definitionState{seen: make(map[singletonKey]bool)}
@@ -44,6 +50,11 @@ func Define(options ...Option) (*Rig, error) {
 			return nil, err
 		}
 	}
+	compiledHooks, err := hook.Compile(state.hooks)
+	if err != nil {
+		return nil, &DefinitionError{Kind: DefinitionInvalidHooks, Cause: err}
+	}
+	state.compiledHooks = compiledHooks
 	if !state.storeSet || state.store == nil {
 		return nil, &DefinitionError{Kind: DefinitionMissingSessionStore}
 	}
@@ -168,6 +179,7 @@ func Define(options ...Option) (*Rig, error) {
 		fields, state.loops, state.primers, state.activePrimer,
 		state.hustles, state.hustleLimits, permissionReview,
 	)
+	manifest.HookPolicyRev = state.hooks.PolicyRevision
 	lifecycleOptions := append([]sessionruntime.LifecycleOption(nil), state.lifecycleOptions...)
 	if len(state.hustles) > 0 {
 		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleHustles(
@@ -208,6 +220,7 @@ func Define(options ...Option) (*Rig, error) {
 	}
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleFingerprint(fingerprint))
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleManifest(manifest))
+	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleHooks(state.compiledHooks))
 	primerNames := make([]identity.AgentName, len(state.primers))
 	for i, name := range state.primers {
 		primerNames[i] = identity.AgentName(name)
@@ -216,7 +229,7 @@ func Define(options ...Option) (*Rig, error) {
 	if err != nil {
 		return nil, &DefinitionError{Kind: DefinitionInvalidSessionStore, Cause: err}
 	}
-	return &Rig{lifecycle: lifecycle}, nil
+	return &Rig{lifecycle: lifecycle, hooks: state.compiledHooks}, nil
 }
 
 func resolvePermissionReviewFingerprint(state *definitionState) (*permissionReviewFingerprint, error) {
