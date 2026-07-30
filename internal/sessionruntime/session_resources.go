@@ -30,10 +30,11 @@ const (
 )
 
 var (
-	errSessionResourcesClosing = errors.New("session: resource registry closing")
-	errSessionResourceKeyEmpty = errors.New("session: resource key is empty")
-	errSessionResourceFactory  = errors.New("session: resource factory is nil")
-	errSessionResourceNil      = errors.New("session: resource factory returned nil")
+	errSessionResourcesClosing   = errors.New("session: resource registry closing")
+	errSessionResourcesSuspended = errors.New("session: resource registry admission suspended")
+	errSessionResourceKeyEmpty   = errors.New("session: resource key is empty")
+	errSessionResourceFactory    = errors.New("session: resource factory is nil")
+	errSessionResourceNil        = errors.New("session: resource factory returned nil")
 )
 
 // SessionResourceStorageErrorKind classifies fail-closed durable root and
@@ -432,6 +433,12 @@ type sessionResources struct {
 	activateDone     chan struct{}
 	activateErr      error
 
+	// suspended is the TEMPORARY, resumable admission gate a live workspace
+	// rewind (workspace_restore.go's RestoreWorkspace) holds for the duration of
+	// the rewind — distinct from closing, which is the terminal, once-only
+	// Shutdown latch. See suspendAdmission/resumeAdmission.
+	suspended bool
+
 	closing         bool
 	shutdownStarted bool
 	shutdownDone    chan struct{}
@@ -513,6 +520,10 @@ func (r *sessionResources) GetOrCreate(
 		if r.closing {
 			r.mu.Unlock()
 			return nil, errSessionResourcesClosing
+		}
+		if r.suspended {
+			r.mu.Unlock()
+			return nil, errSessionResourcesSuspended
 		}
 		if r.activateErr != nil {
 			err := r.activateErr
@@ -840,6 +851,37 @@ func (r *sessionResources) Shutdown(ctx context.Context) error {
 	close(r.shutdownDone)
 	r.mu.Unlock()
 	return result
+}
+
+// suspendAdmission is workspace_restore.go's seam for a manual workspace
+// rewind: it TEMPORARILY blocks new GetOrCreate admissions without touching
+// any already-admitted resource and without latching the registry's terminal
+// closing/shutdownStarted state — unlike Shutdown, it never calls a resource's
+// own Shutdown. A registered SessionResource is a long-lived, per-definition
+// supervisor (often shared by several tool definitions), not a one-shot
+// handle for a single running process, so tearing it down here would destroy
+// state a later GetOrCreate under the SAME key needs and would double-count
+// against the ONE Shutdown call a resource's whole-session lifecycle
+// contract expects. Stopping an already-admitted resource's live
+// process—and thereby releasing the workspace lifetime lease that resource
+// holds—remains the existing cooperative contract: the caller either waits
+// (the checkpoint permit below already only proceeds once every writable
+// lifetime lease is released by its holder) or the resource is stopped
+// through its own ordinary tool-level path before requesting the rewind.
+func (r *sessionResources) suspendAdmission() {
+	r.mu.Lock()
+	r.suspended = true
+	r.mu.Unlock()
+}
+
+// resumeAdmission lifts a prior suspendAdmission so a later GetOrCreate
+// resumes building resources normally. It is idempotent and safe to call
+// even after the registry's terminal Shutdown has started (closing stays
+// authoritative over suspended in GetOrCreate's admission check).
+func (r *sessionResources) resumeAdmission() {
+	r.mu.Lock()
+	r.suspended = false
+	r.mu.Unlock()
 }
 
 func (r *sessionResources) snapshotLocked() []*sessionResourceEntry {

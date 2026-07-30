@@ -1907,6 +1907,14 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		hubOpts = append(hubOpts, hub.WithAppender(s.injectedEventAppender))
 	}
 	s.hub = hub.New(id, hubOpts...)
+	// Attach the checked process-service delegates now that the hub exists, so any
+	// process resource this session activates below (via the prepared loops' Bind,
+	// which may bind a ProcessBinding over s.resources) observes the checked publish
+	// path from its very first call — never the bridge's pre-attachment stub. See
+	// activateProcessServiceBridge's doc for the ordering contract this preserves.
+	if err := s.activateProcessServiceBridge(); err != nil {
+		return abort(err)
+	}
 	if err := s.bindSessionHustles(); err != nil {
 		return abort(err)
 	}
@@ -2461,6 +2469,35 @@ func (s *Session) newWorkspaceBinding() *tool.WorkspaceBinding {
 	return &tool.WorkspaceBinding{Root: s.wsRoot, Coordinator: s.wsCoordinator, Observations: tool.NewWorkspaceObservations()}
 }
 
+// activateProcessServiceBridge attaches Task 24B's checked durable lifecycle
+// publisher and this Session's own Task 24C completion notifier
+// (NotifyProcessCompletion) behind the session's process-service bridge
+// (process_services.go). It is nil-safe: a session with no process-enabled
+// loop never resolved a resources registry, so this is then a no-op.
+//
+// It MUST be called after s.hub exists (the checked publisher publishes
+// through it) and BEFORE the resources registry's one-time Activate runs: a
+// process resource that decides during its own Activate to publish a
+// lifecycle record (for example marking a manifest it cannot otherwise
+// confirm as lost) must observe the checked path immediately, never the
+// bridge's pre-attachment "services unavailable" stub. The live construction
+// path (newSessionTopology) calls this right after building the hub; the
+// restore path (restoreTopologySession) calls it after buildRestoredSession
+// returns and before resources.Activate — both strictly before the session
+// (or restore) is reachable/committed.
+func (s *Session) activateProcessServiceBridge() error {
+	if s.resources == nil {
+		return nil
+	}
+	publisher, err := newCheckedProcessLifecyclePublisher(s.sessionID, s.hub, s.now)
+	if err != nil {
+		return err
+	}
+	s.resources.processServiceBridge.attachProcessLifecyclePublisher(publisher)
+	s.resources.processServiceBridge.attachProcessCompletionNotifier(s)
+	return nil
+}
+
 // shutdownTarget pairs a loop with the Ack channel of the command.Shutdown the
 // session sent it, so the ack-wait phase can drain each loop's reply in turn. It
 // is Shutdown-internal: the send phase records one per loop actually reached, and
@@ -2561,9 +2598,13 @@ func (s *Session) shutdown() error {
 	// component therefore cannot suppress checkpoint, durable-stop, or lease cleanup.
 	s.stopOffloadGC()
 	failures = append(failures, s.stopCheckpoints(shutdownRoot, timeouts.checkpoint))
-	if s.resources != nil {
-		failures = append(failures, s.resources.Shutdown(shutdownRoot))
-	}
+	// Session resources (including the process registry) must fully terminate and
+	// confirm before the hub stops and the leases/session context release: their own
+	// Shutdown is where a live supervised process is actually stopped and its final
+	// lifecycle/completion record durably published, and that publication still needs
+	// a live hub to reach durably (see stopHub below, which only runs after this
+	// returns).
+	failures = append(failures, s.stopSessionResources(shutdownRoot, timeouts.sessionResources))
 	failures = append(failures, s.stopHub(shutdownRoot, timeouts.hub))
 	s.releaseRootLease(shutdownRoot)
 	s.releaseLease(shutdownRoot)

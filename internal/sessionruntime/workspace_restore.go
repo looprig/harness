@@ -42,6 +42,20 @@ func (s *Session) RestoreWorkspace(ctx context.Context, ref workspacestore.Ref) 
 	if err := s.restoreAdmissible(); err != nil {
 		return err
 	}
+	// Suspend NEW process admission before requesting the exclusive checkpoint
+	// permit below, so nothing starts a fresh background process against a
+	// workspace that is about to be swapped out from under it. resumeAdmission runs
+	// on EVERY return path (the defer below): a failed or successful rewind must
+	// never strand the registry suspended. This does not force-stop an already
+	// admitted resource's live process — a registered SessionResource is a
+	// long-lived supervisor the checked publication path and the session's own
+	// Shutdown already own tearing down exactly once (session_resources.go); an
+	// already-running writable lifetime lease still drains the existing cooperative
+	// way, through the permit acquisition immediately below.
+	if s.resources != nil {
+		s.resources.suspendAdmission()
+		defer s.resources.resumeAdmission()
+	}
 	// Exclusive restore permit: drains active managed mutations and writable
 	// background-process lifetime leases, then blocks new ones, so the swap sees no
 	// cooperative writer. Read-only lifetime leases remain compatible with the

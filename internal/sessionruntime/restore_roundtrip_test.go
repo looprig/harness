@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -1084,5 +1085,253 @@ func TestRestoreRecountsSpawnQuota(t *testing.T) {
 	var se *SessionError
 	if !errors.As(err, &se) || se.Kind != SessionLoopQuotaExceeded {
 		t.Fatalf("spawn past restored quota err = %v, want *SessionError{SessionLoopQuotaExceeded}", err)
+	}
+}
+
+// --- Task 25: process-service bridge activation + orphaned-process reconciliation ----
+
+// bridgeProbeResource captures the SessionID/LoopID it was created with (from
+// the binding that requested it) and, on Activate, tries to durably publish a
+// process lifecycle record through the services it is handed — reporting
+// whether that publish actually reached a checked delegate (nil) or was still
+// refused as unavailable (the bridge's pre-attachment stub). It is used on
+// both the live-construction and the restore path to prove the bridge is
+// attached before either commits.
+type bridgeProbeResource struct {
+	published         chan error
+	sessionID, loopID uuid.UUID
+}
+
+func (r *bridgeProbeResource) Activate(ctx context.Context, services tool.SessionResourceServices) error {
+	eventID, _ := uuid.New()
+	originID, _ := uuid.New()
+	meta := validLifecycleMetadata(tool.ProcessLifecycleStarted, r.sessionID, r.loopID, originID, eventID)
+	meta.ProcessHandle = "bridge-probe-handle"
+	r.published <- services.ProcessLifecyclePublisher().PublishProcessLifecycle(ctx, meta)
+	return nil
+}
+
+func (r *bridgeProbeResource) Shutdown(context.Context) error { return nil }
+
+// TestProcessRestoreActivatesBridgeBeforeRestoreDone proves the checked
+// process-service delegates (Task 24B's lifecycle publisher, Task 24C's
+// completion notifier) are attached behind the session's process-service
+// bridge BEFORE the resources registry's Activate runs — on BOTH the live
+// construction path and the restore path, and therefore strictly before
+// RestoreDone is ever appended (Activate always precedes RestoreDone in
+// restoreTopologySession). A resource whose Activate observes the bridge
+// still in its pre-attachment "services unavailable" state would report a
+// non-nil error here; this asserts nil on both passes.
+func TestProcessRestoreActivatesBridgeBeforeRestoreDone(t *testing.T) {
+	t.Parallel()
+	published := make(chan error, 1)
+	definition := processResourceDefinition(t, loop.EngineNative, func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+		_, err := bindings.Process.Registry.GetOrCreate(ctx, "bridge-probe", func(string) (tool.SessionResource, error) {
+			return &bridgeProbeResource{published: published, sessionID: bindings.SessionID, loopID: bindings.LoopID}, nil
+		})
+		return nil, err
+	})
+	store := newRestoreStore(t)
+	resourceRoot := t.TempDir()
+	storageResolver := WithLifecycleSessionResourceStorage(func(context.Context, uuid.UUID) (string, string, error) {
+		return resourceRoot, "bridge-probe-owner", nil
+	})
+	lifecycle, err := newTestLifecycle(definition, store, storageResolver)
+	if err != nil {
+		t.Fatalf("NewTopologyLifecycle: %v", err)
+	}
+
+	live, err := lifecycle.NewSession(context.Background(), "")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	select {
+	case err := <-published:
+		if err != nil {
+			t.Fatalf("live construction PublishProcessLifecycle() error = %v, want nil (bridge must be attached before Activate)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("live construction never activated the process resource")
+	}
+	sessionID := live.SessionID()
+	if err := live.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	restored, err := lifecycle.RestoreSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("RestoreSession: %v", err)
+	}
+	t.Cleanup(func() { _ = restored.Shutdown(context.Background()) })
+	select {
+	case err := <-published:
+		if err != nil {
+			t.Fatalf("restore PublishProcessLifecycle() error = %v, want nil (bridge must be attached before RestoreDone)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("restore never activated the process resource")
+	}
+}
+
+// TestProcessRestoreOrphanedLifecyclesAreUnterminated proves the pure fold
+// orphanedProcessLifecycles reports exactly the (LoopID, ProcessHandle) pairs
+// whose durable lifecycle record sequence never reached a terminal kind
+// (Completed or Lost) — a still-Started/Backgrounded process, and one whose
+// only later record is a StopRequested (never confirmed) — while a properly
+// completed process is excluded.
+func TestProcessRestoreOrphanedLifecyclesAreUnterminated(t *testing.T) {
+	t.Parallel()
+	sessionID := mustSessionID(t)
+	loopID := mustSessionID(t)
+	originID := mustSessionID(t)
+	eventID := mustSessionID(t)
+
+	withHandle := func(kind tool.ProcessLifecycleKind, handle string) tool.ProcessLifecycleMetadata {
+		m := validLifecycleMetadata(kind, sessionID, loopID, originID, eventID)
+		m.ProcessHandle = handle
+		return m
+	}
+
+	events := []event.Event{
+		event.ProcessStarted{Process: withHandle(tool.ProcessLifecycleStarted, "orphan-running")},
+		event.ProcessStarted{Process: withHandle(tool.ProcessLifecycleStarted, "completed-ok")},
+		event.ProcessCompleted{Process: withHandle(tool.ProcessLifecycleCompleted, "completed-ok")},
+		event.ProcessBackgrounded{Process: withHandle(tool.ProcessLifecycleBackgrounded, "orphan-stop-requested")},
+		event.ProcessStopRequested{Process: withHandle(tool.ProcessLifecycleStopRequested, "orphan-stop-requested")},
+	}
+
+	orphans := orphanedProcessLifecycles(events)
+	if len(orphans) != 2 {
+		t.Fatalf("orphanedProcessLifecycles() = %d orphans, want 2: %+v", len(orphans), orphans)
+	}
+	got := make(map[string]bool, len(orphans))
+	for _, o := range orphans {
+		got[o.ProcessHandle] = true
+	}
+	if !got["orphan-running"] || !got["orphan-stop-requested"] {
+		t.Fatalf("orphaned handles = %v, want orphan-running and orphan-stop-requested", got)
+	}
+	if got["completed-ok"] {
+		t.Fatal("a terminated (Completed) process was reported orphaned")
+	}
+}
+
+// capturingLifecyclePublisher is a tool.ProcessLifecyclePublisher test double
+// that records every call it receives, standing in for the checked publisher
+// behind the session's process-service bridge.
+type capturingLifecyclePublisher struct {
+	mu  sync.Mutex
+	got []tool.ProcessLifecycleMetadata
+}
+
+func (p *capturingLifecyclePublisher) PublishProcessLifecycle(_ context.Context, m tool.ProcessLifecycleMetadata) error {
+	p.mu.Lock()
+	p.got = append(p.got, m)
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *capturingLifecyclePublisher) snapshot() []tool.ProcessLifecycleMetadata {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]tool.ProcessLifecycleMetadata(nil), p.got...)
+}
+
+// TestProcessRestorePublishesOrphanedLifecyclesAsLostWithoutOSMetadata proves
+// publishOrphanedProcessLifecycles marks an orphan lost using Task 4's closed
+// ProcessLifecycleLost/ProcessLifecycleLostOnRestore/ProcessTerminalLostOnRestore
+// triple, mints a FRESH EventID (never reusing the orphan's original Started
+// EventID), preserves every other identity field byte-for-byte, carries no
+// exit code, and — critically — reaches the durable log through the SAME
+// checked publication path (the already-attached bridge), never a separate,
+// unchecked write. tool.ProcessLifecycleMetadata carries no OS process
+// identifier at all, so there is no such field to (mis)carry forward either.
+func TestProcessRestorePublishesOrphanedLifecyclesAsLostWithoutOSMetadata(t *testing.T) {
+	t.Parallel()
+	sessionID := mustSessionID(t)
+	loopID := mustSessionID(t)
+	originID := mustSessionID(t)
+	eventID := mustSessionID(t)
+	orphan := validLifecycleMetadata(tool.ProcessLifecycleStarted, sessionID, loopID, originID, eventID)
+	orphan.ProcessHandle = "lost-handle"
+
+	resources := newSessionResources(t.TempDir())
+	capture := &capturingLifecyclePublisher{}
+	resources.processServiceBridge.attachProcessLifecyclePublisher(capture)
+
+	finishTime := orphan.ProcessStartedAt.Add(time.Hour)
+	s := &Session{
+		sessionID: sessionID,
+		resources: resources,
+		newID:     uuid.New,
+		now:       func() time.Time { return finishTime },
+	}
+
+	if err := publishOrphanedProcessLifecycles(context.Background(), s, []tool.ProcessLifecycleMetadata{orphan}); err != nil {
+		t.Fatalf("publishOrphanedProcessLifecycles() error = %v", err)
+	}
+
+	got := capture.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("published = %d records, want 1", len(got))
+	}
+	lost := got[0]
+	if lost.Kind != tool.ProcessLifecycleLost || lost.State != tool.ProcessLifecycleLostOnRestore || lost.Reason != tool.ProcessTerminalLostOnRestore {
+		t.Fatalf("lost record = %+v, want Kind=ProcessLifecycleLost State=ProcessLifecycleLostOnRestore Reason=ProcessTerminalLostOnRestore", lost)
+	}
+	if lost.EventID.IsZero() || lost.EventID == orphan.EventID {
+		t.Fatalf("lost.EventID = %v, want a FRESH non-zero id distinct from the orphan's original %v", lost.EventID, orphan.EventID)
+	}
+	if lost.ProcessHandle != orphan.ProcessHandle || lost.SessionID != orphan.SessionID ||
+		lost.LoopID != orphan.LoopID || lost.OriginExecutionID != orphan.OriginExecutionID {
+		t.Fatalf("lost record identity fields drifted from the orphan: got %+v, orphan %+v", lost, orphan)
+	}
+	if !lost.ProcessFinishedAt.Equal(finishTime) {
+		t.Fatalf("lost.ProcessFinishedAt = %v, want the restore clock's %v", lost.ProcessFinishedAt, finishTime)
+	}
+	if lost.HasExitCode || lost.ExitCode != 0 {
+		t.Fatal("lost record carries an exit code, want none")
+	}
+	if err := lost.Validate(); err != nil {
+		t.Fatalf("synthesized lost record fails its own DTO validation: %v", err)
+	}
+}
+
+// TestProcessRestoreDuplicateDoesNotNotifyTwice proves
+// undeliveredProcessNotifications — the fold Task 24C built and restore reuses
+// unchanged — never re-surfaces a notification a prior restore/live run
+// already caused a later event to consume: a notification is pending on the
+// first pass (nothing has consumed it yet) and absent on a second pass once
+// some later event carries its CommandID as Cause, exactly what a restarted
+// (duplicate) restore over the same durable log would see.
+func TestProcessRestoreDuplicateDoesNotNotifyTwice(t *testing.T) {
+	t.Parallel()
+	sessionID := mustSessionID(t)
+	loopID := mustSessionID(t)
+	cmdID := mustSessionID(t)
+
+	notification := command.ProcessNotification{
+		Header: command.Header{CommandID: cmdID},
+		Notification: tool.ProcessCompletionNotification{
+			CommandID: cmdID, SessionID: sessionID, LoopID: loopID,
+			ProcessHandle: "h", State: tool.ProcessLifecycleExited, Reason: tool.ProcessTerminalExited,
+		},
+	}
+	records := []journal.JournalRecord{journal.NewCommandRecord(sessionID, loopID, notification)}
+
+	firstPass := undeliveredProcessNotifications(records, loopID, causedCommandIDs(nil))
+	if len(firstPass) != 1 || firstPass[0].CommandID != cmdID {
+		t.Fatalf("first restore pending = %+v, want exactly the one notification", firstPass)
+	}
+
+	// A later durable event whose Cause.CommandID is the notification's CommandID —
+	// exactly what causedCommandIDs folds over the loop's own committed event sequence
+	// once it has consumed the notification.
+	caused := []event.Event{
+		event.StepDone{Header: event.Header{Cause: identity.Cause{CommandID: cmdID}}},
+	}
+	secondPass := undeliveredProcessNotifications(records, loopID, causedCommandIDs(caused))
+	if len(secondPass) != 0 {
+		t.Fatalf("duplicate restore re-surfaced an already-consumed notification: %+v", secondPass)
 	}
 }

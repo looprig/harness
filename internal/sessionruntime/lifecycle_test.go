@@ -15,6 +15,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // errFakeAcquire is the leaf error a recordingLeaser returns when told to fail Acquire,
@@ -499,4 +500,161 @@ func TestLifecycleOffloadGCWired(t *testing.T) {
 			t.Fatal("NewSession armed an offload GC runner without WithLifecycleOffloadGC")
 		}
 	})
+}
+
+// newProcessShutdownSession builds a process-enabled live session whose single
+// registered session resource is the caller-supplied testSessionResource — the
+// seam Task 25's shutdown-ordering tests drive to observe exactly when the
+// session resource registry (including the process it supervises) tears down
+// relative to hub publication, other resources, and leases.
+func newProcessShutdownSession(t *testing.T, resource *testSessionResource) *Session {
+	t.Helper()
+	definition := processResourceDefinition(t, loop.EngineNative, func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+		if _, err := bindings.Process.Registry.GetOrCreate(ctx, "process-shutdown", func(string) (tool.SessionResource, error) {
+			return resource, nil
+		}); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	})
+	store := newRestoreStore(t)
+	lifecycle, err := newTestLifecycle(definition, store, WithLifecycleSessionResourceStorage(
+		func(context.Context, uuid.UUID) (string, string, error) {
+			return t.TempDir(), "process-shutdown-owner", nil
+		},
+	))
+	if err != nil {
+		t.Fatalf("NewTopologyLifecycle: %v", err)
+	}
+	s, err := lifecycle.NewSession(context.Background(), "")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	return s
+}
+
+// TestProcessShutdownAdmissionClosesWhileHubPublicationStillWorks proves the
+// two halves of the shutdown-latch requirement together: once Shutdown reaches
+// the session-resources cleanup phase, NEW process admission is refused
+// (errSessionResourcesClosing), while the hub — stopped only in the LATER
+// phase stopSessionResources precedes — still accepts a live subscriber. The
+// session resource's own Shutdown is held open (shutdownWait) so the test can
+// observe this exact mid-teardown window deterministically.
+func TestProcessShutdownAdmissionClosesWhileHubPublicationStillWorks(t *testing.T) {
+	t.Parallel()
+	resource := &testSessionResource{shutdownStart: make(chan struct{}), shutdownWait: make(chan struct{})}
+	s := newProcessShutdownSession(t, resource)
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- s.Shutdown(context.Background()) }()
+
+	select {
+	case <-resource.shutdownStart:
+	case <-time.After(5 * time.Second):
+		close(resource.shutdownWait)
+		t.Fatal("session resource Shutdown was never entered")
+	}
+
+	if _, err := s.resources.GetOrCreate(context.Background(), "admitted-during-shutdown", func(string) (tool.SessionResource, error) {
+		t.Fatal("factory called for admission requested mid-shutdown")
+		return nil, nil
+	}); !errors.Is(err, errSessionResourcesClosing) {
+		close(resource.shutdownWait)
+		t.Fatalf("GetOrCreate during shutdown error = %v, want errSessionResourcesClosing", err)
+	}
+
+	sub, err := s.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
+	if err != nil {
+		close(resource.shutdownWait)
+		t.Fatalf("SubscribeEvents mid-shutdown error = %v, want the hub still accepting subscribers", err)
+	}
+	_ = sub.Close()
+
+	close(resource.shutdownWait)
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown did not complete after the held resource Shutdown released")
+	}
+	if got := resource.shutdownCalls.Load(); got != 1 {
+		t.Fatalf("resource Shutdown calls = %d, want 1", got)
+	}
+}
+
+// TestProcessShutdownResourcesTerminateBeforeHubAndLeases proves the exact
+// teardown order Shutdown documents: the session resource registry (including
+// its supervised process) fully terminates and confirms BEFORE the hub stops
+// and BEFORE the session lease releases. The resource's shutdown hook checks,
+// from inside its own Shutdown call, that neither has happened yet.
+func TestProcessShutdownResourcesTerminateBeforeHubAndLeases(t *testing.T) {
+	t.Parallel()
+	resource := &testSessionResource{}
+	s := newProcessShutdownSession(t, resource)
+
+	sub, err := s.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
+	if err != nil {
+		t.Fatalf("SubscribeEvents: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Close() })
+
+	var order []string
+	var orderMu sync.Mutex
+	resource.shutdownHook = func() {
+		select {
+		case _, ok := <-sub.Events():
+			if !ok {
+				orderMu.Lock()
+				order = append(order, "hub-stopped-before-resources")
+				orderMu.Unlock()
+			}
+		default:
+		}
+		orderMu.Lock()
+		order = append(order, "resources")
+		orderMu.Unlock()
+	}
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	orderMu.Lock()
+	defer orderMu.Unlock()
+	if len(order) != 1 || order[0] != "resources" {
+		t.Fatalf("teardown order observed from inside the resource's own Shutdown = %v, want [resources] (hub must still be open and leases must not have released yet)", order)
+	}
+}
+
+// TestProcessShutdownConcurrentCallersShareResult proves multiple concurrent
+// Shutdown callers on a process-enabled session join ONE teardown owner: the
+// session resource registry's single held resource is shut down exactly once,
+// not once per caller, and every caller observes the same (nil) result.
+func TestProcessShutdownConcurrentCallersShareResult(t *testing.T) {
+	t.Parallel()
+	resource := &testSessionResource{}
+	s := newProcessShutdownSession(t, resource)
+
+	const callers = 8
+	results := make(chan error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- s.Shutdown(context.Background())
+		}()
+	}
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Errorf("concurrent Shutdown() error = %v, want nil", err)
+		}
+	}
+	if got := resource.shutdownCalls.Load(); got != 1 {
+		t.Fatalf("resource Shutdown calls across %d concurrent Shutdown() callers = %d, want 1 (single teardown owner)", callers, got)
+	}
 }

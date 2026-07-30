@@ -1,10 +1,19 @@
 package sessionruntime
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hub"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/harness/pkg/workspacestore"
+	"github.com/looprig/storage/memstore"
 )
 
 func TestWithinRoot(t *testing.T) {
@@ -174,4 +183,114 @@ func readFileT(t *testing.T, path string) string {
 		t.Fatalf("ReadFile %s: %v", path, err)
 	}
 	return string(b)
+}
+
+// TestWorkspaceRestoreProcessAdmissionSuspendedBlocksGetOrCreate proves the
+// registry-level primitive RestoreWorkspace relies on: suspendAdmission
+// TEMPORARILY refuses new GetOrCreate calls (distinct from Shutdown's
+// terminal, once-only closing latch) without ever calling an already-admitted
+// resource's own Shutdown, and resumeAdmission lifts it so a later
+// GetOrCreate resumes building resources normally.
+func TestWorkspaceRestoreProcessAdmissionSuspendedBlocksGetOrCreate(t *testing.T) {
+	t.Parallel()
+	resources := newSessionResources(t.TempDir())
+
+	resources.suspendAdmission()
+	if _, err := resources.GetOrCreate(context.Background(), "k", func(string) (tool.SessionResource, error) {
+		t.Fatal("factory called while admission is suspended")
+		return nil, nil
+	}); !errors.Is(err, errSessionResourcesSuspended) {
+		t.Fatalf("GetOrCreate while suspended error = %v, want errSessionResourcesSuspended", err)
+	}
+
+	resources.resumeAdmission()
+	resource := &testSessionResource{}
+	got, err := resources.GetOrCreate(context.Background(), "k", func(string) (tool.SessionResource, error) {
+		return resource, nil
+	})
+	if err != nil {
+		t.Fatalf("GetOrCreate after resumeAdmission error = %v, want nil", err)
+	}
+	if got != resource {
+		t.Fatalf("GetOrCreate after resumeAdmission returned %v, want the registered resource", got)
+	}
+}
+
+// leaseHealthFunc adapts a plain func into a LeaseHealth, letting a test force
+// RestoreWorkspace's post-permit health check to fail deterministically.
+type leaseHealthFunc func() error
+
+func (f leaseHealthFunc) Healthy() error { return f() }
+
+// TestWorkspaceRestoreProcessAdmissionResumesOnAllPaths proves
+// RestoreWorkspace resumes process admission on EVERY return path — both the
+// happy path and an error path reached after the exclusive permit is already
+// held (a lease-health failure) — never stranding the registry suspended.
+func TestWorkspaceRestoreProcessAdmissionResumesOnAllPaths(t *testing.T) {
+	t.Parallel()
+	sid, _ := uuid.New()
+
+	blobs := memstore.New().Blobs
+	ws, err := workspacestore.Open(blobs)
+	if err != nil {
+		t.Fatalf("workspacestore.Open: %v", err)
+	}
+	source := t.TempDir()
+	mustWriteFile(t, filepath.Join(source, "a.txt"), "a")
+	ref, err := ws.Snapshot(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		unhealthy bool
+	}{
+		{name: "success path resumes admission"},
+		{name: "post-permit error path resumes admission", unhealthy: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var coordinator *workspaceCoordinator
+			if tt.unhealthy {
+				coordinator = newWorkspaceCoordinator(leaseHealthFunc(func() error { return errors.New("lease unhealthy") }))
+			} else {
+				coordinator = newWorkspaceCoordinator(nil)
+			}
+			resources := newSessionResources(t.TempDir())
+			s := &Session{
+				sessionID:     sid,
+				sessionCtx:    ctx,
+				sessionCancel: cancel,
+				factory:       event.NewFactory(uuid.New, time.Now),
+				hub:           hub.New(sid),
+				ws:            ws, wsRoot: t.TempDir(), wsMode: PlacementSession,
+				wsCoordinator: coordinator,
+				resources:     resources,
+			}
+
+			err := s.RestoreWorkspace(context.Background(), ref)
+			if tt.unhealthy {
+				var target *WorkspaceRestoreError
+				if !errors.As(err, &target) || target.Kind != WorkspaceRestoreLeaseUnhealthy {
+					t.Fatalf("RestoreWorkspace() error = %v, want a *WorkspaceRestoreError{Kind: WorkspaceRestoreLeaseUnhealthy}", err)
+				}
+			} else if err != nil {
+				t.Fatalf("RestoreWorkspace() error = %v, want nil", err)
+			}
+
+			// Admission must be resumed regardless of outcome: a subsequent GetOrCreate
+			// must not be refused with errSessionResourcesSuspended.
+			resource := &testSessionResource{}
+			if _, err := resources.GetOrCreate(context.Background(), "after-restore", func(string) (tool.SessionResource, error) {
+				return resource, nil
+			}); err != nil {
+				t.Fatalf("GetOrCreate after RestoreWorkspace error = %v, want nil (admission must resume on every path)", err)
+			}
+		})
+	}
 }

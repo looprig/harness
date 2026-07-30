@@ -613,8 +613,29 @@ func restoreTopologySession(
 		return abortAccepted(s, &RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
 	if resources != nil {
+		// Attach the checked process-service delegates BEFORE Activate: a process
+		// resource's own Activate may need to durably publish a lifecycle record
+		// (for example, Task 4's ProcessLifecycleLostOnRestore for a manifest it
+		// cannot otherwise confirm), and it must observe the checked path on its
+		// very first call, never the bridge's pre-attachment "services unavailable"
+		// stub. See activateProcessServiceBridge's doc for the full contract.
+		if err := s.activateProcessServiceBridge(); err != nil {
+			return abortAccepted(s, &RestoreError{Kind: RestoreLoopFailed, Cause: err})
+		}
 		if err := resources.Activate(ctx); err != nil {
 			return abortAccepted(s, &RestoreError{Kind: RestoreLoopFailed, Cause: err})
+		}
+		// Harness's OWN durable trail (never Tools' on-disk manifest, and never an OS
+		// process identifier — tool.ProcessLifecycleMetadata carries none) is the only
+		// record the session itself can consult for "was a process running when we
+		// crashed, with no way to confirm its actual fate". Any (LoopID, ProcessHandle)
+		// whose last known lifecycle record never reached a terminal (Completed/Lost)
+		// is marked lost here, through the SAME checked publication path Task 24B/24C
+		// built (the bridge just attached above) — never a separate, unchecked write —
+		// mirroring the crash-seam TurnInterrupted closure above, but for process
+		// lifecycles instead of turns.
+		if err := publishOrphanedProcessLifecycles(ctx, s, orphanedProcessLifecycles(all)); err != nil {
+			return abortAccepted(s, &RestoreError{Kind: RestoreAppendFailed, Cause: err})
 		}
 	}
 	// RestoreDone is the commit point: every loop is bound, crash-closed, built,
@@ -1328,6 +1349,98 @@ func withRestoreHeader(ev event.Event, hdr event.Header) event.Event {
 	default:
 		panic("session: withRestoreHeader called on a non-restore event type")
 	}
+}
+
+// processLifecycleKey identifies one supervised process across its durable
+// lifecycle record sequence: the loop that owns it plus its opaque,
+// non-OS-identifying handle (tool.ProcessLifecycleMetadata never carries an OS
+// process identifier — see Task 4's DTO shape).
+type processLifecycleKey struct {
+	loopID uuid.UUID
+	handle string
+}
+
+// orphanedProcessLifecycles scans the full unnarrowed restore replay (every
+// loop's events) and returns the last-known tool.ProcessLifecycleMetadata for
+// every (LoopID, ProcessHandle) whose durable record sequence never reached a
+// terminal kind (ProcessLifecycleCompleted or ProcessLifecycleLost) — a
+// process that, per Harness's OWN durable trail, was still Started,
+// Backgrounded, or had only a StopRequested recorded when the session
+// crashed, with no way to confirm what actually happened to it afterward.
+// Order is first-seen (stream order), so a caller that publishes one
+// synthesized ProcessLost per orphan does so deterministically.
+//
+// This is a pure fold over already-durable Harness events; it never reads an
+// OS-level manifest and never touches an OS process identifier (there is none
+// on the DTO to misuse).
+func orphanedProcessLifecycles(events []event.Event) []tool.ProcessLifecycleMetadata {
+	last := make(map[processLifecycleKey]tool.ProcessLifecycleMetadata)
+	terminal := make(map[processLifecycleKey]bool)
+	order := make([]processLifecycleKey, 0)
+	for _, ev := range events {
+		var metadata tool.ProcessLifecycleMetadata
+		switch typed := ev.(type) {
+		case event.ProcessStarted:
+			metadata = typed.Process
+		case event.ProcessBackgrounded:
+			metadata = typed.Process
+		case event.ProcessStopRequested:
+			metadata = typed.Process
+		case event.ProcessCompleted:
+			metadata = typed.Process
+		case event.ProcessLost:
+			metadata = typed.Process
+		default:
+			continue
+		}
+		key := processLifecycleKey{loopID: metadata.LoopID, handle: metadata.ProcessHandle}
+		if _, seen := last[key]; !seen {
+			order = append(order, key)
+		}
+		last[key] = metadata
+		terminal[key] = metadata.Kind == tool.ProcessLifecycleCompleted || metadata.Kind == tool.ProcessLifecycleLost
+	}
+	orphans := make([]tool.ProcessLifecycleMetadata, 0, len(order))
+	for _, key := range order {
+		if !terminal[key] {
+			orphans = append(orphans, last[key])
+		}
+	}
+	return orphans
+}
+
+// publishOrphanedProcessLifecycles durably marks every orphan (see
+// orphanedProcessLifecycles) lost, through the session's already-attached
+// checked process-service bridge — the SAME idempotent publication path
+// Task 24B's live lifecycle events and Task 24C's completion notifications
+// use, never a separate direct journal write. Each record mints a FRESH
+// EventID (the orphan's original metadata already durably owns its own
+// Started/Backgrounded EventID) and sets Kind/State/Reason to Task 4's
+// ProcessLifecycleLost / ProcessLifecycleLostOnRestore / ProcessTerminalLostOnRestore
+// triple, carrying every other field (SessionID, LoopID, ProcessHandle,
+// OriginExecutionID, ProcessCreatedAt/StartedAt) forward unchanged from the
+// last-known record — it never signals or queries the OS, and never invents
+// an OS-identifying field the DTO does not have.
+func publishOrphanedProcessLifecycles(ctx context.Context, s *Session, orphans []tool.ProcessLifecycleMetadata) error {
+	for _, orphan := range orphans {
+		eventID, err := s.newID()
+		if err != nil {
+			return &RestoreError{Kind: RestoreIDGenerationFailed, Cause: err}
+		}
+		lost := orphan
+		lost.EventID = eventID
+		lost.Kind = tool.ProcessLifecycleLost
+		lost.State = tool.ProcessLifecycleLostOnRestore
+		lost.Reason = tool.ProcessTerminalLostOnRestore
+		lost.ProcessFinishedAt = s.now()
+		lost.HasExitCode = false
+		lost.ExitCode = 0
+		lost.Diagnostic = ""
+		if err := s.resources.processServiceBridge.PublishProcessLifecycle(ctx, lost); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // openTurnCoords returns the TurnID + TurnIndex of the last TurnStarted in one loop's

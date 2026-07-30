@@ -12,10 +12,11 @@ import (
 type ShutdownCleanupPhase string
 
 const (
-	ShutdownCleanupLoopSend        ShutdownCleanupPhase = "loop_send"
-	ShutdownCleanupLoopDrain       ShutdownCleanupPhase = "loop_drain"
-	ShutdownCleanupCheckpointDrain ShutdownCleanupPhase = "checkpoint_drain"
-	ShutdownCleanupHubStop         ShutdownCleanupPhase = "hub_stop"
+	ShutdownCleanupLoopSend         ShutdownCleanupPhase = "loop_send"
+	ShutdownCleanupLoopDrain        ShutdownCleanupPhase = "loop_drain"
+	ShutdownCleanupCheckpointDrain  ShutdownCleanupPhase = "checkpoint_drain"
+	ShutdownCleanupSessionResources ShutdownCleanupPhase = "session_resources"
+	ShutdownCleanupHubStop          ShutdownCleanupPhase = "hub_stop"
 )
 
 // ShutdownCleanupTimeoutError reports a finite session-owned teardown deadline.
@@ -33,11 +34,12 @@ func (e *ShutdownCleanupTimeoutError) Error() string {
 func (e *ShutdownCleanupTimeoutError) Unwrap() error { return e.Cause }
 
 type shutdownCleanupTimeouts struct {
-	hustle     time.Duration
-	loopSend   time.Duration
-	loopDrain  time.Duration
-	checkpoint time.Duration
-	hub        time.Duration
+	hustle           time.Duration
+	loopSend         time.Duration
+	loopDrain        time.Duration
+	checkpoint       time.Duration
+	sessionResources time.Duration
+	hub              time.Duration
 }
 
 func (s *Session) resolveShutdownTimeouts(snapshot []loopSnapshot) shutdownCleanupTimeouts {
@@ -53,18 +55,19 @@ func (s *Session) resolveShutdownTimeouts(snapshot []loopSnapshot) shutdownClean
 	}
 	derived := shutdownCleanupTimeouts{
 		hustle: hustleTimeout, loopSend: loopTimeout, loopDrain: loopTimeout,
-		checkpoint: checkpointTimeout, hub: base,
+		checkpoint: checkpointTimeout, sessionResources: base, hub: base,
 	}
 	return derived.withOverrides(s.shutdownTimeouts)
 }
 
 func (t shutdownCleanupTimeouts) withOverrides(overrides shutdownCleanupTimeouts) shutdownCleanupTimeouts {
 	return shutdownCleanupTimeouts{
-		hustle:     timeoutOverride(t.hustle, overrides.hustle),
-		loopSend:   timeoutOverride(t.loopSend, overrides.loopSend),
-		loopDrain:  timeoutOverride(t.loopDrain, overrides.loopDrain),
-		checkpoint: timeoutOverride(t.checkpoint, overrides.checkpoint),
-		hub:        timeoutOverride(t.hub, overrides.hub),
+		hustle:           timeoutOverride(t.hustle, overrides.hustle),
+		loopSend:         timeoutOverride(t.loopSend, overrides.loopSend),
+		loopDrain:        timeoutOverride(t.loopDrain, overrides.loopDrain),
+		checkpoint:       timeoutOverride(t.checkpoint, overrides.checkpoint),
+		sessionResources: timeoutOverride(t.sessionResources, overrides.sessionResources),
+		hub:              timeoutOverride(t.hub, overrides.hub),
 	}
 }
 
@@ -226,6 +229,34 @@ func (s *Session) stopCheckpoints(root context.Context, timeout time.Duration) e
 		return cleanupTimeoutError(ShutdownCleanupCheckpointDrain, timeout, err)
 	}
 	return nil
+}
+
+// stopSessionResources shuts down the session-owned resource registry
+// (session_resources.go) — including every supervised process it still holds —
+// on a bounded REPORTING deadline. A SessionResource's Shutdown contract
+// requires it to honor ctx and return, but a session-owned teardown must never
+// trust that promise unconditionally: this runs the registry's Shutdown on its
+// own goroutine and reports a ShutdownCleanupSessionResources timeout if it
+// does not complete before timeout, rather than blocking the rest of session
+// teardown (the hub stop and lease release that follow it) indefinitely. The
+// goroutine is not abandoned on a report — it keeps running to real completion
+// in the background on an unbounded context, mirroring abortConstructionAfter's
+// single background cleanup owner, so the registry still reaches a terminal,
+// consistent state even after a timeout was already reported.
+func (s *Session) stopSessionResources(root context.Context, timeout time.Duration) error {
+	if s.resources == nil {
+		return nil
+	}
+	ctx, cancel := cleanupContext(root, timeout)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.resources.Shutdown(context.Background()) }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return cleanupTimeoutError(ShutdownCleanupSessionResources, timeout, ctx.Err())
+	}
 }
 
 func (s *Session) stopHub(root context.Context, timeout time.Duration) error {

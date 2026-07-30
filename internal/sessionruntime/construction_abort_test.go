@@ -17,6 +17,7 @@ import (
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
@@ -416,4 +417,65 @@ type checkedPublisherFunc func(context.Context, event.Event) error
 
 func (f checkedPublisherFunc) PublishEventChecked(ctx context.Context, ev event.Event) error {
 	return f(ctx, ev)
+}
+
+// TestConstructionAbortResourceShutdownBeforeLeaseCleanup proves the
+// construction-abort path mirrors Shutdown's ordering for the process
+// resource registry: once lease hooks have been accepted, abortConstruction's
+// single background cleanup owner shuts down every already-activated session
+// resource (here, the one already-Activated testSessionResource standing in
+// for a supervised process) BEFORE it releases the root lease, and releases
+// the root lease before the session lease (LIFO teardown).
+func TestConstructionAbortResourceShutdownBeforeLeaseCleanup(t *testing.T) {
+	sid, _ := uuid.New()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	resources := newSessionResources(t.TempDir())
+	resource := &testSessionResource{}
+	if _, err := resources.GetOrCreate(context.Background(), "abort-resource", func(string) (tool.SessionResource, error) {
+		return resource, nil
+	}); err != nil {
+		t.Fatalf("GetOrCreate: %v", err)
+	}
+	if err := resources.Activate(context.Background()); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+
+	var releaseMu sync.Mutex
+	var releases []string
+	record := func(name string) { releaseMu.Lock(); releases = append(releases, name); releaseMu.Unlock() }
+	resource.shutdownHook = func() { record("resources") }
+
+	s := &Session{
+		sessionID: sid, sessionCtx: ctx, sessionCancel: cancel, hub: hub.New(sid),
+		checkpointAdmission: newCheckpointAdmissionGate(),
+		loops:               map[uuid.UUID]*loopHandle{},
+		gates:               map[gate.ID]gateEntry{}, gateTimers: map[gate.ID]*time.Timer{},
+		resources: resources,
+		wsRootRelease: func(ctx context.Context) error {
+			if err := ctx.Err(); err != nil {
+				t.Errorf("root release context = %v, want live", err)
+			}
+			record("root")
+			return nil
+		},
+		leaseRelease: func(ctx context.Context) error {
+			if err := ctx.Err(); err != nil {
+				t.Errorf("session release context = %v, want live", err)
+			}
+			record("session")
+			return nil
+		},
+	}
+
+	s.abortConstruction(errors.New("construction failed"))
+
+	if got := resource.shutdownCalls.Load(); got != 1 {
+		t.Fatalf("resource Shutdown calls = %d, want 1", got)
+	}
+	releaseMu.Lock()
+	defer releaseMu.Unlock()
+	if len(releases) != 3 || releases[0] != "resources" || releases[1] != "root" || releases[2] != "session" {
+		t.Fatalf("construction abort teardown order = %v, want [resources root session]", releases)
+	}
 }
