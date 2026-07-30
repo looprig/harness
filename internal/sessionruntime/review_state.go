@@ -386,7 +386,11 @@ func (s *Session) observePermissionReviewOutcome(coords identity.Coordinates, ou
 // moment a classifier-originated response is discovered to be stale — the
 // exact moment design §18 wants counted, replacing the pre-Task-16 silent
 // no-op with a silent no-op THAT ALSO counts (the response itself is still
-// dropped exactly as before; only the bookkeeping is new).
+// dropped exactly as before; only the bookkeeping is new). Since Addendum 4
+// (design §13.4, TOCTOU) it is also called from
+// verifyPermissionReviewObservations on an observation mismatch or an
+// unverifiable/unconfigured recheck — the same "stale, silently dropped, but
+// counted" treatment as the four original drift dimensions.
 func (s *Session) recordPermissionReviewStale(coords identity.Coordinates) {
 	if coords.TurnID.IsZero() {
 		return

@@ -233,6 +233,35 @@ A nil or typed-nil verifier, an invalid policy, or a verifier panic all fail
 closed. Evidence tools never receive session, gate, rule, grant, mutation, or
 delegation capabilities (design §13.1/§13.3).
 
+### Observation recheck (TOCTOU)
+
+Evidence gathering and gate claiming are not atomic: a target a classifier
+observed (a file it stat'd, a git ref it resolved) can change between the
+observation and the eventual auto-approval. `ObservationRequirement` and
+`EvidenceObservationVerifier` (design §13.4) close that window:
+
+- **`ObservationRequirement{Target, Token}`** — one canonical-identity/token
+  pair a target-sensitive evidence tool recorded while it ran. `gate` never
+  computes or interprets either field; both are entirely tool/consumer-owned.
+- **`EvidenceObservationVerifier`** — the consumer-supplied, read-only recheck
+  seam (`VerifyEvidenceObservations(ctx, EvidenceContainmentPolicy,
+  []ObservationRequirement) error`), installed via
+  `rig.WithPermissionReviewObservations(verifier)`. Immediately before a
+  classifier-originated response claims the gate, every observation the
+  contributing classifier(s) recorded is rechecked; a mismatch or
+  unverifiable target makes the response stale — the human gate stays open,
+  exactly like every other review failure below.
+
+Unlike `WithPermissionReviewEvidence`, this option is optional even when
+classifiers and evidence are both configured: a session with no
+target-sensitive evidence tools has nothing to recheck. If a target-sensitive
+evidence tool DOES record an observation and no verifier is configured, the
+recheck fails closed (treated as a mismatch) rather than silently skipping —
+see `rig.WithPermissionReviewObservations`'s doc comment for the full
+reasoning. This mechanism narrows, but never replaces, the pre-existing
+symlink-swap, containment, grant-target, and sandbox checks: the eventual
+tool still consumes its own originally prepared artifact.
+
 ### Human fallback
 
 This is the feature's core invariant: **every classifier outcome other than

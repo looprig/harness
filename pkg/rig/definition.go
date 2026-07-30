@@ -120,6 +120,9 @@ func Define(options ...Option) (*Rig, error) {
 	if err := validatePermissionReviewSecurityCeiling(state); err != nil {
 		return nil, err
 	}
+	if err := validatePermissionReviewObservations(state); err != nil {
+		return nil, err
+	}
 	if err := validateHustleRegistration(state); err != nil {
 		return nil, err
 	}
@@ -335,6 +338,31 @@ func validatePermissionReviewSecurityCeiling(state *definitionState) error {
 	default:
 		return nil
 	}
+}
+
+// validatePermissionReviewObservations enforces WithPermissionReviewObservations'
+// own documented "config X requires config Y" pairing — see that option's
+// doc comment (options.go) for the full reasoning behind why this checks
+// only the unused direction, never a symmetric "missing" direction:
+//
+//   - WithPermissionReviewObservations called + no classifiers registered
+//     at all: DefinitionUnusedPermissionReviewObservations.
+//   - WithPermissionReviewObservations called + classifiers registered but
+//     WithPermissionReviewEvidence never configured (so there is no
+//     evidence runtime at all for any observation to ever be recorded
+//     into): DefinitionUnusedPermissionReviewObservations.
+//   - every other combination (not configured at all; configured alongside
+//     both classifiers and evidence): no error.
+func validatePermissionReviewObservations(state *definitionState) error {
+	if !state.seen[keyPermissionReviewObservations] {
+		return nil
+	}
+	classifiersConfigured := state.seen[keyPermissionClassifiers]
+	evidenceConfigured := state.seen[keyPermissionReviewEvidence]
+	if !classifiersConfigured || !evidenceConfigured {
+		return &DefinitionError{Kind: DefinitionUnusedPermissionReviewObservations}
+	}
+	return nil
 }
 
 // anyClassifierNeedsEvidence reports whether any classifier in set has an

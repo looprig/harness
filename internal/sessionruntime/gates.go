@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"reflect"
 	"time"
 
 	"github.com/looprig/core/uuid"
@@ -225,6 +226,26 @@ func withPermissionReviewEvidence(access gate.EvidenceAccessEvaluator, containme
 func withPermissionReviewSecurityCeiling(ceiling string) Option {
 	return func(s *Session) {
 		s.permissionReviewSecurityCeiling = ceiling
+	}
+}
+
+// withPermissionReviewObservationVerifier configures the session-wide,
+// OPTIONAL consumer-supplied recheck seam (design §13.4, TOCTOU) every
+// classifier-originated auto-approval's recorded observations are verified
+// against immediately before respondFromClassifier claims the gate,
+// mirroring withPermissionReviewEvidence's capture-only shape. It is
+// private: the real value, wired from a consumer's
+// rig.WithPermissionReviewObservations call, is Addendum 4 work, not this
+// seam's. Unlike withPermissionReviewEvidence/withPermissionReviewSecurityCeiling,
+// omitting this option is a fully supported terminal configuration, not a
+// construction-time gap papered over by a later fail-closed check — see
+// permissionReviewObservationVerifier's doc comment (session.go) and
+// verifyPermissionReviewObservations for exactly how a nil verifier is
+// still handled safely (and when it is NOT: one or more recorded
+// observations reaching a nil verifier fails closed).
+func withPermissionReviewObservationVerifier(verifier gate.EvidenceObservationVerifier) Option {
+	return func(s *Session) {
+		s.permissionReviewObservationVerifier = verifier
 	}
 }
 
@@ -1052,8 +1073,20 @@ func (s *Session) respondGateCore(ctx context.Context, response gate.GateRespons
 // respondGateCore itself returns nil for BOTH the stale-drift no-op and a
 // genuine success, so drift's closure captures which one happened locally —
 // respondGateCore's own signature is untouched.
-func (s *Session) respondFromClassifier(ctx context.Context, basis gate.ReviewBasis, reason string) (bool, error) {
+//
+// observations (design §13.4, TOCTOU addendum) is checked BEFORE any of the
+// above: verifyPermissionReviewObservations runs synchronously,
+// DELIBERATELY OUTSIDE respondGateCore's gatesMu critical section, and a
+// failed/mismatched/unverifiable observation returns (false, nil) — the same
+// stale, silently-dropped contract as every drift outcome above — without
+// ever calling respondGateCore at all. See verifyPermissionReviewObservations's
+// own doc comment for why this one check cannot share drift's
+// no-TOCTOU-window claim, and exactly what residual window it leaves.
+func (s *Session) respondFromClassifier(ctx context.Context, basis gate.ReviewBasis, observations []gate.ObservationRequirement, reason string) (bool, error) {
 	if basis.GateID.IsZero() || reason == "" {
+		return false, nil
+	}
+	if !s.verifyPermissionReviewObservations(ctx, basis.GateID, observations) {
 		return false, nil
 	}
 	response := gate.GateResponse{
@@ -1090,6 +1123,113 @@ func (s *Session) respondFromClassifier(ctx context.Context, basis gate.ReviewBa
 		return false, nil
 	}
 	return false, err
+}
+
+// verifyPermissionReviewObservations rechecks every observation requirement
+// (design §13.4, TOCTOU) an eligible classifier-originated response depends
+// on, and reports whether respondFromClassifier may proceed to
+// respondGateCore at all.
+//
+// Placement (the judgment call this addendum's plan explicitly calls out to
+// document): the four PRE-EXISTING drift dimensions (ToolExecutionID/
+// ContextRevision/SecurityCeiling/GatePolicyRevision) run INSIDE
+// respondGateCore's gatesMu critical section because they are pure
+// in-memory field comparisons — cheap, non-blocking, and therefore safe to
+// perform while holding a lock every other gate response in the session
+// also needs (respondGateCore's own doc comment: "so there is no TOCTOU
+// window"). An observation recheck cannot share that placement: it calls a
+// consumer-supplied EvidenceObservationVerifier that performs real I/O
+// (re-stat a file, resolve a git ref against a live filesystem or VCS).
+// Holding gatesMu for that I/O would trade a narrow, already-small TOCTOU
+// window for a NEW, categorically worse problem — unbounded latency (or
+// outright hang, if the verifier's own I/O blocks) while holding a lock
+// every OTHER concurrent gate response in the session (human or classifier,
+// for any gate) also needs to acquire, turning one slow/broken verifier
+// into a session-wide stall. This method therefore runs synchronously but
+// OUTSIDE the lock, immediately before respondFromClassifier calls
+// s.respondGateCore — as late as reasonably possible before the claim
+// without ever holding gatesMu across I/O.
+//
+// Residual TOCTOU window: the gap between this method returning true and
+// respondGateCore's own lock-protected claim a few lines later — a handful
+// of in-process instructions, not the "seconds of evidence-gathering plus
+// classifier inference" window this whole mechanism exists to close. Design
+// §13.4 requires the pre-existing symlink-swap, containment, grant-target,
+// and sandbox checks to remain mandatory regardless — those, not this
+// method, are what bound the residual window: a target that changes in the
+// few instructions between this check and the claim is still caught by the
+// SAME enforcement that already protects every non-classifier-approved tool
+// call, exactly as design §13.4's closing sentence ("the eventual tool
+// still consumes its original prepared artifact") requires.
+//
+// The nil-verifier cases are asymmetric BY DESIGN, not an oversight:
+//   - len(observations) == 0: nothing was ever recorded (no target-sensitive
+//     evidence tool ran, or none is registered at all for this session) —
+//     there is nothing to recheck, so this returns true unconditionally,
+//     with or without a configured verifier. Forcing every session with
+//     classifiers configured to wire rig.WithPermissionReviewObservations
+//     "just in case" would violate Interface Segregation for the common
+//     case (a classifier whose evidence tools are all non-target-sensitive,
+//     e.g. only glob/grep-style multi-match tools).
+//   - len(observations) > 0 but s.permissionReviewObservationVerifier is
+//     nil: a target-sensitive evidence tool DID run and DID record an
+//     observation, but nothing is configured to recheck it. This can only
+//     happen from a genuine consumer misconfiguration (an evidence tool
+//     that records observations, wired without also calling
+//     rig.WithPermissionReviewObservations) — see that option's own doc
+//     comment for why Define()-time cannot catch this case today. Runtime
+//     must never let this silently degrade to "recheck skipped, approval
+//     proceeds" — that would be exactly the fail-open gap this whole
+//     addendum exists to close. It is treated identically to a genuine
+//     verifier-reported mismatch: stale, gate stays open, no session fault,
+//     and (like every other stale outcome here) counted against the design
+//     §18 circuit breaker so a persistent misconfiguration or attack is
+//     eventually visible rather than silently absorbed forever.
+func (s *Session) verifyPermissionReviewObservations(ctx context.Context, gateID gate.ID, observations []gate.ObservationRequirement) bool {
+	if len(observations) == 0 {
+		return true
+	}
+	if nilEvidenceObservationVerifier(s.permissionReviewObservationVerifier) {
+		s.recordPermissionReviewStale(s.gateCoordinatesForStale(gateID))
+		return false
+	}
+	// policy is assembled from the SAME two trusted, session-construction-time
+	// sources hustleEvidenceRuntimeConfig already uses for the structurally
+	// identical EvidenceContainmentPolicy (hustle.go): s.wsRoot (the
+	// canonical workspace root) and s.permissionReviewSecurityCeiling (read
+	// fresh off the session, exactly like the GatePolicyRevision comparison
+	// above — never a value captured earlier in this specific review, so a
+	// ceiling that has since moved on is still caught).
+	policy := gate.EvidenceContainmentPolicy{ReadRoot: s.wsRoot, SecurityCeiling: s.permissionReviewSecurityCeiling}
+	if err := s.permissionReviewObservationVerifier.VerifyEvidenceObservations(ctx, policy, observations); err != nil {
+		s.recordPermissionReviewStale(s.gateCoordinatesForStale(gateID))
+		return false
+	}
+	return true
+}
+
+// gateCoordinatesForStale takes a short, non-blocking lock to read id's
+// directory-entry coordinates for circuit-breaker bookkeeping ONLY — never
+// while holding the lock across the observation verifier's own I/O (that
+// call has already returned by the time this runs). A gate already gone by
+// the time this is called (an ordinary race, not an error here) yields the
+// zero identity.Coordinates, which recordPermissionReviewStale treats like
+// any other coordinates value.
+func (s *Session) gateCoordinatesForStale(id gate.ID) identity.Coordinates {
+	s.gatesMu.Lock()
+	defer s.gatesMu.Unlock()
+	if entry, ok := s.gates[id]; ok {
+		return entry.coordinates
+	}
+	return identity.Coordinates{}
+}
+
+func nilEvidenceObservationVerifier(value gate.EvidenceObservationVerifier) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	return reflected.Kind() == reflect.Pointer && reflected.IsNil()
 }
 
 // revertClaiming reverts a gate from claiming back to open after a failed

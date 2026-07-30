@@ -103,7 +103,7 @@ func TestRespondFromClassifierApprovesAndClosesGate(t *testing.T) {
 	s, app, cmds, gateID, callID := raceGateSession(t)
 	basis := racePermissionReviewBasis(s, gateID, callID)
 
-	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, nil, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() error = %v", err)
 	}
 
@@ -139,7 +139,7 @@ func TestRespondFromClassifierAfterHumanApprovalIsStale(t *testing.T) {
 	}
 	recvCommand(t, cmds)
 
-	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, nil, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() after human approval error = %v, want nil (stale, not a fault)", err)
 	}
 	if c, ok := drainCommand(cmds); ok {
@@ -158,7 +158,7 @@ func TestRespondGateAfterClassifierApprovalIsStale(t *testing.T) {
 	s, app, cmds, gateID, callID := raceGateSession(t)
 	basis := racePermissionReviewBasis(s, gateID, callID)
 
-	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, nil, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() error = %v", err)
 	}
 	recvCommand(t, cmds)
@@ -204,7 +204,7 @@ func TestRespondFromClassifierAndHumanSimultaneousRaceExactlyOneWins(t *testing.
 			}()
 			go func() {
 				defer wg.Done()
-				_, _ = s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1")
+				_, _ = s.respondFromClassifier(context.Background(), basis, nil, "risk-classifier@rev-1")
 			}()
 			wg.Wait()
 
@@ -251,12 +251,12 @@ func TestRespondFromClassifierDuplicateIsStale(t *testing.T) {
 	s, app, cmds, gateID, callID := raceGateSession(t)
 	basis := racePermissionReviewBasis(s, gateID, callID)
 
-	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, nil, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() #1 error = %v", err)
 	}
 	recvCommand(t, cmds)
 
-	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, nil, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() #2 error = %v, want nil (stale duplicate, not a fault)", err)
 	}
 	if c, ok := drainCommand(cmds); ok {
@@ -280,7 +280,7 @@ func TestRespondFromClassifierAfterGateCloseIsStale(t *testing.T) {
 		t.Fatalf("CloseGate() error = %v", err)
 	}
 
-	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, nil, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() after CloseGate error = %v, want nil (stale, not a fault)", err)
 	}
 	if c, ok := drainCommand(cmds); ok {
@@ -310,7 +310,7 @@ func TestRespondFromClassifierAfterPolicyTimeoutIsStale(t *testing.T) {
 	}
 	recvCommand(t, cmds)
 
-	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, nil, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() after policy timeout error = %v, want nil (stale, not a fault)", err)
 	}
 	if c, ok := drainCommand(cmds); ok {
@@ -365,7 +365,13 @@ func TestRespondFromClassifierDriftDropsSilently(t *testing.T) {
 			},
 		},
 		{
-			name: "observation drift (context and security ceiling both moved on)",
+			// Renamed from "observation drift" (Addendum 4): this case only
+			// exercises two of the four PRE-EXISTING basis-field comparisons
+			// moving together — it predates and is unrelated to design
+			// §13.4's real observation-token TOCTOU recheck, which
+			// review_race_test.go's TestRespondFromClassifierObservation*
+			// tests exercise separately.
+			name: "context and security ceiling drift together",
 			drift: func(b gate.ReviewBasis) gate.ReviewBasis {
 				b.ContextRevision = "context-rev-2"
 				b.SecurityCeiling = "ceiling-2"
@@ -379,7 +385,7 @@ func TestRespondFromClassifierDriftDropsSilently(t *testing.T) {
 			s, app, cmds, gateID, callID := raceGateSession(t)
 			basis := tt.drift(racePermissionReviewBasis(s, gateID, callID))
 
-			if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+			if _, err := s.respondFromClassifier(context.Background(), basis, nil, "risk-classifier@rev-1"); err != nil {
 				t.Fatalf("respondFromClassifier() error = %v, want nil (drift silently dropped)", err)
 			}
 			if c, ok := drainCommand(cmds); ok {
@@ -393,6 +399,210 @@ func TestRespondFromClassifierDriftDropsSilently(t *testing.T) {
 				t.Fatalf("ListGates() = %+v, want the gate still open (every non-allow path preserves the human gate)", got)
 			}
 		})
+	}
+}
+
+// observationVerifierStub is a gate.EvidenceObservationVerifier fake: it
+// records every (policy, requirements) call it receives and returns a
+// configured error (nil for a match, non-nil for a mismatch/unverifiable
+// target).
+type observationVerifierStub struct {
+	mu           sync.Mutex
+	err          error
+	calls        int
+	lastPolicy   gate.EvidenceContainmentPolicy
+	lastRequired []gate.ObservationRequirement
+}
+
+func (s *observationVerifierStub) VerifyEvidenceObservations(
+	_ context.Context,
+	policy gate.EvidenceContainmentPolicy,
+	requirements []gate.ObservationRequirement,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	s.lastPolicy = policy
+	s.lastRequired = append([]gate.ObservationRequirement(nil), requirements...)
+	return s.err
+}
+
+func (s *observationVerifierStub) snapshot() (int, gate.EvidenceContainmentPolicy, []gate.ObservationRequirement) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls, s.lastPolicy, append([]gate.ObservationRequirement(nil), s.lastRequired...)
+}
+
+var raceObservation = gate.ObservationRequirement{Target: "/workspace/file", Token: "token-1"}
+
+// TestRespondFromClassifierObservationMatchApprovesAndClosesGate proves
+// design §13.4's TOCTOU recheck lets a genuinely matching observation
+// through exactly like the base no-observations case: the verifier is
+// consulted (with the aggregated requirements and a policy built from the
+// session's own wsRoot/current security ceiling) and, on a nil error, the
+// gate claims and resolves precisely as TestRespondFromClassifierApprovesAndClosesGate
+// does.
+func TestRespondFromClassifierObservationMatchApprovesAndClosesGate(t *testing.T) {
+	t.Parallel()
+	s, app, cmds, gateID, callID := raceGateSession(t)
+	s.wsRoot = "/workspace"
+	s.permissionReviewSecurityCeiling = "ceiling-current"
+	verifier := &observationVerifierStub{}
+	withPermissionReviewObservationVerifier(verifier)(s)
+	basis := racePermissionReviewBasis(s, gateID, callID)
+
+	applied, err := s.respondFromClassifier(context.Background(), basis, []gate.ObservationRequirement{raceObservation}, "risk-classifier@rev-1")
+	if err != nil {
+		t.Fatalf("respondFromClassifier() error = %v", err)
+	}
+	if !applied {
+		t.Fatal("respondFromClassifier() applied = false, want true (matching observation must not block approval)")
+	}
+
+	cmd := recvCommand(t, cmds)
+	approve, ok := cmd.(command.ApproveToolCall)
+	if !ok || approve.Action != gate.ApprovalApprove {
+		t.Fatalf("dispatched command = %#v, want ApproveToolCall{Approve}", cmd)
+	}
+	resolved := app.snapshotResolved()
+	if len(resolved) != 1 || resolved[0].Source.Kind != gate.ResponseFromClassifier {
+		t.Fatalf("resolved events = %+v, want exactly 1, classifier-sourced", resolved)
+	}
+
+	calls, policy, required := verifier.snapshot()
+	if calls != 1 {
+		t.Fatalf("verifier calls = %d, want exactly 1", calls)
+	}
+	if policy.ReadRoot != "/workspace" || policy.SecurityCeiling != "ceiling-current" {
+		t.Fatalf("verifier policy = %+v, want session's own wsRoot/current ceiling", policy)
+	}
+	if len(required) != 1 || required[0] != raceObservation {
+		t.Fatalf("verifier requirements = %+v, want [%+v]", required, raceObservation)
+	}
+}
+
+// TestRespondFromClassifierObservationMismatchDropsSilently proves design
+// §13.4's central security property: a verifier-reported mismatch (or
+// unverifiable target) on ANY recorded observation makes the whole
+// classifier-originated response stale — dropped silently before
+// respondGateCore is ever called, gate left exactly as it was, no session
+// fault — mirroring every other drift outcome in
+// TestRespondFromClassifierDriftDropsSilently.
+func TestRespondFromClassifierObservationMismatchDropsSilently(t *testing.T) {
+	t.Parallel()
+	s, app, cmds, gateID, callID := raceGateSession(t)
+	verifier := &observationVerifierStub{err: errors.New("target changed since observation")}
+	withPermissionReviewObservationVerifier(verifier)(s)
+	basis := racePermissionReviewBasis(s, gateID, callID)
+
+	applied, err := s.respondFromClassifier(context.Background(), basis, []gate.ObservationRequirement{raceObservation}, "risk-classifier@rev-1")
+	if err != nil {
+		t.Fatalf("respondFromClassifier() error = %v, want nil (observation mismatch silently dropped)", err)
+	}
+	if applied {
+		t.Fatal("respondFromClassifier() applied = true, want false (mismatch must never claim the gate)")
+	}
+	if c, ok := drainCommand(cmds); ok {
+		t.Errorf("observation mismatch dispatched a command %T, want none", c)
+	}
+	if got := app.snapshotResolved(); len(got) != 0 {
+		t.Fatalf("resolved events = %d, want 0 (observation mismatch must never claim the gate)", len(got))
+	}
+	got := s.ListGates(context.Background())
+	if len(got) != 1 || got[0].ID != gateID {
+		t.Fatalf("ListGates() = %+v, want the gate still open", got)
+	}
+	if calls, _, _ := verifier.snapshot(); calls != 1 {
+		t.Fatalf("verifier calls = %d, want exactly 1", calls)
+	}
+}
+
+// TestRespondFromClassifierObservationsWithoutVerifierIsStale proves the
+// fail-secure asymmetry documented on verifyPermissionReviewObservations: a
+// session with recorded observations but NO EvidenceObservationVerifier
+// configured (the "consumer wired a target-sensitive evidence tool but
+// forgot rig.WithPermissionReviewObservations" misconfiguration) must never
+// silently skip the recheck and approve anyway — it is treated exactly like
+// a genuine mismatch.
+func TestRespondFromClassifierObservationsWithoutVerifierIsStale(t *testing.T) {
+	t.Parallel()
+	s, app, cmds, gateID, callID := raceGateSession(t)
+	basis := racePermissionReviewBasis(s, gateID, callID)
+
+	applied, err := s.respondFromClassifier(context.Background(), basis, []gate.ObservationRequirement{raceObservation}, "risk-classifier@rev-1")
+	if err != nil {
+		t.Fatalf("respondFromClassifier() error = %v, want nil (unverifiable observation silently dropped)", err)
+	}
+	if applied {
+		t.Fatal("respondFromClassifier() applied = true, want false (no verifier configured must never silently approve)")
+	}
+	if c, ok := drainCommand(cmds); ok {
+		t.Errorf("unverifiable classifier response dispatched a command %T, want none", c)
+	}
+	if got := app.snapshotResolved(); len(got) != 0 {
+		t.Fatalf("resolved events = %d, want 0", len(got))
+	}
+	got := s.ListGates(context.Background())
+	if len(got) != 1 || got[0].ID != gateID {
+		t.Fatalf("ListGates() = %+v, want the gate still open", got)
+	}
+}
+
+// TestRespondFromClassifierNoObservationsSkipsVerifierEvenWhenConfigured
+// proves the OTHER half of the same asymmetry: zero recorded observations
+// never calls a configured verifier at all — a session with a
+// target-sensitive-evidence-capable verifier wired, reviewing a gate whose
+// classifier(s) happened to record nothing this time, behaves exactly like
+// TestRespondFromClassifierApprovesAndClosesGate.
+func TestRespondFromClassifierNoObservationsSkipsVerifierEvenWhenConfigured(t *testing.T) {
+	t.Parallel()
+	s, app, cmds, gateID, callID := raceGateSession(t)
+	verifier := &observationVerifierStub{err: errors.New("must never be consulted")}
+	withPermissionReviewObservationVerifier(verifier)(s)
+	basis := racePermissionReviewBasis(s, gateID, callID)
+
+	applied, err := s.respondFromClassifier(context.Background(), basis, nil, "risk-classifier@rev-1")
+	if err != nil {
+		t.Fatalf("respondFromClassifier() error = %v", err)
+	}
+	if !applied {
+		t.Fatal("respondFromClassifier() applied = false, want true (no observations means nothing to recheck)")
+	}
+	recvCommand(t, cmds)
+	if got := app.snapshotResolved(); len(got) != 1 {
+		t.Fatalf("resolved events = %d, want exactly 1", len(got))
+	}
+	if calls, _, _ := verifier.snapshot(); calls != 0 {
+		t.Fatalf("verifier calls = %d, want 0 (must never be consulted with zero observations)", calls)
+	}
+}
+
+// TestRespondFromClassifierObservationMismatchFeedsCircuitBreaker proves an
+// observation mismatch is counted against design §18's stale-response
+// circuit breaker exactly like basis drift is
+// (TestRespondFromClassifierDriftFeedsCircuitBreaker in review_state_test.go)
+// — a persistent misconfiguration or attack on this new recheck path is
+// eventually visible, not silently absorbed forever.
+func TestRespondFromClassifierObservationMismatchFeedsCircuitBreaker(t *testing.T) {
+	t.Parallel()
+	s, _, cmds, gateID, callID := raceGateSession(t)
+	withPermissionReviewBreaker(reviewCircuitBreakerLimits{MaxStaleResponses: 1})(s)
+	verifier := &observationVerifierStub{err: errors.New("target changed")}
+	withPermissionReviewObservationVerifier(verifier)(s)
+	basis := racePermissionReviewBasis(s, gateID, callID)
+
+	if _, err := s.respondFromClassifier(context.Background(), basis, []gate.ObservationRequirement{raceObservation}, "risk-classifier@rev-1"); err != nil {
+		t.Fatalf("respondFromClassifier() error = %v, want nil (stale, not a fault)", err)
+	}
+	if c, ok := drainCommand(cmds); ok {
+		t.Fatalf("mismatched classifier response dispatched a command %T, want none", c)
+	}
+
+	s.gatesMu.Lock()
+	coords := s.gates[gateID].coordinates
+	s.gatesMu.Unlock()
+	if s.reviewBreakerAllows(coords) {
+		t.Fatal("breaker did not trip after an observation mismatch reached MaxStaleResponses")
 	}
 }
 
@@ -509,7 +719,7 @@ waitOpen:
 
 	basis := racePermissionReviewBasis(s, gateID, callID)
 	seedReviewBasis(s, gateID, basis)
-	if _, err := s.respondFromClassifier(context.Background(), basis, "risk-classifier@rev-1"); err != nil {
+	if _, err := s.respondFromClassifier(context.Background(), basis, nil, "risk-classifier@rev-1"); err != nil {
 		t.Fatalf("respondFromClassifier() error = %v", err)
 	}
 

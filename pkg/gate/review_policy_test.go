@@ -591,6 +591,11 @@ func TestCombinePermissionAssessments(t *testing.T) {
 			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst},
 			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
 		}, reason: gate.ReviewDecisionEligible, eligible: true},
+		{name: "all allowed with recorded observations", outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst,
+				Observations: []gate.ObservationRequirement{{Target: "/workspace/a", Token: "tok-a"}}},
+			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
+		}, reason: gate.ReviewDecisionEligible, eligible: true},
 		{name: "non applicable is neutral", outcomes: []gate.PermissionAssessmentOutcome{
 			{Subject: first, Status: gate.ReviewStatusNotApplicable},
 			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
@@ -691,6 +696,21 @@ func TestCombinePermissionAssessmentsRequiresCompleteRegisteredSet(t *testing.T)
 		}, set: classifiers},
 		{name: "failed carries assessment", outcomes: []gate.PermissionAssessmentOutcome{
 			{Subject: first, Applicable: true, Status: gate.ReviewStatusFailed, Assessment: allowFirst},
+			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
+		}, set: classifiers},
+		{name: "non applicable carries observations", outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Status: gate.ReviewStatusNotApplicable,
+				Observations: []gate.ObservationRequirement{{Target: "/workspace/a", Token: "tok-a"}}},
+			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
+		}, set: classifiers},
+		{name: "allowed with malformed observation", outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst,
+				Observations: []gate.ObservationRequirement{{Target: "/workspace/a", Token: ""}}},
+			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
+		}, set: classifiers},
+		{name: "allowed with too many observations", outcomes: []gate.PermissionAssessmentOutcome{
+			{Subject: first, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowFirst,
+				Observations: tooManyObservationRequirements()},
 			{Subject: second, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: allowSecond},
 		}, set: classifiers},
 	}
@@ -811,6 +831,18 @@ func validPermissionAssessment(
 		Basis: subject.Basis, Risk: risk, Authorization: authorization,
 		Recommendation: recommendation, Rationale: rationale,
 	}
+}
+
+// tooManyObservationRequirements returns one more than
+// gate.MaxObservationRequirementsPerAssessment individually-valid
+// requirements, so a test can prove CombinePermissionAssessments bounds the
+// aggregate count rather than just each requirement's own shape.
+func tooManyObservationRequirements() []gate.ObservationRequirement {
+	out := make([]gate.ObservationRequirement, gate.MaxObservationRequirementsPerAssessment+1)
+	for i := range out {
+		out[i] = gate.ObservationRequirement{Target: "/workspace/a", Token: "tok"}
+	}
+	return out
 }
 
 func cloneReviewPolicy(policy gate.PermissionReviewPolicy) gate.PermissionReviewPolicy {

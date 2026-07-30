@@ -10,13 +10,13 @@ import (
 // name, signature, and pairing requirement documented there
 // (WithPermissionClassifiers, WithPermissionReviewPolicy,
 // WithPermissionReviewSecurityCeiling, WithPermissionReviewEvidence,
-// WithPermissionReviewLimits) is exercised together here exactly as a real
-// consumer would call them, so a rename or signature change breaks this
-// test instead of leaving the README silently stale — the same class of gap
-// Phase 6 found and fixed for WithPermissionReviewPolicyRevision
-// (commit c8fdca47). It reuses this package's own existing test
-// collaborators (defineRigPermissionClassifier and friends) rather than
-// hand-rolling a second classifier fake.
+// WithPermissionReviewObservations, WithPermissionReviewLimits) is
+// exercised together here exactly as a real consumer would call them, so a
+// rename or signature change breaks this test instead of leaving the README
+// silently stale — the same class of gap Phase 6 found and fixed for
+// WithPermissionReviewPolicyRevision (commit c8fdca47). It reuses this
+// package's own existing test collaborators (defineRigPermissionClassifier
+// and friends) rather than hand-rolling a second classifier fake.
 func TestReadmeExamplePermissionReviewOptionsCompileAndSucceed(t *testing.T) {
 	t.Parallel()
 
@@ -26,6 +26,7 @@ func TestReadmeExamplePermissionReviewOptionsCompileAndSucceed(t *testing.T) {
 	evidenceAccess := stubPermissionReviewEvidenceAccess{}
 	evidenceContainment := stubPermissionReviewEvidenceContainment{}
 	allowedEvidenceKinds := []string{"filesystem.read"}
+	observationVerifier := stubPermissionReviewObservationVerifier{}
 	root := t.TempDir()
 
 	r, err := Define(validRigOptions(t,
@@ -34,6 +35,7 @@ func TestReadmeExamplePermissionReviewOptionsCompileAndSucceed(t *testing.T) {
 		WithPermissionReviewPolicy(reviewPolicy),
 		WithPermissionReviewSecurityCeiling("consumer-access-profile/v1"),
 		WithPermissionReviewEvidence(evidenceAccess, evidenceContainment, allowedEvidenceKinds),
+		WithPermissionReviewObservations(observationVerifier),
 		WithPermissionReviewLimits(PermissionReviewLimits{
 			MaxConsecutiveNeedsHuman: 20,
 			MaxInvalidOrFailed:       20,

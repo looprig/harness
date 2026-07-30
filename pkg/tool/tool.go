@@ -133,6 +133,35 @@ type WriteTarget interface {
 	WriteTarget(argsJSON string) (key string, ok bool, err error)
 }
 
+// EvidenceObservation is an optional capability (probed by type assertion,
+// mirroring Sequential/Auditable/WriteTarget) implemented by a
+// target-sensitive evidence tool that can derive the canonical-identity/token
+// pair it observed for one completed call from that call's own prepared
+// Request and produced ToolResult (design §13.4, TOCTOU). It is probed only
+// AFTER a successful InvokableRun, from the evidence runtime's per-call loop
+// (internal/hustleruntime/evidence_runner.go) — never before, and never for a
+// call that failed.
+//
+// Harness never computes, interprets, or canonicalizes target or token
+// itself: deriving canonical identity and minting a stable token from
+// observed metadata is entirely tool/consumer-owned, the same reasoning
+// gate.EvidenceContainmentVerifier's own doc comment gives for why Harness
+// does not own path canonicalization. This package cannot name that gate
+// type directly (pkg/gate imports pkg/tool, so the reverse would cycle),
+// which is why the method returns plain strings rather than a
+// gate.ObservationRequirement — the evidence runtime, which already imports
+// both packages, does that conversion (and validation) at the call site.
+//
+// ok=false means this particular call made no target-sensitive observation
+// (for example a glob/grep-style tool that matched many candidates rather
+// than resolving one canonical target) — nothing is recorded, and evidence
+// execution and authorization are completely unaffected either way. A tool
+// implementing none of this capability simply never contributes an
+// observation for any of its calls; it is still a fully valid evidence tool.
+type EvidenceObservation interface {
+	ObservedRequirement(request Request, result *ToolResult) (target string, token string, ok bool)
+}
+
 // ToolExecuteFunc is the terminal/next step in a middleware chain: it runs the
 // tool against argsJSON and returns its result.
 type ToolExecuteFunc func(ctx context.Context, argsJSON string) (*ToolResult, error)

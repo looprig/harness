@@ -97,14 +97,15 @@ type permissionReviewResponderStub struct {
 }
 
 type permissionReviewResponderCall struct {
-	basis  gate.ReviewBasis
-	reason string
+	basis        gate.ReviewBasis
+	observations []gate.ObservationRequirement
+	reason       string
 }
 
-func (s *permissionReviewResponderStub) respondFromClassifier(_ context.Context, basis gate.ReviewBasis, reason string) (bool, error) {
+func (s *permissionReviewResponderStub) respondFromClassifier(_ context.Context, basis gate.ReviewBasis, observations []gate.ObservationRequirement, reason string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.calls = append(s.calls, permissionReviewResponderCall{basis: basis, reason: reason})
+	s.calls = append(s.calls, permissionReviewResponderCall{basis: basis, observations: observations, reason: reason})
 	applied := s.respErr == nil
 	if s.forceApplied != nil {
 		applied = *s.forceApplied

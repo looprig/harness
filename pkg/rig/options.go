@@ -38,6 +38,7 @@ const (
 	keyPermissionReviewLimits          singletonKey = "permission_review_limits"
 	keyPermissionReviewEvidence        singletonKey = "permission_review_evidence"
 	keyPermissionReviewSecurityCeiling singletonKey = "permission_review_security_ceiling"
+	keyPermissionReviewObservations    singletonKey = "permission_review_observations"
 )
 
 // WithPermissionClassifiers installs the already-validated, ordered permission
@@ -224,6 +225,69 @@ func WithPermissionReviewSecurityCeiling(ceiling string) Option {
 			return &DefinitionError{Kind: DefinitionInvalidPermissionReviewSecurityCeiling}
 		}
 		return singletonCompile(keyPermissionReviewSecurityCeiling, sessionruntime.WithLifecyclePermissionReviewSecurityCeiling(ceiling))(state)
+	}
+}
+
+// WithPermissionReviewObservations installs the consumer-supplied,
+// read-only TOCTOU-recheck seam (design §13.4) every classifier-originated
+// auto-approval's recorded observations are verified against immediately
+// before the gate is claimed. verifier independently re-derives each
+// previously recorded gate.ObservationRequirement's current token and fails
+// closed (leaving the human gate open) on any mismatch or unverifiable
+// target — see gate.EvidenceObservationVerifier's own doc comment for the
+// full trusted-caller contract, which deliberately reuses
+// gate.EvidenceContainmentPolicy rather than introducing a parallel policy
+// type (the security context — canonical read root plus the review's own
+// non-widenable ceiling — is identical to WithPermissionReviewEvidence's own
+// Containment collaborator).
+//
+// A separate option, deliberately NOT folded into WithPermissionReviewEvidence's
+// signature: the two are independent concerns (an evidence-tool access
+// boundary a session needs whenever ANY registered classifier declares
+// evidence tools, versus a TOCTOU recheck a session needs only when at least
+// one of those evidence tools is target-sensitive). Folding Observations in
+// as a fourth WithPermissionReviewEvidence parameter would force every
+// existing and future caller with no target-sensitive evidence tools — the
+// common case today, since no evidence tool in this codebase declares
+// itself target-sensitive yet — to pass an explicit nil at that call site
+// for a concern it will never use, which is exactly the Interface
+// Segregation violation this package's own CLAUDE.md guidance warns
+// against.
+//
+// Required (rejected as DefinitionUnusedPermissionReviewObservations)
+// unless BOTH at least one permission classifier is registered AND
+// WithPermissionReviewEvidence is also configured — mirroring the "config X
+// requires config Y" pairing precedent, but ONLY in the unused direction.
+// There is deliberately NO symmetric "missing" pairing error the way
+// WithPermissionReviewEvidence itself is required whenever
+// anyClassifierNeedsEvidence(state.permissionClassifiers) reports true:
+// that check is possible because hustle.Definition.EvidenceToolPolicy()
+// already gives Define() a real, static, per-classifier "does this need an
+// evidence runtime at all" signal. Nothing analogous exists for "is any of
+// THIS classifier's evidence tools target-sensitive" — no evidence tool
+// definition in this codebase declares that today (it is a per-concrete-tool
+// capability, tool.EvidenceObservation, probed only at runtime after a call
+// executes, not a static Definition-level property Define() could inspect
+// ahead of time the way it inspects EvidenceToolPolicy). Manufacturing a
+// parallel static declarer purely to unlock a Define()-time "missing"
+// check, before any real tool exists that would ever set it, would be
+// speculative generality with no consumer to validate it against. Instead,
+// runtime fails closed: internal/sessionruntime/gates.go's
+// verifyPermissionReviewObservations treats "an observation WAS recorded
+// but no verifier is configured" identically to a genuine mismatch — stale,
+// human gate stays open, never a silent pass — so a consumer who adds a
+// target-sensitive evidence tool later without also wiring this option
+// gets an always-safe (if initially confusing, and always correctable)
+// runtime outcome rather than a false sense of protection. If a future
+// evidence-tool capability gives Define() a real static signal, tightening
+// this to a "missing" pairing error too is a natural, non-breaking
+// follow-up — see this addendum's plan section for the explicit flag.
+func WithPermissionReviewObservations(verifier gate.EvidenceObservationVerifier) Option {
+	return func(state *definitionState) error {
+		if verifier == nil {
+			return &DefinitionError{Kind: DefinitionInvalidPermissionReviewObservations}
+		}
+		return singletonCompile(keyPermissionReviewObservations, sessionruntime.WithLifecyclePermissionReviewObservations(verifier))(state)
 	}
 }
 

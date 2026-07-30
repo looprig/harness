@@ -157,6 +157,22 @@ type Session struct {
 	// never equal a real consumer's own ceiling.
 	permissionReviewSecurityCeiling string
 
+	// permissionReviewObservationVerifier is the immutable, OPTIONAL
+	// consumer-supplied recheck seam (design §13.4, TOCTOU) set by
+	// withPermissionReviewObservationVerifier (internal/sessionruntime/
+	// gates.go). Unlike permissionReviewEvidence*/permissionReviewSecurityCeiling
+	// above, staying nil is a fully supported, non-degraded configuration: a
+	// session whose registered classifiers' evidence tools never record any
+	// ObservationRequirement has nothing for this seam to ever recheck.
+	// respondFromClassifier's verifyPermissionReviewObservations treats the
+	// two "nil verifier" cases very differently, though — see its own doc
+	// comment: zero recorded observations is a genuine no-op, but ONE OR MORE
+	// recorded observations with this still nil is exactly the "consumer
+	// wired an observation-recording evidence tool but forgot
+	// rig.WithPermissionReviewObservations" misconfiguration, and fails
+	// closed (treated as stale) rather than silently skipping the recheck.
+	permissionReviewObservationVerifier gate.EvidenceObservationVerifier
+
 	// review is the session's bounded, PURELY in-memory permission-review
 	// cancellation-group + circuit-breaker bookkeeping (design §15, §18;
 	// internal/sessionruntime/review_state.go). It is never persisted and

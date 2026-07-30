@@ -12,11 +12,22 @@ import (
 // PermissionAssessmentOutcome is one classifier's applicability and terminal
 // review state. Only applicable, allowed outcomes carry an assessment that can
 // contribute to eligibility.
+//
+// Observations is the set of ObservationRequirement tokens (design §13.4,
+// TOCTOU) this classifier's OWN evidence gathering recorded — one review may
+// gather evidence about several distinct targets, so this is a slice, not a
+// single value. It is meaningful only when Status is ReviewStatusAllowed
+// (validPermissionAssessmentOutcome requires it empty otherwise, mirroring
+// Assessment's own zero-value-unless-allowed rule): a classifier that never
+// reached an allowed terminal never contributes evidence a response could be
+// approved on, so its observations (if any were gathered before it failed)
+// are simply discarded rather than carried forward.
 type PermissionAssessmentOutcome struct {
-	Subject    PermissionReviewSubject
-	Applicable bool
-	Status     ReviewStatus
-	Assessment PermissionAssessment
+	Subject      PermissionReviewSubject
+	Applicable   bool
+	Status       ReviewStatus
+	Assessment   PermissionAssessment
+	Observations []ObservationRequirement
 }
 
 // CombinePermissionAssessments applies ordered conjunctive review semantics
@@ -96,10 +107,29 @@ func CombinePermissionAssessments(
 
 func validPermissionAssessmentOutcome(outcome PermissionAssessmentOutcome) bool {
 	if outcome.Status != ReviewStatusAllowed {
-		return zeroPermissionAssessment(outcome.Assessment)
+		return zeroPermissionAssessment(outcome.Assessment) && len(outcome.Observations) == 0
+	}
+	if !validObservationRequirements(outcome.Observations) {
+		return false
 	}
 	return outcome.Assessment.Basis == outcome.Subject.Basis &&
 		validPermissionAssessment(outcome.Assessment)
+}
+
+// validObservationRequirements bounds and shape-checks one outcome's
+// recorded observations. It never inspects Target/Token content beyond
+// ObservationRequirement.Valid()'s own generic shape rules — meaning is
+// entirely consumer-owned.
+func validObservationRequirements(observations []ObservationRequirement) bool {
+	if len(observations) > MaxObservationRequirementsPerAssessment {
+		return false
+	}
+	for _, observation := range observations {
+		if !observation.Valid() {
+			return false
+		}
+	}
+	return true
 }
 
 func validPermissionAssessmentOutcomeStatus(

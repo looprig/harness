@@ -189,6 +189,19 @@ type Lifecycle struct {
 	// (gates.go) return nil (defense in depth).
 	permissionReviewSecurityCeiling           string
 	permissionReviewSecurityCeilingConfigured bool
+
+	// permissionReviewObservationVerifier and
+	// permissionReviewObservationVerifierConfigured capture
+	// WithLifecyclePermissionReviewObservations' installed, OPTIONAL
+	// TOCTOU-recheck seam (design §13.4), mirroring
+	// permissionReviewEvidenceConfigured's "option called, not value
+	// non-zero" signal. Unlike permissionReviewEvidence*/
+	// permissionReviewSecurityCeiling above, leaving this unconfigured is a
+	// fully supported terminal state, not a gap a later construction-time
+	// check must close — see gates.go's permissionReviewObservationVerifier
+	// field doc comment (session.go) for why.
+	permissionReviewObservationVerifier           gate.EvidenceObservationVerifier
+	permissionReviewObservationVerifierConfigured bool
 }
 
 // HustleLimits is sessionruntime's narrow, rig-independent copy of the hustle
@@ -324,6 +337,29 @@ func WithLifecyclePermissionReviewSecurityCeiling(ceiling string) LifecycleOptio
 	return func(r *Lifecycle) {
 		r.permissionReviewSecurityCeiling = ceiling
 		r.permissionReviewSecurityCeilingConfigured = true
+	}
+}
+
+// WithLifecyclePermissionReviewObservations installs the consumer-supplied,
+// OPTIONAL recheck seam (design §13.4, TOCTOU) every classifier-originated
+// auto-approval's recorded observations are verified against immediately
+// before the gate is claimed, mirroring
+// WithLifecyclePermissionReviewEvidence's capture-once-forward-to-both
+// shape. Both NewSession and RestoreSession apply it via the private
+// withPermissionReviewObservationVerifier Option (gates.go) — but, unlike
+// Evidence/SecurityCeiling, ONLY when this option was actually called:
+// omitting it leaves every session's permissionReviewObservationVerifier at
+// its nil zero value, which respondFromClassifier's
+// verifyPermissionReviewObservations then handles as a fully supported
+// terminal state whenever no observation was ever recorded, and as a
+// fail-closed (stale) outcome whenever one was — see that method's own doc
+// comment for the full reasoning, including why this cannot be a
+// Define()-time "missing" pairing error the way
+// WithLifecyclePermissionReviewEvidence's absence is.
+func WithLifecyclePermissionReviewObservations(verifier gate.EvidenceObservationVerifier) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.permissionReviewObservationVerifier = verifier
+		r.permissionReviewObservationVerifierConfigured = true
 	}
 }
 
@@ -586,6 +622,9 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	if r.permissionReviewSecurityCeilingConfigured {
 		opts = append(opts, withPermissionReviewSecurityCeiling(r.permissionReviewSecurityCeiling))
 	}
+	if r.permissionReviewObservationVerifierConfigured {
+		opts = append(opts, withPermissionReviewObservationVerifier(r.permissionReviewObservationVerifier))
+	}
 	opts = append(opts,
 		WithSessionID(sid),
 		WithEventAppender(evAp),
@@ -694,6 +733,9 @@ func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session,
 	}
 	if r.permissionReviewSecurityCeilingConfigured {
 		opts = append(opts, withPermissionReviewSecurityCeiling(r.permissionReviewSecurityCeiling))
+	}
+	if r.permissionReviewObservationVerifierConfigured {
+		opts = append(opts, withPermissionReviewObservationVerifier(r.permissionReviewObservationVerifier))
 	}
 	if r.frozenFingerprint != nil {
 		opts = append(opts, WithFingerprint(*r.frozenFingerprint))

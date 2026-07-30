@@ -51,6 +51,24 @@ const (
 	// DefinitionUnusedPermissionReviewEvidence's "config X requires config Y"
 	// symmetric check.
 	DefinitionUnusedPermissionReviewSecurityCeiling DefinitionErrorKind = "unused_permission_review_security_ceiling"
+
+	// DefinitionInvalidPermissionReviewObservations: WithPermissionReviewObservations
+	// was called with a nil verifier.
+	DefinitionInvalidPermissionReviewObservations DefinitionErrorKind = "invalid_permission_review_observations"
+	// DefinitionUnusedPermissionReviewObservations: WithPermissionReviewObservations
+	// was called but either no permission classifier is configured at all, or
+	// no WithPermissionReviewEvidence was configured (design §13.4's
+	// observation-recheck mechanism lives entirely inside the evidence
+	// runtime — a verifier with no evidence runtime to ever record an
+	// observation into is dead configuration). There is deliberately no
+	// symmetric "missing" error the way DefinitionMissingPermissionReviewEvidence
+	// pairs with WithPermissionReviewEvidence: see WithPermissionReviewObservations'
+	// own doc comment for why "a classifier's evidence tools need this"
+	// cannot be determined at Define()-time today, and how runtime instead
+	// fails closed (internal/sessionruntime/gates.go's
+	// verifyPermissionReviewObservations) if that ever turns out to matter
+	// for a given session.
+	DefinitionUnusedPermissionReviewObservations DefinitionErrorKind = "unused_permission_review_observations"
 )
 
 type DefinitionError struct {

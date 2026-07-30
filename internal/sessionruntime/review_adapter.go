@@ -43,8 +43,15 @@ type permissionReviewHustleRunner interface {
 // review() needs this distinction to audit AutoApproved/stale correctly
 // (design §16.2): the GATE's fate decides AutoApproved, never the
 // classifier's own opinion.
+//
+// observations is classifierApprovalBasis' aggregated set of
+// gate.ObservationRequirement values every contributing classifier's own
+// evidence gathering recorded (design §13.4, TOCTOU). respondFromClassifier
+// treats a mismatch or unverifiable observation among them exactly like a
+// basis-drift mismatch: the response is dropped as stale, folded into the
+// same (false, nil) no-op outcome above, never a distinct return shape.
 type permissionReviewResponder interface {
-	respondFromClassifier(ctx context.Context, basis gate.ReviewBasis, reason string) (bool, error)
+	respondFromClassifier(ctx context.Context, basis gate.ReviewBasis, observations []gate.ObservationRequirement, reason string) (bool, error)
 }
 
 // permissionReviewAuditPublisher is the checked durable-append seam
@@ -272,8 +279,8 @@ func (a *permissionReviewAdapter) review(ctx context.Context, req loopruntime.Pe
 
 	applied := false
 	if decision.Eligible {
-		if basis, reason, ok := classifierApprovalBasis(classifiers, outcomes); ok {
-			responded, err := a.responder.respondFromClassifier(ctx, basis, reason)
+		if basis, observations, reason, ok := classifierApprovalBasis(classifiers, outcomes); ok {
+			responded, err := a.responder.respondFromClassifier(ctx, basis, observations, reason)
 			if err != nil {
 				slog.WarnContext(ctx, "sessionruntime: classifier-originated gate response failed",
 					"gate_id", req.GateID, "error", err)
@@ -461,7 +468,15 @@ func (a *permissionReviewAdapter) reviewOne(ctx context.Context, req loopruntime
 		// classifier with no evidence-tool concept simply never reads it.
 		SecurityCeiling: basis.SecurityCeiling,
 	}
-	if err := a.runner.RunAndFinalize(ctx, runRequest, validate, finish); err != nil {
+	// design §13.4 (TOCTOU): a fresh collector per classifier run, attached
+	// only to the context THIS RunAndFinalize call receives (never req's or
+	// review()'s own ctx directly) — see hustleruntime.ObservationCollector's
+	// doc comment. Any target-sensitive evidence tool this classifier's
+	// Hustle invokes records into it via the evidence runtime; nothing reads
+	// it until after RunAndFinalize returns below.
+	observations := hustleruntime.NewObservationCollector()
+	runCtx := hustleruntime.WithObservationCollector(ctx, observations)
+	if err := a.runner.RunAndFinalize(runCtx, runRequest, validate, finish); err != nil {
 		if runErr == nil {
 			// The finalizer above never ran (a pre-ownership admission/preflight
 			// rejection) — RunAndFinalize's own returned error is the only
@@ -475,12 +490,17 @@ func (a *permissionReviewAdapter) reviewOne(ctx context.Context, req loopruntime
 		// The combined-decision input (gate.PermissionAssessmentOutcome.Status)
 		// stays the coarse ReviewStatusFailed unconditionally — unchanged from
 		// Task 15/16 — regardless of the finer audit classification below; only
-		// the AUDITED status distinguishes cancelled/timed_out/failed.
+		// the AUDITED status distinguishes cancelled/timed_out/failed. Any
+		// observations gathered before this classifier's run ultimately failed
+		// are discarded (never carried onto the outcome) — see
+		// PermissionAssessmentOutcome's own doc comment for why that is exactly
+		// right, not a gap.
 		a.publishReviewCompleted(ctx, req, classifier, classifyReviewFailureStatus(ctx, runErr), gate.PermissionAssessment{}, false)
 		return gate.PermissionAssessmentOutcome{Subject: subject, Applicable: true, Status: gate.ReviewStatusFailed}
 	}
 	return gate.PermissionAssessmentOutcome{
 		Subject: subject, Applicable: true, Status: gate.ReviewStatusAllowed, Assessment: assessment,
+		Observations: observations.Observations(),
 	}
 }
 
@@ -655,13 +675,24 @@ func (a *permissionReviewAdapter) reportAuditFault(ctx context.Context, gateID g
 // this via its common-subject-digest check), so taking the basis from the
 // first applicable outcome and zeroing its classifier-specific fields yields
 // the one shared ReviewBasis every contributing classifier agreed on.
+// classifierApprovalBasis additionally aggregates every contributing
+// classifier's OWN Observations (design §13.4, TOCTOU) into one combined
+// slice — concatenated, not deduplicated: two classifiers observing the same
+// target independently is a stronger, not weaker, signal for the recheck,
+// and deduplicating would need an equality notion this function has no
+// reason to invent. Every applicable outcome here is guaranteed
+// ReviewStatusAllowed (CombinePermissionAssessments only reports Eligible
+// when every applicable outcome is Allowed), so gate.PermissionAssessmentOutcome's
+// own "Observations only meaningful when Allowed" invariant already holds by
+// construction — nothing here re-checks it.
 func classifierApprovalBasis(
 	classifiers []gate.PermissionClassifier,
 	outcomes []gate.PermissionAssessmentOutcome,
-) (gate.ReviewBasis, string, bool) {
+) (gate.ReviewBasis, []gate.ObservationRequirement, string, bool) {
 	var basis gate.ReviewBasis
 	haveBasis := false
 	var reasons []string
+	var observations []gate.ObservationRequirement
 	for index, outcome := range outcomes {
 		if !outcome.Applicable {
 			continue
@@ -672,12 +703,13 @@ func classifierApprovalBasis(
 			basis.SubjectDigest = [32]byte{}
 			haveBasis = true
 		}
+		observations = append(observations, outcome.Observations...)
 		if index < len(classifiers) {
 			reasons = append(reasons, string(classifiers[index].Name())+"@"+classifiers[index].Revision())
 		}
 	}
 	if !haveBasis || len(reasons) == 0 {
-		return gate.ReviewBasis{}, "", false
+		return gate.ReviewBasis{}, nil, "", false
 	}
-	return basis, strings.Join(reasons, ";"), true
+	return basis, observations, strings.Join(reasons, ";"), true
 }

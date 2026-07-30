@@ -204,6 +204,11 @@ func (r *evidenceRunner) run(
 		if err != nil {
 			return nil, err
 		}
+		// design §13.4 (TOCTOU): record this call's observation, if the
+		// concrete tool reports one, into whatever ObservationCollector the
+		// review adapter attached to ctx (nil for every non-review Hustle
+		// run, and a no-op receiver either way — see recordEvidenceObservation).
+		recordEvidenceObservation(observationCollectorFromContext(ctx), concrete, request, result)
 		owned, encodedBytes, err := ownEvidenceResult(result, limits.MaxResultBytes, remaining)
 		if err != nil {
 			return nil, err

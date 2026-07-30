@@ -48,6 +48,11 @@ r, err := rig.Define(
     // read-only evidence. Required whenever any registered classifier's
     // definition declares evidence tools — see pkg/gate/README.md#evidence-boundaries.
     rig.WithPermissionReviewEvidence(evidenceAccess, evidenceContainment, allowedEvidenceKinds),
+    // Optional: TOCTOU recheck (design §13.4) for classifiers whose evidence
+    // tools observe a specific target's identity/state. Only meaningful
+    // paired with WithPermissionReviewEvidence; harmless to omit if no
+    // registered classifier's evidence tools are target-sensitive.
+    rig.WithPermissionReviewObservations(observationVerifier),
     // Optional: circuit-breaker thresholds (design §18). Defaults every one
     // of 8 turn+session counters to rig.DefaultPermissionReviewBreakerThreshold
     // (20) when omitted but classifiers are configured.
@@ -72,16 +77,17 @@ session, err := r.RestoreSession(ctx, priorSessionID)
 ```
 
 `rig.WithPermissionClassifiers`, `WithPermissionReviewPolicy`,
-`WithPermissionReviewEvidence`, and `WithPermissionReviewSecurityCeiling` are
-all supplied at `rig.Define` time above, not per restore — restore itself
-takes no options. Omitting every one of them (the zero-classifier rig) is how
-you disable permission review entirely: it preserves the pre-classifier gate
-behavior byte-for-byte, with no separate on/off flag to flip. See
+`WithPermissionReviewEvidence`, `WithPermissionReviewObservations`, and
+`WithPermissionReviewSecurityCeiling` are all supplied at `rig.Define` time
+above, not per restore — restore itself takes no options. Omitting every one
+of them (the zero-classifier rig) is how you disable permission review
+entirely: it preserves the pre-classifier gate behavior byte-for-byte, with
+no separate on/off flag to flip. See
 [`pkg/gate/README.md`](../gate/README.md#permission-review) for the full
-enable/disable, evidence-boundary, human-fallback, audit/privacy,
-policy-tuning, evaluation-workflow, and restore-behavior story; that
-package — not this one — owns the neutral review domain these options
-configure.
+enable/disable, evidence-boundary, observation-recheck (TOCTOU),
+human-fallback, audit/privacy, policy-tuning, evaluation-workflow, and
+restore-behavior story; that package — not this one — owns the neutral
+review domain these options configure.
 
 ### Restore and a changed permission-review configuration
 
