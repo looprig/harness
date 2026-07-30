@@ -496,7 +496,7 @@ func TestBuildRestoredSessionRootRuntimeFailureIsFatal(t *testing.T) {
 	s, err := buildRestoredSession(
 		restoreCtx, restoreCancel, bound,
 		tool.Bindings{SessionID: sessionID, LoopID: rootID},
-		sessionID, rootID, "", 0, foldLoop([]event.Event{started}), ri, nil,
+		sessionID, rootID, "", 0, foldLoop([]event.Event{started}), ri, nil, nil,
 		fakeSessionJournal{}, event.NewFactory(uuid.New, time.Now), uuid.New, time.Now,
 		WithForeignBuilderRegistry(&registry),
 	)

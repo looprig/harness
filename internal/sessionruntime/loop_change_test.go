@@ -282,7 +282,7 @@ func TestRestoreSeedingAgreesWithLiveView(t *testing.T) {
 
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
-			l, err := loopruntime.NewRestored(ctx, sid, lid, loop.Provenance{}, nopLoopPublisher{}, bound, restoredStateFrom(foldResult{}, tt.ri))
+			l, err := loopruntime.NewRestored(ctx, sid, lid, loop.Provenance{}, nopLoopPublisher{}, bound, restoredStateFrom(foldResult{}, tt.ri, nil))
 			if err != nil {
 				t.Fatalf("NewRestored: %v", err)
 			}

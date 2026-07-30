@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // seededUUID builds a deterministic non-zero uuid from a single seed byte so the
@@ -44,6 +45,29 @@ func fullMachineHeader() Header {
 	header := fullHeader()
 	header.Agency = identity.AgencyMachine
 	return header
+}
+
+// validProcessNotificationCommand builds a fully-populated, valid
+// ProcessNotification: Header.CommandID and Notification.CommandID carry the
+// SAME stable id (Task 4/24C's contract), and the wrapped DTO satisfies its
+// own closed state/reason tuple and bounded process handle.
+func validProcessNotificationCommand() ProcessNotification {
+	id := seededUUID(0x99)
+	return ProcessNotification{
+		Header: Header{
+			CommandID: id,
+			Cause:     identity.Cause{Coordinates: identity.Coordinates{SessionID: seededUUID(0x22), LoopID: seededUUID(0x33)}},
+			Agency:    identity.AgencyMachine,
+		},
+		Notification: tool.ProcessCompletionNotification{
+			CommandID:     id,
+			SessionID:     seededUUID(0x22),
+			LoopID:        seededUUID(0x33),
+			ProcessHandle: "proc-handle-01",
+			State:         tool.ProcessLifecycleExited,
+			Reason:        tool.ProcessTerminalExited,
+		},
+	}
 }
 
 // sampleBlocks is a representative content slice exercising the block-delegation
@@ -102,6 +126,7 @@ func TestMarshalCommandRoundTrip(t *testing.T) {
 		{"Interrupt", Interrupt{Header: fullHeader()}},
 		{"Shutdown", Shutdown{Header: fullHeader()}},
 		{"Compact", Compact{Header: fullHeader(), Coordinates: identity.Coordinates{SessionID: seededUUID(0x22), LoopID: seededUUID(0x33)}}},
+		{"ProcessNotification", validProcessNotificationCommand()},
 	}
 
 	for _, tt := range tests {
@@ -237,6 +262,7 @@ func TestMarshalCommandEnvelopeKeys(t *testing.T) {
 		{"Interrupt", Interrupt{Header: fullHeader()}, CommandInterrupt},
 		{"Shutdown", Shutdown{Header: fullHeader()}, CommandShutdown},
 		{"Compact", Compact{Header: fullHeader(), Coordinates: identity.Coordinates{SessionID: seededUUID(0x22), LoopID: seededUUID(0x33)}}, CommandCompact},
+		{"ProcessNotification", validProcessNotificationCommand(), CommandProcessNotification},
 	}
 
 	for _, tt := range tests {
@@ -270,7 +296,7 @@ func TestMarshalCommandEnvelopeKeys(t *testing.T) {
 // fails TestMarshalCommandCoversEveryType. A missed command type is an
 // unpersistable intent-log record = silent restore data loss, which this guard
 // forbids.
-const wantCommandTypes = 10
+const wantCommandTypes = 11
 
 // unionInstances is one zero-valued instance of EVERY concrete command type. The
 // drift guard asserts the codec handles each, so a new union member is forced
@@ -280,7 +306,7 @@ func unionInstances() []Command {
 		UserInput{}, SubagentResult{},
 		ApproveToolCall{}, DenyToolCall{}, ProvideUserInput{},
 		CancelQueuedInput{}, CancelDelegateRequest{}, Interrupt{}, Shutdown{},
-		Compact{},
+		Compact{}, ProcessNotification{},
 	}
 }
 
@@ -431,6 +457,7 @@ func FuzzDecodeCommand(f *testing.F) {
 		Interrupt{Header: fullHeader()},
 		Shutdown{Header: fullHeader()},
 		Compact{Header: fullHeader(), Coordinates: identity.Coordinates{SessionID: seededUUID(0x22), LoopID: seededUUID(0x33)}},
+		validProcessNotificationCommand(),
 	}
 	for _, c := range seeds {
 		if data, err := MarshalCommand(c); err == nil {
@@ -511,6 +538,7 @@ func isTypedDecodeError(err error) bool {
 		decode       *CommandDecodeError
 		limit        *CommandLimitError
 		validation   *CommandValidationError
+		processMeta  *tool.ProcessLifecycleValidationError
 		blockDecode  *content.BlockDecodeError
 		blockLimit   *content.BlockLimitError
 		unknownBlock *content.UnknownBlockTypeError
@@ -519,6 +547,7 @@ func isTypedDecodeError(err error) bool {
 		errors.As(err, &decode) ||
 		errors.As(err, &limit) ||
 		errors.As(err, &validation) ||
+		errors.As(err, &processMeta) ||
 		errors.As(err, &blockDecode) ||
 		errors.As(err, &blockLimit) ||
 		errors.As(err, &unknownBlock)

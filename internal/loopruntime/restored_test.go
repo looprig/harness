@@ -8,7 +8,10 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/tool"
 	model "github.com/looprig/inference/model"
 )
 
@@ -354,4 +357,71 @@ func TestRestoreTransportMismatch(t *testing.T) {
 			t.Fatal("NewRestored returned a nil loop when no ContextCounter is configured")
 		}
 	})
+}
+
+// TestNewRestoredSeedsPendingProcessNotifications proves RestoredState.
+// PendingProcessNotifications (Task 24C's restore reconciliation) seeds the
+// actor's live de-dup guard directly at construction, with no append and no
+// live dispatch for the seeded entries: a live redelivery of a SEEDED
+// CommandID is dropped as a duplicate, while a FRESH CommandID is accepted
+// normally — proving restore and live delivery share one representation.
+func TestNewRestoredSeedsPendingProcessNotifications(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sessionID := mustID(t)
+	loopID := mustID(t)
+	client := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
+	rec := &recordingPublisher{}
+
+	seededID := mustID(t)
+	seeded := tool.ProcessCompletionNotification{
+		CommandID:     seededID,
+		SessionID:     sessionID,
+		LoopID:        loopID,
+		ProcessHandle: "proc-seeded",
+		State:         tool.ProcessLifecycleExited,
+		Reason:        tool.ProcessTerminalExited,
+	}
+
+	l, err := newRestoredWithConfig(ctx, sessionID, loopID, rec,
+		runtimeConfig{Client: client, Model: testModel(), DrainTimeout: 200 * time.Millisecond},
+		RestoredState{PendingProcessNotifications: []tool.ProcessCompletionNotification{seeded}})
+	if err != nil {
+		t.Fatalf("NewRestored: %v", err)
+	}
+
+	sendNotification := func(id uuid.UUID, n tool.ProcessCompletionNotification) command.ProcessNotificationResult {
+		t.Helper()
+		result := make(chan command.ProcessNotificationResult, 1)
+		l.Commands <- command.ProcessNotification{
+			Header:       command.Header{CommandID: id},
+			Notification: n,
+			Result:       result,
+		}
+		select {
+		case got := <-result:
+			return got
+		case <-time.After(time.Second):
+			t.Fatal("no ProcessNotification result within deadline")
+			return 0
+		}
+	}
+
+	if got := sendNotification(seededID, seeded); got != command.ProcessNotificationDuplicate {
+		t.Errorf("seeded redelivery result = %v, want Duplicate", got)
+	}
+
+	freshID := mustID(t)
+	fresh := tool.ProcessCompletionNotification{
+		CommandID:     freshID,
+		SessionID:     sessionID,
+		LoopID:        loopID,
+		ProcessHandle: "proc-fresh",
+		State:         tool.ProcessLifecycleExited,
+		Reason:        tool.ProcessTerminalExited,
+	}
+	if got := sendNotification(freshID, fresh); got != command.ProcessNotificationAccepted {
+		t.Errorf("fresh notification result = %v, want Accepted", got)
+	}
 }

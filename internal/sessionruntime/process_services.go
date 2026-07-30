@@ -20,6 +20,7 @@ var errSessionProcessServicesUnavailable = errors.New("session: process services
 type sessionProcessServiceBridge struct {
 	mu                 sync.Mutex
 	lifecyclePublisher tool.ProcessLifecyclePublisher // nil until Task 24B attaches it
+	completionNotifier tool.ProcessCompletionNotifier // nil until Task 24C attaches it
 }
 
 func newSessionProcessServices() (
@@ -51,6 +52,24 @@ func (b *sessionProcessServiceBridge) attachProcessLifecyclePublisher(p tool.Pro
 	b.mu.Unlock()
 }
 
+// attachProcessCompletionNotifier installs the checked completion notifier
+// (Task 24C's implementation, *Session.NotifyProcessCompletion) behind the
+// bridge WITHOUT replacing the bridge value itself — the exact same pattern
+// attachProcessLifecyclePublisher established for 24B: every resource that
+// already captured this *sessionProcessServiceBridge through
+// SessionResourceServices observes the checked behavior on its very next
+// call, because the bridge's identity never changes. A nil notifier is
+// ignored so an accidental nil injection can never erase an already-attached
+// delegate and silently fall back to the unavailable stub.
+func (b *sessionProcessServiceBridge) attachProcessCompletionNotifier(n tool.ProcessCompletionNotifier) {
+	if n == nil {
+		return
+	}
+	b.mu.Lock()
+	b.completionNotifier = n
+	b.mu.Unlock()
+}
+
 func (b *sessionProcessServiceBridge) PublishProcessLifecycle(
 	ctx context.Context,
 	metadata tool.ProcessLifecycleMetadata,
@@ -64,11 +83,17 @@ func (b *sessionProcessServiceBridge) PublishProcessLifecycle(
 	return publisher.PublishProcessLifecycle(ctx, metadata)
 }
 
-func (*sessionProcessServiceBridge) NotifyProcessCompletion(
-	context.Context,
-	tool.ProcessCompletionNotification,
+func (b *sessionProcessServiceBridge) NotifyProcessCompletion(
+	ctx context.Context,
+	notification tool.ProcessCompletionNotification,
 ) error {
-	return errSessionProcessServicesUnavailable
+	b.mu.Lock()
+	notifier := b.completionNotifier
+	b.mu.Unlock()
+	if notifier == nil {
+		return errSessionProcessServicesUnavailable
+	}
+	return notifier.NotifyProcessCompletion(ctx, notification)
 }
 
 var (

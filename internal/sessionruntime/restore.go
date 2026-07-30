@@ -6,10 +6,13 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/internal/loopruntime"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 	model "github.com/looprig/inference/model"
 )
 
@@ -378,9 +381,10 @@ func foldLoopInference(events []event.Event) restoredInference {
 }
 
 // restoredStateFrom builds the loopruntime restore seed from a loop's committed-conversation
-// fold and its mode/inference fold, so a re-created loop comes up with both its history AND
-// the effective config it crashed under.
-func restoredStateFrom(folded foldResult, ri restoredInference) loopruntime.RestoredState {
+// fold, its mode/inference fold, and its undelivered process notifications (Task 24C), so a
+// re-created loop comes up with its history, the effective config it crashed under, AND the
+// live de-dup guard already reconciled against durable causality.
+func restoredStateFrom(folded foldResult, ri restoredInference, notifications []tool.ProcessCompletionNotification) loopruntime.RestoredState {
 	return loopruntime.RestoredState{
 		Msgs:          folded.Msgs,
 		DerivedPrefix: folded.DerivedPrefix,
@@ -396,7 +400,54 @@ func restoredStateFrom(folded foldResult, ri restoredInference) loopruntime.Rest
 
 		AutomaticBasis:    folded.AutomaticBasis,
 		HasAutomaticBasis: folded.HasAutomaticBasis,
+
+		PendingProcessNotifications: notifications,
 	}
+}
+
+// causedCommandIDs folds a durable Enduring event sequence into the set of
+// non-zero Header.Cause.CommandID values it carries — generically, over
+// WHATEVER event a command's live processing durably emits, with no
+// dependency on any specific event type. Task 24C's restore-side notification
+// subtraction consumes it: a process-notification CommandID present in this
+// set already caused a durable event before the crash (already consumed) and
+// is therefore excluded from the redelivered remainder.
+func causedCommandIDs(events []event.Event) map[uuid.UUID]struct{} {
+	caused := make(map[uuid.UUID]struct{})
+	for _, ev := range events {
+		if id := ev.EventHeader().Cause.CommandID; !id.IsZero() {
+			caused[id] = struct{}{}
+		}
+	}
+	return caused
+}
+
+// undeliveredProcessNotifications replays loopID's durable command intent log
+// (records, in ledger order — the SAME []journal.JournalRecord slice restore
+// already drains for gate reconstruction) for command.ProcessNotification
+// entries addressed to loopID, and subtracts those whose CommandID already
+// appears in caused (see causedCommandIDs) — already consumed before the
+// crash. The remainder, preserving ledger order, is what NewRestored
+// re-enqueues directly into the loop's live de-dup guard. It is naturally
+// bounded by however many completion commands the session's intent log
+// retains; no separate cap is needed.
+func undeliveredProcessNotifications(records []journal.JournalRecord, loopID uuid.UUID, caused map[uuid.UUID]struct{}) []tool.ProcessCompletionNotification {
+	var pending []tool.ProcessCompletionNotification
+	for _, rec := range records {
+		cmdRec, ok := rec.(journal.CommandRecord)
+		if !ok {
+			continue
+		}
+		notification, ok := cmdRec.Command().(command.ProcessNotification)
+		if !ok || notification.Notification.LoopID != loopID {
+			continue
+		}
+		if _, consumed := caused[notification.Notification.CommandID]; consumed {
+			continue
+		}
+		pending = append(pending, notification.Notification)
+	}
+	return pending
 }
 
 // foldResult is the reconstruction of one loop's committed conversation from its

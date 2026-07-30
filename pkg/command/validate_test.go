@@ -7,6 +7,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // TestValidateCommandValid asserts every addressed command type, populated to its
@@ -39,6 +40,17 @@ func TestValidateCommandValid(t *testing.T) {
 		{"ProvideUserInput", command.ProvideUserInput{Header: hdr, GateRoute: route, Answer: "x"}},
 		{"Interrupt (session-wide, only CommandID)", command.Interrupt{Header: hdr}},
 		{"Shutdown (session-wide, only CommandID)", command.Shutdown{Header: hdr}},
+		{"ProcessNotification", command.ProcessNotification{
+			Header: hdr,
+			Notification: tool.ProcessCompletionNotification{
+				CommandID:     cmdID,
+				SessionID:     sess,
+				LoopID:        loop,
+				ProcessHandle: "proc-handle-01",
+				State:         tool.ProcessLifecycleExited,
+				Reason:        tool.ProcessTerminalExited,
+			},
+		}},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -163,6 +175,23 @@ func TestValidateCommandInvalid(t *testing.T) {
 			wantCmd:   command.CommandProvideUserInput,
 			wantField: command.FieldLoopID,
 			wantRule:  command.RuleRequired,
+		},
+		{
+			name: "ProcessNotification header/notification CommandID mismatch",
+			cmd: command.ProcessNotification{
+				Header: hdr,
+				Notification: tool.ProcessCompletionNotification{
+					CommandID:     target,
+					SessionID:     sess,
+					LoopID:        loop,
+					ProcessHandle: "proc-handle-01",
+					State:         tool.ProcessLifecycleExited,
+					Reason:        tool.ProcessTerminalExited,
+				},
+			},
+			wantCmd:   command.CommandProcessNotification,
+			wantField: command.FieldNotification,
+			wantRule:  command.RuleInvalid,
 		},
 	}
 	for _, tt := range tests {

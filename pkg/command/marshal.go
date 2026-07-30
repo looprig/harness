@@ -1,12 +1,16 @@
 package command
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // schemaVersion is the current wire-envelope schema version stamped into every
@@ -103,6 +107,8 @@ func classifyCommand(cmd Command) (CommandName, bool) {
 		return CommandShutdown, true
 	case Compact:
 		return CommandCompact, true
+	case ProcessNotification:
+		return CommandProcessNotification, true
 	default:
 		return CommandUnknown, false
 	}
@@ -140,12 +146,14 @@ func encodePayload(name CommandName, cmd Command) ([]byte, error) {
 	case SubagentResult:
 		return marshalSubagentResult(c)
 	case ApproveToolCall, DenyToolCall, ProvideUserInput, CancelQueuedInput, CancelDelegateRequest,
-		Interrupt, Shutdown, Compact:
+		Interrupt, Shutdown, Compact, ProcessNotification:
 		// Every field round-trips through encoding/json directly: header + scalars/
 		// strings/ids (uuid.UUID has its own text codec) + embedded Coordinates/
-		// GateRoute. The two block-bearing commands (UserInput/SubagentResult) are
-		// handled above; the ack channels (Interrupt/Shutdown) are json:"-" and drop
-		// out here. This arm is the lossless-plain remainder.
+		// GateRoute, or (ProcessNotification) the bounded tool.ProcessCompletionNotification
+		// DTO's own tagged fields. The two block-bearing commands (UserInput/SubagentResult)
+		// are handled above; the transient channels (Interrupt/Shutdown/CancelDelegateRequest/
+		// ProcessNotification.Result) are json:"-" and drop out here. This arm is the
+		// lossless-plain remainder.
 		return marshalPlain(name, cmd)
 	default:
 		return nil, &UnknownCommandTypeError{Type: name}
@@ -300,9 +308,46 @@ func decodePayload(tag CommandName, data []byte) (Command, error) {
 		return decodePlain[Shutdown](tag, data)
 	case CommandCompact:
 		return decodePlain[Compact](tag, data)
+	case CommandProcessNotification:
+		return decodeProcessNotification(data)
 	default:
 		return nil, &UnknownCommandTypeError{Type: tag}
 	}
+}
+
+// processNotificationWire is ProcessNotification's wire form. It mirrors
+// pkg/event's strict process-lifecycle decode (decodeProcessLifecycleEvent):
+// the payload is a CLOSED set of keys — the envelope discriminator, the
+// generic Header, and the bounded notification DTO's own fields — decoded
+// with DisallowUnknownFields and a trailing-value check so an attempt to
+// smuggle command text, output, stdin, a host path, an OS PID, or any other
+// free-form key (at the envelope level OR inside "notification") fails
+// closed with a typed *CommandDecodeError rather than being silently
+// dropped. This is a deliberate, narrower exception to the rest of the
+// package's permissive decodePlain: ProcessNotification is the one command
+// whose payload is explicitly metadata-only by design.
+type processNotificationWire struct {
+	Type string  `json:"type"`
+	V    *uint32 `json:"v"`
+	Header
+	Notification tool.ProcessCompletionNotification `json:"notification"`
+}
+
+func decodeProcessNotification(data []byte) (Command, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+
+	var wire processNotificationWire
+	if err := decoder.Decode(&wire); err != nil {
+		return nil, &CommandDecodeError{Type: CommandProcessNotification, Cause: err}
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("trailing JSON value")
+		}
+		return nil, &CommandDecodeError{Type: CommandProcessNotification, Cause: err}
+	}
+	return ProcessNotification{Header: wire.Header, Notification: wire.Notification}, nil
 }
 
 // decodePlain decodes a command whose fields all round-trip through encoding/json

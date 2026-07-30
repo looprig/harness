@@ -48,7 +48,7 @@ func RestoreTopology(ctx context.Context, topology Topology, sessionID uuid.UUID
 	return restoreTopologySession(ctx, topology, sessionID, store, uuid.New, time.Now, opts...)
 }
 
-func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Provenance, bound loop.BoundDefinition, bindings tool.Bindings, folded foldResult, ri restoredInference, foreignSID string) error {
+func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Provenance, bound loop.BoundDefinition, bindings tool.Bindings, folded foldResult, ri restoredInference, notifications []tool.ProcessCompletionNotification, foreignSID string) error {
 	loopCtx, cancel := context.WithCancel(s.sessionCtx)
 	var backend loop.Backend
 	var err error
@@ -64,7 +64,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 				parent,
 				s,
 				bound,
-				restoredStateFrom(folded, ri),
+				restoredStateFrom(folded, ri, notifications),
 				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext()},
 			)
 		}
@@ -571,7 +571,7 @@ func restoreTopologySession(
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
 	foreignSID := findForeignSID(rootEvents)
-	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, activePlan.bindings, sessionID, rootLoopID, foreignSID, spawnedCount, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
+	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, activePlan.bindings, sessionID, rootLoopID, foreignSID, spawnedCount, folded, activeInference, activePlan.notifications, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		if constructionCleanupOwned(err) {
 			return nil, err
@@ -669,6 +669,10 @@ type loopPlan struct {
 	folded          foldResult
 	runtimeMismatch *RestoreRuntimeMismatchError
 	tombstoned      bool
+	// notifications are this loop's undelivered process completion
+	// notifications (Task 24C), computed by planLoops from allRecords and
+	// this plan's own events (see undeliveredProcessNotifications).
+	notifications []tool.ProcessCompletionNotification
 }
 
 // discoverRoots scans the full UNNARROWED replay for every LoopStarted, collecting the
@@ -797,6 +801,7 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		if plans[i].tombstoned && i == activeIndex {
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopExited}}
 		}
+		plans[i].notifications = undeliveredProcessNotifications(allRecords, plans[i].started.LoopID, causedCommandIDs(plans[i].events))
 	}
 	return plans, plans[activeIndex], nil
 }
@@ -934,7 +939,7 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 			}
 			continue
 		}
-		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.bindings, plan.folded, foldLoopInference(plan.events), findForeignSID(plan.events)); err != nil {
+		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.bindings, plan.folded, foldLoopInference(plan.events), plan.notifications, findForeignSID(plan.events)); err != nil {
 			mismatch, runtimeFailure := classifyRestoredChildRuntimeFailure(plan.bound, err)
 			if !runtimeFailure {
 				return err
@@ -1066,6 +1071,7 @@ func buildRestoredSession(
 	spawnedCount int,
 	folded foldResult,
 	ri restoredInference,
+	notifications []tool.ProcessCompletionNotification,
 	restoredGates map[gate.ID]gateEntry,
 	j journal.SessionJournal,
 	factory *event.Factory,
@@ -1179,7 +1185,7 @@ func buildRestoredSession(
 				loop.Provenance{},
 				s,
 				cfg,
-				restoredStateFrom(folded, ri),
+				restoredStateFrom(folded, ri, notifications),
 				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext()},
 			)
 		}

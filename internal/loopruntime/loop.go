@@ -522,6 +522,17 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		); err != nil {
 			return nil, err
 		}
+		if len(seed.PendingProcessNotifications) > 0 {
+			// Restore seed: come up already owning the undelivered process
+			// notifications the session reconstructed (already reconciled
+			// against durable causality) — the SAME live de-dup guard a fresh
+			// delivery populates, so restore and live delivery share one
+			// representation with no separate append or dispatch here.
+			state.processNotifications = make(map[uuid.UUID]tool.ProcessCompletionNotification, len(seed.PendingProcessNotifications))
+			for _, notification := range seed.PendingProcessNotifications {
+				state.processNotifications[notification.CommandID] = notification
+			}
+		}
 	}
 	go runLoop(lc, state)
 	return &Loop{
@@ -671,6 +682,23 @@ type loopState struct {
 	// Owned SOLELY by runLoop/the actor; control commands route by GateID and kind,
 	// then delete the entry. Cleared on turn end.
 	pendingGates map[gatedomain.ID]pendingGate
+
+	// processNotifications is the actor-owned bounded set of accepted process
+	// completion notifications (Task 24C), keyed by their stable CommandID. It
+	// is deliberately SEPARATE from inbox: a completion notification is
+	// metadata-only (no content.UserMessage to fold into a turn), so it never
+	// touches turn-start/tool-continuation machinery. It serves two jobs:
+	//   - a live de-dup guard, so an at-least-once redelivery of the SAME
+	//     CommandID (a crash between the supervisor's dispatch and its causality
+	//     commit) is dropped rather than double counted;
+	//   - restore seeding, populated directly from RestoredState.
+	//     PendingProcessNotifications at construction — already reconciled
+	//     against durable causality by the session, bypassing live dispatch.
+	// Bounded like the ordinary managed queues (loop.ManagedInputQueueCapacity):
+	// a full set is never grown further; the caller (Tools' supervisor) retries
+	// dispatch later with the same CommandID against the durable command, which
+	// remains authoritative (see command.ProcessNotificationStopped).
+	processNotifications map[uuid.UUID]tool.ProcessCompletionNotification
 }
 
 // newLoopState builds the actor-owned loop state with its identity (sessionID,
@@ -699,6 +727,17 @@ func newLoopState(sessionID, loopID uuid.UUID, parent Provenance) loopState {
 		pendingGates: make(map[gatedomain.ID]pendingGate),
 		external:     make(externalSlots),
 	}
+}
+
+// replyProcessNotification sends v on result iff result is non-nil (a
+// restore-reconstructed redelivery and a decoded wire record both carry a nil
+// Result — command.ProcessNotification.Result is a caller-owned buffered
+// channel, so this never blocks the actor).
+func replyProcessNotification(result chan<- command.ProcessNotificationResult, v command.ProcessNotificationResult) {
+	if result == nil {
+		return
+	}
+	result <- v
 }
 
 // turnResult is the turn goroutine's hand-back to the actor. The conversation is
@@ -1952,6 +1991,49 @@ func runLoop(cfg loopConfig, state loopState) {
 		// observable via the prior TurnStarted/TurnFoldedInto for this InputID.
 	}
 
+	// handleProcessNotification is the actor's Task 24C delivery point for a
+	// metadata-only process completion notification. It never folds into a
+	// turn or touches state.inbox (see processNotifications' doc). Every path
+	// replies exactly once on c.Result (nil-safe: a restore-reconstructed
+	// redelivery never reaches this method at all, and a decoded wire record
+	// always carries a nil Result).
+	handleProcessNotification := func(c command.ProcessNotification) {
+		if err := command.ValidateCommand(c); err != nil {
+			slog.Warn("invalid ProcessNotification command", "error", err)
+			replyProcessNotification(c.Result, command.ProcessNotificationStopped)
+			return
+		}
+		if c.Notification.SessionID != state.sessionID || c.Notification.LoopID != state.id {
+			// Defense in depth: the session already validates these coordinates
+			// against the live CommandRecord route before append, so this should
+			// never fire in production — but a misrouted delivery must never be
+			// silently accepted onto the wrong loop's guard.
+			slog.Warn("process notification addressed to a different session/loop",
+				"loop", state.id, "notification_loop", c.Notification.LoopID)
+			replyProcessNotification(c.Result, command.ProcessNotificationStopped)
+			return
+		}
+		if _, duplicate := state.processNotifications[c.Notification.CommandID]; duplicate {
+			// At-least-once redelivery: the causing dispatch already landed (or a
+			// retry raced it here). Metadata-only, so acting on it twice would cost
+			// only a redundant downstream read — but the guard drops it outright so
+			// the live set never double-counts one CommandID.
+			replyProcessNotification(c.Result, command.ProcessNotificationDuplicate)
+			return
+		}
+		if len(state.processNotifications) >= loop.ManagedInputQueueCapacity {
+			// Full: nothing is lost — the durable command remains authoritative and
+			// the supervisor retries dispatch later with the SAME CommandID.
+			replyProcessNotification(c.Result, command.ProcessNotificationStopped)
+			return
+		}
+		if state.processNotifications == nil {
+			state.processNotifications = make(map[uuid.UUID]tool.ProcessCompletionNotification)
+		}
+		state.processNotifications[c.Notification.CommandID] = c.Notification
+		replyProcessNotification(c.Result, command.ProcessNotificationAccepted)
+	}
+
 	cancelDelegateRequest := func(c command.CancelDelegateRequest) {
 		if err := c.Validate(); err != nil {
 			slog.Warn("invalid CancelDelegateRequest command", "error", err)
@@ -2337,6 +2419,9 @@ func runLoop(cfg loopConfig, state loopState) {
 
 		case command.CancelDelegateRequest:
 			cancelDelegateRequest(c)
+
+		case command.ProcessNotification:
+			handleProcessNotification(c)
 
 		case command.SetLoopMode:
 			// Select a predeclared mode for the NEXT turn. Validated against the bound

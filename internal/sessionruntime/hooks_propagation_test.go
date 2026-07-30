@@ -116,6 +116,7 @@ func TestForeignBuildersRemainIsolatedFromNativeHooks(t *testing.T) {
 		foldResult{},
 		restoredInference{},
 		nil,
+		nil,
 		fakeSessionJournal{},
 		event.NewFactory(uuid.New, time.Now),
 		uuid.New,

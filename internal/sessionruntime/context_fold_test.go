@@ -81,7 +81,7 @@ func TestFoldLoopCarriesContextBasisWithoutMeasurement(t *testing.T) {
 			if folded.HasContext || !folded.HasBasis || folded.Basis != wantBasis {
 				t.Fatalf("folded context=%v basis=%+v hasBasis=%v, want absent context and %+v", folded.HasContext, folded.Basis, folded.HasBasis, wantBasis)
 			}
-			seed := restoredStateFrom(folded, restoredInference{})
+			seed := restoredStateFrom(folded, restoredInference{}, nil)
 			if !seed.HasBasis || seed.Basis != wantBasis {
 				t.Fatalf("restored basis=%+v has=%v, want %+v true", seed.Basis, seed.HasBasis, wantBasis)
 			}
@@ -119,7 +119,7 @@ func TestFoldLoopRecordsDerivedPrefixAfterCompactionCommitted(t *testing.T) {
 		t.Fatalf("folded.Msgs = %+v, want exactly [committed.Summary] (CompactionCommitted fully replaces msgs)", folded.Msgs)
 	}
 
-	seed := restoredStateFrom(folded, restoredInference{})
+	seed := restoredStateFrom(folded, restoredInference{}, nil)
 	if seed.DerivedPrefix != 1 {
 		t.Fatalf("restoredStateFrom().DerivedPrefix = %d, want 1", seed.DerivedPrefix)
 	}
@@ -132,7 +132,7 @@ func TestFoldLoopRecordsDerivedPrefixAfterCompactionCommitted(t *testing.T) {
 	if uncompacted.DerivedPrefix != 0 {
 		t.Fatalf("uncompacted foldLoop().DerivedPrefix = %d, want 0", uncompacted.DerivedPrefix)
 	}
-	if seed := restoredStateFrom(uncompacted, restoredInference{}); seed.DerivedPrefix != 0 {
+	if seed := restoredStateFrom(uncompacted, restoredInference{}, nil); seed.DerivedPrefix != 0 {
 		t.Fatalf("uncompacted restoredStateFrom().DerivedPrefix = %d, want 0", seed.DerivedPrefix)
 	}
 }
@@ -162,7 +162,7 @@ func TestFoldLoopRestoresOnlyAutomaticAttemptLatch(t *testing.T) {
 			if folded.HasAutomaticBasis != tt.wantAutomatic || folded.AutomaticBasis != tt.wantBasis {
 				t.Fatalf("automatic basis=%+v has=%v, want %+v has=%v", folded.AutomaticBasis, folded.HasAutomaticBasis, tt.wantBasis, tt.wantAutomatic)
 			}
-			seed := restoredStateFrom(folded, restoredInference{})
+			seed := restoredStateFrom(folded, restoredInference{}, nil)
 			if seed.HasAutomaticBasis != tt.wantAutomatic || seed.AutomaticBasis != tt.wantBasis {
 				t.Fatalf("seed automatic basis=%+v has=%v, want %+v has=%v", seed.AutomaticBasis, seed.HasAutomaticBasis, tt.wantBasis, tt.wantAutomatic)
 			}

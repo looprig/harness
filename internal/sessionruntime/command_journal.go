@@ -10,8 +10,10 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreign"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -413,3 +415,193 @@ func isJournalLeaseLost(err error) bool {
 	var leaseLost *journal.JournalLeaseLostError
 	return errors.As(err, &leaseLost)
 }
+
+// commandAppenderResult is the OPTIONAL extension of commandAppender an
+// injected appender may additionally satisfy to report whether ITS OWN
+// durable append produced a NEW frame (Appended=true) or deduplicated an
+// already-durable retry (Appended=false — the underlying durable journal
+// recognized the command's idempotency id, its CommandID, as already
+// indexed). It mirrors pkg/hub's eventAppenderResult exactly, one Task 24C
+// process-notification delivery earlier used the SAME 24A idempotency
+// primitive on the event side for. The plain commandAppender surface is
+// never weakened (Interface Segregation): an appender written before this
+// extension existed, or one that simply does not implement it, keeps
+// satisfying commandAppender and is treated as if every successful append is
+// new — exactly its pre-extension behavior.
+type commandAppenderResult interface {
+	commandAppender
+	AppendCommandResult(ctx context.Context, rec journal.CommandRecord) (journal.AppendResult, error)
+}
+
+// appendCommandResultChecked is the process-notification path's STRICT append:
+// unlike appendCommand/appendCommandWithPolicy (audit-only: log and proceed),
+// a non-nil error here is returned to the caller unchanged — "Command append
+// failure remains explicit for this process-notification path" — including a
+// typed *journal.IdempotencyCollisionError when rec's CommandID already names
+// a durable record with a DIFFERENT persisted payload. It reports whether
+// THIS call durably persisted a NEW frame (true) or deduplicated an
+// already-durable retry (false); a nil appender (no-persistence/headless
+// mode) always reports a new frame, mirroring nopEventAppender's contract.
+func (s *Session) appendCommandResultChecked(ctx context.Context, rec journal.CommandRecord) (bool, error) {
+	app := s.cmdAppender
+	if app == nil {
+		return true, nil
+	}
+	if r, ok := app.(commandAppenderResult); ok {
+		result, err := r.AppendCommandResult(ctx, rec)
+		if err != nil {
+			return false, err
+		}
+		return result.Appended, nil
+	}
+	if err := app.AppendCommand(ctx, rec); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// boundLoopFor returns loopID's bound definition and channel handle under
+// loopsMu — the two facts NotifyProcessCompletion needs (the engine, to
+// refuse a foreign loop structurally, and the command sink, to dispatch).
+func (s *Session) boundLoopFor(loopID uuid.UUID) (loop.BoundDefinition, loop.Backend, bool) {
+	s.loopsMu.RLock()
+	defer s.loopsMu.RUnlock()
+	h, ok := s.loops[loopID]
+	if !ok {
+		return nil, nil, false
+	}
+	return h.bound, h.backend, true
+}
+
+// ProcessNotificationOwnerMismatchError reports that a Tools-supplied
+// ProcessCompletionNotification named a session other than the one this
+// Session was constructed for. A process resource is bound to exactly one
+// session for its whole lifetime, so a notification naming a different
+// session can only be a bug or a forged call — never a legitimate delivery —
+// and is rejected fail-secure before it ever reaches the durable journal or a
+// loop's command sink.
+type ProcessNotificationOwnerMismatchError struct {
+	Want uuid.UUID
+	Got  uuid.UUID
+}
+
+func (e *ProcessNotificationOwnerMismatchError) Error() string {
+	return "session: process notification session " + e.Got.String() +
+		" does not match owning session " + e.Want.String()
+}
+
+// ProcessNotificationUnsupportedError reports that a process completion
+// notification was addressed to a loop whose bound definition is not
+// EngineNative. Foreign engines never receive process notifications — they
+// have no backend arm to deliver one to, so accepting it would either block
+// forever or silently drop it; this refuses structurally, on the ENGINE,
+// mirroring loopHandle.ReplaceExternalTools' identical foreign-engine guard
+// (see loop_tools.go) rather than testing bindings or backend shape.
+type ProcessNotificationUnsupportedError struct {
+	LoopID uuid.UUID
+	Engine loop.Engine
+}
+
+func (e *ProcessNotificationUnsupportedError) Error() string {
+	return "session: process notifications unsupported on foreign-engine loop " + e.LoopID.String()
+}
+
+// ProcessNotificationDeliveryStoppedError reports that a durably-appended (or
+// deduplicated) ProcessNotification could not be delivered to its owning
+// loop right now: the loop's bounded live notification set is full, or the
+// loop exited concurrently with dispatch. The durable command remains
+// authoritative — the caller (Tools' supervisor) retries dispatch later with
+// the SAME CommandID; no re-append happens on that retry (24A's idempotency
+// index already recognizes the id).
+type ProcessNotificationDeliveryStoppedError struct {
+	LoopID uuid.UUID
+}
+
+func (e *ProcessNotificationDeliveryStoppedError) Error() string {
+	return "session: process notification delivery stopped for loop " + e.LoopID.String()
+}
+
+// NotifyProcessCompletion is Task 24C's real implementation of
+// tool.ProcessCompletionNotifier, attached behind the session-owned
+// sessionProcessServiceBridge exactly like 24B's checked lifecycle publisher
+// (see process_services.go's attachProcessCompletionNotifier). It reports
+// only the boundary contract's plain error (nil on ACCEPTED or DUPLICATE,
+// the durable append's typed collision on COLLISION, and a typed reason on
+// STOPPED); notifyProcessCompletion below carries the richer
+// command.ProcessNotificationResult a caller inspecting the disposition
+// (tests, and a future retry policy) needs.
+func (s *Session) NotifyProcessCompletion(ctx context.Context, n tool.ProcessCompletionNotification) error {
+	_, err := s.notifyProcessCompletion(ctx, n)
+	return err
+}
+
+// notifyProcessCompletion appends the durable completion command FIRST using
+// n's stable, pre-persisted CommandID (Harness installs it directly onto the
+// command's Header — it never mints a replacement), then — only after a
+// successful or deduplicated append — dispatches it to n's owning loop and
+// returns whatever disposition the loop's own live de-dup guard reports.
+// Command append failure is explicit here (unlike the audit-only
+// appendCommand path every other command uses): a non-collision append error
+// is returned unchanged and nothing is dispatched.
+func (s *Session) notifyProcessCompletion(ctx context.Context, n tool.ProcessCompletionNotification) (command.ProcessNotificationResult, error) {
+	if err := n.Validate(); err != nil {
+		return 0, err
+	}
+	if n.SessionID != s.sessionID {
+		return 0, &ProcessNotificationOwnerMismatchError{Want: s.sessionID, Got: n.SessionID}
+	}
+	bound, backend, ok := s.boundLoopFor(n.LoopID)
+	if !ok {
+		return command.ProcessNotificationStopped, &SessionError{Kind: SessionLoopNotFound}
+	}
+	if bound == nil {
+		return command.ProcessNotificationStopped, &ProcessNotificationUnsupportedError{LoopID: n.LoopID}
+	}
+	if engine := bound.Engine(); engine != loop.EngineNative {
+		return command.ProcessNotificationStopped, &ProcessNotificationUnsupportedError{LoopID: n.LoopID, Engine: engine}
+	}
+
+	result := make(chan command.ProcessNotificationResult, 1)
+	cmd := command.ProcessNotification{
+		Header:       command.Header{CommandID: n.CommandID, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()},
+		Notification: n,
+		Result:       result,
+	}
+	rec := journal.NewCommandRecord(s.sessionID, n.LoopID, cmd)
+	if err := journal.ValidateCommandRecordRoute(rec); err != nil {
+		// Defense in depth: cmd is built from n's already-validated fields
+		// directly above, so this should never fire in production, but a
+		// process-notification record — like a machine delegate request —
+		// never reaches the durable log unvalidated.
+		return 0, err
+	}
+	_, err := s.appendCommandResultChecked(ctx, rec)
+	if err != nil {
+		var collision *journal.IdempotencyCollisionError
+		if errors.As(err, &collision) {
+			return command.ProcessNotificationCollision, err
+		}
+		return 0, err
+	}
+
+	select {
+	case backend.CommandSink() <- cmd:
+	case <-backend.DoneChan():
+		return command.ProcessNotificationStopped, &ProcessNotificationDeliveryStoppedError{LoopID: n.LoopID}
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	select {
+	case disposition := <-result:
+		if disposition == command.ProcessNotificationStopped {
+			return disposition, &ProcessNotificationDeliveryStoppedError{LoopID: n.LoopID}
+		}
+		return disposition, nil
+	case <-backend.DoneChan():
+		return command.ProcessNotificationStopped, &ProcessNotificationDeliveryStoppedError{LoopID: n.LoopID}
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+var _ tool.ProcessCompletionNotifier = (*Session)(nil)

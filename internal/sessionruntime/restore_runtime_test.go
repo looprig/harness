@@ -245,14 +245,14 @@ func TestRestoredAdapterUsesRegistryAndFoldedAgentSessionID(t *testing.T) {
 	}
 	s := &Session{sessionCtx: context.Background(), sessionID: mustUUID(), newID: uuid.New, factory: event.NewFactory(uuid.New, time.Now), loops: make(map[uuid.UUID]*loopHandle), foreignRegistry: &registry}
 	ri := foldLoopInference([]event.Event{started, event.LoopAgentSessionBound{Header: started.Header, ACPSessionID: "bound-session"}})
-	if err := s.attachRestoredLoop(started, loop.Provenance{}, bound, tool.Bindings{SessionID: s.sessionID, LoopID: started.LoopID}, foldLoop([]event.Event{}), ri, "legacy-session"); err != nil {
+	if err := s.attachRestoredLoop(started, loop.Provenance{}, bound, tool.Bindings{SessionID: s.sessionID, LoopID: started.LoopID}, foldLoop([]event.Event{}), ri, nil, "legacy-session"); err != nil {
 		t.Fatalf("attachRestoredLoop: %v", err)
 	}
 	if builder.restoreSeed.AgentSessionID != "bound-session" {
 		t.Fatalf("AgentSessionID = %q, want bound-session", builder.restoreSeed.AgentSessionID)
 	}
 	missingSID := &Session{sessionCtx: context.Background(), sessionID: mustUUID(), newID: uuid.New, factory: event.NewFactory(uuid.New, time.Now), loops: make(map[uuid.UUID]*loopHandle), foreignRegistry: &registry}
-	if err := missingSID.attachRestoredLoop(started, loop.Provenance{}, bound, tool.Bindings{SessionID: missingSID.sessionID, LoopID: started.LoopID}, foldLoop([]event.Event{}), restoredInference{}, ""); err == nil {
+	if err := missingSID.attachRestoredLoop(started, loop.Provenance{}, bound, tool.Bindings{SessionID: missingSID.sessionID, LoopID: started.LoopID}, foldLoop([]event.Event{}), restoredInference{}, nil, ""); err == nil {
 		t.Fatal("attachRestoredLoop succeeded without an AgentSessionID or legacy foreign SID")
 	} else {
 		var restoreErr *RestoreError

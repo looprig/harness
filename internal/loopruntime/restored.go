@@ -7,6 +7,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 	model "github.com/looprig/inference/model"
 )
 
@@ -59,6 +60,17 @@ type RestoredState struct {
 
 	AutomaticBasis    event.ContextBasis
 	HasAutomaticBasis bool
+
+	// PendingProcessNotifications are Task 24C's undelivered process
+	// completion notifications reconstructed at restore: the session replays
+	// this loop's durable ProcessNotification commands and subtracts any
+	// whose CommandID already appears as the cause of one of this loop's
+	// durable Enduring events (already consumed before the crash). NewRestored
+	// seeds them directly into the actor's live de-dup guard — the SAME
+	// representation a live delivery populates — so restore never re-dispatches
+	// them through Loop.Commands (there is no live sender at restore time) and
+	// never re-appends them (they are already durable).
+	PendingProcessNotifications []tool.ProcessCompletionNotification
 }
 
 // NewRestored constructs a loop SEEDED with pre-built committed state and starts its

@@ -93,6 +93,8 @@ func ValidateCommand(cmd Command) error {
 		return validateGateRoute(CommandDenyToolCall, c.GateRoute)
 	case ProvideUserInput:
 		return validateGateRoute(CommandProvideUserInput, c.GateRoute)
+	case ProcessNotification:
+		return validateProcessNotification(c)
 	default:
 		// UserInput, Interrupt, Shutdown, and any other command: only CommandID is
 		// required (already checked above).
@@ -150,6 +152,19 @@ func validateCancelDelegateRequest(c CancelDelegateRequest) error {
 	return nil
 }
 
+// validateProcessNotification requires the generic envelope CommandID to
+// exactly equal the wrapped DTO's own stable CommandID (Task 4's contract:
+// Harness never mints a replacement id) and delegates the closed
+// coordinates/handle/state-reason validation to the DTO's own Validate — the
+// SAME bounded/enum-only checks Task 4 already built, so the command layer
+// never re-derives (and risks drifting from) that invariant set.
+func validateProcessNotification(c ProcessNotification) error {
+	if c.Notification.CommandID.IsZero() || c.Notification.CommandID != c.Header.CommandID {
+		return &CommandValidationError{Command: CommandProcessNotification, Field: FieldNotification, Rule: RuleInvalid}
+	}
+	return c.Notification.Validate()
+}
+
 // validateApproveAction requires exactly one of the two approve actions.
 // gate.ApprovalDeny travels on DenyToolCall, so it is rejected here alongside
 // unknown and empty actions — fail-secure: a record that does not name a valid
@@ -198,6 +213,8 @@ func commandName(cmd Command) CommandName {
 		return CommandInterrupt
 	case Shutdown:
 		return CommandShutdown
+	case ProcessNotification:
+		return CommandProcessNotification
 	default:
 		return CommandUnknown
 	}
