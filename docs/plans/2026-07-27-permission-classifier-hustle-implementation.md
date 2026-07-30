@@ -2772,7 +2772,111 @@ job):**
   recheck; they carry no real security logic and must not be mistaken for
   one.
 
-Commit `0bfd8262`.
+Commit `0bfd8262`. Doc commit `ca55bdf8`.
+
+### Follow-up 1 — classifiers: wiring real evidence tools to record observations
+
+Wired `evidence_filesystem_stat` (`pathStatTool`) and `evidence_filesystem_read`
+(`readFileTool`) — the two genuinely single-target evidence tools in
+`classifiers/internal/evidence` — to implement `tool.EvidenceObservation`.
+Deliberately NOT wired: `evidence_filesystem_list`/`glob`/`grep` (variable-size
+matched-entry sets, not one canonical target) and `evidence_git_repository_status`/
+`evidence_git_remotes` (whole-repository aggregates). `evidence_git_diff`/
+`evidence_git_branch` genuinely could be target-sensitive but need a small,
+deliberate carrier added to `tool.Requirement` first (its `Match`/`Scope` fields
+are already reserved for stored-rule-matching/access-routing, not a general
+structured-data carrier) — flagged as a Harness-side follow-up, not done here.
+
+Both wired tools share one formula, `filesystemObservationFingerprint(root, rel)`
+in the new `internal/evidence/observation.go`: a SHA-256 hex digest over
+netstring-encoded (`<byte-length>:<raw-bytes>`, collision-proof regardless of
+field content) fields — a fixed `"fsv1"` scheme-version literal, then either
+`"absent"` (a real valid token, not a skip — absence is itself a TOCTOU-relevant
+observation per design §13.4's own worked example) or `"present"` plus a 4-tuple
+(entry kind, decimal size, the RAW decimal `os.FileMode` bits — type and
+permission together, so a file→symlink swap always changes it — and decimal
+nanosecond mtime) from an `os.Root.Lstat` that never follows the final symlink;
+when that lstat entry IS itself a symlink, the formula additionally folds in the
+raw `Readlink` target text and the resolved target's own identical 4-tuple (or an
+explicit absent/unresolvable/unreadable marker). `Target` is the canonicalized
+absolute path (`filepath.Join(root, rel)`), self-describing with no side channel
+needed. Read deliberately reuses Stat's identical formula rather than a content
+hash, since `tool.Request` carries no offset/limit and a range-dependent token
+would not be independently re-derivable from `Target` alone — a documented,
+narrower-but-still-real trade-off (it still catches a file replaced by a symlink,
+just not a same-metadata content edit).
+
+Commit `5f44b31`. Separately, commit `e510cef` added `lint`/`vuln`/`secure`
+Makefile targets to this module (it declared the `gosec`/`staticcheck`/
+`govulncheck` tool deps but had no target running them, unlike Harness/CodeRig —
+a real, durable CI gap the Task 28 final spec review flagged as Important
+finding #2, now closed).
+
+### Follow-up 2 — CodeRig: the real EvidenceObservationVerifier
+
+`internal/app/permission_review_observation.go`'s `permissionReviewEvidenceObservation`
+independently REIMPLEMENTS classifiers' token formula from scratch (never
+imports or copies classifiers' source — the independent reimplementation is
+what makes the recheck a genuine trust boundary, not a copy-paste convenience),
+verified byte-for-byte against both a hand-written reference formula in its own
+test and classifiers' real production token output. Wired via the new
+`rig.WithPermissionReviewObservations(verifier)`, reusing the same canonical
+`ReadRoot` and `SecurityCeiling` values `permissionReviewEvidenceContainment`
+already computes (via a newly extracted shared `canonicalizeEvidenceReadRoot`
+helper) — one source of truth for containment and observation, consistency by
+construction rather than by convention. Commit `80c61eb`.
+
+**A genuine cross-repo bug was found and fixed while building this, not just
+new code.** CodeRig's own end-to-end symlink-swap acceptance test
+(`TestPermissionReviewObservationSymlinkSwapBlocksAutoApprovalEndToEnd`)
+initially failed against Harness's `0bfd8262`/`ca55bdf8` — not a CodeRig bug.
+Harness's `internal/hustleruntime.executeWithEvidence` derives its per-evidence-
+call context via `newEvidenceAttemptContext`, which deliberately strips every
+ambient context value from its caller — a real, intentional isolation boundary,
+proven by its own `TestEvidenceExecutionStripsAmbientContextAuthority`. That
+silently dropped the `ObservationCollector` value `internal/sessionruntime/
+review_adapter.go`'s `reviewOne` attaches several call frames above, so **every
+real target-sensitive evidence-tool call recorded nothing**, and the whole
+pre-approval recheck (`verifyPermissionReviewObservations`) always took its
+"nothing was ever recorded" no-op branch — auto-approval proceeded exactly as
+if the Critical fix did not exist. Every pre-existing Harness unit test attached
+the collector directly at `evidenceRunner.run`, bypassing this exact boundary,
+which is why unit-level verification of `0bfd8262` did not catch it — only a
+genuine end-to-end test across the module boundary surfaced it. Fixed in
+Harness commit `ddf99df3`: a one-line re-attachment of the collector
+immediately after `newEvidenceAttemptContext` runs (`WithObservationCollector`
+is a no-op for the nil collector every non-review Hustle has, so this changes
+nothing outside a classifier review), scoped narrowly rather than loosening
+the general isolation guarantee, plus a new regression test,
+`TestRunAndFinalizeThreadsObservationCollectorThroughRealEvidenceExecution`,
+which attaches the collector at the real production call site
+(`RunAndFinalize`'s own ctx) instead of shortcutting straight to
+`evidenceRunner.run` the way every prior test in that file did. Independently
+confirmed (not just trusted) to fail against pre-fix code and pass after, via a
+scratch `git apply -R` of just that commit's `execution.go` hunk.
+
+**Lesson for future work in this codebase**: when a fix spans a module or
+context-isolation boundary, unit tests that attach test doubles/values on the
+near side of that boundary can pass while the real, full-stack path is
+silently broken. Prefer an end-to-end test that cannot shortcut the boundary
+whenever a fix's whole point is closing a gap between two components.
+
+### Deferred, not fixed here — CodeRig's SecurityCeiling is session-wide, not role-scoped
+
+The Task 28 final spec-compliance review separately flagged (Important finding
+#4, independent of the TOCTOU gap this addendum closes) that
+`internal/app/permission_review.go`'s `SecurityCeiling` is one session-wide
+value rather than scoped per role/reviewer, inherited from a Harness-level
+simplification Addendum 3 already documented as a known limitation. Assessed
+as not currently exploitable — `SecurityCeiling` is not consumed by the
+eligibility risk/authorization matrix, only by drift-binding (both this
+addendum's new observation recheck and the pre-existing basis-drift check),
+and both sides of any drift comparison use the same static value — but it
+does mean drift-detection is inert across roles, which undermines the
+"effective for the one review being evaluated" intent design §13.1/§21 state.
+**User decision (asked directly): defer, document as a known limitation, do
+not block finishing this branch on it.** Recorded here as the disclosed
+follow-up; not addressed by any commit in this addendum.
 
 ---
 
