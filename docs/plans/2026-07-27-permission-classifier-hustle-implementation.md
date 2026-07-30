@@ -2498,6 +2498,284 @@ without explicit user authorization.
 
 ---
 
+## Addendum 4 — TOCTOU observation-token wiring (pre-Phase-8/final)
+
+Task 28's final spec-compliance review raised a genuine Critical finding,
+independently re-verified (not just trusted) before dispatch: design §13.4's
+observation-token TOCTOU mechanism was entirely unimplemented.
+`gate.ReviewBasis` had no observation field; `pkg/tool/definition.go`'s
+`EvidenceFactoryBindings` doc comment explicitly said it "deliberately has no
+... observations ... capability"; the only test with "observation" in its
+name (`review_race_test.go`'s "observation drift (context and security
+ceiling both moved on)" subtest) just combined two unrelated pre-existing
+drift dimensions and proved nothing about a real token recheck. Concrete
+attack this closes: a classifier's evidence tool inspects a target (for
+example, confirms a deletion target is empty/non-symlinked), the classifier
+assesses "safe, auto-approve" based on that observation, the target is
+swapped after evidence-gathering but before the gate is claimed, and nothing
+previously detected it.
+
+This addendum is Harness-side structural mechanism only — new types, a new
+interface, a new recheck point, a new rig option — mirroring the
+already-proven `EvidenceAccessEvaluator`/`EvidenceContainmentVerifier`/
+`EvidenceContainmentPolicy` seam (Addendum 2) rather than inventing a new
+shape. Harness owns the public interface; a consumer (CodeRig, via a
+sandbox-aware implementation) supplies the real verifier; Harness's own code
+never implements target-resolution logic itself, the same reasoning
+`pkg/gate/evidence.go`'s doc comments already give for containment. Real
+evidence tools recording observations, and CodeRig's real verifier
+implementation, are explicitly out of scope — separate follow-up dispatches,
+described below.
+
+**What was added:**
+
+- `pkg/gate` (new `observation.go`): `ObservationRequirement{Target, Token
+  string}` — one canonical-identity/token pair a target-sensitive evidence
+  tool recorded, bounded and validated (`Valid()`: non-empty, valid UTF-8, no
+  NUL, ≤4KiB each). An ordinary comparable Go value — no bespoke `Equal`
+  method, directly usable as a map key or in a slice. `EvidenceObservationVerifier`
+  — the consumer-supplied recheck seam, `VerifyEvidenceObservations(ctx,
+  EvidenceContainmentPolicy, []ObservationRequirement) error` — deliberately
+  reuses `EvidenceContainmentPolicy` rather than introducing a parallel
+  `EvidenceObservationPolicy`: the security context (canonical `ReadRoot`
+  plus the review's own non-widenable `SecurityCeiling`) is identical to what
+  `EvidenceContainmentVerifier` already needs, and a second policy type would
+  only invite the two to drift. `gate.PermissionAssessmentOutcome` gained an
+  `Observations []ObservationRequirement` field, validated inside
+  `CombinePermissionAssessments` exactly like `Assessment` already is
+  (bounded to `MaxObservationRequirementsPerAssessment` = 256, each entry
+  well-formed, empty unless `Status == ReviewStatusAllowed`).
+- **Threading decision (basis vs. sibling structure):** observations do NOT
+  live on `gate.ReviewBasis`/`PermissionReviewSubject`. Those are constructed
+  and digest-stamped by `reviewOne` *before* the classifier's Hustle runs
+  (and therefore before any evidence-gathering, and any observation, can
+  exist) — folding observations in there was structurally impossible, not
+  just undesirable. Instead they travel as a sibling value attached to
+  `gate.PermissionAssessmentOutcome` (produced *after* the Hustle run
+  completes) and are aggregated by `classifierApprovalBasis` alongside the
+  existing basis/reason derivation, concatenated (not deduplicated — two
+  classifiers independently observing the same target is a stronger, not
+  weaker, signal) across every contributing classifier.
+- `pkg/tool` (`tool.go`): new optional capability `EvidenceObservation`
+  (`ObservedRequirement(Request, *ToolResult) (target, token string, ok
+  bool)`), probed by type assertion mirroring the existing
+  `Sequential`/`Auditable`/`WriteTarget` pattern. Returns plain strings, not
+  a `gate.ObservationRequirement` — `pkg/tool` cannot import `pkg/gate` (the
+  reverse already holds, so importing back would cycle); the evidence
+  runtime, which already imports both, does the conversion and validation at
+  the call site.
+- `internal/hustleruntime` (new `observation_collector.go`): `ObservationCollector`,
+  a small mutex-guarded accumulator (capped at `MaxObservationsPerRun` = 256,
+  the same bound as the outcome-level cap — defense in depth, two layers).
+  `WithObservationCollector`/an unexported `observationCollectorFromContext`
+  attach/read it via `context.Value`, mirroring the existing
+  `withPreparedEvidenceCall`/`loop.WithPreparedCall` per-call-capability
+  convention, rather than widening `hustle.Result`/`hustle.Outcome` — those
+  are generic across every Hustle definition (including non-review ones like
+  compaction), and observations are a permission-review-specific concern.
+  `evidenceRunner.run`'s per-call loop (`evidence_runner.go`) calls the new
+  `recordEvidenceObservation` immediately after `executeEvidenceCall`
+  succeeds: it probes the concrete tool for `tool.EvidenceObservation` under
+  a local `recover` (a tool implementation is trusted but fallible, exactly
+  like a permission classifier's `Applies`/`MarshalInput`/`ValidateResult` —
+  `pkg/gate/reviewer.go`'s `PermissionClassifierPanicError` doc comment), and
+  drops (never records, never fails the already-succeeded evidence call) any
+  report that is malformed, panics, or declines (`ok == false`).
+- `internal/sessionruntime`: `reviewOne` (`review_adapter.go`) creates one
+  fresh `ObservationCollector` per classifier's `RunAndFinalize` call,
+  attaches it only to that call's own context, and reads it back afterward
+  onto the returned outcome (only on the `ReviewStatusAllowed` path — a
+  classifier whose run ultimately failed discards whatever it observed,
+  correctly, since a non-allowed outcome can never itself contribute to
+  eligibility). `permissionReviewResponder`/`respondFromClassifier`
+  (`gates.go`) gained a new `observations []gate.ObservationRequirement`
+  parameter.
+
+  **The I/O-under-lock judgment call:** the four pre-existing drift checks
+  (`ToolExecutionID`/`ContextRevision`/`SecurityCeiling`/`GatePolicyRevision`)
+  run *inside* `respondGateCore`'s `gatesMu` critical section specifically
+  because they are cheap, non-blocking, pure in-memory field comparisons —
+  the existing doc comment's own words: "so there is no TOCTOU window." An
+  observation recheck cannot share that placement: `EvidenceObservationVerifier`
+  performs real I/O (re-stat a file, resolve a git ref against a live
+  filesystem or VCS). Holding `gatesMu` across that I/O would trade a narrow,
+  already-small TOCTOU window for a categorically worse one — unbounded
+  latency (or an outright hang, if the verifier's own I/O blocks) while
+  holding a lock every OTHER concurrent gate response in the session (human
+  or classifier, for any gate) also needs, turning one slow or broken
+  verifier into a session-wide stall. The recheck (`verifyPermissionReviewObservations`,
+  new in `gates.go`) therefore runs synchronously but deliberately OUTSIDE
+  the lock, immediately before `respondFromClassifier` calls
+  `s.respondGateCore` — as late as reasonably possible before the claim
+  without ever holding `gatesMu` across I/O. On failure/mismatch it returns
+  `(false, nil)` without calling `respondGateCore` at all, exactly the same
+  "stale, silently dropped, no session fault" contract every other drift
+  path already uses, and feeds the same design §18 stale-response circuit
+  breaker (`recordPermissionReviewStale`) via a short, separately locked
+  `gateCoordinatesForStale` peek (never held across the verifier's I/O).
+
+  **Residual TOCTOU window:** the gap between `verifyPermissionReviewObservations`
+  returning `true` and `respondGateCore`'s own lock-protected claim a few
+  lines later — a handful of in-process instructions, not the
+  seconds-to-minutes of evidence-gathering-plus-classifier-inference window
+  this whole mechanism exists to close. That residual window is bounded not
+  by this recheck but by design §13.4's closing requirement, unchanged and
+  still fully enforced: the pre-existing symlink-swap, containment,
+  grant-target, and sandbox checks remain mandatory regardless — "the
+  eventual tool still consumes its original prepared artifact." The
+  alternative (holding `gatesMu` across the verifier call) was rejected
+  because it converts a vanishingly small, already-covered-by-other-checks
+  window into an unbounded-latency session-wide lock hazard for a strictly
+  smaller security benefit.
+
+  **Nil-verifier asymmetry (deliberate, not an oversight):** zero recorded
+  observations always returns `true` without ever calling a configured
+  verifier — a session with no target-sensitive evidence tools has nothing
+  to recheck, and must not be forced to wire one "just in case" (Interface
+  Segregation). One or more recorded observations reaching a `nil`
+  `permissionReviewObservationVerifier`, by contrast, is treated identically
+  to a genuine verifier-reported mismatch — fail closed, never a silent
+  skip. This is the "consumer wired a target-sensitive evidence tool but
+  forgot `rig.WithPermissionReviewObservations`" misconfiguration case,
+  and letting it silently degrade to "recheck skipped, approval proceeds"
+  would have been exactly the fail-open gap this whole addendum exists to
+  close.
+- `internal/sessionruntime` (`session.go`/`lifecycle.go`): new private
+  `withPermissionReviewObservationVerifier` `Option`, new
+  `permissionReviewObservationVerifier gate.EvidenceObservationVerifier`
+  `Session` field (nil-safe, no fail-closed construction-time check — see
+  below), and a new exported `WithLifecyclePermissionReviewObservations`
+  `LifecycleOption`, threaded into both `NewSession` and `RestoreSession`
+  identically, mirroring `WithLifecyclePermissionReviewEvidence`'s shape but
+  — unlike it — applied conditionally (`permissionReviewObservationVerifierConfigured`),
+  since omitting it is a fully supported terminal state, not a gap papered
+  over later.
+- `pkg/rig` (`options.go`/`definition.go`/`errors.go`): new
+  `WithPermissionReviewObservations(gate.EvidenceObservationVerifier) Option`.
+
+  **Separate option, not folded into `WithPermissionReviewEvidence`:** the
+  two are independent concerns — an evidence-tool access boundary a session
+  needs whenever ANY registered classifier declares evidence tools, versus a
+  TOCTOU recheck a session needs only when at least one of those evidence
+  tools is target-sensitive. Folding observations in as a fourth
+  `WithPermissionReviewEvidence` parameter would force every existing and
+  future caller with no target-sensitive evidence tools — the common case
+  today, since no evidence tool in this codebase declares itself
+  target-sensitive yet — to pass an explicit `nil` for a concern it will
+  never use, an Interface Segregation violation this repository's own
+  `CLAUDE.md` guidance calls out directly.
+
+  **Define()-time pairing — asymmetric by design:** `validatePermissionReviewObservations`
+  rejects `WithPermissionReviewObservations` as
+  `DefinitionUnusedPermissionReviewObservations` when configured without any
+  classifier registered, or without `WithPermissionReviewEvidence` also
+  configured (there being no evidence runtime at all for an observation to
+  ever be recorded into). There is **deliberately no symmetric "missing"
+  error** the way `WithPermissionReviewEvidence` itself is required whenever
+  `anyClassifierNeedsEvidence` reports true. That check is possible only
+  because `hustle.Definition.EvidenceToolPolicy()` already gives `Define()` a
+  real, static, per-classifier "does this need an evidence runtime at all"
+  signal. Nothing analogous exists yet for "is any of this classifier's
+  evidence tools target-sensitive": `tool.EvidenceObservation` is a
+  per-concrete-tool runtime capability, probed only after a call executes,
+  not a static `Definition`-level property `Define()` could inspect ahead of
+  time (unlike `tool.EvidenceKindDeclarer`, Addendum 2's analogous
+  fail-fast-at-construction declarer for `Requirement.Kind`). Manufacturing a
+  parallel static declarer purely to unlock a Define()-time "missing" check,
+  before any real tool exists that would ever set it, would have been
+  speculative generality with no consumer to validate it against. Runtime's
+  fail-closed nil-verifier-with-observations behavior (above) covers the gap
+  instead: a consumer who later adds a target-sensitive evidence tool
+  without also wiring this option gets an always-safe (if initially
+  confusing, and always correctable) runtime outcome rather than a false
+  sense of protection. If a future evidence-tool capability gives `Define()`
+  a real static signal, tightening this to a "missing" pairing error too is
+  a natural, non-breaking follow-up.
+
+**Tests** (all re-run fresh, PASS, `-race` included; `go vet`, `staticcheck`,
+`gosec`, and `govulncheck` all clean across the whole module):
+
+- `pkg/gate`: `TestObservationRequirementValid` (construction/bounds table:
+  empty, invalid UTF-8, NUL byte, at/over the byte cap) and
+  `TestObservationRequirementComparable` (plain-value equality, map-key
+  usability). `TestCombinePermissionAssessments`/
+  `TestCombinePermissionAssessmentsRequiresCompleteRegisteredSet` gained new
+  table rows: observations surviving combination on an eligible outcome,
+  and rejection for observations on a non-applicable outcome, a malformed
+  observation, and too many observations.
+- `internal/hustleruntime` (`observation_collector_test.go`): a well-formed
+  observation is recorded from a reporting tool and reaches the collector
+  attached to the run's context; a non-reporting tool, a tool that declines
+  (`ok=false`), a malformed report, and a panicking report are all
+  correctly dropped without failing the underlying evidence call; no
+  collector attached is a no-op; `ObservationCollector`'s count bound and
+  nil-receiver safety are tested directly.
+- `internal/sessionruntime/review_race_test.go`: five new tests alongside
+  the pre-existing drift table —
+  `TestRespondFromClassifierObservationMatchApprovesAndClosesGate` (a
+  matching observation approves exactly like the base case, and asserts the
+  verifier was called with the session's own current `wsRoot`/security
+  ceiling), `TestRespondFromClassifierObservationMismatchDropsSilently` (a
+  mismatch is dropped exactly like every other drift outcome: no command,
+  no `GateResolved`, gate stays open),
+  `TestRespondFromClassifierObservationsWithoutVerifierIsStale` (the
+  fail-closed nil-verifier-with-observations case),
+  `TestRespondFromClassifierNoObservationsSkipsVerifierEvenWhenConfigured`
+  (the converse: zero observations never even calls a configured verifier),
+  and `TestRespondFromClassifierObservationMismatchFeedsCircuitBreaker`
+  (design §18 integration). The pre-existing table's misleadingly-named
+  "observation drift (context and security ceiling both moved on)" subtest
+  — which only ever combined two of the four ORIGINAL basis-field
+  comparisons and predates this real mechanism — is renamed to "context and
+  security ceiling drift together" rather than deleted or left
+  misleadingly named.
+- `pkg/rig` (new `permission_review_observations_test.go`): nil-verifier and
+  duplicate-option rejection; the "unused" pairing error with no classifiers
+  registered at all (via `Define()`) and, separately, with classifiers
+  registered but no evidence configured (via a direct
+  `validatePermissionReviewObservations(state)` call, isolating that branch
+  from the earlier, unrelated `DefinitionMissingPermissionReviewEvidence`
+  check every registered classifier in this codebase currently also trips —
+  see the function's own doc comment); and two end-to-end positive paths —
+  `Define()`+`NewSession()` succeeding both with and without
+  `WithPermissionReviewObservations` configured, proving the option is
+  genuinely optional, not silently required. `pkg/rig/README.md`'s "How to
+  use" example gained the new option, and
+  `TestReadmeExamplePermissionReviewOptionsCompileAndSucceed` was updated
+  to exercise it, preserving that test's own "a rename or signature change
+  breaks this test instead of leaving the README silently stale" guarantee.
+
+**What remains deferred (explicit follow-up dispatches, not this one's
+job):**
+
+- **classifiers repository:** wiring the actual evidence tools
+  (`evidence_filesystem_stat` and any other single-target tool — NOT
+  glob/grep-style multi-match tools, which observe many candidates rather
+  than resolving one canonical target) to implement `tool.EvidenceObservation`
+  and report a real `(target, token)` pair derived from what they actually
+  observed (for example, a canonicalized path plus a hash of stable
+  stat/git metadata). This dispatch deliberately built the mechanism to
+  support that without further Harness-side change: `Observations` is a
+  slice (multiple targets per review are already supported, not just
+  exactly-one), and the capability is purely additive (a tool that never
+  implements it is unaffected).
+- **CodeRig:** the real `gate.EvidenceObservationVerifier` implementation —
+  sandbox-aware canonical-identity resolution and token re-derivation,
+  mirroring how `EvidenceContainmentVerifier`'s own real implementation
+  independently re-resolves every prepared evidence target. It plugs in via
+  `rig.WithPermissionReviewObservations(verifier)`, called the same place
+  `WithPermissionReviewEvidence` already is in CodeRig's own composition
+  root. This dispatch's stub test verifiers
+  (`stubPermissionReviewObservationVerifier` in `pkg/rig`,
+  `observationVerifierStub` in `internal/sessionruntime`) prove the seam is
+  reachable end-to-end from `Define()` through to `respondFromClassifier`'s
+  recheck; they carry no real security logic and must not be mistaken for
+  one.
+
+Commit `0bfd8262`.
+
+---
+
 # Acceptance ledger
 
 Update this table only from fresh command output:
