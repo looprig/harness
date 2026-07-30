@@ -73,9 +73,13 @@ func turnStarted(sid, loop, turn uuid.UUID) event.TurnStarted {
 }
 
 // turnDone builds a valid loop-scoped TurnDone (reconstructed as LastTurn).
-func turnDone(sid, loop, turn uuid.UUID) event.TurnDone {
+// eventID must be distinct across every TurnDone appended to the same
+// journal: a fixed, shared EventID across two different TurnDone events
+// (different TurnID/content) is a genuine idempotency collision under
+// journal's fingerprint-based dedup (pkg/journal), not a legitimate retry.
+func turnDone(sid, loop, turn, eventID uuid.UUID) event.TurnDone {
 	return event.TurnDone{
-		Header:    event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: loop, TurnID: turn}, EventID: fixedUUID(0xA2)},
+		Header:    event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: loop, TurnID: turn}, EventID: eventID},
 		TurnIndex: 1,
 		Message:   aiMsg("done"),
 	}
@@ -275,7 +279,7 @@ func TestReaderReadStatus(t *testing.T) {
 				update(t, cat, sessionStarted(sid), 1)
 				update(t, cat, turnStarted(sid, loop, turn), 2)
 				update(t, cat, stepDone(sid, loop, turn, step), 3)
-				update(t, cat, turnDone(sid, loop, turn), 4)
+				update(t, cat, turnDone(sid, loop, turn, fixedUUID(0xA2)), 4)
 			},
 			wantState: "idle", wantLastTurn: true, wantLastStep: true,
 		},
@@ -388,12 +392,12 @@ func TestReaderReadJournal(t *testing.T) {
 		openPayload := gate.OpenPayload{GateID: g.ID, Payload: gate.PermissionPayload{Request: tool.Request{ToolName: "Bash", Summary: "echo ok", Requirements: []tool.Requirement{{Kind: "tool.invoke", Scope: "Bash", Match: "echo ok", Description: "run: echo ok"}}}}}
 
 		recs := []journal.JournalRecord{
-			journal.NewEventRecord(sessionStarted(sid)),                  // seq 2 (after opening fence at 1)
-			journal.NewGatePreparedRecord(prepared, openPayload),         // seq 3 (filtered)
-			journal.NewEventRecord(hustleStarted(t, sid)),                // seq 4 (internal, filtered)
-			journal.NewEventRecord(permissionReviewCompleted(sid)),       // seq 5 (internal, filtered)
-			journal.NewEventRecord(turnDone(sid, loop, fixedUUID(0x74))), // seq 6
-			journal.NewEventRecord(turnDone(sid, loop, fixedUUID(0x75))), // seq 7
+			journal.NewEventRecord(sessionStarted(sid)),                                   // seq 2 (after opening fence at 1)
+			journal.NewGatePreparedRecord(prepared, openPayload),                          // seq 3 (filtered)
+			journal.NewEventRecord(hustleStarted(t, sid)),                                 // seq 4 (internal, filtered)
+			journal.NewEventRecord(permissionReviewCompleted(sid)),                        // seq 5 (internal, filtered)
+			journal.NewEventRecord(turnDone(sid, loop, fixedUUID(0x74), fixedUUID(0xA6))), // seq 6
+			journal.NewEventRecord(turnDone(sid, loop, fixedUUID(0x75), fixedUUID(0xA7))), // seq 7
 		}
 		for _, rec := range recs {
 			if _, err := j.Append(context.Background(), rec); err != nil {
