@@ -107,6 +107,21 @@ func AssessDrift(baseline, candidate ConfigManifest) DriftAssessment {
 		}
 		add(DriftPermission, "review_configured",
 			boolID(baseline.PermissionReviewConfigured), boolID(candidate.PermissionReviewConfigured), severity)
+	} else if baseline.PermissionReviewConfigured && candidate.PermissionReviewConfigured &&
+		baseline.PermissionReviewPolicyRev != candidate.PermissionReviewPolicyRev {
+		// Both sides stay configured, but the review POLICY's own identity
+		// changed underneath the still-enabled reviewer (e.g. a strict custom
+		// policy replaced by a looser default). This is the directional
+		// counterpart of the review_configured Warn above, for the
+		// posture-narrows-invisibly gap an opaque TopologyRev-only comparison
+		// cannot catch: TopologyRev also folds in ordinary loop topology, so
+		// its own drift stays Info (below) even though it happens to also
+		// change here. Direction is unknowable from a revision LABEL alone
+		// (unlike PermissionStrictness/ConfinementStrictness, a review
+		// policy carries no ordered level), so this fails secure exactly
+		// like assessDirectional's unknown-direction case: any change warns.
+		add(DriftPermission, "review_policy_rev",
+			baseline.PermissionReviewPolicyRev, candidate.PermissionReviewPolicyRev, DriftWarn)
 	}
 	if baseline.WorkspaceRoot != candidate.WorkspaceRoot {
 		add(DriftWorkspace, "", baseline.WorkspaceRoot, candidate.WorkspaceRoot, DriftWarn)

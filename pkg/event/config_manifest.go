@@ -12,7 +12,10 @@ import (
 // changes the canonical encoding, which changes every fingerprint — restore
 // therefore never treats raw fingerprint inequality across schema versions as
 // drift (see AssessDrift) and records a one-time baseline upgrade instead.
-const ManifestSchemaVersion uint32 = 1
+//
+// v2 adds PermissionReviewPolicyRev to the canonical encoding (the
+// review-policy-identity-drift-while-enabled fix).
+const ManifestSchemaVersion uint32 = 2
 
 // manifestEncodingDomain separates manifest digests from every other SHA-256
 // in the system. It is part of the durable contract; never change it without a
@@ -65,16 +68,34 @@ type ConfigManifest struct {
 	PermissionStrictness      StrictnessLevel `json:"permission_strictness,omitzero"`
 	// PermissionReviewConfigured reports only whether ANY permission-review
 	// classifier was registered for this session — never the classifier or
-	// policy identity itself (that stays folded into TopologyRev, for
-	// detecting drift AMONG already-enabled classifiers). It exists so
-	// AssessDrift has a directionally-comparable signal for the one
-	// transition an opaque digest can't distinguish: classifiers going from
-	// unconfigured to configured across a restore, which must never resume
-	// silently (design §21).
-	PermissionReviewConfigured bool            `json:"permission_review_configured,omitzero"`
-	ConfinementRev             string          `json:"confinement_rev,omitzero"`
-	ConfinementStrictness      StrictnessLevel `json:"confinement_strictness,omitzero"`
-	ExternalCapabilityRev      string          `json:"external_capability_rev,omitzero"`
+	// policy identity itself (the classifier SET's identity stays folded into
+	// TopologyRev, for detecting drift among already-enabled classifiers,
+	// classified Info like the rest of TopologyRev). It exists so AssessDrift
+	// has a directionally-comparable signal for the one transition an opaque
+	// digest can't distinguish: classifiers going from unconfigured to
+	// configured across a restore, which must never resume silently (design
+	// §21).
+	PermissionReviewConfigured bool `json:"permission_review_configured,omitzero"`
+	// PermissionReviewPolicyRev is the review POLICY's own Revision label
+	// (gate.PermissionReviewPolicy.Revision — e.g. "strict-policy-v1"),
+	// carried SEPARATELY from TopologyRev (which also folds this same value
+	// in, alongside classifier identity, for backward-compatible digest
+	// coverage). Without this dedicated field, a policy-identity change while
+	// classifiers stay configured on both sides is visible only as an opaque
+	// TopologyRev digest difference — classified DriftInfo like any other
+	// topology change and silently auto-accepted by DefaultPolicyDecider, so
+	// a session opened under a strict review policy (e.g. MaximumAutoRisk:
+	// low) could restore under a looser one (e.g. default MaximumAutoRisk:
+	// high) with no warning at all. AssessDrift compares this field
+	// DIRECTLY (Warn on any change) whenever PermissionReviewConfigured is
+	// true on both sides — the same kind of directional fix already applied
+	// to PermissionReviewConfigured itself for the disabled->enabled
+	// transition, extended to cover an already-enabled reviewer's policy
+	// identity changing underneath it.
+	PermissionReviewPolicyRev string          `json:"permission_review_policy_rev,omitzero"`
+	ConfinementRev            string          `json:"confinement_rev,omitzero"`
+	ConfinementStrictness     StrictnessLevel `json:"confinement_strictness,omitzero"`
+	ExternalCapabilityRev     string          `json:"external_capability_rev,omitzero"`
 	// AppFields are application-defined, secret-free compatibility fields.
 	// Canonically encoded in sorted key order.
 	AppFields map[string]string `json:"app_fields,omitzero"`
@@ -130,6 +151,7 @@ func (m ConfigManifest) canonical() []byte {
 		reviewConfiguredFlag = 1
 	}
 	material = binary.BigEndian.AppendUint64(material, reviewConfiguredFlag)
+	material = appendManifestString(material, m.PermissionReviewPolicyRev)
 	material = appendManifestString(material, m.ConfinementRev)
 	material = binary.BigEndian.AppendUint64(material, uint64(m.ConfinementStrictness))
 	material = appendManifestString(material, m.ExternalCapabilityRev)

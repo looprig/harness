@@ -378,7 +378,10 @@ func TestPermissionReviewFingerprintDomainsIndependentlyChangeIdentity(t *testin
 // AssessDrift uses to catch the disabled->enabled silent-reviewer-activation bug
 // (design §21) is actually wired from the real rig-level review projection: set
 // only when a review IS configured (review != nil), never derived from anything
-// else, and independent of classifier/policy identity (which stays in TopologyRev).
+// else. It also proves the companion PermissionReviewPolicyRev field (the
+// review-policy-identity-drift-while-enabled fix) is wired from the SAME
+// projection's own review policy revision -- classifier identity itself
+// still stays folded into TopologyRev only, exactly as before.
 func TestFrozenManifestWithPermissionReviewSetsConfigured(t *testing.T) {
 	t.Parallel()
 	definition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
@@ -389,6 +392,9 @@ func TestFrozenManifestWithPermissionReviewSetsConfigured(t *testing.T) {
 	)
 	if disabled.PermissionReviewConfigured {
 		t.Fatal("PermissionReviewConfigured = true with no review configured, want false")
+	}
+	if disabled.PermissionReviewPolicyRev != "" {
+		t.Fatalf("PermissionReviewPolicyRev = %q with no review configured, want empty", disabled.PermissionReviewPolicyRev)
 	}
 
 	classifier := defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("status"))
@@ -403,6 +409,56 @@ func TestFrozenManifestWithPermissionReviewSetsConfigured(t *testing.T) {
 	)
 	if !enabled.PermissionReviewConfigured {
 		t.Fatal("PermissionReviewConfigured = false with a review configured, want true")
+	}
+	if enabled.PermissionReviewPolicyRev != "review-policy-v1" {
+		t.Fatalf("PermissionReviewPolicyRev = %q, want %q", enabled.PermissionReviewPolicyRev, "review-policy-v1")
+	}
+}
+
+// TestFrozenManifestWithPermissionReviewPolicyRevChangesWithPolicyOnly proves
+// PermissionReviewPolicyRev tracks EXACTLY the review policy's own revision --
+// changing while the classifier set stays byte-identical, and NOT changing
+// when only the classifier set changes under the SAME policy revision (that
+// remains TopologyRev's job). This is what lets AssessDrift's new
+// review_policy_rev check (pkg/event/drift.go) warn on a strict-to-default
+// policy restore without also firing spuriously on an unrelated classifier
+// swap.
+func TestFrozenManifestWithPermissionReviewPolicyRevChangesWithPolicyOnly(t *testing.T) {
+	t.Parallel()
+	definition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
+	fields := ConfigFingerprintFields{AgentKind: "coderig:operator"}
+	classifier := defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("status"))
+	set := rigPermissionClassifierSet(t, classifier)
+
+	manifestFor := func(t *testing.T, set gate.PermissionClassifierSet, policyRevision string) event.ConfigManifest {
+		t.Helper()
+		review, err := permissionReviewFingerprintFrom(set, rigReviewPolicy(t, policyRevision))
+		if err != nil {
+			t.Fatalf("permissionReviewFingerprintFrom: %v", err)
+		}
+		return frozenManifestWithPermissionReview(
+			fields, []loop.Definition{definition}, []string{"agent"}, "agent", nil, HustleLimits{}, review,
+		)
+	}
+
+	strict := manifestFor(t, set, "strict-policy-v1")
+	looser := manifestFor(t, set, "default-policy-v1")
+	if strict.PermissionReviewPolicyRev == looser.PermissionReviewPolicyRev {
+		t.Fatal("PermissionReviewPolicyRev did not change across a policy-revision-only change")
+	}
+	if strict.TopologyRev == looser.TopologyRev {
+		t.Fatal("TopologyRev did not change across a policy-revision-only change (it folds the policy revision in too)")
+	}
+
+	secondClassifier := defineRigPermissionClassifierWith(t, "alpha", "classifier-alpha-v2", rigEvidencePolicy("status"), rigHustleOutput())
+	differentSet := rigPermissionClassifierSet(t, secondClassifier)
+	samePolicyDifferentClassifier := manifestFor(t, differentSet, "strict-policy-v1")
+	if strict.PermissionReviewPolicyRev != samePolicyDifferentClassifier.PermissionReviewPolicyRev {
+		t.Fatalf("PermissionReviewPolicyRev changed on a classifier-only change: %q != %q",
+			strict.PermissionReviewPolicyRev, samePolicyDifferentClassifier.PermissionReviewPolicyRev)
+	}
+	if strict.TopologyRev == samePolicyDifferentClassifier.TopologyRev {
+		t.Fatal("TopologyRev did not change across a classifier-only change")
 	}
 }
 

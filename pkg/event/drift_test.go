@@ -141,6 +141,77 @@ func TestAssessDriftPermissionReviewConfiguredTransitions(t *testing.T) {
 		}
 	})
 
+	// TestAssessDriftPermissionReviewConfiguredTransitions/enabled_to_enabled_with_different_review_policy_revision_is_warn
+	// proves the fix for the confirmed gap: a session opened under one review
+	// policy identity (e.g. a strict custom policy) and restored under a
+	// DIFFERENT review policy identity (e.g. a looser default), with
+	// classifiers configured on BOTH sides, must warn — it must not fall
+	// through the opaque TopologyRev-only comparison (which is Info, like any
+	// other topology change) the way the classifier-identity-only subtest
+	// above deliberately still does.
+	t.Run("enabled to enabled with different review policy revision is warn", func(t *testing.T) {
+		t.Parallel()
+		baseline := base
+		baseline.PermissionReviewConfigured = true
+		baseline.PermissionReviewPolicyRev = "strict-policy-v1"
+		candidate := base
+		candidate.PermissionReviewConfigured = true
+		candidate.PermissionReviewPolicyRev = "default-policy-v1"
+		assessment := AssessDrift(baseline, candidate)
+		if !assessment.AnyWarn() {
+			t.Fatalf("enabled->enabled review policy revision change did not warn: %+v", assessment)
+		}
+		found := false
+		for _, change := range assessment.Changes {
+			if change.Category == DriftPermission && change.Field == "review_policy_rev" {
+				found = true
+				if change.Severity != DriftWarn {
+					t.Errorf("severity = %s, want warn", change.Severity)
+				}
+				if change.Old != "strict-policy-v1" || change.New != "default-policy-v1" {
+					t.Errorf("old/new = %q/%q, want the two policy revisions", change.Old, change.New)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("no review_policy_rev change reported: %+v", assessment)
+		}
+	})
+
+	// The disabled-side variants must never warn on a policy-revision
+	// difference: PermissionReviewConfigured's own transition already governs
+	// whichever side is unconfigured, and a policy revision recorded while
+	// unconfigured carries no live meaning.
+	t.Run("disabled to enabled ignores stale policy revision on the disabled side", func(t *testing.T) {
+		t.Parallel()
+		baseline := base
+		baseline.PermissionReviewConfigured = false
+		baseline.PermissionReviewPolicyRev = "stale-v0"
+		candidate := base
+		candidate.PermissionReviewConfigured = true
+		candidate.PermissionReviewPolicyRev = "default-policy-v1"
+		assessment := AssessDrift(baseline, candidate)
+		for _, change := range assessment.Changes {
+			if change.Category == DriftPermission && change.Field == "review_policy_rev" {
+				t.Fatalf("unexpected review_policy_rev change while one side is unconfigured: %+v", change)
+			}
+		}
+	})
+
+	t.Run("enabled to enabled with identical review policy revision stays unaffected", func(t *testing.T) {
+		t.Parallel()
+		baseline := base
+		baseline.PermissionReviewConfigured = true
+		baseline.PermissionReviewPolicyRev = "default-policy-v1"
+		candidate := base
+		candidate.PermissionReviewConfigured = true
+		candidate.PermissionReviewPolicyRev = "default-policy-v1"
+		assessment := AssessDrift(baseline, candidate)
+		if len(assessment.Changes) != 0 || assessment.AnyWarn() {
+			t.Fatalf("identical review policy revision produced drift: %+v", assessment)
+		}
+	})
+
 	t.Run("enabled to disabled is not warn", func(t *testing.T) {
 		t.Parallel()
 		baseline := base

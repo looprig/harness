@@ -342,8 +342,18 @@ func frozenManifestWithPermissionReview(
 	// reviewer). The full classifier/policy identity stays folded into TopologyRev
 	// below, for the SEPARATE purpose of detecting drift among already-enabled
 	// classifiers.
+	//
+	// PermissionReviewPolicyRev additionally surfaces the review policy's OWN
+	// revision (review.reviewPolicyRevision) as its own manifest field --
+	// still ALSO folded into TopologyRev above for backward-compatible digest
+	// coverage, but exposed directly here so AssessDrift can Warn when it
+	// changes while classifiers stay configured on both sides (the
+	// strict-to-default-policy-restore gap an opaque TopologyRev-only
+	// comparison cannot classify, since TopologyRev also carries ordinary
+	// loop topology and stays Info).
 	manifest.PermissionReviewConfigured = review != nil
 	if review != nil {
+		manifest.PermissionReviewPolicyRev = review.reviewPolicyRevision
 		manifest.TopologyRev = topologyRevisionWithHustlesAndPermissionReview(
 			definitions, primers, active, hustles, limits, review,
 		)

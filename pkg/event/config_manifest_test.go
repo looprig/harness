@@ -24,6 +24,7 @@ func testManifest() ConfigManifest {
 		NativePermissionPolicyRev:  "ffff",
 		PermissionStrictness:       3,
 		PermissionReviewConfigured: true,
+		PermissionReviewPolicyRev:  "iiii",
 		ConfinementRev:             "gggg",
 		ConfinementStrictness:      2,
 		ExternalCapabilityRev:      "hhhh",
@@ -51,6 +52,9 @@ func TestManifestFingerprint(t *testing.T) {
 		{name: "permission review configured change alters fingerprint", mutate: func(m *ConfigManifest) {
 			m.PermissionReviewConfigured = false
 		}, same: false},
+		{name: "permission review policy revision change alters fingerprint", mutate: func(m *ConfigManifest) {
+			m.PermissionReviewPolicyRev = "jjjj"
+		}, same: false},
 		{name: "schema version change alters fingerprint", mutate: func(m *ConfigManifest) {
 			m.SchemaVersion = ManifestSchemaVersion + 1
 		}, same: false},
@@ -77,7 +81,9 @@ func TestManifestFingerprintGolden(t *testing.T) {
 		t.Fatalf("fingerprint %q is not lowercase hex sha256", got)
 	}
 	// Frozen on first run; drift here means the canonical encoding changed.
-	const golden = "836322e9636db88d50a5d6a937d67cac8d1298a2308eed3cadc52b27867d33e2"
+	// Bumped for the v2 schema (PermissionReviewPolicyRev added to the
+	// canonical encoding — see ManifestSchemaVersion's doc comment).
+	const golden = "235e46e8ee74310873d9142ce5422d9040f8654b1d2f1c85287c79c3abceafbe"
 	if golden != "" && got != golden {
 		t.Errorf("canonical encoding drifted: fingerprint = %s, want %s", got, golden)
 	}
