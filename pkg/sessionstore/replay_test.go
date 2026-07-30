@@ -797,10 +797,16 @@ func buildGateFixture(t *testing.T) fixture {
 		t.Fatalf("OpenJournal() err = %v", err)
 	}
 
-	stepH := event.Header{
-		Coordinates: identity.Coordinates{SessionID: id, LoopID: loopID, TurnID: turnID, StepID: stepID},
-		EventID:     newTestUUID(t),
-	}
+	coords := identity.Coordinates{SessionID: id, LoopID: loopID, TurnID: turnID, StepID: stepID}
+	// Each event below is a distinct durable record (prepared/opened/resolved
+	// are different kinds with different payloads emitted at different
+	// points in the gate lifecycle), so each gets its own EventID: a shared
+	// EventID across genuinely different payloads is exactly the case
+	// journal's idempotency collision detection (pkg/journal) exists to
+	// reject as a real id collision, not a legitimate duplicate retry.
+	preparedH := event.Header{Coordinates: coords, EventID: newTestUUID(t)}
+	openedH := event.Header{Coordinates: coords, EventID: newTestUUID(t)}
+	resolvedH := event.Header{Coordinates: coords, EventID: newTestUUID(t)}
 	g := gate.Gate{
 		ID:       gateID,
 		Kind:     gate.KindPermission,
@@ -810,14 +816,14 @@ func buildGateFixture(t *testing.T) fixture {
 		Subject:  gate.Subject{ToolExecutionID: toolExecID},
 		Prompt:   gate.Prompt{Title: "Approve", Body: "echo ok", Controls: []gate.Control{{Action: "approve", Label: "Approve"}, {Action: "deny", Label: "Deny"}}},
 	}
-	prepared := event.GatePrepared{Header: stepH, Gate: g}
+	prepared := event.GatePrepared{Header: preparedH, Gate: g}
 	openPayload := gate.OpenPayload{
 		GateID:  gateID,
 		Payload: gate.PermissionPayload{Request: tool.Request{ToolName: "Bash", Summary: "echo ok", Requirements: []tool.Requirement{{Kind: "tool.invoke", Scope: "Bash", Match: "echo ok", Description: "run: echo ok"}}}},
 	}
-	opened := event.GateOpened{Header: stepH, Gate: g}
+	opened := event.GateOpened{Header: openedH, Gate: g}
 	resolved := event.GateResolved{
-		Header: stepH,
+		Header: resolvedH,
 		GateID: gateID,
 		Reason: gate.CloseAnswered,
 		Action: "approve",
