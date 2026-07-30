@@ -10,18 +10,54 @@ import (
 	"testing"
 )
 
-func TestDependencyBoundaries(t *testing.T) {
+// forbiddenHustleImports is design §22.8's boundary: "pkg/hustle does not
+// import gate, rig, session, or runtime internals." pkg/gate is included
+// even though pkg/hustle importing it today would already be blocked by
+// Go's own import-cycle detection (pkg/gate imports pkg/hustle) — this test
+// must assert the design rule itself rather than silently rely on the
+// compiler to enforce it, so the boundary stays caught even if the cycle
+// relationship ever changes.
+var forbiddenHustleImports = []string{
+	"github.com/looprig/harness/internal/",
+	"github.com/looprig/harness/pkg/event",
+	"github.com/looprig/harness/pkg/gate",
+	"github.com/looprig/harness/pkg/loop",
+	"github.com/looprig/harness/pkg/rig",
+	"github.com/looprig/harness/pkg/session",
+	"github.com/looprig/harness/pkg/tools",
+	"github.com/looprig/tools",
+	"github.com/looprig/llm",
+}
+
+// TestForbiddenHustleImportsCoversDesignBoundary proves design §22.8's full
+// forbidden list ("gate, rig, session, or runtime internals") is actually
+// enforced by TestDependencyBoundaries below, not just the subset that
+// happens to compile-error today.
+func TestForbiddenHustleImportsCoversDesignBoundary(t *testing.T) {
 	t.Parallel()
-	forbidden := []string{
-		"github.com/looprig/harness/internal/",
-		"github.com/looprig/harness/pkg/event",
-		"github.com/looprig/harness/pkg/loop",
+	want := []string{
+		"github.com/looprig/harness/pkg/gate",
 		"github.com/looprig/harness/pkg/rig",
 		"github.com/looprig/harness/pkg/session",
-		"github.com/looprig/harness/pkg/tools",
-		"github.com/looprig/tools",
-		"github.com/looprig/llm",
+		"github.com/looprig/harness/internal/",
 	}
+	for _, w := range want {
+		found := false
+		for _, f := range forbiddenHustleImports {
+			if f == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("forbiddenHustleImports = %v, want it to contain %q", forbiddenHustleImports, w)
+		}
+	}
+}
+
+func TestDependencyBoundaries(t *testing.T) {
+	t.Parallel()
+	forbidden := forbiddenHustleImports
 	tests := []struct {
 		name string
 		dir  string
