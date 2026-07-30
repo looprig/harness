@@ -1201,7 +1201,29 @@ func (s *Session) verifyPermissionReviewObservations(ctx context.Context, gateID
 	// above — never a value captured earlier in this specific review, so a
 	// ceiling that has since moved on is still caught).
 	policy := gate.EvidenceContainmentPolicy{ReadRoot: s.wsRoot, SecurityCeiling: s.permissionReviewSecurityCeiling}
-	if err := s.permissionReviewObservationVerifier.VerifyEvidenceObservations(ctx, policy, observations); err != nil {
+	// Bound this specific I/O call (CLAUDE.md: "Every I/O call ... must use a
+	// context.Context with a timeout or deadline. No unbounded blocking.").
+	// ctx here traces back through respondFromClassifier ->
+	// StartPermissionReview's beginPermissionReviewCancellation, which is a
+	// bare context.WithCancel with no deadline anywhere in that chain — so
+	// without this, a consumer-supplied verifier whose re-stat/git-ref-resolve
+	// I/O hangs would hang this call forever. s.hustleLimits.AuditTimeout is
+	// the same positive-guaranteed budget review_adapter.go's publish already
+	// reuses for the adapter's own audit-publish call (StartPermissionReview
+	// sets adapter.auditTimeout from this exact field, and only after
+	// s.hustleController is confirmed non-nil, which hustleruntime.New
+	// guarantees means AuditTimeout > 0) — mirrored here rather than adding a
+	// new consumer-facing timeout knob for one recheck call. context.WithTimeout
+	// still composes with ctx's own cancellation, so an outer review
+	// cancellation (gate resolved, session shutdown) stops this just as
+	// promptly as before.
+	verifyCtx := ctx
+	if s.hustleLimits.AuditTimeout > 0 {
+		var cancel context.CancelFunc
+		verifyCtx, cancel = context.WithTimeout(ctx, s.hustleLimits.AuditTimeout)
+		defer cancel()
+	}
+	if err := s.permissionReviewObservationVerifier.VerifyEvidenceObservations(verifyCtx, policy, observations); err != nil {
 		s.recordPermissionReviewStale(s.gateCoordinatesForStale(gateID))
 		return false
 	}

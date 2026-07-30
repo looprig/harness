@@ -737,3 +737,78 @@ waitOpen:
 		t.Errorf("writer batches = %d, want 0 (a classifier response is Approve, never Approve-always, so nothing persists)", len(batches))
 	}
 }
+
+// blockingObservationVerifier is a gate.EvidenceObservationVerifier whose
+// VerifyEvidenceObservations never returns on its own: it blocks until its
+// ctx is cancelled (by an outer deadline or an outer cancellation) and then
+// reports that cancellation as its error, exactly like a real verifier whose
+// re-stat/git-ref-resolve I/O hangs (a stuck NFS mount, an unresponsive git
+// remote) would look from the caller's side.
+type blockingObservationVerifier struct{}
+
+func (blockingObservationVerifier) VerifyEvidenceObservations(
+	ctx context.Context,
+	_ gate.EvidenceContainmentPolicy,
+	_ []gate.ObservationRequirement,
+) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestVerifyPermissionReviewObservationsBoundedByAuditTimeout proves the
+// TOCTOU observation recheck (design §13.4) cannot block
+// respondFromClassifier indefinitely. verifyPermissionReviewObservations
+// calls a consumer-supplied EvidenceObservationVerifier that performs real
+// I/O (re-stat, resolve a git ref); this codebase's CLAUDE.md requires every
+// I/O call to run under a context with a timeout or deadline. Before the
+// fix, the ctx handed to VerifyEvidenceObservations traces back through
+// respondFromClassifier -> StartPermissionReview's
+// beginPermissionReviewCancellation, which is a bare context.WithCancel(ctx)
+// with no deadline anywhere in the chain — so a hanging verifier hangs this
+// call forever. With the fix, the call is bounded by s.hustleLimits.AuditTimeout
+// (the same positive-guaranteed budget the adapter's own audit-publish call
+// already reuses, per review_adapter.go's publish), so a hanging verifier is
+// treated as an ordinary stale/unverifiable observation: the gate stays
+// open, no command is dispatched, and respondFromClassifier returns
+// (false, nil) promptly instead of hanging.
+func TestVerifyPermissionReviewObservationsBoundedByAuditTimeout(t *testing.T) {
+	t.Parallel()
+	s, _, cmds, gateID, callID := raceGateSession(t)
+	s.hustleLimits.AuditTimeout = 20 * time.Millisecond
+	withPermissionReviewObservationVerifier(blockingObservationVerifier{})(s)
+	basis := racePermissionReviewBasis(s, gateID, callID)
+
+	type result struct {
+		applied bool
+		err     error
+	}
+	done := make(chan result, 1)
+	start := time.Now()
+	go func() {
+		applied, err := s.respondFromClassifier(context.Background(), basis, []gate.ObservationRequirement{raceObservation}, "risk-classifier@rev-1")
+		done <- result{applied: applied, err: err}
+	}()
+
+	var res result
+	select {
+	case res = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("respondFromClassifier() did not return within 2s; the observation recheck is unbounded")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("respondFromClassifier() took %v, want bounded near s.hustleLimits.AuditTimeout (20ms)", elapsed)
+	}
+	if res.err != nil {
+		t.Fatalf("respondFromClassifier() error = %v, want nil (a bounded-out recheck is stale, not a session fault)", res.err)
+	}
+	if res.applied {
+		t.Fatal("respondFromClassifier() applied = true, want false (a timed-out recheck must never approve)")
+	}
+	if c, ok := drainCommand(cmds); ok {
+		t.Errorf("timed-out observation recheck dispatched a command %T, want none", c)
+	}
+	got := s.ListGates(context.Background())
+	if len(got) != 1 || got[0].ID != gateID {
+		t.Fatalf("ListGates() = %+v, want the gate still open", got)
+	}
+}
