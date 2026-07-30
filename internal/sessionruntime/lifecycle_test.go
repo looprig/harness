@@ -3,6 +3,8 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -515,12 +517,20 @@ func newProcessShutdownSession(t *testing.T, resource *testSessionResource) *Ses
 		}); err != nil {
 			return nil, err
 		}
-		return nil, nil
+		return []tool.InvokableTool{primerTestTool{name: "process"}}, nil
 	})
 	store := newRestoreStore(t)
+	// t.TempDir()'s own directories are created 0755 (a Go testing-package
+	// detail, not owner-only), which fails establishSessionResourceRoot's
+	// strict private-storage check — mint a real 0700 subdirectory instead,
+	// mirroring session_resources_test.go's own established pattern.
+	root := filepath.Join(t.TempDir(), "resources")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatalf("Mkdir(root) error = %v", err)
+	}
 	lifecycle, err := newTestLifecycle(definition, store, WithLifecycleSessionResourceStorage(
 		func(context.Context, uuid.UUID) (string, string, error) {
-			return t.TempDir(), "process-shutdown-owner", nil
+			return root, "process-shutdown-owner", nil
 		},
 	))
 	if err != nil {

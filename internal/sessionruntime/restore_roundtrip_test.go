@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
@@ -1129,10 +1131,20 @@ func TestProcessRestoreActivatesBridgeBeforeRestoreDone(t *testing.T) {
 		_, err := bindings.Process.Registry.GetOrCreate(ctx, "bridge-probe", func(string) (tool.SessionResource, error) {
 			return &bridgeProbeResource{published: published, sessionID: bindings.SessionID, loopID: bindings.LoopID}, nil
 		})
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
+		return []tool.InvokableTool{primerTestTool{name: "process"}}, nil
 	})
 	store := newRestoreStore(t)
-	resourceRoot := t.TempDir()
+	// t.TempDir()'s own directories are created 0755 (a Go testing-package
+	// detail, not owner-only), which fails establishSessionResourceRoot's
+	// strict private-storage check — mint a real 0700 subdirectory instead,
+	// mirroring session_resources_test.go's own established pattern.
+	resourceRoot := filepath.Join(t.TempDir(), "resources")
+	if err := os.Mkdir(resourceRoot, 0o700); err != nil {
+		t.Fatalf("Mkdir(resourceRoot) error = %v", err)
+	}
 	storageResolver := WithLifecycleSessionResourceStorage(func(context.Context, uuid.UUID) (string, string, error) {
 		return resourceRoot, "bridge-probe-owner", nil
 	})
