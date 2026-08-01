@@ -337,14 +337,14 @@ func TestSubagentSchemaActionBranchesAreClosedAndExplicit(t *testing.T) {
 	if len(branches) != 6 {
 		t.Fatalf("allOf branches=%d, want 6", len(branches))
 	}
-	fields := []string{"agent", "mode", "delegate_id", "request_id", "message", "wait", "timeout_seconds"}
+	fields := []string{"description", "prompt", "subagent_type", "mode", "agent_harness", "model", "effort", "run_in_background", "delegate_id", "request_id", "timeout_seconds"}
 	expected := []struct {
 		index             int
 		action            string
 		required, allowed []string
 	}{
-		{0, "start", []string{"agent", "message"}, []string{"agent", "mode", "message", "wait", "timeout_seconds"}},
-		{2, "send", []string{"delegate_id", "message"}, []string{"delegate_id", "message", "wait", "timeout_seconds"}},
+		{0, "start", []string{"description", "prompt", "subagent_type"}, []string{"description", "prompt", "subagent_type", "mode", "agent_harness", "model", "effort", "run_in_background", "timeout_seconds"}},
+		{2, "send", []string{"delegate_id", "prompt"}, []string{"delegate_id", "prompt", "run_in_background", "timeout_seconds"}},
 		{3, "wait", []string{"delegate_id", "request_id"}, []string{"delegate_id", "request_id", "timeout_seconds"}},
 		{4, "interrupt", []string{"delegate_id"}, []string{"delegate_id"}},
 		{5, "status", nil, []string{"delegate_id"}},
@@ -398,8 +398,8 @@ func TestSubagentSchemaActionBranchesAreClosedAndExplicit(t *testing.T) {
 		t.Fatal("default branch is not 'not required(action)'")
 	}
 	defaultRequired := stringSet(defaultBranch["then"].(map[string]any)["required"])
-	if !defaultRequired["agent"] || !defaultRequired["message"] {
-		t.Fatal("default start must require agent+message")
+	if !defaultRequired["description"] || !defaultRequired["prompt"] || !defaultRequired["subagent_type"] {
+		t.Fatal("default start must require description+prompt+subagent_type")
 	}
 }
 

@@ -119,6 +119,27 @@ func TestPrepareCallRuntimeIsParentScopedAndOptional(t *testing.T) {
 			t.Fatalf("PrepareCall() error = %v, want %s", err, errCategoryFieldNotAllowed)
 		}
 	})
+
+	t.Run("unrelated role entries do not make native role unknown", func(t *testing.T) {
+		entry := testPreparationEntry("claude-code", "acp/claude-code", "sonnet", inferencemodel.EffortMedium)
+		entry.SubagentType = "other"
+		unrelated, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{entry})
+		if err != nil {
+			t.Fatal(err)
+		}
+		toolInstance := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker"}}, unrelated)
+		_, prepared, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"action":"start","description":"d","prompt":"p","subagent_type":"worker"}`)
+		if err != nil {
+			t.Fatalf("PrepareCall() omitted selectors error = %v", err)
+		}
+		if got := mustDelegateArtifact(t, prepared).Runtime; got != nil {
+			t.Fatalf("runtime = %#v, want nil", got)
+		}
+		_, _, err = toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"action":"start","description":"d","prompt":"p","subagent_type":"worker","agent_harness":"claude-code"}`)
+		if err == nil || !strings.Contains(err.Error(), errCategoryFieldNotAllowed) {
+			t.Fatalf("PrepareCall() explicit selector error = %v, want %s", err, errCategoryFieldNotAllowed)
+		}
+	})
 }
 
 func mustDelegateArtifact(t *testing.T, prepared tool.PreparedArtifact) tool.DelegateArtifact {

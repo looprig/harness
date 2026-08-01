@@ -51,7 +51,7 @@ const (
 )
 
 // SubagentCatalogEntry is one delegate the tool advertises in its Info().Desc: the
-// name the model passes as {agent} and a one-line description. The rig projects the
+// name the model passes as {subagent_type} and a one-line description. The rig projects the
 // parent definition's delegate set onto this at the composition root.
 type SubagentCatalogEntry struct {
 	Name        identity.AgentName
@@ -107,79 +107,7 @@ func NewSubagentWithRuntimeCatalog(controller tool.DelegateController, style loo
 }
 
 func (s *SubagentTool) schema() string {
-	fieldOrder := []string{"action", "agent", "mode", "delegate_id", "request_id", "message", "wait", "timeout_seconds"}
-	properties := map[string]any{
-		"action": map[string]any{"type": "string", "enum": []string{"start", "send", "wait", "interrupt", "status"}},
-		"agent":  map[string]any{"type": "string"}, "mode": map[string]any{"type": "string"},
-		"delegate_id": map[string]any{"type": "string"}, "request_id": map[string]any{"type": "string"},
-		"message": map[string]any{"type": "string"}, "wait": map[string]any{"type": "boolean"},
-		"timeout_seconds": map[string]any{"type": "integer", "minimum": 0},
-	}
-	startVariants := make([]any, 0, len(s.catalog))
-	for _, entry := range s.catalog {
-		modes := make([]string, len(entry.Modes))
-		for i, mode := range entry.Modes {
-			modes[i] = string(mode)
-		}
-		variantProps := map[string]any{"agent": map[string]any{"const": string(entry.Name)}}
-		if len(modes) > 0 {
-			variantProps["mode"] = map[string]any{"type": "string", "enum": modes}
-		}
-		startVariants = append(startVariants, map[string]any{"type": "object", "properties": variantProps})
-	}
-	actionBranch := func(action string, required, allowed []string) map[string]any {
-		allowedSet := map[string]struct{}{"action": {}}
-		for _, name := range allowed {
-			allowedSet[name] = struct{}{}
-		}
-		forbidden := make([]string, 0)
-		for _, name := range fieldOrder {
-			if _, ok := allowedSet[name]; !ok {
-				forbidden = append(forbidden, name)
-			}
-		}
-		then := map[string]any{"not": map[string]any{"anyOf": requiredProperties(forbidden)}}
-		if len(required) > 0 {
-			then["required"] = required
-		}
-		return map[string]any{
-			"if":   map[string]any{"required": []string{"action"}, "properties": map[string]any{"action": map[string]any{"const": action}}},
-			"then": then,
-		}
-	}
-	startAllowed := []string{"agent", "mode", "message", "wait", "timeout_seconds"}
-	startBranch := actionBranch("start", []string{"agent", "message"}, startAllowed)
-	if len(startVariants) > 0 {
-		startBranch["then"].(map[string]any)["oneOf"] = startVariants
-	}
-	defaultStartBranch := map[string]any{
-		"if":   map[string]any{"not": map[string]any{"required": []string{"action"}}},
-		"then": startBranch["then"],
-	}
-	branches := []any{
-		startBranch,
-		defaultStartBranch,
-		actionBranch("send", []string{"delegate_id", "message"}, []string{"delegate_id", "message", "wait", "timeout_seconds"}),
-		actionBranch("wait", []string{"delegate_id", "request_id"}, []string{"delegate_id", "request_id", "timeout_seconds"}),
-		actionBranch("interrupt", []string{"delegate_id"}, []string{"delegate_id"}),
-		actionBranch("status", nil, []string{"delegate_id"}),
-	}
-	if s.style == loop.DelegationSyncOnly {
-		properties["action"] = map[string]any{"type": "string", "enum": []string{"start"}}
-		properties["wait"] = map[string]any{"const": true}
-		branches = branches[:2]
-	}
-	schema := map[string]any{"type": "object", "additionalProperties": false, "properties": properties, "allOf": branches}
-	encoded, _ := json.Marshal(schema)
-	return string(encoded)
-}
-
-func requiredProperties(names []string) []any {
-	result := make([]any, len(names))
-	for i, name := range names {
-		result[i] = map[string]any{"required": []string{name}}
-	}
-	return result
+	return buildSubagentSchema(s.style, s.catalog, s.runtimeCatalog)
 }
 
 func cloneSubagentCatalog(catalog []SubagentCatalogEntry) []SubagentCatalogEntry {
@@ -190,40 +118,10 @@ func cloneSubagentCatalog(catalog []SubagentCatalogEntry) []SubagentCatalogEntry
 	return result
 }
 
-// subagentDesc renders the static prefix followed by an <available_agents> block
+// subagentDesc renders the static prefix followed by an <available_subagents> block
 // listing each catalog entry. An empty catalog renders just the prefix.
 func (s *SubagentTool) subagentDesc() string {
-	if len(s.catalog) == 0 {
-		return subagentDescPrefix
-	}
-	var b strings.Builder
-	b.WriteString(subagentDescPrefix)
-	b.WriteString("\n<available_agents>\n")
-	for _, e := range s.catalog {
-		b.WriteString("- ")
-		b.WriteString(string(e.Name))
-		if strings.TrimSpace(e.Description) != "" {
-			b.WriteString(": ")
-			b.WriteString(e.Description)
-		}
-		if len(e.Modes) > 0 {
-			b.WriteString(" (modes: ")
-			for i, mode := range e.Modes {
-				if i > 0 {
-					b.WriteString(", ")
-				}
-				if mode == "" {
-					b.WriteString("default")
-				} else {
-					b.WriteString(string(mode))
-				}
-			}
-			b.WriteString(")")
-		}
-		b.WriteString("\n")
-	}
-	b.WriteString("</available_agents>")
-	return b.String()
+	return buildSubagentDescription(s.catalog, s.runtimeCatalog)
 }
 
 // Info returns the self-description. Name MUST equal "Subagent"; the schema is derived

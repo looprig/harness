@@ -385,10 +385,15 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 			}
 			return nil, nil
 		}
+		if !s.hasSubagentType(envelope.SubagentType) {
+			return nil, preparationFailure(errCategoryUnknownRuntime)
+		}
 		if envelope.agentHarnessSet || envelope.modelSet || envelope.effortSet {
 			return nil, preparationFailure(errCategoryFieldNotAllowed)
 		}
-		return nil, preparationFailure(errCategoryUnknownRuntime)
+		// A parent may expose runtime choices for other roles while this role is
+		// native-only. Unknown entries must never leak across the role boundary.
+		return nil, nil
 	}
 
 	selected := entries[0]
@@ -457,6 +462,15 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 			Effort:  envelope.effortSet,
 		},
 	}, nil
+}
+
+func (s *SubagentTool) hasSubagentType(agent string) bool {
+	for _, entry := range s.catalog {
+		if string(entry.Name) == agent {
+			return true
+		}
+	}
+	return false
 }
 
 func delegateEffortString(effort inferencemodel.Effort) string {
