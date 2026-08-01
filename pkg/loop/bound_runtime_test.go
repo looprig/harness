@@ -2,6 +2,8 @@ package loop
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"reflect"
 	"testing"
@@ -26,6 +28,71 @@ func TestEngineAdapterIsAValidClosedEngine(t *testing.T) {
 	}
 	if got := bound.RuntimeProfile(); got != "adapter-profile" {
 		t.Fatalf("RuntimeProfile() = %q, want adapter-profile", got)
+	}
+}
+
+func TestOverrideBoundRuntimeSelectionRecordsAliasAndCanonicalNone(t *testing.T) {
+	t.Parallel()
+
+	definition := mustDefinition(t)
+	bound, err := definition.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind() error = %v", err)
+	}
+
+	selected, err := OverrideBoundRuntimeSelection(bound, "acp/codex", "gpt-5.6-luna", testModel(), model.EffortNone)
+	if err != nil {
+		t.Fatalf("OverrideBoundRuntimeSelection() error = %v", err)
+	}
+	identity := selected.RuntimeIdentity()
+	if identity.ModelAlias != "gpt-5.6-luna" || identity.Effort != model.EffortNone {
+		t.Fatalf("RuntimeIdentity() = %+v, want alias and none effort", identity)
+	}
+	if identity.Digest() == "" {
+		t.Fatal("RuntimeIdentity().Digest() = empty, want digest")
+	}
+	expected := sha256.Sum256([]byte(`{"domain":"loop/runtime-identity/v1","profile":"acp/codex","model_alias":"gpt-5.6-luna","target_provider":"lmstudio","target_model":"m","effort":"none"}`))
+	if got, want := identity.Digest(), hex.EncodeToString(expected[:]); got != want {
+		t.Fatalf("RuntimeIdentity().Digest() = %q, want canonical none digest %q", got, want)
+	}
+
+	legacy, err := OverrideBoundRuntime(bound, "acp/codex", testModel(), model.EffortNone)
+	if err != nil {
+		t.Fatalf("OverrideBoundRuntime() error = %v", err)
+	}
+	if legacy.RuntimeIdentity().ModelAlias != "" {
+		t.Fatalf("legacy helper recorded alias %q, want empty", legacy.RuntimeIdentity().ModelAlias)
+	}
+	if legacy.RuntimeIdentity().Digest() == selected.RuntimeIdentity().Digest() {
+		t.Fatal("alias change did not change runtime identity digest")
+	}
+}
+
+func TestOverrideBoundRuntimeSelectionRejectsInvalidProfilesAndAliases(t *testing.T) {
+	t.Parallel()
+
+	definition := mustDefinition(t)
+	bound, err := definition.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind() error = %v", err)
+	}
+	for _, test := range []struct {
+		name    string
+		profile RuntimeProfileName
+		alias   ModelAlias
+	}{
+		{name: "path profile", profile: "/tmp/child", alias: "model"},
+		{name: "backslash profile", profile: `acp\\codex`, alias: "model"},
+		{name: "dot dot profile", profile: "acp/../codex", alias: "model"},
+		{name: "unknown slash profile", profile: "acp/other", alias: "model"},
+		{name: "whitespace alias", profile: "acp/codex", alias: "model alias"},
+		{name: "path alias", profile: "acp/codex", alias: "../model"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := OverrideBoundRuntimeSelection(bound, test.profile, test.alias, testModel(), model.EffortHigh); err == nil {
+				t.Fatal("OverrideBoundRuntimeSelection() error = nil, want error")
+			}
+		})
 	}
 }
 

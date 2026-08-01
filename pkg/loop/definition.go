@@ -657,6 +657,7 @@ type boundDefinitionState struct {
 	accessOverride        AccessGate
 	runtimeProfile        RuntimeProfileName
 	runtimeCatalogDigest  string
+	runtimeModelAlias     ModelAlias
 	runtimeTargetProvider model.ProviderName
 	runtimeTargetModel    string
 	runtimeEffort         model.Effort
@@ -673,6 +674,7 @@ func (b *boundDefinitionState) RuntimeIdentity() RuntimeIdentity {
 	return RuntimeIdentity{
 		Profile:        b.runtimeProfile,
 		CatalogDigest:  b.runtimeCatalogDigest,
+		ModelAlias:     b.runtimeModelAlias,
 		TargetProvider: b.runtimeTargetProvider,
 		TargetModel:    b.runtimeTargetModel,
 		Effort:         b.runtimeEffort,

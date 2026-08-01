@@ -178,8 +178,17 @@ func (c RuntimeCatalog) EntriesFor(agent identity.AgentName) []RuntimeCatalogEnt
 // Resolve selects a runtime tuple for agent. Empty harness, alias, and effort
 // selectors use the deterministic default at that level. Explicit selectors
 // are checked only within the already-selected parent-scoped entry; no global
-// or format fallback is ever attempted.
+// or format fallback is ever attempted. Its zero effort retains the legacy
+// meaning of an omitted effort selector.
 func (c RuntimeCatalog) Resolve(agent identity.AgentName, harness AgentHarnessName, alias ModelAlias, effort model.Effort) (Resolved, error) {
+	return c.ResolveWithExplicitEffort(agent, harness, alias, effort, false)
+}
+
+// ResolveWithExplicitEffort selects a runtime tuple while preserving whether
+// the caller supplied the effort selector. This distinction matters because
+// EffortNone is model.Effort's zero value: omitted effort uses DefaultEffort,
+// while explicit none is valid only when the model advertises none.
+func (c RuntimeCatalog) ResolveWithExplicitEffort(agent identity.AgentName, harness AgentHarnessName, alias ModelAlias, effort model.Effort, explicitEffort bool) (Resolved, error) {
 	if agent == "" {
 		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
 	}
@@ -229,7 +238,12 @@ func (c RuntimeCatalog) Resolve(agent identity.AgentName, harness AgentHarnessNa
 	}
 
 	selectedEffort := selectedModel.DefaultEffort
-	if effort != model.EffortNone {
+	if explicitEffort {
+		if !containsEffort(selectedModel.Efforts, effort) {
+			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogIncompatibleEffort, Field: "Effort"}
+		}
+		selectedEffort = effort
+	} else if effort != model.EffortNone {
 		if !containsEffort(selectedModel.Efforts, effort) {
 			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogIncompatibleEffort, Field: "Effort"}
 		}
@@ -275,7 +289,7 @@ func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
 	if err := validateCatalogIdentifier(string(entry.AgentHarness), false); err != nil {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "AgentHarness"}
 	}
-	if err := validateCatalogIdentifier(string(entry.Profile), false); err != nil {
+	if err := validateRuntimeProfile(string(entry.Profile)); err != nil {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "Profile"}
 	}
 	if entry.Credential != CredentialGatewayBacked && entry.Credential != CredentialNativeAuth {
@@ -393,6 +407,30 @@ func validateCatalogIdentifier(value string, allowInternalSpaces bool) error {
 		if r == '/' || r == '\\' || r == ':' || r == 0 || unicode.IsControl(r) || (!allowInternalSpaces && unicode.IsSpace(r)) {
 			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier}
 		}
+	}
+	return nil
+}
+
+func validateRuntimeProfile(value string) error {
+	const maxIdentifierBytes = 128
+	if value == "" || len(value) > maxIdentifierBytes || !utf8.ValidString(value) || strings.TrimSpace(value) != value {
+		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier}
+	}
+	for _, r := range value {
+		if r == '\\' || r == ':' || r == 0 || unicode.IsControl(r) || unicode.IsSpace(r) {
+			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier}
+		}
+	}
+	if strings.Contains(value, "/") {
+		switch value {
+		case "acp/claude-code", "acp/codex":
+			return nil
+		default:
+			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier}
+		}
+	}
+	if value == "." || value == ".." {
+		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier}
 	}
 	return nil
 }

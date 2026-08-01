@@ -15,6 +15,7 @@ import (
 type RuntimeIdentity struct {
 	Profile        RuntimeProfileName
 	CatalogDigest  string
+	ModelAlias     ModelAlias
 	TargetProvider model.ProviderName
 	TargetModel    string
 	Effort         model.Effort
@@ -26,23 +27,25 @@ type RuntimeIdentity struct {
 // it should carry this opaque digest as its runtime-identity revision rather
 // than hashing a model descriptor, endpoint, or credential.
 func (i RuntimeIdentity) Digest() string {
-	if i.Profile == "" && i.CatalogDigest == "" && i.TargetProvider == "" && i.TargetModel == "" && i.Effort == model.EffortNone {
+	if i.Profile == "" && i.CatalogDigest == "" && i.ModelAlias == "" && i.TargetProvider == "" && i.TargetModel == "" && i.Effort == model.EffortNone {
 		return ""
 	}
 	projection := struct {
 		Domain         string             `json:"domain"`
 		Profile        RuntimeProfileName `json:"profile,omitempty"`
 		CatalogDigest  string             `json:"catalog_digest,omitempty"`
+		ModelAlias     ModelAlias         `json:"model_alias,omitempty"`
 		TargetProvider model.ProviderName `json:"target_provider,omitempty"`
 		TargetModel    string             `json:"target_model,omitempty"`
-		Effort         model.Effort       `json:"effort"`
+		Effort         string             `json:"effort"`
 	}{
 		Domain:         "loop/runtime-identity/v1",
 		Profile:        i.Profile,
 		CatalogDigest:  i.CatalogDigest,
+		ModelAlias:     i.ModelAlias,
 		TargetProvider: i.TargetProvider,
 		TargetModel:    i.TargetModel,
-		Effort:         i.Effort,
+		Effort:         runtimeEffortString(i.Effort),
 	}
 	encoded, err := json.Marshal(projection)
 	if err != nil {
@@ -101,11 +104,21 @@ func OverrideBoundAccess(bound BoundDefinition, access AccessGate) (BoundDefinit
 // Every bound mode receives the same model and effort so a later mode
 // selection cannot silently un-pin the selected runtime tuple.
 func OverrideBoundRuntime(bound BoundDefinition, profile RuntimeProfileName, target model.Model, effort model.Effort) (BoundDefinition, error) {
+	return OverrideBoundRuntimeSelection(bound, profile, "", target, effort)
+}
+
+// OverrideBoundRuntimeSelection is the binding-time seam for a resolved
+// runtime tuple. alias is optional only for compatibility with callers using
+// OverrideBoundRuntime; non-empty aliases use the catalog's identifier rules.
+func OverrideBoundRuntimeSelection(bound BoundDefinition, profile RuntimeProfileName, alias ModelAlias, target model.Model, effort model.Effort) (BoundDefinition, error) {
 	state, ok := bound.(*boundDefinitionState)
 	if !ok || state == nil {
 		return nil, &BindError{Kind: BindInvalidDefinition, Index: -1}
 	}
-	if validateCatalogIdentifier(string(profile), false) != nil {
+	if validateRuntimeProfile(string(profile)) != nil {
+		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1}
+	}
+	if alias != "" && validateCatalogIdentifier(string(alias), false) != nil {
 		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1}
 	}
 	if zeroModel(target) {
@@ -127,6 +140,7 @@ func OverrideBoundRuntime(bound BoundDefinition, profile RuntimeProfileName, tar
 	definition.model = cloneModel(target)
 	clone.definition = &definition
 	clone.runtimeProfile = profile
+	clone.runtimeModelAlias = alias
 	clone.runtimeTargetProvider = target.Provider
 	clone.runtimeTargetModel = target.Name
 	clone.runtimeEffort = effort
@@ -139,6 +153,13 @@ func OverrideBoundRuntime(bound BoundDefinition, profile RuntimeProfileName, tar
 		clone.modes[index] = pinned
 	}
 	return &clone, nil
+}
+
+func runtimeEffortString(effort model.Effort) string {
+	if effort == model.EffortNone {
+		return "none"
+	}
+	return string(effort)
 }
 
 // OverrideBoundRuntimeCatalog records the immutable catalog snapshot used to

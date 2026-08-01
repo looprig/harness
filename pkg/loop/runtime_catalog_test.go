@@ -86,6 +86,35 @@ func TestNewRuntimeCatalogInvariants(t *testing.T) {
 	}
 }
 
+func TestRuntimeCatalogAcceptsPlannedProfilesAndRejectsPathLikeProfiles(t *testing.T) {
+	t.Parallel()
+
+	valid := testCatalogEntries()
+	valid[0].Profile = "acp/codex"
+	valid[1].Profile = "acp/claude-code"
+	if _, err := NewRuntimeCatalog(valid); err != nil {
+		t.Fatalf("planned ACP profiles rejected: %v", err)
+	}
+
+	for _, profile := range []RuntimeProfileName{
+		"/tmp/child",
+		`acp\\codex`,
+		"acp/../codex",
+		"acp//codex",
+		"acp/other",
+		"acp/claude-code/extra",
+		"acp:codex",
+		"acp codex",
+		"..",
+	} {
+		entries := testCatalogEntries()
+		entries[0].Profile = profile
+		if _, err := NewRuntimeCatalog(entries); err == nil {
+			t.Errorf("profile %q accepted, want rejection", profile)
+		}
+	}
+}
+
 func TestRuntimeCatalogSortsEntriesAndModels(t *testing.T) {
 	entries := testCatalogEntries()
 	entries[0].Models = append(entries[0].Models, RuntimeModelOption{
@@ -182,6 +211,43 @@ func TestRuntimeCatalogResolveDefaultsAndRejectsIncompatibleSelectors(t *testing
 				t.Fatalf("Resolve() selectors = %q/%q/%q, want %q/%q/%q", got.AgentHarness, got.ModelAlias, got.Effort, tt.want.AgentHarness, tt.want.ModelAlias, tt.want.Effort)
 			}
 		})
+	}
+}
+
+func TestRuntimeCatalogResolveWithExplicitEffortDistinguishesNoneFromOmitted(t *testing.T) {
+	t.Parallel()
+
+	entries := testCatalogEntries()
+	entries[1].Models[0].DefaultEffort = model.EffortHigh
+	entries[1].Models[0].Efforts = []model.Effort{model.EffortNone, model.EffortHigh}
+	catalog, err := NewRuntimeCatalog(entries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+
+	omitted, err := catalog.Resolve("worker", "claude-code", "sonnet", model.EffortNone)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if omitted.Effort != model.EffortHigh {
+		t.Fatalf("omitted effort = %q, want high", omitted.Effort)
+	}
+
+	explicit, err := catalog.ResolveWithExplicitEffort("worker", "claude-code", "sonnet", model.EffortNone, true)
+	if err != nil {
+		t.Fatalf("ResolveWithExplicitEffort() error = %v", err)
+	}
+	if explicit.Effort != model.EffortNone {
+		t.Fatalf("explicit none effort = %q, want none", explicit.Effort)
+	}
+
+	entries = testCatalogEntries()
+	catalog, err = NewRuntimeCatalog(entries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() without none error = %v", err)
+	}
+	if _, err := catalog.ResolveWithExplicitEffort("worker", "claude-code", "sonnet", model.EffortNone, true); err == nil {
+		t.Fatal("explicit none accepted for a model that does not advertise none")
 	}
 }
 
