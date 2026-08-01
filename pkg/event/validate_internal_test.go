@@ -248,6 +248,34 @@ func TestCurrentManifestRuntimeIdentityFieldsAreBoundedOpaqueIdentifiers(t *test
 	}
 }
 
+func TestCurrentManifestRuntimeProfileAcceptsSafeUTF8AndRejectsUnsafePathData(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "safe UTF-8", value: "acp/é", want: true},
+		{name: "control", value: "acp/\x00", want: false},
+		{name: "space", value: "acp/é model", want: false},
+		{name: "colon", value: "acp/é:codex", want: false},
+		{name: "backslash", value: `acp/é\\codex`, want: false},
+		{name: "dot segment", value: "acp/../codex", want: false},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			manifest := testManifest()
+			manifest.RuntimeProfile = tt.value
+			if got := validConfigManifestSchema(manifest, false); got != tt.want {
+				t.Fatalf("validConfigManifestSchema(profile %q) = %t, want %t", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestConfigurationAdoptedOverLongActorRejected asserts a decoded adoption whose
 // Actor exceeds MaxConfigActorLen is rejected with FieldActor/RuleInvalid. A live
 // decider can't trip this (the restore constructor truncates), but a hand-crafted

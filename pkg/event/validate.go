@@ -2,6 +2,7 @@ package event
 
 import (
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/looprig/core/content"
@@ -466,15 +467,18 @@ func validRuntimeManifestIdentifier(value string) bool {
 	if len(value) > maxRuntimeManifestIdentifierBytes || !utf8.ValidString(value) {
 		return false
 	}
-	for i := 0; i < len(value); i++ {
-		b := value[i]
-		if (b >= 'a' && b <= 'z') ||
-			(b >= 'A' && b <= 'Z') ||
-			(b >= '0' && b <= '9') ||
-			b == '.' || b == '_' || b == '-' || b == '/' {
-			continue
-		}
+	if strings.TrimSpace(value) != value {
 		return false
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+		for _, r := range segment {
+			if r == '\\' || r == ':' || r == 0 || unicode.IsControl(r) || unicode.IsSpace(r) {
+				return false
+			}
+		}
 	}
 	return true
 }
