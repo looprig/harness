@@ -283,13 +283,14 @@ type Session struct {
 	// RestoreForeignBuilderMissing). The session depends only on these narrow function
 	// seams, never on the foreignloop concrete loop (Dependency Inversion): loopruntime.New
 	// itself only ever builds native, and the foreign backend is injected here.
-	foreignBuild         foreign.Builder
-	foreignBuildRestored foreign.RestoredBuilder
-	foreignRegistry      *foreign.BuilderRegistry
-	runtimeCatalog       loop.RuntimeCatalog
-	hasRuntimeCatalog    bool
-	delegateSubscribe    func(event.EventFilter) (event.Subscription, error)
-	delegateEnqueue      func(context.Context, loop.Backend, command.UserInput) error
+	foreignBuild           foreign.Builder
+	foreignBuildRestored   foreign.RestoredBuilder
+	foreignRegistry        *foreign.BuilderRegistry
+	runtimeCatalog         loop.RuntimeCatalog
+	hasRuntimeCatalog      bool
+	runtimeCatalogProvider RuntimeCatalogProvider
+	delegateSubscribe      func(event.EventFilter) (event.Subscription, error)
+	delegateEnqueue        func(context.Context, loop.Backend, command.UserInput) error
 
 	// ws is the workspace snapshot store CheckpointWorkspace archives the session's
 	// working tree into, and wsRoot is the directory it archives. Both are wired
@@ -1180,10 +1181,10 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Definition) (uuid.UUI
 // rides as a plain parameter into the LoopStarted build only — it touches no identity /
 // Provenance / Header struct, so it never perturbs the loop tree or the quota/depth math.
 func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, selectedMode loop.ModeName, prepared *preparedLoop) (uuid.UUID, error) {
-	return s.newLoopWithAdmission(parent, cfg, parentToolUseID, selectedMode, prepared, nil, nil)
+	return s.newLoopWithAdmission(parent, cfg, parentToolUseID, selectedMode, prepared, nil, nil, loop.RuntimeCatalog{}, false)
 }
 
-func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, selectedMode loop.ModeName, prepared *preparedLoop, admission *delegateAdmission, runtime *loop.Resolved) (uuid.UUID, error) {
+func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, selectedMode loop.ModeName, prepared *preparedLoop, admission *delegateAdmission, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog bool) (uuid.UUID, error) {
 	// Whether this spawn counts toward the cumulative spawn quota. The initial root loop is
 	// built by newSession via NewLoop with zero provenance and must not consume a quota slot;
 	// every subagent spawn
@@ -1268,8 +1269,8 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		}
 		if runtime != nil {
 			bound, err = loop.OverrideBoundRuntimeSelection(bound, runtime.Profile, runtime.ModelAlias, runtime.Target, runtime.Effort)
-			if err == nil {
-				bound, err = loop.OverrideBoundRuntimeCatalog(bound, s.runtimeCatalog)
+			if err == nil && hasRuntimeCatalog {
+				bound, err = loop.OverrideBoundRuntimeCatalog(bound, runtimeCatalog)
 			}
 			if err != nil {
 				release()
@@ -1680,7 +1681,9 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// manager is attached to this session so its scoped controllers can spawn + address
 	// children through it.
 	s.topology = cloneTopology(topology)
-	if s.hasRuntimeCatalog {
+	if s.runtimeCatalogProvider != nil {
+		s.delegation = newDelegationManagerWithCatalogProvider(s.topology, s.runtimeCatalogProvider)
+	} else if s.hasRuntimeCatalog {
 		s.delegation = newDelegationManager(s.topology, s.runtimeCatalog)
 	} else {
 		s.delegation = newDelegationManager(s.topology)

@@ -45,6 +45,12 @@ func (nopCommandAppender) AppendCommand(context.Context, journal.CommandRecord) 
 // appender (Phase 10) without New growing a positional parameter.
 type Option func(*Session)
 
+// RuntimeCatalogProvider returns the immutable runtime catalog visible to one
+// parent definition. Returning false preserves the native/no-choice surface
+// for that parent. A provider is composition-root policy and must not derive
+// entries from model-controlled request data.
+type RuntimeCatalogProvider func(parent loop.Definition) (loop.RuntimeCatalog, bool)
+
 // WithCommandAppender injects the intent-log appender (the composition
 // root's adapter over SessionJournal). A nil appender is ignored (the nop default stays
 // installed) so a caller can never accidentally null out the field and nil-deref the
@@ -239,6 +245,16 @@ func WithRuntimeCatalog(catalog loop.RuntimeCatalog) Option {
 	return func(s *Session) {
 		s.runtimeCatalog = catalog
 		s.hasRuntimeCatalog = true
+	}
+}
+
+// WithRuntimeCatalogProvider installs parent-specific catalog snapshots. It
+// takes precedence over WithRuntimeCatalog when both are supplied.
+func WithRuntimeCatalogProvider(provider RuntimeCatalogProvider) Option {
+	return func(s *Session) {
+		if provider != nil {
+			s.runtimeCatalogProvider = provider
+		}
 	}
 }
 

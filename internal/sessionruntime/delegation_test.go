@@ -323,6 +323,16 @@ func TestDelegateRuntimeIsRevalidatedAndPinnedAtChildBind(t *testing.T) {
 	if handle.bound.Model().Name != "runtime-target" || handle.bound.Engine() != loop.EngineAdapter {
 		t.Fatalf("bound runtime = engine=%v model=%q, want adapter/runtime-target", handle.bound.Engine(), handle.bound.Model().Name)
 	}
+	defaultResult, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "default", Wait: true})
+	if err != nil {
+		t.Fatalf("default runtime start: %v", err)
+	}
+	s.loopsMu.RLock()
+	defaultHandle := s.loops[defaultResult.DelegateID]
+	s.loopsMu.RUnlock()
+	if defaultHandle == nil || defaultHandle.bound.RuntimeProfile() != "acp/test" || defaultHandle.bound.Model().Name != "runtime-target" {
+		t.Fatalf("default bound runtime = %#v, want catalog default adapter runtime", defaultHandle)
+	}
 	_, err = ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "bad", Wait: true, Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Model: "missing", Effort: "high"}})
 	var runtimeErr *DelegateError
 	if !errors.As(err, &runtimeErr) || runtimeErr.Kind != DelegateRuntimeInvalid {
@@ -357,6 +367,61 @@ func TestDelegateCatalogDerivesAllowedModes(t *testing.T) {
 		if !strings.Contains(string(info.Schema), want) {
 			t.Errorf("schema missing %s: %s", want, info.Schema)
 		}
+	}
+}
+
+func TestDelegateRuntimeCatalogProviderIsParentScoped(t *testing.T) {
+	t.Parallel()
+	parentA := mustDefine(
+		loop.WithName("parent-a"),
+		loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("parent-a")}}, validModel("parent-a")),
+		loop.WithDelegates("child"),
+		loop.WithDelegation(loop.Delegation{Style: loop.DelegationManaged}),
+	)
+	parentB := mustDefine(
+		loop.WithName("parent-b"),
+		loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("parent-b")}}, validModel("parent-b")),
+		loop.WithDelegates("child"),
+		loop.WithDelegation(loop.Delegation{Style: loop.DelegationManaged}),
+	)
+	child := delegateChild("child", "child")
+	catalog := func(harness loop.AgentHarnessName, profile loop.RuntimeProfileName) loop.RuntimeCatalog {
+		result, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+			SubagentType: "child", AgentHarness: harness, Profile: profile, Credential: loop.CredentialGatewayBacked,
+			Default: true, DefaultModel: "model", Models: []loop.RuntimeModelOption{{
+				Alias: "model", Target: validModel(string(harness)), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh},
+			}},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	catalogA := catalog("claude-code", "acp/claude-code")
+	catalogB := catalog("codex", "acp/codex")
+	manager := newDelegationManagerWithCatalogProvider(
+		Topology{Definitions: []loop.Definition{parentA, parentB, child}},
+		func(parent loop.Definition) (loop.RuntimeCatalog, bool) {
+			switch parent.Name() {
+			case "parent-a":
+				return catalogA, true
+			case "parent-b":
+				return catalogB, true
+			default:
+				return loop.RuntimeCatalog{}, false
+			}
+		},
+	)
+	controllerA := manager.controllerFor(mustUUID(), parentA).(*scopedController)
+	controllerB := manager.controllerFor(mustUUID(), parentB).(*scopedController)
+	if !controllerA.hasRuntimeCatalog || controllerA.runtimeCatalog.Digest() != catalogA.Digest() {
+		t.Fatal("parent-a did not receive its catalog")
+	}
+	if !controllerB.hasRuntimeCatalog || controllerB.runtimeCatalog.Digest() != catalogB.Digest() {
+		t.Fatal("parent-b did not receive its catalog")
+	}
+	if controllerA.runtimeCatalog.Digest() == controllerB.runtimeCatalog.Digest() {
+		t.Fatal("parent-specific catalogs collapsed to one snapshot")
 	}
 }
 

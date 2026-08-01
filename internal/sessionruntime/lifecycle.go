@@ -517,6 +517,14 @@ func WithLifecycleRuntimeCatalog(catalog loop.RuntimeCatalog) LifecycleOption {
 	}
 }
 
+// WithLifecycleRuntimeCatalogProvider forwards parent-specific runtime catalog
+// selection to every live/restored session.
+func WithLifecycleRuntimeCatalogProvider(provider RuntimeCatalogProvider) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.baseOpts = append(r.baseOpts, WithRuntimeCatalogProvider(provider))
+	}
+}
+
 // WithLifecycleGateCaps captures the live gate-directory bounds. Zero (the default) means no
 // cap. Forwarded to both NewSession and RestoreSession as WithGateCaps.
 func WithLifecycleGateCaps(caps GateCaps) LifecycleOption {

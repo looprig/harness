@@ -53,9 +53,10 @@ type delegationManager struct {
 	// loop's folded history (request id → the terminal of the correlated turn). It is the
 	// post-restore fallback for wait: the in-memory pending handle does not survive a
 	// process restart, but the child's committed turn terminal does. Guarded by mu.
-	resolved          map[uuid.UUID]resolvedRequest
-	runtimeCatalog    loop.RuntimeCatalog
-	hasRuntimeCatalog bool
+	resolved               map[uuid.UUID]resolvedRequest
+	runtimeCatalog         loop.RuntimeCatalog
+	hasRuntimeCatalog      bool
+	runtimeCatalogProvider RuntimeCatalogProvider
 }
 
 type delegateAdmission struct {
@@ -144,6 +145,25 @@ func newDelegationManager(topology Topology, catalogs ...loop.RuntimeCatalog) *d
 		manager.hasRuntimeCatalog = true
 	}
 	return manager
+}
+
+func newDelegationManagerWithCatalogProvider(topology Topology, provider RuntimeCatalogProvider) *delegationManager {
+	manager := newDelegationManager(topology)
+	manager.runtimeCatalogProvider = provider
+	return manager
+}
+
+func (m *delegationManager) catalogFor(parent loop.Definition) (loop.RuntimeCatalog, bool) {
+	if m == nil {
+		return loop.RuntimeCatalog{}, false
+	}
+	if m.runtimeCatalogProvider != nil {
+		return m.runtimeCatalogProvider(parent)
+	}
+	if m.hasRuntimeCatalog {
+		return m.runtimeCatalog, true
+	}
+	return loop.RuntimeCatalog{}, false
 }
 
 // seedResolvedDelegateRecords reconstructs durable delegate correlation from required
@@ -302,8 +322,10 @@ func delegateExtraTools(def loop.Definition, manager *delegationManager) []tool.
 		}
 		catalog[i] = entry
 	}
-	if manager != nil && manager.hasRuntimeCatalog {
-		return []tool.Definition{delegationtool.Definition(def.Delegation().Style, catalog, manager.runtimeCatalog)}
+	if manager != nil {
+		if runtimeCatalog, ok := manager.catalogFor(def); ok {
+			return []tool.Definition{delegationtool.Definition(def.Delegation().Style, catalog, runtimeCatalog)}
+		}
 	}
 	return []tool.Definition{delegationtool.Definition(def.Delegation().Style, catalog)}
 }
@@ -324,8 +346,7 @@ func (m *delegationManager) controllerFor(parentLoopID uuid.UUID, parent loop.De
 		allowed:      allowed,
 	}
 	if m != nil {
-		controller.runtimeCatalog = m.runtimeCatalog
-		controller.hasRuntimeCatalog = m.hasRuntimeCatalog
+		controller.runtimeCatalog, controller.hasRuntimeCatalog = m.catalogFor(parent)
 	}
 	return controller
 }
@@ -456,6 +477,16 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 		return tool.DelegateResult{}, err
 	}
 	var runtime *loop.Resolved
+	if c.hasRuntimeCatalog {
+		entries := c.runtimeCatalog.EntriesFor(agent)
+		if req.Runtime == nil && len(entries) > 0 {
+			resolved, err := c.runtimeCatalog.Resolve(agent, "", "", inferencemodel.EffortNone)
+			if err != nil {
+				return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeInvalid}
+			}
+			runtime = &resolved
+		}
+	}
 	if req.Runtime != nil {
 		if !c.hasRuntimeCatalog {
 			return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeUnavailable}
@@ -484,7 +515,7 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateInterruptPending, DelegateID: c.parentLoopID}
 	}
 	parent := loop.Provenance{LoopID: c.parentLoopID}
-	childID, requestID, sub, err := s.startDelegate(ctx, parent, childDef, mode, req.Message, req.ParentToolUseID, runtime)
+	childID, requestID, sub, err := s.startDelegate(ctx, parent, childDef, mode, req.Message, req.ParentToolUseID, runtime, c.runtimeCatalog, c.hasRuntimeCatalog)
 	if err != nil {
 		return tool.DelegateResult{}, err
 	}
@@ -736,9 +767,9 @@ func timeoutOrInterrupted(timeoutSeconds *int, waitCtx context.Context) tool.Del
 // subscription, request mint, backend construction, and initial-command acceptance all
 // precede the checked LoopStarted commit. The backend's publisher remains blocked until
 // that commit, so TurnStarted can neither race ahead nor survive a failed spawn.
-func (s *Session) startDelegate(ctx context.Context, parent loop.Provenance, cfg loop.Definition, mode loop.ModeName, message, parentToolUseID string, runtime *loop.Resolved) (childID, requestID uuid.UUID, sub event.Subscription, err error) {
+func (s *Session) startDelegate(ctx context.Context, parent loop.Provenance, cfg loop.Definition, mode loop.ModeName, message, parentToolUseID string, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog bool) (childID, requestID uuid.UUID, sub event.Subscription, err error) {
 	admission := &delegateAdmission{ctx: ctx, message: message}
-	childID, err = s.newLoopWithAdmission(parent, cfg, parentToolUseID, mode, nil, admission, runtime)
+	childID, err = s.newLoopWithAdmission(parent, cfg, parentToolUseID, mode, nil, admission, runtime, runtimeCatalog, hasRuntimeCatalog)
 	if err != nil {
 		return uuid.UUID{}, uuid.UUID{}, nil, err
 	}

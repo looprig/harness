@@ -364,7 +364,9 @@ func restoreTopologySession(
 	}
 
 	var manager *delegationManager
-	if probe.hasRuntimeCatalog {
+	if probe.runtimeCatalogProvider != nil {
+		manager = newDelegationManagerWithCatalogProvider(topology, probe.runtimeCatalogProvider)
+	} else if probe.hasRuntimeCatalog {
 		manager = newDelegationManager(topology, probe.runtimeCatalog)
 	} else {
 		manager = newDelegationManager(topology)
