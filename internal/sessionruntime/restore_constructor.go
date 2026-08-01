@@ -75,7 +75,9 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 			cancel()
 			return &RestoreError{Kind: RestoreForeignBuilderMissing}
 		}
-		backend, err = s.foreignBuildRestored(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.RestoredForeign{ForeignSID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
+		// Legacy journals expose one foreign SID. Phase 6 dedicated journal wiring may
+		// replace the agent-side value with a separately journaled AgentSessionID.
+		backend, err = s.foreignBuildRestored(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
 	}
 	if err != nil {
 		cancel()
@@ -881,9 +883,11 @@ func buildRestoredSession(
 			restoreErr := &RestoreError{Kind: RestoreForeignBuilderMissing}
 			return abort(restoreErr)
 		}
+		// Legacy journals expose one foreign SID. Phase 6 dedicated journal wiring may
+		// replace the agent-side value with a separately journaled AgentSessionID.
 		l, err = s.foreignBuildRestored(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
 			func() (uuid.UUID, error) { return newID() }, factory,
-			foreign.RestoredForeign{ForeignSID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
+			foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
 	}
 	if err != nil {
 		cancel()

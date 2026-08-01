@@ -10,6 +10,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -93,6 +94,9 @@ func TestCodexForeignRestoreRecoversSIDFromForeignSessionBound(t *testing.T) {
 	if seed.ForeignSID != "codex-thread-restored-1" {
 		t.Errorf("restored seed.ForeignSID = %q, want %q", seed.ForeignSID, "codex-thread-restored-1")
 	}
+	if seed.AgentSessionID != "codex-thread-restored-1" {
+		t.Errorf("restored seed.AgentSessionID = %q, want %q", seed.AgentSessionID, "codex-thread-restored-1")
+	}
 	if seed.TurnIndex != folded.TurnIndex {
 		t.Errorf("restored seed.TurnIndex = %d, want %d", seed.TurnIndex, folded.TurnIndex)
 	}
@@ -104,6 +108,58 @@ func TestCodexForeignRestoreRecoversSIDFromForeignSessionBound(t *testing.T) {
 	}
 	if calledLID != rootLoopID {
 		t.Errorf("restored Builder loopID = %v, want %v", calledLID, rootLoopID)
+	}
+}
+
+func TestForeignRestoreLegacySIDSeedsRootAndChildAgentSessionIDs(t *testing.T) {
+	t.Parallel()
+
+	const legacySID = "legacy-foreign-sid-root-and-child"
+	folded := foldLoop([]event.Event{
+		event.LoopStarted{},
+		event.TurnStarted{Message: foldUserMsg("hello")},
+		event.ForeignSessionBound{ForeignSID: legacySID},
+		foldStepGroup(aiMessage("hi")),
+		event.TurnDone{Message: aiMessage("hi")},
+	})
+	sessionID := mustUUID()
+	rootLoopID := mustUUID()
+	childLoopID := mustUUID()
+	builder := &fakeForeignBuilder{backend: newFakeBackend()}
+	rootBound := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineForeignCodex, "be helpful"), sessionID, rootLoopID)
+	restoreCtx, restoreCancel := context.WithCancel(context.Background())
+	t.Cleanup(restoreCancel)
+
+	s, err := buildRestoredSession(restoreCtx, restoreCancel, rootBound, tool.Bindings{SessionID: sessionID, LoopID: rootLoopID}, sessionID, rootLoopID,
+		legacySID, 0, folded, restoredInference{}, nil, fakeSessionJournal{}, event.NewFactory(uuid.New, time.Now), uuid.New, time.Now,
+		WithForeignBuilders(builder.build, builder.buildRestored))
+	if err != nil {
+		t.Fatalf("buildRestoredSession: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	builder.mu.Lock()
+	rootSeed := builder.restoreSeed
+	builder.mu.Unlock()
+	if rootSeed.ForeignSID != legacySID || rootSeed.AgentSessionID != legacySID {
+		t.Fatalf("root restored seed IDs = (%q, %q), want (%q, %q)", rootSeed.ForeignSID, rootSeed.AgentSessionID, legacySID, legacySID)
+	}
+
+	builder.mu.Lock()
+	builder.backend = newFakeBackend()
+	builder.mu.Unlock()
+	childBound := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineForeignCodex, "be helpful"), sessionID, childLoopID)
+	started := event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: childLoopID}}}
+	if err := s.attachRestoredLoop(started, loop.Provenance{}, childBound,
+		tool.Bindings{SessionID: sessionID, LoopID: childLoopID}, folded, restoredInference{}, legacySID); err != nil {
+		t.Fatalf("attachRestoredLoop: %v", err)
+	}
+
+	builder.mu.Lock()
+	childSeed := builder.restoreSeed
+	builder.mu.Unlock()
+	if childSeed.ForeignSID != legacySID || childSeed.AgentSessionID != legacySID {
+		t.Fatalf("child restored seed IDs = (%q, %q), want (%q, %q)", childSeed.ForeignSID, childSeed.AgentSessionID, legacySID, legacySID)
 	}
 }
 
@@ -300,6 +356,9 @@ func TestForeignRestore(t *testing.T) {
 				}
 				if seed.ForeignSID != tt.foreignSID {
 					t.Errorf("restored seed.ForeignSID = %q, want %q", seed.ForeignSID, tt.foreignSID)
+				}
+				if seed.AgentSessionID != tt.foreignSID {
+					t.Errorf("restored seed.AgentSessionID = %q, want %q", seed.AgentSessionID, tt.foreignSID)
 				}
 				if seed.TurnIndex != folded.TurnIndex {
 					t.Errorf("restored seed.TurnIndex = %d, want %d", seed.TurnIndex, folded.TurnIndex)
