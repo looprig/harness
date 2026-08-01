@@ -363,7 +363,12 @@ func restoreTopologySession(
 		withResolvedPlacement(resolved)(probe)
 	}
 
-	manager := newDelegationManager(topology)
+	var manager *delegationManager
+	if probe.hasRuntimeCatalog {
+		manager = newDelegationManager(topology, probe.runtimeCatalog)
+	} else {
+		manager = newDelegationManager(topology)
+	}
 	contextDisposition := func(bound loop.BoundDefinition) (bool, error) {
 		if newPath {
 			// The NEW-path decision (above) already assessed drift; context staleness reuses

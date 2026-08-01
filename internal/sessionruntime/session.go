@@ -285,6 +285,9 @@ type Session struct {
 	// itself only ever builds native, and the foreign backend is injected here.
 	foreignBuild         foreign.Builder
 	foreignBuildRestored foreign.RestoredBuilder
+	foreignRegistry      *foreign.BuilderRegistry
+	runtimeCatalog       loop.RuntimeCatalog
+	hasRuntimeCatalog    bool
 	delegateSubscribe    func(event.EventFilter) (event.Subscription, error)
 	delegateEnqueue      func(context.Context, loop.Backend, command.UserInput) error
 
@@ -1177,10 +1180,10 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Definition) (uuid.UUI
 // rides as a plain parameter into the LoopStarted build only — it touches no identity /
 // Provenance / Header struct, so it never perturbs the loop tree or the quota/depth math.
 func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, selectedMode loop.ModeName, prepared *preparedLoop) (uuid.UUID, error) {
-	return s.newLoopWithAdmission(parent, cfg, parentToolUseID, selectedMode, prepared, nil)
+	return s.newLoopWithAdmission(parent, cfg, parentToolUseID, selectedMode, prepared, nil, nil)
 }
 
-func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, selectedMode loop.ModeName, prepared *preparedLoop, admission *delegateAdmission) (uuid.UUID, error) {
+func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, selectedMode loop.ModeName, prepared *preparedLoop, admission *delegateAdmission, runtime *loop.Resolved) (uuid.UUID, error) {
 	// Whether this spawn counts toward the cumulative spawn quota. The initial root loop is
 	// built by newSession via NewLoop with zero provenance and must not consume a quota slot;
 	// every subagent spawn
@@ -1262,6 +1265,16 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		if err != nil {
 			release()
 			return uuid.UUID{}, err
+		}
+		if runtime != nil {
+			bound, err = loop.OverrideBoundRuntimeSelection(bound, runtime.Profile, runtime.ModelAlias, runtime.Target, runtime.Effort)
+			if err == nil {
+				bound, err = loop.OverrideBoundRuntimeCatalog(bound, s.runtimeCatalog)
+			}
+			if err != nil {
+				release()
+				return uuid.UUID{}, err
+			}
 		}
 	}
 	// A spawned subagent keeps its OWN definition's access gate — never the
@@ -1346,6 +1359,27 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext()},
 			)
 		}
+	case loop.EngineAdapter:
+		if s.foreignRegistry == nil {
+			release()
+			cancel()
+			return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing}
+		}
+		builder, _, lookupErr := s.foreignRegistry.Builder(bound.RuntimeProfile())
+		if lookupErr != nil {
+			release()
+			cancel()
+			return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing, Cause: lookupErr}
+		}
+		selectedBound, selectErr := loop.SelectBoundMode(bound, startedMode)
+		if selectErr != nil {
+			release()
+			cancel()
+			return uuid.UUID{}, selectErr
+		}
+		bound = selectedBound
+		b, foreignSID, err = builder(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
+			func() (uuid.UUID, error) { return s.newID() }, s.factory)
 	default:
 		if s.foreignBuild == nil {
 			release()
@@ -1646,7 +1680,11 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// manager is attached to this session so its scoped controllers can spawn + address
 	// children through it.
 	s.topology = cloneTopology(topology)
-	s.delegation = newDelegationManager(s.topology)
+	if s.hasRuntimeCatalog {
+		s.delegation = newDelegationManager(s.topology, s.runtimeCatalog)
+	} else {
+		s.delegation = newDelegationManager(s.topology)
+	}
 	s.delegation.attach(s)
 	// The Factory mints from closures over the LIVE newID + now fields, so a test
 	// that swaps either after construction pins the stamp too (the same seam the

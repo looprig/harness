@@ -90,6 +90,14 @@ type wireEnvelope struct {
 	TimeoutSeconds  *int           `json:"timeout_seconds,omitempty"`
 }
 
+func fields(names ...string) map[string]struct{} {
+	result := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		result[name] = struct{}{}
+	}
+	return result
+}
+
 // prepareEnvelope performs the untrusted preparation boundary for a Subagent
 // call. It is deliberately independent of the controller and runtime catalog so
 // the same normalized artifact can be extended by Task 21 without re-decoding.

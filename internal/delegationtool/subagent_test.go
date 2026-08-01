@@ -29,6 +29,20 @@ func textOf(t *testing.T, result *tool.ToolResult) string {
 	return block.Text
 }
 
+func invokePrepared(t *testing.T, s *SubagentTool, args string) (*tool.ToolResult, error) {
+	t.Helper()
+	executionID, err := uuid.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, artifact, err := s.PrepareCall(context.Background(), executionID, args)
+	if err != nil {
+		return tool.TextResult("error: subagent action unavailable"), nil
+	}
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{Request: request, Artifact: artifact})
+	return s.InvokableRun(ctx, args)
+}
+
 func TestSubagentInfoSchemaBytesDeterministicAcrossConcurrentCalls(t *testing.T) {
 	t.Parallel()
 	s := NewSubagent(&fakeController{}, loop.DelegationManaged, subagentCatalog())
@@ -187,8 +201,8 @@ func TestSubagentInfoSchemaPerStyle(t *testing.T) {
 	}
 }
 
-// TestSubagentStartDefaults asserts the synchronous-preserving defaults: a missing
-// action means "start" and a missing "wait" on start means true, and the envelope is
+// TestSubagentStartDefaults asserts the new background-preserving defaults: a missing
+// action means "start" and a missing "run_in_background" means true, and the envelope is
 // translated into the right DelegateRequest.
 func TestSubagentStartDefaults(t *testing.T) {
 	t.Parallel()
@@ -199,9 +213,9 @@ func TestSubagentStartDefaults(t *testing.T) {
 		wantWait bool
 		wantMode string
 	}{
-		{name: "omitted action is start with wait true", args: `{"agent":"explorer","message":"map repo"}`, wantOp: tool.DelegateStart, wantWait: true},
-		{name: "explicit start honors wait false", args: `{"action":"start","agent":"explorer","message":"m","wait":false}`, wantOp: tool.DelegateStart, wantWait: false},
-		{name: "start carries the selected mode", args: `{"action":"start","agent":"explorer","message":"m","mode":"review"}`, wantOp: tool.DelegateStart, wantWait: true, wantMode: "review"},
+		{name: "omitted action is background start", args: `{"description":"d","prompt":"map repo","subagent_type":"explorer"}`, wantOp: tool.DelegateStart, wantWait: false},
+		{name: "explicit start foreground", args: `{"action":"start","description":"d","prompt":"m","subagent_type":"explorer","run_in_background":false}`, wantOp: tool.DelegateStart, wantWait: true},
+		{name: "start carries the selected mode", args: `{"action":"start","description":"d","prompt":"m","subagent_type":"explorer","mode":"review"}`, wantOp: tool.DelegateStart, wantWait: false, wantMode: "review"},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -213,7 +227,7 @@ func TestSubagentStartDefaults(t *testing.T) {
 				Output:     "ok",
 			}}
 			s := NewSubagent(fc, loop.DelegationManaged, subagentCatalog())
-			if _, err := s.InvokableRun(context.Background(), tt.args); err != nil {
+			if _, err := invokePrepared(t, s, tt.args); err != nil {
 				t.Fatalf("InvokableRun() Go error = %v (must be nil)", err)
 			}
 			got := fc.last()
@@ -239,10 +253,10 @@ func TestSubagentSyncOnlyCannotCraftAsyncStart(t *testing.T) {
 	s := NewSubagent(fc, loop.DelegationSyncOnly, subagentCatalog())
 
 	for _, args := range []string{
-		`{"agent":"explorer","message":"map repo"}`,
-		`{"action":"start","agent":"explorer","message":"map repo","wait":true}`,
+		`{"description":"d","prompt":"map repo","subagent_type":"explorer","run_in_background":false}`,
+		`{"action":"start","description":"d","prompt":"map repo","subagent_type":"explorer","run_in_background":false}`,
 	} {
-		if _, err := s.InvokableRun(context.Background(), args); err != nil {
+		if _, err := invokePrepared(t, s, args); err != nil {
 			t.Fatalf("InvokableRun(%s): %v", args, err)
 		}
 		if got := fc.last(); got.Operation != tool.DelegateStart || !got.Wait {
@@ -251,7 +265,7 @@ func TestSubagentSyncOnlyCannotCraftAsyncStart(t *testing.T) {
 	}
 
 	before := len(fc.requests)
-	res, err := s.InvokableRun(context.Background(), `{"action":"start","agent":"explorer","message":"map repo","wait":false}`)
+	res, err := invokePrepared(t, s, `{"action":"start","description":"d","prompt":"map repo","subagent_type":"explorer","run_in_background":true}`)
 	if err != nil {
 		t.Fatalf("InvokableRun crafted async start Go error = %v", err)
 	}
@@ -271,18 +285,18 @@ func TestSubagentStrictActionEnvelopes(t *testing.T) {
 		name string
 		args string
 	}{
-		{name: "unknown field", args: `{"agent":"explorer","message":"m","extra":true}`},
-		{name: "trailing JSON", args: `{"agent":"explorer","message":"m"} {}`},
-		{name: "fractional timeout", args: `{"agent":"explorer","message":"m","timeout_seconds":1.5}`},
-		{name: "start forbids delegate", args: `{"agent":"explorer","message":"m","delegate_id":"` + del + `"}`},
-		{name: "start forbids request", args: `{"agent":"explorer","message":"m","request_id":"` + req + `"}`},
-		{name: "send forbids agent", args: `{"action":"send","delegate_id":"` + del + `","message":"m","agent":"explorer"}`},
-		{name: "send forbids mode", args: `{"action":"send","delegate_id":"` + del + `","message":"m","mode":"review"}`},
-		{name: "send forbids request", args: `{"action":"send","delegate_id":"` + del + `","message":"m","request_id":"` + req + `"}`},
-		{name: "wait forbids wait", args: `{"action":"wait","delegate_id":"` + del + `","request_id":"` + req + `","wait":true}`},
-		{name: "wait forbids message", args: `{"action":"wait","delegate_id":"` + del + `","request_id":"` + req + `","message":"m"}`},
+		{name: "unknown field", args: `{"description":"d","prompt":"m","subagent_type":"explorer","extra":true}`},
+		{name: "trailing JSON", args: `{"description":"d","prompt":"m","subagent_type":"explorer"} {}`},
+		{name: "fractional timeout", args: `{"description":"d","prompt":"m","subagent_type":"explorer","timeout_seconds":1.5}`},
+		{name: "start forbids delegate", args: `{"description":"d","prompt":"m","subagent_type":"explorer","delegate_id":"` + del + `"}`},
+		{name: "start forbids request", args: `{"description":"d","prompt":"m","subagent_type":"explorer","request_id":"` + req + `"}`},
+		{name: "send forbids agent", args: `{"action":"send","delegate_id":"` + del + `","prompt":"m","subagent_type":"explorer"}`},
+		{name: "send forbids mode", args: `{"action":"send","delegate_id":"` + del + `","prompt":"m","mode":"review"}`},
+		{name: "send forbids request", args: `{"action":"send","delegate_id":"` + del + `","prompt":"m","request_id":"` + req + `"}`},
+		{name: "wait forbids background", args: `{"action":"wait","delegate_id":"` + del + `","request_id":"` + req + `","run_in_background":true}`},
+		{name: "wait forbids prompt", args: `{"action":"wait","delegate_id":"` + del + `","request_id":"` + req + `","prompt":"m"}`},
 		{name: "interrupt forbids timeout", args: `{"action":"interrupt","delegate_id":"` + del + `","timeout_seconds":1}`},
-		{name: "status forbids message", args: `{"action":"status","message":"m"}`},
+		{name: "status forbids prompt", args: `{"action":"status","prompt":"m"}`},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -290,7 +304,7 @@ func TestSubagentStrictActionEnvelopes(t *testing.T) {
 			t.Parallel()
 			fc := &fakeController{}
 			s := NewSubagent(fc, loop.DelegationManaged, subagentCatalog())
-			res, err := s.InvokableRun(context.Background(), tt.args)
+			res, err := invokePrepared(t, s, tt.args)
 			if err != nil {
 				t.Fatalf("InvokableRun Go error = %v", err)
 			}
@@ -417,7 +431,7 @@ func TestSubagentActionMapping(t *testing.T) {
 		wantDelegate  bool
 		wantRequestID bool
 	}{
-		{name: "send", args: `{"action":"send","delegate_id":"` + del + `","message":"progress?"}`, wantOp: tool.DelegateSend, wantDelegate: true},
+		{name: "send", args: `{"action":"send","delegate_id":"` + del + `","prompt":"progress?"}`, wantOp: tool.DelegateSend, wantDelegate: true},
 		{name: "wait", args: `{"action":"wait","delegate_id":"` + del + `","request_id":"` + req + `"}`, wantOp: tool.DelegateWait, wantDelegate: true, wantRequestID: true},
 		{name: "interrupt", args: `{"action":"interrupt","delegate_id":"` + del + `"}`, wantOp: tool.DelegateInterrupt, wantDelegate: true},
 		{name: "status one", args: `{"action":"status","delegate_id":"` + del + `"}`, wantOp: tool.DelegateStatus, wantDelegate: true},
@@ -432,7 +446,7 @@ func TestSubagentActionMapping(t *testing.T) {
 				Status:     tool.DelegateStatusRunning,
 			}}
 			s := NewSubagent(fc, loop.DelegationManaged, subagentCatalog())
-			if _, err := s.InvokableRun(context.Background(), tt.args); err != nil {
+			if _, err := invokePrepared(t, s, tt.args); err != nil {
 				t.Fatalf("InvokableRun() Go error = %v", err)
 			}
 			got := fc.last()
@@ -463,17 +477,17 @@ func TestSubagentEnvelopeErrors(t *testing.T) {
 		args    string
 		wantSub string
 	}{
-		{name: "unparsable", args: `not json`, wantSub: "invalid arguments"},
-		{name: "unknown action", args: `{"action":"destroy"}`, wantSub: "unknown action"},
-		{name: "start missing agent", args: `{"action":"start","message":"m"}`, wantSub: "'agent' is required"},
-		{name: "start missing message", args: `{"action":"start","agent":"explorer"}`, wantSub: "'message' is required"},
-		{name: "send missing delegate", args: `{"action":"send","message":"m"}`, wantSub: "'delegate_id' is required"},
-		{name: "send missing message", args: `{"action":"send","delegate_id":"` + del + `"}`, wantSub: "'message' is required"},
-		{name: "wait missing delegate", args: `{"action":"wait","request_id":"` + del + `"}`, wantSub: "'delegate_id' is required"},
-		{name: "wait missing request", args: `{"action":"wait","delegate_id":"` + del + `"}`, wantSub: "'request_id' is required"},
-		{name: "wait zero request", args: `{"action":"wait","delegate_id":"` + del + `","request_id":"` + zero + `"}`, wantSub: "'request_id' is required"},
-		{name: "interrupt missing delegate", args: `{"action":"interrupt"}`, wantSub: "'delegate_id' is required"},
-		{name: "negative timeout", args: `{"action":"start","agent":"explorer","message":"m","timeout_seconds":-1}`, wantSub: "'timeout_seconds' must be non-negative"},
+		{name: "unparsable", args: `not json`, wantSub: "error:"},
+		{name: "unknown action", args: `{"action":"destroy"}`, wantSub: "error:"},
+		{name: "start missing role", args: `{"action":"start","description":"d","prompt":"m"}`, wantSub: "error:"},
+		{name: "start missing prompt", args: `{"action":"start","description":"d","subagent_type":"explorer"}`, wantSub: "error:"},
+		{name: "send missing delegate", args: `{"action":"send","prompt":"m"}`, wantSub: "error:"},
+		{name: "send missing prompt", args: `{"action":"send","delegate_id":"` + del + `"}`, wantSub: "error:"},
+		{name: "wait missing delegate", args: `{"action":"wait","request_id":"` + del + `"}`, wantSub: "error:"},
+		{name: "wait missing request", args: `{"action":"wait","delegate_id":"` + del + `"}`, wantSub: "error:"},
+		{name: "wait zero request", args: `{"action":"wait","delegate_id":"` + del + `","request_id":"` + zero + `"}`, wantSub: "error:"},
+		{name: "interrupt missing delegate", args: `{"action":"interrupt"}`, wantSub: "error:"},
+		{name: "negative timeout", args: `{"action":"start","description":"d","prompt":"m","subagent_type":"explorer","timeout_seconds":-1}`, wantSub: "error:"},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -481,7 +495,7 @@ func TestSubagentEnvelopeErrors(t *testing.T) {
 			t.Parallel()
 			fc := &fakeController{}
 			s := NewSubagent(fc, loop.DelegationManaged, subagentCatalog())
-			res, err := s.InvokableRun(context.Background(), tt.args)
+			res, err := invokePrepared(t, s, tt.args)
 			if err != nil {
 				t.Fatalf("InvokableRun() Go error = %v (failures must be tool-result strings)", err)
 			}
@@ -516,7 +530,7 @@ func TestSubagentWaitResultFormatting(t *testing.T) {
 		{name: "failed becomes error", result: tool.DelegateResult{DelegateID: del, Status: tool.DelegateStatusFailed}, want: "failed", wantSub: true},
 		{name: "interrupted becomes error", result: tool.DelegateResult{DelegateID: del, Status: tool.DelegateStatusInterrupted}, want: "interrupted", wantSub: true},
 		{name: "timed out becomes error", result: tool.DelegateResult{DelegateID: del, Status: tool.DelegateStatusTimedOut}, want: "timed out", wantSub: true},
-		{name: "execute error", execErr: &stubControllerError{msg: "not owned"}, want: "not owned", wantSub: true},
+		{name: "execute error", execErr: &stubControllerError{msg: "not owned"}, want: "request failed", wantSub: true},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -524,7 +538,7 @@ func TestSubagentWaitResultFormatting(t *testing.T) {
 			t.Parallel()
 			fc := &fakeController{result: tt.result, execErr: tt.execErr}
 			s := NewSubagent(fc, loop.DelegationManaged, subagentCatalog())
-			res, err := s.InvokableRun(context.Background(), `{"action":"start","agent":"explorer","message":"m","wait":true}`)
+			res, err := invokePrepared(t, s, `{"action":"start","description":"d","prompt":"m","subagent_type":"explorer","run_in_background":false}`)
 			if err != nil {
 				t.Fatalf("InvokableRun() Go error = %v", err)
 			}
@@ -550,7 +564,7 @@ func TestSubagentQueuedResultFormatting(t *testing.T) {
 	req := mustParseUUID(t, "66666666-6666-4666-8666-666666666666")
 	fc := &fakeController{result: tool.DelegateResult{DelegateID: del, RequestID: req, Status: tool.DelegateStatusQueued}}
 	s := NewSubagent(fc, loop.DelegationManaged, subagentCatalog())
-	res, err := s.InvokableRun(context.Background(), `{"action":"start","agent":"explorer","message":"m","wait":false}`)
+	res, err := invokePrepared(t, s, `{"action":"start","description":"d","prompt":"m","subagent_type":"explorer","run_in_background":true}`)
 	if err != nil {
 		t.Fatalf("InvokableRun() Go error = %v", err)
 	}
@@ -576,7 +590,7 @@ func TestSubagentStatusFormatting(t *testing.T) {
 	del := mustParseUUID(t, "55555555-5555-4555-8555-555555555555")
 	fc := &fakeController{result: tool.DelegateResult{DelegateID: del, Status: tool.DelegateStatusRunning, PendingRequests: 2}}
 	s := NewSubagent(fc, loop.DelegationManaged, subagentCatalog())
-	res, err := s.InvokableRun(context.Background(), `{"action":"status","delegate_id":"`+del.String()+`"}`)
+	res, err := invokePrepared(t, s, `{"action":"status","delegate_id":"`+del.String()+`"}`)
 	if err != nil {
 		t.Fatalf("InvokableRun() Go error = %v", err)
 	}
@@ -638,6 +652,69 @@ func TestSubagentCapabilities(t *testing.T) {
 	}
 }
 
+func TestSubagentExecutionRequiresTypedPreparedArtifact(t *testing.T) {
+	t.Parallel()
+	fc := &fakeController{}
+	s := NewSubagent(fc, loop.DelegationManaged, subagentCatalog())
+	for name, ctx := range map[string]context.Context{
+		"missing":    context.Background(),
+		"wrong type": loop.WithPreparedCall(context.Background(), tool.PreparedCall{Artifact: tool.TokenArtifact{Token: "not a delegation"}}),
+	} {
+		name, ctx := name, ctx
+		t.Run(name, func(t *testing.T) {
+			result, err := s.InvokableRun(ctx, `{"description":"ignored","prompt":"ignored","subagent_type":"explorer"}`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := textOf(t, result); got != "error: subagent call unavailable" {
+				t.Fatalf("result = %q, want bounded unavailable error", got)
+			}
+		})
+	}
+	if got := len(fc.requests); got != 0 {
+		t.Fatalf("controller calls = %d, want 0", got)
+	}
+}
+
+func TestSubagentExecutionUsesPreparedRequestAndTrustedToolUseID(t *testing.T) {
+	t.Parallel()
+	fc := &fakeController{result: tool.DelegateResult{Status: tool.DelegateStatusQueued}}
+	s := NewSubagent(fc, loop.DelegationManaged, subagentCatalog())
+	request, artifact, err := s.PrepareCall(context.Background(), mustParseUUID(t, "11111111-1111-4111-8111-111111111111"), `{"description":"d","prompt":"p","subagent_type":"explorer"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{Request: request, Artifact: artifact})
+	ctx = loop.WithToolUseID(ctx, "trusted-tool-use-id")
+	if _, err := s.InvokableRun(ctx, `not JSON and deliberately unrelated`); err != nil {
+		t.Fatal(err)
+	}
+	got := fc.last()
+	if got.Agent != "explorer" || got.Message != "p" || got.ParentToolUseID != "trusted-tool-use-id" {
+		t.Fatalf("request = %+v, want prepared values plus trusted tool id", got)
+	}
+}
+
+func TestSubagentQueuedRuntimeResultUsesJSONAndOmitsNativeHarnessWhenEmpty(t *testing.T) {
+	t.Parallel()
+	catalog := testPreparationCatalog(t)
+	fc := &fakeController{result: tool.DelegateResult{DelegateID: mustParseUUID(t, "55555555-5555-4555-8555-555555555555"), RequestID: mustParseUUID(t, "66666666-6666-4666-8666-666666666666"), Status: tool.DelegateStatusQueued}}
+	s := NewSubagentWithRuntimeCatalog(fc, loop.DelegationManaged, subagentCatalog(), catalog)
+	result, err := invokePrepared(t, s, `{"action":"start","description":"d","prompt":"p","subagent_type":"worker","agent_harness":"claude-code","model":"sonnet","effort":"medium"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Runtime *runtimeResult `json:"runtime"`
+	}
+	if err := json.Unmarshal([]byte(textOf(t, result)), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Runtime == nil || out.Runtime.AgentHarness != "claude-code" || out.Runtime.Model != "sonnet" || out.Runtime.Effort != "medium" {
+		t.Fatalf("runtime result = %+v, want resolved tuple", out.Runtime)
+	}
+}
+
 // FuzzSubagentArgs fuzzes the untrusted decoder: InvokableRun parses model output, so
 // it must NEVER panic and must ALWAYS return a nil Go error (every failure is a
 // tool-result string).
@@ -674,24 +751,23 @@ func FuzzSubagentArgs(f *testing.F) {
 	})
 }
 
-// TestSubagentPrepareCallIsPure: the Subagent tool implements the mandatory
-// preparation capability with a pure empty request (its historical AutoApprove
-// posture): no requirements, no grant binding, no artifact.
+// TestSubagentPrepareCallProducesArtifact verifies that preparation owns the
+// envelope and execution receives a typed artifact even for native/no-choice calls.
 func TestSubagentPrepareCallIsPure(t *testing.T) {
 	var _ tool.CallPreparer = (*SubagentTool)(nil)
-	st := &SubagentTool{}
+	st := NewSubagent(&fakeController{}, loop.DelegationManaged, subagentCatalog())
 	id, err := uuid.New()
 	if err != nil {
 		t.Fatalf("uuid.New: %v", err)
 	}
-	request, artifact, err := st.PrepareCall(context.Background(), id, `{"action":"start"}`)
+	request, artifact, err := st.PrepareCall(context.Background(), id, `{"description":"d","prompt":"m","subagent_type":"explorer"}`)
 	if err != nil {
 		t.Fatalf("PrepareCall() error = %v", err)
 	}
 	if len(request.Requirements) != 0 || request.ExecutionID != "" {
 		t.Errorf("PrepareCall() request = %+v, want a pure empty request", request)
 	}
-	if artifact != nil {
-		t.Errorf("PrepareCall() artifact = %#v, want nil", artifact)
+	if _, ok := artifact.(tool.DelegateArtifact); !ok {
+		t.Errorf("PrepareCall() artifact = %T, want tool.DelegateArtifact", artifact)
 	}
 }

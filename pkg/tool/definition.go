@@ -147,6 +147,12 @@ type DelegateRequest struct {
 	RequestID       *uuid.UUID
 	TimeoutSeconds  *int
 	ParentToolUseID string
+	// Runtime is the prepared, catalog-resolved agent-harness/model/effort tuple
+	// for a DelegateStart; nil for every other operation and for a start with no
+	// runtime choice. The controller re-resolves it against its OWN parent-scoped
+	// RuntimeCatalog before applying it (defense in depth) rather than trusting
+	// this value as final.
+	Runtime *DelegateRuntime
 }
 
 // DelegateChildStatus is the bounded mechanical status of one owned child returned

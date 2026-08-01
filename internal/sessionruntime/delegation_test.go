@@ -13,6 +13,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
@@ -283,6 +284,46 @@ func TestDelegateModeSelectiveStart(t *testing.T) {
 	}
 	if handle.Mode() != "review" {
 		t.Errorf("child live mode = %q, want review (started directly in the selected mode)", handle.Mode())
+	}
+}
+
+func TestDelegateRuntimeIsRevalidatedAndPinnedAtChildBind(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := delegateChild("child", "runtime child")
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType: "child", AgentHarness: "test", Profile: "acp/test", Default: true, DefaultModel: "runtime",
+		Credential: loop.CredentialGatewayBacked,
+		Models:     []loop.RuntimeModelOption{{Alias: "runtime", Target: validModel("runtime-target"), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := &fakeForeignBuilder{sid: fixedForeignSID, backend: newFakeBackend()}
+	registry := &foreign.BuilderRegistry{}
+	if err := registry.Register("acp/test", builder.build, builder.buildRestored); err != nil {
+		t.Fatal(err)
+	}
+	s := newDelegationSession(t, parent, []Option{WithRuntimeCatalog(catalog), WithForeignBuilderRegistry(registry)}, child)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+	request := tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true, Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Model: "runtime", Effort: "high"}}
+	result, err := ctrl.Execute(delegateCtx(t), request)
+	if err != nil {
+		t.Fatalf("runtime start: %v", err)
+	}
+	s.loopsMu.RLock()
+	handle, ok := s.loops[result.DelegateID]
+	s.loopsMu.RUnlock()
+	if !ok || handle == nil {
+		t.Fatal("runtime child not registered")
+	}
+	if handle.bound.Model().Name != "runtime-target" || handle.bound.Engine() != loop.EngineAdapter {
+		t.Fatalf("bound runtime = engine=%v model=%q, want adapter/runtime-target", handle.bound.Engine(), handle.bound.Model().Name)
+	}
+	_, err = ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "bad", Wait: true, Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Model: "missing", Effort: "high"}})
+	var runtimeErr *DelegateError
+	if !errors.As(err, &runtimeErr) || runtimeErr.Kind != DelegateRuntimeInvalid {
+		t.Fatalf("invalid runtime error = %v, want typed runtime refusal", err)
 	}
 }
 

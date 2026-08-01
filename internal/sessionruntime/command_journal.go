@@ -227,6 +227,21 @@ func WithForeignBuilders(b foreign.Builder, rb foreign.RestoredBuilder) Option {
 	}
 }
 
+// WithForeignBuilderRegistry injects profile-keyed foreign construction while
+// retaining the legacy function-pair seam for EngineForeignClaude/Codex.
+func WithForeignBuilderRegistry(registry *foreign.BuilderRegistry) Option {
+	return func(s *Session) { s.foreignRegistry = registry }
+}
+
+// WithRuntimeCatalog installs one immutable parent-scoped catalog snapshot. The
+// same value feeds Subagent schema/preparation and controller revalidation.
+func WithRuntimeCatalog(catalog loop.RuntimeCatalog) Option {
+	return func(s *Session) {
+		s.runtimeCatalog = catalog
+		s.hasRuntimeCatalog = true
+	}
+}
+
 // WithWorkspaceCheckpointing wires the workspace snapshot store and the workspace root this
 // session checkpoints. Both are required for CheckpointWorkspace; without this option the
 // capability is unconfigured and CheckpointWorkspace fails closed with a typed

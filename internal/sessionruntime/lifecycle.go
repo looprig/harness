@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
@@ -497,6 +498,22 @@ func WithLifecycleForeignBuilders(b foreign.Builder, rb foreign.RestoredBuilder)
 		if b != nil && rb != nil {
 			r.baseOpts = append(r.baseOpts, WithForeignBuilders(b, rb))
 		}
+	}
+}
+
+// WithLifecycleForeignBuilderRegistry forwards profile-keyed foreign routing to
+// every live/restored session while preserving the legacy builder pair option.
+func WithLifecycleForeignBuilderRegistry(registry *foreign.BuilderRegistry) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.baseOpts = append(r.baseOpts, WithForeignBuilderRegistry(registry))
+	}
+}
+
+// WithLifecycleRuntimeCatalog forwards the immutable parent-scoped runtime
+// snapshot to every session constructed by this lifecycle.
+func WithLifecycleRuntimeCatalog(catalog loop.RuntimeCatalog) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.baseOpts = append(r.baseOpts, WithRuntimeCatalog(catalog))
 	}
 }
 
