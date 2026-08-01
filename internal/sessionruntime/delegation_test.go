@@ -292,9 +292,12 @@ func TestDelegateRuntimeIsRevalidatedAndPinnedAtChildBind(t *testing.T) {
 	parent := delegateParent(loop.DelegationManaged, "child")
 	child := delegateChild("child", "runtime child")
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "child", AgentHarness: "test", Profile: "acp/test", Default: true, DefaultModel: "runtime",
+		SubagentType: "child", AgentHarness: "test", Profile: "acp/test", Default: true, DefaultModel: "runtime", SmallModel: "runtime-small",
 		Credential: loop.CredentialGatewayBacked,
-		Models:     []loop.RuntimeModelOption{{Alias: "runtime", Target: validModel("runtime-target"), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}}},
+		Models: []loop.RuntimeModelOption{
+			{Alias: "runtime", Target: validModel("runtime-target"), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
+			{Alias: "runtime-small", Target: validModel("runtime-small-target"), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
+		},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -306,7 +309,7 @@ func TestDelegateRuntimeIsRevalidatedAndPinnedAtChildBind(t *testing.T) {
 	}
 	s := newDelegationSession(t, parent, []Option{WithRuntimeCatalog(catalog), WithForeignBuilderRegistry(registry)}, child)
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	request := tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true, Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Model: "runtime", Effort: "high"}}
+	request := tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true, Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Model: "runtime", SmallModel: "runtime-small", Effort: "high"}}
 	result, err := ctrl.Execute(delegateCtx(t), request)
 	if err != nil {
 		t.Fatalf("runtime start: %v", err)
@@ -324,6 +327,10 @@ func TestDelegateRuntimeIsRevalidatedAndPinnedAtChildBind(t *testing.T) {
 	var runtimeErr *DelegateError
 	if !errors.As(err, &runtimeErr) || runtimeErr.Kind != DelegateRuntimeInvalid {
 		t.Fatalf("invalid runtime error = %v, want typed runtime refusal", err)
+	}
+	_, err = ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "bad small", Wait: true, Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Model: "runtime", SmallModel: "wrong-small", Effort: "high"}})
+	if !errors.As(err, &runtimeErr) || runtimeErr.Kind != DelegateRuntimeInvalid {
+		t.Fatalf("invalid small model error = %v, want typed runtime refusal", err)
 	}
 }
 

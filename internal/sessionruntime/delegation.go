@@ -467,7 +467,7 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 			parseRuntimeEffort(req.Runtime.Effort),
 			req.Runtime.Explicit.Effort,
 		)
-		if err != nil || string(resolved.AgentHarness) != req.Runtime.Harness || string(resolved.ModelAlias) != req.Runtime.Model || runtimeEffortString(resolved.Effort) != req.Runtime.Effort || string(resolved.Profile) != req.Runtime.Profile {
+		if err != nil || string(resolved.AgentHarness) != req.Runtime.Harness || string(resolved.Profile) != req.Runtime.Profile || string(resolved.ModelAlias) != req.Runtime.Model || string(resolved.SmallModel) != req.Runtime.SmallModel || runtimeEffortString(resolved.Effort) != req.Runtime.Effort {
 			return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeInvalid}
 		}
 		runtime = &resolved

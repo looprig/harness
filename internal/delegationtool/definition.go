@@ -362,7 +362,8 @@ func buildSubagentDescription(catalog []SubagentCatalogEntry, runtimeCatalog loo
 			}
 		}
 	}
-	if len(nonDefault) > maxAvailableSubagentRows {
+	elided := len(nonDefault) > maxAvailableSubagentRows
+	if elided {
 		nonDefault = nonDefault[:maxAvailableSubagentRows]
 	}
 	var b strings.Builder
@@ -376,7 +377,7 @@ func buildSubagentDescription(catalog []SubagentCatalogEntry, runtimeCatalog loo
 		}
 		b.WriteString("\n")
 	}
-	if totalNonDefaultRows(catalog, runtimeCatalog) > maxAvailableSubagentRows {
+	if elided {
 		b.WriteString("- <elided non-default runtime combinations>\n")
 	}
 	b.WriteString("</available_subagents>")
@@ -387,23 +388,4 @@ func orderedSubagentCatalog(catalog []SubagentCatalogEntry) []SubagentCatalogEnt
 	ordered := cloneSubagentCatalog(catalog)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Name < ordered[j].Name })
 	return ordered
-}
-
-func totalNonDefaultRows(catalog []SubagentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) int {
-	total := 0
-	for _, role := range catalog {
-		entries := runtimeCatalog.EntriesFor(role.Name)
-		for _, entry := range entries {
-			for _, model := range entry.Models {
-				total += len(model.Efforts)
-				if len(model.Efforts) == 0 {
-					total++
-				}
-			}
-		}
-		if len(entries) > 0 {
-			total--
-		}
-	}
-	return total
 }

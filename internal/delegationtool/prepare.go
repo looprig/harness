@@ -404,8 +404,7 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 		return nil, nil
 	}
 
-	advertised := runtimeAdvertisedSelectors(entries, entries[0])
-	if envelope.agentHarnessSet && !advertised.Harness {
+	if envelope.agentHarnessSet && !runtimeHarnessSelectable(entries) {
 		return nil, preparationFailure(errCategoryFieldNotAllowed)
 	}
 	selected := entries[0]
@@ -429,7 +428,7 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 			return nil, preparationFailure(errCategoryFieldNotAllowed)
 		}
 	}
-	advertised = runtimeAdvertisedSelectors(entries, selected)
+	advertised := runtimeAdvertisedSelectors(entries, selected)
 
 	if envelope.modelSet {
 		if !advertised.Model {
