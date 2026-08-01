@@ -192,6 +192,62 @@ func TestManifestSchemaV2RejectsRuntimeFieldsAndV3AcceptsThem(t *testing.T) {
 	}
 }
 
+func TestCurrentManifestRuntimeIdentityFieldsAreBoundedOpaqueIdentifiers(t *testing.T) {
+	t.Parallel()
+
+	valid := testManifest()
+	if !validConfigManifestSchema(valid, false) {
+		t.Fatal("existing runtime profile, catalog-v1, and 64-char identity fixture rejected")
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*ConfigManifest)
+	}{
+		{
+			name: "profile overlong",
+			mutate: func(m *ConfigManifest) {
+				m.RuntimeProfile = strings.Repeat("p", maxRuntimeManifestIdentifierBytes+1)
+			},
+		},
+		{
+			name:   "catalog control",
+			mutate: func(m *ConfigManifest) { m.RuntimeCatalogRev = "catalog-\n-v1" },
+		},
+		{
+			name:   "identity invalid separator",
+			mutate: func(m *ConfigManifest) { m.RuntimeIdentityRev = "identity:v1" },
+		},
+		{
+			name:   "profile surrounding whitespace",
+			mutate: func(m *ConfigManifest) { m.RuntimeProfile = " acp/codex" },
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			manifest := valid
+			tt.mutate(&manifest)
+			if validConfigManifestSchema(manifest, false) {
+				t.Fatalf("manifest with %s accepted", tt.name)
+			}
+			if err := ValidateEvent(SessionStarted{Header: fullHeaderSession(), Manifest: manifest}); err == nil {
+				t.Fatalf("SessionStarted with %s accepted", tt.name)
+			}
+		})
+	}
+
+	// Native/current manifests may omit all runtime identity fields.
+	empty := valid
+	empty.RuntimeProfile = ""
+	empty.RuntimeCatalogRev = ""
+	empty.RuntimeIdentityRev = ""
+	if !validConfigManifestSchema(empty, false) {
+		t.Fatal("current manifest with omitted runtime identity fields rejected")
+	}
+}
+
 // TestConfigurationAdoptedOverLongActorRejected asserts a decoded adoption whose
 // Actor exceeds MaxConfigActorLen is rejected with FieldActor/RuleInvalid. A live
 // decider can't trip this (the restore constructor truncates), but a hand-crafted

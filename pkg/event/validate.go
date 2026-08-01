@@ -356,6 +356,12 @@ func invalidPermissionReview(name EventName, field FieldName) error {
 // the journal, and a legacy (SchemaVersion 0) manifest projection is never
 // persisted.
 const (
+	// maxRuntimeManifestIdentifierBytes bounds the current-schema runtime
+	// identity fields. They are opaque identifiers at this boundary: the
+	// producer owns their meaning, while the journal only accepts the bounded,
+	// secret-free alphabet used by runtime profiles and revisions.
+	maxRuntimeManifestIdentifierBytes = 128
+
 	// The manifest is decoded from untrusted journal input, so its collections
 	// are capped defense-in-depth. The caps are generous: they never trip a
 	// legitimate configuration, only an abusive one.
@@ -440,10 +446,37 @@ func validConfigManifestSchema(manifest ConfigManifest, allowLegacy bool) bool {
 		// than accepting data the v2 fingerprint does not authenticate.
 		return zeroRuntimeManifest(manifest)
 	case ManifestSchemaVersion:
-		return true
+		return validRuntimeManifestIdentifier(manifest.RuntimeProfile) &&
+			validRuntimeManifestIdentifier(manifest.RuntimeCatalogRev) &&
+			validRuntimeManifestIdentifier(manifest.RuntimeIdentityRev)
 	default:
 		return false
 	}
+}
+
+// validRuntimeManifestIdentifier validates one current-schema runtime identity
+// field. Empty is valid because native and legacy sessions have no runtime
+// override. Non-empty values are deliberately treated as opaque: this helper
+// does not interpret profiles, catalog revisions, or digests. It only bounds
+// them and permits the identifier alphabet emitted by the runtime producers.
+func validRuntimeManifestIdentifier(value string) bool {
+	if value == "" {
+		return true
+	}
+	if len(value) > maxRuntimeManifestIdentifierBytes || !utf8.ValidString(value) {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if (b >= 'a' && b <= 'z') ||
+			(b >= 'A' && b <= 'Z') ||
+			(b >= '0' && b <= '9') ||
+			b == '.' || b == '_' || b == '-' || b == '/' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func zeroRuntimeManifest(manifest ConfigManifest) bool {
