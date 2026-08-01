@@ -15,8 +15,11 @@ import (
 // the recorded session on its next turn.
 type RestoredForeign struct {
 	ForeignSID string
-	TurnIndex  event.TurnIndex
-	Msgs       content.AgenticMessages
+	// AgentSessionID is optional journaled agent state. It is empty for
+	// legacy events and for foreign runtimes that do not expose one.
+	AgentSessionID string
+	TurnIndex      event.TurnIndex
+	Msgs           content.AgenticMessages
 }
 
 // RestoredBuilder is the composition-root seam a session uses to reconstruct a foreign
