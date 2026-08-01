@@ -64,7 +64,7 @@ type Resolved struct {
 type RuntimeCatalogErrorKind string
 
 const (
-	RuntimeCatalogInvalidCredential    RuntimeCatalogErrorKind = "invalid_credential"
+	RuntimeCatalogInvalidCredential    RuntimeCatalogErrorKind = "invalid_credential" // #nosec G101 -- bounded error category, not a credential
 	RuntimeCatalogInvalidIdentifier    RuntimeCatalogErrorKind = "invalid_identifier"
 	RuntimeCatalogInvalidModel         RuntimeCatalogErrorKind = "invalid_model"
 	RuntimeCatalogMissingDefaultModel  RuntimeCatalogErrorKind = "missing_default_model"
