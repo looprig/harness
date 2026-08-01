@@ -32,7 +32,7 @@ func TestPrepareCallResolvesRuntimeDefaultsAndExplicitTuple(t *testing.T) {
 		if artifact.Runtime == nil {
 			t.Fatal("prepared runtime is nil")
 		}
-		want := tool.DelegateRuntime{Harness: "claude-code", Profile: "acp/claude-code", Model: "sonnet", SmallModel: "sonnet-small", Effort: "medium"}
+		want := tool.DelegateRuntime{Harness: "claude-code", Profile: "acp/claude-code", Model: "sonnet", SmallModel: "sonnet-small", Effort: "medium", Advertised: tool.DelegateRuntimeAdvertised{Harness: true, Model: true, Effort: true}}
 		if *artifact.Runtime != want {
 			t.Fatalf("runtime = %#v, want %#v", *artifact.Runtime, want)
 		}
@@ -47,7 +47,7 @@ func TestPrepareCallResolvesRuntimeDefaultsAndExplicitTuple(t *testing.T) {
 		if runtime == nil {
 			t.Fatal("prepared runtime is nil")
 		}
-		want := tool.DelegateRuntime{Harness: "codex", Profile: "acp/codex", Model: "luna", SmallModel: "luna-small", Effort: "none", Explicit: tool.DelegateRuntimeExplicit{Harness: true, Model: true, Effort: true}}
+		want := tool.DelegateRuntime{Harness: "codex", Profile: "acp/codex", Model: "luna", SmallModel: "luna-small", Effort: "none", Explicit: tool.DelegateRuntimeExplicit{Harness: true, Model: true, Effort: true}, Advertised: tool.DelegateRuntimeAdvertised{Harness: true, Model: true, Effort: true}}
 		if *runtime != want {
 			t.Fatalf("runtime = %#v, want %#v", *runtime, want)
 		}
@@ -142,6 +142,29 @@ func TestPrepareCallRuntimeIsParentScopedAndOptional(t *testing.T) {
 	})
 }
 
+func TestPrepareCallRejectsSelectorsThatAreNotAdvertised(t *testing.T) {
+	t.Parallel()
+	catalog := singleChoicePreparationCatalog(t)
+	tests := []struct {
+		name string
+		args string
+	}{
+		{name: "single harness", args: `{"action":"start","description":"d","prompt":"p","subagent_type":"worker","agent_harness":"claude-code"}`},
+		{name: "single model", args: `{"action":"start","description":"d","prompt":"p","subagent_type":"worker","model":"sonnet"}`},
+		{name: "single effort", args: `{"action":"start","description":"d","prompt":"p","subagent_type":"worker","effort":"medium"}`},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			toolInstance := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker"}}, catalog)
+			_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), tt.args)
+			if err == nil || !strings.Contains(err.Error(), errCategoryFieldNotAllowed) {
+				t.Fatalf("PrepareCall() error = %v, want %s", err, errCategoryFieldNotAllowed)
+			}
+		})
+	}
+}
+
 func mustDelegateArtifact(t *testing.T, prepared tool.PreparedArtifact) tool.DelegateArtifact {
 	t.Helper()
 	artifact, ok := prepared.(tool.DelegateArtifact)
@@ -177,6 +200,19 @@ func testPreparationEntry(harness loop.AgentHarnessName, profile loop.RuntimePro
 			{Alias: alias + "-small", Target: inferencemodel.Model{Provider: "provider", Name: modelName + "-small", Sampling: inferencemodel.Sampling{Effort: inferencemodel.EffortLow}}, DefaultEffort: inferencemodel.EffortLow, Efforts: []inferencemodel.Effort{inferencemodel.EffortLow}},
 		},
 	}
+}
+
+func singleChoicePreparationCatalog(t *testing.T) loop.RuntimeCatalog {
+	t.Helper()
+	entry := testPreparationEntry("claude-code", "acp/claude-code", "sonnet", inferencemodel.EffortMedium)
+	entry.SmallModel = ""
+	entry.Models = entry.Models[:1]
+	entry.Models[0].Efforts = []inferencemodel.Effort{inferencemodel.EffortMedium}
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return catalog
 }
 
 func uuidForPreparation() uuid.UUID {

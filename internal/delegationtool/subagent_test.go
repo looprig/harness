@@ -351,13 +351,13 @@ func TestSubagentSchemaActionBranchesAreClosedAndExplicit(t *testing.T) {
 	if len(branches) != 6 {
 		t.Fatalf("allOf branches=%d, want 6", len(branches))
 	}
-	fields := []string{"description", "prompt", "subagent_type", "mode", "agent_harness", "model", "effort", "run_in_background", "delegate_id", "request_id", "timeout_seconds"}
+	fields := []string{"description", "prompt", "subagent_type", "mode", "run_in_background", "delegate_id", "request_id", "timeout_seconds"}
 	expected := []struct {
 		index             int
 		action            string
 		required, allowed []string
 	}{
-		{0, "start", []string{"description", "prompt", "subagent_type"}, []string{"description", "prompt", "subagent_type", "mode", "agent_harness", "model", "effort", "run_in_background", "timeout_seconds"}},
+		{0, "start", []string{"description", "prompt", "subagent_type"}, []string{"description", "prompt", "subagent_type", "mode", "run_in_background", "timeout_seconds"}},
 		{2, "send", []string{"delegate_id", "prompt"}, []string{"delegate_id", "prompt", "run_in_background", "timeout_seconds"}},
 		{3, "wait", []string{"delegate_id", "request_id"}, []string{"delegate_id", "request_id", "timeout_seconds"}},
 		{4, "interrupt", []string{"delegate_id"}, []string{"delegate_id"}},
@@ -712,6 +712,27 @@ func TestSubagentQueuedRuntimeResultUsesJSONAndOmitsNativeHarnessWhenEmpty(t *te
 	}
 	if out.Runtime == nil || out.Runtime.AgentHarness != "claude-code" || out.Runtime.Model != "sonnet" || out.Runtime.Effort != "medium" {
 		t.Fatalf("runtime result = %+v, want resolved tuple", out.Runtime)
+	}
+}
+
+func TestSubagentQueuedNativeNoChoiceOmitsRuntime(t *testing.T) {
+	t.Parallel()
+	fc := &fakeController{result: tool.DelegateResult{
+		DelegateID: mustParseUUID(t, "55555555-5555-4555-8555-555555555555"),
+		RequestID:  mustParseUUID(t, "66666666-6666-4666-8666-666666666666"),
+		Status:     tool.DelegateStatusQueued,
+	}}
+	s := NewSubagentWithRuntimeCatalog(fc, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker"}}, emptyRuntimeCatalog(t))
+	result, err := invokePrepared(t, s, `{"action":"start","description":"d","prompt":"p","subagent_type":"worker"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(textOf(t, result)), &out); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := out["runtime"]; present {
+		t.Fatalf("native no-choice result = %s, must omit runtime", textOf(t, result))
 	}
 }
 

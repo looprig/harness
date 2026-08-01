@@ -30,9 +30,14 @@ func TestNewEnvelopeSchemaUsesOnlyNewWireFields(t *testing.T) {
 			t.Errorf("legacy property %q is present", old)
 		}
 	}
-	for _, field := range []string{"action", "description", "prompt", "subagent_type", "mode", "agent_harness", "model", "effort", "run_in_background", "delegate_id", "request_id", "timeout_seconds"} {
+	for _, field := range []string{"action", "description", "prompt", "subagent_type", "mode", "run_in_background", "delegate_id", "request_id", "timeout_seconds"} {
 		if _, present := properties[field]; !present {
 			t.Errorf("new property %q is missing", field)
+		}
+	}
+	for _, field := range []string{"agent_harness", "model", "effort"} {
+		if _, present := properties[field]; present {
+			t.Errorf("selector property %q is present without a runtime choice", field)
 		}
 	}
 	if schema["additionalProperties"] != false {

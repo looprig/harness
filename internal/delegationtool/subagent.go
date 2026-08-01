@@ -16,7 +16,7 @@ import (
 // parent-scoped tool.DelegateController.Execute — the tool's only runtime binding.
 //
 // SCHEMA IS NOT A SECURITY BOUNDARY. The exposed JSON schema is DERIVED from the
-// active delegation style (SyncOnly ⇒ only `start` with `wait` fixed true; Managed ⇒
+// active delegation style (SyncOnly ⇒ only `start` with `run_in_background` fixed false; Managed ⇒
 // all five actions) purely to guide the model. The parent-scoped controller
 // re-enforces the same action set, ownership, mode, and permission ceiling regardless
 // of crafted JSON, so the tool forwards a well-formed envelope faithfully and lets the
@@ -72,10 +72,12 @@ type SubagentTool struct {
 // delegation style and delegate catalog derived from the parent definition at the
 // composition root.
 func NewSubagent(controller tool.DelegateController, style loop.DelegationStyle, catalog []SubagentCatalogEntry, runtimeCatalog ...loop.RuntimeCatalog) *SubagentTool {
-	s := &SubagentTool{controller: controller, style: style, catalog: cloneSubagentCatalog(catalog)}
+	// A missing variadic argument is an explicit empty/native catalog, not a
+	// legacy escape hatch. This keeps preparation fail-closed for runtime
+	// selectors even when a product has no optional adapter profiles.
+	s := &SubagentTool{controller: controller, style: style, catalog: cloneSubagentCatalog(catalog), hasRuntimeCatalog: true}
 	if len(runtimeCatalog) > 0 {
 		s.runtimeCatalog = runtimeCatalog[0]
-		s.hasRuntimeCatalog = true
 	}
 	return s
 }
@@ -199,8 +201,17 @@ func formatWaited(result tool.DelegateResult) string {
 
 func formatQueued(result tool.DelegateResult, runtime *tool.DelegateRuntime) string {
 	var advertised *runtimeResult
-	if runtime != nil {
-		advertised = &runtimeResult{AgentHarness: runtime.Harness, Model: runtime.Model, Effort: runtime.Effort}
+	if runtime != nil && runtime.Advertised.Any() {
+		advertised = &runtimeResult{}
+		if runtime.Advertised.Harness {
+			advertised.AgentHarness = runtime.Harness
+		}
+		if runtime.Advertised.Model {
+			advertised.Model = runtime.Model
+		}
+		if runtime.Advertised.Effort {
+			advertised.Effort = runtime.Effort
+		}
 	}
 	return marshalResult(queuedResult{DelegateID: result.DelegateID.String(), RequestID: result.RequestID.String(), Status: "queued", Runtime: advertised})
 }

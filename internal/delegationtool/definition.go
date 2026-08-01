@@ -41,13 +41,20 @@ func buildSubagentSchema(style loop.DelegationStyle, catalog []SubagentCatalogEn
 		"prompt":            map[string]any{"type": "string"},
 		"subagent_type":     map[string]any{"type": "string"},
 		"mode":              map[string]any{"type": "string"},
-		"agent_harness":     map[string]any{"type": "string"},
-		"model":             map[string]any{"type": "string"},
-		"effort":            map[string]any{"type": "string"},
 		"run_in_background": map[string]any{"type": "boolean", "default": true},
 		"delegate_id":       map[string]any{"type": "string"},
 		"request_id":        map[string]any{"type": "string"},
 		"timeout_seconds":   map[string]any{"type": "integer", "minimum": 0},
+	}
+	selectors := availableRuntimeSelectors(catalog, runtimeCatalog)
+	if selectors.Harness {
+		properties["agent_harness"] = map[string]any{"type": "string"}
+	}
+	if selectors.Model {
+		properties["model"] = map[string]any{"type": "string"}
+	}
+	if selectors.Effort {
+		properties["effort"] = map[string]any{"type": "string"}
 	}
 	startThen := map[string]any{
 		"not":      map[string]any{"anyOf": requiredProperties([]string{"delegate_id", "request_id"})},
@@ -74,7 +81,17 @@ func buildSubagentSchema(style loop.DelegationStyle, catalog []SubagentCatalogEn
 			"then": then,
 		}
 	}
-	startBranch := actionBranch("start", nil, []string{"description", "prompt", "subagent_type", "mode", "agent_harness", "model", "effort", "run_in_background", "timeout_seconds"})
+	startAllowed := []string{"description", "prompt", "subagent_type", "mode", "run_in_background", "timeout_seconds"}
+	if selectors.Harness {
+		startAllowed = append(startAllowed, "agent_harness")
+	}
+	if selectors.Model {
+		startAllowed = append(startAllowed, "model")
+	}
+	if selectors.Effort {
+		startAllowed = append(startAllowed, "effort")
+	}
+	startBranch := actionBranch("start", nil, startAllowed)
 	startBranch["then"] = startThen
 	defaultStartBranch := map[string]any{
 		"if":   map[string]any{"not": map[string]any{"required": []string{"action"}}},
@@ -110,50 +127,63 @@ func startRoleVariants(catalog []SubagentCatalogEntry, runtimeCatalog loop.Runti
 	catalog = orderedSubagentCatalog(catalog)
 	variants := make([]any, 0, len(catalog))
 	for _, role := range catalog {
-		base := map[string]any{"type": "object", "properties": map[string]any{"subagent_type": map[string]any{"const": string(role.Name)}}}
-		roleProperties := base["properties"].(map[string]any)
-		modes := make([]string, len(role.Modes))
-		for i, mode := range role.Modes {
-			modes[i] = string(mode)
-		}
-		if len(modes) > 0 {
-			roleProperties["mode"] = map[string]any{"type": "string", "enum": modes}
-		}
 		entries := runtimeCatalog.EntriesFor(role.Name)
 		if len(entries) == 0 {
-			variants = append(variants, base)
+			variants = append(variants, startRoleVariant(role, nil, false, false))
 			continue
 		}
-		showHarness := len(entries) > 1 || anyNonDefaultHarness(entries)
-		if !showHarness {
-			addModelAndEffort(roleProperties, entries[0])
-			variants = append(variants, base)
+		if !runtimeHarnessSelectable(entries) {
+			variants = append(variants, startRoleVariant(role, &entries[0], false, false))
 			continue
 		}
+		defaultEntry := runtimeDefaultEntry(entries)
+		harnessBranches := []any{startRoleVariant(role, &defaultEntry, false, true)}
 		harnesses := make([]string, len(entries))
-		for i, entry := range entries {
-			harnesses[i] = string(entry.AgentHarness)
-		}
-		roleProperties["agent_harness"] = map[string]any{"type": "string", "enum": harnesses}
-		defaultEntry := entries[0]
 		for _, entry := range entries {
-			if entry.Default {
-				defaultEntry = entry
-				break
-			}
+			entry := entry
+			harnesses[len(harnessBranches)-1] = string(entry.AgentHarness)
+			harnessBranches = append(harnessBranches, startRoleVariant(role, &entry, true, false))
 		}
-		defaultProperties := map[string]any{"type": "object", "not": map[string]any{"required": []string{"agent_harness"}}, "properties": map[string]any{}}
-		addModelAndEffort(defaultProperties["properties"].(map[string]any), defaultEntry)
-		harnessBranches := []any{defaultProperties}
-		for _, entry := range entries {
-			branchProperties := map[string]any{"agent_harness": map[string]any{"const": string(entry.AgentHarness)}}
-			addModelAndEffort(branchProperties, entry)
-			harnessBranches = append(harnessBranches, map[string]any{"type": "object", "properties": branchProperties, "required": []string{"agent_harness"}})
-		}
-		base["oneOf"] = harnessBranches
-		variants = append(variants, base)
+		variants = append(variants, map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"agent_harness": map[string]any{"type": "string", "enum": harnesses},
+			},
+			"oneOf": harnessBranches,
+		})
 	}
 	return variants
+}
+
+func startRoleVariant(role SubagentCatalogEntry, entry *loop.RuntimeCatalogEntry, explicitHarness, defaultBranch bool) map[string]any {
+	properties := map[string]any{
+		"action":            map[string]any{"const": "start"},
+		"description":       map[string]any{"type": "string"},
+		"prompt":            map[string]any{"type": "string"},
+		"subagent_type":     map[string]any{"const": string(role.Name)},
+		"run_in_background": map[string]any{"type": "boolean"},
+		"timeout_seconds":   map[string]any{"type": "integer", "minimum": 0},
+	}
+	modes := make([]string, len(role.Modes))
+	for i, mode := range role.Modes {
+		modes[i] = string(mode)
+	}
+	if len(modes) > 0 {
+		properties["mode"] = map[string]any{"type": "string", "enum": modes}
+	}
+	if entry != nil {
+		if explicitHarness {
+			properties["agent_harness"] = map[string]any{"const": string(entry.AgentHarness)}
+		}
+		addModelAndEffort(properties, *entry)
+	}
+	branch := map[string]any{"type": "object", "additionalProperties": false, "properties": properties}
+	if explicitHarness {
+		branch["required"] = []string{"agent_harness"}
+	} else if defaultBranch {
+		branch["not"] = map[string]any{"required": []string{"agent_harness"}}
+	}
+	return branch
 }
 
 func anyNonDefaultHarness(entries []loop.RuntimeCatalogEntry) bool {
@@ -163,6 +193,66 @@ func anyNonDefaultHarness(entries []loop.RuntimeCatalogEntry) bool {
 		}
 	}
 	return false
+}
+
+type runtimeSelectorAvailability struct {
+	Harness bool
+	Model   bool
+	Effort  bool
+}
+
+func runtimeHarnessSelectable(entries []loop.RuntimeCatalogEntry) bool {
+	return len(entries) > 1 || anyNonDefaultHarness(entries)
+}
+
+func runtimeModelSelectable(entry loop.RuntimeCatalogEntry) bool {
+	return len(entry.Models) > 1
+}
+
+func runtimeEffortSelectable(entry loop.RuntimeCatalogEntry) bool {
+	return len(admittedEfforts(entry.Models)) > 1
+}
+
+func runtimeDefaultEntry(entries []loop.RuntimeCatalogEntry) loop.RuntimeCatalogEntry {
+	if len(entries) == 0 {
+		return loop.RuntimeCatalogEntry{}
+	}
+	for _, entry := range entries {
+		if entry.Default {
+			return entry
+		}
+	}
+	return entries[0]
+}
+
+func runtimeAdvertisedSelectors(entries []loop.RuntimeCatalogEntry, selected loop.RuntimeCatalogEntry) runtimeSelectorAvailability {
+	return runtimeSelectorAvailability{
+		Harness: runtimeHarnessSelectable(entries),
+		Model:   runtimeModelSelectable(selected),
+		Effort:  runtimeEffortSelectable(selected),
+	}
+}
+
+func availableRuntimeSelectors(catalog []SubagentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) runtimeSelectorAvailability {
+	available := runtimeSelectorAvailability{}
+	for _, role := range catalog {
+		entries := runtimeCatalog.EntriesFor(role.Name)
+		if len(entries) == 0 {
+			continue
+		}
+		if runtimeHarnessSelectable(entries) {
+			available.Harness = true
+		}
+		for _, entry := range entries {
+			if runtimeModelSelectable(entry) {
+				available.Model = true
+			}
+			if runtimeEffortSelectable(entry) {
+				available.Effort = true
+			}
+		}
+	}
+	return available
 }
 
 func addModelAndEffort(properties map[string]any, entry loop.RuntimeCatalogEntry) {

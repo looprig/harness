@@ -11,6 +11,7 @@ type DelegateRuntime struct {
 	SmallModel string
 	Effort     string
 	Explicit   DelegateRuntimeExplicit
+	Advertised DelegateRuntimeAdvertised
 }
 
 // DelegateRuntimeExplicit records which selectors were supplied by the caller.
@@ -20,6 +21,19 @@ type DelegateRuntimeExplicit struct {
 	Harness bool
 	Model   bool
 	Effort  bool
+}
+
+// DelegateRuntimeAdvertised records which resolved selectors were visible in
+// the parent-scoped Subagent schema. It is presentation metadata only; the
+// controller ignores it and revalidates the concrete runtime tuple itself.
+type DelegateRuntimeAdvertised struct {
+	Harness bool
+	Model   bool
+	Effort  bool
+}
+
+func (a DelegateRuntimeAdvertised) Any() bool {
+	return a.Harness || a.Model || a.Effort
 }
 
 // DelegateArtifact is the prepared, fully validated Subagent call. It is

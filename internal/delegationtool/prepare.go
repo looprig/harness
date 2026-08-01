@@ -380,8 +380,12 @@ func (s *SubagentTool) prepareDelegateCall(ctx context.Context, envelope Subagen
 
 func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.DelegateRuntime, error) {
 	if !s.hasRuntimeCatalog {
-		// The legacy constructor is native-only and deliberately has no runtime
-		// choice. Keep that path compatible until the hard replacement tasks.
+		// A zero catalog is the native/no-choice catalog. An explicitly supplied
+		// selector must never be silently ignored when a caller bypasses the
+		// composition seam.
+		if envelope.agentHarnessSet || envelope.modelSet || envelope.effortSet {
+			return nil, preparationFailure(errCategoryFieldNotAllowed)
+		}
 		return nil, nil
 	}
 
@@ -404,6 +408,10 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 		return nil, nil
 	}
 
+	advertised := runtimeAdvertisedSelectors(entries, entries[0])
+	if envelope.agentHarnessSet && !advertised.Harness {
+		return nil, preparationFailure(errCategoryFieldNotAllowed)
+	}
 	selected := entries[0]
 	if !envelope.agentHarnessSet {
 		for _, entry := range entries {
@@ -425,8 +433,12 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 			return nil, preparationFailure(errCategoryFieldNotAllowed)
 		}
 	}
+	advertised = runtimeAdvertisedSelectors(entries, selected)
 
 	if envelope.modelSet {
+		if !advertised.Model {
+			return nil, preparationFailure(errCategoryFieldNotAllowed)
+		}
 		found := false
 		for _, option := range selected.Models {
 			if string(option.Alias) == envelope.Model {
@@ -441,6 +453,9 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 
 	var effort inferencemodel.Effort
 	if envelope.effortSet {
+		if !advertised.Effort {
+			return nil, preparationFailure(errCategoryFieldNotAllowed)
+		}
 		effort = parseDelegateEffort(*envelope.Effort)
 	}
 	resolved, err := s.runtimeCatalog.ResolveWithExplicitEffort(
@@ -468,6 +483,11 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 			Harness: envelope.agentHarnessSet,
 			Model:   envelope.modelSet,
 			Effort:  envelope.effortSet,
+		},
+		Advertised: tool.DelegateRuntimeAdvertised{
+			Harness: advertised.Harness,
+			Model:   advertised.Model,
+			Effort:  advertised.Effort,
 		},
 	}, nil
 }
