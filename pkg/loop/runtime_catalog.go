@@ -416,21 +416,13 @@ func validateRuntimeProfile(value string) error {
 	if value == "" || len(value) > maxIdentifierBytes || !utf8.ValidString(value) || strings.TrimSpace(value) != value {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier}
 	}
-	for _, r := range value {
-		if r == '\\' || r == ':' || r == 0 || unicode.IsControl(r) || unicode.IsSpace(r) {
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "." || segment == ".." {
 			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier}
 		}
-	}
-	if strings.Contains(value, "/") {
-		switch value {
-		case "acp/claude-code", "acp/codex":
-			return nil
-		default:
+		if err := validateCatalogIdentifier(segment, false); err != nil {
 			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier}
 		}
-	}
-	if value == "." || value == ".." {
-		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier}
 	}
 	return nil
 }

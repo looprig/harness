@@ -86,25 +86,36 @@ func TestNewRuntimeCatalogInvariants(t *testing.T) {
 	}
 }
 
-func TestRuntimeCatalogAcceptsPlannedProfilesAndRejectsPathLikeProfiles(t *testing.T) {
+func TestRuntimeCatalogAcceptsSafeProfileSegmentsAndRejectsPathLikeProfiles(t *testing.T) {
 	t.Parallel()
 
 	valid := testCatalogEntries()
 	valid[0].Profile = "acp/codex"
 	valid[1].Profile = "acp/claude-code"
-	if _, err := NewRuntimeCatalog(valid); err != nil {
-		t.Fatalf("planned ACP profiles rejected: %v", err)
+	for _, profiles := range [][2]RuntimeProfileName{
+		{"acp/codex", "acp/claude-code"},
+		{"acp/other", "vendor/runtime-v2"},
+		{"acp/claude-code/extra", "vendor/runtime/experimental"},
+	} {
+		entries := testCatalogEntries()
+		entries[0].Profile, entries[1].Profile = profiles[0], profiles[1]
+		if _, err := NewRuntimeCatalog(entries); err != nil {
+			t.Fatalf("safe profiles %q and %q rejected: %v", profiles[0], profiles[1], err)
+		}
 	}
 
 	for _, profile := range []RuntimeProfileName{
+		"/acp/codex",
+		"acp/codex/",
 		"/tmp/child",
 		`acp\\codex`,
 		"acp/../codex",
+		"acp/./codex",
 		"acp//codex",
-		"acp/other",
-		"acp/claude-code/extra",
 		"acp:codex",
 		"acp codex",
+		"C:/child",
+		".",
 		"..",
 	} {
 		entries := testCatalogEntries()

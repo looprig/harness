@@ -84,7 +84,7 @@ func TestOverrideBoundRuntimeSelectionRejectsInvalidProfilesAndAliases(t *testin
 		{name: "path profile", profile: "/tmp/child", alias: "model"},
 		{name: "backslash profile", profile: `acp\\codex`, alias: "model"},
 		{name: "dot dot profile", profile: "acp/../codex", alias: "model"},
-		{name: "unknown slash profile", profile: "acp/other", alias: "model"},
+		{name: "double slash profile", profile: "acp//other", alias: "model"},
 		{name: "whitespace alias", profile: "acp/codex", alias: "model alias"},
 		{name: "path alias", profile: "acp/codex", alias: "../model"},
 	} {
