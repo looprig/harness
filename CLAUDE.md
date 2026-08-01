@@ -78,6 +78,14 @@ Harness defines runner and access-gate contracts but does not implement a shell 
 
 The optional `github.com/looprig/tools` module owns Bash and the other standard tool implementations. Consumers assemble sandbox profiles and executors directly; there is no confinement bridge.
 
+**Model-facing tool ownership** — `Subagent` is deliberately Harness-owned. Its
+schema and catalog are derived from the frozen delegate topology, and its only
+runtime authority is the parent-scoped delegate controller. Optional task
+tracking belongs to the `github.com/looprig/tools` module; Harness does not
+import that module. Consumers may select the standard `TaskDefinitions()`
+bundle when they want task tracking. `Subagent` is automatically injected by
+Harness and must not be added manually to a consumer's tool definitions.
+
 **File paths** — Always call `filepath.Clean` and verify the result stays within the expected root before opening files from user-supplied paths.
 
 ## Build & Testing Requirements

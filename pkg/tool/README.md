@@ -13,6 +13,22 @@ all of them can depend on it without a cycle. The standard tool
 implementations (bash, web, …) live in the sibling
 [`looprig/tools`](https://github.com/looprig/tools) module.
 
+### Task tracking and delegation ownership
+
+Optional task tracking is a standard-tool concern. Consumers that want it may
+select the `TaskDefinitions()` bundle from
+[`github.com/looprig/tools`](https://github.com/looprig/tools), which exposes the
+four task model-facing names from one selected definition. Each bound Loop gets
+its own task graph, while modes within that Loop share the graph.
+
+`Subagent` is intentionally different: it is the Harness-owned model-facing
+control tool. Harness derives its schema and catalog from the frozen delegate
+topology and binds it to the parent-scoped delegate controller, so its authority
+cannot be supplied by optional task tracking. Harness therefore does not import
+`github.com/looprig/tools`. `Subagent` is automatically injected into each
+applicable Loop; consumers must not add it manually. Agents coordinate task
+work through Subagent messages rather than shared task memory.
+
 ## What is tool?
 
 - **`BaseTool`** — `Info(ctx) (*ToolInfo, error)`. The minimal contract;
