@@ -2,12 +2,17 @@ package delegationtool
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"strings"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
+	inferencemodel "github.com/looprig/inference/model"
 )
 
 const (
@@ -59,6 +64,12 @@ type SubagentEnvelope struct {
 	DelegateID      *uuid.UUID
 	RequestID       *uuid.UUID
 	TimeoutSeconds  *int
+
+	// Selector presence is kept separately from the normalized string values so
+	// an explicit selector can never be confused with an omitted selector.
+	agentHarnessSet bool
+	modelSet        bool
+	effortSet       bool
 }
 
 // wireEnvelope is intentionally the complete and only accepted JSON surface.
@@ -146,6 +157,9 @@ func prepareEnvelope(argsJSON string) (SubagentEnvelope, error) {
 	if wire.RunInBackground != nil {
 		background = *wire.RunInBackground
 	}
+	_, agentHarnessSet := present["agent_harness"]
+	_, modelSet := present["model"]
+	_, effortSet := present["effort"]
 
 	return SubagentEnvelope{
 		Action:          action,
@@ -160,6 +174,9 @@ func prepareEnvelope(argsJSON string) (SubagentEnvelope, error) {
 		DelegateID:      delegateID,
 		RequestID:       requestID,
 		TimeoutSeconds:  wire.TimeoutSeconds,
+		agentHarnessSet: agentHarnessSet,
+		modelSet:        modelSet,
+		effortSet:       effortSet,
 	}, nil
 }
 
@@ -307,4 +324,151 @@ func parseWireUUID(value *string) (*uuid.UUID, error) {
 		return nil, err
 	}
 	return &u, nil
+}
+
+// prepareDelegateCall translates the validated envelope exactly once into the
+// controller request and, for starts, resolves the optional runtime tuple from
+// the immutable parent catalog.
+func (s *SubagentTool) prepareDelegateCall(ctx context.Context, envelope SubagentEnvelope) (tool.DelegateRequest, *tool.DelegateRuntime, error) {
+	request := tool.DelegateRequest{
+		Agent:          envelope.SubagentType,
+		Mode:           envelope.Mode,
+		Message:        envelope.Prompt,
+		RequestID:      envelope.RequestID,
+		TimeoutSeconds: envelope.TimeoutSeconds,
+	}
+	if envelope.DelegateID != nil {
+		request.DelegateID = *envelope.DelegateID
+	}
+	if toolUseID, ok := loop.ToolUseIDFrom(ctx); ok {
+		request.ParentToolUseID = toolUseID
+	}
+
+	var runtime *tool.DelegateRuntime
+	switch envelope.Action {
+	case actionStart:
+		request.Operation = tool.DelegateStart
+		request.Wait = !envelope.RunInBackground
+		var err error
+		runtime, err = s.resolveDelegateRuntime(envelope)
+		if err != nil {
+			return tool.DelegateRequest{}, nil, err
+		}
+	case actionSend:
+		request.Operation = tool.DelegateSend
+		request.Wait = !envelope.RunInBackground
+	case actionWait:
+		request.Operation = tool.DelegateWait
+		request.Wait = true
+	case actionInterrupt:
+		request.Operation = tool.DelegateInterrupt
+	case actionStatus:
+		request.Operation = tool.DelegateStatus
+	default:
+		return tool.DelegateRequest{}, nil, preparationFailure(errCategoryInvalidValue)
+	}
+	return request, runtime, nil
+}
+
+func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.DelegateRuntime, error) {
+	if !s.hasRuntimeCatalog {
+		// The legacy constructor is native-only and deliberately has no runtime
+		// choice. Keep that path compatible until the hard replacement tasks.
+		return nil, nil
+	}
+
+	entries := s.runtimeCatalog.EntriesFor(identity.AgentName(envelope.SubagentType))
+	if len(entries) == 0 {
+		if !s.runtimeCatalog.HasEntries() {
+			if envelope.agentHarnessSet || envelope.modelSet || envelope.effortSet {
+				return nil, preparationFailure(errCategoryFieldNotAllowed)
+			}
+			return nil, nil
+		}
+		if envelope.agentHarnessSet || envelope.modelSet || envelope.effortSet {
+			return nil, preparationFailure(errCategoryFieldNotAllowed)
+		}
+		return nil, preparationFailure(errCategoryUnknownRuntime)
+	}
+
+	selected := entries[0]
+	if !envelope.agentHarnessSet {
+		for _, entry := range entries {
+			if entry.Default {
+				selected = entry
+				break
+			}
+		}
+	} else {
+		found := false
+		for _, entry := range entries {
+			if string(entry.AgentHarness) == envelope.AgentHarness {
+				selected = entry
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, preparationFailure(errCategoryFieldNotAllowed)
+		}
+	}
+
+	if envelope.modelSet {
+		found := false
+		for _, option := range selected.Models {
+			if string(option.Alias) == envelope.Model {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, preparationFailure(errCategoryFieldNotAllowed)
+		}
+	}
+
+	var effort inferencemodel.Effort
+	if envelope.effortSet {
+		effort = parseDelegateEffort(*envelope.Effort)
+	}
+	resolved, err := s.runtimeCatalog.ResolveWithExplicitEffort(
+		identity.AgentName(envelope.SubagentType),
+		loop.AgentHarnessName(envelope.AgentHarness),
+		loop.ModelAlias(envelope.Model),
+		effort,
+		envelope.effortSet,
+	)
+	if err != nil {
+		var catalogErr *loop.RuntimeCatalogError
+		if errors.As(err, &catalogErr) && catalogErr.Kind != loop.RuntimeCatalogIncompatibleEffort {
+			return nil, preparationFailure(errCategoryUnknownRuntime)
+		}
+		return nil, preparationFailure(errCategoryUnknownRuntime)
+	}
+
+	return &tool.DelegateRuntime{
+		Harness:    string(resolved.AgentHarness),
+		Profile:    string(resolved.Profile),
+		Model:      string(resolved.ModelAlias),
+		SmallModel: string(resolved.SmallModel),
+		Effort:     delegateEffortString(resolved.Effort),
+		Explicit: tool.DelegateRuntimeExplicit{
+			Harness: envelope.agentHarnessSet,
+			Model:   envelope.modelSet,
+			Effort:  envelope.effortSet,
+		},
+	}, nil
+}
+
+func delegateEffortString(effort inferencemodel.Effort) string {
+	if effort == inferencemodel.EffortNone {
+		return "none"
+	}
+	return string(effort)
+}
+
+func parseDelegateEffort(value string) inferencemodel.Effort {
+	if value == "none" {
+		return inferencemodel.EffortNone
+	}
+	return inferencemodel.Effort(value)
 }

@@ -82,13 +82,28 @@ type SubagentTool struct {
 	controller tool.DelegateController
 	style      loop.DelegationStyle
 	catalog    []SubagentCatalogEntry
+
+	runtimeCatalog    loop.RuntimeCatalog
+	hasRuntimeCatalog bool
 }
 
 // NewSubagent constructs a SubagentTool bound to the parent-scoped controller, with the
 // delegation style and delegate catalog derived from the parent definition at the
 // composition root.
-func NewSubagent(controller tool.DelegateController, style loop.DelegationStyle, catalog []SubagentCatalogEntry) *SubagentTool {
-	return &SubagentTool{controller: controller, style: style, catalog: cloneSubagentCatalog(catalog)}
+func NewSubagent(controller tool.DelegateController, style loop.DelegationStyle, catalog []SubagentCatalogEntry, runtimeCatalog ...loop.RuntimeCatalog) *SubagentTool {
+	s := &SubagentTool{controller: controller, style: style, catalog: cloneSubagentCatalog(catalog)}
+	if len(runtimeCatalog) > 0 {
+		s.runtimeCatalog = runtimeCatalog[0]
+		s.hasRuntimeCatalog = true
+	}
+	return s
+}
+
+// NewSubagentWithRuntimeCatalog is the explicit construction path for the
+// parent-scoped preparation boundary. NewSubagent remains source-compatible
+// for native/legacy callers that do not provide a catalog.
+func NewSubagentWithRuntimeCatalog(controller tool.DelegateController, style loop.DelegationStyle, catalog []SubagentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) *SubagentTool {
+	return NewSubagent(controller, style, catalog, runtimeCatalog)
 }
 
 func (s *SubagentTool) schema() string {
@@ -230,8 +245,19 @@ func (s *SubagentTool) AuditSummary(string) string { return "Subagent" }
 // rule, so the combined gate auto-allows it (the tool's historical AutoApprove
 // posture). Argument validation stays in InvokableRun, whose failures are
 // model-visible tool-result strings.
-func (s *SubagentTool) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
-	return tool.Request{}, nil, nil
+func (s *SubagentTool) PrepareCall(ctx context.Context, _ uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error) {
+	if !s.hasRuntimeCatalog {
+		return tool.Request{}, nil, nil
+	}
+	envelope, err := prepareEnvelope(argsJSON)
+	if err != nil {
+		return tool.Request{}, nil, err
+	}
+	delegateRequest, runtime, err := s.prepareDelegateCall(ctx, envelope)
+	if err != nil {
+		return tool.Request{}, nil, err
+	}
+	return tool.Request{}, tool.DelegateArtifact{Request: delegateRequest, Runtime: runtime}, nil
 }
 
 // InvokableRun parses the untrusted envelope, validates it at the boundary, translates

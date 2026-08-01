@@ -8,9 +8,9 @@ import (
 )
 
 // Definition binds the harness-owned delegation control tool to one parent Loop.
-func Definition(style loop.DelegationStyle, catalog []SubagentCatalogEntry) tool.Definition {
+func Definition(style loop.DelegationStyle, catalog []SubagentCatalogEntry, runtimeCatalog ...loop.RuntimeCatalog) tool.Definition {
 	catalog = cloneSubagentCatalog(catalog)
 	return tool.NewDefinition(subagentToolName, tool.RequiresDelegateController, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
-		return []tool.InvokableTool{NewSubagent(bindings.Delegate, style, catalog)}, nil
+		return []tool.InvokableTool{NewSubagent(bindings.Delegate, style, catalog, runtimeCatalog...)}, nil
 	})
 }

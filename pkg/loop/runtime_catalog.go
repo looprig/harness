@@ -175,6 +175,11 @@ func (c RuntimeCatalog) EntriesFor(agent identity.AgentName) []RuntimeCatalogEnt
 	return result
 }
 
+// HasEntries reports whether this parent has any optional runtime choices.
+// It is intentionally a narrow query so native/no-choice parents can preserve
+// the absence of an adapter runtime without exposing the catalog backing slice.
+func (c RuntimeCatalog) HasEntries() bool { return len(c.entries) != 0 }
+
 // Resolve selects a runtime tuple for agent. Empty harness, alias, and effort
 // selectors use the deterministic default at that level. Explicit selectors
 // are checked only within the already-selected parent-scoped entry; no global
