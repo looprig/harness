@@ -42,7 +42,9 @@ This revision was checked against:
 - `inference/gateway` at the merged multi-model gateway change;
 - `acp/launch` at the gateway-backed Claude Code, Codex, and Gemini adapter
   changes;
-- `foreignloops`' current single-builder/single-agent construction path;
+- `acp/client` and `acp/launch` as the protocol/session and safe process
+  boundaries for a new `acp/loop` adapter;
+- Harness's existing public backend-builder boundary;
 - Claude Code's current subagent tool documentation.
 
 The long-running-command branch does not change the current Subagent envelope,
@@ -151,15 +153,15 @@ format, or translate a harness's tool language. Its generic runtime contract is:
 
 ```text
 role + opaque agent-harness alias + opaque model alias + effort
-    -> resolved native or foreign runtime profile
+    -> resolved native or adapter runtime profile
 ```
 
-Harness carries only validated, secret-free aliases plus a generic foreign
-profile key passed to its injected `foreign.Builder` boundary. A product with no
+Harness carries only validated, secret-free aliases plus a generic runtime
+profile key passed to its injected backend-builder boundary. A product with no
 ACP module registers no ACP-backed profiles; native delegation continues to
-work and no ACP code is linked or initialized. Other foreign-loop
-implementations can register profiles through the same boundary without
-pretending to be ACP.
+work and no ACP code is linked or initialized. The canonical ACP integration is
+`acp/loop`, which adapts `acp/client` and `acp/launch` to Harness's public
+`loop.Backend` construction seam.
 
 There are also two different tool surfaces:
 
@@ -172,14 +174,14 @@ There are also two different tool surfaces:
 
 This iteration does not translate arbitrary Harness tools into an ACP harness
 and does not claim that a role's native tool definitions automatically exist in
-a foreign child. The runtime catalog admits a role/profile combination only if
+an ACP child. The runtime catalog admits a role/profile combination only if
 the role's requirements can be honored by that profile. Portable role data in
 this release is limited to system/instruction policy and explicitly mapped
 access posture; native-only tool requirements make an ACP combination
 incompatible.
 
-A future optional tool-export adapter may bridge selected Harness tools to a
-foreign runtime using a protocol that runtime supports. It must invoke the same
+A future optional tool-export adapter may bridge selected Harness tools to an
+ACP runtime using a protocol that runtime supports. It must invoke the same
 prepared/gated/audited Harness execution seam; no such bridge belongs in the
 core `Subagent` or Loop packages.
 
@@ -196,8 +198,8 @@ The child role and three runtime dimensions are independently selectable:
 - `effort` selects Looprig's dialect-neutral effort intent.
 
 `mode` remains a fourth, behavioral dimension. For a native runtime it selects
-the role's declared instructions, tools, limits, and defaults. A foreign
-profile receives only the mode data its compatibility contract explicitly
+the role's declared instructions, tools, limits, and defaults. An ACP profile
+receives only the mode data its compatibility contract explicitly
 maps; this release requires instructions but does not claim to enforce native
 Harness tool definitions or tool-iteration limits inside an ACP harness.
 Resolution order for a new child is:
@@ -274,20 +276,20 @@ a tuple only when it is truthful and safe. At minimum it checks:
 
 The model-facing schema is capability-derived rather than permanently widened:
 
-- if a parent has no registered foreign agent-harness profiles,
+- if a parent has no registered ACP agent-harness profiles,
   `agent_harness` is absent from its `Subagent` schema and description, and an
   explicit field is rejected during preparation;
-- if foreign profiles are available, `agent_harness` is present only in the
+- if ACP profiles are available, `agent_harness` is present only in the
   affected start branches and enumerates only the aliases allowed to that
   parent/role;
-- `model` is advertised only when the resolved native or foreign runtime offers
+- `model` is advertised only when the resolved native or ACP runtime offers
   a model choice beyond its implicit default;
 - `effort` is advertised only when at least one admitted model offers a choice
   beyond its default;
-- a mixed catalog may expose `native` alongside configured foreign harness
+- a mixed catalog may expose `native` alongside configured ACP harness
   aliases, while omission continues to select the deterministic default.
 
-There is no process-global `acp_enabled` flag. Registering an optional foreign
+There is no process-global `acp_enabled` flag. Registering an optional ACP
 profile changes only the catalog/schema branches that can actually use it. A
 plain Harness build with no ACP composition retains the native Subagent surface
 and behavior.
@@ -345,7 +347,7 @@ not names hard-coded by Harness.
 | `prompt` | yes | Initial child user turn. |
 | `subagent_type` | yes | One child role in the parent's frozen allowlist. |
 | `mode` | no | One mode declared by that role; omission uses its initial mode. |
-| `agent_harness` | no | Capability-derived. Present only when that role has a selectable foreign/native harness choice; omission uses its default. |
+| `agent_harness` | no | Capability-derived. Present only when that role has a selectable ACP/native harness choice; omission uses its default. |
 | `model` | no | Capability-derived. One gateway/native alias available under the resolved harness; omission uses its default. |
 | `effort` | no | Capability-derived. One allowed neutral effort for the resolved harness/model; omission uses its default. |
 | `run_in_background` | no | Managed defaults to `true`; sync-only defaults to and requires `false`. |
@@ -454,28 +456,32 @@ Harness needs a narrow composition seam that resolves an authorized selection
 to a child runtime before the first prompt. The resolved value contains:
 
 - the selected role definition and mode;
-- an engine kind (`native` or generic `foreign profile`);
+- an engine kind (`native` or generic `adapter`);
 - a stable secret-free agent-harness/profile alias;
 - the full selected target `model.Model` and effort;
 - for native, the already-configured `inference.Client`;
-- for foreign execution, only an opaque profile key consumed by the injected
-  foreign builder.
+- for adapter execution, only an opaque profile key consumed by the injected
+  backend builder.
 
 Harness must not import ACP or the gateway. It stores and validates aliases and
 calls injected resolver/builder seams. The product composition root owns real
 clients, gateway routes, ACP connector factories, executable paths, and
 environment policy.
 
-The current one foreign-builder pair can remain if it becomes a router over the
+The existing backend-builder pair can remain if it becomes a router over the
 resolved profile carried by `loop.BoundDefinition`. A clearer alternative is a
 profile-keyed builder registry. In either shape, routing on `Engine` alone is
-insufficient because several distinct foreign harness profiles can share one
-generic engine. Routing on display name is also forbidden. Use an explicit
-stable profile alias.
+insufficient because several distinct ACP harness profiles can share one
+generic adapter engine. Routing on display name is also forbidden. Use an
+explicit stable profile alias.
 
-`foreignloops` owns the concrete ACP-to-`loop.Backend` adapter because it already
-owns foreign Loop normalization. That adapter may use `acp/client` and
-`acp/launch`; Harness remains dependent only on `pkg/foreign` seams.
+`acp/loop` owns the concrete ACP-to-Harness adapter. It may import
+`acp/client`, `acp/launch`, and Harness public packages to implement
+`loop.Backend` plus the existing live/restore builder contracts. Pure ACP wire,
+client, transport, and launch packages remain Harness-independent. Harness
+does not import `acp/loop`; the product composition root injects its builders.
+Existing direct-CLI compatibility integrations are outside this design and are
+not part of the canonical ACP path.
 
 For every ACP child:
 

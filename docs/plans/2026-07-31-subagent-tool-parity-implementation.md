@@ -10,19 +10,20 @@ alias, and inference effort. Run ACP children through the inference gateway so
 different sibling Loops can use different harness/model/effort combinations.
 
 **Architecture:** Harness owns only secret-free selection, authorization,
-durability, and foreign-builder seams. The product composition root owns the
-available runtime catalog and gateway. `inference/gateway` routes a
+durability, and generic backend-builder seams. The product composition root
+owns the available runtime catalog and gateway. `inference/gateway` routes a
 harness-facing alias from any supported ACP ingress dialect to an injected
-model target. `acp/launch` owns safe ACP process/proxy setup. `foreignloops`
-adapts an ACP client/session into a Harness foreign `loop.Backend`.
+model target. `acp/launch` owns safe ACP process/proxy setup. The new
+`acp/loop` package directly adapts `acp/client` plus `acp/launch` into a Harness
+`loop.Backend` and its live/restore builder contracts.
 
 ACP remains optional: Harness exposes a protocol-neutral opaque
-foreign-profile seam and does not import or name ACP types. A product without
-ACP registers no ACP-backed profiles. Native delegation and `Subagent` continue
-without linking or initializing ACP, the gateway, or Foreignloops.
+runtime-profile seam and does not import or name ACP types. A product without
+ACP registers no ACP-backed profiles. Native delegation and `Subagent`
+continue without linking or initializing ACP or the gateway.
 
 **Tech stack:** Go 1.26, Harness prepared-call contracts,
-`inference/gateway`, `acp/client`, `acp/launch`, `foreignloops/backend`, and
+`inference/gateway`, `acp/client`, `acp/launch`, `acp/loop`, and
 the existing Looprig model/effort/event types.
 
 ---
@@ -66,7 +67,7 @@ They are capability-derived schema properties, not unconditional parameters.
 When a parent has no corresponding runtime choice, the property is absent and
 an explicitly supplied value is rejected.
 
-ACP, not MCP, is the foreign-agent protocol in this plan.
+ACP, not MCP, is the agent protocol in this plan.
 
 Run focused and module tests with `GOWORK=off` and `-race`. Refresh module
 versions/vendor trees only at the release task, after the producing module has
@@ -77,21 +78,20 @@ committed and tagged the needed public contract.
 The module delivery order is:
 
 ```text
-inference gateway (already landed)    acp/launch effort controls
+inference gateway (already landed)    harness runtime-profile seams
                     \                 /
                      \               /
-              harness public selection seams
-                         |
-              foreignloops ACP backend
+             acp/client + launch + acp/loop
                          |
           product composition and end-to-end tests
 ```
 
-The diagram is delivery sequencing, not an import from ACP to Inference:
-`acp/launch` continues to consume the gateway only through its structural
-`ModelProxy`/`ProxyBinding` contract. No layer may reverse the actual package
-dependencies. Harness must not import ACP, foreignloops, or
-`inference/gateway`. `acp/launch` must not import Inference or Harness.
+The diagram is delivery sequencing. `acp/launch` continues to consume the
+gateway only through its structural `ModelProxy`/`ProxyBinding` contract.
+`acp/loop` is a product-facing adapter and may import Harness public packages,
+`acp/client`, and `acp/launch`. Pure ACP wire packages remain independent:
+`acp/launch` must not import Inference or Harness, and Harness must not import
+ACP, `acp/loop`, or `inference/gateway`.
 
 ### Task 1: Add stable runtime-selection value contracts
 
@@ -197,8 +197,8 @@ Stage only the four owned files.
 
 **Harness files:**
 
-- Create: `pkg/foreign/profile.go`
-- Create: `pkg/foreign/profile_test.go`
+- Create: `pkg/loop/runtime_profile.go`
+- Create: `pkg/loop/runtime_profile_test.go`
 - Modify: `pkg/rig/options.go`
 - Modify: `pkg/rig/options_test.go`
 - Modify: `internal/sessionruntime/session.go`
@@ -216,24 +216,24 @@ Add a session-owned resolver/provider seam that can:
 3. re-resolve a persisted runtime identity during restore.
 
 The resolved runtime must contain a selected `loop.BoundDefinition` whose
-mode, model, effort, engine, and stable foreign profile are already fixed.
+mode, model, effort, engine, and stable runtime profile are already fixed.
 Implementation handles remain inside the injected resolver, not in the tool
 catalog.
 
 Introduce a stable profile alias on a bound definition, for example:
 
 ```go
-type ProfileName string
+type RuntimeProfileName string
 
 type RuntimeIdentity struct {
 	AgentHarness AgentHarnessName
 	ModelAlias   ModelAlias
-	Profile      foreign.ProfileName
+	Profile      RuntimeProfileName
 }
 ```
 
-`ProfileName` is secret-free and opaque. It is not an executable name and is
-not model-selectable independently of `agent_harness`.
+`RuntimeProfileName` is secret-free and opaque. It is not an executable name
+and is not model-selectable independently of `agent_harness`.
 
 **Step 2: Pin parent scoping and determinism**
 
@@ -245,23 +245,24 @@ Tests must prove:
 - duplicate/ambiguous aliases fail session construction;
 - missing resolver leaves legacy/default runtime behavior intact only when no
   runtime-selection catalog is advertised;
-- a native-only catalog neither consults nor requires a foreign builder,
+- a native-only catalog neither consults nor requires an adapter builder,
   gateway, ACP connector, or ACP availability check;
 - requested ACP runtime without a resolver fails closed;
 - aliases never route by display name or `Engine` alone.
 
 **Step 3: Implement the narrow options**
 
-Wire live and restore resolution through Session/Lifecycle options. Prefer one
-paired option, mirroring `WithForeignBuilders`, so a consumer cannot configure a
-live-only catalog that restore cannot interpret.
+Wire live and restore resolution through Session/Lifecycle options. Keep live
+and restore construction paired, as the existing backend-builder option does,
+so a consumer cannot configure a live-only catalog that restore cannot
+interpret.
 
 Do not put ACP, gateway, process, or executable types into Harness public APIs.
 
 **Step 4: Run focused tests**
 
 ```bash
-GOWORK=off go test -race ./pkg/foreign ./pkg/rig ./internal/sessionruntime -run 'TestDelegateRuntime|TestRuntimeCatalog'
+GOWORK=off go test -race ./pkg/loop ./pkg/rig ./internal/sessionruntime -run 'TestDelegateRuntime|TestRuntimeCatalog'
 ```
 
 Expected: PASS.
@@ -276,16 +277,18 @@ Expected: PASS.
 - Modify: `pkg/loop/definition_test.go`
 - Modify: `pkg/loop/bound_overrides_test.go`
 - Modify: `internal/sessionruntime/session.go`
-- Modify: `internal/sessionruntime/foreign_newloop_test.go`
+- Create: `internal/sessionruntime/adapter_newloop_test.go`
 
 **Step 1: Write failing bound-runtime tests**
 
-Add a protocol-neutral generic foreign-profile engine, for example
-`EngineForeignProfile`; do not add an ACP-named engine to Harness. Add a sealed
+Add a protocol-neutral generic adapter engine named `EngineAdapter`; do not add
+an ACP-named engine to Harness. Keep the existing provider-specific engine
+values only as compatibility paths; the new ACP composition must not select
+them. Add a sealed
 bind-time override that clones a bound definition and changes only:
 
 - engine;
-- stable foreign profile;
+- stable runtime profile;
 - full model descriptor;
 - effort;
 - optional native client when the selected runtime is native.
@@ -311,20 +314,23 @@ values chosen by defaults, so later `SetMode`/mode changes cannot replace it.
 Omission changes initial resolution only; it does not make an ACP child's
 runtime mutable after launch.
 
-The model must pass `ValidateContextModel`; effort must be valid; a generic
-foreign-profile engine must have a non-empty profile; a native engine must have
-no foreign profile and must have a usable client.
+The model must pass `ValidateContextModel`; effort must be valid; an adapter
+engine must have a non-empty runtime profile; a native engine must have no
+adapter profile and must have a usable client.
 
-**Step 3: Route a generic foreign profile through the foreign seam**
+**Step 3: Route a generic adapter profile through the backend seam**
 
-Update the construction switch so `EngineForeignProfile` uses the injected
-foreign builder. The builder receives the selected bound definition and reads
-its profile/model/effort. Missing builder/profile fails closed.
+Update the construction switch so `EngineAdapter` uses the injected backend
+builder. The existing public builder types currently live in Harness's
+`pkg/foreign` package; treat that package name as a compatibility API detail,
+not as the name or ownership model for ACP Loops. The builder receives the
+selected bound definition and reads its profile/model/effort. Missing
+builder/profile fails closed.
 
 **Step 4: Run focused tests**
 
 ```bash
-GOWORK=off go test -race ./pkg/loop ./internal/sessionruntime -run 'Test(OverrideBoundRuntime|DelegateRuntimeBinding|ForeignProfile)'
+GOWORK=off go test -race ./pkg/loop ./internal/sessionruntime -run 'Test(OverrideBoundRuntime|DelegateRuntimeBinding|AdapterProfile)'
 ```
 
 Expected: PASS.
@@ -552,7 +558,7 @@ Expected: PASS.
 **Step 1: Add an additive durable runtime identity**
 
 Persist the stable `agent_harness`, harness-facing `model_alias`, and opaque
-foreign profile identity needed to reconstruct the exact backend. Keep
+runtime profile identity needed to reconstruct the exact backend. Keep
 `LoopStarted.Runtime` as the authoritative target model key/limits/effort.
 
 The event must reject:
@@ -562,9 +568,10 @@ The event must reject:
 - blank/invalid identifiers;
 - invalid model runtime/effort.
 
-Legacy native records remain decodable. Legacy foreign records continue through
-their existing engine-specific compatibility path; never reinterpret them as a
-new generic ACP profile without an explicit migration rule.
+Legacy native records remain decodable. Legacy provider-specific records
+continue through their existing engine-specific compatibility path; never
+reinterpret those compatibility records as a new generic ACP profile without
+an explicit migration rule.
 
 **Step 2: Digest the public catalog**
 
@@ -703,78 +710,94 @@ GOWORK=off go test -race ./client ./protocol ./transport/stdio
 
 Then run the ACP module's required secure checks before committing.
 
-### Task 10: Implement an ACP foreign-loop driver/backend
+### Task 10: Implement the Harness adapter in `acp/loop`
 
-**Foreignloops files:**
+**ACP files:**
 
-- Add dependency on the released/tagged ACP module
-- Create: `driver/acp/config.go`
-- Create: `driver/acp/agent.go`
-- Create: `driver/acp/stream.go`
-- Create: `driver/acp/decode.go`
-- Create matching unit, race, cancellation, and fuzz tests
-- Modify: `backend/config.go`
-- Modify: `backend/builder.go`
-- Modify: `backend/restored.go`
-- Modify: boundary/dependency tests and module documentation
+- Create: `loop/config.go`
+- Create: `loop/builder.go`
+- Create: `loop/backend.go`
+- Create: `loop/session.go`
+- Create: `loop/updates.go`
+- Create: `loop/restore.go`
+- Create matching unit, race, cancellation, restore, and fuzz tests
+- Modify: `internal/boundary/deps_test.go`
+- Modify: `CLAUDE.md`
+- Modify: module/package documentation
 
-**Step 1: Define a profile-keyed factory**
+**Step 1: Declare the product-facing package boundary**
 
-The current `backend.Config` closes over one fixed `driver.Agent`. Replace or
-augment it with an immutable profile router/factory that receives the selected
-bound definition's stable profile, model alias, and effort and returns one
-child-owned agent/session.
+`acp/loop` is the only new ACP package allowed to import Harness. It directly
+adapts `acp/client` and `acp/launch` to Harness public contracts. Its `Backend`
+implements `harness/pkg/loop.Backend`; its builder exposes live and restored
+functions assignable to the existing Harness builder contracts (currently
+exported from `harness/pkg/foreign`).
 
-Do not route on `Engine`, role name, display name, or model provider. Unknown
-profiles fail closed before process launch.
+Update ACP dependency-boundary tests and documentation so pure wire packages
+(`protocol`, `transport`, `client`, and `launch`) remain independent of
+Harness/Inference while this explicit product adapter may import Harness.
+There is no intermediate direct-CLI driver and no dependency on a separate
+Loop-adapter module.
 
-**Step 2: Build one ACP client/session per child Loop**
+**Step 2: Define a profile-keyed ACP factory**
 
-Use `acp/launch.Dial` with a shared gateway `ProxyBinding`. The product supplies
-validated connector factories and absolute command/env configuration. The ACP
-driver must not construct executables from model-facing strings.
+Create an immutable profile router/factory that receives the selected bound
+definition's stable runtime profile, model alias, and effort and returns one
+child-owned managed ACP client/session. It owns connector factories and the
+shared gateway binding reference, while the product owns validated executable
+and environment configuration.
+
+Do not route on `Engine`, role name, display name, model provider, or raw
+model-facing input. Unknown profiles fail closed before process launch.
+
+**Step 3: Build one ACP client/session per child Loop**
+
+Use `acp/launch.Dial` with the session's shared gateway `ProxyBinding`. The ACP
+Loop adapter must not construct executables, arguments, URLs, or environment
+values from model-facing strings.
 
 For each new child:
 
-1. create the connector for its profile/model/effort;
-2. dial and initialize the ACP peer;
+1. resolve its approved profile/model/effort connector configuration;
+2. create one `launch.ManagedClient` and initialize the ACP peer;
 3. call `session/new` with the session workspace CWD;
-4. apply session-level model/effort/mode controls where required;
-5. only then accept the first Harness turn;
-6. map ACP updates to normalized `driver.Event` values;
+4. apply adapter-specific model and effort controls before the first prompt;
+5. receive Harness commands and submit them to that pinned ACP session;
+6. convert ACP updates directly into Harness events and snapshots;
 7. close the ACP session/client/process on Loop close, failure, or cancellation.
 
-**Step 3: Preserve conversation and restore semantics**
+**Step 4: Preserve conversation and restore semantics**
 
 Follow-up turns reuse only the same child ACP session. For restore, use
 `session/load`/`session/resume` only when the selected adapter advertises and
-the bridge proves that capability. Otherwise return a typed restore-unavailable
-error; never start a blank session under an old Harness Loop ID.
+the adapter proves that capability. Otherwise return a typed
+restore-unavailable error; never start a blank session under an old Harness
+Loop ID.
 
-**Step 4: Prove independent siblings and cleanup**
+**Step 5: Prove independent siblings and cleanup**
 
 Tests use fake ACP peers and a fake shared proxy to prove:
 
-- Claude and Codex child sessions coexist;
+- Claude Code and Codex child sessions coexist;
 - each receives its own model/effort before first prompt;
-- prompts and updates do not cross sessions;
+- prompts, updates, event publication, and snapshots do not cross sessions;
 - interrupt cancels only the addressed child;
 - closing one child does not close the shared gateway or sibling;
 - partial construction unwinds every process/session/resource;
 - malformed ACP updates fail safely and fuzz without panic/leak.
 
-**Step 5: Run Foreignloops verification**
+**Step 6: Run ACP Loop verification**
 
 ```bash
-GOWORK=off go test -race ./driver/... ./backend/...
+GOWORK=off go test -race ./loop ./client ./launch
 ```
 
-Then run the module's secure checks and refresh vendor from tagged dependencies.
+Then run the ACP module's full secure and boundary checks.
 
 ### Task 10A: Keep Harness and ACP tool ownership separate
 
-**Harness and Foreignloops files:** add focused compatibility tests and contract
-documentation beside the runtime-profile and ACP backend code.
+**Harness and ACP files:** add focused compatibility tests and contract
+documentation beside the runtime-profile and `acp/loop` code.
 
 Do not send `loop.BoundDefinition.Tools()` to an ACP child and do not claim the
 ACP child executes them. Pin the two supported cases:
@@ -782,7 +805,7 @@ ACP child executes them. Pin the two supported cases:
 - a native runtime profile executes the role's bound Harness tools through the
   existing native runner;
 - an ACP runtime profile executes its agent harness's own tool surface; Harness
-  observes normalized tool events and enforces the explicitly mapped foreign
+  observes normalized tool events and enforces the explicitly mapped ACP
   permission posture.
 
 Add role/profile compatibility requirements so a role that requires a
@@ -795,11 +818,11 @@ This is a boundary test/documentation task, not a new MCP server or tool bridge.
 A later optional adapter may export selected Harness tools only through the same
 prepared/gated/audited invocation boundary.
 
-### Task 11: Compose the gateway, catalog, and ACP profiles in the product
+### Task 11: Compose the gateway, catalog, and ACP Loops in CodeRig/product
 
 **Consumer files:** discover the active product composition root with `rg`
-before editing. Do not assume stale CodeRig paths or its current local replace
-targets.
+before editing. CodeRig is the intended consumer, but do not assume stale paths
+or its current local replace targets.
 
 **Step 1: Build one immutable source configuration**
 
@@ -811,9 +834,13 @@ From product config, construct:
   resolved target carries its own, independently validated
   `model.Model.APIFormat` egress format;
 - one loopback `gateway.Server` shared by the session;
-- ACP profile factories for installed/preflighted adapters;
+- an `acp/loop` profile factory for each installed/preflighted agent harness;
 - the parent-scoped Subagent runtime catalog derived from those same routes and
   profiles.
+
+Register the `acp/loop` live and restore builders through Harness's existing
+backend-builder option. CodeRig must not import or register the direct Claude
+or Codex CLI Loop integrations for this path.
 
 Do not create the gateway catalog and Subagent catalog from independent lists.
 A startup validator must reject route/profile/catalog drift.
@@ -894,13 +921,13 @@ Document:
 - catalog ownership at the composition root;
 - gateway is routing, not discovery;
 - one ACP process/session per child Loop;
-- ACP is optional and Harness sees only opaque foreign profile aliases;
+- ACP is optional and Harness sees only opaque runtime profile aliases;
 - native children use bound Harness tools while ACP children use their agent
   harness's own tools in this iteration;
 - ACP is unrelated to MCP;
 - `isolation` remains deferred;
 - ACP primary/root Loops are deferred because exporting Harness control tools
-  into a foreign ACP harness needs a separate prepared/gated tool bridge;
+  into an ACP agent harness needs a separate prepared/gated tool bridge;
 
 ### Task 13: Full verification and release discipline
 
@@ -926,16 +953,9 @@ GOWORK=off go test -race ./...
 ```
 
 Run ACP's secure target and verify its boundary test still proves `launch`,
-`client`, `protocol`, and `transport` do not import Harness/Inference.
-
-**Foreignloops:**
-
-```bash
-GOWORK=off go test -race ./...
-```
-
-Run its secure target and process-leak/cancellation integration tests on Darwin
-and Linux.
+`client`, `protocol`, and `transport` do not import Harness/Inference. Verify
+`acp/loop` is the sole new Harness-importing ACP adapter and run its
+process-leak/cancellation integration tests on Darwin and Linux.
 
 **Inference:**
 
@@ -958,7 +978,7 @@ producer release exists.
 
 Record in the implementation handoff:
 
-- exact commits/tags for Harness, ACP, Foreignloops, Inference, and the product;
+- exact commits/tags for Harness, ACP, Inference, and the product;
 - focused and full verification commands with exit status;
 - the catalog shown to the test parent Loop;
 - durable `LoopStarted` runtime identities for both example children;
