@@ -154,6 +154,10 @@ func (s *SubagentTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolRe
 	}
 	req := artifact.Request
 	req.Runtime = artifact.Runtime
+	// ParentToolUseID is an execution-context fact, not part of the prepared
+	// model-facing envelope. Clear any stale value before adding the trusted
+	// runner context value.
+	req.ParentToolUseID = ""
 	if toolUseID, present := loop.ToolUseIDFrom(ctx); present {
 		req.ParentToolUseID = toolUseID
 	}

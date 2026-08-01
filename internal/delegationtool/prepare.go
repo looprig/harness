@@ -348,10 +348,6 @@ func (s *SubagentTool) prepareDelegateCall(ctx context.Context, envelope Subagen
 	if envelope.DelegateID != nil {
 		request.DelegateID = *envelope.DelegateID
 	}
-	if toolUseID, ok := loop.ToolUseIDFrom(ctx); ok {
-		request.ParentToolUseID = toolUseID
-	}
-
 	var runtime *tool.DelegateRuntime
 	switch envelope.Action {
 	case actionStart:

@@ -695,6 +695,24 @@ func TestSubagentExecutionUsesPreparedRequestAndTrustedToolUseID(t *testing.T) {
 	}
 }
 
+func TestSubagentExecutionDoesNotRetainPreparationToolUseID(t *testing.T) {
+	t.Parallel()
+	fc := &fakeController{result: tool.DelegateResult{Status: tool.DelegateStatusQueued}}
+	s := NewSubagent(fc, loop.DelegationManaged, subagentCatalog())
+	prepareCtx := loop.WithToolUseID(context.Background(), "preparation-only")
+	request, artifact, err := s.PrepareCall(prepareCtx, mustParseUUID(t, "11111111-1111-4111-8111-111111111111"), `{"description":"d","prompt":"p","subagent_type":"explorer"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{Request: request, Artifact: artifact})
+	if _, err := s.InvokableRun(ctx, "ignored"); err != nil {
+		t.Fatal(err)
+	}
+	if got := fc.last().ParentToolUseID; got != "" {
+		t.Fatalf("ParentToolUseID = %q, want empty without execution context", got)
+	}
+}
+
 func TestSubagentQueuedRuntimeResultUsesJSONAndOmitsNativeHarnessWhenEmpty(t *testing.T) {
 	t.Parallel()
 	catalog := testPreparationCatalog(t)
