@@ -368,7 +368,9 @@ const (
 	// disjoint, plus thirteen manifest scalar-field categories including hook
 	// policy. Restore may append one root-agent-name change after AssessDrift,
 	// so that slot is explicit too. It still bounds a decoded hostile event.
-	maxConfigDriftScalarChanges  = 13
+	// Runtime identity contributes five additional bounded scalar changes, each
+	// of which is fail-closed.
+	maxConfigDriftScalarChanges  = 18
 	maxConfigDriftAgentNameSlots = 1
 	maxConfigDriftChanges        = 2*maxConfigManifestTools + 2*maxConfigManifestAppFields + maxConfigDriftScalarChanges + maxConfigDriftAgentNameSlots
 	// MaxConfigMessageLen and MaxConfigActorLen bound the durable, partly
@@ -431,12 +433,22 @@ func validConfigManifestSchema(manifest ConfigManifest, allowLegacy bool) bool {
 		// HookPolicyRev did not exist in schema v1 and is deliberately excluded
 		// from its historical canonical layout. Reject it rather than accepting
 		// policy state that the fingerprint cannot authenticate.
-		return manifest.HookPolicyRev == ""
+		return manifest.HookPolicyRev == "" && zeroRuntimeManifest(manifest)
+	case 2:
+		// Schema v2 has no runtime identity fields. Reject populated fields rather
+		// than accepting data the v2 fingerprint does not authenticate.
+		return zeroRuntimeManifest(manifest)
 	case ManifestSchemaVersion:
 		return true
 	default:
 		return false
 	}
+}
+
+func zeroRuntimeManifest(manifest ConfigManifest) bool {
+	return manifest.RuntimeProfile == "" && manifest.RuntimeCatalogRev == "" &&
+		manifest.RuntimeTargetProvider == "" && manifest.RuntimeTargetModel == "" &&
+		manifest.RuntimeEffort == ""
 }
 
 func invalidHustle(name EventName, field FieldName) *InvalidEventError {

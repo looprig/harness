@@ -18,12 +18,16 @@ import (
 // canonical encoding. Neither shipped independently — both landed in the
 // same merge before v2 was ever persisted anywhere — so v2 is defined as
 // carrying both fields together, not as two separate single-field bumps.
-const ManifestSchemaVersion uint32 = 2
+// v3 adds the explicit runtime identity fields. v1 and v2 canonical encodings
+// remain immutable so previously persisted fingerprints remain verifiable.
+const ManifestSchemaVersion uint32 = 3
 
 // manifestEncodingDomain separates manifest digests from every other SHA-256
 // in the system. It is part of the durable contract; never change it without a
 // schema bump.
-const manifestEncodingDomain = "looprig/config-manifest/v2"
+const manifestEncodingDomain = "looprig/config-manifest/v3"
+
+const manifestEncodingDomainV2 = "looprig/config-manifest/v2"
 
 // manifestEncodingDomainV1 preserves verification of fingerprints already
 // persisted before HookPolicyRev extended the canonical schema.
@@ -104,6 +108,11 @@ type ConfigManifest struct {
 	ConfinementStrictness     StrictnessLevel `json:"confinement_strictness,omitzero"`
 	ExternalCapabilityRev     string          `json:"external_capability_rev,omitzero"`
 	HookPolicyRev             string          `json:"hook_policy_rev,omitzero"`
+	RuntimeProfile            string          `json:"runtime_profile,omitzero"`
+	RuntimeCatalogRev         string          `json:"runtime_catalog_rev,omitzero"`
+	RuntimeTargetProvider     string          `json:"runtime_target_provider,omitzero"`
+	RuntimeTargetModel        string          `json:"runtime_target_model,omitzero"`
+	RuntimeEffort             string          `json:"runtime_effort,omitzero"`
 	// AppFields are application-defined, secret-free compatibility fields.
 	// Canonically encoded in sorted key order.
 	AppFields map[string]string `json:"app_fields,omitzero"`
@@ -124,6 +133,8 @@ func (m ConfigManifest) canonical() []byte {
 	domain := manifestEncodingDomain
 	if m.SchemaVersion == 1 {
 		domain = manifestEncodingDomainV1
+	} else if m.SchemaVersion == 2 {
+		domain = manifestEncodingDomainV2
 	}
 	material := appendManifestString(nil, domain)
 	material = binary.BigEndian.AppendUint64(material, uint64(m.SchemaVersion))
@@ -181,6 +192,13 @@ func (m ConfigManifest) canonical() []byte {
 	if m.SchemaVersion != 1 {
 		material = appendManifestString(material, m.HookPolicyRev)
 	}
+	if m.SchemaVersion >= ManifestSchemaVersion {
+		material = appendManifestString(material, m.RuntimeProfile)
+		material = appendManifestString(material, m.RuntimeCatalogRev)
+		material = appendManifestString(material, m.RuntimeTargetProvider)
+		material = appendManifestString(material, m.RuntimeTargetModel)
+		material = appendManifestString(material, m.RuntimeEffort)
+	}
 	keys := make([]string, 0, len(m.AppFields))
 	for key := range m.AppFields {
 		keys = append(keys, key)
@@ -214,6 +232,11 @@ func ManifestFromLegacy(f ConfigFingerprint) ConfigManifest {
 		PermissionPosture:         f.PermissionPosture,
 		NativePermissionPolicyRev: f.NativePermissionPolicyRev,
 		ExternalCapabilityRev:     f.ExternalCapabilityRev,
+		RuntimeProfile:            f.RuntimeProfile,
+		RuntimeCatalogRev:         f.RuntimeCatalogRev,
+		RuntimeTargetProvider:     f.RuntimeTargetProvider,
+		RuntimeTargetModel:        f.RuntimeTargetModel,
+		RuntimeEffort:             f.RuntimeEffort,
 	}
 }
 

@@ -82,6 +82,17 @@ type ConfigFingerprint struct {
 	// WithAllowConfigMismatch decides on. A field that promised more than that
 	// would be a promise nothing here keeps.
 	ExternalCapabilityRev string `json:"external_capability_rev,omitzero"`
+	// RuntimeProfile is the secret-free backend profile selected for this bound
+	// loop. Empty preserves native and legacy callers.
+	RuntimeProfile string `json:"runtime_profile,omitzero"`
+	// RuntimeCatalogRev identifies the parent-scoped runtime catalog snapshot.
+	RuntimeCatalogRev string `json:"runtime_catalog_rev,omitzero"`
+	// RuntimeTargetProvider and RuntimeTargetModel identify the selected target
+	// without carrying endpoint or credential material.
+	RuntimeTargetProvider string `json:"runtime_target_provider,omitzero"`
+	RuntimeTargetModel    string `json:"runtime_target_model,omitzero"`
+	// RuntimeEffort is the effective inference effort selected for the target.
+	RuntimeEffort string `json:"runtime_effort,omitzero"`
 }
 
 // Equal reports whether two fingerprints identify the same configuration: true iff
@@ -99,5 +110,10 @@ func (f ConfigFingerprint) Equal(other ConfigFingerprint) bool {
 		f.AgentAdapter == other.AgentAdapter &&
 		f.PermissionPosture == other.PermissionPosture &&
 		f.NativePermissionPolicyRev == other.NativePermissionPolicyRev &&
-		f.ExternalCapabilityRev == other.ExternalCapabilityRev
+		f.ExternalCapabilityRev == other.ExternalCapabilityRev &&
+		f.RuntimeProfile == other.RuntimeProfile &&
+		f.RuntimeCatalogRev == other.RuntimeCatalogRev &&
+		f.RuntimeTargetProvider == other.RuntimeTargetProvider &&
+		f.RuntimeTargetModel == other.RuntimeTargetModel &&
+		f.RuntimeEffort == other.RuntimeEffort
 }

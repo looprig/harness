@@ -61,6 +61,8 @@ func TestAssessDrift(t *testing.T) {
 			wantCategory: DriftRuntimeSkills, wantSeverity: DriftWarn},
 		{name: "hook policy change is warn", mutate: func(m *ConfigManifest) { m.HookPolicyRev = "hook-v2" },
 			wantCategory: DriftHookPolicy, wantSeverity: DriftWarn},
+		{name: "runtime profile change is warn", mutate: func(m *ConfigManifest) { m.RuntimeProfile = "acp/claude" },
+			wantCategory: DriftRuntime, wantSeverity: DriftWarn},
 		{name: "app field change is info", mutate: func(m *ConfigManifest) { m.AppFields["a"] = "x" },
 			wantCategory: DriftApp, wantSeverity: DriftInfo},
 	}
@@ -79,6 +81,29 @@ func TestAssessDrift(t *testing.T) {
 					change.Category, change.Severity, tt.wantCategory, tt.wantSeverity)
 			}
 		})
+	}
+}
+
+func TestAssessDriftRuntimeIdentityFailsClosed(t *testing.T) {
+	t.Parallel()
+	baseline := testManifest()
+	candidate := baseline
+	candidate.RuntimeProfile = "acp/claude"
+	candidate.RuntimeCatalogRev = "catalog-v2"
+	candidate.RuntimeTargetProvider = "anthropic"
+	candidate.RuntimeTargetModel = "claude-opus"
+	candidate.RuntimeEffort = "max"
+	assessment := AssessDrift(baseline, candidate)
+	if !assessment.AnyWarn() {
+		t.Fatalf("runtime identity drift = %+v, want warning", assessment)
+	}
+	if len(assessment.Changes) != 5 {
+		t.Fatalf("runtime identity drift changes = %+v, want five changes", assessment.Changes)
+	}
+	for _, change := range assessment.Changes {
+		if change.Category != DriftRuntime || change.Severity != DriftWarn {
+			t.Errorf("runtime change = %+v, want runtime/warn", change)
+		}
 	}
 }
 
@@ -282,6 +307,11 @@ func TestConfigDriftBudgetCoversDisjointValidManifests(t *testing.T) {
 		ConfinementStrictness:     2,
 		ExternalCapabilityRev:     "old-external",
 		HookPolicyRev:             "old-hook",
+		RuntimeProfile:            "old-profile",
+		RuntimeCatalogRev:         "old-catalog",
+		RuntimeTargetProvider:     "old-provider",
+		RuntimeTargetModel:        "old-target",
+		RuntimeEffort:             "old-effort",
 		Tools:                     make([]ToolManifestEntry, maxConfigManifestTools),
 		AppFields:                 make(map[string]string, maxConfigManifestAppFields),
 	}
@@ -302,6 +332,11 @@ func TestConfigDriftBudgetCoversDisjointValidManifests(t *testing.T) {
 		ConfinementStrictness:     3,
 		ExternalCapabilityRev:     "new-external",
 		HookPolicyRev:             "new-hook",
+		RuntimeProfile:            "new-profile",
+		RuntimeCatalogRev:         "new-catalog",
+		RuntimeTargetProvider:     "new-provider",
+		RuntimeTargetModel:        "new-target",
+		RuntimeEffort:             "new-effort",
 		Tools:                     make([]ToolManifestEntry, maxConfigManifestTools),
 		AppFields:                 make(map[string]string, maxConfigManifestAppFields),
 	}

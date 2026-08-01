@@ -65,15 +65,29 @@ type ConfigFingerprintFields struct {
 	// composition root attaches. Canonically encoded in sorted key order by the
 	// manifest. Nil means none.
 	AppFields map[string]string
+	// Runtime identity fields are secret-free projections supplied by the
+	// composition root for the frozen restore path. Empty preserves legacy callers.
+	RuntimeProfile        string
+	RuntimeCatalogRev     string
+	RuntimeTargetProvider string
+	RuntimeTargetModel    string
+	RuntimeEffort         string
 }
 
 // FingerprintFrom derives the stable, secret-free behavior fingerprint of a bound loop.
 func FingerprintFrom(definition loop.BoundDefinition) event.ConfigFingerprint {
-	return event.ConfigFingerprint{
+	fingerprint := event.ConfigFingerprint{
 		ModelID:         definition.Model().Name,
 		SystemPromptRev: hexSHA256(definition.EffectiveSystem()),
 		ToolPolicyRev:   toolPolicyRev(definition.Tools()),
 	}
+	runtime := definition.RuntimeIdentity()
+	fingerprint.RuntimeProfile = string(runtime.Profile)
+	fingerprint.RuntimeCatalogRev = runtime.CatalogDigest
+	fingerprint.RuntimeTargetProvider = string(runtime.TargetProvider)
+	fingerprint.RuntimeTargetModel = runtime.TargetModel
+	fingerprint.RuntimeEffort = string(runtime.Effort)
+	return fingerprint
 }
 
 func fingerprintWith(definition loop.BoundDefinition, fields ConfigFingerprintFields) event.ConfigFingerprint {
@@ -118,6 +132,11 @@ func frozenFingerprint(fields ConfigFingerprintFields, definitions []loop.Defini
 		PermissionPosture:         fields.Posture,
 		NativePermissionPolicyRev: fields.NativePermissionPolicyRev,
 		ExternalCapabilityRev:     fields.ExternalCapabilityRev,
+		RuntimeProfile:            fields.RuntimeProfile,
+		RuntimeCatalogRev:         fields.RuntimeCatalogRev,
+		RuntimeTargetProvider:     fields.RuntimeTargetProvider,
+		RuntimeTargetModel:        fields.RuntimeTargetModel,
+		RuntimeEffort:             fields.RuntimeEffort,
 	}
 }
 
@@ -196,6 +215,11 @@ func frozenManifest(fields ConfigFingerprintFields, definitions []loop.Definitio
 		ConfinementRev:            fields.ConfinementRev,
 		ConfinementStrictness:     fields.ConfinementStrictness,
 		ExternalCapabilityRev:     fields.ExternalCapabilityRev,
+		RuntimeProfile:            fields.RuntimeProfile,
+		RuntimeCatalogRev:         fields.RuntimeCatalogRev,
+		RuntimeTargetProvider:     fields.RuntimeTargetProvider,
+		RuntimeTargetModel:        fields.RuntimeTargetModel,
+		RuntimeEffort:             fields.RuntimeEffort,
 		// HookPolicyRev is assigned by Define from the compiled hook set. It is
 		// intentionally absent from ConfigFingerprintFields and the legacy
 		// ConfigFingerprint compatibility projection.

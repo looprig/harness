@@ -30,6 +30,7 @@ const (
 	DriftAdapter       DriftCategory = "adapter"
 	DriftRuntimeSkills DriftCategory = "runtime_skills"
 	DriftHookPolicy    DriftCategory = "hook_policy"
+	DriftRuntime       DriftCategory = "runtime"
 	DriftApp           DriftCategory = "app"
 )
 
@@ -87,6 +88,7 @@ func AssessDrift(baseline, candidate ConfigManifest) DriftAssessment {
 	if baseline.ExternalCapabilityRev != candidate.ExternalCapabilityRev {
 		add(DriftExternal, "", baseline.ExternalCapabilityRev, candidate.ExternalCapabilityRev, DriftInfo)
 	}
+	assessRuntime(baseline, candidate, add)
 	assessTools(baseline, candidate, add)
 	assessDirectional(DriftConfinement,
 		baseline.ConfinementRev, candidate.ConfinementRev,
@@ -158,6 +160,24 @@ func AssessDrift(baseline, candidate ConfigManifest) DriftAssessment {
 		return a.New < b.New
 	})
 	return assessment
+}
+
+func assessRuntime(baseline, candidate ConfigManifest, add func(DriftCategory, string, string, string, DriftSeverity)) {
+	if baseline.RuntimeProfile != candidate.RuntimeProfile {
+		add(DriftRuntime, "profile", baseline.RuntimeProfile, candidate.RuntimeProfile, DriftWarn)
+	}
+	if baseline.RuntimeCatalogRev != candidate.RuntimeCatalogRev {
+		add(DriftRuntime, "catalog_rev", baseline.RuntimeCatalogRev, candidate.RuntimeCatalogRev, DriftWarn)
+	}
+	if baseline.RuntimeTargetProvider != candidate.RuntimeTargetProvider {
+		add(DriftRuntime, "target_provider", baseline.RuntimeTargetProvider, candidate.RuntimeTargetProvider, DriftWarn)
+	}
+	if baseline.RuntimeTargetModel != candidate.RuntimeTargetModel {
+		add(DriftRuntime, "target_model", baseline.RuntimeTargetModel, candidate.RuntimeTargetModel, DriftWarn)
+	}
+	if baseline.RuntimeEffort != candidate.RuntimeEffort {
+		add(DriftRuntime, "effort", baseline.RuntimeEffort, candidate.RuntimeEffort, DriftWarn)
+	}
 }
 
 func assessTools(baseline, candidate ConfigManifest, add func(DriftCategory, string, string, string, DriftSeverity)) {

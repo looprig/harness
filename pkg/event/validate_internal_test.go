@@ -174,6 +174,26 @@ func TestSessionStartedRejectsInvalidManifestSchemaState(t *testing.T) {
 	}
 }
 
+func TestManifestSchemaV2RejectsRuntimeFieldsAndV3AcceptsThem(t *testing.T) {
+	t.Parallel()
+	legacy := ConfigManifest{
+		SchemaVersion:         2,
+		RuntimeProfile:        "acp-codex",
+		RuntimeCatalogRev:     "catalog-v1",
+		RuntimeTargetProvider: "openai",
+		RuntimeTargetModel:    "gpt-5.6-luna",
+		RuntimeEffort:         "high",
+	}
+	if validConfigManifestSchema(legacy, false) {
+		t.Fatal("schema v2 with runtime fields accepted, but v2 canonical encoding cannot authenticate them")
+	}
+	current := legacy
+	current.SchemaVersion = ManifestSchemaVersion
+	if !validConfigManifestSchema(current, false) {
+		t.Fatal("current manifest with runtime fields rejected")
+	}
+}
+
 // TestConfigurationAdoptedOverLongActorRejected asserts a decoded adoption whose
 // Actor exceeds MaxConfigActorLen is rejected with FieldActor/RuleInvalid. A live
 // decider can't trip this (the restore constructor truncates), but a hand-crafted

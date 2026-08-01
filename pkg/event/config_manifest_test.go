@@ -59,6 +59,18 @@ func TestManifestFingerprint(t *testing.T) {
 		{name: "hook policy change alters fingerprint", mutate: func(m *ConfigManifest) {
 			m.HookPolicyRev = "other"
 		}, same: false},
+		{name: "runtime profile change alters fingerprint", mutate: func(m *ConfigManifest) {
+			m.RuntimeProfile = "acp/claude"
+		}, same: false},
+		{name: "runtime catalog change alters fingerprint", mutate: func(m *ConfigManifest) {
+			m.RuntimeCatalogRev = "catalog-v2"
+		}, same: false},
+		{name: "runtime target change alters fingerprint", mutate: func(m *ConfigManifest) {
+			m.RuntimeTargetModel = "claude-opus"
+		}, same: false},
+		{name: "runtime effort change alters fingerprint", mutate: func(m *ConfigManifest) {
+			m.RuntimeEffort = "max"
+		}, same: false},
 		{name: "schema version change alters fingerprint", mutate: func(m *ConfigManifest) {
 			m.SchemaVersion = ManifestSchemaVersion + 1
 		}, same: false},
@@ -76,13 +88,28 @@ func TestManifestFingerprint(t *testing.T) {
 	}
 }
 
+func TestManifestV2FingerprintRemainsHistorical(t *testing.T) {
+	t.Parallel()
+	manifest := testManifest()
+	manifest.SchemaVersion = 2
+	manifest.RuntimeProfile = "must-not-enter-v2"
+	manifest.RuntimeCatalogRev = "must-not-enter-v2"
+	manifest.RuntimeTargetProvider = "must-not-enter-v2"
+	manifest.RuntimeTargetModel = "must-not-enter-v2"
+	manifest.RuntimeEffort = "must-not-enter-v2"
+	const historical = "21812bba801a58b50aa752f09466b35ea4f8ebd7520c825a49efd79110403c4d"
+	if got := manifest.Fingerprint(); got != historical {
+		t.Fatalf("schema-v2 fingerprint = %s, want historical %s", got, historical)
+	}
+}
+
 func TestManifestHookSchemaContract(t *testing.T) {
 	t.Parallel()
-	if ManifestSchemaVersion != 2 {
-		t.Errorf("ManifestSchemaVersion = %d, want 2", ManifestSchemaVersion)
+	if ManifestSchemaVersion != 3 {
+		t.Errorf("ManifestSchemaVersion = %d, want 3", ManifestSchemaVersion)
 	}
-	if manifestEncodingDomain != "looprig/config-manifest/v2" {
-		t.Errorf("manifestEncodingDomain = %q, want v2 domain", manifestEncodingDomain)
+	if manifestEncodingDomain != "looprig/config-manifest/v3" {
+		t.Errorf("manifestEncodingDomain = %q, want v3 domain", manifestEncodingDomain)
 	}
 }
 
@@ -99,7 +126,7 @@ func TestManifestFingerprintGolden(t *testing.T) {
 	// PermissionReviewPolicyRev and HookPolicyRev together (see
 	// ManifestSchemaVersion's doc comment) — neither field's original
 	// standalone golden value is correct once both are present.
-	const golden = "21812bba801a58b50aa752f09466b35ea4f8ebd7520c825a49efd79110403c4d"
+	const golden = "e254ab9e6baa98101fadb7cd332bcb2a931f172729c1ca99621a724ee587604f"
 	if golden != "" && got != golden {
 		t.Errorf("canonical encoding drifted: fingerprint = %s, want %s", got, golden)
 	}

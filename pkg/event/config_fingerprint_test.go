@@ -11,14 +11,19 @@ import (
 // identical-baseline in the Equal table.
 func fullFingerprint() event.ConfigFingerprint {
 	return event.ConfigFingerprint{
-		AgentKind:         "primary",
-		ModelID:           "claude-test",
-		SystemPromptRev:   "abc123",
-		ToolPolicyRev:     "def456",
-		RuntimeSkills:     true,
-		WorkspaceRoot:     "/home/user/repo",
-		AgentAdapter:      "claude",
-		PermissionPosture: "default",
+		AgentKind:             "primary",
+		ModelID:               "claude-test",
+		SystemPromptRev:       "abc123",
+		ToolPolicyRev:         "def456",
+		RuntimeSkills:         true,
+		WorkspaceRoot:         "/home/user/repo",
+		AgentAdapter:          "claude",
+		PermissionPosture:     "default",
+		RuntimeProfile:        "acp/codex",
+		RuntimeCatalogRev:     "catalog-v1",
+		RuntimeTargetProvider: "openai",
+		RuntimeTargetModel:    "gpt-5.6-luna",
+		RuntimeEffort:         "high",
 		// A digest over the application's external capabilities (an MCP
 		// configuration), as mcpharness.Manager.ConfigDigest produces.
 		ExternalCapabilityRev: "aa08cfe9f431598f187f5bec202f211f",
@@ -51,6 +56,16 @@ func TestConfigFingerprintEqual(t *testing.T) {
 	diffPosture.PermissionPosture = "acceptEdits"
 	diffExternal := base
 	diffExternal.ExternalCapabilityRev = "other-mcp-digest"
+	diffRuntimeProfile := base
+	diffRuntimeProfile.RuntimeProfile = "acp/claude"
+	diffRuntimeCatalog := base
+	diffRuntimeCatalog.RuntimeCatalogRev = "catalog-v2"
+	diffRuntimeProvider := base
+	diffRuntimeProvider.RuntimeTargetProvider = "anthropic"
+	diffRuntimeModel := base
+	diffRuntimeModel.RuntimeTargetModel = "claude-opus"
+	diffRuntimeEffort := base
+	diffRuntimeEffort.RuntimeEffort = "max"
 
 	tests := []struct {
 		name string
@@ -68,6 +83,11 @@ func TestConfigFingerprintEqual(t *testing.T) {
 		{"AgentAdapter differs", base, diffAdapter, false},
 		{"PermissionPosture differs", base, diffPosture, false},
 		{"ExternalCapabilityRev differs", base, diffExternal, false},
+		{"RuntimeProfile differs", base, diffRuntimeProfile, false},
+		{"RuntimeCatalogRev differs", base, diffRuntimeCatalog, false},
+		{"RuntimeTargetProvider differs", base, diffRuntimeProvider, false},
+		{"RuntimeTargetModel differs", base, diffRuntimeModel, false},
+		{"RuntimeEffort differs", base, diffRuntimeEffort, false},
 		{"zero vs full differs", event.ConfigFingerprint{}, base, false},
 	}
 	for _, tt := range tests {
@@ -207,6 +227,7 @@ func TestConfigFingerprintJSONRoundTrip(t *testing.T) {
 		{"agent adapter only", event.ConfigFingerprint{AgentAdapter: "claude"}},
 		{"permission posture only", event.ConfigFingerprint{PermissionPosture: "default"}},
 		{"external capability only", event.ConfigFingerprint{ExternalCapabilityRev: "d1ge57"}},
+		{"runtime identity only", event.ConfigFingerprint{RuntimeProfile: "acp/codex", RuntimeCatalogRev: "catalog-v1", RuntimeTargetProvider: "openai", RuntimeTargetModel: "gpt-5.6-luna", RuntimeEffort: "high"}},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -270,6 +291,22 @@ func TestConfigFingerprintOldRecordCompat(t *testing.T) {
 	}
 	if !fromOld.Equal(today) {
 		t.Errorf("old record %+v not Equal to today's empty-new-fields fingerprint %+v", fromOld, today)
+	}
+}
+
+func TestConfigFingerprintOldJSONWithoutRuntimeEqualsZeroRuntime(t *testing.T) {
+	t.Parallel()
+
+	oldJSON := `{"agent_kind":"primary","model_id":"claude-test","system_prompt_rev":"abc123","tool_policy_rev":"def456"}`
+	var fromOld event.ConfigFingerprint
+	if err := json.Unmarshal([]byte(oldJSON), &fromOld); err != nil {
+		t.Fatalf("json.Unmarshal(old record): %v", err)
+	}
+	today := event.ConfigFingerprint{
+		AgentKind: "primary", ModelID: "claude-test", SystemPromptRev: "abc123", ToolPolicyRev: "def456",
+	}
+	if !fromOld.Equal(today) {
+		t.Fatalf("old JSON without runtime fields = %+v, want zero-runtime %+v", fromOld, today)
 	}
 }
 
