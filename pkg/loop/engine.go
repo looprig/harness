@@ -7,4 +7,5 @@ const (
 	EngineNative Engine = iota
 	EngineForeignClaude
 	EngineForeignCodex
+	EngineAdapter
 )

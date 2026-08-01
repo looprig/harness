@@ -125,7 +125,7 @@ func Define(opts ...Option) (Definition, error) {
 	if _, configured := resolved.seen["access_gate"]; configured && nilLike(resolved.accessGate) {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidAccessGate, Field: "access_gate"}
 	}
-	if resolved.engine != EngineNative && resolved.engine != EngineForeignClaude && resolved.engine != EngineForeignCodex {
+	if resolved.engine != EngineNative && resolved.engine != EngineForeignClaude && resolved.engine != EngineForeignCodex && resolved.engine != EngineAdapter {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidEngine, Field: "engine"}
 	}
 	if _, configured := resolved.seen["runtime_context"]; configured && nilLike(resolved.runtimeContext) {
@@ -613,6 +613,9 @@ type BoundDefinition interface {
 	DisplayName() string
 	Description() string
 	Engine() Engine
+	RuntimeProfile() RuntimeProfileName
+	RuntimeCatalogDigest() string
+	RuntimeIdentity() RuntimeIdentity
 	Client() inference.Client
 	Model() model.Model
 	Effort() model.Effort
@@ -646,16 +649,23 @@ type BoundDefinition interface {
 // binding without an explicit override always inherits its own definition's
 // gate, never another loop's.
 type boundDefinitionState struct {
-	definition     *definitionState
-	modes          []BoundMode
-	accessOverride AccessGate
+	definition           *definitionState
+	modes                []BoundMode
+	accessOverride       AccessGate
+	runtimeProfile       RuntimeProfileName
+	runtimeCatalogDigest string
 }
 
-func (*boundDefinitionState) boundDefinition()           {}
-func (b *boundDefinitionState) Name() identity.AgentName { return b.definition.name }
-func (b *boundDefinitionState) DisplayName() string      { return b.definition.displayName }
-func (b *boundDefinitionState) Description() string      { return b.definition.description }
-func (b *boundDefinitionState) Engine() Engine           { return b.definition.engine }
+func (*boundDefinitionState) boundDefinition()                     {}
+func (b *boundDefinitionState) Name() identity.AgentName           { return b.definition.name }
+func (b *boundDefinitionState) DisplayName() string                { return b.definition.displayName }
+func (b *boundDefinitionState) Description() string                { return b.definition.description }
+func (b *boundDefinitionState) Engine() Engine                     { return b.definition.engine }
+func (b *boundDefinitionState) RuntimeProfile() RuntimeProfileName { return b.runtimeProfile }
+func (b *boundDefinitionState) RuntimeCatalogDigest() string       { return b.runtimeCatalogDigest }
+func (b *boundDefinitionState) RuntimeIdentity() RuntimeIdentity {
+	return RuntimeIdentity{Profile: b.runtimeProfile, CatalogDigest: b.runtimeCatalogDigest}
+}
 func (b *boundDefinitionState) Client() inference.Client { return b.definition.client }
 func (b *boundDefinitionState) InitialMode() ModeName    { return b.definition.initialMode }
 func (b *boundDefinitionState) Access() AccessGate {

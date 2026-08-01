@@ -74,6 +74,7 @@ const (
 	BindDuplicateToolName       BindErrorKind = "duplicate_tool_name"
 	BindInvalidToolInfo         BindErrorKind = "invalid_tool_info"
 	BindInvalidAccessGate       BindErrorKind = "invalid_access_gate"
+	BindInvalidRuntime          BindErrorKind = "invalid_runtime"
 	BindInvalidSessionID        BindErrorKind = "invalid_session_id"
 	BindInvalidLoopID           BindErrorKind = "invalid_loop_id"
 )

@@ -1,5 +1,48 @@
 package loop
 
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+
+	model "github.com/looprig/inference/model"
+)
+
+// RuntimeIdentity is the secret-free runtime portion of a bound loop's
+// configuration identity. The catalog digest is supplied by the composition
+// root from its immutable RuntimeCatalog snapshot; raw endpoints, credentials,
+// and model descriptors are intentionally absent.
+type RuntimeIdentity struct {
+	Profile       RuntimeProfileName
+	CatalogDigest string
+}
+
+// Digest returns a stable SHA-256 identity for the runtime selection. The zero
+// identity returns empty so native callers retain the additive legacy shape.
+// The composition root's session fingerprint builder is the integration point:
+// it should carry this opaque digest as its runtime-identity revision rather
+// than hashing a model descriptor, endpoint, or credential.
+func (i RuntimeIdentity) Digest() string {
+	if i.Profile == "" && i.CatalogDigest == "" {
+		return ""
+	}
+	projection := struct {
+		Domain        string             `json:"domain"`
+		Profile       RuntimeProfileName `json:"profile,omitempty"`
+		CatalogDigest string             `json:"catalog_digest,omitempty"`
+	}{
+		Domain:        "loop/runtime-identity/v1",
+		Profile:       i.Profile,
+		CatalogDigest: i.CatalogDigest,
+	}
+	encoded, err := json.Marshal(projection)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
 // SelectBoundMode returns a private bound view whose default accessors resolve the
 // selected effective mode. It retains every declared mode for later trusted changes.
 func SelectBoundMode(bound BoundDefinition, mode ModeName) (BoundDefinition, error) {
@@ -39,5 +82,69 @@ func OverrideBoundAccess(bound BoundDefinition, access AccessGate) (BoundDefinit
 	}
 	clone := *state
 	clone.accessOverride = access
+	return &clone, nil
+}
+
+// OverrideBoundRuntime returns a private bound view whose engine, runtime
+// profile, model, and effort are replaced by an already-validated runtime
+// selection. The caller MUST have resolved the selection through its
+// parent-scoped RuntimeCatalog; this function does not re-consult policy.
+// Every bound mode receives the same model and effort so a later mode
+// selection cannot silently un-pin the selected runtime tuple.
+func OverrideBoundRuntime(bound BoundDefinition, profile RuntimeProfileName, target model.Model, effort model.Effort) (BoundDefinition, error) {
+	state, ok := bound.(*boundDefinitionState)
+	if !ok || state == nil {
+		return nil, &BindError{Kind: BindInvalidDefinition, Index: -1}
+	}
+	if validateCatalogIdentifier(string(profile), false) != nil {
+		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1}
+	}
+	if zeroModel(target) {
+		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1}
+	}
+	if err := target.Validate(); err != nil {
+		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1, Cause: err}
+	}
+	if err := target.Key().Validate(); err != nil {
+		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1, Cause: err}
+	}
+	if !target.Sampling.Effort.Valid() || !effort.Valid() || effort == model.EffortNone {
+		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1}
+	}
+
+	clone := *state
+	definition := *state.definition
+	definition.engine = EngineAdapter
+	definition.model = cloneModel(target)
+	clone.definition = &definition
+	clone.runtimeProfile = profile
+	clone.modes = make([]BoundMode, len(state.modes))
+	for index, mode := range state.modes {
+		pinned := cloneBoundMode(mode)
+		pinned.Model = cloneModel(target)
+		pinned.Model.Sampling.Effort = effort
+		pinned.Effort = effort
+		clone.modes[index] = pinned
+	}
+	return &clone, nil
+}
+
+// OverrideBoundRuntimeCatalog records the immutable catalog snapshot used to
+// authorize a bound runtime. It changes only the runtime identity and leaves
+// the selected runtime tuple and all loop behavior untouched.
+func OverrideBoundRuntimeCatalog(bound BoundDefinition, catalog RuntimeCatalog) (BoundDefinition, error) {
+	state, ok := bound.(*boundDefinitionState)
+	if !ok || state == nil {
+		return nil, &BindError{Kind: BindInvalidDefinition, Index: -1}
+	}
+	digest := catalog.Digest()
+	if len(digest) != sha256.Size*2 {
+		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1}
+	}
+	if _, err := hex.DecodeString(digest); err != nil {
+		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1}
+	}
+	clone := *state
+	clone.runtimeCatalogDigest = digest
 	return &clone, nil
 }
