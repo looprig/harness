@@ -34,6 +34,8 @@ import (
 // without a prompt; there is no path or command boundary to classify.
 const subagentToolName = "Subagent"
 
+const maxSubagentResultBytes = 256 << 10
+
 // SubagentAction is the model-facing delegation verb carried by the envelope.
 type SubagentAction string
 
@@ -191,7 +193,7 @@ func formatResult(req tool.DelegateRequest, result tool.DelegateResult) string {
 func formatWaited(result tool.DelegateResult) string {
 	switch result.Status {
 	case tool.DelegateStatusCompleted:
-		return result.Output
+		return boundSubagentOutput(result.Output)
 	case tool.DelegateStatusFailed:
 		return "error: delegate failed"
 	case tool.DelegateStatusInterrupted:
@@ -201,6 +203,13 @@ func formatWaited(result tool.DelegateResult) string {
 	default:
 		return "error: delegate returned invalid status"
 	}
+}
+
+func boundSubagentOutput(value string) string {
+	if len(value) <= maxSubagentResultBytes {
+		return value
+	}
+	return value[:maxSubagentResultBytes]
 }
 
 func formatQueued(result tool.DelegateResult, runtime *tool.DelegateRuntime) string {
@@ -229,7 +238,7 @@ func formatStatus(result tool.DelegateResult) string {
 		for i, child := range result.Children {
 			children[i] = statusChildResult{DelegateID: child.DelegateID.String(), Status: statusLabel(child.Status), PendingRequests: child.PendingRequests}
 		}
-		return marshalResult(statusListResult{Children: children})
+		return marshalResult(statusListResult{Children: children, Truncated: result.ChildrenTruncated})
 	}
 	return marshalResult(statusResult{DelegateID: result.DelegateID.String(), Status: statusLabel(result.Status), PendingRequests: result.PendingRequests})
 }
@@ -265,7 +274,8 @@ type statusChildResult struct {
 }
 
 type statusListResult struct {
-	Children []statusChildResult `json:"children"`
+	Children  []statusChildResult `json:"children"`
+	Truncated bool                `json:"truncated,omitempty"`
 }
 
 func marshalResult(value any) string {

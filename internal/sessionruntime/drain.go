@@ -9,6 +9,8 @@ import (
 	"github.com/looprig/harness/pkg/event"
 )
 
+const maxDelegateOutputBytes = 256 << 10
+
 // drainFailedError wraps a TurnFailed.Err terminal: the sub-loop's turn ended on
 // a non-cancellation provider/LLM error. Cause is the typed cause the loop
 // carried; callers errors.As to this type and errors.Is/As through Unwrap to the
@@ -226,6 +228,14 @@ func aiText(m *content.AIMessage) string {
 	var b strings.Builder
 	for _, blk := range m.Blocks {
 		if tb, ok := blk.(*content.TextBlock); ok {
+			remaining := maxDelegateOutputBytes - b.Len()
+			if remaining <= 0 {
+				break
+			}
+			if len(tb.Text) > remaining {
+				b.WriteString(tb.Text[:remaining])
+				break
+			}
 			b.WriteString(tb.Text)
 		}
 	}

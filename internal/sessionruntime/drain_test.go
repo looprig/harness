@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -80,6 +81,13 @@ func aiMessage(text string) *content.AIMessage {
 		Role:   content.RoleAssistant,
 		Blocks: []content.Block{&content.TextBlock{Text: text}},
 	}}
+}
+
+func TestAITextBoundsDelegatedOutput(t *testing.T) {
+	got := aiText(aiMessage(strings.Repeat("x", maxDelegateOutputBytes+1)))
+	if len(got) != maxDelegateOutputBytes {
+		t.Fatalf("aiText length = %d, want %d", len(got), maxDelegateOutputBytes)
+	}
 }
 
 func turnDone(turn uuid.UUID, msg *content.AIMessage) event.TurnDone {

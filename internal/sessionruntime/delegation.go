@@ -430,6 +430,8 @@ type scopedController struct {
 	hasRuntimeCatalog bool
 }
 
+const maxDelegateStatusChildren = 256
+
 var _ tool.DelegateController = (*scopedController)(nil)
 
 // Execute enforces the action set for the parent's delegation style, then dispatches.
@@ -491,6 +493,9 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 		if !c.hasRuntimeCatalog {
 			return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeUnavailable}
 		}
+		if !validControllerRuntimeSelection(c.runtimeCatalog, agent, *req.Runtime) {
+			return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeInvalid}
+		}
 		resolved, err := c.runtimeCatalog.ResolveWithExplicitEffort(
 			agent,
 			loop.AgentHarnessName(req.Runtime.Harness),
@@ -520,6 +525,85 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 		return tool.DelegateResult{}, err
 	}
 	return c.resolveOrQueue(ctx, s, childID, requestID, sub, req)
+}
+
+// validControllerRuntimeSelection re-applies the model-facing capability rules
+// at the controller boundary. Preparation normally supplies the Explicit bits,
+// but a caller can bypass schema/preparation and invoke the typed controller
+// directly, so omitted selectors must still equal catalog defaults and explicit
+// selectors must correspond to an actually selectable branch.
+func validControllerRuntimeSelection(catalog loop.RuntimeCatalog, agent identity.AgentName, runtime tool.DelegateRuntime) bool {
+	entries := catalog.EntriesFor(agent)
+	var selected *loop.RuntimeCatalogEntry
+	for i := range entries {
+		if entries[i].AgentHarness == loop.AgentHarnessName(runtime.Harness) {
+			selected = &entries[i]
+			break
+		}
+	}
+	if selected == nil {
+		return false
+	}
+	harnessSelectable := len(entries) > 1 || anyNonDefaultRuntimeHarness(entries)
+	if runtime.Explicit.Harness {
+		if !harnessSelectable {
+			return false
+		}
+	} else if !selected.Default {
+		return false
+	}
+	if runtime.Explicit.Model {
+		if len(selected.Models) <= 1 {
+			return false
+		}
+	} else if runtime.Model != string(selected.DefaultModel) {
+		return false
+	}
+	var selectedModel *loop.RuntimeModelOption
+	for i := range selected.Models {
+		if selected.Models[i].Alias == loop.ModelAlias(runtime.Model) {
+			selectedModel = &selected.Models[i]
+			break
+		}
+	}
+	if selectedModel == nil {
+		return false
+	}
+	if runtime.Explicit.Effort {
+		if len(runtimeEfforts(selected.Models)) <= 1 {
+			return false
+		}
+	} else if runtime.Effort != runtimeEffortString(selectedModel.DefaultEffort) {
+		return false
+	}
+	return true
+}
+
+func anyNonDefaultRuntimeHarness(entries []loop.RuntimeCatalogEntry) bool {
+	for _, entry := range entries {
+		if !entry.Default {
+			return true
+		}
+	}
+	return false
+}
+
+func runtimeEfforts(models []loop.RuntimeModelOption) []inferencemodel.Effort {
+	seen := make(map[inferencemodel.Effort]struct{})
+	for _, option := range models {
+		efforts := option.Efforts
+		if len(efforts) == 0 {
+			efforts = []inferencemodel.Effort{option.DefaultEffort}
+		}
+		for _, effort := range efforts {
+			seen[effort] = struct{}{}
+		}
+	}
+	result := make([]inferencemodel.Effort, 0, len(seen))
+	for effort := range seen {
+		result = append(result, effort)
+	}
+	return result
 }
 
 // send enqueues a distinct NON-FOLDING follow-up turn on an owned child and waits or
@@ -622,15 +706,20 @@ func (c *scopedController) status(s *Session, req tool.DelegateRequest) (tool.De
 			PendingRequests: c.manager.pendingCount(req.DelegateID),
 		}, nil
 	}
-	children := make([]tool.DelegateChildStatus, 0)
-	for _, id := range c.ownedChildren(s) {
+	owned := c.ownedChildren(s)
+	truncated := len(owned) > maxDelegateStatusChildren
+	if truncated {
+		owned = owned[:maxDelegateStatusChildren]
+	}
+	children := make([]tool.DelegateChildStatus, 0, len(owned))
+	for _, id := range owned {
 		children = append(children, tool.DelegateChildStatus{
 			DelegateID:      id,
 			Status:          c.childStatus(s, id),
 			PendingRequests: c.manager.pendingCount(id),
 		})
 	}
-	return tool.DelegateResult{Children: children}, nil
+	return tool.DelegateResult{Children: children, ChildrenTruncated: truncated}, nil
 }
 
 // resolveOrQueue waits for the correlated turn (wait:true) or registers a pending

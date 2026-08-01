@@ -172,12 +172,13 @@ type DelegateChildStatus struct {
 // unresolved requests for a single addressed child, and Children is the per-child
 // status list for a DelegateStatus that omitted DelegateID.
 type DelegateResult struct {
-	DelegateID      uuid.UUID
-	RequestID       uuid.UUID
-	Status          DelegateStatusValue
-	Output          string
-	PendingRequests int
-	Children        []DelegateChildStatus
+	DelegateID        uuid.UUID
+	RequestID         uuid.UUID
+	Status            DelegateStatusValue
+	Output            string
+	PendingRequests   int
+	Children          []DelegateChildStatus
+	ChildrenTruncated bool
 }
 
 // DelegateController is the only delegation capability exposed to a built tool.
