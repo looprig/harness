@@ -12,16 +12,40 @@ import (
 func TestEngineAdapterIsAValidClosedEngine(t *testing.T) {
 	t.Parallel()
 
-	definition := mustDefinition(t, WithEngine(EngineAdapter))
+	definition := mustDefinition(t)
 	bound, err := definition.Bind(context.Background(), validToolBindings(t))
 	if err != nil {
 		t.Fatalf("Bind() error = %v", err)
 	}
+	bound, err = OverrideBoundRuntime(bound, "adapter-profile", testModel(), model.EffortHigh)
+	if err != nil {
+		t.Fatalf("OverrideBoundRuntime() error = %v", err)
+	}
 	if got := bound.Engine(); got != EngineAdapter {
 		t.Fatalf("Engine() = %v, want EngineAdapter", got)
 	}
-	if got := bound.RuntimeProfile(); got != "" {
-		t.Fatalf("RuntimeProfile() = %q, want empty native/default profile", got)
+	if got := bound.RuntimeProfile(); got != "adapter-profile" {
+		t.Fatalf("RuntimeProfile() = %q, want adapter-profile", got)
+	}
+}
+
+func TestOverrideBoundRuntimeAcceptsEffortNone(t *testing.T) {
+	t.Parallel()
+
+	definition := mustDefinition(t)
+	bound, err := definition.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind() error = %v", err)
+	}
+	overridden, err := OverrideBoundRuntime(bound, "adapter-profile", testModel(), model.EffortNone)
+	if err != nil {
+		t.Fatalf("OverrideBoundRuntime() error = %v, want nil", err)
+	}
+	if got := overridden.Effort(); got != model.EffortNone {
+		t.Fatalf("Effort() = %q, want none", got)
+	}
+	if got := overridden.Model().Sampling.Effort; got != model.EffortNone {
+		t.Fatalf("Model().Sampling.Effort = %q, want none", got)
 	}
 }
 
@@ -111,7 +135,6 @@ func TestOverrideBoundRuntimeRejectsInvalidInputs(t *testing.T) {
 		{name: "invalid profile", bound: bound, profile: "profile with spaces", target: testModel(), effort: model.EffortHigh},
 		{name: "zero target", bound: bound, profile: "profile", target: model.Model{}, effort: model.EffortHigh},
 		{name: "invalid target", bound: bound, profile: "profile", target: invalidTarget, effort: model.EffortHigh},
-		{name: "zero effort", bound: bound, profile: "profile", target: testModel(), effort: model.EffortNone},
 		{name: "invalid effort", bound: bound, profile: "profile", target: testModel(), effort: model.Effort("invalid")},
 	}
 	for _, tt := range tests {
@@ -170,6 +193,28 @@ func TestBoundRuntimeIdentityDigestIncludesProfileAndCatalog(t *testing.T) {
 	baseDigest := routed.RuntimeIdentity().Digest()
 	if baseDigest == "" {
 		t.Fatal("RuntimeIdentity().Digest() = empty, want digest")
+	}
+	identity := routed.RuntimeIdentity()
+	if identity.TargetProvider != testModel().Provider || identity.TargetModel != testModel().Name || identity.Effort != model.EffortHigh {
+		t.Fatalf("RuntimeIdentity() = %+v, want selected provider/model/effort", identity)
+	}
+
+	modelChangedTarget := testModel()
+	modelChangedTarget.Name = "different-runtime-model"
+	modelChanged, err := OverrideBoundRuntime(bound, "profile-a", modelChangedTarget, model.EffortHigh)
+	if err != nil {
+		t.Fatalf("OverrideBoundRuntime(model changed) error = %v", err)
+	}
+	if got := modelChanged.RuntimeIdentity().Digest(); got == baseDigest {
+		t.Fatal("runtime model change did not change identity digest")
+	}
+
+	effortChanged, err := OverrideBoundRuntime(bound, "profile-a", testModel(), model.EffortMax)
+	if err != nil {
+		t.Fatalf("OverrideBoundRuntime(effort changed) error = %v", err)
+	}
+	if got := effortChanged.RuntimeIdentity().Digest(); got == baseDigest {
+		t.Fatal("runtime effort change did not change identity digest")
 	}
 
 	profileChanged, err := OverrideBoundRuntime(bound, "profile-b", testModel(), model.EffortHigh)

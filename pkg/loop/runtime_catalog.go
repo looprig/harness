@@ -35,14 +35,15 @@ type RuntimeModelOption struct {
 
 // RuntimeCatalogEntry describes one role/harness runtime combination.
 type RuntimeCatalogEntry struct {
-	SubagentType identity.AgentName
-	AgentHarness AgentHarnessName
-	Profile      RuntimeProfileName
-	Credential   CredentialMode
-	Default      bool
-	DefaultModel ModelAlias
-	SmallModel   ModelAlias
-	Models       []RuntimeModelOption
+	SubagentType    identity.AgentName
+	AgentHarness    AgentHarnessName
+	Profile         RuntimeProfileName
+	Credential      CredentialMode
+	Default         bool
+	DefaultModel    ModelAlias
+	SmallModel      ModelAlias
+	NeedsSmallModel bool
+	Models          []RuntimeModelOption
 }
 
 // Resolved is the immutable runtime tuple selected from a RuntimeCatalog.
@@ -297,6 +298,9 @@ func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
 
 	aliases := make(map[ModelAlias]struct{}, len(entry.Models))
 	defaultModelFound := false
+	if entry.NeedsSmallModel && entry.SmallModel == "" {
+		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSmallModel, Field: "SmallModel"}
+	}
 	smallModelFound := entry.SmallModel == ""
 	for i := range entry.Models {
 		option := &entry.Models[i]
@@ -347,7 +351,7 @@ func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
 	if !defaultModelFound {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidDefaultModel, Field: "DefaultModel"}
 	}
-	if !smallModelFound {
+	if entry.NeedsSmallModel && !smallModelFound {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSmallModel, Field: "SmallModel"}
 	}
 	return nil
@@ -435,52 +439,64 @@ type runtimeCatalogDigest struct {
 }
 
 type runtimeCatalogEntryDigest struct {
-	SubagentType string                     `json:"subagent_type"`
-	AgentHarness string                     `json:"agent_harness"`
-	Profile      string                     `json:"profile"`
-	Credential   CredentialMode             `json:"credential"`
-	Default      bool                       `json:"default"`
-	DefaultModel string                     `json:"default_model"`
-	SmallModel   string                     `json:"small_model,omitempty"`
-	Models       []runtimeModelOptionDigest `json:"models"`
+	SubagentType    string                     `json:"subagent_type"`
+	AgentHarness    string                     `json:"agent_harness"`
+	Profile         string                     `json:"profile"`
+	Credential      CredentialMode             `json:"credential"`
+	Default         bool                       `json:"default"`
+	DefaultModel    string                     `json:"default_model"`
+	SmallModel      string                     `json:"small_model,omitempty"`
+	NeedsSmallModel bool                       `json:"needs_small_model,omitempty"`
+	Models          []runtimeModelOptionDigest `json:"models"`
 }
 
 type runtimeModelOptionDigest struct {
-	Alias         string              `json:"alias"`
-	Provider      string              `json:"provider"`
-	APIFormat     string              `json:"api_format"`
-	Name          string              `json:"name"`
-	Origin        model.Origin        `json:"origin"`
-	Capabilities  model.Capabilities  `json:"capabilities"`
-	Limits        model.ContextLimits `json:"limits"`
-	DefaultEffort string              `json:"default_effort"`
-	Efforts       []string            `json:"efforts"`
+	Alias          string              `json:"alias"`
+	Provider       string              `json:"provider"`
+	APIFormat      string              `json:"api_format"`
+	Name           string              `json:"name"`
+	Origin         model.Origin        `json:"origin"`
+	Capabilities   model.Capabilities  `json:"capabilities"`
+	Limits         model.ContextLimits `json:"limits"`
+	DefaultEffort  string              `json:"default_effort"`
+	Efforts        []string            `json:"efforts"`
+	Temperature    *float64            `json:"temperature,omitempty"`
+	TopP           *float64            `json:"top_p,omitempty"`
+	MaxTokens      *int                `json:"max_tokens,omitempty"`
+	Stop           []string            `json:"stop,omitempty"`
+	SamplingEffort string              `json:"sampling_effort"`
 }
 
 func digestRuntimeCatalog(entries []RuntimeCatalogEntry) string {
 	projection := runtimeCatalogDigest{Entries: make([]runtimeCatalogEntryDigest, len(entries))}
 	for i, entry := range entries {
 		row := runtimeCatalogEntryDigest{
-			SubagentType: string(entry.SubagentType),
-			AgentHarness: string(entry.AgentHarness),
-			Profile:      string(entry.Profile),
-			Credential:   entry.Credential,
-			Default:      entry.Default,
-			DefaultModel: string(entry.DefaultModel),
-			SmallModel:   string(entry.SmallModel),
-			Models:       make([]runtimeModelOptionDigest, len(entry.Models)),
+			SubagentType:    string(entry.SubagentType),
+			AgentHarness:    string(entry.AgentHarness),
+			Profile:         string(entry.Profile),
+			Credential:      entry.Credential,
+			Default:         entry.Default,
+			DefaultModel:    string(entry.DefaultModel),
+			SmallModel:      string(entry.SmallModel),
+			NeedsSmallModel: entry.NeedsSmallModel,
+			Models:          make([]runtimeModelOptionDigest, len(entry.Models)),
 		}
 		for j, option := range entry.Models {
 			row.Models[j] = runtimeModelOptionDigest{
-				Alias:         string(option.Alias),
-				Provider:      string(option.Target.Provider),
-				APIFormat:     string(option.Target.APIFormat),
-				Name:          option.Target.Name,
-				Origin:        option.Target.Origin,
-				Capabilities:  option.Target.Caps,
-				Limits:        option.Target.Limits,
-				DefaultEffort: catalogEffortString(option.DefaultEffort),
-				Efforts:       catalogEffortStrings(option.Efforts),
+				Alias:          string(option.Alias),
+				Provider:       string(option.Target.Provider),
+				APIFormat:      string(option.Target.APIFormat),
+				Name:           option.Target.Name,
+				Origin:         option.Target.Origin,
+				Capabilities:   option.Target.Caps,
+				Limits:         option.Target.Limits,
+				DefaultEffort:  catalogEffortString(option.DefaultEffort),
+				Efforts:        catalogEffortStrings(option.Efforts),
+				Temperature:    option.Target.Sampling.Temperature,
+				TopP:           option.Target.Sampling.TopP,
+				MaxTokens:      option.Target.Sampling.MaxTokens,
+				Stop:           append([]string(nil), option.Target.Sampling.Stop...),
+				SamplingEffort: catalogEffortString(option.Target.Sampling.Effort),
 			}
 		}
 		projection.Entries[i] = row

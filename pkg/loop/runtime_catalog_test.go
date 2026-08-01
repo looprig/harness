@@ -41,7 +41,10 @@ func TestNewRuntimeCatalogInvariants(t *testing.T) {
 			entries[0].Models[0].Efforts = []model.Effort{model.EffortLow, model.EffortLow}
 		}, wantKind: RuntimeCatalogDuplicateEffort},
 		{name: "default effort not advertised", mutate: func(entries []RuntimeCatalogEntry) { entries[0].Models[0].DefaultEffort = model.EffortMedium }, wantKind: RuntimeCatalogInvalidDefaultEffort},
-		{name: "unknown small model", mutate: func(entries []RuntimeCatalogEntry) { entries[0].SmallModel = "missing" }, wantKind: RuntimeCatalogInvalidSmallModel},
+		{name: "unknown required small model", mutate: func(entries []RuntimeCatalogEntry) {
+			entries[0].NeedsSmallModel = true
+			entries[0].SmallModel = "missing"
+		}, wantKind: RuntimeCatalogInvalidSmallModel},
 		{name: "native alias shared across harnesses", mutate: func(entries []RuntimeCatalogEntry) {
 			entries[0].Credential = CredentialNativeAuth
 			entries[1].Credential = CredentialNativeAuth
@@ -236,6 +239,74 @@ func TestRuntimeCatalogDefensiveCopiesAndDigest(t *testing.T) {
 	}
 	if strings.Contains(digest, "secret") || strings.Contains(digest, "https") {
 		t.Fatalf("Digest() contains raw catalog material: %q", digest)
+	}
+
+	mutations := []struct {
+		name   string
+		mutate func(*model.Model)
+	}{
+		{name: "temperature", mutate: func(target *model.Model) { value := 0.25; target.Sampling.Temperature = &value }},
+		{name: "top-p", mutate: func(target *model.Model) { value := 0.75; target.Sampling.TopP = &value }},
+		{name: "max tokens", mutate: func(target *model.Model) { value := 321; target.Sampling.MaxTokens = &value }},
+		{name: "stop", mutate: func(target *model.Model) { target.Sampling.Stop = []string{"<stop>"} }},
+		{name: "effort", mutate: func(target *model.Model) { target.Sampling.Effort = model.EffortHigh }},
+	}
+	for _, mutation := range mutations {
+		entries := testCatalogEntries()
+		mutation.mutate(&entries[0].Models[0].Target)
+		changedCatalog, err := NewRuntimeCatalog(entries)
+		if err != nil {
+			t.Fatalf("NewRuntimeCatalog(%s) error = %v", mutation.name, err)
+		}
+		if changedCatalog.Digest() == digest {
+			t.Errorf("catalog digest did not change for %s mutation", mutation.name)
+		}
+	}
+}
+
+func TestRuntimeCatalogNeedsSmallModel(t *testing.T) {
+	t.Parallel()
+
+	entries := testCatalogEntries()
+	entries[1].NeedsSmallModel = true
+	if _, err := NewRuntimeCatalog(entries); err != nil {
+		t.Fatalf("catalog with required small model rejected: %v", err)
+	}
+
+	entries[1].SmallModel = ""
+	if _, err := NewRuntimeCatalog(entries); err == nil {
+		t.Fatal("catalog with required empty small model accepted")
+	}
+
+	entries = testCatalogEntries()
+	entries[1].NeedsSmallModel = true
+	entries[1].SmallModel = "missing"
+	if _, err := NewRuntimeCatalog(entries); err == nil {
+		t.Fatal("catalog with required unknown small model accepted")
+	}
+
+	entries = testCatalogEntries()
+	entries[1].SmallModel = ""
+	if _, err := NewRuntimeCatalog(entries); err != nil {
+		t.Fatalf("catalog with optional empty small model rejected: %v", err)
+	}
+}
+
+func TestRuntimeCatalogNeedsSmallModelAffectsDigest(t *testing.T) {
+	t.Parallel()
+
+	base, err := NewRuntimeCatalog(testCatalogEntries())
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog(base) error = %v", err)
+	}
+	entries := testCatalogEntries()
+	entries[1].NeedsSmallModel = true
+	changed, err := NewRuntimeCatalog(entries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog(changed) error = %v", err)
+	}
+	if base.Digest() == changed.Digest() {
+		t.Fatal("catalog digest did not change for NeedsSmallModel mutation")
 	}
 }
 

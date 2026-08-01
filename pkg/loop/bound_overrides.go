@@ -11,10 +11,13 @@ import (
 // RuntimeIdentity is the secret-free runtime portion of a bound loop's
 // configuration identity. The catalog digest is supplied by the composition
 // root from its immutable RuntimeCatalog snapshot; raw endpoints, credentials,
-// and model descriptors are intentionally absent.
+// and non-identity model behavior are intentionally absent.
 type RuntimeIdentity struct {
-	Profile       RuntimeProfileName
-	CatalogDigest string
+	Profile        RuntimeProfileName
+	CatalogDigest  string
+	TargetProvider model.ProviderName
+	TargetModel    string
+	Effort         model.Effort
 }
 
 // Digest returns a stable SHA-256 identity for the runtime selection. The zero
@@ -23,17 +26,23 @@ type RuntimeIdentity struct {
 // it should carry this opaque digest as its runtime-identity revision rather
 // than hashing a model descriptor, endpoint, or credential.
 func (i RuntimeIdentity) Digest() string {
-	if i.Profile == "" && i.CatalogDigest == "" {
+	if i.Profile == "" && i.CatalogDigest == "" && i.TargetProvider == "" && i.TargetModel == "" && i.Effort == model.EffortNone {
 		return ""
 	}
 	projection := struct {
-		Domain        string             `json:"domain"`
-		Profile       RuntimeProfileName `json:"profile,omitempty"`
-		CatalogDigest string             `json:"catalog_digest,omitempty"`
+		Domain         string             `json:"domain"`
+		Profile        RuntimeProfileName `json:"profile,omitempty"`
+		CatalogDigest  string             `json:"catalog_digest,omitempty"`
+		TargetProvider model.ProviderName `json:"target_provider,omitempty"`
+		TargetModel    string             `json:"target_model,omitempty"`
+		Effort         model.Effort       `json:"effort"`
 	}{
-		Domain:        "loop/runtime-identity/v1",
-		Profile:       i.Profile,
-		CatalogDigest: i.CatalogDigest,
+		Domain:         "loop/runtime-identity/v1",
+		Profile:        i.Profile,
+		CatalogDigest:  i.CatalogDigest,
+		TargetProvider: i.TargetProvider,
+		TargetModel:    i.TargetModel,
+		Effort:         i.Effort,
 	}
 	encoded, err := json.Marshal(projection)
 	if err != nil {
@@ -108,7 +117,7 @@ func OverrideBoundRuntime(bound BoundDefinition, profile RuntimeProfileName, tar
 	if err := target.Key().Validate(); err != nil {
 		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1, Cause: err}
 	}
-	if !target.Sampling.Effort.Valid() || !effort.Valid() || effort == model.EffortNone {
+	if !target.Sampling.Effort.Valid() || !effort.Valid() {
 		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1}
 	}
 
@@ -118,6 +127,9 @@ func OverrideBoundRuntime(bound BoundDefinition, profile RuntimeProfileName, tar
 	definition.model = cloneModel(target)
 	clone.definition = &definition
 	clone.runtimeProfile = profile
+	clone.runtimeTargetProvider = target.Provider
+	clone.runtimeTargetModel = target.Name
+	clone.runtimeEffort = effort
 	clone.modes = make([]BoundMode, len(state.modes))
 	for index, mode := range state.modes {
 		pinned := cloneBoundMode(mode)

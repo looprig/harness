@@ -99,6 +99,30 @@ func TestBuilderRegistry(t *testing.T) {
 			},
 		},
 		{
+			name:    "nil live builder",
+			profile: "nil-live",
+			register: func(r *foreign.BuilderRegistry) error {
+				return r.Register("nil-live", nil, restored)
+			},
+			wantRegisterError: func(t *testing.T, err error) {
+				if err == nil {
+					t.Fatal("nil live Register() error = nil")
+				}
+			},
+		},
+		{
+			name:    "nil restored builder",
+			profile: "nil-restored",
+			register: func(r *foreign.BuilderRegistry) error {
+				return r.Register("nil-restored", live, nil)
+			},
+			wantRegisterError: func(t *testing.T, err error) {
+				if err == nil {
+					t.Fatal("nil restored Register() error = nil")
+				}
+			},
+		},
+		{
 			name:    "unknown profile",
 			profile: "unknown-secret-profile-token",
 			register: func(r *foreign.BuilderRegistry) error {

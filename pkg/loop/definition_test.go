@@ -37,6 +37,7 @@ func TestDefineValidation(t *testing.T) {
 		{name: "negative drain", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithDrainTimeout(-time.Second)}, kind: DefinitionInvalidDrainTimeout},
 		{name: "nil middleware", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolMiddlewares(nil)}, kind: DefinitionInvalidMiddleware},
 		{name: "invalid engine", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithEngine(Engine(99))}, kind: DefinitionInvalidEngine},
+		{name: "adapter engine requires runtime profile", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithEngine(EngineAdapter)}, kind: DefinitionInvalidEngine},
 		{name: "nil runtime context", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithRuntimeContext(nil)}, kind: DefinitionInvalidRuntimeContext},
 		{name: "typed nil runtime context", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithRuntimeContext((*nilRuntimeContext)(nil))}, kind: DefinitionInvalidRuntimeContext},
 		{name: "empty delegate", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithDelegates("")}, kind: DefinitionInvalidDelegate},

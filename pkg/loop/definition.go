@@ -128,6 +128,9 @@ func Define(opts ...Option) (Definition, error) {
 	if resolved.engine != EngineNative && resolved.engine != EngineForeignClaude && resolved.engine != EngineForeignCodex && resolved.engine != EngineAdapter {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidEngine, Field: "engine"}
 	}
+	if resolved.engine == EngineAdapter {
+		return Definition{}, &DefinitionError{Kind: DefinitionInvalidEngine, Field: "engine"}
+	}
 	if _, configured := resolved.seen["runtime_context"]; configured && nilLike(resolved.runtimeContext) {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidRuntimeContext, Field: "runtime_context"}
 	}
@@ -649,11 +652,14 @@ type BoundDefinition interface {
 // binding without an explicit override always inherits its own definition's
 // gate, never another loop's.
 type boundDefinitionState struct {
-	definition           *definitionState
-	modes                []BoundMode
-	accessOverride       AccessGate
-	runtimeProfile       RuntimeProfileName
-	runtimeCatalogDigest string
+	definition            *definitionState
+	modes                 []BoundMode
+	accessOverride        AccessGate
+	runtimeProfile        RuntimeProfileName
+	runtimeCatalogDigest  string
+	runtimeTargetProvider model.ProviderName
+	runtimeTargetModel    string
+	runtimeEffort         model.Effort
 }
 
 func (*boundDefinitionState) boundDefinition()                     {}
@@ -664,7 +670,13 @@ func (b *boundDefinitionState) Engine() Engine                     { return b.de
 func (b *boundDefinitionState) RuntimeProfile() RuntimeProfileName { return b.runtimeProfile }
 func (b *boundDefinitionState) RuntimeCatalogDigest() string       { return b.runtimeCatalogDigest }
 func (b *boundDefinitionState) RuntimeIdentity() RuntimeIdentity {
-	return RuntimeIdentity{Profile: b.runtimeProfile, CatalogDigest: b.runtimeCatalogDigest}
+	return RuntimeIdentity{
+		Profile:        b.runtimeProfile,
+		CatalogDigest:  b.runtimeCatalogDigest,
+		TargetProvider: b.runtimeTargetProvider,
+		TargetModel:    b.runtimeTargetModel,
+		Effort:         b.runtimeEffort,
+	}
 }
 func (b *boundDefinitionState) Client() inference.Client { return b.definition.client }
 func (b *boundDefinitionState) InitialMode() ModeName    { return b.definition.initialMode }

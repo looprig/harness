@@ -34,6 +34,7 @@ var (
 	errBuilderRegistryNil      = errors.New("foreign: builder registry unavailable")
 	errEmptyBuilderProfile     = errors.New("foreign: builder profile required")
 	errDuplicateBuilderProfile = errors.New("foreign: builder profile already registered")
+	errNilBuilder              = errors.New("foreign: builder callbacks required")
 )
 
 // UnknownProfileError reports a profile that is not registered. Its message is
@@ -69,6 +70,9 @@ func (r *BuilderRegistry) Register(profile loop.RuntimeProfileName, builder Buil
 	}
 	if profile == "" {
 		return errEmptyBuilderProfile
+	}
+	if builder == nil || restored == nil {
+		return errNilBuilder
 	}
 
 	r.mu.Lock()
