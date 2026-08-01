@@ -1,6 +1,7 @@
 package event
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -29,6 +30,9 @@ func testManifest() ConfigManifest {
 		ConfinementStrictness:      2,
 		ExternalCapabilityRev:      "hhhh",
 		HookPolicyRev:              "jjjj",
+		RuntimeProfile:             "acp/codex",
+		RuntimeCatalogRev:          "catalog-v1",
+		RuntimeIdentityRev:         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		AppFields:                  map[string]string{"b": "2", "a": "1"},
 	}
 }
@@ -65,11 +69,8 @@ func TestManifestFingerprint(t *testing.T) {
 		{name: "runtime catalog change alters fingerprint", mutate: func(m *ConfigManifest) {
 			m.RuntimeCatalogRev = "catalog-v2"
 		}, same: false},
-		{name: "runtime target change alters fingerprint", mutate: func(m *ConfigManifest) {
-			m.RuntimeTargetModel = "claude-opus"
-		}, same: false},
-		{name: "runtime effort change alters fingerprint", mutate: func(m *ConfigManifest) {
-			m.RuntimeEffort = "max"
+		{name: "runtime identity change alters fingerprint", mutate: func(m *ConfigManifest) {
+			m.RuntimeIdentityRev = "different-runtime-identity-revision"
 		}, same: false},
 		{name: "schema version change alters fingerprint", mutate: func(m *ConfigManifest) {
 			m.SchemaVersion = ManifestSchemaVersion + 1
@@ -94,9 +95,7 @@ func TestManifestV2FingerprintRemainsHistorical(t *testing.T) {
 	manifest.SchemaVersion = 2
 	manifest.RuntimeProfile = "must-not-enter-v2"
 	manifest.RuntimeCatalogRev = "must-not-enter-v2"
-	manifest.RuntimeTargetProvider = "must-not-enter-v2"
-	manifest.RuntimeTargetModel = "must-not-enter-v2"
-	manifest.RuntimeEffort = "must-not-enter-v2"
+	manifest.RuntimeIdentityRev = "must-not-enter-v2"
 	const historical = "21812bba801a58b50aa752f09466b35ea4f8ebd7520c825a49efd79110403c4d"
 	if got := manifest.Fingerprint(); got != historical {
 		t.Fatalf("schema-v2 fingerprint = %s, want historical %s", got, historical)
@@ -113,6 +112,29 @@ func TestManifestHookSchemaContract(t *testing.T) {
 	}
 }
 
+func TestManifestRuntimeIdentityIsOpaqueJSON(t *testing.T) {
+	t.Parallel()
+	manifest := ConfigManifest{
+		SchemaVersion:      ManifestSchemaVersion,
+		RuntimeProfile:     "acp/codex",
+		RuntimeCatalogRev:  "catalog-v1",
+		RuntimeIdentityRev: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	encoded := string(data)
+	for _, raw := range []string{"openai", "gpt-5.6-luna", "high", "target-alias"} {
+		if strings.Contains(encoded, raw) {
+			t.Fatalf("manifest JSON contains raw descriptor %q: %s", raw, encoded)
+		}
+	}
+	if !strings.Contains(encoded, "runtime_identity_rev") {
+		t.Fatalf("manifest JSON omitted opaque identity revision: %s", encoded)
+	}
+}
+
 // The canonical encoding is a durable contract: this golden vector pins it. If
 // this test ever fails, the encoding changed — that is a manifest schema bump,
 // not a test to update casually.
@@ -126,7 +148,7 @@ func TestManifestFingerprintGolden(t *testing.T) {
 	// PermissionReviewPolicyRev and HookPolicyRev together (see
 	// ManifestSchemaVersion's doc comment) — neither field's original
 	// standalone golden value is correct once both are present.
-	const golden = "e254ab9e6baa98101fadb7cd332bcb2a931f172729c1ca99621a724ee587604f"
+	const golden = "c46358c71c990ea83b64ee23280b32f39d28cbbc39a25febcec1d8f836c9e607"
 	if golden != "" && got != golden {
 		t.Errorf("canonical encoding drifted: fingerprint = %s, want %s", got, golden)
 	}

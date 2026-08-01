@@ -177,12 +177,10 @@ func TestSessionStartedRejectsInvalidManifestSchemaState(t *testing.T) {
 func TestManifestSchemaV2RejectsRuntimeFieldsAndV3AcceptsThem(t *testing.T) {
 	t.Parallel()
 	legacy := ConfigManifest{
-		SchemaVersion:         2,
-		RuntimeProfile:        "acp-codex",
-		RuntimeCatalogRev:     "catalog-v1",
-		RuntimeTargetProvider: "openai",
-		RuntimeTargetModel:    "gpt-5.6-luna",
-		RuntimeEffort:         "high",
+		SchemaVersion:      2,
+		RuntimeProfile:     "acp-codex",
+		RuntimeCatalogRev:  "catalog-v1",
+		RuntimeIdentityRev: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 	}
 	if validConfigManifestSchema(legacy, false) {
 		t.Fatal("schema v2 with runtime fields accepted, but v2 canonical encoding cannot authenticate them")

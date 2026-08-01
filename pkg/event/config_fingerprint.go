@@ -87,12 +87,11 @@ type ConfigFingerprint struct {
 	RuntimeProfile string `json:"runtime_profile,omitzero"`
 	// RuntimeCatalogRev identifies the parent-scoped runtime catalog snapshot.
 	RuntimeCatalogRev string `json:"runtime_catalog_rev,omitzero"`
-	// RuntimeTargetProvider and RuntimeTargetModel identify the selected target
-	// without carrying endpoint or credential material.
-	RuntimeTargetProvider string `json:"runtime_target_provider,omitzero"`
-	RuntimeTargetModel    string `json:"runtime_target_model,omitzero"`
-	// RuntimeEffort is the effective inference effort selected for the target.
-	RuntimeEffort string `json:"runtime_effort,omitzero"`
+	// RuntimeIdentityRev is an opaque hex digest of the selected runtime tuple.
+	// It is produced by loop.BoundDefinition.RuntimeIdentity().Digest() and
+	// covers the model alias, target key, effective effort (including canonical
+	// none), profile, and catalog without persisting raw model descriptors.
+	RuntimeIdentityRev string `json:"runtime_identity_rev,omitzero"`
 }
 
 // Equal reports whether two fingerprints identify the same configuration: true iff
@@ -113,7 +112,5 @@ func (f ConfigFingerprint) Equal(other ConfigFingerprint) bool {
 		f.ExternalCapabilityRev == other.ExternalCapabilityRev &&
 		f.RuntimeProfile == other.RuntimeProfile &&
 		f.RuntimeCatalogRev == other.RuntimeCatalogRev &&
-		f.RuntimeTargetProvider == other.RuntimeTargetProvider &&
-		f.RuntimeTargetModel == other.RuntimeTargetModel &&
-		f.RuntimeEffort == other.RuntimeEffort
+		f.RuntimeIdentityRev == other.RuntimeIdentityRev
 }

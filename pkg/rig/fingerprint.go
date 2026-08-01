@@ -43,10 +43,9 @@ type ConfigFingerprintFields struct {
 	// mcpharness.Manager.ConfigDigest, taken after the Manager has started.
 	ExternalCapabilityRev string
 
-	// The fields below are carried ONLY by the richer event.ConfigManifest; the
-	// legacy event.ConfigFingerprint has no home for them. Each is optional and
-	// zero-safe: a caller that supplies nothing leaves the manifest field empty,
-	// which keeps the manifest additive against a journal that predates it.
+	// Runtime identity fields are secret-free and zero-safe. RuntimeIdentityRev is
+	// the opaque digest from loop.BoundDefinition.RuntimeIdentity().Digest(); raw
+	// target descriptors never enter durable fingerprints or manifests.
 
 	// WorkspaceTrust is an opaque, secret-free label for the workspace's trust
 	// posture (e.g. "trusted"/"untrusted"). Empty means unspecified.
@@ -64,14 +63,10 @@ type ConfigFingerprintFields struct {
 	// AppFields are application-defined, secret-free compatibility fields the
 	// composition root attaches. Canonically encoded in sorted key order by the
 	// manifest. Nil means none.
-	AppFields map[string]string
-	// Runtime identity fields are secret-free projections supplied by the
-	// composition root for the frozen restore path. Empty preserves legacy callers.
-	RuntimeProfile        string
-	RuntimeCatalogRev     string
-	RuntimeTargetProvider string
-	RuntimeTargetModel    string
-	RuntimeEffort         string
+	AppFields          map[string]string
+	RuntimeProfile     string
+	RuntimeCatalogRev  string
+	RuntimeIdentityRev string
 }
 
 // FingerprintFrom derives the stable, secret-free behavior fingerprint of a bound loop.
@@ -84,9 +79,7 @@ func FingerprintFrom(definition loop.BoundDefinition) event.ConfigFingerprint {
 	runtime := definition.RuntimeIdentity()
 	fingerprint.RuntimeProfile = string(runtime.Profile)
 	fingerprint.RuntimeCatalogRev = runtime.CatalogDigest
-	fingerprint.RuntimeTargetProvider = string(runtime.TargetProvider)
-	fingerprint.RuntimeTargetModel = runtime.TargetModel
-	fingerprint.RuntimeEffort = string(runtime.Effort)
+	fingerprint.RuntimeIdentityRev = runtime.Digest()
 	return fingerprint
 }
 
@@ -134,9 +127,7 @@ func frozenFingerprint(fields ConfigFingerprintFields, definitions []loop.Defini
 		ExternalCapabilityRev:     fields.ExternalCapabilityRev,
 		RuntimeProfile:            fields.RuntimeProfile,
 		RuntimeCatalogRev:         fields.RuntimeCatalogRev,
-		RuntimeTargetProvider:     fields.RuntimeTargetProvider,
-		RuntimeTargetModel:        fields.RuntimeTargetModel,
-		RuntimeEffort:             fields.RuntimeEffort,
+		RuntimeIdentityRev:        fields.RuntimeIdentityRev,
 	}
 }
 
@@ -217,9 +208,7 @@ func frozenManifest(fields ConfigFingerprintFields, definitions []loop.Definitio
 		ExternalCapabilityRev:     fields.ExternalCapabilityRev,
 		RuntimeProfile:            fields.RuntimeProfile,
 		RuntimeCatalogRev:         fields.RuntimeCatalogRev,
-		RuntimeTargetProvider:     fields.RuntimeTargetProvider,
-		RuntimeTargetModel:        fields.RuntimeTargetModel,
-		RuntimeEffort:             fields.RuntimeEffort,
+		RuntimeIdentityRev:        fields.RuntimeIdentityRev,
 		// HookPolicyRev is assigned by Define from the compiled hook set. It is
 		// intentionally absent from ConfigFingerprintFields and the legacy
 		// ConfigFingerprint compatibility projection.

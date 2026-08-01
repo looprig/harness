@@ -1,8 +1,10 @@
 package event
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -63,6 +65,10 @@ func TestAssessDrift(t *testing.T) {
 			wantCategory: DriftHookPolicy, wantSeverity: DriftWarn},
 		{name: "runtime profile change is warn", mutate: func(m *ConfigManifest) { m.RuntimeProfile = "acp/claude" },
 			wantCategory: DriftRuntime, wantSeverity: DriftWarn},
+		{name: "runtime catalog change is warn", mutate: func(m *ConfigManifest) { m.RuntimeCatalogRev = "catalog-v2" },
+			wantCategory: DriftRuntime, wantSeverity: DriftWarn},
+		{name: "runtime identity revision change is warn", mutate: func(m *ConfigManifest) { m.RuntimeIdentityRev = "identity-v2" },
+			wantCategory: DriftRuntime, wantSeverity: DriftWarn},
 		{name: "app field change is info", mutate: func(m *ConfigManifest) { m.AppFields["a"] = "x" },
 			wantCategory: DriftApp, wantSeverity: DriftInfo},
 	}
@@ -90,19 +96,26 @@ func TestAssessDriftRuntimeIdentityFailsClosed(t *testing.T) {
 	candidate := baseline
 	candidate.RuntimeProfile = "acp/claude"
 	candidate.RuntimeCatalogRev = "catalog-v2"
-	candidate.RuntimeTargetProvider = "anthropic"
-	candidate.RuntimeTargetModel = "claude-opus"
-	candidate.RuntimeEffort = "max"
+	candidate.RuntimeIdentityRev = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	assessment := AssessDrift(baseline, candidate)
 	if !assessment.AnyWarn() {
 		t.Fatalf("runtime identity drift = %+v, want warning", assessment)
 	}
-	if len(assessment.Changes) != 5 {
-		t.Fatalf("runtime identity drift changes = %+v, want five changes", assessment.Changes)
+	if len(assessment.Changes) != 3 {
+		t.Fatalf("runtime identity drift changes = %+v, want three changes", assessment.Changes)
 	}
 	for _, change := range assessment.Changes {
 		if change.Category != DriftRuntime || change.Severity != DriftWarn {
 			t.Errorf("runtime change = %+v, want runtime/warn", change)
+		}
+	}
+	data, err := json.Marshal(assessment)
+	if err != nil {
+		t.Fatalf("json.Marshal(assessment): %v", err)
+	}
+	for _, raw := range []string{"anthropic", "claude-opus", "max", "target-alias"} {
+		if strings.Contains(string(data), raw) {
+			t.Fatalf("drift JSON contains raw runtime descriptor %q: %s", raw, data)
 		}
 	}
 }
@@ -309,9 +322,7 @@ func TestConfigDriftBudgetCoversDisjointValidManifests(t *testing.T) {
 		HookPolicyRev:             "old-hook",
 		RuntimeProfile:            "old-profile",
 		RuntimeCatalogRev:         "old-catalog",
-		RuntimeTargetProvider:     "old-provider",
-		RuntimeTargetModel:        "old-target",
-		RuntimeEffort:             "old-effort",
+		RuntimeIdentityRev:        "old-identity-revision",
 		Tools:                     make([]ToolManifestEntry, maxConfigManifestTools),
 		AppFields:                 make(map[string]string, maxConfigManifestAppFields),
 	}
@@ -334,9 +345,7 @@ func TestConfigDriftBudgetCoversDisjointValidManifests(t *testing.T) {
 		HookPolicyRev:             "new-hook",
 		RuntimeProfile:            "new-profile",
 		RuntimeCatalogRev:         "new-catalog",
-		RuntimeTargetProvider:     "new-provider",
-		RuntimeTargetModel:        "new-target",
-		RuntimeEffort:             "new-effort",
+		RuntimeIdentityRev:        "new-identity-revision",
 		Tools:                     make([]ToolManifestEntry, maxConfigManifestTools),
 		AppFields:                 make(map[string]string, maxConfigManifestAppFields),
 	}

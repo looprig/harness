@@ -169,14 +169,8 @@ func assessRuntime(baseline, candidate ConfigManifest, add func(DriftCategory, s
 	if baseline.RuntimeCatalogRev != candidate.RuntimeCatalogRev {
 		add(DriftRuntime, "catalog_rev", baseline.RuntimeCatalogRev, candidate.RuntimeCatalogRev, DriftWarn)
 	}
-	if baseline.RuntimeTargetProvider != candidate.RuntimeTargetProvider {
-		add(DriftRuntime, "target_provider", baseline.RuntimeTargetProvider, candidate.RuntimeTargetProvider, DriftWarn)
-	}
-	if baseline.RuntimeTargetModel != candidate.RuntimeTargetModel {
-		add(DriftRuntime, "target_model", baseline.RuntimeTargetModel, candidate.RuntimeTargetModel, DriftWarn)
-	}
-	if baseline.RuntimeEffort != candidate.RuntimeEffort {
-		add(DriftRuntime, "effort", baseline.RuntimeEffort, candidate.RuntimeEffort, DriftWarn)
+	if baseline.RuntimeIdentityRev != candidate.RuntimeIdentityRev {
+		add(DriftRuntime, "identity_rev", baseline.RuntimeIdentityRev, candidate.RuntimeIdentityRev, DriftWarn)
 	}
 }
 

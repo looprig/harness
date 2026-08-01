@@ -368,9 +368,9 @@ const (
 	// disjoint, plus thirteen manifest scalar-field categories including hook
 	// policy. Restore may append one root-agent-name change after AssessDrift,
 	// so that slot is explicit too. It still bounds a decoded hostile event.
-	// Runtime identity contributes five additional bounded scalar changes, each
+	// Runtime identity contributes three additional bounded scalar changes, each
 	// of which is fail-closed.
-	maxConfigDriftScalarChanges  = 18
+	maxConfigDriftScalarChanges  = 16
 	maxConfigDriftAgentNameSlots = 1
 	maxConfigDriftChanges        = 2*maxConfigManifestTools + 2*maxConfigManifestAppFields + maxConfigDriftScalarChanges + maxConfigDriftAgentNameSlots
 	// MaxConfigMessageLen and MaxConfigActorLen bound the durable, partly
@@ -447,8 +447,7 @@ func validConfigManifestSchema(manifest ConfigManifest, allowLegacy bool) bool {
 
 func zeroRuntimeManifest(manifest ConfigManifest) bool {
 	return manifest.RuntimeProfile == "" && manifest.RuntimeCatalogRev == "" &&
-		manifest.RuntimeTargetProvider == "" && manifest.RuntimeTargetModel == "" &&
-		manifest.RuntimeEffort == ""
+		manifest.RuntimeIdentityRev == ""
 }
 
 func invalidHustle(name EventName, field FieldName) *InvalidEventError {

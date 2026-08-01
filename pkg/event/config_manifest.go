@@ -110,9 +110,10 @@ type ConfigManifest struct {
 	HookPolicyRev             string          `json:"hook_policy_rev,omitzero"`
 	RuntimeProfile            string          `json:"runtime_profile,omitzero"`
 	RuntimeCatalogRev         string          `json:"runtime_catalog_rev,omitzero"`
-	RuntimeTargetProvider     string          `json:"runtime_target_provider,omitzero"`
-	RuntimeTargetModel        string          `json:"runtime_target_model,omitzero"`
-	RuntimeEffort             string          `json:"runtime_effort,omitzero"`
+	// RuntimeIdentityRev is the opaque hex digest of the selected runtime tuple;
+	// raw provider, model, effort, alias, endpoint, and credential values never
+	// enter the durable manifest.
+	RuntimeIdentityRev string `json:"runtime_identity_rev,omitzero"`
 	// AppFields are application-defined, secret-free compatibility fields.
 	// Canonically encoded in sorted key order.
 	AppFields map[string]string `json:"app_fields,omitzero"`
@@ -195,9 +196,7 @@ func (m ConfigManifest) canonical() []byte {
 	if m.SchemaVersion >= ManifestSchemaVersion {
 		material = appendManifestString(material, m.RuntimeProfile)
 		material = appendManifestString(material, m.RuntimeCatalogRev)
-		material = appendManifestString(material, m.RuntimeTargetProvider)
-		material = appendManifestString(material, m.RuntimeTargetModel)
-		material = appendManifestString(material, m.RuntimeEffort)
+		material = appendManifestString(material, m.RuntimeIdentityRev)
 	}
 	keys := make([]string, 0, len(m.AppFields))
 	for key := range m.AppFields {
@@ -234,9 +233,7 @@ func ManifestFromLegacy(f ConfigFingerprint) ConfigManifest {
 		ExternalCapabilityRev:     f.ExternalCapabilityRev,
 		RuntimeProfile:            f.RuntimeProfile,
 		RuntimeCatalogRev:         f.RuntimeCatalogRev,
-		RuntimeTargetProvider:     f.RuntimeTargetProvider,
-		RuntimeTargetModel:        f.RuntimeTargetModel,
-		RuntimeEffort:             f.RuntimeEffort,
+		RuntimeIdentityRev:        f.RuntimeIdentityRev,
 	}
 }
 

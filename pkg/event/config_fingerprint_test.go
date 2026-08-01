@@ -2,28 +2,49 @@ package event_test
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/looprig/harness/pkg/event"
 )
 
+func TestConfigFingerprintRuntimeIdentityIsOpaque(t *testing.T) {
+	t.Parallel()
+	fingerprint := event.ConfigFingerprint{
+		RuntimeProfile:     "acp/codex",
+		RuntimeCatalogRev:  "catalog-v1",
+		RuntimeIdentityRev: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	}
+	data, err := json.Marshal(fingerprint)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	encoded := string(data)
+	for _, raw := range []string{"openai", "gpt-5.6-luna", "high", "target-alias"} {
+		if strings.Contains(encoded, raw) {
+			t.Fatalf("runtime JSON contains raw descriptor %q: %s", raw, encoded)
+		}
+	}
+	if !strings.Contains(encoded, "runtime_identity_rev") {
+		t.Fatalf("runtime JSON omitted opaque identity revision: %s", encoded)
+	}
+}
+
 // fullFingerprint is a fingerprint with every field populated, used as the
 // identical-baseline in the Equal table.
 func fullFingerprint() event.ConfigFingerprint {
 	return event.ConfigFingerprint{
-		AgentKind:             "primary",
-		ModelID:               "claude-test",
-		SystemPromptRev:       "abc123",
-		ToolPolicyRev:         "def456",
-		RuntimeSkills:         true,
-		WorkspaceRoot:         "/home/user/repo",
-		AgentAdapter:          "claude",
-		PermissionPosture:     "default",
-		RuntimeProfile:        "acp/codex",
-		RuntimeCatalogRev:     "catalog-v1",
-		RuntimeTargetProvider: "openai",
-		RuntimeTargetModel:    "gpt-5.6-luna",
-		RuntimeEffort:         "high",
+		AgentKind:          "primary",
+		ModelID:            "claude-test",
+		SystemPromptRev:    "abc123",
+		ToolPolicyRev:      "def456",
+		RuntimeSkills:      true,
+		WorkspaceRoot:      "/home/user/repo",
+		AgentAdapter:       "claude",
+		PermissionPosture:  "default",
+		RuntimeProfile:     "acp/codex",
+		RuntimeCatalogRev:  "catalog-v1",
+		RuntimeIdentityRev: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		// A digest over the application's external capabilities (an MCP
 		// configuration), as mcpharness.Manager.ConfigDigest produces.
 		ExternalCapabilityRev: "aa08cfe9f431598f187f5bec202f211f",
@@ -60,12 +81,8 @@ func TestConfigFingerprintEqual(t *testing.T) {
 	diffRuntimeProfile.RuntimeProfile = "acp/claude"
 	diffRuntimeCatalog := base
 	diffRuntimeCatalog.RuntimeCatalogRev = "catalog-v2"
-	diffRuntimeProvider := base
-	diffRuntimeProvider.RuntimeTargetProvider = "anthropic"
-	diffRuntimeModel := base
-	diffRuntimeModel.RuntimeTargetModel = "claude-opus"
-	diffRuntimeEffort := base
-	diffRuntimeEffort.RuntimeEffort = "max"
+	diffRuntimeIdentity := base
+	diffRuntimeIdentity.RuntimeIdentityRev = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 
 	tests := []struct {
 		name string
@@ -85,9 +102,7 @@ func TestConfigFingerprintEqual(t *testing.T) {
 		{"ExternalCapabilityRev differs", base, diffExternal, false},
 		{"RuntimeProfile differs", base, diffRuntimeProfile, false},
 		{"RuntimeCatalogRev differs", base, diffRuntimeCatalog, false},
-		{"RuntimeTargetProvider differs", base, diffRuntimeProvider, false},
-		{"RuntimeTargetModel differs", base, diffRuntimeModel, false},
-		{"RuntimeEffort differs", base, diffRuntimeEffort, false},
+		{"RuntimeIdentityRev differs", base, diffRuntimeIdentity, false},
 		{"zero vs full differs", event.ConfigFingerprint{}, base, false},
 	}
 	for _, tt := range tests {
@@ -227,7 +242,7 @@ func TestConfigFingerprintJSONRoundTrip(t *testing.T) {
 		{"agent adapter only", event.ConfigFingerprint{AgentAdapter: "claude"}},
 		{"permission posture only", event.ConfigFingerprint{PermissionPosture: "default"}},
 		{"external capability only", event.ConfigFingerprint{ExternalCapabilityRev: "d1ge57"}},
-		{"runtime identity only", event.ConfigFingerprint{RuntimeProfile: "acp/codex", RuntimeCatalogRev: "catalog-v1", RuntimeTargetProvider: "openai", RuntimeTargetModel: "gpt-5.6-luna", RuntimeEffort: "high"}},
+		{"runtime identity only", event.ConfigFingerprint{RuntimeProfile: "acp/codex", RuntimeCatalogRev: "catalog-v1", RuntimeIdentityRev: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}},
 	}
 	for _, tt := range tests {
 		tt := tt

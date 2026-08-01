@@ -3,6 +3,7 @@ package rig
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -83,7 +84,7 @@ func fingerprintWithDefinition(d loop.Definition, fields ConfigFingerprintFields
 func runtimeBoundDefinition(t *testing.T, d loop.Definition) loop.BoundDefinition {
 	t.Helper()
 	bound := bindFingerprintDefinition(d)
-	overridden, err := loop.OverrideBoundRuntime(bound, "acp-codex", validModel("gpt-5.6-luna"), model.EffortHigh)
+	overridden, err := loop.OverrideBoundRuntimeSelection(bound, "acp-codex", "target", validModel("gpt-5.6-luna"), model.EffortHigh)
 	if err != nil {
 		t.Fatalf("OverrideBoundRuntime: %v", err)
 	}
@@ -115,21 +116,29 @@ func TestFingerprintFromProjectsRuntimeIdentity(t *testing.T) {
 	t.Parallel()
 	definition := fpConfig("base-model", "system")
 	base := FingerprintFrom(runtimeBoundDefinition(t, definition))
-	if base.RuntimeProfile != "acp-codex" || base.RuntimeCatalogRev == "" || base.RuntimeTargetProvider != "test" ||
-		base.RuntimeTargetModel != "gpt-5.6-luna" || base.RuntimeEffort != "high" {
+	if base.RuntimeProfile != "acp-codex" || base.RuntimeCatalogRev == "" || base.RuntimeIdentityRev == "" {
 		t.Fatalf("FingerprintFrom runtime fields = %+v", base)
 	}
 	for name, mutate := range map[string]func(*event.ConfigFingerprint){
 		"profile":  func(fp *event.ConfigFingerprint) { fp.RuntimeProfile = "acp/claude" },
 		"catalog":  func(fp *event.ConfigFingerprint) { fp.RuntimeCatalogRev = "catalog-v2" },
-		"provider": func(fp *event.ConfigFingerprint) { fp.RuntimeTargetProvider = "anthropic" },
-		"model":    func(fp *event.ConfigFingerprint) { fp.RuntimeTargetModel = "claude-opus" },
-		"effort":   func(fp *event.ConfigFingerprint) { fp.RuntimeEffort = "max" },
+		"identity": func(fp *event.ConfigFingerprint) { fp.RuntimeIdentityRev = "different-runtime-identity-revision" },
 	} {
 		mutated := base
 		mutate(&mutated)
 		if base.Equal(mutated) {
 			t.Errorf("runtime %s change was invisible: %+v", name, mutated)
+		}
+	}
+	data, err := json.Marshal(base)
+	if err != nil {
+		t.Fatalf("json.Marshal(fingerprint): %v", err)
+	}
+	// ModelID remains the historical selected model identity. The runtime
+	// projection itself must contain only profile/catalog plus the opaque digest.
+	for _, raw := range []string{"test", "high", "target"} {
+		if strings.Contains(string(data), raw) {
+			t.Fatalf("fingerprint JSON contains raw runtime descriptor %q: %s", raw, data)
 		}
 	}
 }
@@ -138,19 +147,17 @@ func TestFrozenRuntimeIdentityFieldsAgreeWithManifest(t *testing.T) {
 	t.Parallel()
 	fields := ConfigFingerprintFields{
 		RuntimeProfile: "acp-codex", RuntimeCatalogRev: "catalog-v1",
-		RuntimeTargetProvider: "test", RuntimeTargetModel: "gpt-5.6-luna", RuntimeEffort: "high",
+		RuntimeIdentityRev: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 	}
 	definition := fpConfig("gpt-5.6-luna", "system")
 	fingerprint := frozenFingerprint(fields, []loop.Definition{definition}, []string{"agent"}, "agent")
 	manifest := frozenManifest(fields, []loop.Definition{definition}, []string{"agent"}, "agent")
 	if fingerprint.RuntimeProfile != fields.RuntimeProfile || fingerprint.RuntimeCatalogRev != fields.RuntimeCatalogRev ||
-		fingerprint.RuntimeTargetProvider != fields.RuntimeTargetProvider || fingerprint.RuntimeTargetModel != fields.RuntimeTargetModel ||
-		fingerprint.RuntimeEffort != fields.RuntimeEffort {
+		fingerprint.RuntimeIdentityRev != fields.RuntimeIdentityRev {
 		t.Fatalf("frozen fingerprint dropped runtime fields: %+v", fingerprint)
 	}
 	if manifest.RuntimeProfile != fingerprint.RuntimeProfile || manifest.RuntimeCatalogRev != fingerprint.RuntimeCatalogRev ||
-		manifest.RuntimeTargetProvider != fingerprint.RuntimeTargetProvider || manifest.RuntimeTargetModel != fingerprint.RuntimeTargetModel ||
-		manifest.RuntimeEffort != fingerprint.RuntimeEffort {
+		manifest.RuntimeIdentityRev != fingerprint.RuntimeIdentityRev {
 		t.Fatalf("frozen manifest disagrees with fingerprint: manifest=%+v fingerprint=%+v", manifest, fingerprint)
 	}
 }
