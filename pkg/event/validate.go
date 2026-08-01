@@ -368,9 +368,10 @@ const (
 	// disjoint, plus thirteen manifest scalar-field categories including hook
 	// policy. Restore may append one root-agent-name change after AssessDrift,
 	// so that slot is explicit too. It still bounds a decoded hostile event.
-	// Runtime identity contributes three additional bounded scalar changes, each
-	// of which is fail-closed.
-	maxConfigDriftScalarChanges  = 16
+	// Runtime identity contributes three additional bounded scalar changes, and
+	// a configured permission-review policy can contribute one more, each of
+	// which is fail-closed.
+	maxConfigDriftScalarChanges  = 17
 	maxConfigDriftAgentNameSlots = 1
 	maxConfigDriftChanges        = 2*maxConfigManifestTools + 2*maxConfigManifestAppFields + maxConfigDriftScalarChanges + maxConfigDriftAgentNameSlots
 	// MaxConfigMessageLen and MaxConfigActorLen bound the durable, partly
