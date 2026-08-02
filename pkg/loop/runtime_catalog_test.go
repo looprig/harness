@@ -387,6 +387,51 @@ func TestRuntimeCatalogNeedsSmallModelAffectsDigest(t *testing.T) {
 	}
 }
 
+func TestRuntimeCatalogResolvesNativeSmallModel(t *testing.T) {
+	t.Parallel()
+
+	entries := testCatalogEntries()
+	entries[0].Credential = CredentialNativeAuth
+	entries[0].Models[0].Credential = CredentialNativeAuth
+	entries[0].Models[0].NativeSmallModel = "gpt-5.6-mini"
+	catalog, err := NewRuntimeCatalog(entries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+
+	resolved, err := catalog.Resolve("worker", "codex", "o3", model.EffortLow)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if resolved.NativeSmallModel != "gpt-5.6-mini" {
+		t.Fatalf("Resolved.NativeSmallModel = %q, want %q", resolved.NativeSmallModel, "gpt-5.6-mini")
+	}
+}
+
+func TestRuntimeCatalogNativeSmallModelAffectsDigest(t *testing.T) {
+	t.Parallel()
+
+	baseEntries := testCatalogEntries()
+	baseEntries[0].Credential = CredentialNativeAuth
+	baseEntries[0].Models[0].Credential = CredentialNativeAuth
+	base, err := NewRuntimeCatalog(baseEntries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog(base) error = %v", err)
+	}
+
+	changedEntries := testCatalogEntries()
+	changedEntries[0].Credential = CredentialNativeAuth
+	changedEntries[0].Models[0].Credential = CredentialNativeAuth
+	changedEntries[0].Models[0].NativeSmallModel = "gpt-5.6-mini"
+	changed, err := NewRuntimeCatalog(changedEntries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog(changed) error = %v", err)
+	}
+	if base.Digest() == changed.Digest() {
+		t.Fatal("catalog digest did not change for NativeSmallModel mutation")
+	}
+}
+
 func TestRuntimeCatalogAllowsSharedGatewayAliasesButNotNativeAliases(t *testing.T) {
 	entries := testCatalogEntries()
 	entries[0].Credential = CredentialGatewayBacked

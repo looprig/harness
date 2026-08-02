@@ -32,10 +32,13 @@ type RuntimeModelOption struct {
 	// It lets one harness expose its own native-auth catalogue alongside
 	// product-owned gateway targets while each resolved child still has one
 	// immutable credential mode. Empty inherits RuntimeCatalogEntry.Credential.
-	Credential    CredentialMode
-	Target        model.Model
-	DefaultEffort model.Effort
-	Efforts       []model.Effort
+	Credential CredentialMode
+	// NativeSmallModel is the connector-native small-model identifier used by
+	// native-auth runtimes. It is intentionally bounded and secret-free.
+	NativeSmallModel string
+	Target           model.Model
+	DefaultEffort    model.Effort
+	Efforts          []model.Effort
 }
 
 // RuntimeCatalogEntry describes one role/harness runtime combination.
@@ -54,14 +57,15 @@ type RuntimeCatalogEntry struct {
 // Resolved is the immutable runtime tuple selected from a RuntimeCatalog.
 // Target is a defensive copy of the cataloged model descriptor.
 type Resolved struct {
-	SubagentType identity.AgentName
-	AgentHarness AgentHarnessName
-	Profile      RuntimeProfileName
-	Credential   CredentialMode
-	ModelAlias   ModelAlias
-	SmallModel   ModelAlias
-	Target       model.Model
-	Effort       model.Effort
+	SubagentType     identity.AgentName
+	AgentHarness     AgentHarnessName
+	Profile          RuntimeProfileName
+	Credential       CredentialMode
+	ModelAlias       ModelAlias
+	NativeSmallModel string
+	SmallModel       ModelAlias
+	Target           model.Model
+	Effort           model.Effort
 }
 
 // RuntimeCatalogErrorKind identifies a catalog construction or resolution
@@ -261,14 +265,15 @@ func (c RuntimeCatalog) ResolveWithExplicitEffort(agent identity.AgentName, harn
 	}
 
 	return Resolved{
-		SubagentType: selected.SubagentType,
-		AgentHarness: selected.AgentHarness,
-		Profile:      selected.Profile,
-		Credential:   effectiveModelCredential(*selected, *selectedModel),
-		ModelAlias:   selectedModel.Alias,
-		SmallModel:   selected.SmallModel,
-		Target:       selectedModel.Target.Clone(),
-		Effort:       selectedEffort,
+		SubagentType:     selected.SubagentType,
+		AgentHarness:     selected.AgentHarness,
+		Profile:          selected.Profile,
+		Credential:       effectiveModelCredential(*selected, *selectedModel),
+		ModelAlias:       selectedModel.Alias,
+		NativeSmallModel: selectedModel.NativeSmallModel,
+		SmallModel:       selected.SmallModel,
+		Target:           selectedModel.Target.Clone(),
+		Effort:           selectedEffort,
 	}, nil
 }
 
@@ -340,6 +345,11 @@ func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
 		}
 		if option.Credential != "" && option.Credential != CredentialGatewayBacked && option.Credential != CredentialNativeAuth {
 			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidCredential, Field: "Models.Credential"}
+		}
+		if option.NativeSmallModel != "" {
+			if err := validateCatalogIdentifier(option.NativeSmallModel, false); err != nil {
+				return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "Models.NativeSmallModel"}
+			}
 		}
 		if _, exists := aliases[option.Alias]; exists {
 			return &RuntimeCatalogError{Kind: RuntimeCatalogDuplicateAlias, Field: "Models.Alias"}
@@ -501,21 +511,22 @@ type runtimeCatalogEntryDigest struct {
 }
 
 type runtimeModelOptionDigest struct {
-	Alias          string              `json:"alias"`
-	Credential     CredentialMode      `json:"credential,omitempty"`
-	Provider       string              `json:"provider"`
-	APIFormat      string              `json:"api_format"`
-	Name           string              `json:"name"`
-	Origin         model.Origin        `json:"origin"`
-	Capabilities   model.Capabilities  `json:"capabilities"`
-	Limits         model.ContextLimits `json:"limits"`
-	DefaultEffort  string              `json:"default_effort"`
-	Efforts        []string            `json:"efforts"`
-	Temperature    *float64            `json:"temperature,omitempty"`
-	TopP           *float64            `json:"top_p,omitempty"`
-	MaxTokens      *int                `json:"max_tokens,omitempty"`
-	Stop           []string            `json:"stop,omitempty"`
-	SamplingEffort string              `json:"sampling_effort"`
+	Alias            string              `json:"alias"`
+	Credential       CredentialMode      `json:"credential,omitempty"`
+	NativeSmallModel string              `json:"native_small_model,omitempty"`
+	Provider         string              `json:"provider"`
+	APIFormat        string              `json:"api_format"`
+	Name             string              `json:"name"`
+	Origin           model.Origin        `json:"origin"`
+	Capabilities     model.Capabilities  `json:"capabilities"`
+	Limits           model.ContextLimits `json:"limits"`
+	DefaultEffort    string              `json:"default_effort"`
+	Efforts          []string            `json:"efforts"`
+	Temperature      *float64            `json:"temperature,omitempty"`
+	TopP             *float64            `json:"top_p,omitempty"`
+	MaxTokens        *int                `json:"max_tokens,omitempty"`
+	Stop             []string            `json:"stop,omitempty"`
+	SamplingEffort   string              `json:"sampling_effort"`
 }
 
 func digestRuntimeCatalog(entries []RuntimeCatalogEntry) string {
@@ -534,21 +545,22 @@ func digestRuntimeCatalog(entries []RuntimeCatalogEntry) string {
 		}
 		for j, option := range entry.Models {
 			row.Models[j] = runtimeModelOptionDigest{
-				Alias:          string(option.Alias),
-				Credential:     option.Credential,
-				Provider:       string(option.Target.Provider),
-				APIFormat:      string(option.Target.APIFormat),
-				Name:           option.Target.Name,
-				Origin:         option.Target.Origin,
-				Capabilities:   option.Target.Caps,
-				Limits:         option.Target.Limits,
-				DefaultEffort:  catalogEffortString(option.DefaultEffort),
-				Efforts:        catalogEffortStrings(option.Efforts),
-				Temperature:    option.Target.Sampling.Temperature,
-				TopP:           option.Target.Sampling.TopP,
-				MaxTokens:      option.Target.Sampling.MaxTokens,
-				Stop:           append([]string(nil), option.Target.Sampling.Stop...),
-				SamplingEffort: catalogEffortString(option.Target.Sampling.Effort),
+				Alias:            string(option.Alias),
+				Credential:       option.Credential,
+				NativeSmallModel: option.NativeSmallModel,
+				Provider:         string(option.Target.Provider),
+				APIFormat:        string(option.Target.APIFormat),
+				Name:             option.Target.Name,
+				Origin:           option.Target.Origin,
+				Capabilities:     option.Target.Caps,
+				Limits:           option.Target.Limits,
+				DefaultEffort:    catalogEffortString(option.DefaultEffort),
+				Efforts:          catalogEffortStrings(option.Efforts),
+				Temperature:      option.Target.Sampling.Temperature,
+				TopP:             option.Target.Sampling.TopP,
+				MaxTokens:        option.Target.Sampling.MaxTokens,
+				Stop:             append([]string(nil), option.Target.Sampling.Stop...),
+				SamplingEffort:   catalogEffortString(option.Target.Sampling.Effort),
 			}
 		}
 		projection.Entries[i] = row
