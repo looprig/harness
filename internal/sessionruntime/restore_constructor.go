@@ -67,17 +67,20 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 			)
 		}
 	default:
-		if foreignSID == "" {
+		agentSessionID := ri.AgentSessionID
+		if agentSessionID == "" {
+			agentSessionID = foreignSID
+		}
+		if agentSessionID == "" {
 			cancel()
 			return &RestoreError{Kind: RestoreForeignSIDMissing}
 		}
-		if s.foreignBuildRestored == nil {
+		restoredBuilder, builderErr := s.restoredBuilder(bound)
+		if builderErr != nil {
 			cancel()
-			return &RestoreError{Kind: RestoreForeignBuilderMissing}
+			return builderErr
 		}
-		// Legacy journals expose one foreign SID. Phase 6 dedicated journal wiring may
-		// replace the agent-side value with a separately journaled AgentSessionID.
-		backend, err = s.foreignBuildRestored(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
+		backend, err = restoredBuilder(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: agentSessionID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
 	}
 	if err != nil {
 		cancel()
@@ -88,6 +91,20 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, bindings: bindings, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
 	s.loopsMu.Unlock()
 	return nil
+}
+
+func (s *Session) restoredBuilder(bound loop.BoundDefinition) (foreign.RestoredBuilder, error) {
+	if s.foreignRegistry != nil && bound.Engine() == loop.EngineAdapter && bound.RuntimeProfile() != "" {
+		_, restored, err := s.foreignRegistry.Builder(bound.RuntimeProfile())
+		if err != nil {
+			return nil, &RestoreError{Kind: RestoreForeignBuilderMissing, Cause: err}
+		}
+		return restored, nil
+	}
+	if s.foreignBuildRestored == nil {
+		return nil, &RestoreError{Kind: RestoreForeignBuilderMissing}
+	}
+	return s.foreignBuildRestored, nil
 }
 
 func restoreTopologySession(
@@ -588,8 +605,9 @@ func runRestoreFailureCleanup(timeout time.Duration, appendErrored func(context.
 // turnIndex + open-turn flag). planLoops builds one per durable loop; the restore
 // constructor crash-closes, seeds, and attaches from these.
 type loopPlan struct {
-	started event.LoopStarted
-	bound   loop.BoundDefinition
+	started    event.LoopStarted
+	definition loop.Definition
+	bound      loop.BoundDefinition
 	// bindings is the EXACT tool.Bindings this loop was bound with. It is retained so a
 	// later external-toolset replacement builds its tools with the same capabilities (and
 	// the same WorkspaceObservations instance) the declared tools got — rebuilding a fresh
@@ -688,7 +706,7 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		// different gates per definition (or OverrideBoundAccess at a binding
 		// seam), never by harness-side attenuation against the parent.
 		loopEvents := eventsFromRecords(allRecords, started.LoopID)
-		plans = append(plans, loopPlan{started: started, bound: bound, bindings: bindings, events: loopEvents})
+		plans = append(plans, loopPlan{started: started, definition: definition, bound: bound, bindings: bindings, events: loopEvents})
 		if started.LoopID == roots[topology.ActivePrimer].LoopID {
 			activeIndex = len(plans) - 1
 		}
@@ -706,8 +724,68 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 			return nil, loopPlan{}, foldErr
 		}
 		plans[i].folded = folded
+		ri := foldLoopInference(plans[i].events)
+		catalog, hasCatalog := manager.catalogFor(plans[i].definition)
+		plans[i].bound, foldErr = restoreRuntimeBinding(plans[i].started, plans[i].bound, ri, catalog, hasCatalog, findForeignSID(plans[i].events) != "")
+		if foldErr != nil {
+			return nil, loopPlan{}, foldErr
+		}
 	}
 	return plans, plans[activeIndex], nil
+}
+
+// restoreRuntimeBinding re-authorizes a durable adapter selection against the
+// current parent-scoped catalog before any backend constructor observes Engine.
+// A journaled AgentRuntime is authoritative even when the current definition
+// initially binds as native; OverrideBoundRuntimeSelection turns that view into
+// the adapter view only after every durable selector and target identity matches.
+func restoreRuntimeBinding(started event.LoopStarted, bound loop.BoundDefinition, ri restoredInference, catalog loop.RuntimeCatalog, hasCatalog bool, hasForeignSID bool) (loop.BoundDefinition, error) {
+	if ri.AgentRuntime == nil {
+		if bound.Engine() != loop.EngineNative || hasForeignSID {
+			return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeMissing}
+		}
+		return bound, nil
+	}
+	if !hasCatalog {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+	}
+	if !ri.HasRuntime {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeTargetMismatch}
+	}
+	runtime := ri.AgentRuntime
+	resolved, err := catalog.ResolveWithExplicitEffort(
+		started.AgentName,
+		loop.AgentHarnessName(runtime.Harness),
+		loop.ModelAlias(runtime.ModelAlias),
+		ri.Runtime.Effort,
+		true,
+	)
+	if err != nil {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable, Cause: err}
+	}
+	if resolved.Profile != loop.RuntimeProfileName(runtime.Profile) ||
+		resolved.AgentHarness != loop.AgentHarnessName(runtime.Harness) ||
+		resolved.SmallModel != loop.ModelAlias(runtime.SmallModelAlias) {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+	}
+	if string(resolved.Credential) != runtime.CredentialMode {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeCredentialMismatch}
+	}
+	if resolved.Target.Key() != ri.Runtime.Key {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeTargetMismatch}
+	}
+	if resolved.Effort != ri.Runtime.Effort {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeEffortMismatch}
+	}
+	bound, err = loop.OverrideBoundRuntimeSelection(bound, resolved.Profile, resolved.ModelAlias, resolved.Target, resolved.Effort)
+	if err != nil {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+	}
+	bound, err = loop.OverrideBoundRuntimeCatalog(bound, catalog)
+	if err != nil {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+	}
+	return bound, nil
 }
 
 // attachAndActivate registers every non-root restored loop, resolves the durable active
@@ -880,21 +958,25 @@ func buildRestoredSession(
 			)
 		}
 	default:
-		if foreignSID == "" {
+		agentSessionID := ri.AgentSessionID
+		if agentSessionID == "" {
+			agentSessionID = foreignSID
+		}
+		if agentSessionID == "" {
 			cancel()
 			restoreErr := &RestoreError{Kind: RestoreForeignSIDMissing}
 			return abort(restoreErr)
 		}
-		if s.foreignBuildRestored == nil {
+		restoredBuilder, builderErr := s.restoredBuilder(cfg)
+		if builderErr != nil {
 			cancel()
-			restoreErr := &RestoreError{Kind: RestoreForeignBuilderMissing}
-			return abort(restoreErr)
+			return abort(builderErr)
 		}
 		// Legacy journals expose one foreign SID. Phase 6 dedicated journal wiring may
 		// replace the agent-side value with a separately journaled AgentSessionID.
-		l, err = s.foreignBuildRestored(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
+		l, err = restoredBuilder(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
 			func() (uuid.UUID, error) { return newID() }, factory,
-			foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
+			foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: agentSessionID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
 	}
 	if err != nil {
 		cancel()

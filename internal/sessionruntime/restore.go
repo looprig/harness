@@ -318,10 +318,12 @@ func effectiveCurrentWorkspace(events []event.Event) (string, bool) {
 // precedence, so restore does not consult a mutable model catalog for identity,
 // limits, or effort.
 type restoredInference struct {
-	Mode       loop.ModeName
-	HasMode    bool
-	Runtime    event.ModelRuntime
-	HasRuntime bool
+	Mode           loop.ModeName
+	HasMode        bool
+	Runtime        event.ModelRuntime
+	HasRuntime     bool
+	AgentRuntime   *event.AgentRuntime
+	AgentSessionID string
 }
 
 // foldLoopInference folds a loop's ordered lifecycle events into its durable mode
@@ -329,9 +331,11 @@ type restoredInference struct {
 // additive runtime retain the live bound definition fallback.
 func foldLoopInference(events []event.Event) restoredInference {
 	var ri restoredInference
+	var loopID uuid.UUID
 	for _, ev := range events {
 		switch e := ev.(type) {
 		case event.LoopStarted:
+			loopID = e.LoopID
 			// Seed the mode BASELINE from the durable start mode: a mode-selective spawn
 			// records the selected mode on LoopStarted and emits NO LoopModeChanged, so
 			// without this a child spawned in a non-default mode would resume at the
@@ -346,6 +350,13 @@ func foldLoopInference(events []event.Event) restoredInference {
 				ri.Runtime = e.Runtime
 				ri.HasRuntime = true
 			}
+			if e.AgentRuntime != nil {
+				copy := *e.AgentRuntime
+				ri.AgentRuntime = &copy
+				if copy.ACPSessionID != "" {
+					ri.AgentSessionID = copy.ACPSessionID
+				}
+			}
 		case event.LoopModeChanged:
 			ri.Mode = loop.ModeName(e.Mode)
 			ri.HasMode = true
@@ -357,6 +368,10 @@ func foldLoopInference(events []event.Event) restoredInference {
 		case event.LoopInferenceChanged:
 			ri.Runtime = e.Runtime
 			ri.HasRuntime = e.Runtime != (event.ModelRuntime{})
+		case event.LoopAgentSessionBound:
+			if loopID.IsZero() || e.LoopID == loopID {
+				ri.AgentSessionID = e.ACPSessionID
+			}
 		}
 	}
 	return ri

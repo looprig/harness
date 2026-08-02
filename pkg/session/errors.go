@@ -185,6 +185,41 @@ func (e *AgentNameMismatchError) Error() string {
 	return "session: restore agent name mismatch: persisted=" + strconv.Quote(string(e.Persisted)) + " != configured=" + strconv.Quote(string(e.Configured)) + "; pass WithAllowConfigMismatch to override"
 }
 
+// RestoreRuntimeMismatchKind classifies a durable adapter runtime that cannot
+// be safely reconstructed from the current catalog. Values are bounded and do
+// not contain selector or target data.
+type RestoreRuntimeMismatchKind string
+
+const (
+	RestoreRuntimeMissing            RestoreRuntimeMismatchKind = "missing_runtime"
+	RestoreRuntimeUnavailable        RestoreRuntimeMismatchKind = "runtime_unavailable"
+	RestoreRuntimeTargetMismatch     RestoreRuntimeMismatchKind = "target_mismatch"
+	RestoreRuntimeCredentialMismatch RestoreRuntimeMismatchKind = "credential_mismatch"
+	RestoreRuntimeEffortMismatch     RestoreRuntimeMismatchKind = "effort_mismatch"
+)
+
+// RestoreRuntimeMismatchError reports a fail-closed adapter restore decision.
+// Its public text is deliberately category-only: journal selectors, model keys,
+// credentials, and catalog/provider details never reach model-facing errors.
+type RestoreRuntimeMismatchError struct {
+	Kind  RestoreRuntimeMismatchKind
+	Cause error
+}
+
+func (e *RestoreRuntimeMismatchError) Error() string {
+	if e == nil || e.Kind == "" {
+		return "session: restore runtime mismatch"
+	}
+	return "session: restore runtime mismatch: " + string(e.Kind)
+}
+
+func (e *RestoreRuntimeMismatchError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
 type RestoreDiscoveryErrorKind string
 
 const (

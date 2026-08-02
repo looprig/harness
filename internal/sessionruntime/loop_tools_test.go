@@ -567,6 +567,24 @@ func TestRestoredLoopComesUpWithEmptySlot(t *testing.T) {
 	}
 }
 
+func TestFoldLoopInferenceCarriesRuntimeAndLoopScopedAgentSession(t *testing.T) {
+	t.Parallel()
+	loopID := mustUUID()
+	runtime := &event.AgentRuntime{Harness: "codex", Profile: "acp/codex", CredentialMode: "gateway-backed", ModelAlias: "luna", SmallModelAlias: "small"}
+	got := foldLoopInference([]event.Event{
+		event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: loopID}}, AgentRuntime: runtime},
+		event.LoopAgentSessionBound{Header: event.Header{Coordinates: identity.Coordinates{LoopID: mustUUID()}}, ACPSessionID: "wrong-loop"},
+		event.LoopAgentSessionBound{Header: event.Header{Coordinates: identity.Coordinates{LoopID: loopID}}, ACPSessionID: "first"},
+		event.LoopAgentSessionBound{Header: event.Header{Coordinates: identity.Coordinates{LoopID: loopID}}, ACPSessionID: "last"},
+	})
+	if got.AgentRuntime == nil || *got.AgentRuntime != *runtime {
+		t.Fatalf("AgentRuntime = %#v, want %#v", got.AgentRuntime, runtime)
+	}
+	if got.AgentSessionID != "last" {
+		t.Fatalf("AgentSessionID = %q, want last", got.AgentSessionID)
+	}
+}
+
 // TestReplaceExternalToolsRefusedOnForeignLoop drives a foreign-engine loop through the
 // public builder seam, not a hand-built handle. A foreign loop's toolset belongs to the
 // foreign agent and its backend
