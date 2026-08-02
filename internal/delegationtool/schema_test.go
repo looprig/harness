@@ -69,10 +69,10 @@ func TestSchemaRuntimeSelectorsFollowCapabilities(t *testing.T) {
 		},
 		{
 			name:       "multiple models and efforts expose both selectors",
-			catalog:    schemaCatalog(t, schemaEntryWithModels("worker", "claude-code", true, []schemaModel{{alias: "sonnet", efforts: []inferencemodel.Effort{inferencemodel.EffortLow, inferencemodel.EffortHigh}}, {alias: "opus", efforts: []inferencemodel.Effort{inferencemodel.EffortMedium}}})),
+			catalog:    schemaCatalog(t, schemaEntryWithModels("worker", "claude-code", true, []schemaModel{{alias: "sonnet", efforts: []inferencemodel.Effort{inferencemodel.EffortLow, inferencemodel.EffortHigh}}, {alias: "opus", efforts: []inferencemodel.Effort{inferencemodel.EffortLow, inferencemodel.EffortHigh}}})),
 			wantFields: []string{"model", "effort"},
 			noFields:   []string{"agent_harness"},
-			wantEnums:  map[string][]string{"model": {"opus", "sonnet"}, "effort": {"low", "medium", "high"}},
+			wantEnums:  map[string][]string{"model": {"opus", "sonnet"}, "effort": {"low", "high"}},
 		},
 	}
 	for _, tt := range tests {
@@ -95,6 +95,59 @@ func TestSchemaRuntimeSelectorsFollowCapabilities(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSchemaRuntimeSelectorsKeepModelEffortPairsResolvable(t *testing.T) {
+	catalog := schemaCatalog(t, schemaEntryWithModels("worker", "claude-code", true, []schemaModel{
+		{alias: "sonnet", efforts: []inferencemodel.Effort{inferencemodel.EffortLow}},
+		{alias: "opus", efforts: []inferencemodel.Effort{inferencemodel.EffortHigh}},
+	}))
+	info, err := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker"}}, catalog).Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(info.Schema, &schema); err != nil {
+		t.Fatal(err)
+	}
+	for model, effort := range map[string]string{"sonnet": "low", "opus": "high"} {
+		if !schemaContainsModelEffortPair(schema, model, effort) {
+			t.Errorf("schema missing resolvable model/effort pair %q/%q", model, effort)
+		}
+	}
+	if schemaContainsModelEffortPair(schema, "sonnet", "high") || schemaContainsModelEffortPair(schema, "opus", "low") {
+		t.Fatal("schema advertises an unresolved model/effort pair")
+	}
+}
+
+func schemaContainsModelEffortPair(value any, model, effort string) bool {
+	object, ok := value.(map[string]any)
+	if !ok {
+		if children, ok := value.([]any); ok {
+			for _, child := range children {
+				if schemaContainsModelEffortPair(child, model, effort) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	properties, _ := object["properties"].(map[string]any)
+	modelProperty, _ := properties["model"].(map[string]any)
+	if modelProperty["const"] == model {
+		effortProperty, _ := properties["effort"].(map[string]any)
+		for _, value := range effortProperty["enum"].([]any) {
+			if value == effort {
+				return true
+			}
+		}
+	}
+	for _, child := range object {
+		if schemaContainsModelEffortPair(child, model, effort) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSchemaDescriptionBoundsAvailableSubagentRows(t *testing.T) {

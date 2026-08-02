@@ -175,15 +175,74 @@ func startRoleVariant(role SubagentCatalogEntry, entry *loop.RuntimeCatalogEntry
 		if explicitHarness {
 			properties["agent_harness"] = map[string]any{"const": string(entry.AgentHarness)}
 		}
-		addModelAndEffort(properties, *entry)
 	}
 	branch := map[string]any{"type": "object", "additionalProperties": false, "properties": properties}
+	if entry != nil {
+		if runtimeModelEffortsVary(entry.Models) {
+			properties["model"] = map[string]any{"type": "string"}
+			properties["effort"] = map[string]any{"type": "string"}
+			branch["oneOf"] = modelEffortVariants(entry.Models, entry.DefaultModel)
+		} else {
+			addModelAndEffort(properties, *entry)
+		}
+	}
 	if explicitHarness {
 		branch["required"] = []string{"agent_harness"}
 	} else if defaultBranch {
 		branch["not"] = map[string]any{"required": []string{"agent_harness"}}
 	}
 	return branch
+}
+
+func runtimeModelEffortsVary(models []loop.RuntimeModelOption) bool {
+	if len(models) < 2 {
+		return false
+	}
+	want := admittedEfforts(models[:1])
+	for _, model := range models[1:] {
+		if !equalStringSlices(want, admittedEfforts([]loop.RuntimeModelOption{model})) {
+			return true
+		}
+	}
+	return false
+}
+
+func equalStringSlices(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func modelEffortVariants(models []loop.RuntimeModelOption, defaultModel loop.ModelAlias) []any {
+	defaultEfforts := admittedEfforts(models[:1])
+	for _, model := range models {
+		if model.Alias == defaultModel {
+			defaultEfforts = admittedEfforts([]loop.RuntimeModelOption{model})
+			break
+		}
+	}
+	variants := []any{map[string]any{
+		"not": map[string]any{"required": []string{"model"}},
+		"properties": map[string]any{
+			"effort": map[string]any{"type": "string", "enum": defaultEfforts},
+		},
+	}}
+	for _, model := range models {
+		variants = append(variants, map[string]any{
+			"properties": map[string]any{
+				"model":  map[string]any{"const": string(model.Alias)},
+				"effort": map[string]any{"type": "string", "enum": admittedEfforts([]loop.RuntimeModelOption{model})},
+			},
+			"required": []string{"model"},
+		})
+	}
+	return variants
 }
 
 func anyNonDefaultHarness(entries []loop.RuntimeCatalogEntry) bool {

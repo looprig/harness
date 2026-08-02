@@ -425,7 +425,7 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 			}
 		}
 		if !found {
-			return nil, preparationFailure(errCategoryFieldNotAllowed)
+			return nil, preparationFailure(errCategoryUnknownRuntime)
 		}
 	}
 	advertised := runtimeAdvertisedSelectors(entries, selected)
@@ -442,7 +442,7 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 			}
 		}
 		if !found {
-			return nil, preparationFailure(errCategoryFieldNotAllowed)
+			return nil, preparationFailure(errCategoryUnknownRuntime)
 		}
 	}
 

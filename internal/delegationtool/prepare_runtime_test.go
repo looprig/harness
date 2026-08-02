@@ -62,8 +62,8 @@ func TestPrepareCallRuntimeSelectorErrorsAreBounded(t *testing.T) {
 		args     string
 		category string
 	}{
-		{name: "unknown harness is not allowed", args: `{"action":"start","description":"d","prompt":"p","subagent_type":"worker","agent_harness":"missing"}`, category: errCategoryFieldNotAllowed},
-		{name: "unknown model is not allowed", args: `{"action":"start","description":"d","prompt":"p","subagent_type":"worker","agent_harness":"claude-code","model":"missing"}`, category: errCategoryFieldNotAllowed},
+		{name: "unknown advertised harness is unknown runtime", args: `{"action":"start","description":"d","prompt":"p","subagent_type":"worker","agent_harness":"missing"}`, category: errCategoryUnknownRuntime},
+		{name: "unknown advertised model is unknown runtime", args: `{"action":"start","description":"d","prompt":"p","subagent_type":"worker","agent_harness":"claude-code","model":"missing"}`, category: errCategoryUnknownRuntime},
 		{name: "incompatible effort is unknown runtime", args: `{"action":"start","description":"d","prompt":"p","subagent_type":"worker","agent_harness":"claude-code","model":"sonnet","effort":"low"}`, category: errCategoryUnknownRuntime},
 		{name: "unknown role is unknown runtime", args: `{"action":"start","description":"d","prompt":"p","subagent_type":"missing"}`, category: errCategoryUnknownRuntime},
 	}
