@@ -186,7 +186,7 @@ func encodePayload(ev Event) ([]byte, error) {
 		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged,
 		LoopExternalToolsetChanged, ContextMeasured,
 		CompactionCommitted, CompactionRejected, CompactWaiterResolved, CompactWaiterRejected,
-		ForeignSessionBound, TurnRejected,
+		ForeignSessionBound, LoopAgentSessionBound, TurnRejected,
 		UserInputRequested, TurnInterrupted,
 		TurnStarted, TurnFoldedInto, InputCancelled, TurnDone,
 		PermissionDecided, GatePrepared, GateOpened:
@@ -636,6 +636,8 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[CompactWaiterRejected](tag, data)
 	case "ForeignSessionBound":
 		return decodePlain[ForeignSessionBound](tag, data)
+	case "LoopAgentSessionBound":
+		return decodePlain[LoopAgentSessionBound](tag, data)
 	case "TurnStarted":
 		return decodePlain[TurnStarted](tag, data)
 	case "StepDone":

@@ -43,6 +43,7 @@ var (
 	_ Event = LoopModeChanged{}
 	_ Event = LoopExternalToolsetChanged{}
 	_ Event = ForeignSessionBound{}
+	_ Event = LoopAgentSessionBound{}
 	_ Event = CompactionStarted{}
 	_ Event = CompactionCommitted{}
 	_ Event = CompactionRejected{}

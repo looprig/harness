@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -1474,7 +1475,20 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	// ctx param, so it publishes on the session lifetime (s.sessionCtx). The header
 	// (Coordinates/Cause + minted EventID/CreatedAt) was stamped above before the loop
 	// was built.
-	ev := event.LoopStarted{Header: startedHeader, Runtime: runtimeForModel(liveModel), ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: bound.DisplayName(), Description: bound.Description()}
+	identity := bound.RuntimeIdentity()
+	var agentRuntime *event.AgentRuntime
+	if identity.Profile != "" || identity.ModelAlias != "" || identity.Effort != model.EffortNone {
+		harness := string(identity.Profile)
+		if i := strings.LastIndexByte(harness, '/'); i >= 0 {
+			harness = harness[i+1:]
+		}
+		smallModel := ""
+		if runtime != nil {
+			smallModel = string(runtime.SmallModel)
+		}
+		agentRuntime = &event.AgentRuntime{Harness: harness, Profile: string(identity.Profile), CredentialMode: string(loop.CredentialGatewayBacked), ModelAlias: string(identity.ModelAlias), SmallModelAlias: smallModel}
+	}
+	ev := event.LoopStarted{Header: startedHeader, Runtime: runtimeForModel(liveModel), AgentRuntime: agentRuntime, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: bound.DisplayName(), Description: bound.Description()}
 	if admission != nil {
 		ev.InitialRequestID = admission.requestID
 	}
@@ -1495,6 +1509,11 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			_ = admission.sub.Close()
 		}
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: err}
+	}
+	if foreignSID != "" {
+		if err := publish(s.sessionCtx, event.LoopAgentSessionBound{Header: startedHeader, ACPSessionID: foreignSID}); err != nil {
+			return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: err}
+		}
 	}
 	if admission != nil {
 		admission.publisher.release()

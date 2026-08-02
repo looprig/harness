@@ -14,6 +14,7 @@ import (
 	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
+	model "github.com/looprig/inference/model"
 )
 
 // fixedForeignSID is the deterministic session id the fake foreign Builder returns, so
@@ -267,5 +268,93 @@ func TestForeignNewLoop(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestForeignBuilderEmitsAgentSessionBindingOnce(t *testing.T) {
+	t.Parallel()
+
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := delegateChild("child", "child")
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex", Default: true,
+		Credential: loop.CredentialGatewayBacked, DefaultModel: "luna", SmallModel: "small",
+		Models: []loop.RuntimeModelOption{
+			{Alias: "luna", Target: validModel("luna-target"), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
+			{Alias: "small", Target: validModel("small-target"), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recordingEventAppender{}
+	builder := &fakeForeignBuilder{sid: fixedForeignSID, backend: newFakeBackend()}
+	registry := &foreign.BuilderRegistry{}
+	if err := registry.Register("acp/codex", builder.build, builder.buildRestored); err != nil {
+		t.Fatal(err)
+	}
+	s := newDelegationSession(t, parent, []Option{
+		WithEventAppender(rec),
+		WithRuntimeCatalog(catalog),
+		WithForeignBuilderRegistry(registry),
+	}, child)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+	result, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart,
+		Agent:     "child",
+		Message:   "go",
+		Wait:      false,
+		Runtime: &tool.DelegateRuntime{
+			Harness:    "codex",
+			Profile:    "acp/codex",
+			Model:      "luna",
+			SmallModel: "small",
+			Effort:     "high",
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	var started event.LoopStarted
+	var bound []event.LoopAgentSessionBound
+	startedIndex, boundIndex := -1, -1
+	for index, ev := range rec.snapshot() {
+		switch typed := ev.(type) {
+		case event.LoopStarted:
+			if typed.LoopID == result.DelegateID {
+				started = typed
+				startedIndex = index
+			}
+		case event.LoopAgentSessionBound:
+			if typed.LoopID == result.DelegateID {
+				bound = append(bound, typed)
+				boundIndex = index
+			}
+		}
+	}
+	if startedIndex < 0 {
+		t.Fatal("child LoopStarted was not recorded")
+	}
+	if len(bound) != 1 {
+		t.Fatalf("child LoopAgentSessionBound count = %d, want 1", len(bound))
+	}
+	if boundIndex <= startedIndex {
+		t.Fatalf("LoopAgentSessionBound index = %d, LoopStarted index = %d; want binding after start", boundIndex, startedIndex)
+	}
+	if bound[0].ACPSessionID != fixedForeignSID {
+		t.Errorf("ACPSessionID = %q, want %q", bound[0].ACPSessionID, fixedForeignSID)
+	}
+	if started.ForeignSID != fixedForeignSID {
+		t.Errorf("LoopStarted.ForeignSID = %q, want %q", started.ForeignSID, fixedForeignSID)
+	}
+	if started.AgentRuntime == nil {
+		t.Fatal("LoopStarted.AgentRuntime = nil, want resolved runtime identity")
+	}
+	if got := *started.AgentRuntime; got != (event.AgentRuntime{
+		Harness: "codex", Profile: "acp/codex", CredentialMode: "gateway-backed",
+		ModelAlias: "luna", SmallModelAlias: "small",
+	}) {
+		t.Fatalf("LoopStarted.AgentRuntime = %+v, want resolved identity", got)
 	}
 }

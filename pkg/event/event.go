@@ -430,7 +430,8 @@ type LoopStarted struct {
 	Header
 	// Runtime is the initial resolved model identity, limits, and effort. It is
 	// durable so restore and catalog repair never consult a mutable catalog.
-	Runtime ModelRuntime `json:"runtime,omitzero"`
+	Runtime      ModelRuntime  `json:"runtime,omitzero"`
+	AgentRuntime *AgentRuntime `json:"agent_runtime,omitzero"`
 	// ParentToolUseID is the durable provider tool-use id of the Subagent tool call
 	// that spawned this loop (content.ToolUseBlock.ID), empty for loops not spawned by
 	// a tool call (e.g. the primary/root). It is the durable carrier that correlates a
@@ -457,6 +458,17 @@ type LoopStarted struct {
 	Description string `json:"description,omitzero"`
 }
 
+// AgentRuntime is the bounded, secret-free identity of the runtime selected for
+// a loop. It is additive so legacy LoopStarted records decode with nil.
+type AgentRuntime struct {
+	Harness         string `json:"harness,omitzero"`
+	Profile         string `json:"profile,omitzero"`
+	CredentialMode  string `json:"credential_mode,omitzero"`
+	ModelAlias      string `json:"model_alias,omitzero"`
+	SmallModelAlias string `json:"small_model_alias,omitzero"`
+	ACPSessionID    string `json:"acp_session_id,omitzero"`
+}
+
 // DelegateRequestAccepted is the durable actor-side acceptance of a follow-up
 // machine NoFold request, emitted before it can queue or start.
 type DelegateRequestAccepted struct {
@@ -473,6 +485,14 @@ type ForeignSessionBound struct {
 	loopScoped
 	Header
 	ForeignSID string `json:"foreign_sid"`
+}
+
+// LoopAgentSessionBound records the durable foreign agent session binding for a loop.
+type LoopAgentSessionBound struct {
+	enduring
+	loopScoped
+	Header
+	ACPSessionID string `json:"acp_session_id"`
 }
 
 func (SessionStarted) isEvent()          {}
@@ -493,3 +513,4 @@ func (LoopIdle) isEvent()                {}
 func (LoopStarted) isEvent()             {}
 func (DelegateRequestAccepted) isEvent() {}
 func (ForeignSessionBound) isEvent()     {}
+func (LoopAgentSessionBound) isEvent()   {}

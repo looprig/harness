@@ -59,6 +59,8 @@ const (
 	FieldDefinition         FieldName = "Definition"
 	FieldRunID              FieldName = "RunID"
 	FieldRuntime            FieldName = "Runtime"
+	FieldAgentRuntime       FieldName = "AgentRuntime"
+	FieldACPSessionID       FieldName = "ACPSessionID"
 	FieldDuration           FieldName = "Duration"
 	FieldStage              FieldName = "Stage"
 	FieldReasonCode         FieldName = "ReasonCode"
@@ -196,7 +198,19 @@ func validateEventBody(ev Event) error {
 	case IntegrationStatus:
 		return validateIntegrationStatus(e)
 	case LoopStarted:
-		return validateModelRuntime("LoopStarted", e.Runtime)
+		if e.Runtime == (ModelRuntime{}) && e.AgentRuntime == nil {
+			return nil
+		}
+		if err := validateModelRuntime("LoopStarted", e.Runtime); err != nil {
+			return err
+		}
+		if e.AgentRuntime != nil {
+			return validateAgentRuntime(*e.AgentRuntime)
+		}
+	case LoopAgentSessionBound:
+		if !validAgentRuntimeIdentifier(e.ACPSessionID) || e.ACPSessionID == "" {
+			return &InvalidEventError{Event: "LoopAgentSessionBound", Field: FieldACPSessionID, Rule: RuleInvalid}
+		}
 	case ContextMeasured:
 		if e.Visibility() != Public {
 			return &InvalidEventError{Event: "ContextMeasured", Field: FieldVisibility, Rule: RuleInvalid}
@@ -357,6 +371,7 @@ func invalidPermissionReview(name EventName, field FieldName) error {
 // the journal, and a legacy (SchemaVersion 0) manifest projection is never
 // persisted.
 const (
+	maxAgentRuntimeIdentityBytes = 128
 	// maxRuntimeManifestIdentifierBytes bounds the current-schema runtime
 	// identity fields. They are opaque identifiers at this boundary: the
 	// producer owns their meaning, while the journal only accepts the bounded,
@@ -389,6 +404,35 @@ const (
 	MaxConfigMessageLen = 4096
 	MaxConfigActorLen   = 1024
 )
+
+func validateAgentRuntime(v AgentRuntime) error {
+	for _, value := range []string{v.Harness, v.Profile, v.CredentialMode, v.ModelAlias, v.SmallModelAlias, v.ACPSessionID} {
+		if value != "" && !validAgentRuntimeIdentifier(value) {
+			return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+		}
+	}
+	return nil
+}
+
+func validAgentRuntimeIdentifier(value string) bool {
+	if value == "" {
+		return true
+	}
+	if len(value) > maxAgentRuntimeIdentityBytes || !utf8.ValidString(value) || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+		for _, r := range segment {
+			if r == '\\' || r == ':' || r == 0 || unicode.IsControl(r) || unicode.IsSpace(r) {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 // validateConfigurationAdopted enforces the config-epoch invariants: epoch 1
 // belongs to SessionStarted so an adoption is always >= 2, the adopted
@@ -842,6 +886,8 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "CompactWaiterRejected", loopProfile(), true
 	case ForeignSessionBound:
 		return "ForeignSessionBound", loopProfile(), true
+	case LoopAgentSessionBound:
+		return "LoopAgentSessionBound", loopProfile(), true
 	case TokenDelta:
 		return "TokenDelta", stepProfile(), true
 	case TurnStarted:
