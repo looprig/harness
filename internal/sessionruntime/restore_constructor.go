@@ -497,18 +497,6 @@ func restoreTopologySession(
 		}
 		crashClosures = append(crashClosures, closure)
 	}
-	// Correlation is seeded only after every checked crash closure committed, so an open
-	// wait:false request resolves as Interrupted after restore rather than unknown.
-	tombstoned := make(map[uuid.UUID]struct{})
-	for _, plan := range plans {
-		if plan.tombstoned || plan.runtimeMismatch != nil {
-			tombstoned[plan.started.LoopID] = struct{}{}
-		}
-	}
-	if err := seedResolvedDelegateRecords(manager, allRecords, all, crashClosures, tombstoned); err != nil {
-		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: err})
-	}
-
 	// (6b) Materialize the workspace ref selected by the latest durable transition BEFORE
 	// declaring the restore done, so
 	// RestoreDone is appended only if the workspace is also restored (fail closed — the
@@ -573,6 +561,20 @@ func restoreTopologySession(
 	// session context (tearing down the seeded loops) before recording a RestoreErrored.
 	if err := attachAndActivate(s, all, plans, rootLoopID); err != nil {
 		return abortAccepted(s, err)
+	}
+	// Correlation is seeded only after every checked crash closure committed AND every
+	// restored loop was attached. A child can fail during restored backend construction
+	// after the initial fold (and be tombstoned by attachAndActivate), so seeding before
+	// attachment would leave that child's durable requests with stale Interrupted or
+	// Completed results instead of Failed.
+	tombstoned := make(map[uuid.UUID]struct{})
+	for _, plan := range plans {
+		if plan.tombstoned || plan.runtimeMismatch != nil {
+			tombstoned[plan.started.LoopID] = struct{}{}
+		}
+	}
+	if err := seedResolvedDelegateRecords(manager, allRecords, all, crashClosures, tombstoned); err != nil {
+		return abortAccepted(s, &RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
 	// RestoreDone is the commit point: every loop is bound, crash-closed, built,
 	// attached, and the active selection has been validated before this append.
@@ -897,25 +899,44 @@ func classifyRestoredChildRuntimeFailure(err error) (*RestoreRuntimeMismatchErro
 }
 
 func (s *Session) attachRestoredTombstonedLoop(plan loopPlan, parent loop.Provenance) error {
+	var tombstone event.LoopRestoreTombstoned
 	if !plan.tombstoned {
 		hdr, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{SessionID: s.sessionID, LoopID: plan.started.LoopID}})
 		if err != nil {
 			return &RestoreError{Kind: RestoreIDGenerationFailed, Cause: err}
 		}
-		ev := event.LoopRestoreTombstoned{Header: hdr, Category: restoreTombstoneCategory(plan.runtimeMismatch)}
-		if err := s.PublishEventChecked(context.Background(), ev); err != nil {
-			return &RestoreError{Kind: RestoreAppendFailed, Cause: err}
-		}
+		tombstone = event.LoopRestoreTombstoned{Header: hdr, Category: restoreTombstoneCategory(plan.runtimeMismatch)}
 	}
 	_, cancel := context.WithCancel(s.sessionCtx)
 	liveMode, liveModel := liveViewFor(plan.bound, foldLoopInference(plan.events))
-	s.loopsMu.Lock()
-	s.loops[plan.started.LoopID] = &loopHandle{
+	handle := &loopHandle{
 		id: plan.started.LoopID, owner: s, bound: plan.bound, bindings: plan.bindings,
 		parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel,
 		state: tool.DelegateStatusFailed, tombstoned: true,
 	}
+	s.loopsMu.Lock()
+	if existing, ok := s.loops[plan.started.LoopID]; ok && existing.tombstoned {
+		s.loopsMu.Unlock()
+		cancel()
+		return nil
+	}
+	s.loops[plan.started.LoopID] = handle
 	s.loopsMu.Unlock()
+	if plan.tombstoned {
+		return nil
+	}
+	// Register the failed handle before fanout. Subscribers may synchronously inspect
+	// ownership/status after receiving the durable tombstone, and must never observe the
+	// event before the loop is addressable.
+	if err := s.PublishEventChecked(context.Background(), tombstone); err != nil {
+		s.loopsMu.Lock()
+		if current, ok := s.loops[plan.started.LoopID]; ok && current == handle {
+			delete(s.loops, plan.started.LoopID)
+		}
+		s.loopsMu.Unlock()
+		cancel()
+		return &RestoreError{Kind: RestoreAppendFailed, Cause: err}
+	}
 	return nil
 }
 

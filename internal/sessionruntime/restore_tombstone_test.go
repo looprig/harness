@@ -176,6 +176,12 @@ func TestAttachAndActivateTombstonesRuntimeMismatchFromRestoredBuilder(t *testin
 	if err := attachAndActivate(s, []event.Event{started}, []loopPlan{plan}, rootID); err != nil {
 		t.Fatalf("attachAndActivate: %v", err)
 	}
+	if got := s.ActiveLoopID(); got != rootID {
+		t.Fatalf("active loop = %v, want root %v", got, rootID)
+	}
+	if got := s.spawnedCount(); got != 0 {
+		t.Fatalf("spawned count = %d, want unchanged 0", got)
+	}
 	s.loopsMu.RLock()
 	handle, ok := s.loops[childID]
 	s.loopsMu.RUnlock()
@@ -193,5 +199,167 @@ func TestAttachAndActivateTombstonesRuntimeMismatchFromRestoredBuilder(t *testin
 		}
 	case <-time.After(time.Second):
 		t.Fatal("runtime mismatch tombstone was not published")
+	}
+}
+
+func TestAttachAndActivateActiveChildRuntimeFailureIsFatal(t *testing.T) {
+	t.Parallel()
+	s, rootID, childID, plan := runtimeFailureRestoreFixture(t,
+		&RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}, nil)
+
+	err := attachAndActivate(s, []event.Event{
+		plan.started,
+		event.ActiveLoopChanged{ActiveLoopID: childID},
+	}, []loopPlan{plan}, rootID)
+	var restoreErr *RestoreError
+	var sessionErr *SessionError
+	if !errors.As(err, &restoreErr) || restoreErr.Kind != RestoreLoopFailed ||
+		!errors.As(err, &sessionErr) || sessionErr.Kind != SessionLoopExited {
+		t.Fatalf("attachAndActivate error = %v, want RestoreLoopFailed wrapping SessionLoopExited", err)
+	}
+	if got := s.ActiveLoopID(); got != rootID {
+		t.Fatalf("active loop = %v, want root %v after failed activation", got, rootID)
+	}
+}
+
+func TestAttachAndActivateUnrelatedChildRestoreErrorIsFatalWithoutTombstone(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("unrelated restored builder failure")
+	s, rootID, childID, plan := runtimeFailureRestoreFixture(t,
+		&RestoreError{Kind: RestoreLoopFailed, Cause: sentinel}, nil)
+
+	err := attachAndActivate(s, []event.Event{plan.started}, []loopPlan{plan}, rootID)
+	var restoreErr *RestoreError
+	if !errors.As(err, &restoreErr) || restoreErr.Kind != RestoreLoopFailed || !errors.Is(err, sentinel) {
+		t.Fatalf("attachAndActivate error = %v, want RestoreLoopFailed retaining unrelated cause", err)
+	}
+	if _, ok := s.Loop(childID); ok {
+		t.Fatal("unrelated child restore failure registered a tombstoned handle")
+	}
+	if got := s.ActiveLoopID(); got != rootID {
+		t.Fatalf("active loop = %v, want root %v", got, rootID)
+	}
+}
+
+func TestBuildRestoredSessionRootRuntimeFailureIsFatal(t *testing.T) {
+	t.Parallel()
+	sessionID, rootID := mustUUID(), mustUUID()
+	started := restoreRuntimeStarted(model.ModelKey{Provider: "provider", Model: "luna-target"})
+	started.Header = event.Header{
+		AgentName:   "worker",
+		Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: rootID},
+	}
+	ri := foldLoopInference([]event.Event{started})
+	ri.AgentSessionID = "root-agent-session"
+	bound := bindCfg(engineCfg(&stubLLM{}, loop.EngineNative, "system"), sessionID, rootID)
+	var err error
+	bound, err = restoreRuntimeBinding(started, bound, ri, restoreRuntimeCatalog(t), true, false)
+	if err != nil {
+		t.Fatalf("restoreRuntimeBinding: %v", err)
+	}
+
+	runtimeFailure := &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+	builder := &fakeForeignBuilder{err: runtimeFailure}
+	var registry foreign.BuilderRegistry
+	if err := registry.Register("acp/codex", builder.build, builder.buildRestored); err != nil {
+		t.Fatalf("registry.Register: %v", err)
+	}
+	restoreCtx, restoreCancel := context.WithCancel(context.Background())
+	t.Cleanup(restoreCancel)
+	s, err := buildRestoredSession(
+		restoreCtx, restoreCancel, bound,
+		tool.Bindings{SessionID: sessionID, LoopID: rootID},
+		sessionID, rootID, "", 0, foldLoop([]event.Event{started}), ri, nil,
+		fakeSessionJournal{}, event.NewFactory(uuid.New, time.Now), uuid.New, time.Now,
+		WithForeignBuilderRegistry(&registry),
+	)
+	if s != nil {
+		t.Fatal("buildRestoredSession returned a session after root runtime failure")
+	}
+	var restoreErr *RestoreError
+	if !errors.As(err, &restoreErr) || restoreErr.Kind != RestoreLoopFailed || !errors.Is(err, runtimeFailure) {
+		t.Fatalf("buildRestoredSession error = %v, want RestoreLoopFailed retaining runtime failure", err)
+	}
+}
+
+func TestTombstoneCommitObserverCanLookupFailedChild(t *testing.T) {
+	t.Parallel()
+	var observed, found, failed bool
+	s, _, _, plan := runtimeFailureRestoreFixture(t,
+		&RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable},
+		func(s *Session, childID uuid.UUID, ev event.Event) {
+			if _, ok := ev.(event.LoopRestoreTombstoned); !ok {
+				return
+			}
+			observed = true
+			handle, ok := s.Loop(childID)
+			found = ok
+			if loopHandle, ok := handle.(*loopHandle); ok {
+				failed = loopHandle.tombstoned && loopHandle.mechanicalState() == tool.DelegateStatusFailed
+			}
+		})
+
+	if err := s.attachRestoredTombstonedLoop(plan, loop.Provenance{LoopID: plan.started.Cause.Coordinates.LoopID}); err != nil {
+		t.Fatalf("attachRestoredTombstonedLoop: %v", err)
+	}
+	if !observed || !found || !failed {
+		t.Fatalf("commit observer state: observed=%v found=%v failed=%v; want all true", observed, found, failed)
+	}
+}
+
+func runtimeFailureRestoreFixture(
+	t *testing.T,
+	builderErr error,
+	observer func(*Session, uuid.UUID, event.Event),
+) (*Session, uuid.UUID, uuid.UUID, loopPlan) {
+	t.Helper()
+	sessionID, rootID, childID := mustUUID(), mustUUID(), mustUUID()
+	started := restoreRuntimeStarted(model.ModelKey{Provider: "provider", Model: "luna-target"})
+	started.Header = event.Header{
+		AgentName:   "worker",
+		Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: childID},
+		Cause:       identity.Cause{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: rootID}},
+	}
+	bound := bindCfg(engineCfg(&stubLLM{}, loop.EngineNative, "system"), sessionID, childID)
+	var err error
+	bound, err = restoreRuntimeBinding(started, bound, foldLoopInference([]event.Event{started}), restoreRuntimeCatalog(t), true, false)
+	if err != nil {
+		t.Fatalf("restoreRuntimeBinding: %v", err)
+	}
+	events := []event.Event{
+		started,
+		event.LoopAgentSessionBound{Header: started.Header, ACPSessionID: "child-agent-session"},
+	}
+
+	builder := &fakeForeignBuilder{err: builderErr}
+	var registry foreign.BuilderRegistry
+	if err := registry.Register("acp/codex", builder.build, builder.buildRestored); err != nil {
+		t.Fatalf("registry.Register: %v", err)
+	}
+	s := &Session{
+		sessionID:       sessionID,
+		sessionCtx:      context.Background(),
+		factory:         event.NewFactory(uuid.New, time.Now),
+		loops:           make(map[uuid.UUID]*loopHandle),
+		foreignRegistry: &registry,
+	}
+	if observer == nil {
+		s.hub = hub.New(sessionID)
+	} else {
+		s.hub = hub.New(sessionID, hub.WithCommitObserver(func(ev event.Event) { observer(s, childID, ev) }))
+	}
+	rootBackend := newFakeBackend()
+	s.loops[rootID] = &loopHandle{id: rootID, owner: s, backend: rootBackend, bound: bound, state: tool.DelegateStatusIdle}
+	s.activeLoopID = rootID
+	t.Cleanup(func() {
+		rootBackend.CommandSink() <- command.Shutdown{Ack: make(chan error, 1)}
+	})
+
+	return s, rootID, childID, loopPlan{
+		started:  started,
+		bound:    bound,
+		bindings: tool.Bindings{SessionID: sessionID, LoopID: childID},
+		folded:   foldLoop(events),
+		events:   events,
 	}
 }
