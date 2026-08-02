@@ -412,6 +412,32 @@ type ActiveLoopChanged struct {
 	ActiveLoopID   uuid.UUID `json:"active_loop_id"`
 }
 
+// LoopRestoreTombstoneCategory is the bounded reason a restored child was kept
+// in the durable topology without a live backend.
+const (
+	LoopRestoreTombstoneRuntimeMismatch    = "runtime_mismatch"
+	LoopRestoreTombstoneRuntimeUnavailable = "runtime_unavailable"
+)
+
+func ValidLoopRestoreTombstoneCategory(category string) bool {
+	switch category {
+	case LoopRestoreTombstoneRuntimeMismatch, LoopRestoreTombstoneRuntimeUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+// LoopRestoreTombstoned records that a non-root child survived restore as a
+// closed, failed registry entry because its durable runtime could not be
+// re-authorized against the current runtime catalog.
+type LoopRestoreTombstoned struct {
+	enduring
+	loopScoped
+	Header
+	Category string `json:"category"`
+}
+
 // LoopIdle is emitted when a loop parks with no active turn. Header.SessionID and
 // Header.LoopID are set; TurnID/StepID are zero. It drives session quiescence.
 type LoopIdle struct {
@@ -509,6 +535,7 @@ func (ConfigurationAdopted) isEvent()    {}
 func (WorkspaceCheckpointed) isEvent()   {}
 func (WorkspaceRestored) isEvent()       {}
 func (ActiveLoopChanged) isEvent()       {}
+func (LoopRestoreTombstoned) isEvent()   {}
 func (LoopIdle) isEvent()                {}
 func (LoopStarted) isEvent()             {}
 func (DelegateRequestAccepted) isEvent() {}

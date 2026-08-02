@@ -591,10 +591,11 @@ type loopHandle struct {
 	// full binding set before dispatching on Engine. It is therefore NOT a signal for
 	// whether a loop can host harness tools — use bound.Engine() for that. (A foreign loop
 	// is refused by ReplaceExternalTools on its engine, not on this field.)
-	bindings tool.Bindings
-	backend  loop.Backend
-	parent   loop.Provenance
-	cancel   context.CancelFunc
+	bindings   tool.Bindings
+	backend    loop.Backend
+	tombstoned bool
+	parent     loop.Provenance
+	cancel     context.CancelFunc
 
 	// liveMu guards the live view (liveMode/liveModel) — the CURRENT selection
 	// Handle.Mode()/Model() report. The loop actor is the authoritative owner of the
@@ -1036,6 +1037,9 @@ func (s *Session) SetActiveLoop(ctx context.Context, id uuid.UUID) error {
 	}
 	if closing {
 		return &SessionError{Kind: SessionClosing}
+	}
+	if target.backend == nil {
+		return &SessionError{Kind: SessionLoopExited}
 	}
 	select {
 	case <-target.backend.DoneChan():
@@ -1886,6 +1890,9 @@ func (s *Session) interruptLoopID(loopID uuid.UUID) error {
 	if !ok {
 		return &SessionError{Kind: SessionLoopNotFound}
 	}
+	if l == nil {
+		return &SessionError{Kind: SessionLoopExited}
+	}
 	s.interruptLoop(loopID, l)
 	return nil
 }
@@ -1910,6 +1917,9 @@ func (s *Session) cancelDelegateRequest(loopID, requestID uuid.UUID) (command.De
 	l, ok := s.loopFor(loopID)
 	if !ok {
 		return command.DelegateCancelNoop, &SessionError{Kind: SessionLoopNotFound}
+	}
+	if l == nil {
+		return command.DelegateCancelNoop, &SessionError{Kind: SessionLoopExited}
 	}
 	id, err := s.newID()
 	if err != nil {
@@ -2063,6 +2073,9 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 	l, ok := s.loopFor(loopID)
 	if !ok {
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopNotFound}
+	}
+	if l == nil {
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
 	}
 	id, err := s.newCommandID()
 	if err != nil {

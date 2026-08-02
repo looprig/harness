@@ -168,7 +168,11 @@ func (m *delegationManager) catalogFor(parent loop.Definition) (loop.RuntimeCata
 
 // seedResolvedDelegateRecords reconstructs durable delegate correlation from required
 // machine NoFold intents, then overlays exact started-turn terminals and crash closures.
-func seedResolvedDelegateRecords(m *delegationManager, records []journal.JournalRecord, replayed, closures []event.Event) error {
+func seedResolvedDelegateRecords(m *delegationManager, records []journal.JournalRecord, replayed, closures []event.Event, tombstonedSet ...map[uuid.UUID]struct{}) error {
+	tombstoned := map[uuid.UUID]struct{}{}
+	if len(tombstonedSet) > 0 && tombstonedSet[0] != nil {
+		tombstoned = tombstonedSet[0]
+	}
 	intents := make(map[uuid.UUID]uuid.UUID)
 	for _, record := range records {
 		commandRecord, ok := record.(journal.CommandRecord)
@@ -213,6 +217,11 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	for requestID, terminal := range foldDelegateTerminals(combined) {
 		if _, admitted := index[requestID]; admitted {
 			index[requestID] = terminal
+		}
+	}
+	for requestID, childID := range intents {
+		if _, ok := tombstoned[childID]; ok {
+			index[requestID] = resolvedRequest{childID: childID, status: tool.DelegateStatusFailed}
 		}
 	}
 	// A queued request may be durably cancelled before TurnStarted, so it has no
@@ -697,7 +706,7 @@ func (c *scopedController) interrupt(s *Session, req tool.DelegateRequest) (tool
 // when delegate_id is omitted. It never returns a raw event cursor or child transcript.
 func (c *scopedController) status(s *Session, req tool.DelegateRequest) (tool.DelegateResult, error) {
 	if !req.DelegateID.IsZero() {
-		if err := c.ownsChild(s, req.DelegateID); err != nil {
+		if err := c.ownsChildForStatus(s, req.DelegateID); err != nil {
 			return tool.DelegateResult{}, err
 		}
 		return tool.DelegateResult{
@@ -747,11 +756,25 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 // ownsChild fails closed unless childID is a registered loop whose parent is exactly
 // this controller's bound parent — rejecting siblings, ancestors, and unrelated loops.
 func (c *scopedController) ownsChild(s *Session, childID uuid.UUID) error {
+	return c.ownsChildWithClosed(s, childID, false)
+}
+
+func (c *scopedController) ownsChildForStatus(s *Session, childID uuid.UUID) error {
+	return c.ownsChildWithClosed(s, childID, true)
+}
+
+func (c *scopedController) ownsChildWithClosed(s *Session, childID uuid.UUID, allowClosed bool) error {
 	s.loopsMu.RLock()
 	handle, ok := s.loops[childID]
 	s.loopsMu.RUnlock()
-	if !ok || handle.parent.LoopID != c.parentLoopID {
+	if !ok {
 		return &DelegateError{Kind: DelegateNotOwned, DelegateID: childID}
+	}
+	if handle.parent.LoopID != c.parentLoopID {
+		return &DelegateError{Kind: DelegateNotOwned, DelegateID: childID}
+	}
+	if handle.tombstoned && !allowClosed {
+		return &DelegateError{Kind: DelegateClosed, DelegateID: childID}
 	}
 	return nil
 }
@@ -779,6 +802,9 @@ func (c *scopedController) childStatus(s *Session, childID uuid.UUID) tool.Deleg
 	s.loopsMu.RUnlock()
 	if !ok {
 		return tool.DelegateStatusUnknown
+	}
+	if handle.backend == nil {
+		return tool.DelegateStatusFailed
 	}
 	select {
 	case <-handle.backend.DoneChan():
@@ -921,6 +947,9 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 	if !ok {
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopNotFound}
 	}
+	if backend == nil {
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+	}
 	id, err := s.newCommandID()
 	if err != nil {
 		return uuid.UUID{}, err
@@ -976,6 +1005,7 @@ const (
 	DelegateInterruptPending
 	DelegateRuntimeUnavailable
 	DelegateRuntimeInvalid
+	DelegateClosed
 )
 
 // DelegateError is the typed delegation refusal. Callers errors.As to inspect Kind and
@@ -1014,6 +1044,8 @@ func (e *DelegateError) Error() string {
 		return "delegation: loop is interrupt-pending; new delegate work is not admitted until the interrupt barrier releases"
 	case DelegateRuntimeUnavailable, DelegateRuntimeInvalid:
 		return "delegation: runtime selection is unavailable"
+	case DelegateClosed:
+		return "delegation: delegate is closed"
 	default:
 		return "delegation: refused"
 	}

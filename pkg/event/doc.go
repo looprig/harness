@@ -44,6 +44,7 @@ var (
 	_ Event = LoopExternalToolsetChanged{}
 	_ Event = ForeignSessionBound{}
 	_ Event = LoopAgentSessionBound{}
+	_ Event = LoopRestoreTombstoned{}
 	_ Event = CompactionStarted{}
 	_ Event = CompactionCommitted{}
 	_ Event = CompactionRejected{}

@@ -181,6 +181,7 @@ func encodePayload(ev Event) ([]byte, error) {
 		ConfigurationAdopted,
 		RestoreStarted, RestoreDone, WorkspaceCheckpointed, WorkspaceRestored,
 		ActiveLoopChanged,
+		LoopRestoreTombstoned,
 		HustleStarted, HustleCompleted, HustleFailed,
 		PermissionReviewStarted, PermissionReviewCompleted,
 		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged,
@@ -602,6 +603,8 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[WorkspaceRestored](tag, data)
 	case "ActiveLoopChanged":
 		return decodePlain[ActiveLoopChanged](tag, data)
+	case "LoopRestoreTombstoned":
+		return decodePlain[LoopRestoreTombstoned](tag, data)
 	case "HustleStarted":
 		return decodePlain[HustleStarted](tag, data)
 	case "HustleCompleted":

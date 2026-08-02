@@ -2,6 +2,7 @@ package sessionruntime
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/looprig/core/uuid"
@@ -498,7 +499,13 @@ func restoreTopologySession(
 	}
 	// Correlation is seeded only after every checked crash closure committed, so an open
 	// wait:false request resolves as Interrupted after restore rather than unknown.
-	if err := seedResolvedDelegateRecords(manager, allRecords, all, crashClosures); err != nil {
+	tombstoned := make(map[uuid.UUID]struct{})
+	for _, plan := range plans {
+		if plan.tombstoned || plan.runtimeMismatch != nil {
+			tombstoned[plan.started.LoopID] = struct{}{}
+		}
+	}
+	if err := seedResolvedDelegateRecords(manager, allRecords, all, crashClosures, tombstoned); err != nil {
 		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
 
@@ -613,9 +620,11 @@ type loopPlan struct {
 	// the same WorkspaceObservations instance) the declared tools got — rebuilding a fresh
 	// binding would hand external tools a separate observation set and break TOCTOU
 	// tracking across the toolset.
-	bindings tool.Bindings
-	events   []event.Event
-	folded   foldResult
+	bindings        tool.Bindings
+	events          []event.Event
+	folded          foldResult
+	runtimeMismatch *RestoreRuntimeMismatchError
+	tombstoned      bool
 }
 
 // discoverRoots scans the full UNNARROWED replay for every LoopStarted, collecting the
@@ -726,12 +735,31 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		plans[i].folded = folded
 		ri := foldLoopInference(plans[i].events)
 		catalog, hasCatalog := manager.catalogFor(plans[i].definition)
-		plans[i].bound, foldErr = restoreRuntimeBinding(plans[i].started, plans[i].bound, ri, catalog, hasCatalog, findForeignSID(plans[i].events) != "")
-		if foldErr != nil {
-			return nil, loopPlan{}, foldErr
+		bound, runtimeErr := restoreRuntimeBinding(plans[i].started, plans[i].bound, ri, catalog, hasCatalog, findForeignSID(plans[i].events) != "")
+		if runtimeErr != nil {
+			var mismatch *RestoreRuntimeMismatchError
+			if !errors.As(runtimeErr, &mismatch) || i == activeIndex {
+				return nil, loopPlan{}, runtimeErr
+			}
+			plans[i].runtimeMismatch = mismatch
+		} else {
+			plans[i].bound = bound
+		}
+		plans[i].tombstoned = hasLoopRestoreTombstone(plans[i].events)
+		if plans[i].tombstoned && i == activeIndex {
+			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopExited}}
 		}
 	}
 	return plans, plans[activeIndex], nil
+}
+
+func hasLoopRestoreTombstone(events []event.Event) bool {
+	for _, ev := range events {
+		if _, ok := ev.(event.LoopRestoreTombstoned); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // restoreRuntimeBinding re-authorizes a durable adapter selection against the
@@ -801,6 +829,12 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 			continue
 		}
 		parent := loop.Provenance{LoopID: plan.started.Cause.Coordinates.LoopID, TurnID: plan.started.Cause.Coordinates.TurnID, StepID: plan.started.Cause.Coordinates.StepID}
+		if plan.runtimeMismatch != nil || plan.tombstoned {
+			if err := s.attachRestoredTombstonedLoop(plan, parent); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.bindings, plan.folded, foldLoopInference(plan.events), findForeignSID(plan.events)); err != nil {
 			return err
 		}
@@ -809,6 +843,11 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 	for _, ev := range all {
 		if changed, ok := ev.(event.ActiveLoopChanged); ok {
 			activeID = changed.ActiveLoopID
+		}
+	}
+	for _, plan := range plans {
+		if (plan.tombstoned || plan.runtimeMismatch != nil) && plan.started.LoopID == activeID {
+			return &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopExited}}
 		}
 	}
 	if _, ok := s.Loop(activeID); !ok {
@@ -820,6 +859,29 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 		fault := s.faultErr
 		s.loopsMu.Unlock()
 		return &RestoreError{Kind: RestoreAppendFailed, Cause: fault}
+	}
+	s.loopsMu.Unlock()
+	return nil
+}
+
+func (s *Session) attachRestoredTombstonedLoop(plan loopPlan, parent loop.Provenance) error {
+	if !plan.tombstoned {
+		hdr, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{SessionID: s.sessionID, LoopID: plan.started.LoopID}})
+		if err != nil {
+			return &RestoreError{Kind: RestoreIDGenerationFailed, Cause: err}
+		}
+		ev := event.LoopRestoreTombstoned{Header: hdr, Category: event.LoopRestoreTombstoneRuntimeMismatch}
+		if err := s.PublishEventChecked(context.Background(), ev); err != nil {
+			return &RestoreError{Kind: RestoreAppendFailed, Cause: err}
+		}
+	}
+	_, cancel := context.WithCancel(s.sessionCtx)
+	liveMode, liveModel := liveViewFor(plan.bound, foldLoopInference(plan.events))
+	s.loopsMu.Lock()
+	s.loops[plan.started.LoopID] = &loopHandle{
+		id: plan.started.LoopID, owner: s, bound: plan.bound, bindings: plan.bindings,
+		parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel,
+		state: tool.DelegateStatusFailed, tombstoned: true,
 	}
 	s.loopsMu.Unlock()
 	return nil

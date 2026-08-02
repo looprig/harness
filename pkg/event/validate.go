@@ -49,6 +49,7 @@ const (
 	FieldCause              FieldName = "Cause"
 	FieldCommandID          FieldName = "CommandID"
 	FieldActiveLoopID       FieldName = "ActiveLoopID"
+	FieldCategory           FieldName = "Category"
 	FieldModel              FieldName = "Model"
 	FieldModelKey           FieldName = "ModelKey"
 	FieldContextLimits      FieldName = "ContextLimits"
@@ -184,6 +185,10 @@ func validateEventBody(ev Event) error {
 	case ActiveLoopChanged:
 		if e.ActiveLoopID.IsZero() {
 			return &InvalidEventError{Event: "ActiveLoopChanged", Field: FieldActiveLoopID, Rule: RuleRequired}
+		}
+	case LoopRestoreTombstoned:
+		if !ValidLoopRestoreTombstoneCategory(e.Category) {
+			return &InvalidEventError{Event: "LoopRestoreTombstoned", Field: FieldCategory, Rule: RuleInvalid}
 		}
 	case DelegateRequestAccepted:
 		if e.Cause.CommandID.IsZero() {
@@ -866,6 +871,8 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "WorkspaceRestored", sessionProfile(), true
 	case ActiveLoopChanged:
 		return "ActiveLoopChanged", sessionProfile(), true
+	case LoopRestoreTombstoned:
+		return "LoopRestoreTombstoned", loopProfile(), true
 	case IntegrationStatus:
 		// Session-scoped: an integration is a session-global resource, not a
 		// loop's. Same shape as WorkspaceCheckpointed — only SessionID set.
