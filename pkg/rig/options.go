@@ -28,6 +28,7 @@ const (
 	keyDelegationLimits                singletonKey = "delegation_limits"
 	keyConfigFingerprint               singletonKey = "config_fingerprint"
 	keyForeignBuilder                  singletonKey = "foreign_builders"
+	keyRuntimeCatalog                  singletonKey = "runtime_catalog"
 	keyGateCaps                        singletonKey = "gate_caps"
 	keyAllowConfigMismatch             singletonKey = "allow_config_mismatch"
 	keyRestoreDecider                  singletonKey = "restore_decider"
@@ -418,6 +419,12 @@ func WithForeignBuilders(builder foreign.Builder, restored foreign.RestoredBuild
 		}
 		return singletonCompile(keyForeignBuilder, sessionruntime.WithLifecycleForeignBuilders(builder, restored))(state)
 	}
+}
+
+// WithRuntimeCatalog installs the immutable parent-scoped runtime catalog
+// forwarded to every new and restored session.
+func WithRuntimeCatalog(catalog loop.RuntimeCatalog) Option {
+	return singletonCompile(keyRuntimeCatalog, sessionruntime.WithLifecycleRuntimeCatalog(catalog))
 }
 
 func WithGateCaps(caps GateCaps) Option {
