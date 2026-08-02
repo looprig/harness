@@ -3,6 +3,7 @@ package delegationtool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
@@ -165,6 +166,12 @@ func (s *SubagentTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolRe
 	}
 	result, err := s.controller.Execute(ctx, req)
 	if err != nil {
+		var modelFacing interface{ ModelFacingError() string }
+		if errors.As(err, &modelFacing) {
+			if message := modelFacing.ModelFacingError(); message != "" {
+				return tool.TextResult("error: " + message), nil
+			}
+		}
 		return tool.TextResult("error: subagent request failed"), nil
 	}
 	return tool.TextResult(formatResult(req, result)), nil

@@ -483,6 +483,9 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 	if !known {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownAgent, Agent: agent}
 	}
+	if c.hasRuntimeCatalog && !c.runtimeCatalog.HasEntries() {
+		return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeUnavailable}
+	}
 	mode := loop.ModeName(req.Mode)
 	if err := validateDelegateMode(childDef, mode); err != nil {
 		return tool.DelegateResult{}, err
@@ -1048,5 +1051,20 @@ func (e *DelegateError) Error() string {
 		return "delegation: delegate is closed"
 	default:
 		return "delegation: refused"
+	}
+}
+
+// ModelFacingError exposes only the fixed, bounded category needed by the
+// model-facing Subagent result. It deliberately omits all request fields;
+// ordinary delegation errors continue to use the generic tool-result error.
+func (e *DelegateError) ModelFacingError() string {
+	if e == nil {
+		return ""
+	}
+	switch e.Kind {
+	case DelegateRuntimeUnavailable, DelegateRuntimeInvalid:
+		return "runtime selection is unavailable"
+	default:
+		return ""
 	}
 }

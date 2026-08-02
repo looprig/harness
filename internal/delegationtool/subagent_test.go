@@ -123,6 +123,14 @@ type stubControllerError struct{ msg string }
 
 func (e *stubControllerError) Error() string { return e.msg }
 
+type modelFacingStubControllerError struct{}
+
+func (modelFacingStubControllerError) Error() string { return "internal detail" }
+
+func (modelFacingStubControllerError) ModelFacingError() string {
+	return "runtime selection is unavailable"
+}
+
 func mustParseUUID(t *testing.T, s string) uuid.UUID {
 	t.Helper()
 	id, err := uuid.Parse(s)
@@ -531,6 +539,7 @@ func TestSubagentWaitResultFormatting(t *testing.T) {
 		{name: "interrupted becomes error", result: tool.DelegateResult{DelegateID: del, Status: tool.DelegateStatusInterrupted}, want: "interrupted", wantSub: true},
 		{name: "timed out becomes error", result: tool.DelegateResult{DelegateID: del, Status: tool.DelegateStatusTimedOut}, want: "timed out", wantSub: true},
 		{name: "execute error", execErr: &stubControllerError{msg: "not owned"}, want: "request failed", wantSub: true},
+		{name: "bounded model-facing error", execErr: modelFacingStubControllerError{}, want: "runtime selection is unavailable", wantSub: true},
 	}
 	for _, tt := range tests {
 		tt := tt

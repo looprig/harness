@@ -1366,17 +1366,6 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			)
 		}
 	case loop.EngineAdapter:
-		if s.foreignRegistry == nil {
-			release()
-			cancel()
-			return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing}
-		}
-		builder, _, lookupErr := s.foreignRegistry.Builder(bound.RuntimeProfile())
-		if lookupErr != nil {
-			release()
-			cancel()
-			return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing, Cause: lookupErr}
-		}
 		selectedBound, selectErr := loop.SelectBoundMode(bound, startedMode)
 		if selectErr != nil {
 			release()
@@ -1384,8 +1373,27 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			return uuid.UUID{}, selectErr
 		}
 		bound = selectedBound
-		b, foreignSID, err = builder(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
-			func() (uuid.UUID, error) { return s.newID() }, s.factory)
+		if s.foreignRegistry != nil {
+			builder, _, lookupErr := s.foreignRegistry.Builder(bound.RuntimeProfile())
+			if lookupErr != nil {
+				release()
+				cancel()
+				return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing, Cause: lookupErr}
+			}
+			b, foreignSID, err = builder(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
+				func() (uuid.UUID, error) { return s.newID() }, s.factory)
+		} else if s.foreignBuild != nil {
+			// The legacy function-pair seam remains a valid composition path for
+			// adapter definitions. A profile-aware dispatcher supplied through
+			// WithForeignBuilders still performs its own bounded lookup; the
+			// session must not reject it merely because no registry option exists.
+			b, foreignSID, err = s.foreignBuild(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
+				func() (uuid.UUID, error) { return s.newID() }, s.factory)
+		} else {
+			release()
+			cancel()
+			return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing}
+		}
 	default:
 		if s.foreignBuild == nil {
 			release()
