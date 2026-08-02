@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -1345,6 +1344,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	loopCtx, cancel := context.WithCancel(s.sessionCtx)
 	var b loop.Backend
 	var foreignSID string
+	var agentSessionHeader event.Header
 	switch bound.Engine() {
 	case loop.EngineNative:
 		var compactor loopruntime.Compactor
@@ -1405,6 +1405,19 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			_ = admission.sub.Close()
 		}
 		return uuid.UUID{}, err
+	}
+	if foreignSID != "" && runtime != nil && runtime.Profile != "" {
+		agentSessionHeader, err = s.factory.Stamp(event.Header{
+			Coordinates: identity.Coordinates{SessionID: s.sessionID, LoopID: loopID},
+		})
+		if err != nil {
+			release()
+			cancel()
+			if admission != nil {
+				_ = admission.sub.Close()
+			}
+			return uuid.UUID{}, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
+		}
 	}
 	if admission != nil {
 		if err := s.appendDelegateCommand(admission.ctx, loopID, admission.command); err != nil {
@@ -1475,18 +1488,15 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	// ctx param, so it publishes on the session lifetime (s.sessionCtx). The header
 	// (Coordinates/Cause + minted EventID/CreatedAt) was stamped above before the loop
 	// was built.
-	identity := bound.RuntimeIdentity()
 	var agentRuntime *event.AgentRuntime
-	if identity.Profile != "" || identity.ModelAlias != "" || identity.Effort != model.EffortNone {
-		harness := string(identity.Profile)
-		if i := strings.LastIndexByte(harness, '/'); i >= 0 {
-			harness = harness[i+1:]
+	if runtime != nil && runtime.Profile != "" {
+		agentRuntime = &event.AgentRuntime{
+			Harness:         string(runtime.AgentHarness),
+			Profile:         string(runtime.Profile),
+			CredentialMode:  string(runtime.Credential),
+			ModelAlias:      string(runtime.ModelAlias),
+			SmallModelAlias: string(runtime.SmallModel),
 		}
-		smallModel := ""
-		if runtime != nil {
-			smallModel = string(runtime.SmallModel)
-		}
-		agentRuntime = &event.AgentRuntime{Harness: harness, Profile: string(identity.Profile), CredentialMode: string(loop.CredentialGatewayBacked), ModelAlias: string(identity.ModelAlias), SmallModelAlias: smallModel}
 	}
 	ev := event.LoopStarted{Header: startedHeader, Runtime: runtimeForModel(liveModel), AgentRuntime: agentRuntime, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: bound.DisplayName(), Description: bound.Description()}
 	if admission != nil {
@@ -1510,8 +1520,18 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		}
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: err}
 	}
-	if foreignSID != "" {
-		if err := publish(s.sessionCtx, event.LoopAgentSessionBound{Header: startedHeader, ACPSessionID: foreignSID}); err != nil {
+	if foreignSID != "" && runtime != nil && runtime.Profile != "" {
+		if err := publish(s.sessionCtx, event.LoopAgentSessionBound{Header: agentSessionHeader, ACPSessionID: foreignSID}); err != nil {
+			s.loopsMu.Lock()
+			if !s.constructing {
+				delete(s.loops, loopID)
+			}
+			s.loopsMu.Unlock()
+			release()
+			cancel()
+			if admission != nil {
+				_ = admission.sub.Close()
+			}
 			return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: err}
 		}
 	}

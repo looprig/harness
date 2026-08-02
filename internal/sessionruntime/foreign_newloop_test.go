@@ -345,6 +345,9 @@ func TestForeignBuilderEmitsAgentSessionBindingOnce(t *testing.T) {
 	if bound[0].ACPSessionID != fixedForeignSID {
 		t.Errorf("ACPSessionID = %q, want %q", bound[0].ACPSessionID, fixedForeignSID)
 	}
+	if started.EventID == bound[0].EventID {
+		t.Fatalf("LoopAgentSessionBound reused LoopStarted EventID %s", started.EventID)
+	}
 	if started.ForeignSID != fixedForeignSID {
 		t.Errorf("LoopStarted.ForeignSID = %q, want %q", started.ForeignSID, fixedForeignSID)
 	}

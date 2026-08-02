@@ -208,7 +208,7 @@ func validateEventBody(ev Event) error {
 			return validateAgentRuntime(*e.AgentRuntime)
 		}
 	case LoopAgentSessionBound:
-		if !validAgentRuntimeIdentifier(e.ACPSessionID) || e.ACPSessionID == "" {
+		if !validAgentRuntimeIdentifier(e.ACPSessionID, false) || e.ACPSessionID == "" {
 			return &InvalidEventError{Event: "LoopAgentSessionBound", Field: FieldACPSessionID, Rule: RuleInvalid}
 		}
 	case ContextMeasured:
@@ -406,19 +406,44 @@ const (
 )
 
 func validateAgentRuntime(v AgentRuntime) error {
-	for _, value := range []string{v.Harness, v.Profile, v.CredentialMode, v.ModelAlias, v.SmallModelAlias, v.ACPSessionID} {
-		if value != "" && !validAgentRuntimeIdentifier(value) {
+	if v.Harness == "" || v.Profile == "" || v.CredentialMode == "" || v.ModelAlias == "" {
+		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleRequired}
+	}
+	if v.CredentialMode != "native-auth" && v.CredentialMode != "gateway-backed" {
+		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+	}
+	for _, candidate := range []struct {
+		value      string
+		allowSlash bool
+	}{
+		{v.Harness, false},
+		{v.Profile, true},
+		{v.CredentialMode, false},
+		{v.ModelAlias, false},
+		{v.SmallModelAlias, false},
+		{v.ACPSessionID, false},
+	} {
+		if candidate.value != "" && !validAgentRuntimeIdentifier(candidate.value, candidate.allowSlash) {
 			return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
 		}
 	}
 	return nil
 }
 
-func validAgentRuntimeIdentifier(value string) bool {
+func validAgentRuntimeIdentifier(value string, allowSlash bool) bool {
 	if value == "" {
 		return true
 	}
 	if len(value) > maxAgentRuntimeIdentityBytes || !utf8.ValidString(value) || strings.TrimSpace(value) != value {
+		return false
+	}
+	if strings.Contains(value, "://") || strings.HasPrefix(value, "/") || strings.HasPrefix(value, "~/") || strings.HasPrefix(value, "./") || strings.HasPrefix(value, "../") {
+		return false
+	}
+	if !allowSlash && strings.Contains(value, "/") {
+		return false
+	}
+	if allowSlash && strings.Contains(value, "\\") {
 		return false
 	}
 	for _, segment := range strings.Split(value, "/") {

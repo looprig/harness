@@ -431,7 +431,7 @@ type LoopStarted struct {
 	// Runtime is the initial resolved model identity, limits, and effort. It is
 	// durable so restore and catalog repair never consult a mutable catalog.
 	Runtime      ModelRuntime  `json:"runtime,omitzero"`
-	AgentRuntime *AgentRuntime `json:"agent_runtime,omitzero"`
+	AgentRuntime *AgentRuntime `json:"agent_runtime,omitempty"`
 	// ParentToolUseID is the durable provider tool-use id of the Subagent tool call
 	// that spawned this loop (content.ToolUseBlock.ID), empty for loops not spawned by
 	// a tool call (e.g. the primary/root). It is the durable carrier that correlates a
@@ -461,12 +461,12 @@ type LoopStarted struct {
 // AgentRuntime is the bounded, secret-free identity of the runtime selected for
 // a loop. It is additive so legacy LoopStarted records decode with nil.
 type AgentRuntime struct {
-	Harness         string `json:"harness,omitzero"`
-	Profile         string `json:"profile,omitzero"`
-	CredentialMode  string `json:"credential_mode,omitzero"`
-	ModelAlias      string `json:"model_alias,omitzero"`
-	SmallModelAlias string `json:"small_model_alias,omitzero"`
-	ACPSessionID    string `json:"acp_session_id,omitzero"`
+	Harness         string `json:"harness"`
+	Profile         string `json:"profile"`
+	CredentialMode  string `json:"credential_mode"`
+	ModelAlias      string `json:"model_alias"`
+	SmallModelAlias string `json:"small_model_alias,omitempty"`
+	ACPSessionID    string `json:"acp_session_id,omitempty"`
 }
 
 // DelegateRequestAccepted is the durable actor-side acceptance of a follow-up
