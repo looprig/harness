@@ -22,7 +22,7 @@ func restoreRuntimeCatalog(t *testing.T) loop.RuntimeCatalog {
 		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
 		Credential: loop.CredentialGatewayBacked, Default: true, DefaultModel: "luna", SmallModel: "small",
 		Models: []loop.RuntimeModelOption{
-			{Alias: "luna", Target: model.Model{Provider: "provider", Name: "luna-target"}, DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
+			{Alias: "luna", Target: model.Model{Provider: "provider", Name: "luna-target"}, DefaultEffort: model.EffortLow, Efforts: []model.Effort{model.EffortLow, model.EffortHigh}},
 			{Alias: "small", Target: model.Model{Provider: "provider", Name: "small-target"}, DefaultEffort: model.EffortLow, Efforts: []model.Effort{model.EffortLow}},
 		},
 	}})
@@ -64,6 +64,21 @@ func TestRestoreRuntimeBindingAdapterResolvesAndOverridesNativeDefinition(t *tes
 	}
 	if got.Engine() != loop.EngineAdapter || got.RuntimeProfile() != "acp/codex" || got.Model().Key() != started.Runtime.Key {
 		t.Fatalf("bound runtime = engine %v profile %q key %#v", got.Engine(), got.RuntimeProfile(), got.Model().Key())
+	}
+}
+
+func TestRestoreRuntimeBindingAcceptsConcreteTargetAlias(t *testing.T) {
+	t.Parallel()
+	catalog := restoreRuntimeCatalog(t)
+	started := restoreRuntimeStarted(model.ModelKey{Provider: "provider", Model: "luna-target"})
+	started.AgentRuntime.ModelAlias = "luna@high"
+	bound := bindCfg(engineCfg(&stubLLM{}, loop.EngineNative, "system"), mustUUID(), started.LoopID)
+	got, err := restoreRuntimeBinding(started, bound, foldLoopInference([]event.Event{started}), catalog, true, false)
+	if err != nil {
+		t.Fatalf("restoreRuntimeBinding: %v", err)
+	}
+	if identity := got.RuntimeIdentity(); identity.ModelAlias != "luna@high" {
+		t.Fatalf("RuntimeIdentity().ModelAlias = %q, want concrete alias luna@high", identity.ModelAlias)
 	}
 }
 

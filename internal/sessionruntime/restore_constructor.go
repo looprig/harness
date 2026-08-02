@@ -783,12 +783,11 @@ func restoreRuntimeBinding(started event.LoopStarted, bound loop.BoundDefinition
 		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeTargetMismatch}
 	}
 	runtime := ri.AgentRuntime
-	resolved, err := catalog.ResolveWithExplicitEffort(
+	resolved, err := catalog.ResolveTargetAlias(
 		started.AgentName,
 		loop.AgentHarnessName(runtime.Harness),
 		loop.ModelAlias(runtime.ModelAlias),
 		ri.Runtime.Effort,
-		true,
 	)
 	if err != nil {
 		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable, Cause: err}
@@ -807,7 +806,11 @@ func restoreRuntimeBinding(started event.LoopStarted, bound loop.BoundDefinition
 	if resolved.Effort != ri.Runtime.Effort {
 		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeEffortMismatch}
 	}
-	bound, err = loop.OverrideBoundRuntimeSelection(bound, resolved.Profile, resolved.ModelAlias, resolved.Target, resolved.Effort)
+	runtimeAlias := resolved.TargetAlias
+	if runtimeAlias == "" {
+		runtimeAlias = resolved.ModelAlias
+	}
+	bound, err = loop.OverrideBoundRuntimeSelection(bound, resolved.Profile, runtimeAlias, resolved.Target, resolved.Effort)
 	if err != nil {
 		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
 	}

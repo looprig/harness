@@ -1272,7 +1272,14 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			return uuid.UUID{}, err
 		}
 		if runtime != nil {
-			bound, err = loop.OverrideBoundRuntimeSelection(bound, runtime.Profile, runtime.ModelAlias, runtime.Target, runtime.Effort)
+			runtimeAlias := runtime.TargetAlias
+			if runtimeAlias == "" {
+				// Resolved values created before concrete target aliases were
+				// introduced remain valid and use the model-facing alias as the
+				// compatible durable identity.
+				runtimeAlias = runtime.ModelAlias
+			}
+			bound, err = loop.OverrideBoundRuntimeSelection(bound, runtime.Profile, runtimeAlias, runtime.Target, runtime.Effort)
 			if err == nil && hasRuntimeCatalog {
 				bound, err = loop.OverrideBoundRuntimeCatalog(bound, runtimeCatalog)
 			}
@@ -1502,11 +1509,15 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	// was built.
 	var agentRuntime *event.AgentRuntime
 	if runtime != nil && runtime.Profile != "" {
+		runtimeAlias := runtime.TargetAlias
+		if runtimeAlias == "" {
+			runtimeAlias = runtime.ModelAlias
+		}
 		agentRuntime = &event.AgentRuntime{
 			Harness:         string(runtime.AgentHarness),
 			Profile:         string(runtime.Profile),
 			CredentialMode:  string(runtime.Credential),
-			ModelAlias:      string(runtime.ModelAlias),
+			ModelAlias:      string(runtimeAlias),
 			SmallModelAlias: string(runtime.SmallModel),
 		}
 	}

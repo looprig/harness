@@ -280,7 +280,7 @@ func TestForeignBuilderEmitsAgentSessionBindingOnce(t *testing.T) {
 		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex", Default: true,
 		Credential: loop.CredentialGatewayBacked, DefaultModel: "luna", SmallModel: "small",
 		Models: []loop.RuntimeModelOption{
-			{Alias: "luna", Target: validModel("luna-target"), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
+			{Alias: "luna", Target: validModel("luna-target"), DefaultEffort: model.EffortLow, Efforts: []model.Effort{model.EffortLow, model.EffortHigh}},
 			{Alias: "small", Target: validModel("small-target"), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
 		},
 	}})
@@ -310,6 +310,7 @@ func TestForeignBuilderEmitsAgentSessionBindingOnce(t *testing.T) {
 			Model:      "luna",
 			SmallModel: "small",
 			Effort:     "high",
+			Explicit:   tool.DelegateRuntimeExplicit{Effort: true},
 		},
 	})
 	if err != nil {
@@ -356,7 +357,7 @@ func TestForeignBuilderEmitsAgentSessionBindingOnce(t *testing.T) {
 	}
 	if got := *started.AgentRuntime; got != (event.AgentRuntime{
 		Harness: "codex", Profile: "acp/codex", CredentialMode: "gateway-backed",
-		ModelAlias: "luna", SmallModelAlias: "small",
+		ModelAlias: "luna@high", SmallModelAlias: "small",
 	}) {
 		t.Fatalf("LoopStarted.AgentRuntime = %+v, want resolved identity", got)
 	}

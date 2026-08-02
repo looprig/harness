@@ -57,11 +57,16 @@ type RuntimeCatalogEntry struct {
 // Resolved is the immutable runtime tuple selected from a RuntimeCatalog.
 // Target is a defensive copy of the cataloged model descriptor.
 type Resolved struct {
-	SubagentType     identity.AgentName
-	AgentHarness     AgentHarnessName
-	Profile          RuntimeProfileName
-	Credential       CredentialMode
-	ModelAlias       ModelAlias
+	SubagentType identity.AgentName
+	AgentHarness AgentHarnessName
+	Profile      RuntimeProfileName
+	Credential   CredentialMode
+	// ModelAlias is the stable model-facing selector accepted by Subagent.
+	ModelAlias ModelAlias
+	// TargetAlias is the concrete alias sent to a gateway or ACP launcher. It
+	// is derived from the selected effort for gateway-backed runtimes and is
+	// always bare for native-auth runtimes.
+	TargetAlias      ModelAlias
 	NativeSmallModel string
 	SmallModel       ModelAlias
 	Target           model.Model
@@ -86,6 +91,7 @@ const (
 	RuntimeCatalogInvalidDefaultEffort RuntimeCatalogErrorKind = "invalid_default_effort"
 	RuntimeCatalogInvalidSmallModel    RuntimeCatalogErrorKind = "invalid_small_model"
 	RuntimeCatalogNativeAliasConflict  RuntimeCatalogErrorKind = "native_alias_conflict"
+	RuntimeCatalogDerivedAliasConflict RuntimeCatalogErrorKind = "derived_alias_conflict"
 	RuntimeCatalogUnknownAgent         RuntimeCatalogErrorKind = "unknown_agent"
 	RuntimeCatalogUnknownHarness       RuntimeCatalogErrorKind = "unknown_harness"
 	RuntimeCatalogUnknownModel         RuntimeCatalogErrorKind = "unknown_model"
@@ -144,6 +150,9 @@ func NewRuntimeCatalog(entries []RuntimeCatalogEntry) (RuntimeCatalog, error) {
 		}
 	}
 	if err := validateNativeAliasOwnership(cloned); err != nil {
+		return RuntimeCatalog{}, err
+	}
+	if err := validateDerivedAliasOwnership(cloned); err != nil {
 		return RuntimeCatalog{}, err
 	}
 
@@ -270,11 +279,58 @@ func (c RuntimeCatalog) ResolveWithExplicitEffort(agent identity.AgentName, harn
 		Profile:          selected.Profile,
 		Credential:       effectiveModelCredential(*selected, *selectedModel),
 		ModelAlias:       selectedModel.Alias,
+		TargetAlias:      concreteRuntimeAlias(*selectedModel, effectiveModelCredential(*selected, *selectedModel), selectedEffort),
 		NativeSmallModel: selectedModel.NativeSmallModel,
 		SmallModel:       selected.SmallModel,
 		Target:           selectedModel.Target.Clone(),
 		Effort:           selectedEffort,
 	}, nil
+}
+
+// ResolveTargetAlias resolves a durable or trusted runtime target alias back
+// to its model-facing catalog selector. New gateway-backed records use the
+// concrete per-effort alias; the bare model alias is also accepted so legacy
+// records remain restorable. This method is intentionally not used by
+// model-facing Subagent preparation or controller validation.
+func (c RuntimeCatalog) ResolveTargetAlias(agent identity.AgentName, harness AgentHarnessName, targetAlias ModelAlias, effort model.Effort) (Resolved, error) {
+	if agent == "" {
+		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
+	}
+
+	var selected *RuntimeCatalogEntry
+	for i := range c.entries {
+		entry := &c.entries[i]
+		if entry.SubagentType != agent {
+			continue
+		}
+		if harness == "" {
+			if entry.Default {
+				selected = entry
+				break
+			}
+			continue
+		}
+		if entry.AgentHarness == harness {
+			selected = entry
+			break
+		}
+	}
+	if selected == nil {
+		if harness == "" {
+			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
+		}
+		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownHarness, Field: "AgentHarness"}
+	}
+
+	for i := range selected.Models {
+		option := &selected.Models[i]
+		credential := effectiveModelCredential(*selected, *option)
+		if targetAlias != option.Alias && targetAlias != concreteRuntimeAlias(*option, credential, effort) {
+			continue
+		}
+		return c.ResolveWithExplicitEffort(agent, harness, option.Alias, effort, true)
+	}
+	return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownModel, Field: "ModelAlias"}
 }
 
 // Digest returns the deterministic SHA-256 identity of the catalog. The
@@ -426,6 +482,42 @@ func validateNativeAliasOwnership(entries []RuntimeCatalogEntry) error {
 		}
 	}
 	return nil
+}
+
+func validateDerivedAliasOwnership(entries []RuntimeCatalogEntry) error {
+	configured := make(map[ModelAlias]struct{})
+	derived := make(map[ModelAlias]struct{})
+	for _, entry := range entries {
+		for _, option := range entry.Models {
+			configured[option.Alias] = struct{}{}
+			if effectiveModelCredential(entry, option) != CredentialGatewayBacked {
+				continue
+			}
+			for _, effort := range option.Efforts {
+				if effort == option.DefaultEffort {
+					continue
+				}
+				alias := concreteRuntimeAlias(option, CredentialGatewayBacked, effort)
+				if err := validateCatalogIdentifier(string(alias), false); err != nil {
+					return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "Models.TargetAlias"}
+				}
+				derived[alias] = struct{}{}
+			}
+		}
+	}
+	for alias := range derived {
+		if _, exists := configured[alias]; exists {
+			return &RuntimeCatalogError{Kind: RuntimeCatalogDerivedAliasConflict, Field: "Models.Alias"}
+		}
+	}
+	return nil
+}
+
+func concreteRuntimeAlias(option RuntimeModelOption, credential CredentialMode, effort model.Effort) ModelAlias {
+	if credential == CredentialNativeAuth || effort == option.DefaultEffort {
+		return option.Alias
+	}
+	return ModelAlias(string(option.Alias) + "@" + catalogEffortString(effort))
 }
 
 func validateCatalogIdentifier(value string, allowInternalSpaces bool) error {

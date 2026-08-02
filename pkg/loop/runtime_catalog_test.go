@@ -171,7 +171,7 @@ func TestRuntimeCatalogResolveDefaultsAndRejectsIncompatibleSelectors(t *testing
 		{
 			name: "all omitted use defaults", want: Resolved{
 				SubagentType: "worker", AgentHarness: "claude-code", Profile: "claude-profile",
-				Credential: CredentialGatewayBacked, ModelAlias: "sonnet", SmallModel: "sonnet-small",
+				Credential: CredentialGatewayBacked, ModelAlias: "sonnet", TargetAlias: "sonnet", SmallModel: "sonnet-small",
 				Target: runtimeModel("sonnet-target", model.EffortMedium), Effort: model.EffortMedium,
 			},
 		},
@@ -179,7 +179,7 @@ func TestRuntimeCatalogResolveDefaultsAndRejectsIncompatibleSelectors(t *testing
 			name: "explicit complete tuple", harness: "codex", alias: "o3", effort: model.EffortHigh,
 			want: Resolved{
 				SubagentType: "worker", AgentHarness: "codex", Profile: "codex-profile",
-				Credential: CredentialGatewayBacked, ModelAlias: "o3", SmallModel: "o3",
+				Credential: CredentialGatewayBacked, ModelAlias: "o3", TargetAlias: "o3@high", SmallModel: "o3",
 				Target: runtimeModel("o3-target", model.EffortLow), Effort: model.EffortHigh,
 			},
 		},
@@ -222,6 +222,85 @@ func TestRuntimeCatalogResolveDefaultsAndRejectsIncompatibleSelectors(t *testing
 				t.Fatalf("Resolve() selectors = %q/%q/%q, want %q/%q/%q", got.AgentHarness, got.ModelAlias, got.Effort, tt.want.AgentHarness, tt.want.ModelAlias, tt.want.Effort)
 			}
 		})
+	}
+}
+
+func TestRuntimeCatalogDerivesConcreteGatewayTargetAliasesWithoutChangingSelectors(t *testing.T) {
+	t.Parallel()
+
+	catalog, err := NewRuntimeCatalog(testCatalogEntries())
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+
+	defaultTarget, err := catalog.Resolve("worker", "claude-code", "sonnet", model.EffortMedium)
+	if err != nil {
+		t.Fatalf("Resolve(default) error = %v", err)
+	}
+	if defaultTarget.ModelAlias != "sonnet" || defaultTarget.TargetAlias != "sonnet" {
+		t.Fatalf("default resolved aliases = model %q, target %q; want sonnet/sonnet", defaultTarget.ModelAlias, defaultTarget.TargetAlias)
+	}
+
+	highTarget, err := catalog.Resolve("worker", "claude-code", "sonnet", model.EffortHigh)
+	if err != nil {
+		t.Fatalf("Resolve(high) error = %v", err)
+	}
+	if highTarget.ModelAlias != "sonnet" || highTarget.TargetAlias != "sonnet@high" {
+		t.Fatalf("high resolved aliases = model %q, target %q; want sonnet/sonnet@high", highTarget.ModelAlias, highTarget.TargetAlias)
+	}
+
+	nativeEntries := testCatalogEntries()
+	nativeEntries[0].Credential = CredentialNativeAuth
+	nativeEntries[0].Models[0].Credential = CredentialNativeAuth
+	nativeCatalog, err := NewRuntimeCatalog(nativeEntries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog(native) error = %v", err)
+	}
+	nativeTarget, err := nativeCatalog.Resolve("worker", "codex", "o3", model.EffortHigh)
+	if err != nil {
+		t.Fatalf("Resolve(native high) error = %v", err)
+	}
+	if nativeTarget.ModelAlias != "o3" || nativeTarget.TargetAlias != "o3" {
+		t.Fatalf("native resolved aliases = model %q, target %q; want o3/o3", nativeTarget.ModelAlias, nativeTarget.TargetAlias)
+	}
+}
+
+func TestRuntimeCatalogRejectsConfiguredAliasesThatCollideWithDerivedGatewayAliases(t *testing.T) {
+	t.Parallel()
+
+	entries := testCatalogEntries()
+	entries[1].Models = append(entries[1].Models, RuntimeModelOption{
+		Alias:         "sonnet@high",
+		Target:        runtimeModel("collision-target", model.EffortHigh),
+		DefaultEffort: model.EffortHigh,
+		Efforts:       []model.Effort{model.EffortHigh},
+	})
+	_, err := NewRuntimeCatalog(entries)
+	if err == nil {
+		t.Fatal("NewRuntimeCatalog() error = nil, want derived alias collision")
+	}
+	var catalogErr *RuntimeCatalogError
+	if !errors.As(err, &catalogErr) || catalogErr.Kind != RuntimeCatalogDerivedAliasConflict {
+		t.Fatalf("error = %T %v, want kind %q", err, err, RuntimeCatalogDerivedAliasConflict)
+	}
+}
+
+func TestRuntimeCatalogResolvesConcreteAndLegacyTargetAliases(t *testing.T) {
+	t.Parallel()
+
+	catalog, err := NewRuntimeCatalog(testCatalogEntries())
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+
+	for _, alias := range []ModelAlias{"sonnet@high", "sonnet"} {
+		resolved, err := catalog.ResolveTargetAlias("worker", "claude-code", alias, model.EffortHigh)
+		if err != nil {
+			t.Fatalf("ResolveTargetAlias(%q) error = %v", alias, err)
+		}
+		if resolved.ModelAlias != "sonnet" || resolved.TargetAlias != "sonnet@high" || resolved.Effort != model.EffortHigh {
+			t.Fatalf("ResolveTargetAlias(%q) = model %q, target %q, effort %q; want sonnet/sonnet@high/high", alias, resolved.ModelAlias, resolved.TargetAlias, resolved.Effort)
+		}
 	}
 }
 
