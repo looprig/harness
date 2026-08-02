@@ -26,6 +26,21 @@ func audioTranscriptionConfigToMldev(fromObject map[string]any, parentObject map
 		return nil, fmt.Errorf("languageCodes parameter is only supported in Gemini Enterprise Agent Platform mode, not in Gemini Developer API mode.")
 	}
 
+	fromLanguageAuto := InternalGetValueByPath(fromObject, []string{"languageAuto"})
+	if fromLanguageAuto != nil {
+		InternalSetValueByPath(toObject, []string{"languageAuto"}, fromLanguageAuto)
+	}
+
+	fromLanguageHints := InternalGetValueByPath(fromObject, []string{"languageHints"})
+	if fromLanguageHints != nil {
+		InternalSetValueByPath(toObject, []string{"languageHints"}, fromLanguageHints)
+	}
+
+	fromAdaptationPhrases := InternalGetValueByPath(fromObject, []string{"adaptationPhrases"})
+	if fromAdaptationPhrases != nil {
+		InternalSetValueByPath(toObject, []string{"adaptationPhrases"}, fromAdaptationPhrases)
+	}
+
 	return toObject, nil
 }
 
@@ -547,9 +562,9 @@ func liveConnectConfigToMldev(fromObject map[string]any, parentObject map[string
 		InternalSetValueByPath(parentObject, []string{"setup", "safetySettings"}, fromSafetySettings)
 	}
 
-	fromStreamTranslationConfig := InternalGetValueByPath(fromObject, []string{"streamTranslationConfig"})
-	if fromStreamTranslationConfig != nil {
-		InternalSetValueByPath(parentObject, []string{"setup", "generationConfig", "streamTranslationConfig"}, fromStreamTranslationConfig)
+	fromTranslationConfig := InternalGetValueByPath(fromObject, []string{"translationConfig"})
+	if fromTranslationConfig != nil {
+		InternalSetValueByPath(parentObject, []string{"setup", "generationConfig", "translationConfig"}, fromTranslationConfig)
 	}
 
 	return toObject, nil
@@ -596,6 +611,11 @@ func liveConnectConfigToVertex(fromObject map[string]any, parentObject map[strin
 	fromSpeechConfig := InternalGetValueByPath(fromObject, []string{"speechConfig"})
 	if fromSpeechConfig != nil {
 		fromSpeechConfig, err = InternalTLiveSpeechConfig(fromSpeechConfig)
+		if err != nil {
+			return nil, err
+		}
+
+		fromSpeechConfig, err = speechConfigToVertex(fromSpeechConfig.(map[string]any), toObject, rootObject)
 		if err != nil {
 			return nil, err
 		}
@@ -693,8 +713,8 @@ func liveConnectConfigToVertex(fromObject map[string]any, parentObject map[strin
 		InternalSetValueByPath(parentObject, []string{"setup", "safetySettings"}, fromSafetySettings)
 	}
 
-	if InternalGetValueByPath(fromObject, []string{"streamTranslationConfig"}) != nil {
-		return nil, fmt.Errorf("streamTranslationConfig parameter is only supported in Gemini Developer API mode, not in Gemini Enterprise Agent Platform mode.")
+	if InternalGetValueByPath(fromObject, []string{"translationConfig"}) != nil {
+		return nil, fmt.Errorf("translationConfig parameter is only supported in Gemini Developer API mode, not in Gemini Enterprise Agent Platform mode.")
 	}
 
 	return toObject, nil
@@ -1080,6 +1100,11 @@ func voiceActivityFromMldev(fromObject map[string]any, parentObject map[string]a
 		InternalSetValueByPath(toObject, []string{"voiceActivityType"}, fromVoiceActivityType)
 	}
 
+	fromAudioOffset := InternalGetValueByPath(fromObject, []string{"audioOffset"})
+	if fromAudioOffset != nil {
+		InternalSetValueByPath(toObject, []string{"audioOffset"}, fromAudioOffset)
+	}
+
 	return toObject, nil
 }
 
@@ -1089,6 +1114,11 @@ func voiceActivityFromVertex(fromObject map[string]any, parentObject map[string]
 	fromVoiceActivityType := InternalGetValueByPath(fromObject, []string{"type"})
 	if fromVoiceActivityType != nil {
 		InternalSetValueByPath(toObject, []string{"voiceActivityType"}, fromVoiceActivityType)
+	}
+
+	fromAudioOffset := InternalGetValueByPath(fromObject, []string{"audioOffset"})
+	if fromAudioOffset != nil {
+		InternalSetValueByPath(toObject, []string{"audioOffset"}, fromAudioOffset)
 	}
 
 	return toObject, nil

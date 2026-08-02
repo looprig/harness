@@ -24,28 +24,26 @@ import (
 // Thinking folds streamed ThinkingChunk deltas into a single ThinkingBlock.
 // The zero value is ready to use.
 type Thinking struct {
-	builder  strings.Builder
-	received bool
+	builder   strings.Builder
+	signature string
+	received  bool
 }
 
 // Add appends one thinking delta to the accumulator.
 func (a *Thinking) Add(chunk *content.ThinkingChunk) {
 	a.received = true
 	a.builder.WriteString(chunk.Thinking)
+	if chunk.Signature != "" {
+		a.signature = chunk.Signature
+	}
 }
 
 // Block returns the accumulated ThinkingBlock, or nil if no chunk was received.
-//
-// Signature is intentionally left empty. ThinkingChunk carries no signature, and
-// the extended-thinking signature is attached to the finalized block by the
-// provider decode path, not reconstructed from streamed deltas. This is a
-// conscious omission (streaming does not populate it today either); a future
-// provider that streams signatures would thread one through here.
 func (a Thinking) Block() *content.ThinkingBlock {
 	if !a.received {
 		return nil
 	}
-	return &content.ThinkingBlock{Thinking: a.builder.String()}
+	return &content.ThinkingBlock{Thinking: a.builder.String(), Signature: a.signature}
 }
 
 // Empty reports whether no chunk has been added yet.

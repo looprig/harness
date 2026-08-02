@@ -22,6 +22,42 @@ type Codec struct{}
 // Compile-time proof that Codec honors the codec.Codec contract.
 var _ codec.Codec = Codec{}
 
+// Compile-time proof that Codec also honors the ingress-side codec.ServerCodec
+// contract: recognizing and decoding native /v1/messages requests, and encoding
+// results back into native Anthropic responses/streams.
+var _ codec.ServerCodec = Codec{}
+
+// MatchRequest reports whether req is a POST /v1/messages request.
+func (Codec) MatchRequest(req *http.Request) bool {
+	return matchMessagesRequest(req)
+}
+
+// DecodeRequest decodes a matched POST /v1/messages request into a
+// codec.DecodedRequest, delegating to the free decodeMessagesRequest.
+func (Codec) DecodeRequest(req *http.Request) (codec.DecodedRequest, error) {
+	return decodeMessagesRequest(req)
+}
+
+// WriteResponse encodes a complete inference.Response as the native Anthropic
+// Messages API non-streaming response, delegating to the free
+// writeMessageResponse.
+func (Codec) WriteResponse(w http.ResponseWriter, resp *inference.Response) error {
+	return writeMessageResponse(w, resp)
+}
+
+// OpenStream begins the native Anthropic Messages streaming response and
+// returns its request-scoped StreamEncoder, delegating to the free
+// openMessagesStream.
+func (Codec) OpenStream(w http.ResponseWriter) (codec.StreamEncoder, error) {
+	return openMessagesStream(w)
+}
+
+// WriteError encodes err as the native Anthropic error envelope, delegating to
+// the free writeMessageError.
+func (Codec) WriteError(w http.ResponseWriter, err error) {
+	writeMessageError(w, err)
+}
+
 // EncodeRequest builds the Anthropic Messages request: a JSON body reader plus the
 // application/json content type as an EncodedRequest. RequestModeStream sets
 // "stream":true in the body, every other mode omits it.

@@ -49,3 +49,54 @@ func (e *DecodeError) Error() string {
 }
 
 func (e *DecodeError) Unwrap() error { return e.Err }
+
+// ServerDecodeError reports a native generateContent/streamGenerateContent
+// request this codec cannot decode into the provider-neutral vocabulary:
+// malformed shape, an unrecognized route, or a recognized-but-unsupported
+// feature. Reason is a short machine-checkable diagnostic code; Detail
+// elaborates for logs/messages.
+type ServerDecodeError struct {
+	Reason string
+	Detail string
+}
+
+func (e *ServerDecodeError) Error() string {
+	msg := "gemini: invalid request: " + e.Reason
+	if e.Detail != "" {
+		msg += ": " + e.Detail
+	}
+	return msg
+}
+
+// DuplicateKeyError reports a request body with a duplicate JSON object
+// member name. encoding/json silently takes the last occurrence; this codec
+// rejects the request instead so a client cannot smuggle a semantically
+// different value past a naive review of the first occurrence.
+type DuplicateKeyError struct {
+	Key string
+}
+
+func (e *DuplicateKeyError) Error() string {
+	return "gemini: duplicate JSON object key " + e.Key
+}
+
+// StreamTerminatedError is returned by StreamEncoder.WriteChunk, Finish, or
+// Fail once the stream has already been terminated by a prior Finish or Fail
+// call, per the single-termination-ownership rule in codec.StreamEncoder.
+type StreamTerminatedError struct{}
+
+func (e *StreamTerminatedError) Error() string {
+	return "gemini: stream already terminated"
+}
+
+// UnsupportedChunkError is returned when a content.Chunk has a concrete type
+// this dialect's stream encoder does not model. content.Chunk is a sealed
+// interface, so this only guards against future variants added to the
+// vocabulary.
+type UnsupportedChunkError struct {
+	Chunk string
+}
+
+func (e *UnsupportedChunkError) Error() string {
+	return "gemini: unsupported stream chunk type " + e.Chunk
+}

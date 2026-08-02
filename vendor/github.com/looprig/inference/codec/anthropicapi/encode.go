@@ -69,9 +69,14 @@ func buildMessagesRequest(req inference.Request, stream bool) (messagesRequest, 
 		}
 	}
 
+	var sys *systemPrompt
+	if system != "" {
+		sys = &systemPrompt{Text: system}
+	}
+
 	r := messagesRequest{
 		Model:         req.Model.Name,
-		System:        system,
+		System:        sys,
 		Messages:      messages,
 		MaxTokens:     effectiveMaxTokens(sampling.MaxTokens),
 		StopSequences: sampling.Stop,
@@ -120,7 +125,34 @@ func buildMessagesRequest(req inference.Request, stream bool) (messagesRequest, 
 		r.TopP = sampling.TopP
 	}
 
+	if req.Model.Caps.PromptCaching {
+		applyCacheBreakpoints(&r)
+	}
+
 	return r, nil
+}
+
+// applyCacheBreakpoints marks the codec's two ephemeral cache_control
+// breakpoints: one on the system prompt (which caches tools + system, since
+// tools render before system in Anthropic's prefix order) and one on the last
+// cacheable block of the last message, so multi-turn requests accrue
+// incremental cache hits. A thinking block cannot carry cache_control, so the
+// message breakpoint walks back to the nearest non-thinking block. At most two
+// breakpoints are emitted, well under the wire limit of four.
+func applyCacheBreakpoints(r *messagesRequest) {
+	if r.System != nil {
+		r.System.Cache = true
+	}
+	for i := len(r.Messages) - 1; i >= 0; i-- {
+		blocks := r.Messages[i].Content
+		for j := len(blocks) - 1; j >= 0; j-- {
+			if blocks[j].Type == blockTypeThinking {
+				continue
+			}
+			blocks[j].CacheControl = &cacheControl{Type: cacheControlEphemeral}
+			return
+		}
+	}
 }
 
 // encodeBlocks maps a slice of content blocks to their Anthropic wire form.

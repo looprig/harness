@@ -63,9 +63,59 @@ type DocumentBlock struct {
 
 // ThinkingBlock carries model reasoning text.
 // Signature is empty during streaming and non-empty only on a complete block.
+//
+// ProviderState carries provider-private opaque reasoning state (for example
+// an Anthropic thinking signature or a Gemini thoughtSignature) that this
+// package never interprets. It is meaningful only for a same-dialect replay
+// against the provider that issued it. Construct via NewThinkingBlock so the
+// bytes are defensively copied; a bare struct literal aliases the caller's
+// slice.
+//
+// ProviderStateFormat is an opaque, codec-chosen label identifying which
+// dialect encoded ProviderState (for example "gemini" or "openai-responses").
+// It is meaningless and unset whenever ProviderState is empty. This field
+// exists to satisfy the inference gateway's first-milestone requirement that
+// opaque replay state is never translated across provider dialects (see
+// docs/plans/2026-07-31-inference-gateway-design.md, "Thinking" section):
+// a codec MUST NEVER replay ProviderState toward a wire field it owns unless
+// ProviderStateFormat equals that codec's own label; otherwise it MUST treat
+// ProviderState as absent. This is the load-bearing invariant that prevents
+// one provider's opaque bytes (e.g. a Gemini thoughtSignature) from being
+// forwarded to a different provider (e.g. as an OpenAI Responses
+// encrypted_content) as if it were that provider's own native state.
 type ThinkingBlock struct {
-	Thinking  string
-	Signature string
+	Thinking            string
+	Signature           string
+	ProviderState       json.RawMessage `json:"ProviderState,omitempty"`
+	ProviderStateFormat string          `json:"ProviderStateFormat,omitempty"`
+}
+
+// NewThinkingBlock builds a ThinkingBlock, defensively copying providerState so
+// the caller cannot mutate the retained block through its input slice.
+// providerStateFormat tags which dialect encoded providerState; see the
+// ThinkingBlock doc comment for the invariant this enforces.
+func NewThinkingBlock(thinking, signature string, providerState json.RawMessage, providerStateFormat string) *ThinkingBlock {
+	var state json.RawMessage
+	if providerState != nil {
+		state = append(json.RawMessage(nil), providerState...)
+	}
+	return &ThinkingBlock{
+		Thinking:            thinking,
+		Signature:           signature,
+		ProviderState:       state,
+		ProviderStateFormat: providerStateFormat,
+	}
+}
+
+// ReplayableAs reports whether b carries provider-opaque state safe to
+// replay toward a wire field owned by the dialect labeled format. False for
+// a nil receiver, an empty ProviderState, or a ProviderStateFormat that does
+// not exactly match format — the same "treat as absent" degrade every caller
+// of this method must already apply on a false result. See the
+// ProviderStateFormat field doc for the cross-dialect-replay invariant this
+// method exists to let every call site enforce identically.
+func (b *ThinkingBlock) ReplayableAs(format string) bool {
+	return b != nil && len(b.ProviderState) > 0 && b.ProviderStateFormat == format
 }
 
 type ToolUseBlock struct {

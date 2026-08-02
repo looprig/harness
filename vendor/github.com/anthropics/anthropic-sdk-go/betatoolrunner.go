@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"iter"
 
+	"github.com/anthropics/anthropic-sdk-go/internal/stainlessheader"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"golang.org/x/sync/errgroup"
 )
@@ -63,6 +64,8 @@ func newBetaToolRunnerBase(messageService *BetaMessageService, tools []BetaTool,
 	params.BetaMessageNewParams.Tools = apiTools
 	params.Messages = append([]BetaMessageParam{}, params.Messages...)
 
+	opts = append([]option.RequestOption{stainlessheader.With(stainlessheader.BetaToolRunner)}, opts...)
+
 	return betaToolRunnerBase{
 		messageService: messageService,
 		Params:         params,
@@ -114,14 +117,31 @@ func (b *betaToolRunnerBase) Err() error {
 // executeTools processes any tool use blocks in the given message and returns a tool result message.
 // Returns:
 //   - (result, nil) if tools executed successfully
-//   - (nil, nil) if no tools to execute
+//   - (nil, nil) if no tools to execute or the turn ended in a refusal
 //   - (nil, ctx.Err()) if context was cancelled
 func (b *betaToolRunnerBase) executeTools(ctx context.Context, message *BetaMessage) (*BetaMessageParam, error) {
+	// A refusal-terminated turn is terminal: its tool calls belong to a dead
+	// conversation — executing them fires side effects the caller never
+	// confirmed and produces tool_results that cannot be coherently replayed.
+	if message.StopReason == BetaStopReasonRefusal {
+		return nil, nil
+	}
+
+	// Tool calls before the last fallback block belong to the attempt that
+	// refused; the fallback middleware strips them from replayed history, so
+	// answering them would orphan the tool_result.
+	seam := -1
+	for i, block := range message.Content {
+		if block.Type == "fallback" {
+			seam = i
+		}
+	}
+
 	var toolUseBlocks []BetaToolUseBlock
 
 	// Find all tool use blocks in the message
-	for _, block := range message.Content {
-		if block.Type == "tool_use" {
+	for i, block := range message.Content {
+		if i > seam && block.Type == "tool_use" {
 			toolUseBlocks = append(toolUseBlocks, block.AsToolUse())
 		}
 	}

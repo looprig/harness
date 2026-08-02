@@ -145,6 +145,7 @@ func (c *ledgerCursor) Next(ctx context.Context) (storage.Record, error) {
 	src := c.records[c.pos]
 	payload := make([]byte, len(src))
 	copy(payload, src)
+	// #nosec G115 -- c.pos only increments from 0 and is bounded by len(c.records) (checked above), never negative
 	rec := storage.Record{Seq: c.base + uint64(c.pos), Payload: payload}
 	c.pos++
 	return rec, nil

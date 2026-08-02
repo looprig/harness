@@ -141,6 +141,10 @@ func WithImages() ModelOption { return func(m *Model) { m.Caps.AcceptsImages = t
 // WithThinking marks the model as supporting extended thinking.
 func WithThinking() ModelOption { return func(m *Model) { m.Caps.Thinking = true } }
 
+// WithPromptCaching marks the endpoint as honoring explicit cache_control
+// breakpoints (see Capabilities.PromptCaching).
+func WithPromptCaching() ModelOption { return func(m *Model) { m.Caps.PromptCaching = true } }
+
 // WithStructuredOutput marks the model as supporting native structured output.
 func WithStructuredOutput() ModelOption {
 	return func(m *Model) { m.Caps.StructuredOutput = true }

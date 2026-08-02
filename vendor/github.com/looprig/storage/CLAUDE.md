@@ -8,6 +8,8 @@ nothing outside the Go standard library, and it must stay that way.
 - **No third-party dependencies, ever.** There is no scenario in this module where stdlib
   is insufficient. Do not `go get` anything. Do not add a `require` line beyond the module
   itself. If a task seems to need an external package, the task is wrong for this module.
+  (`make secure`'s staticcheck/gosec/govulncheck are PATH-resolved dev-tool binaries, not
+  go.mod dependencies — this does not contradict the rule above.)
 
 ## Code rules (same discipline as the consuming repos)
 

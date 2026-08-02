@@ -23,6 +23,43 @@ type Codec struct{}
 // Compile-time proof that Codec honors the codec.Codec contract.
 var _ codec.Codec = Codec{}
 
+// Compile-time proof that Codec also honors the ingress-side codec.ServerCodec
+// contract: recognizing and decoding native POST /v1/chat/completions
+// requests, and encoding results back into native Chat Completions
+// responses/streams.
+var _ codec.ServerCodec = Codec{}
+
+// MatchRequest reports whether req is a POST /v1/chat/completions request.
+func (Codec) MatchRequest(req *http.Request) bool {
+	return matchChatCompletionsRequest(req)
+}
+
+// DecodeRequest decodes a matched POST /v1/chat/completions request into a
+// codec.DecodedRequest, delegating to the free decodeChatCompletionsRequest.
+func (Codec) DecodeRequest(req *http.Request) (codec.DecodedRequest, error) {
+	return decodeChatCompletionsRequest(req)
+}
+
+// WriteResponse encodes a complete inference.Response as the native Chat
+// Completions non-streaming response, delegating to the free
+// writeChatResponse.
+func (Codec) WriteResponse(w http.ResponseWriter, resp *inference.Response) error {
+	return writeChatResponse(w, resp)
+}
+
+// OpenStream begins the native Chat Completions streaming response and
+// returns its request-scoped StreamEncoder, delegating to the free
+// openChatStream.
+func (Codec) OpenStream(w http.ResponseWriter) (codec.StreamEncoder, error) {
+	return openChatStream(w)
+}
+
+// WriteError encodes err as the native Chat Completions error envelope,
+// delegating to the free writeChatError.
+func (Codec) WriteError(w http.ResponseWriter, err error) {
+	writeChatError(w, err)
+}
+
 // EncodeRequest builds the OpenAI chat completions request: a JSON body reader plus the
 // application/json content type as an EncodedRequest. RequestModeStream sets
 // "stream":true in the body, every other mode omits it.

@@ -22,6 +22,48 @@ type Codec struct{}
 // Compile-time proof that Codec honors the codec.Codec contract.
 var _ codec.Codec = Codec{}
 
+// Compile-time proof that Codec also honors the ingress-side codec.ServerCodec
+// contract: recognizing and decoding native
+// POST /v1beta/models/{model}:generateContent and
+// POST /v1beta/models/{model}:streamGenerateContent requests, and encoding
+// results back into native generateContent responses/streams.
+var _ codec.ServerCodec = Codec{}
+
+// MatchRequest reports whether req is a POST to either of this codec's two
+// owned routes: :generateContent (non-streaming) or :streamGenerateContent
+// (streaming).
+func (Codec) MatchRequest(req *http.Request) bool {
+	return matchGenerateContentRequest(req)
+}
+
+// DecodeRequest decodes a matched request into a codec.DecodedRequest,
+// delegating to the free decodeGenerateContentRequest. The {model} path
+// segment becomes RequestedModel; which of the two routes matched sets
+// Streaming.
+func (Codec) DecodeRequest(req *http.Request) (codec.DecodedRequest, error) {
+	return decodeGenerateContentRequest(req)
+}
+
+// WriteResponse encodes a complete inference.Response as the native
+// generateContent non-streaming response, delegating to the free
+// writeGenerateContentResponse.
+func (Codec) WriteResponse(w http.ResponseWriter, resp *inference.Response) error {
+	return writeGenerateContentResponse(w, resp)
+}
+
+// OpenStream begins the native streamGenerateContent streaming response and
+// returns its request-scoped StreamEncoder, delegating to the free
+// openGenerateContentStream.
+func (Codec) OpenStream(w http.ResponseWriter) (codec.StreamEncoder, error) {
+	return openGenerateContentStream(w)
+}
+
+// WriteError encodes err as the native generateContent error envelope,
+// delegating to the free writeGenerateContentError.
+func (Codec) WriteError(w http.ResponseWriter, err error) {
+	writeGenerateContentError(w, err)
+}
+
 // EncodeRequest builds the Gemini generateContent request: a JSON body reader plus the
 // application/json content type as an EncodedRequest. The RequestMode is intentionally
 // ignored: Gemini's generateContent and streamGenerateContent bodies are identical —

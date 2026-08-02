@@ -25,11 +25,14 @@ const (
 	outputFormatJSONSchema = "json_schema"
 	toolChoiceAny          = "any"
 
+	cacheControlEphemeral = "ephemeral"
+
 	responseTypeError = "error"
 
 	// SSE event `type` values.
 	eventContentBlockStart = "content_block_start"
 	eventContentBlockDelta = "content_block_delta"
+	eventContentBlockStop  = "content_block_stop"
 	eventMessageStart      = "message_start"
 	eventMessageDelta      = "message_delta"
 	eventMessageStop       = "message_stop"
@@ -61,7 +64,7 @@ const defaultMaxTokens = 4096
 // read model → conversation → tools → sampling → thinking → stream.
 type messagesRequest struct {
 	Model         string             `json:"model"`
-	System        string             `json:"system,omitempty"`
+	System        *systemPrompt      `json:"system,omitempty"`
 	Messages      []anthropicMessage `json:"messages"`
 	Tools         []anthropicTool    `json:"tools,omitempty"`
 	ToolChoice    *toolChoice        `json:"tool_choice,omitempty"`
@@ -72,6 +75,32 @@ type messagesRequest struct {
 	Thinking      *thinkingConfig    `json:"thinking,omitempty"`
 	OutputConfig  *outputConfig      `json:"output_config,omitempty"`
 	Stream        bool               `json:"stream,omitempty"`
+}
+
+// cacheControl is the `cache_control` breakpoint marker on a content block.
+// Only the ephemeral type exists on the wire today (default 5-minute TTL).
+type cacheControl struct {
+	Type string `json:"type"`
+}
+
+// systemPrompt marshals the top-level `system` field. Without a breakpoint it
+// emits the plain-string form — byte-compatible with the pre-caching wire
+// shape. With Cache set it emits the array-of-blocks form, because a bare
+// string cannot carry a cache_control marker.
+type systemPrompt struct {
+	Text  string
+	Cache bool
+}
+
+func (s systemPrompt) MarshalJSON() ([]byte, error) {
+	if !s.Cache {
+		return json.Marshal(s.Text)
+	}
+	return json.Marshal([]anthropicBlock{{
+		Type:         blockTypeText,
+		Text:         s.Text,
+		CacheControl: &cacheControl{Type: cacheControlEphemeral},
+	}})
 }
 
 // thinkingConfig is the `thinking` request field. Only adaptive thinking is
@@ -92,8 +121,14 @@ type outputFormat struct {
 	Schema json.RawMessage `json:"schema"`
 }
 
+// toolChoice is the `tool_choice` request field. Name is populated only on
+// decode, for the "tool" variant (force one named tool) — a real Anthropic
+// wire shape the encode side never emits and the neutral vocabulary cannot
+// represent, so the server decoder uses Name only to produce a precise
+// unsupported-feature error.
 type toolChoice struct {
 	Type string `json:"type"`
+	Name string `json:"name,omitempty"`
 }
 
 // anthropicTool is one entry of the `tools` array.
@@ -140,6 +175,9 @@ type anthropicBlock struct {
 	ToolUseID string           `json:"tool_use_id,omitempty"`
 	Content   []anthropicBlock `json:"content,omitempty"`
 	IsError   bool             `json:"is_error,omitempty"`
+
+	// cache breakpoint marker (encode only; never populated on decode)
+	CacheControl *cacheControl `json:"cache_control,omitempty"`
 }
 
 // imageSource is the `source` object of an image block: either a base64 inline

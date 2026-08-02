@@ -300,8 +300,6 @@ type BetaSelfHostedWork struct {
 	LatestHeartbeatAt string `json:"latest_heartbeat_at" api:"required"`
 	// User-provided metadata key-value pairs associated with this work item
 	Metadata map[string]string `json:"metadata" api:"required"`
-	// Session instance JWT secret (only included in certain retrieval paths)
-	Secret string `json:"secret" api:"required"`
 	// RFC 3339 timestamp when work execution started
 	StartedAt string `json:"started_at" api:"required"`
 	// Current state of the work item
@@ -323,7 +321,6 @@ type BetaSelfHostedWork struct {
 		EnvironmentID     respjson.Field
 		LatestHeartbeatAt respjson.Field
 		Metadata          respjson.Field
-		Secret            respjson.Field
 		StartedAt         respjson.Field
 		State             respjson.Field
 		StopRequestedAt   respjson.Field

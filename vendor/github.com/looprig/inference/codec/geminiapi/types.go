@@ -52,6 +52,19 @@ type geminiPart struct {
 	FileData         *fileData         `json:"fileData,omitempty"`
 	FunctionCall     *functionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *functionResponse `json:"functionResponse,omitempty"`
+
+	// ThoughtSignature is Gemini 2.5+'s opaque, provider-private continuation
+	// token for a thought (or the function-call part it accompanies). It is a
+	// plain base64-ish string on the wire, not structured JSON, so it is
+	// carried as a Go string here — the domain-model mapping into
+	// content.ThinkingBlock.ProviderState (a json.RawMessage) stores this
+	// string's JSON-marshaled form, the same "wrap the opaque wire string as
+	// a JSON string value" convention codec/openairesponses uses for its own
+	// analogous encrypted_content field (see opaqueStateFromWire/
+	// opaqueStateToWire, decode.go/encode.go). A same-dialect round trip must
+	// echo it back byte-for-byte on a replayed thought part; this codec never
+	// interprets its contents.
+	ThoughtSignature string `json:"thoughtSignature,omitempty"`
 }
 
 // inlineData carries raw image (or other media) bytes inline as base64. This is

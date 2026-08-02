@@ -28,20 +28,50 @@ func (acc *BetaMessage) Accumulate(event BetaRawMessageStreamEventUnion) error {
 	case BetaRawMessageDeltaEvent:
 		acc.StopReason = event.Delta.StopReason
 		acc.StopSequence = event.Delta.StopSequence
+		if event.Delta.JSON.StopDetails.Valid() {
+			acc.StopDetails = event.Delta.StopDetails
+		}
 		acc.Usage.OutputTokens = event.Usage.OutputTokens
+		if event.Usage.JSON.InputTokens.Valid() {
+			acc.Usage.InputTokens = event.Usage.InputTokens
+		}
+		if event.Usage.JSON.CacheCreationInputTokens.Valid() {
+			acc.Usage.CacheCreationInputTokens = event.Usage.CacheCreationInputTokens
+		}
+		if event.Usage.JSON.CacheReadInputTokens.Valid() {
+			acc.Usage.CacheReadInputTokens = event.Usage.CacheReadInputTokens
+		}
+		if event.Usage.JSON.ServerToolUse.Valid() {
+			acc.Usage.ServerToolUse = event.Usage.ServerToolUse
+		}
+		if event.Usage.JSON.OutputTokensDetails.Valid() {
+			acc.Usage.OutputTokensDetails = event.Usage.OutputTokensDetails
+		}
 		acc.Usage.Iterations = event.Usage.Iterations
 		acc.ContextManagement = event.ContextManagement
 	case BetaRawContentBlockStartEvent:
+		// Content blocks start in index order with no gaps: a start event always
+		// addresses the slot right after the previous block, even when deltas and
+		// stops for still-open blocks interleave after it.
+		if event.Index != int64(len(acc.Content)) {
+			return fmt.Errorf("received event of type %s for content block at index %d, expected index %d", event.Type, event.Index, len(acc.Content))
+		}
 		acc.Content = append(acc.Content, BetaContentBlockUnion{})
-		err := acc.Content[len(acc.Content)-1].UnmarshalJSON([]byte(event.ContentBlock.RawJSON()))
+		err := acc.Content[event.Index].UnmarshalJSON([]byte(event.ContentBlock.RawJSON()))
 		if err != nil {
 			return err
 		}
-	case BetaRawContentBlockDeltaEvent:
-		if len(acc.Content) == 0 {
-			return fmt.Errorf("received event of type %s but there was no content block", event.Type)
+		// The final hop's fallback block names the model that served the response;
+		// non-streaming responses already report that model, so relabel the
+		// accumulated snapshot to match. Last block wins on multi-hop chains.
+		if fallback, ok := acc.Content[event.Index].AsAny().(BetaFallbackBlock); ok {
+			acc.Model = fallback.To.Model
 		}
-		cb := &acc.Content[len(acc.Content)-1]
+	case BetaRawContentBlockDeltaEvent:
+		if err := checkContentBlockIndex(string(event.Type), event.Index, len(acc.Content)); err != nil {
+			return err
+		}
+		cb := &acc.Content[event.Index]
 		switch delta := event.Delta.AsAny().(type) {
 		case BetaTextDelta:
 			cb.Text += delta.Text
@@ -66,6 +96,7 @@ func (acc *BetaMessage) Accumulate(event BetaRawMessageStreamEventUnion) error {
 			cb.Citations = append(cb.Citations, citation)
 		case BetaCompactionContentBlockDelta:
 			cb.Content.OfString = delta.Content
+			cb.EncryptedContent = delta.EncryptedContent
 		}
 	case BetaRawMessageStopEvent:
 		// Re-marshal the accumulated message to update JSON.raw so that AsAny()
@@ -78,10 +109,10 @@ func (acc *BetaMessage) Accumulate(event BetaRawMessageStreamEventUnion) error {
 	case BetaRawContentBlockStopEvent:
 		// Re-marshal the content block to update JSON.raw so that AsAny()
 		// returns the accumulated data rather than the original stream data
-		if len(acc.Content) == 0 {
-			return fmt.Errorf("received event of type %s but there was no content block", event.Type)
+		if err := checkContentBlockIndex(string(event.Type), event.Index, len(acc.Content)); err != nil {
+			return err
 		}
-		contentBlock := &acc.Content[len(acc.Content)-1]
+		contentBlock := &acc.Content[event.Index]
 		cbJSON, err := json.Marshal(contentBlock)
 		if err != nil {
 			return fmt.Errorf("error converting content block to JSON: %w", err)
@@ -194,6 +225,11 @@ func (variant BetaToolSearchToolResultBlock) toParamUnion() BetaContentBlockPara
 func (variant BetaCompactionBlock) toParamUnion() BetaContentBlockParamUnion {
 	p := variant.ToParam()
 	return BetaContentBlockParamUnion{OfCompaction: &p}
+}
+
+func (variant BetaFallbackBlock) toParamUnion() BetaContentBlockParamUnion {
+	p := variant.ToParam()
+	return BetaContentBlockParamUnion{OfFallback: &p}
 }
 
 func (r BetaMessage) ToParam() BetaMessageParam {
@@ -478,5 +514,13 @@ func (r BetaCompactionBlock) ToParam() BetaCompactionBlockParam {
 	var p BetaCompactionBlockParam
 	p.Type = r.Type
 	p.Content = param.NewOpt(r.Content)
+	return p
+}
+
+func (r BetaFallbackBlock) ToParam() BetaFallbackBlockParam {
+	var p BetaFallbackBlockParam
+	p.Type = r.Type
+	p.From = BetaFallbackInfoParam{Model: r.From.Model}
+	p.To = BetaFallbackInfoParam{Model: r.To.Model}
 	return p
 }

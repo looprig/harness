@@ -20,6 +20,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/packages/pagination"
 	"github.com/anthropics/anthropic-sdk-go/packages/param"
 	"github.com/anthropics/anthropic-sdk-go/packages/respjson"
+	"github.com/anthropics/anthropic-sdk-go/shared/constant"
 )
 
 // BetaAgentService contains methods and other services that help with interacting
@@ -1226,19 +1227,15 @@ const (
 
 // JSON Schema for custom tool input parameters.
 type BetaManagedAgentsCustomToolInputSchema struct {
-	// JSON Schema properties defining the tool's input parameters.
-	Properties map[string]any `json:"properties" api:"nullable"`
-	// List of required property names.
-	Required []string `json:"required"`
-	// Must be 'object' for tool input schemas.
-	//
-	// Any of "object".
-	Type BetaManagedAgentsCustomToolInputSchemaType `json:"type"`
+	Type        constant.Object `json:"type" default:"object"`
+	Properties  map[string]any  `json:"properties" api:"nullable"`
+	Required    []string        `json:"required" api:"nullable"`
+	ExtraFields map[string]any  `json:"" api:"extrafields"`
 	// JSON contains metadata for fields, check presence with [respjson.Field.Valid].
 	JSON struct {
+		Type        respjson.Field
 		Properties  respjson.Field
 		Required    respjson.Field
-		Type        respjson.Field
 		ExtraFields map[string]respjson.Field
 		raw         string
 	} `json:"-"`
@@ -1260,29 +1257,21 @@ func (r BetaManagedAgentsCustomToolInputSchema) ToParam() BetaManagedAgentsCusto
 	return param.Override[BetaManagedAgentsCustomToolInputSchemaParam](json.RawMessage(r.RawJSON()))
 }
 
-// Must be 'object' for tool input schemas.
-type BetaManagedAgentsCustomToolInputSchemaType string
-
-const (
-	BetaManagedAgentsCustomToolInputSchemaTypeObject BetaManagedAgentsCustomToolInputSchemaType = "object"
-)
-
 // JSON Schema for custom tool input parameters.
+//
+// The property Type is required.
 type BetaManagedAgentsCustomToolInputSchemaParam struct {
-	// JSON Schema properties defining the tool's input parameters.
 	Properties map[string]any `json:"properties,omitzero"`
-	// List of required property names.
-	Required []string `json:"required,omitzero"`
-	// Must be 'object' for tool input schemas.
-	//
-	// Any of "object".
-	Type BetaManagedAgentsCustomToolInputSchemaType `json:"type,omitzero"`
+	Required   []string       `json:"required,omitzero"`
+	// This field can be elided, and will marshal its zero value as "object".
+	Type        constant.Object `json:"type" default:"object"`
+	ExtraFields map[string]any  `json:"-"`
 	paramObj
 }
 
 func (r BetaManagedAgentsCustomToolInputSchemaParam) MarshalJSON() (data []byte, err error) {
 	type shadow BetaManagedAgentsCustomToolInputSchemaParam
-	return param.MarshalObject(r, (*shadow)(&r))
+	return param.MarshalWithExtras(r, (*shadow)(&r), r.ExtraFields)
 }
 func (r *BetaManagedAgentsCustomToolInputSchemaParam) UnmarshalJSON(data []byte) error {
 	return apijson.UnmarshalRoot(data, r)
@@ -1296,7 +1285,7 @@ func (r *BetaManagedAgentsCustomToolInputSchemaParam) UnmarshalJSON(data []byte)
 // The properties Description, InputSchema, Name, Type are required.
 type BetaManagedAgentsCustomToolParams struct {
 	// Description of what the tool does, shown to the agent to help it decide when to
-	// use the tool. 1-1024 characters.
+	// use the tool. 1-4096 characters.
 	Description string `json:"description" api:"required"`
 	// JSON Schema for custom tool input parameters.
 	InputSchema BetaManagedAgentsCustomToolInputSchemaParam `json:"input_schema,omitzero" api:"required"`
@@ -1712,6 +1701,8 @@ const (
 type BetaManagedAgentsModel = string
 
 const (
+	BetaManagedAgentsModelClaudeSonnet5            BetaManagedAgentsModel = "claude-sonnet-5"
+	BetaManagedAgentsModelClaudeFable5             BetaManagedAgentsModel = "claude-fable-5"
 	BetaManagedAgentsModelClaudeOpus4_8            BetaManagedAgentsModel = "claude-opus-4-8"
 	BetaManagedAgentsModelClaudeOpus4_7            BetaManagedAgentsModel = "claude-opus-4-7"
 	BetaManagedAgentsModelClaudeOpus4_6            BetaManagedAgentsModel = "claude-opus-4-6"
@@ -2205,14 +2196,16 @@ type BetaAgentNewParams struct {
 	// e.g. `claude-opus-4-6`, or a `model_config` object for additional configuration
 	// control
 	Model BetaManagedAgentsModelConfigParams `json:"model,omitzero" api:"required"`
-	// Human-readable name for the agent. 1-256 characters.
+	// Human-readable name for the agent.
 	Name string `json:"name" api:"required"`
-	// Description of what the agent does. Up to 2048 characters.
+	// Description of what the agent does.
 	Description param.Opt[string] `json:"description,omitzero"`
-	// System prompt for the agent. Up to 100,000 characters.
+	// System prompt for the agent.
 	System param.Opt[string] `json:"system,omitzero"`
 	// MCP servers this agent connects to. Maximum 20. Names must be unique within the
-	// array.
+	// array. Every server must be referenced by an `mcp_toolset` in `tools`;
+	// unreferenced servers are rejected. See the
+	// [MCP connector guide](https://platform.claude.com/docs/en/managed-agents/mcp-connector).
 	MCPServers []BetaManagedAgentsURLMCPServerParams `json:"mcp_servers,omitzero"`
 	// Arbitrary key-value metadata. Maximum 16 pairs, keys up to 64 chars, values up
 	// to 512 chars.
@@ -2220,7 +2213,7 @@ type BetaAgentNewParams struct {
 	// A coordinator topology: the session's primary thread orchestrates work by
 	// spawning session threads, each running an agent drawn from the `agents` roster.
 	Multiagent BetaManagedAgentsMultiagentParams `json:"multiagent,omitzero"`
-	// Skills available to the agent. Maximum 20.
+	// Skills available to the agent.
 	Skills []BetaManagedAgentsSkillParamsUnion `json:"skills,omitzero"`
 	// Tool configurations available to the agent. Maximum of 128 tools across all
 	// toolsets allowed.
@@ -2442,23 +2435,23 @@ type BetaAgentUpdateParams struct {
 	// value from a create or retrieve response. The request fails if this does not
 	// match the server's current version.
 	Version int64 `json:"version" api:"required"`
-	// Description. Up to 2048 characters. Omit to preserve; send empty string or null
-	// to clear.
+	// Description. Omit to preserve; send empty string or null to clear.
 	Description param.Opt[string] `json:"description,omitzero"`
-	// System prompt. Up to 100,000 characters. Omit to preserve; send empty string or
-	// null to clear.
+	// System prompt. Omit to preserve; send empty string or null to clear.
 	System param.Opt[string] `json:"system,omitzero"`
-	// Human-readable name. 1-256 characters. Omit to preserve. Cannot be cleared.
+	// Human-readable name. Must be non-empty. Omit to preserve. Cannot be cleared.
 	Name param.Opt[string] `json:"name,omitzero"`
-	// MCP servers. Full replacement. Omit to preserve; send empty array or null to
-	// clear. Names must be unique. Maximum 20.
+	// MCP servers. Full replacement. Omit to preserve; send empty array or `null` to
+	// clear. Names must be unique. Maximum 20. Every server must be referenced by an
+	// `mcp_toolset` in the agent's resulting `tools`; unreferenced servers are
+	// rejected. See the
+	// [MCP connector guide](https://platform.claude.com/docs/en/managed-agents/mcp-connector).
 	MCPServers []BetaManagedAgentsURLMCPServerParams `json:"mcp_servers,omitzero"`
 	// Metadata patch. Set a key to a string to upsert it, or to null to delete it.
 	// Omit the field to preserve. The stored bag is limited to 16 keys (up to 64 chars
 	// each) with values up to 512 chars.
 	Metadata map[string]string `json:"metadata,omitzero"`
 	// Skills. Full replacement. Omit to preserve; send empty array or null to clear.
-	// Maximum 20.
 	Skills []BetaManagedAgentsSkillParamsUnion `json:"skills,omitzero"`
 	// Tool configurations available to the agent. Full replacement. Omit to preserve;
 	// send empty array or null to clear. Maximum of 128 tools across all toolsets

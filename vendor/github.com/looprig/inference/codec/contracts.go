@@ -58,3 +58,71 @@ type StreamingCodec interface {
 	Codec
 	StreamDecoder
 }
+
+// DecodedRequest is a semantic decoding of a native harness HTTP request: the
+// provider-neutral Request, the untrusted harness-requested model name (never
+// trusted as an upstream target identity — the gateway resolves it to a Target
+// and overwrites Request.Model before invocation), and whether the harness asked
+// for a streaming response.
+type DecodedRequest struct {
+	Request        inference.Request
+	RequestedModel string
+	Streaming      bool
+}
+
+// ServerCodec is the ingress-side counterpart to Codec: it recognizes and decodes
+// one dialect's native HTTP request, and encodes inference results back into that
+// dialect's native HTTP response. A ServerCodec owns dialect request recognition
+// and semantic body decoding, and dialect response JSON and stream event encoding.
+// It does NOT own authentication, body limits, route resolution, target
+// substitution, upstream invocation, cancellation, or HTTP lifecycle — those
+// belong to the gateway package.
+//
+// Implementations must be stateless and safe for concurrent use; only the
+// StreamEncoder returned by OpenStream is request-scoped.
+type ServerCodec interface {
+	// MatchRequest reports whether req's method and path belong to this codec's
+	// dialect. It must not consume req.Body.
+	MatchRequest(req *http.Request) bool
+
+	// DecodeRequest decodes a matched request into a DecodedRequest. It owns
+	// semantic validation of the native request shape, including rejecting an
+	// unsupported Content-Type and malformed bodies, and must never panic on
+	// malformed input.
+	DecodeRequest(req *http.Request) (DecodedRequest, error)
+
+	// WriteResponse encodes a complete non-streaming inference.Response as this
+	// dialect's native successful HTTP response.
+	WriteResponse(w http.ResponseWriter, resp *inference.Response) error
+
+	// OpenStream begins this dialect's native streaming HTTP response and
+	// returns a request-scoped StreamEncoder for the remainder of the stream.
+	// Once called, the returned StreamEncoder owns w until Finish or Fail is
+	// called.
+	OpenStream(w http.ResponseWriter) (StreamEncoder, error)
+
+	// WriteError encodes err as this dialect's native error envelope, including
+	// its HTTP status code. It must not panic regardless of the concrete error
+	// type.
+	WriteError(w http.ResponseWriter, err error)
+}
+
+// StreamEncoder owns one in-flight native streaming HTTP response body. It is
+// request-scoped and may hold request-local state such as generated tool-call
+// identifiers and event sequence numbers; it is never shared across requests.
+//
+// Exactly one of Finish or Fail terminates a StreamEncoder. Once either has been
+// called, every further call — including a second Finish or Fail — must return an
+// error rather than writing to the closed stream again, and must never panic.
+type StreamEncoder interface {
+	// WriteChunk encodes and flushes one content.Chunk as a native stream event.
+	WriteChunk(chunk content.Chunk) error
+
+	// Finish encodes the dialect's native stream-completion event(s) from
+	// authoritative terminal metadata and closes the stream cleanly.
+	Finish(result stream.StreamResult) error
+
+	// Fail encodes a native in-stream error event, if the dialect distinguishes
+	// one, and closes the stream.
+	Fail(err error) error
+}

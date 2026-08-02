@@ -30,7 +30,7 @@ Or to pin the version:
 <!-- x-release-please-start-version -->
 
 ```sh
-go get -u 'github.com/openai/openai-go/v3@v3.37.0'
+go get -u 'github.com/openai/openai-go/v3@v3.42.0'
 ```
 
 <!-- x-release-please-end -->
@@ -1064,7 +1064,7 @@ func main() {
 	const azureOpenAIEndpoint = "https://<azure-openai-resource>.openai.azure.com"
 
 	// The latest API versions, including previews, can be found here:
-	// https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#rest-api-versionng
+	// https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#rest-api-versioning
 	const azureOpenAIAPIVersion = "2024-06-01"
 
 	tokenCredential, err := azidentity.NewDefaultAzureCredential(nil)

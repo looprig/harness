@@ -8,15 +8,19 @@ import (
 	"github.com/looprig/inference/codec/anthropicapi"
 	"github.com/looprig/inference/codec/geminiapi"
 	"github.com/looprig/inference/codec/openaiapi"
+	"github.com/looprig/inference/codec/openairesponses"
 	model "github.com/looprig/inference/model"
 )
 
 const bytesPerEstimatedToken uint64 = 4
 
-// EstimatorRevision pins both the bundled OpenAI/Anthropic/Gemini encoder suite
-// and the complete-request bytes/4 heuristic. Any count-affecting codec change
-// must bump this revision so durable measurements remain attributable.
-const EstimatorRevision TokenizerRevision = "bundled-openai-anthropic-gemini-request-bytes-div4-v1"
+// EstimatorRevision pins the bundled OpenAI/OpenAI-Responses/Anthropic/Gemini
+// encoder suite and the complete-request bytes/4 heuristic. Any
+// count-affecting codec change must bump this revision so durable
+// measurements remain attributable. Bumped from
+// "bundled-openai-anthropic-gemini-request-bytes-div4-v1" to add the
+// openairesponses encoder to the bundle.
+const EstimatorRevision TokenizerRevision = "bundled-openai-responses-anthropic-gemini-request-bytes-div4-v1"
 
 // Estimator deterministically estimates input occupancy from a dialect's encoded
 // complete request. Its zero value is ready for use.
@@ -97,6 +101,8 @@ func encodeRequest(req inference.Request) ([]byte, error) {
 	switch req.Model.APIFormat {
 	case model.APIFormatOpenAI:
 		body, err = openaiapi.EncodeRequest(req, false)
+	case model.APIFormatOpenAIResponses:
+		body, err = openairesponses.EncodeRequest(req, false)
 	case model.APIFormatAnthropic:
 		body, err = anthropicapi.EncodeRequest(req, false)
 	case model.APIFormatGemini:
