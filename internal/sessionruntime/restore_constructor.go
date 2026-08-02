@@ -975,7 +975,12 @@ func buildRestoredSession(
 	if err != nil {
 		return abort(&RestoreError{Kind: RestoreJournalFailed, Cause: err})
 	}
-	hubOpts := []hub.Option{hub.WithAppender(appender), hub.WithFactory(factory), hub.WithFaultReporter(s)}
+	hubOpts := []hub.Option{
+		hub.WithAppender(appender),
+		hub.WithFactory(factory),
+		hub.WithFaultReporter(s),
+		hub.WithCommitObserver(s.recordLoopMechanicalState),
+	}
 	s.hub = hub.New(sessionID, hubOpts...)
 	s.gateAppender = &liveGateAppender{prepared: gateAppender, publisher: s}
 	if err := s.bindSessionHustles(); err != nil {

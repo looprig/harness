@@ -74,10 +74,11 @@ type Hub struct {
 	// and read without the lock — appender.AppendEvent is the durable write the hub
 	// runs OUTSIDE mu (no I/O under the lock); factory mints headers for synthesized
 	// session events; reporter is the fail-secure escalation seam.
-	appender     eventAppender
-	factory      *event.Factory
-	reporter     FaultReporter
-	idleBoundary sessionIdleBoundary
+	appender       eventAppender
+	factory        *event.Factory
+	reporter       FaultReporter
+	idleBoundary   sessionIdleBoundary
+	commitObserver func(event.Event)
 }
 
 // New builds an idle hub for sessionID. The returned hub has no subscribers and a
@@ -245,6 +246,7 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 					h.reporter.ReportFault(ctx, fault)
 					return fault
 				}
+				h.observeCommit(ev)
 				h.deliver(subs, ev, seq)
 				h.deliver(subs, idle, ds)
 				return nil
@@ -273,12 +275,19 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 
 	// (5) Deliver live in causal order, then wake idle waiters AFTER the durable
 	// append of the SessionIdle edge.
+	h.observeCommit(ev)
 	h.deliver(subs, ev, seq)
 	if derived != nil {
 		h.deliver(subs, derived, derivedSeq)
 		h.signalIdleIfEdge(derived)
 	}
 	return committed, nil
+}
+
+func (h *Hub) observeCommit(ev event.Event) {
+	if h.commitObserver != nil {
+		h.commitObserver(ev)
+	}
 }
 
 // PublishInternalEventChecked durably appends one recognized private

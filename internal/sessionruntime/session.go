@@ -1747,7 +1747,11 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// nop default (headless/no-persistence). A nil appender is passed through to
 	// hub.WithAppender, which ignores it (the nop default stays), so the no-injection
 	// path is unchanged.
-	hubOpts := []hub.Option{hub.WithFactory(s.factory), hub.WithFaultReporter(s)}
+	hubOpts := []hub.Option{
+		hub.WithFactory(s.factory),
+		hub.WithFaultReporter(s),
+		hub.WithCommitObserver(s.recordLoopMechanicalState),
+	}
 	if s.injectedEventAppender != nil {
 		hubOpts = append(hubOpts, hub.WithAppender(s.injectedEventAppender))
 	}

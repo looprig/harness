@@ -37,6 +37,20 @@ func (nopEventAppender) AppendEvent(context.Context, event.Event) (uint64, error
 // (hub.New(id)) working while the composition root injects the durable trio.
 type Option func(*Hub)
 
+// WithCommitObserver installs a callback invoked after the primary event and any
+// derived session event have durably committed, but before either event is fanned
+// out to subscribers. It is an observation hook: the callback must not mutate
+// durable state or return an error. The session runtime uses it to keep its
+// bounded live status view ordered before consumers can observe the same
+// committed terminal.
+func WithCommitObserver(observer func(event.Event)) Option {
+	return func(h *Hub) {
+		if observer != nil {
+			h.commitObserver = observer
+		}
+	}
+}
+
 // sessionIdleBoundary is the narrow internal collaborator around a derived idle edge.
 // The hub discovers it structurally from its already-injected FaultReporter, so no public
 // hook/subscriber/watcher API is exposed.
