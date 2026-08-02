@@ -146,6 +146,9 @@ Pin validation and cloning:
 - model descriptors validate and are deep-cloned;
 - efforts are valid, unique, deterministically ordered, and compatible with
   the target's thinking capability;
+- the model-facing token `none` round-trips to internal `model.EffortNone`
+  without collapsing into omission; `xhigh` round-trips as
+  `model.EffortXHigh`; `ultra` and an explicit empty string are rejected;
 - no URL, token, executable, environment, or client is included in a
   model-facing/durable projection.
 
@@ -680,7 +683,8 @@ Claude Code:
 
 - locate only an advertised select option whose category is
   `thought_level` (or the exact pinned ACP category name);
-- resolve only configured Looprig effort aliases;
+- resolve only configured Looprig effort aliases from the closed external set
+  `none|low|medium|high|xhigh|max`, mapping `none` to the internal zero value;
 - apply it with `session/set_config_option` after `session/new` and before the
   first prompt;
 - fail with a typed capability/alias error when requested but unavailable.
@@ -691,6 +695,10 @@ Codex:
 - keep model and effort fixed for the connector lifetime;
 - require a new connector/process/session for another tuple;
 - never use speculative extension calls.
+
+Neither connector may clamp `xhigh`/`max`, reinterpret explicit `none` as an
+omitted default, or admit `ultra`. A catalogue tuple is executable only when
+the adapter and gateway can preserve its exact selected effort.
 
 Do not assume every adapter supports every effort. Connector capability must be
 explicit and testable.
