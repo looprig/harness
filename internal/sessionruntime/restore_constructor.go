@@ -824,19 +824,34 @@ func restoreRuntimeBinding(started event.LoopStarted, bound loop.BoundDefinition
 // fault); the caller cancels the session context and records a RestoreErrored. On success
 // s.activeLoopID reflects the durable active loop.
 func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoopID uuid.UUID) error {
-	for _, plan := range plans {
+	for i := range plans {
+		plan := &plans[i]
 		if plan.started.LoopID == rootLoopID {
 			continue
 		}
 		parent := loop.Provenance{LoopID: plan.started.Cause.Coordinates.LoopID, TurnID: plan.started.Cause.Coordinates.TurnID, StepID: plan.started.Cause.Coordinates.StepID}
 		if plan.runtimeMismatch != nil || plan.tombstoned {
-			if err := s.attachRestoredTombstonedLoop(plan, parent); err != nil {
+			if err := s.attachRestoredTombstonedLoop(*plan, parent); err != nil {
 				return err
 			}
 			continue
 		}
 		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.bindings, plan.folded, foldLoopInference(plan.events), findForeignSID(plan.events)); err != nil {
-			return err
+			mismatch, runtimeFailure := classifyRestoredChildRuntimeFailure(err)
+			if !runtimeFailure {
+				return err
+			}
+			// A runtime-classified failure can arise after the preflight fold (for
+			// example, an adapter session/load failure). Keep the same per-child
+			// degraded-restore rule as catalog drift: preserve the folded child
+			// identity, publish one bounded tombstone, and continue restoring
+			// siblings. The active-loop check below still makes an active child
+			// failure session-fatal.
+			plan.runtimeMismatch = mismatch
+			if tombstoneErr := s.attachRestoredTombstonedLoop(*plan, parent); tombstoneErr != nil {
+				return tombstoneErr
+			}
+			plan.tombstoned = true
 		}
 	}
 	activeID := rootLoopID
@@ -864,13 +879,30 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 	return nil
 }
 
+func classifyRestoredChildRuntimeFailure(err error) (*RestoreRuntimeMismatchError, bool) {
+	var mismatch *RestoreRuntimeMismatchError
+	if errors.As(err, &mismatch) {
+		return mismatch, true
+	}
+	var restoreErr *RestoreError
+	if !errors.As(err, &restoreErr) {
+		return nil, false
+	}
+	switch restoreErr.Kind {
+	case RestoreForeignBuilderMissing, RestoreForeignSIDMissing:
+		return &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}, true
+	default:
+		return nil, false
+	}
+}
+
 func (s *Session) attachRestoredTombstonedLoop(plan loopPlan, parent loop.Provenance) error {
 	if !plan.tombstoned {
 		hdr, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{SessionID: s.sessionID, LoopID: plan.started.LoopID}})
 		if err != nil {
 			return &RestoreError{Kind: RestoreIDGenerationFailed, Cause: err}
 		}
-		ev := event.LoopRestoreTombstoned{Header: hdr, Category: event.LoopRestoreTombstoneRuntimeMismatch}
+		ev := event.LoopRestoreTombstoned{Header: hdr, Category: restoreTombstoneCategory(plan.runtimeMismatch)}
 		if err := s.PublishEventChecked(context.Background(), ev); err != nil {
 			return &RestoreError{Kind: RestoreAppendFailed, Cause: err}
 		}
@@ -885,6 +917,13 @@ func (s *Session) attachRestoredTombstonedLoop(plan loopPlan, parent loop.Proven
 	}
 	s.loopsMu.Unlock()
 	return nil
+}
+
+func restoreTombstoneCategory(mismatch *RestoreRuntimeMismatchError) string {
+	if mismatch != nil && mismatch.Kind == RestoreRuntimeUnavailable {
+		return event.LoopRestoreTombstoneRuntimeUnavailable
+	}
+	return event.LoopRestoreTombstoneRuntimeMismatch
 }
 
 // buildRestoredSession assembles the live Session for a successful restore: the hub
