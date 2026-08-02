@@ -407,6 +407,34 @@ func TestRuntimeCatalogAllowsSharedGatewayAliasesButNotNativeAliases(t *testing.
 	}
 }
 
+func TestRuntimeCatalogAllowsNativeAndGatewayModelsWithinOneHarness(t *testing.T) {
+	entries := testCatalogEntries()
+	entries[0].Models = append(entries[0].Models, RuntimeModelOption{
+		Alias: "codex-native", Credential: CredentialNativeAuth,
+		Target:        runtimeModel("native-target", model.EffortNone),
+		DefaultEffort: model.EffortNone, Efforts: []model.Effort{model.EffortNone},
+	})
+	catalog, err := NewRuntimeCatalog(entries)
+	if err != nil {
+		t.Fatalf("mixed gateway/native entry rejected: %v", err)
+	}
+	resolved, err := catalog.Resolve("worker", "codex", "codex-native", model.EffortNone)
+	if err != nil {
+		t.Fatalf("native model did not resolve: %v", err)
+	}
+	if resolved.Credential != CredentialNativeAuth {
+		t.Fatalf("resolved credential = %q, want %q", resolved.Credential, CredentialNativeAuth)
+	}
+	if _, err := catalog.Resolve("worker", "claude-code", "codex-native", model.EffortNone); err == nil {
+		t.Fatal("native model resolved under a different harness")
+	}
+
+	entries[0].Models[len(entries[0].Models)-1].Alias = entries[1].Models[0].Alias
+	if _, err := NewRuntimeCatalog(entries); err == nil {
+		t.Fatal("native model sharing a gateway alias across harnesses was accepted")
+	}
+}
+
 func testCatalogEntries() []RuntimeCatalogEntry {
 	return []RuntimeCatalogEntry{
 		{

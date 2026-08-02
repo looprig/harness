@@ -27,7 +27,12 @@ type RuntimeProfileName string
 
 // RuntimeModelOption describes one model alias admitted by one catalog entry.
 type RuntimeModelOption struct {
-	Alias         ModelAlias
+	Alias ModelAlias
+	// Credential optionally overrides the entry credential for this model.
+	// It lets one harness expose its own native-auth catalogue alongside
+	// product-owned gateway targets while each resolved child still has one
+	// immutable credential mode. Empty inherits RuntimeCatalogEntry.Credential.
+	Credential    CredentialMode
 	Target        model.Model
 	DefaultEffort model.Effort
 	Efforts       []model.Effort
@@ -259,7 +264,7 @@ func (c RuntimeCatalog) ResolveWithExplicitEffort(agent identity.AgentName, harn
 		SubagentType: selected.SubagentType,
 		AgentHarness: selected.AgentHarness,
 		Profile:      selected.Profile,
-		Credential:   selected.Credential,
+		Credential:   effectiveModelCredential(*selected, *selectedModel),
 		ModelAlias:   selectedModel.Alias,
 		SmallModel:   selected.SmallModel,
 		Target:       selectedModel.Target.Clone(),
@@ -285,6 +290,13 @@ type runtimeHarnessKey struct {
 type runtimeAliasOwner struct {
 	harness    AgentHarnessName
 	credential CredentialMode
+}
+
+func effectiveModelCredential(entry RuntimeCatalogEntry, option RuntimeModelOption) CredentialMode {
+	if option.Credential != "" {
+		return option.Credential
+	}
+	return entry.Credential
 }
 
 func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
@@ -325,6 +337,9 @@ func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
 		option := &entry.Models[i]
 		if err := validateCatalogIdentifier(string(option.Alias), false); err != nil {
 			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "Models.Alias"}
+		}
+		if option.Credential != "" && option.Credential != CredentialGatewayBacked && option.Credential != CredentialNativeAuth {
+			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidCredential, Field: "Models.Credential"}
 		}
 		if _, exists := aliases[option.Alias]; exists {
 			return &RuntimeCatalogError{Kind: RuntimeCatalogDuplicateAlias, Field: "Models.Alias"}
@@ -379,15 +394,15 @@ func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
 func validateNativeAliasOwnership(entries []RuntimeCatalogEntry) error {
 	owners := make(map[ModelAlias][]runtimeAliasOwner)
 	for _, entry := range entries {
-		aliases := make(map[ModelAlias]struct{}, len(entry.Models)+1)
 		for _, option := range entry.Models {
-			aliases[option.Alias] = struct{}{}
+			owners[option.Alias] = append(owners[option.Alias], runtimeAliasOwner{
+				harness: entry.AgentHarness, credential: effectiveModelCredential(entry, option),
+			})
 		}
 		if entry.SmallModel != "" {
-			aliases[entry.SmallModel] = struct{}{}
-		}
-		for alias := range aliases {
-			owners[alias] = append(owners[alias], runtimeAliasOwner{harness: entry.AgentHarness, credential: entry.Credential})
+			owners[entry.SmallModel] = append(owners[entry.SmallModel], runtimeAliasOwner{
+				harness: entry.AgentHarness, credential: entry.Credential,
+			})
 		}
 	}
 	for _, aliasOwners := range owners {
@@ -487,6 +502,7 @@ type runtimeCatalogEntryDigest struct {
 
 type runtimeModelOptionDigest struct {
 	Alias          string              `json:"alias"`
+	Credential     CredentialMode      `json:"credential,omitempty"`
 	Provider       string              `json:"provider"`
 	APIFormat      string              `json:"api_format"`
 	Name           string              `json:"name"`
@@ -519,6 +535,7 @@ func digestRuntimeCatalog(entries []RuntimeCatalogEntry) string {
 		for j, option := range entry.Models {
 			row.Models[j] = runtimeModelOptionDigest{
 				Alias:          string(option.Alias),
+				Credential:     option.Credential,
 				Provider:       string(option.Target.Provider),
 				APIFormat:      string(option.Target.APIFormat),
 				Name:           option.Target.Name,
