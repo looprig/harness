@@ -568,6 +568,40 @@ func TestRuntimeCatalogDescriptionDigest(t *testing.T) {
 	if got, want := countJSONKey(projection, "description"), 2; got != want {
 		t.Fatalf("digest JSON description count = %d, want %d: %s", got, want, encoded)
 	}
+	changedEncoded, err := runtimeCatalogDigestJSON(modelCatalog.entries)
+	if err != nil {
+		t.Fatalf("runtimeCatalogDigestJSON(changed model) error = %v", err)
+	}
+	var baseProjection, changedProjection runtimeCatalogDigest
+	if err := json.Unmarshal(encoded, &baseProjection); err != nil {
+		t.Fatalf("unmarshal base digest JSON: %v", err)
+	}
+	if err := json.Unmarshal(changedEncoded, &changedProjection); err != nil {
+		t.Fatalf("unmarshal changed digest JSON: %v", err)
+	}
+	baseCodex := runtimeCatalogDigestEntryForHarness(t, baseProjection, "codex")
+	changedCodex := runtimeCatalogDigestEntryForHarness(t, changedProjection, "codex")
+	if baseCodex.ConfigurationFingerprint != changedCodex.ConfigurationFingerprint {
+		t.Fatalf("description-only change altered configuration fingerprint: base=%q changed=%q", baseCodex.ConfigurationFingerprint, changedCodex.ConfigurationFingerprint)
+	}
+	if string(encoded) == string(changedEncoded) || catalog.Digest() == modelCatalog.Digest() {
+		t.Fatal("description-only change did not alter the outer digest projection and digest")
+	}
+	for _, digestJSON := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "base", data: encoded},
+		{name: "changed", data: changedEncoded},
+	} {
+		var value any
+		if err := json.Unmarshal(digestJSON.data, &value); err != nil {
+			t.Fatalf("unmarshal %s digest JSON: %v", digestJSON.name, err)
+		}
+		if got, want := countJSONKey(value, "description"), 2; got != want {
+			t.Fatalf("%s digest JSON description count = %d, want %d: %s", digestJSON.name, got, want, digestJSON.data)
+		}
+	}
 	for _, forbidden := range []string{"https://endpoint.example/v1", "base_url", "api_key", "secret"} {
 		if strings.Contains(string(encoded), forbidden) {
 			t.Fatalf("digest JSON contains forbidden provider wiring %q: %s", forbidden, encoded)
@@ -654,6 +688,17 @@ func countJSONKey(value any, wanted string) int {
 	default:
 		return 0
 	}
+}
+
+func runtimeCatalogDigestEntryForHarness(t *testing.T, projection runtimeCatalogDigest, harness AgentHarnessName) runtimeCatalogEntryDigest {
+	t.Helper()
+	for _, entry := range projection.Entries {
+		if entry.AgentHarness == string(harness) {
+			return entry
+		}
+	}
+	t.Fatalf("no digest entry for harness %q", harness)
+	return runtimeCatalogEntryDigest{}
 }
 
 func TestRuntimeCatalogNeedsSmallModel(t *testing.T) {

@@ -875,9 +875,26 @@ type runtimeModelOptionDigest struct {
 }
 
 type runtimeCatalogEntryConfiguration struct {
-	Source     RuntimeSourceName
-	Credential CredentialMode
-	Models     []RuntimeModelOption
+	Source     RuntimeSourceName                 `json:"source"`
+	Credential CredentialMode                    `json:"credential"`
+	Models     []runtimeModelOptionConfiguration `json:"models"`
+}
+
+type runtimeModelOptionConfiguration struct {
+	Source           RuntimeSourceName         `json:"source"`
+	Credential       CredentialMode            `json:"credential"`
+	NativeSmallModel string                    `json:"native_small_model,omitempty"`
+	Target           runtimeModelConfiguration `json:"target"`
+}
+
+type runtimeModelConfiguration struct {
+	Provider     model.ProviderName  `json:"provider"`
+	APIFormat    model.APIFormat     `json:"api_format"`
+	Name         string              `json:"name"`
+	Origin       model.Origin        `json:"origin"`
+	Capabilities model.Capabilities  `json:"capabilities"`
+	Limits       model.ContextLimits `json:"limits"`
+	Sampling     model.Sampling      `json:"sampling"`
 }
 
 func digestRuntimeCatalog(entries []RuntimeCatalogEntry) string {
@@ -925,14 +942,26 @@ func runtimeCatalogDigestJSON(entries []RuntimeCatalogEntry) ([]byte, error) {
 }
 
 func runtimeCatalogConfigurationFingerprint(entry RuntimeCatalogEntry) (string, error) {
-	models := cloneRuntimeCatalogEntry(entry).Models
-	for i := range models {
-		models[i].Target.BaseURL = ""
-	}
 	configuration := runtimeCatalogEntryConfiguration{
 		Source:     entry.Source,
 		Credential: entry.Credential,
-		Models:     models,
+		Models:     make([]runtimeModelOptionConfiguration, len(entry.Models)),
+	}
+	for i, option := range entry.Models {
+		configuration.Models[i] = runtimeModelOptionConfiguration{
+			Source:           effectiveRuntimeSource(entry, option),
+			Credential:       option.Credential,
+			NativeSmallModel: option.NativeSmallModel,
+			Target: runtimeModelConfiguration{
+				Provider:     option.Target.Provider,
+				APIFormat:    option.Target.APIFormat,
+				Name:         option.Target.Name,
+				Origin:       option.Target.Origin,
+				Capabilities: option.Target.Caps,
+				Limits:       option.Target.Limits,
+				Sampling:     option.Target.Sampling.Clone(),
+			},
+		}
 	}
 	encoded, err := json.Marshal(configuration)
 	if err != nil {
