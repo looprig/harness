@@ -325,7 +325,7 @@ func (s *agentToolConfig) validateAgentMode(prepared PreparedStartAgent) error {
 			return nil
 		}
 		modes := selectableAgentModes(role.Modes)
-		if len(modes) == 0 {
+		if len(modes) < 2 {
 			return preparationFailure(errCategoryFieldNotAllowed)
 		}
 		for _, mode := range modes {
@@ -378,8 +378,6 @@ func (s *agentToolConfig) resolveDelegateRuntime(prepared PreparedStartAgent) (*
 		if !found {
 			return nil, preparationFailure(errCategoryUnknownRuntime)
 		}
-	} else if prepared.agentHarnessSet && runtimeSourceSelectableForEntries(harnessEntries) && !selected.Default {
-		return nil, preparationFailure(errCategoryFieldNotAllowed)
 	}
 	if !prepared.agentSourceSet && runtimeSourceSelectableForEntries(harnessEntries) {
 		if filtered, ok := runtimeEntryForSource([]loop.RuntimeCatalogEntry{selected}, selected.Source); ok {

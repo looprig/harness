@@ -103,7 +103,7 @@ func marshalAgentSchema(properties map[string]any, required []string) string {
 
 func agentModeSelectable(catalog []AgentCatalogEntry) bool {
 	for _, role := range catalog {
-		if len(selectableAgentModes(role.Modes)) > 0 {
+		if len(selectableAgentModes(role.Modes)) >= 2 {
 			return true
 		}
 	}
@@ -185,7 +185,7 @@ func startRoleChoiceForHarness(role AgentCatalogEntry, entries []loop.RuntimeCat
 
 func startRoleSourceVariants(role AgentCatalogEntry, entries []loop.RuntimeCatalogEntry, explicitHarness, defaultSource bool) map[string]any {
 	branches := make([]any, 0, len(entries)+1)
-	if defaultSource {
+	if defaultSource || explicitHarness {
 		entry := runtimeDefaultEntry(entries)
 		if filtered, ok := runtimeEntryForSource([]loop.RuntimeCatalogEntry{entry}, entry.Source); ok {
 			entry = filtered
@@ -211,7 +211,7 @@ func startRoleVariantWithSelectors(role AgentCatalogEntry, entry *loop.RuntimeCa
 		"timeout_seconds":   map[string]any{"type": "integer", "minimum": 0, "maximum": maxTimeoutSeconds},
 	}
 	modes := selectableAgentModes(role.Modes)
-	if len(modes) > 0 {
+	if len(modes) >= 2 {
 		properties["agent_mode"] = map[string]any{"type": "string", "enum": modes}
 	}
 	if entry != nil {

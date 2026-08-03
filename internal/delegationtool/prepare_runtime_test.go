@@ -351,6 +351,34 @@ func TestPrepareStartAgentRuntimeResolvesPerModelSourcesWithinOneEntry(t *testin
 	}
 }
 
+func TestPrepareStartAgentRuntimeDefaultsSourceWithinExplicitHarness(t *testing.T) {
+	t.Parallel()
+
+	toolInstance := NewStartAgent(
+		&fakeController{},
+		loop.DelegationManaged,
+		[]AgentCatalogEntry{{Name: "worker"}},
+		explicitHarnessMixedSourcePreparationCatalog(t),
+	)
+	_, prepared, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"agent_type":"worker","instructions":"p","agent_harness":"codex"}`)
+	if err != nil {
+		t.Fatalf("PrepareCall() error = %v", err)
+	}
+	runtime := mustDelegateArtifact(t, prepared).Runtime
+	if runtime == nil {
+		t.Fatal("prepared runtime is nil")
+	}
+	want := tool.DelegateRuntime{
+		Harness: "codex", Profile: "acp/codex-gateway", Source: "gateway", SelectionKind: "explicit",
+		Model: "luna", Effort: "high",
+		Explicit:   tool.DelegateRuntimeExplicit{Harness: true},
+		Advertised: tool.DelegateRuntimeAdvertised{Harness: true, Source: true, Model: true, Effort: true},
+	}
+	if *runtime != want {
+		t.Fatalf("runtime = %#v, want deterministic per-harness default %#v", *runtime, want)
+	}
+}
+
 func mustDelegateArtifact(t *testing.T, prepared tool.PreparedArtifact) tool.DelegateArtifact {
 	t.Helper()
 	artifact, ok := prepared.(tool.DelegateArtifact)
@@ -423,6 +451,26 @@ func mixedSourcePreparationCatalog(t *testing.T) loop.RuntimeCatalog {
 			SelectionKind: loop.RuntimeSelectionHarnessManaged,
 		},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return catalog
+}
+
+func explicitHarnessMixedSourcePreparationCatalog(t *testing.T) loop.RuntimeCatalog {
+	t.Helper()
+	defaultEntry := testPreparationEntry("claude-code", "acp/claude-code", "sonnet", inferencemodel.EffortMedium)
+	defaultEntry.Source = loop.RuntimeSourceGateway
+	gateway := testPreparationEntry("codex", "acp/codex-gateway", "luna", inferencemodel.EffortHigh)
+	gateway.Source = loop.RuntimeSourceGateway
+	gateway.SmallModel = ""
+	gateway.Models = gateway.Models[:1]
+	native := loop.RuntimeCatalogEntry{
+		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
+		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionHarnessManaged,
+	}
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{native, gateway, defaultEntry})
 	if err != nil {
 		t.Fatal(err)
 	}

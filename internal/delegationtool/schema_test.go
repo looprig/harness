@@ -21,7 +21,7 @@ func TestAgentToolSchemasAreClosedAndOperationSpecific(t *testing.T) {
 		properties []string
 		required   []string
 	}{
-		{name: "StartAgent", tool: NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog(), emptyRuntimeCatalog(t)), properties: []string{"agent_mode", "agent_type", "effort", "instructions", "model", "name", "timeout_seconds", "wait_for_response"}, required: []string{"agent_type", "instructions"}},
+		{name: "StartAgent", tool: NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog(), emptyRuntimeCatalog(t)), properties: []string{"agent_type", "effort", "instructions", "model", "name", "timeout_seconds", "wait_for_response"}, required: []string{"agent_type", "instructions"}},
 		{name: "MessageAgent", tool: NewMessageAgent(&fakeController{}, loop.DelegationManaged, agentCatalog()), properties: []string{"agent_id", "message", "timeout_seconds", "wait_for_response"}, required: []string{"agent_id", "message"}},
 		{name: "ListAgents", tool: NewListAgents(&fakeController{}, loop.DelegationManaged, agentCatalog()), properties: []string{"agent_id"}},
 		{name: "StopAgent", tool: NewStopAgent(&fakeController{}, loop.DelegationManaged, agentCatalog()), properties: []string{"agent_id"}, required: []string{"agent_id"}},
@@ -68,24 +68,39 @@ func TestAgentToolSchemasAreClosedAndOperationSpecific(t *testing.T) {
 	}
 }
 
-func TestStartAgentSchemaAndPreparationUseOnlyExplicitModeNames(t *testing.T) {
+func TestStartAgentModeSelectorRequiresMultipleExplicitModes(t *testing.T) {
 	t.Parallel()
-	catalog := []AgentCatalogEntry{{Name: "worker", Modes: []loop.ModeName{"", "review"}}}
-	config := newAgentToolConfig(loop.DelegationManaged, catalog)
-	info, err := newStartAgent(&fakeController{}, config).Info(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := schemaEnumValues(t, info.Schema, "agent_mode"); !equalStrings(got, []string{"review"}) {
-		t.Fatalf("agent_mode enum = %q, want only explicit mode review", got)
-	}
-	prepared, err := config.prepareStartAgent(`{"agent_type":"worker","instructions":"review","agent_mode":"review"}`)
-	if err != nil {
-		t.Fatalf("prepare declared agent_mode: %v", err)
-	}
-	if prepared.AgentMode != "review" {
-		t.Fatalf("prepared agent_mode = %q, want review", prepared.AgentMode)
-	}
+
+	t.Run("singleton mode is initial state, not a selector", func(t *testing.T) {
+		config := newAgentToolConfig(loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker", Modes: []loop.ModeName{"", "review", "review"}}})
+		info, err := newStartAgent(&fakeController{}, config).Info(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertSchemaFieldPresence(t, info.Schema, []string{"agent_mode"}, false)
+		_, err = config.prepareStartAgent(`{"agent_type":"worker","instructions":"review","agent_mode":"review"}`)
+		assertPrepareCategory(t, err, errCategoryFieldNotAllowed)
+	})
+
+	t.Run("two explicit modes are selectable", func(t *testing.T) {
+		config := newAgentToolConfig(loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker", Modes: []loop.ModeName{"", "review", "build", "review"}}})
+		info, err := newStartAgent(&fakeController{}, config).Info(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := schemaEnumValues(t, info.Schema, "agent_mode"); !equalStrings(got, []string{"build", "review"}) {
+			t.Fatalf("agent_mode enum = %q, want distinct non-empty modes build and review", got)
+		}
+		for _, mode := range []string{"build", "review"} {
+			prepared, err := config.prepareStartAgent(`{"agent_type":"worker","instructions":"work","agent_mode":"` + mode + `"}`)
+			if err != nil {
+				t.Fatalf("prepare agent_mode %q: %v", mode, err)
+			}
+			if prepared.AgentMode != mode {
+				t.Fatalf("prepared agent_mode = %q, want %q", prepared.AgentMode, mode)
+			}
+		}
+	})
 }
 
 func TestSchemaRuntimeSelectorsFollowCapabilities(t *testing.T) {
@@ -236,6 +251,80 @@ func TestSchemaMixedSourceOverridesFilterEachAgentSourceBranch(t *testing.T) {
 	if got := branches["native"]; !equalStringSet(got, map[string]struct{}{"native": {}, "native-alt": {}}) {
 		t.Fatalf("native source branch models = %v, want only native options", got)
 	}
+}
+
+func TestSchemaExplicitHarnessWithMultipleSourcesIncludesOmittedSourceDefault(t *testing.T) {
+	info, err := NewStartAgent(
+		&fakeController{},
+		loop.DelegationManaged,
+		[]AgentCatalogEntry{{Name: "worker"}},
+		explicitHarnessMixedSourcePreparationCatalog(t),
+	).Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var schema map[string]any
+	if err := json.Unmarshal(info.Schema, &schema); err != nil {
+		t.Fatal(err)
+	}
+	if !schemaContainsOmittedSourceHarnessBranch(schema, "codex") {
+		t.Fatalf("schema lacks omitted-source branch for explicit harness codex: %s", info.Schema)
+	}
+}
+
+func schemaContainsOmittedSourceHarnessBranch(value any, harness string) bool {
+	switch node := value.(type) {
+	case map[string]any:
+		properties, _ := node["properties"].(map[string]any)
+		harnessProperty, _ := properties["agent_harness"].(map[string]any)
+		_, hasSource := properties["agent_source"]
+		if harnessProperty["const"] == harness && !hasSource && schemaRequiresField(node["required"], "agent_harness") && schemaForbidsRequiredField(node["not"], "agent_source") {
+			return true
+		}
+		for _, child := range node {
+			if schemaContainsOmittedSourceHarnessBranch(child, harness) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range node {
+			if schemaContainsOmittedSourceHarnessBranch(child, harness) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func schemaRequiresField(value any, field string) bool {
+	for _, required := range schemaStrings(value) {
+		if required == field {
+			return true
+		}
+	}
+	return false
+}
+
+func schemaForbidsRequiredField(value any, field string) bool {
+	switch node := value.(type) {
+	case map[string]any:
+		if schemaRequiresField(node["required"], field) {
+			return true
+		}
+		for _, child := range node {
+			if schemaForbidsRequiredField(child, field) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range node {
+			if schemaForbidsRequiredField(child, field) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func schemaContainsSourceModelPair(value any, source, model string) bool {
