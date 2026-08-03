@@ -70,6 +70,7 @@ type stopAgentWire struct {
 	AgentID *string `json:"agent_id"`
 }
 
+// PreparedStartAgent contains validated StartAgent arguments ready for delegation.
 type PreparedStartAgent struct {
 	AgentType       string
 	Name            string
@@ -90,6 +91,7 @@ type PreparedStartAgent struct {
 	agentModeSet    bool
 }
 
+// PreparedMessageAgent contains validated MessageAgent arguments ready for delegation.
 type PreparedMessageAgent struct {
 	AgentID         uuid.UUID
 	Message         string
@@ -97,7 +99,10 @@ type PreparedMessageAgent struct {
 	TimeoutSeconds  *int
 }
 
+// PreparedListAgents contains validated ListAgents arguments ready for delegation.
 type PreparedListAgents struct{ AgentID *uuid.UUID }
+
+// PreparedStopAgent contains validated StopAgent arguments ready for delegation.
 type PreparedStopAgent struct{ AgentID uuid.UUID }
 
 func prepareStartAgent(argsJSON string) (PreparedStartAgent, error) {

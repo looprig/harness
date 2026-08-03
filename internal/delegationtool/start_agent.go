@@ -11,6 +11,7 @@ import (
 
 const startAgentToolName = "StartAgent"
 
+// StartAgentTool is the StartAgent agent tool for creating child agents.
 type StartAgentTool struct {
 	controller tool.DelegateController
 	config     *agentToolConfig
@@ -20,6 +21,7 @@ func newStartAgent(controller tool.DelegateController, config *agentToolConfig) 
 	return &StartAgentTool{controller: controller, config: config}
 }
 
+// NewStartAgent constructs a StartAgent agent tool with the supplied delegation policy and catalogs.
 func NewStartAgent(controller tool.DelegateController, style loop.DelegationStyle, catalog []AgentCatalogEntry, runtimeCatalog ...loop.RuntimeCatalog) *StartAgentTool {
 	return newStartAgent(controller, newAgentToolConfig(style, catalog, runtimeCatalog...))
 }

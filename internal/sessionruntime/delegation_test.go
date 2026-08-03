@@ -35,6 +35,26 @@ type failDelegateAcceptanceAppender struct {
 	err     error
 }
 
+type blockingChildTurnStartedAppender struct {
+	enabled atomic.Bool
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (a *blockingChildTurnStartedAppender) AppendEvent(ctx context.Context, ev event.Event) (uint64, error) {
+	if _, ok := ev.(event.TurnStarted); !ok || !a.enabled.Load() {
+		return 1, nil
+	}
+	a.once.Do(func() { close(a.reached) })
+	select {
+	case <-a.release:
+		return 1, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
 func (a *failDelegateAcceptanceAppender) AppendEvent(_ context.Context, ev event.Event) (uint64, error) {
 	if _, ok := ev.(event.DelegateRequestAccepted); ok && a.enabled.Load() {
 		return 0, a.err
@@ -1076,18 +1096,9 @@ func TestDelegateStatusCountsOnlyRequestsQueuedBehindActiveTurn(t *testing.T) {
 func TestDelegateStatusDoesNotCountStartedRequestBeforeDrainObservesTurnStarted(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
-	client := &releasedFailureLLM{started: make(chan struct{}), release: make(chan struct{}), err: errors.New("released provider")}
-	child := mustDefine(
-		loop.WithName("child"),
-		loop.WithInference(client, validModel("child")),
-		loop.WithDrainTimeout(100*time.Millisecond),
-	)
-	s := newDelegationSession(t, parent, nil, child)
-	// Keep the result drain from observing TurnStarted. The authoritative lifecycle
-	// callback must still mark the tracked request active on the publication path.
-	s.delegateSubscribe = func(event.EventFilter) (event.Subscription, error) {
-		return newFakeSubscription(0), nil
-	}
+	appender := &blockingChildTurnStartedAppender{reached: make(chan struct{}), release: make(chan struct{})}
+	s := newDelegationSession(t, parent, []Option{WithEventAppender(appender)}, delegateBlockingChild("child"))
+	appender.enabled.Store(true)
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 
 	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: false})
@@ -1095,13 +1106,13 @@ func TestDelegateStatusDoesNotCountStartedRequestBeforeDrainObservesTurnStarted(
 		t.Fatal(err)
 	}
 	defer func() {
-		close(client.release)
+		close(appender.release)
 		_, _ = ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: active.AgentID})
 	}()
 	select {
-	case <-client.started:
+	case <-appender.reached:
 	case <-time.After(2 * time.Second):
-		t.Fatal("request did not become active")
+		t.Fatal("TurnStarted did not reach blocked appender")
 	}
 
 	status, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: active.AgentID})

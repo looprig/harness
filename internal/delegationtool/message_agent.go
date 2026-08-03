@@ -11,6 +11,7 @@ import (
 
 const messageAgentToolName = "MessageAgent"
 
+// MessageAgentTool is the MessageAgent agent tool for sending work to a child agent.
 type MessageAgentTool struct {
 	controller tool.DelegateController
 	config     *agentToolConfig
@@ -20,6 +21,7 @@ func newMessageAgent(controller tool.DelegateController, config *agentToolConfig
 	return &MessageAgentTool{controller: controller, config: config}
 }
 
+// NewMessageAgent constructs a MessageAgent agent tool with the supplied delegation policy and catalogs.
 func NewMessageAgent(controller tool.DelegateController, style loop.DelegationStyle, catalog []AgentCatalogEntry, runtimeCatalog ...loop.RuntimeCatalog) *MessageAgentTool {
 	return newMessageAgent(controller, newAgentToolConfig(style, catalog, runtimeCatalog...))
 }

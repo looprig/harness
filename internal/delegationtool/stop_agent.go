@@ -11,6 +11,7 @@ import (
 
 const stopAgentToolName = "StopAgent"
 
+// StopAgentTool is the StopAgent agent tool for interrupting a child agent.
 type StopAgentTool struct {
 	controller tool.DelegateController
 	config     *agentToolConfig
@@ -20,6 +21,7 @@ func newStopAgent(controller tool.DelegateController, config *agentToolConfig) *
 	return &StopAgentTool{controller: controller, config: config}
 }
 
+// NewStopAgent constructs a StopAgent agent tool with the supplied delegation policy and catalogs.
 func NewStopAgent(controller tool.DelegateController, style loop.DelegationStyle, catalog []AgentCatalogEntry, runtimeCatalog ...loop.RuntimeCatalog) *StopAgentTool {
 	return newStopAgent(controller, newAgentToolConfig(style, catalog, runtimeCatalog...))
 }

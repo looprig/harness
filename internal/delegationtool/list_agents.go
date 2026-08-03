@@ -11,6 +11,7 @@ import (
 
 const listAgentsToolName = "ListAgents"
 
+// ListAgentsTool is the ListAgents agent tool for inspecting owned child agents.
 type ListAgentsTool struct {
 	controller tool.DelegateController
 	config     *agentToolConfig
@@ -20,6 +21,7 @@ func newListAgents(controller tool.DelegateController, config *agentToolConfig) 
 	return &ListAgentsTool{controller: controller, config: config}
 }
 
+// NewListAgents constructs a ListAgents agent tool with the supplied delegation policy and catalogs.
 func NewListAgents(controller tool.DelegateController, style loop.DelegationStyle, catalog []AgentCatalogEntry, runtimeCatalog ...loop.RuntimeCatalog) *ListAgentsTool {
 	return newListAgents(controller, newAgentToolConfig(style, catalog, runtimeCatalog...))
 }

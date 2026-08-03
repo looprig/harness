@@ -413,12 +413,24 @@ func (p *pendingRequest) queued() bool {
 	return p.lifecycle == pendingRequestQueued
 }
 
+func (p *pendingRequest) terminal() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lifecycle == pendingRequestTerminal
+}
+
 // registerRequest records every request immediately after accepted admission, before
 // either foreground or background draining begins. Since callers subscribe before
 // admission, the correlated TurnStarted remains observable even if it raced ahead.
 func (m *delegationManager) registerRequest(requestID, childID uuid.UUID) *pendingRequest {
-	pr := &pendingRequest{childID: childID, done: make(chan struct{})}
+	pr := &pendingRequest{childID: childID, done: make(chan struct{}), lifecycle: pendingRequestActive}
 	m.mu.Lock()
+	for _, tracked := range m.requests {
+		if tracked.childID == childID && !tracked.terminal() {
+			pr.lifecycle = pendingRequestQueued
+			break
+		}
+	}
 	m.requests[requestID] = pr
 	m.mu.Unlock()
 	return pr
