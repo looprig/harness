@@ -28,6 +28,9 @@ type RuntimeProfileName string
 // RuntimeModelOption describes one model alias admitted by one catalog entry.
 type RuntimeModelOption struct {
 	Alias ModelAlias
+	// Description is bounded, secret-free presentation guidance for selecting
+	// this model. Empty means no guidance is available.
+	Description string
 	// Source optionally overrides the entry source for this model. It is the
 	// stable catalogue discriminator when gateway and native choices share one
 	// harness.
@@ -50,6 +53,9 @@ type RuntimeCatalogEntry struct {
 	SubagentType identity.AgentName
 	AgentHarness AgentHarnessName
 	Profile      RuntimeProfileName
+	// Description is bounded, secret-free presentation guidance for this
+	// harness. Empty means no guidance is available.
+	Description string
 	// Source is the stable catalogue source identity. Empty preserves the
 	// legacy shape and is derived from Credential during normalization.
 	Source     RuntimeSourceName
@@ -94,6 +100,7 @@ const (
 	RuntimeCatalogInvalidSource        RuntimeCatalogErrorKind = "invalid_source"
 	RuntimeCatalogInvalidSelectionKind RuntimeCatalogErrorKind = "invalid_selection_kind"
 	RuntimeCatalogInvalidIdentifier    RuntimeCatalogErrorKind = "invalid_identifier"
+	RuntimeCatalogInvalidDescription   RuntimeCatalogErrorKind = "invalid_description"
 	RuntimeCatalogInvalidModel         RuntimeCatalogErrorKind = "invalid_model"
 	RuntimeCatalogMissingDefaultModel  RuntimeCatalogErrorKind = "missing_default_model"
 	RuntimeCatalogInvalidDefaultModel  RuntimeCatalogErrorKind = "invalid_default_model"
@@ -570,6 +577,9 @@ func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
 	if err := validateRuntimeProfile(string(entry.Profile)); err != nil {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "Profile"}
 	}
+	if err := validatePresentationText(entry.Description); err != nil {
+		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidDescription, Field: "Description"}
+	}
 	if entry.Credential == "" && entry.Source == "" {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidCredential, Field: "Credential"}
 	}
@@ -620,6 +630,9 @@ func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
 		option := &entry.Models[i]
 		if err := validateCatalogIdentifier(string(option.Alias), false); err != nil {
 			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "Models.Alias"}
+		}
+		if err := validatePresentationText(option.Description); err != nil {
+			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidDescription, Field: "Models.Description"}
 		}
 		if !option.Source.valid() {
 			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSource, Field: "Models.Source"}
@@ -767,6 +780,22 @@ func validateCatalogIdentifier(value string, allowInternalSpaces bool) error {
 	return nil
 }
 
+func validatePresentationText(value string) error {
+	const maxPresentationBytes = 256
+	if value == "" {
+		return nil
+	}
+	if len(value) > maxPresentationBytes || !utf8.ValidString(value) || strings.TrimSpace(value) != value {
+		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidDescription}
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidDescription}
+		}
+	}
+	return nil
+}
+
 func validateRuntimeProfile(value string) error {
 	const maxIdentifierBytes = 128
 	if value == "" || len(value) > maxIdentifierBytes || !utf8.ValidString(value) || strings.TrimSpace(value) != value {
@@ -828,6 +857,7 @@ type runtimeCatalogEntryDigest struct {
 	SubagentType    string                     `json:"subagent_type"`
 	AgentHarness    string                     `json:"agent_harness"`
 	Profile         string                     `json:"profile"`
+	Description     string                     `json:"description,omitempty"`
 	Source          RuntimeSourceName          `json:"source"`
 	Credential      CredentialMode             `json:"credential"`
 	SelectionKind   RuntimeSelectionKind       `json:"selection_kind"`
@@ -840,6 +870,7 @@ type runtimeCatalogEntryDigest struct {
 
 type runtimeModelOptionDigest struct {
 	Alias            string              `json:"alias"`
+	Description      string              `json:"description,omitempty"`
 	Source           RuntimeSourceName   `json:"source,omitempty"`
 	Credential       CredentialMode      `json:"credential,omitempty"`
 	NativeSmallModel string              `json:"native_small_model,omitempty"`
@@ -859,12 +890,24 @@ type runtimeModelOptionDigest struct {
 }
 
 func digestRuntimeCatalog(entries []RuntimeCatalogEntry) string {
+	encoded, err := runtimeCatalogDigestJSON(entries)
+	if err != nil {
+		// The projection consists only of fixed JSON values. Keep Digest total if
+		// a future field accidentally violates that contract.
+		return ""
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+func runtimeCatalogDigestJSON(entries []RuntimeCatalogEntry) ([]byte, error) {
 	projection := runtimeCatalogDigest{Entries: make([]runtimeCatalogEntryDigest, len(entries))}
 	for i, entry := range entries {
 		row := runtimeCatalogEntryDigest{
 			SubagentType:    string(entry.SubagentType),
 			AgentHarness:    string(entry.AgentHarness),
 			Profile:         string(entry.Profile),
+			Description:     entry.Description,
 			Source:          entry.Source,
 			Credential:      entry.Credential,
 			SelectionKind:   entry.SelectionKind,
@@ -877,6 +920,7 @@ func digestRuntimeCatalog(entries []RuntimeCatalogEntry) string {
 		for j, option := range entry.Models {
 			row.Models[j] = runtimeModelOptionDigest{
 				Alias:            string(option.Alias),
+				Description:      option.Description,
 				Source:           effectiveRuntimeSource(entry, option),
 				Credential:       option.Credential,
 				NativeSmallModel: option.NativeSmallModel,
@@ -897,14 +941,7 @@ func digestRuntimeCatalog(entries []RuntimeCatalogEntry) string {
 		}
 		projection.Entries[i] = row
 	}
-	encoded, err := json.Marshal(projection)
-	if err != nil {
-		// The projection consists only of fixed JSON values. Keep Digest total if
-		// a future field accidentally violates that contract.
-		return ""
-	}
-	sum := sha256.Sum256(encoded)
-	return hex.EncodeToString(sum[:])
+	return json.Marshal(projection)
 }
 
 func catalogEffortString(effort model.Effort) string {

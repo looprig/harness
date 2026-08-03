@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -419,6 +420,176 @@ func TestRuntimeCatalogDefensiveCopiesAndDigest(t *testing.T) {
 		if changedCatalog.Digest() == digest {
 			t.Errorf("catalog digest did not change for %s mutation", mutation.name)
 		}
+	}
+}
+
+func TestRuntimeCatalogDescriptionCloning(t *testing.T) {
+	entries := testCatalogEntries()
+	entries[0].Description = "Codex harness guidance"
+	entries[0].Models[0].Description = "Use o3 for difficult implementation work"
+
+	catalog, err := NewRuntimeCatalog(entries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+	entries[0].Description = "changed input harness description"
+	entries[0].Models[0].Description = "changed input model description"
+
+	got := catalog.EntriesFor("worker")
+	codex := runtimeCatalogEntryForHarness(t, got, "codex")
+	if codex.Description != "Codex harness guidance" {
+		t.Fatalf("entry description = %q, want original description", codex.Description)
+	}
+	if codex.Models[0].Description != "Use o3 for difficult implementation work" {
+		t.Fatalf("model description = %q, want original description", codex.Models[0].Description)
+	}
+
+	codex.Description = "changed returned harness description"
+	codex.Models[0].Description = "changed returned model description"
+	again := runtimeCatalogEntryForHarness(t, catalog.EntriesFor("worker"), "codex")
+	if again.Description != "Codex harness guidance" || again.Models[0].Description != "Use o3 for difficult implementation work" {
+		t.Fatalf("returned descriptions mutated catalog: entry=%q model=%q", again.Description, again.Models[0].Description)
+	}
+}
+
+func TestRuntimeCatalogDescriptionValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		description string
+		wantErr     bool
+	}{
+		{name: "absent"},
+		{name: "single line", description: "Use for focused implementation work."},
+		{name: "maximum bytes", description: strings.Repeat("a", 256)},
+		{name: "invalid UTF-8", description: string([]byte{0xff}), wantErr: true},
+		{name: "blank present", description: "   ", wantErr: true},
+		{name: "leading whitespace", description: " guidance", wantErr: true},
+		{name: "trailing whitespace", description: "guidance ", wantErr: true},
+		{name: "newline", description: "first\nsecond", wantErr: true},
+		{name: "carriage return", description: "first\rsecond", wantErr: true},
+		{name: "tab", description: "first\tsecond", wantErr: true},
+		{name: "unicode line separator", description: "first\u2028second", wantErr: true},
+		{name: "over maximum bytes", description: strings.Repeat("a", 257), wantErr: true},
+	}
+
+	fields := []struct {
+		name   string
+		field  string
+		mutate func([]RuntimeCatalogEntry, string)
+	}{
+		{name: "harness", field: "Description", mutate: func(entries []RuntimeCatalogEntry, description string) {
+			entries[0].Description = description
+		}},
+		{name: "model", field: "Models.Description", mutate: func(entries []RuntimeCatalogEntry, description string) {
+			entries[0].Models[0].Description = description
+		}},
+	}
+
+	for _, field := range fields {
+		for _, tt := range tests {
+			t.Run(field.name+"/"+tt.name, func(t *testing.T) {
+				entries := testCatalogEntries()
+				field.mutate(entries, tt.description)
+				_, err := NewRuntimeCatalog(entries)
+				if !tt.wantErr {
+					if err != nil {
+						t.Fatalf("NewRuntimeCatalog() error = %v", err)
+					}
+					return
+				}
+				var catalogErr *RuntimeCatalogError
+				if !errors.As(err, &catalogErr) {
+					t.Fatalf("NewRuntimeCatalog() error = %T %v, want *RuntimeCatalogError", err, err)
+				}
+				if catalogErr.Kind != RuntimeCatalogInvalidDescription || catalogErr.Field != field.field {
+					t.Fatalf("catalog error = %#v, want kind %q field %q", catalogErr, RuntimeCatalogInvalidDescription, field.field)
+				}
+			})
+		}
+	}
+}
+
+func TestRuntimeCatalogDescriptionDigest(t *testing.T) {
+	entries := testCatalogEntries()
+	entries[0].Description = "Codex harness guidance"
+	entries[0].Models[0].Description = "Use o3 for difficult implementation work"
+	entries[0].Models[0].Target.BaseURL = "https://endpoint.example/v1"
+
+	catalog, err := NewRuntimeCatalog(entries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+	baseDigest := catalog.Digest()
+
+	changedHarness := testCatalogEntries()
+	changedHarness[0].Description = "Different Codex harness guidance"
+	changedHarness[0].Models[0].Description = entries[0].Models[0].Description
+	harnessCatalog, err := NewRuntimeCatalog(changedHarness)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog(changed harness) error = %v", err)
+	}
+	if harnessCatalog.Digest() == baseDigest {
+		t.Fatal("catalog digest did not change for harness description")
+	}
+
+	changedModel := entries
+	changedModel[0].Models[0].Description = "Different o3 model guidance"
+	modelCatalog, err := NewRuntimeCatalog(changedModel)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog(changed model) error = %v", err)
+	}
+	if modelCatalog.Digest() == baseDigest {
+		t.Fatal("catalog digest did not change for model description")
+	}
+
+	encoded, err := runtimeCatalogDigestJSON(catalog.entries)
+	if err != nil {
+		t.Fatalf("runtimeCatalogDigestJSON() error = %v", err)
+	}
+	var projection any
+	if err := json.Unmarshal(encoded, &projection); err != nil {
+		t.Fatalf("unmarshal digest JSON: %v", err)
+	}
+	if got, want := countJSONKey(projection, "description"), 2; got != want {
+		t.Fatalf("digest JSON description count = %d, want %d: %s", got, want, encoded)
+	}
+	for _, forbidden := range []string{"https://endpoint.example/v1", "base_url", "api_key", "secret"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("digest JSON contains forbidden provider wiring %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func runtimeCatalogEntryForHarness(t *testing.T, entries []RuntimeCatalogEntry, harness AgentHarnessName) *RuntimeCatalogEntry {
+	t.Helper()
+	for i := range entries {
+		if entries[i].AgentHarness == harness {
+			return &entries[i]
+		}
+	}
+	t.Fatalf("no entry for harness %q", harness)
+	return nil
+}
+
+func countJSONKey(value any, wanted string) int {
+	switch value := value.(type) {
+	case []any:
+		count := 0
+		for _, item := range value {
+			count += countJSONKey(item, wanted)
+		}
+		return count
+	case map[string]any:
+		count := 0
+		for key, item := range value {
+			if key == wanted {
+				count++
+			}
+			count += countJSONKey(item, wanted)
+		}
+		return count
+	default:
+		return 0
 	}
 }
 
