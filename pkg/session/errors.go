@@ -189,7 +189,7 @@ const (
 	RestoreRuntimeMissing            = "missing_runtime"
 	RestoreRuntimeUnavailable        = "runtime_unavailable"
 	RestoreRuntimeTargetMismatch     = "target_mismatch"
-	RestoreRuntimeCredentialMismatch = "credential_mismatch"
+	RestoreRuntimeCredentialMismatch = "credential_mismatch" // #nosec G101 -- closed error-category label, not a credential
 	RestoreRuntimeEffortMismatch     = "effort_mismatch"
 )
 

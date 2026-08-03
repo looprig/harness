@@ -304,15 +304,6 @@ func modelEffortVariants(models []loop.RuntimeModelOption, defaultModel loop.Mod
 	return variants
 }
 
-func anyNonDefaultHarness(entries []loop.RuntimeCatalogEntry) bool {
-	for _, entry := range entries {
-		if !entry.Default {
-			return true
-		}
-	}
-	return false
-}
-
 type runtimeSelectorAvailability struct {
 	Harness bool
 	Source  bool

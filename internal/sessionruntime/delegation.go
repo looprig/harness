@@ -763,15 +763,6 @@ func runtimeDefaultControllerEntry(entries []loop.RuntimeCatalogEntry) loop.Runt
 	return entries[0]
 }
 
-func anyNonDefaultRuntimeHarness(entries []loop.RuntimeCatalogEntry) bool {
-	for _, entry := range entries {
-		if !entry.Default {
-			return true
-		}
-	}
-	return false
-}
-
 func runtimeEfforts(models []loop.RuntimeModelOption) []inferencemodel.Effort {
 	seen := make(map[inferencemodel.Effort]struct{})
 	for _, option := range models {
