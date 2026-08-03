@@ -134,6 +134,10 @@ func delegateCtx(t *testing.T) context.Context {
 
 func requestIDPtr(id uuid.UUID) *uuid.UUID { return &id }
 
+func waitResponse(ctx context.Context, controller tool.DelegateController, session *Session, agentID, responseID uuid.UUID, timeoutSeconds *int) (tool.DelegateResult, error) {
+	return controller.(*scopedController).waitResponse(ctx, session, agentID, responseID, timeoutSeconds)
+}
+
 // TestDelegateStartSyncReturnsChildText proves the synchronous start path: the scoped
 // controller spawns the authorized child, drives one turn, and returns its final text.
 // The child is registered as owned by the parent.
@@ -142,21 +146,21 @@ func TestDelegateStartSyncReturnsChildText(t *testing.T) {
 	s := newDelegationSession(t, delegateParent(loop.DelegationManaged, "child"), nil, delegateChild("child", "child final"))
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), delegateParent(loop.DelegationManaged, "child"))
 
-	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
+	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Name: "api_planner", Message: "go", WaitForResponse: true})
 	if err != nil {
 		t.Fatalf("Execute(start) error = %v", err)
 	}
-	if res.Status != tool.DelegateStatusCompleted {
-		t.Errorf("status = %v, want Completed", res.Status)
+	if res.ResponseStatus != tool.DelegateResponseCompleted || res.State != tool.AgentStateIdle {
+		t.Errorf("result state/status = %v/%v, want idle/completed", res.State, res.ResponseStatus)
 	}
-	if res.Output != "child final" {
-		t.Errorf("output = %q, want %q", res.Output, "child final")
+	if res.Response != "child final" {
+		t.Errorf("output = %q, want %q", res.Response, "child final")
 	}
-	if res.DelegateID.IsZero() {
+	if res.AgentID.IsZero() {
 		t.Fatal("delegate id is zero")
 	}
 	s.loopsMu.RLock()
-	handle, ok := s.loops[res.DelegateID]
+	handle, ok := s.loops[res.AgentID]
 	s.loopsMu.RUnlock()
 	if !ok || handle.parent.LoopID != s.ActiveLoopID() {
 		t.Errorf("child not registered as owned by parent %v", s.ActiveLoopID())
@@ -172,9 +176,9 @@ func TestDelegateStartValidation(t *testing.T) {
 		req  tool.DelegateRequest
 		kind DelegateErrorKind
 	}{
-		{name: "unauthorized agent", req: tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "stranger", Message: "m", Wait: true}, kind: DelegateUnauthorizedAgent},
-		{name: "unknown agent not in topology", req: tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "ghost", Message: "m", Wait: true}, kind: DelegateUnknownAgent},
-		{name: "undeclared mode", req: tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Mode: "nope", Message: "m", Wait: true}, kind: DelegateUnknownMode},
+		{name: "unauthorized agent", req: tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "stranger", Message: "m", WaitForResponse: true}, kind: DelegateUnauthorizedAgent},
+		{name: "unknown agent not in topology", req: tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "ghost", Message: "m", WaitForResponse: true}, kind: DelegateUnknownAgent},
+		{name: "undeclared mode", req: tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", AgentMode: "nope", Message: "m", WaitForResponse: true}, kind: DelegateUnknownMode},
 	}
 	// The parent authorizes "child" and "ghost", but only "child" resolves in the topology.
 	parent := delegateParent(loop.DelegationManaged, "child", "ghost")
@@ -217,7 +221,7 @@ func TestDelegateStartFailsClosedForRoleMissingFromPopulatedCatalog(t *testing.T
 	s := newDelegationSession(t, parent, []Option{WithRuntimeCatalog(catalog)}, child)
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	before := s.spawnedCount()
-	_, err = ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
+	_, err = ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: true})
 	var runtimeErr *DelegateError
 	if !errors.As(err, &runtimeErr) || runtimeErr.Kind != DelegateRuntimeUnavailable {
 		t.Fatalf("missing-role start error = %v, want DelegateRuntimeUnavailable", err)
@@ -237,12 +241,12 @@ func TestDelegateStartKeepsNativeFallbackForEmptyCatalog(t *testing.T) {
 	}
 	s := newDelegationSession(t, parent, []Option{WithRuntimeCatalog(emptyCatalog)}, child)
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	result, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
+	result, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: true})
 	if err != nil {
 		t.Fatalf("empty-catalog native start error = %v", err)
 	}
-	if result.Output != "native child" {
-		t.Fatalf("empty-catalog output = %q, want %q", result.Output, "native child")
+	if result.Response != "native child" {
+		t.Fatalf("empty-catalog output = %q, want %q", result.Response, "native child")
 	}
 }
 
@@ -252,12 +256,12 @@ func TestDelegateStartKeepsNativeFallbackForEmptyCatalog(t *testing.T) {
 func TestDelegateActionSetEnforcement(t *testing.T) {
 	t.Parallel()
 	s := newDelegationSession(t, delegateParent(loop.DelegationManaged, "child"), nil, delegateChild("child", "final"))
-	del := requestIDPtr(mustUUID())
-	managedOnly := []tool.DelegateOperation{tool.DelegateSend, tool.DelegateWait, tool.DelegateInterrupt, tool.DelegateStatus}
+	del := mustUUID()
+	managedOnly := []tool.DelegateOperation{tool.DelegateSend, tool.DelegateInterrupt, tool.DelegateStatus}
 	for _, op := range managedOnly {
 		op := op
 		syncCtrl := s.delegation.controllerFor(s.ActiveLoopID(), delegateParent(loop.DelegationSyncOnly, "child"))
-		_, err := syncCtrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: op, DelegateID: *del, RequestID: del})
+		_, err := syncCtrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: op, AgentID: del})
 		var de *DelegateError
 		if !errors.As(err, &de) || de.Kind != DelegateActionUnavailable {
 			t.Fatalf("sync-only op %v error = %v, want DelegateActionUnavailable", op, err)
@@ -265,7 +269,7 @@ func TestDelegateActionSetEnforcement(t *testing.T) {
 	}
 
 	syncCtrl := s.delegation.controllerFor(s.ActiveLoopID(), delegateParent(loop.DelegationSyncOnly, "child"))
-	_, err := syncCtrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "m", Wait: false})
+	_, err := syncCtrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "m", WaitForResponse: false})
 	var de *DelegateError
 	if !errors.As(err, &de) || de.Kind != DelegateActionUnavailable {
 		t.Fatalf("sync-only wait:false start error = %v, want DelegateActionUnavailable", err)
@@ -281,11 +285,11 @@ func TestDelegateOwnershipRejection(t *testing.T) {
 	s := newDelegationSession(t, parent, nil, delegateChild("child", "final"))
 	owner := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 
-	res, err := owner.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
+	res, err := owner.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: true})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	childID := res.DelegateID
+	childID := res.AgentID
 
 	// A controller bound to an unrelated parent loop id owns nothing here.
 	stranger := s.delegation.controllerFor(mustUUID(), parent)
@@ -293,10 +297,9 @@ func TestDelegateOwnershipRejection(t *testing.T) {
 		name string
 		req  tool.DelegateRequest
 	}{
-		{name: "send", req: tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: childID, Message: "m"}},
-		{name: "interrupt", req: tool.DelegateRequest{Operation: tool.DelegateInterrupt, DelegateID: childID}},
-		{name: "status", req: tool.DelegateRequest{Operation: tool.DelegateStatus, DelegateID: childID}},
-		{name: "wait", req: tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: childID, RequestID: requestIDPtr(mustUUID())}},
+		{name: "send", req: tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: childID, Message: "m"}},
+		{name: "interrupt", req: tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: childID}},
+		{name: "status", req: tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: childID}},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -310,7 +313,7 @@ func TestDelegateOwnershipRejection(t *testing.T) {
 	}
 
 	// The real owner CAN interrupt its child.
-	if _, err := owner.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateInterrupt, DelegateID: childID}); err != nil {
+	if _, err := owner.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: childID}); err != nil {
 		t.Fatalf("owner interrupt error = %v", err)
 	}
 }
@@ -324,16 +327,20 @@ func TestDelegateModeSelectiveStart(t *testing.T) {
 	s := newDelegationSession(t, parent, nil, delegateChildWithModes("child", "final"))
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 
-	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Mode: "review", Message: "go", Wait: true})
+	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", AgentMode: "review", Message: "go", WaitForResponse: true})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	handle, ok := s.Loop(res.DelegateID)
+	handle, ok := s.Loop(res.AgentID)
 	if !ok {
 		t.Fatal("child not registered")
 	}
 	if handle.Mode() != "review" {
 		t.Errorf("child live mode = %q, want review (started directly in the selected mode)", handle.Mode())
+	}
+	listed, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: res.AgentID})
+	if err != nil || len(listed.Agents) != 1 || listed.Agents[0].AgentMode != "review" {
+		t.Fatalf("listed initial mode = %+v, %v; want review", listed.Agents, err)
 	}
 }
 
@@ -363,13 +370,13 @@ func TestDelegateRuntimeIsRevalidatedAndPinnedAtChildBind(t *testing.T) {
 	}
 	s := newDelegationSession(t, parent, []Option{WithRuntimeCatalog(catalog), WithForeignBuilderRegistry(registry)}, child)
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	request := tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true, Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Model: "runtime", SmallModel: "runtime-small", Effort: "high"}}
+	request := tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: true, Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Model: "runtime", SmallModel: "runtime-small", Effort: "high"}}
 	result, err := ctrl.Execute(delegateCtx(t), request)
 	if err != nil {
 		t.Fatalf("runtime start: %v", err)
 	}
 	s.loopsMu.RLock()
-	handle, ok := s.loops[result.DelegateID]
+	handle, ok := s.loops[result.AgentID]
 	s.loopsMu.RUnlock()
 	if !ok || handle == nil {
 		t.Fatal("runtime child not registered")
@@ -377,34 +384,42 @@ func TestDelegateRuntimeIsRevalidatedAndPinnedAtChildBind(t *testing.T) {
 	if handle.bound.Model().Name != "runtime-target" || handle.bound.Engine() != loop.EngineAdapter {
 		t.Fatalf("bound runtime = engine=%v model=%q, want adapter/runtime-target", handle.bound.Engine(), handle.bound.Model().Name)
 	}
-	defaultResult, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "default", Wait: true})
+	listed, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: result.AgentID})
+	if err != nil || len(listed.Agents) != 1 {
+		t.Fatalf("list selected runtime = %+v, %v", listed.Agents, err)
+	}
+	listedRuntime := listed.Agents[0].Runtime
+	if listedRuntime.Harness != "test" || listedRuntime.Source != "gateway" || listedRuntime.Model != "runtime" || listedRuntime.Effort != "high" {
+		t.Fatalf("listed runtime = %+v, want test/gateway/runtime/high", listedRuntime)
+	}
+	defaultResult, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "default", WaitForResponse: true})
 	if err != nil {
 		t.Fatalf("default runtime start: %v", err)
 	}
 	s.loopsMu.RLock()
-	defaultHandle := s.loops[defaultResult.DelegateID]
+	defaultHandle := s.loops[defaultResult.AgentID]
 	s.loopsMu.RUnlock()
 	if defaultHandle == nil || defaultHandle.bound.RuntimeProfile() != "acp/test" || defaultHandle.bound.Model().Name != "runtime-target" {
 		t.Fatalf("default bound runtime = %#v, want catalog default adapter runtime", defaultHandle)
 	}
-	_, err = ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "bad", Wait: true, Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Model: "missing", Effort: "high"}})
+	_, err = ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "bad", WaitForResponse: true, Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Model: "missing", Effort: "high"}})
 	var runtimeErr *DelegateError
 	if !errors.As(err, &runtimeErr) || runtimeErr.Kind != DelegateRuntimeInvalid {
 		t.Fatalf("invalid runtime error = %v, want typed runtime refusal", err)
 	}
-	_, err = ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "bad small", Wait: true, Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Model: "runtime", SmallModel: "wrong-small", Effort: "high"}})
+	_, err = ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "bad small", WaitForResponse: true, Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Model: "runtime", SmallModel: "wrong-small", Effort: "high"}})
 	if !errors.As(err, &runtimeErr) || runtimeErr.Kind != DelegateRuntimeInvalid {
 		t.Fatalf("invalid small model error = %v, want typed runtime refusal", err)
 	}
 	managedResult, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
-		Operation: tool.DelegateStart, Agent: "child", Message: "managed", Wait: true,
+		Operation: tool.DelegateStart, AgentType: "child", Message: "managed", WaitForResponse: true,
 		Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Source: "native", SelectionKind: "harness-managed", Explicit: tool.DelegateRuntimeExplicit{Source: true}},
 	})
 	if err != nil {
 		t.Fatalf("managed runtime start: %v", err)
 	}
 	s.loopsMu.RLock()
-	managedHandle := s.loops[managedResult.DelegateID]
+	managedHandle := s.loops[managedResult.AgentID]
 	s.loopsMu.RUnlock()
 	if managedHandle == nil {
 		t.Fatal("managed runtime child not registered")
@@ -418,7 +433,7 @@ func TestDelegateRuntimeIsRevalidatedAndPinnedAtChildBind(t *testing.T) {
 		{Harness: "test", Profile: "acp/test", Source: "native", SelectionKind: "harness-managed", Model: "runtime", Explicit: tool.DelegateRuntimeExplicit{Source: true}},
 		{Harness: "test", Profile: "acp/test", Source: "native", SelectionKind: "harness-managed", Effort: "high", Explicit: tool.DelegateRuntimeExplicit{Source: true}},
 	} {
-		_, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "invalid mixed source", Wait: true, Runtime: runtime})
+		_, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "invalid mixed source", WaitForResponse: true, Runtime: runtime})
 		if !errors.As(err, &runtimeErr) || runtimeErr.Kind != DelegateRuntimeInvalid {
 			t.Fatalf("invalid mixed-source runtime %+v error = %v, want typed runtime refusal", runtime, err)
 		}
@@ -782,17 +797,17 @@ func TestDelegateWaitFalseThenWaitResolves(t *testing.T) {
 	s := newDelegationSession(t, parent, nil, delegateChild("child", "async final"))
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 
-	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
+	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: false})
 	if err != nil {
 		t.Fatalf("start wait:false: %v", err)
 	}
-	if queued.Status != tool.DelegateStatusQueued {
-		t.Fatalf("status = %v, want Queued", queued.Status)
+	if queued.State != tool.AgentStateWorking {
+		t.Fatalf("state = %v, want working", queued.State)
 	}
-	if queued.RequestID.IsZero() || queued.DelegateID.IsZero() {
+	if queued.CorrelationID.IsZero() || queued.AgentID.IsZero() {
 		t.Fatalf("queued handle missing ids: %+v", queued)
 	}
-	pending, ok := s.delegation.getPending(queued.RequestID)
+	pending, ok := s.delegation.getPending(queued.CorrelationID)
 	if !ok {
 		t.Fatal("queued request was not registered")
 	}
@@ -801,31 +816,27 @@ func TestDelegateWaitFalseThenWaitResolves(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("queued request did not resolve")
 	}
-	status, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStatus, DelegateID: queued.DelegateID})
+	status, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: queued.AgentID})
 	if err != nil {
 		t.Fatalf("status before collection: %v", err)
 	}
-	if status.Status != tool.DelegateStatusIdle || status.PendingRequests != 1 {
-		t.Fatalf("resolved-uncollected status = %v pending=%d, want Idle pending=1", status.Status, status.PendingRequests)
+	if len(status.Agents) != 1 || status.Agents[0].State != tool.AgentStateIdle || status.Agents[0].QueuedMessages != 1 {
+		t.Fatalf("resolved-uncollected agents = %+v, want one idle agent with one queued message", status.Agents)
 	}
 
-	resolved, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
-		Operation:  tool.DelegateWait,
-		DelegateID: queued.DelegateID,
-		RequestID:  requestIDPtr(queued.RequestID),
-	})
+	resolved, err := waitResponse(delegateCtx(t), ctrl, s, queued.AgentID, queued.CorrelationID, nil)
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
-	if resolved.Status != tool.DelegateStatusCompleted {
-		t.Errorf("status = %v, want Completed", resolved.Status)
+	if resolved.ResponseStatus != tool.DelegateResponseCompleted {
+		t.Errorf("response status = %v, want Completed", resolved.ResponseStatus)
 	}
-	if resolved.Output != "async final" {
-		t.Errorf("output = %q, want %q", resolved.Output, "async final")
+	if resolved.Response != "async final" {
+		t.Errorf("output = %q, want %q", resolved.Response, "async final")
 	}
 
 	// An unknown request id for the same owned child is rejected.
-	_, err = ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: queued.DelegateID, RequestID: requestIDPtr(mustUUID())})
+	_, err = waitResponse(delegateCtx(t), ctrl, s, queued.AgentID, mustUUID(), nil)
 	var de *DelegateError
 	if !errors.As(err, &de) || de.Kind != DelegateUnknownRequest {
 		t.Fatalf("wait unknown request error = %v, want DelegateUnknownRequest", err)
@@ -837,16 +848,16 @@ func TestDelegateWaitTimeoutInterruptsRunningChild(t *testing.T) {
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
+	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
 	zero := 0
-	result, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: queued.DelegateID, RequestID: requestIDPtr(queued.RequestID), TimeoutSeconds: &zero})
-	if err != nil || result.Status != tool.DelegateStatusTimedOut {
+	result, err := waitResponse(context.Background(), ctrl, s, queued.AgentID, queued.CorrelationID, &zero)
+	if err != nil || result.ResponseStatus != tool.DelegateResponseTimedOut {
 		t.Fatalf("timed wait = %+v, %v; want TimedOut", result, err)
 	}
-	pending, ok := s.delegation.getPending(queued.RequestID)
+	pending, ok := s.delegation.getPending(queued.CorrelationID)
 	if !ok {
 		t.Fatal("pending request disappeared after timeout")
 	}
@@ -866,21 +877,21 @@ func TestDelegateQueuedRequestTimeoutCancelsOnlyThatRequest(t *testing.T) {
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
+	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitDelegateMechanicalStatus(t, ctrl, active.DelegateID, tool.DelegateStatusRunning)
-	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: active.DelegateID, Message: "B", Wait: false})
+	waitDelegateMechanicalStatus(t, ctrl, active.AgentID, tool.DelegateStatusRunning)
+	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: active.AgentID, Message: "B", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
 	zero := 0
-	timed, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: active.DelegateID, RequestID: requestIDPtr(queued.RequestID), TimeoutSeconds: &zero})
-	if err != nil || timed.Status != tool.DelegateStatusTimedOut {
+	timed, err := waitResponse(context.Background(), ctrl, s, active.AgentID, queued.CorrelationID, &zero)
+	if err != nil || timed.ResponseStatus != tool.DelegateResponseTimedOut {
 		t.Fatalf("timed wait = %+v, %v; want TimedOut", timed, err)
 	}
-	pending, ok := s.delegation.getPending(queued.RequestID)
+	pending, ok := s.delegation.getPending(queued.CorrelationID)
 	if !ok {
 		t.Fatal("timed request was not left collectable")
 	}
@@ -893,11 +904,11 @@ func TestDelegateQueuedRequestTimeoutCancelsOnlyThatRequest(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("queued request-specific timeout did not resolve")
 	}
-	status, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, DelegateID: active.DelegateID})
-	if err != nil || status.Status != tool.DelegateStatusRunning {
+	status, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: active.AgentID})
+	if err != nil || len(status.Agents) != 1 || status.Agents[0].State != tool.AgentStateWorking {
 		t.Fatalf("A status after B timeout = %+v, %v; want Running", status, err)
 	}
-	_, _ = ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, DelegateID: active.DelegateID})
+	_, _ = ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: active.AgentID})
 }
 
 func TestDelegateQueuedRequestCallerCancellationTargetsOnlyThatRequest(t *testing.T) {
@@ -905,32 +916,32 @@ func TestDelegateQueuedRequestCallerCancellationTargetsOnlyThatRequest(t *testin
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
+	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitDelegateMechanicalStatus(t, ctrl, active.DelegateID, tool.DelegateStatusRunning)
-	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: active.DelegateID, Message: "B", Wait: false})
+	waitDelegateMechanicalStatus(t, ctrl, active.AgentID, tool.DelegateStatusRunning)
+	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: active.AgentID, Message: "B", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
 	cancelledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	result, err := ctrl.Execute(cancelledCtx, tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: active.DelegateID, RequestID: requestIDPtr(queued.RequestID)})
-	if err != nil || result.Status != tool.DelegateStatusInterrupted {
+	result, err := waitResponse(cancelledCtx, ctrl, s, active.AgentID, queued.CorrelationID, nil)
+	if err != nil || result.ResponseStatus != tool.DelegateResponseInterrupted {
 		t.Fatalf("cancelled wait = %+v, %v; want Interrupted", result, err)
 	}
-	pending, _ := s.delegation.getPending(queued.RequestID)
+	pending, _ := s.delegation.getPending(queued.CorrelationID)
 	select {
 	case <-pending.done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("caller cancellation did not resolve targeted queued request")
 	}
-	status, _ := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, DelegateID: active.DelegateID})
-	if status.Status != tool.DelegateStatusRunning {
-		t.Fatalf("A status after B caller cancellation = %v, want Running", status.Status)
+	status, _ := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: active.AgentID})
+	if len(status.Agents) != 1 || status.Agents[0].State != tool.AgentStateWorking {
+		t.Fatalf("A status after B caller cancellation = %+v, want working", status.Agents)
 	}
-	_, _ = ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, DelegateID: active.DelegateID})
+	_, _ = ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: active.AgentID})
 }
 
 func TestDelegateRunningRequestTimeoutStartsNextWithoutCancellingIt(t *testing.T) {
@@ -938,21 +949,21 @@ func TestDelegateRunningRequestTimeoutStartsNextWithoutCancellingIt(t *testing.T
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	running, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "B", Wait: false})
+	running, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "B", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitDelegateMechanicalStatus(t, ctrl, running.DelegateID, tool.DelegateStatusRunning)
-	next, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: running.DelegateID, Message: "C", Wait: false})
+	waitDelegateMechanicalStatus(t, ctrl, running.AgentID, tool.DelegateStatusRunning)
+	next, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: running.AgentID, Message: "C", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
 	zero := 0
-	result, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: running.DelegateID, RequestID: requestIDPtr(running.RequestID), TimeoutSeconds: &zero})
-	if err != nil || result.Status != tool.DelegateStatusTimedOut {
+	result, err := waitResponse(context.Background(), ctrl, s, running.AgentID, running.CorrelationID, &zero)
+	if err != nil || result.ResponseStatus != tool.DelegateResponseTimedOut {
 		t.Fatalf("running timeout = %+v, %v; want TimedOut", result, err)
 	}
-	runningPending, _ := s.delegation.getPending(running.RequestID)
+	runningPending, _ := s.delegation.getPending(running.CorrelationID)
 	select {
 	case <-runningPending.done:
 		_, status := runningPending.result()
@@ -962,8 +973,8 @@ func TestDelegateRunningRequestTimeoutStartsNextWithoutCancellingIt(t *testing.T
 	case <-time.After(2 * time.Second):
 		t.Fatal("running request did not resolve after targeted timeout")
 	}
-	waitDelegateMechanicalStatus(t, ctrl, running.DelegateID, tool.DelegateStatusRunning)
-	nextPending, ok := s.delegation.getPending(next.RequestID)
+	waitDelegateMechanicalStatus(t, ctrl, running.AgentID, tool.DelegateStatusRunning)
+	nextPending, ok := s.delegation.getPending(next.CorrelationID)
 	if !ok {
 		t.Fatal("next request handle missing")
 	}
@@ -972,7 +983,7 @@ func TestDelegateRunningRequestTimeoutStartsNextWithoutCancellingIt(t *testing.T
 		t.Fatal("targeting running B also resolved/cancelled C")
 	default:
 	}
-	_, _ = s.cancelDelegateRequest(running.DelegateID, next.RequestID)
+	_, _ = s.cancelDelegateRequest(running.AgentID, next.CorrelationID)
 }
 
 func TestDelegateTerminalWinsCancelledWaitBeforeControlDispatch(t *testing.T) {
@@ -980,11 +991,11 @@ func TestDelegateTerminalWinsCancelledWaitBeforeControlDispatch(t *testing.T) {
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateChild("child", "B done"))
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	request, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "B", Wait: false})
+	request, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "B", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	pending, _ := s.delegation.getPending(request.RequestID)
+	pending, _ := s.delegation.getPending(request.CorrelationID)
 	select {
 	case <-pending.done:
 	case <-time.After(2 * time.Second):
@@ -992,12 +1003,12 @@ func TestDelegateTerminalWinsCancelledWaitBeforeControlDispatch(t *testing.T) {
 	}
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	result, err := ctrl.Execute(cancelled, tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: request.DelegateID, RequestID: requestIDPtr(request.RequestID)})
-	if err != nil || result.Status != tool.DelegateStatusCompleted || result.Output != "B done" {
+	result, err := waitResponse(cancelled, ctrl, s, request.AgentID, request.CorrelationID, nil)
+	if err != nil || result.ResponseStatus != tool.DelegateResponseCompleted || result.Response != "B done" {
 		t.Fatalf("terminal/deadline race = %+v, %v; want completed B", result, err)
 	}
-	next, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: request.DelegateID, Message: "C", Wait: true})
-	if err != nil || next.Status != tool.DelegateStatusCompleted {
+	next, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: request.AgentID, Message: "C", WaitForResponse: true})
+	if err != nil || next.ResponseStatus != tool.DelegateResponseCompleted {
 		t.Fatalf("C after terminal race = %+v, %v", next, err)
 	}
 }
@@ -1007,28 +1018,28 @@ func TestNativeQueuedDelegateInterruptResolvesWithoutWaitTimeout(t *testing.T) {
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
+	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitDelegateMechanicalStatus(t, ctrl, active.DelegateID, tool.DelegateStatusRunning)
-	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: active.DelegateID, Message: "B", Wait: false})
+	waitDelegateMechanicalStatus(t, ctrl, active.AgentID, tool.DelegateStatusRunning)
+	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: active.AgentID, Message: "B", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, DelegateID: active.DelegateID}); err != nil {
+	if _, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: active.AgentID}); err != nil {
 		t.Fatal(err)
 	}
 	result := make(chan tool.DelegateResult, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		got, waitErr := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: active.DelegateID, RequestID: requestIDPtr(queued.RequestID)})
+		got, waitErr := waitResponse(context.Background(), ctrl, s, active.AgentID, queued.CorrelationID, nil)
 		result <- got
 		errCh <- waitErr
 	}()
 	select {
 	case got := <-result:
-		if waitErr := <-errCh; waitErr != nil || got.Status != tool.DelegateStatusInterrupted {
+		if waitErr := <-errCh; waitErr != nil || got.ResponseStatus != tool.DelegateResponseInterrupted {
 			t.Fatalf("wait = %+v, %v; want Interrupted", got, waitErr)
 		}
 	case <-time.After(2 * time.Second):
@@ -1050,7 +1061,7 @@ func TestNativeQueuedDelegateFailedTurnResolvesFailedLiveAndRestore(t *testing.T
 	commands := &fakeCommandAppender{}
 	s := newDelegationSession(t, parent, []Option{WithEventAppender(events), WithCommandAppender(commands)}, child)
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
+	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1059,14 +1070,14 @@ func TestNativeQueuedDelegateFailedTurnResolvesFailedLiveAndRestore(t *testing.T
 	case <-time.After(2 * time.Second):
 		t.Fatal("active turn never reached injected provider")
 	}
-	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: active.DelegateID, Message: "B", Wait: false})
+	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: active.AgentID, Message: "B", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
 	close(client.release)
 
-	live, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: active.DelegateID, RequestID: requestIDPtr(queued.RequestID)})
-	if err != nil || live.Status != tool.DelegateStatusFailed {
+	live, err := waitResponse(context.Background(), ctrl, s, active.AgentID, queued.CorrelationID, nil)
+	if err != nil || live.ResponseStatus != tool.DelegateResponseFailed {
 		t.Fatalf("live wait = %+v, %v; want Failed", live, err)
 	}
 
@@ -1079,9 +1090,9 @@ func TestNativeQueuedDelegateFailedTurnResolvesFailedLiveAndRestore(t *testing.T
 	if err := seedResolvedDelegateRecords(restored, journalRecords, events.snapshot(), nil); err != nil {
 		t.Fatal(err)
 	}
-	resolved, ok := restored.getResolved(queued.RequestID)
-	if !ok || resolved.childID != active.DelegateID || resolved.status != tool.DelegateStatusFailed {
-		t.Fatalf("restored cancellation = %+v, %v; want Failed child %v", resolved, ok, active.DelegateID)
+	resolved, ok := restored.getResolved(queued.CorrelationID)
+	if !ok || resolved.childID != active.AgentID || resolved.status != tool.DelegateStatusFailed {
+		t.Fatalf("restored cancellation = %+v, %v; want Failed child %v", resolved, ok, active.AgentID)
 	}
 }
 
@@ -1089,19 +1100,29 @@ func waitDelegateMechanicalStatus(t *testing.T, ctrl tool.DelegateController, de
 	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for {
-		status, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, DelegateID: delegateID})
+		status, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: delegateID})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if status.Status == want {
+		if len(status.Agents) == 1 && agentStateMatchesLegacy(status.Agents[0].State, want) {
 			return
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("delegate status = %v, want %v", status.Status, want)
+			t.Fatalf("delegate agents = %+v, want legacy state %v", status.Agents, want)
 		case <-time.After(time.Millisecond):
 		}
 	}
+}
+
+func agentStateMatchesLegacy(state tool.AgentState, status tool.DelegateStatusValue) bool {
+	if status == tool.DelegateStatusRunning {
+		return state == tool.AgentStateWorking
+	}
+	if status == tool.DelegateStatusIdle {
+		return state == tool.AgentStateIdle
+	}
+	return state == tool.AgentStateUnavailable
 }
 
 // TestDelegateStatusReportsMechanicalState proves status returns bounded mechanical
@@ -1112,28 +1133,28 @@ func TestDelegateStatusReportsMechanicalState(t *testing.T) {
 	s := newDelegationSession(t, parent, nil, delegateChild("child", "final"))
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 
-	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
+	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Name: "api_planner", Message: "go", WaitForResponse: true})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
 
-	single, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStatus, DelegateID: res.DelegateID})
+	single, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: res.AgentID})
 	if err != nil {
 		t.Fatalf("status one: %v", err)
 	}
-	if single.Status != tool.DelegateStatusIdle {
-		t.Errorf("single status = %v, want Idle (child finished its turn, no pending request)", single.Status)
+	if len(single.Agents) != 1 || single.Agents[0].State != tool.AgentStateIdle || single.Agents[0].QueuedMessages != 0 {
+		t.Errorf("single agents = %+v, want one idle child with no queued messages", single.Agents)
 	}
-	if single.PendingRequests != 0 {
-		t.Errorf("pending = %d, want 0", single.PendingRequests)
+	if single.Agents[0].Name != "api_planner" || single.Agents[0].AgentType != "child" {
+		t.Errorf("single agent identity = %+v, want durable api_planner/child", single.Agents[0])
 	}
 
 	all, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStatus})
 	if err != nil {
 		t.Fatalf("status all: %v", err)
 	}
-	if len(all.Children) != 1 || all.Children[0].DelegateID != res.DelegateID {
-		t.Errorf("children = %+v, want exactly the one owned child", all.Children)
+	if len(all.Agents) != 1 || all.Agents[0].AgentID != res.AgentID {
+		t.Errorf("agents = %+v, want exactly the one owned child", all.Agents)
 	}
 }
 
@@ -1147,7 +1168,7 @@ func TestDelegateStatusReportsWaitTrueChildRunning(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = ctrl.Execute(startCtx, tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
+		_, _ = ctrl.Execute(startCtx, tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: true})
 	}()
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -1156,9 +1177,9 @@ func TestDelegateStatusReportsWaitTrueChildRunning(t *testing.T) {
 		if err != nil {
 			t.Fatalf("status: %v", err)
 		}
-		if len(status.Children) == 1 {
-			if status.Children[0].Status != tool.DelegateStatusRunning {
-				t.Fatalf("active wait:true child status = %v, want Running", status.Children[0].Status)
+		if len(status.Agents) == 1 {
+			if status.Agents[0].State != tool.AgentStateWorking {
+				t.Fatalf("active wait:true child state = %v, want working", status.Agents[0].State)
 			}
 			cancel()
 			<-done
@@ -1196,7 +1217,7 @@ func TestDelegateStartSetupFailuresLeaveNoChildQuotaOrDurablePhantom(t *testing.
 			beforeQuota := s.spawnedCount()
 			ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent).(*scopedController)
 			beforeLoops := len(ctrl.ownedChildren(s))
-			_, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
+			_, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: false})
 			if !errors.Is(err, sentinel) {
 				t.Fatalf("start error = %v, want injected sentinel", err)
 			}
@@ -1221,7 +1242,7 @@ func TestDelegateStartCommitsLoopStartedBeforeTurnEvents(t *testing.T) {
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, []Option{WithEventAppender(rec)}, delegateChild("child", "answer"))
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
+	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1232,11 +1253,11 @@ func TestDelegateStartCommitsLoopStartedBeforeTurnEvents(t *testing.T) {
 		for i, ev := range events {
 			switch e := ev.(type) {
 			case event.LoopStarted:
-				if e.LoopID == queued.DelegateID {
+				if e.LoopID == queued.AgentID {
 					started = i
 				}
 			case event.TurnStarted:
-				if e.LoopID == queued.DelegateID {
+				if e.LoopID == queued.AgentID {
 					turn = i
 				}
 			}
@@ -1263,7 +1284,7 @@ func TestDelegateStartAppendFailureRollsBackPreparedChild(t *testing.T) {
 	appender.enabled.Store(true)
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent).(*scopedController)
 	beforeQuota := s.spawnedCount()
-	_, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
+	_, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: false})
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("start error = %v, want append sentinel", err)
 	}
@@ -1281,7 +1302,7 @@ func TestDelegateRequiredIntentAppendFailureDoesNotDispatch(t *testing.T) {
 	failing := &fakeCommandAppender{err: sentinel}
 	s.cmdAppender = failing
 	before := s.spawnedCount()
-	_, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
+	_, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: false})
 	var sessionErr *SessionError
 	if !errors.As(err, &sessionErr) || sessionErr.Kind != SessionDelegateIntentAppendFailed || !errors.Is(err, sentinel) {
 		t.Fatalf("start error = %T %v, want typed required-intent failure", err, err)
@@ -1291,16 +1312,16 @@ func TestDelegateRequiredIntentAppendFailureDoesNotDispatch(t *testing.T) {
 	}
 
 	s.cmdAppender = &fakeCommandAppender{}
-	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
+	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.cmdAppender = failing
-	_, err = ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: started.DelegateID, Message: "queued", Wait: false})
+	_, err = ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: started.AgentID, Message: "queued", WaitForResponse: false})
 	if !errors.As(err, &sessionErr) || sessionErr.Kind != SessionDelegateIntentAppendFailed || !errors.Is(err, sentinel) {
 		t.Fatalf("send error = %T %v, want typed required-intent failure", err, err)
 	}
-	if got := s.delegation.pendingCount(started.DelegateID); got != 0 {
+	if got := s.delegation.pendingCount(started.AgentID); got != 0 {
 		t.Fatalf("failed send pending count = %d, want 0", got)
 	}
 }
@@ -1312,17 +1333,17 @@ func TestDelegateAcceptanceAppendFailureReturnsNoHandle(t *testing.T) {
 	appender := &failDelegateAcceptanceAppender{err: sentinel}
 	s := newDelegationSession(t, parent, []Option{WithEventAppender(appender)}, delegateChild("child", "answer"))
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: true})
+	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	appender.enabled.Store(true)
-	result, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: started.DelegateID, Message: "B", Wait: false})
+	result, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: started.AgentID, Message: "B", WaitForResponse: false})
 	var sessionErr *SessionError
-	if err == nil || !result.RequestID.IsZero() || !errors.Is(err, sentinel) || !errors.As(err, &sessionErr) || sessionErr.Kind != SessionDelegateAdmissionCommitFailed {
+	if err == nil || !result.CorrelationID.IsZero() || !errors.Is(err, sentinel) || !errors.As(err, &sessionErr) || sessionErr.Kind != SessionDelegateAdmissionCommitFailed {
 		t.Fatalf("send = %+v, %v; want no handle and acceptance failure", result, err)
 	}
-	if got := s.delegation.pendingCount(started.DelegateID); got != 0 {
+	if got := s.delegation.pendingCount(started.AgentID); got != 0 {
 		t.Fatalf("pending=%d, want 0", got)
 	}
 }
@@ -1337,16 +1358,16 @@ func TestDelegateQuotaReservedBeforeConstruction(t *testing.T) {
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 
 	// An invalid mode is refused BEFORE reserving quota.
-	if _, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Mode: "ghost", Message: "m", Wait: true}); err == nil {
+	if _, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", AgentMode: "ghost", Message: "m", WaitForResponse: true}); err == nil {
 		t.Fatal("expected an invalid-mode refusal")
 	}
 
 	// The first real spawn consumes the sole quota slot.
-	if _, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "m", Wait: true}); err != nil {
+	if _, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "m", WaitForResponse: true}); err != nil {
 		t.Fatalf("first start: %v", err)
 	}
 	// The second exceeds the quota.
-	_, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "m", Wait: true})
+	_, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "m", WaitForResponse: true})
 	var se *SessionError
 	if !errors.As(err, &se) || se.Kind != SessionLoopQuotaExceeded {
 		t.Fatalf("second start error = %v, want SessionLoopQuotaExceeded", err)
@@ -1392,25 +1413,25 @@ func TestDelegateSendResolvesDistinctTurns(t *testing.T) {
 	s := newDelegationSession(t, parent, nil, delegateChild("child", "answer"))
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 
-	start, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
+	start, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: true})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	childID := start.DelegateID
+	childID := start.AgentID
 
-	seen := map[uuid.UUID]struct{}{start.RequestID: {}}
+	seen := map[uuid.UUID]struct{}{start.CorrelationID: {}}
 	for i := 0; i < 2; i++ {
-		res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: childID, Message: "again", Wait: true})
+		res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: childID, Message: "again", WaitForResponse: true})
 		if err != nil {
 			t.Fatalf("send %d: %v", i, err)
 		}
-		if res.Status != tool.DelegateStatusCompleted || res.Output != "answer" {
-			t.Fatalf("send %d = %v/%q, want Completed/answer", i, res.Status, res.Output)
+		if res.ResponseStatus != tool.DelegateResponseCompleted || res.Response != "answer" {
+			t.Fatalf("send %d = %v/%q, want Completed/answer", i, res.ResponseStatus, res.Response)
 		}
-		if _, dup := seen[res.RequestID]; dup || res.RequestID.IsZero() {
-			t.Fatalf("send %d request id %v not distinct", i, res.RequestID)
+		if _, dup := seen[res.CorrelationID]; dup || res.CorrelationID.IsZero() {
+			t.Fatalf("send %d request id %v not distinct", i, res.CorrelationID)
 		}
-		seen[res.RequestID] = struct{}{}
+		seen[res.CorrelationID] = struct{}{}
 	}
 }
 
@@ -1443,11 +1464,11 @@ func TestDelegateWaitResolvesAfterRestore(t *testing.T) {
 	defer func() { _ = obs.Close() }()
 
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	queued, err := ctrl.Execute(ctx, tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
+	queued, err := ctrl.Execute(ctx, tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: false})
 	if err != nil {
 		t.Fatalf("start wait:false: %v", err)
 	}
-	childID, reqID := queued.DelegateID, queued.RequestID
+	childID, reqID := queued.AgentID, queued.CorrelationID
 
 	// Wait until the child's turn is durably done before shutdown (so its terminal is on
 	// the durable stream the restore reads).
@@ -1467,12 +1488,12 @@ func TestDelegateWaitResolvesAfterRestore(t *testing.T) {
 	t.Cleanup(func() { _ = r.Shutdown(context.Background()) })
 
 	rctrl := r.delegation.controllerFor(r.ActiveLoopID(), parent)
-	res, err := rctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: childID, RequestID: requestIDPtr(reqID)})
+	res, err := waitResponse(context.Background(), rctrl, r, childID, reqID, nil)
 	if err != nil {
 		t.Fatalf("wait after restore: %v", err)
 	}
-	if res.Status != tool.DelegateStatusCompleted || res.Output != "durable answer" {
-		t.Fatalf("post-restore wait = %v/%q, want Completed/durable answer", res.Status, res.Output)
+	if res.ResponseStatus != tool.DelegateResponseCompleted || res.Response != "durable answer" {
+		t.Fatalf("post-restore wait = %v/%q, want Completed/durable answer", res.ResponseStatus, res.Response)
 	}
 }
 
@@ -1495,18 +1516,18 @@ func TestDelegateQueuedRequestRestoresInterruptedWithoutReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	a, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
+	a, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !waitTurnStartedRequest(t, obs, a.RequestID) {
+	if !waitTurnStartedRequest(t, obs, a.CorrelationID) {
 		t.Fatal("turn A never started")
 	}
-	b, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: a.DelegateID, Message: "B", Wait: false})
+	b, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: a.AgentID, Message: "B", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !waitInputQueuedRequest(t, obs, b.RequestID) {
+	if !waitInputQueuedRequest(t, obs, b.CorrelationID) {
 		t.Fatal("request B never durably queued")
 	}
 	sid := s.SessionID()
@@ -1529,19 +1550,19 @@ func TestDelegateQueuedRequestRestoresInterruptedWithoutReplay(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = restored.Shutdown(context.Background()) })
 	restoredCtrl := restored.delegation.controllerFor(restored.ActiveLoopID(), parent)
-	result, err := restoredCtrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: a.DelegateID, RequestID: requestIDPtr(b.RequestID)})
+	result, err := waitResponse(context.Background(), restoredCtrl, restored, a.AgentID, b.CorrelationID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != tool.DelegateStatusInterrupted {
-		t.Fatalf("restored queued request B status = %v, want Interrupted", result.Status)
+	if result.ResponseStatus != tool.DelegateResponseInterrupted {
+		t.Fatalf("restored queued request B status = %v, want Interrupted", result.ResponseStatus)
 	}
-	status, err := restoredCtrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, DelegateID: a.DelegateID})
+	status, err := restoredCtrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: a.AgentID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.Status != tool.DelegateStatusIdle {
-		t.Fatalf("restored child status = %v, want idle (B not replayed)", status.Status)
+	if len(status.Agents) != 1 || status.Agents[0].State != tool.AgentStateIdle {
+		t.Fatalf("restored child agents = %+v, want idle (B not replayed)", status.Agents)
 	}
 }
 

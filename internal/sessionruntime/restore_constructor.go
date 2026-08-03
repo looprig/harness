@@ -90,7 +90,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 	}
 	liveMode, liveModel := liveViewFor(bound, ri)
 	s.loopsMu.Lock()
-	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, bindings: bindings, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
+	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, bindings: bindings, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle, agentName: started.DisplayName, agentMode: loop.ModeName(started.InitialMode)}
 	s.loopsMu.Unlock()
 	return nil
 }
@@ -965,6 +965,7 @@ func (s *Session) attachRestoredTombstonedLoop(plan loopPlan, parent loop.Proven
 		id: plan.started.LoopID, owner: s, bound: plan.bound, bindings: plan.bindings,
 		parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel,
 		state: tool.DelegateStatusFailed, tombstoned: true,
+		agentName: plan.started.DisplayName, agentMode: loop.ModeName(plan.started.InitialMode),
 	}
 	s.loopsMu.Lock()
 	if existing, ok := s.loops[plan.started.LoopID]; ok && existing.tombstoned {

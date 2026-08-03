@@ -607,6 +607,8 @@ type loopHandle struct {
 	liveModel model.Model
 	stateMu   sync.RWMutex
 	state     tool.DelegateStatusValue
+	agentName string
+	agentMode loop.ModeName
 }
 
 func runtimeForModel(model model.Model) event.ModelRuntime {
@@ -1493,12 +1495,17 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		liveModel = selected.Model
 	}
 	initialState := tool.DelegateStatusIdle
+	displayName := bound.DisplayName()
 	if admission != nil {
 		// The initial command has already been accepted behind the publication barrier;
 		// the child is mechanically running even before TurnStarted is released.
 		initialState = tool.DelegateStatusRunning
+		displayName = admission.name
+		if displayName == "" {
+			displayName = string(bound.Name()) + "-" + loopID.String()
+		}
 	}
-	s.loops[loopID] = &loopHandle{id: loopID, owner: s, bound: bound, bindings: bindings, backend: b, parent: parent, cancel: cancel, liveMode: startedMode, liveModel: liveModel, state: initialState}
+	s.loops[loopID] = &loopHandle{id: loopID, owner: s, bound: bound, bindings: bindings, backend: b, parent: parent, cancel: cancel, liveMode: startedMode, liveModel: liveModel, state: initialState, agentName: displayName, agentMode: startedMode}
 	s.loopsMu.Unlock()
 
 	// Announce the new loop to subscribers active at creation time. Published AFTER
@@ -1536,7 +1543,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	if runtime != nil && runtime.SelectionKind == loop.RuntimeSelectionHarnessManaged {
 		startedRuntime = event.ModelRuntime{}
 	}
-	ev := event.LoopStarted{Header: startedHeader, Runtime: startedRuntime, AgentRuntime: agentRuntime, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: bound.DisplayName(), Description: bound.Description()}
+	ev := event.LoopStarted{Header: startedHeader, Runtime: startedRuntime, AgentRuntime: agentRuntime, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: displayName, Description: bound.Description()}
 	if admission != nil {
 		ev.InitialRequestID = admission.requestID
 	}

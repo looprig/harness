@@ -61,6 +61,7 @@ type delegationManager struct {
 
 type delegateAdmission struct {
 	ctx       context.Context
+	name      string
 	message   string
 	sub       event.Subscription
 	requestID uuid.UUID
@@ -448,7 +449,7 @@ var _ tool.DelegateController = (*scopedController)(nil)
 // that re-enforces the action set, agent authorization, mode validity, and ownership
 // regardless of crafted JSON.
 func (c *scopedController) Execute(ctx context.Context, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	if c.style == loop.DelegationSyncOnly && (req.Operation != tool.DelegateStart || !req.Wait) {
+	if c.style == loop.DelegationSyncOnly && (req.Operation != tool.DelegateStart || !req.WaitForResponse) {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateActionUnavailable}
 	}
 	s, ok := c.manager.sess()
@@ -460,8 +461,6 @@ func (c *scopedController) Execute(ctx context.Context, req tool.DelegateRequest
 		return c.start(ctx, s, req)
 	case tool.DelegateSend:
 		return c.send(ctx, s, req)
-	case tool.DelegateWait:
-		return c.wait(ctx, s, req)
 	case tool.DelegateInterrupt:
 		return c.interrupt(s, req)
 	case tool.DelegateStatus:
@@ -475,7 +474,7 @@ func (c *scopedController) Execute(ctx context.Context, req tool.DelegateRequest
 // child (newLoop reserves the quota slot before construction and records the selected
 // mode on LoopStarted), then waits or returns a queued handle.
 func (c *scopedController) start(ctx context.Context, s *Session, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	agent := identity.AgentName(req.Agent)
+	agent := identity.AgentName(req.AgentType)
 	if _, authorized := c.allowed[agent]; !authorized {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnauthorizedAgent, Agent: agent}
 	}
@@ -483,7 +482,7 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 	if !known {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownAgent, Agent: agent}
 	}
-	mode := loop.ModeName(req.Mode)
+	mode := loop.ModeName(req.AgentMode)
 	if err := validateDelegateMode(childDef, mode); err != nil {
 		return tool.DelegateResult{}, err
 	}
@@ -537,7 +536,7 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateInterruptPending, DelegateID: c.parentLoopID}
 	}
 	parent := loop.Provenance{LoopID: c.parentLoopID}
-	childID, requestID, sub, err := s.startDelegate(ctx, parent, childDef, mode, req.Message, req.ParentToolUseID, runtime, c.runtimeCatalog, c.hasRuntimeCatalog)
+	childID, requestID, sub, err := s.startDelegate(ctx, parent, childDef, mode, req.Name, req.Message, req.ParentToolUseID, runtime, c.runtimeCatalog, c.hasRuntimeCatalog)
 	if err != nil {
 		return tool.DelegateResult{}, err
 	}
@@ -784,10 +783,10 @@ func runtimeEfforts(models []loop.RuntimeModelOption) []inferencemodel.Effort {
 // send enqueues a distinct NON-FOLDING follow-up turn on an owned child and waits or
 // returns a queued handle.
 func (c *scopedController) send(ctx context.Context, s *Session, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	if req.DelegateID.IsZero() {
+	if req.AgentID.IsZero() {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateMissingDelegateID}
 	}
-	if err := c.ownsChild(s, req.DelegateID); err != nil {
+	if err := c.ownsChild(s, req.AgentID); err != nil {
 		return tool.DelegateResult{}, err
 	}
 	// Interrupt admission gate: same machine-side flush as start — a parent under an interrupt
@@ -797,110 +796,102 @@ func (c *scopedController) send(ctx context.Context, s *Session, req tool.Delega
 	if s.loopInterruptPending(c.parentLoopID) {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateInterruptPending, DelegateID: c.parentLoopID}
 	}
-	requestID, sub, err := s.sendDelegate(ctx, req.DelegateID, req.Message)
+	requestID, sub, err := s.sendDelegate(ctx, req.AgentID, req.Message)
 	if err != nil {
 		return tool.DelegateResult{}, err
 	}
-	return c.resolveOrQueue(ctx, s, req.DelegateID, requestID, sub, req)
+	return c.resolveOrQueue(ctx, s, req.AgentID, requestID, sub, req)
 }
 
-// wait resolves one previously returned request id for an owned child. The request id
-// is required because a child may have several queued turns.
-func (c *scopedController) wait(ctx context.Context, s *Session, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	if req.DelegateID.IsZero() {
+// waitResponse preserves the current internal collector until Phase 3 replaces it
+// with automatic durable hand-back. No tool operation or model-supplied ID reaches it.
+func (c *scopedController) waitResponse(ctx context.Context, s *Session, agentID, responseID uuid.UUID, timeoutSeconds *int) (tool.DelegateResult, error) {
+	if agentID.IsZero() {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateMissingDelegateID}
 	}
-	if req.RequestID == nil || req.RequestID.IsZero() {
+	if responseID.IsZero() {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateMissingRequestID}
 	}
-	if err := c.ownsChild(s, req.DelegateID); err != nil {
+	if err := c.ownsChild(s, agentID); err != nil {
 		return tool.DelegateResult{}, err
 	}
-	requestID := *req.RequestID
 	// Live in-memory handle first: a request registered this process lifetime.
-	if pr, ok := c.manager.getPending(requestID); ok {
-		if pr.childID != req.DelegateID {
-			return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownRequest, RequestID: requestID}
+	if pr, ok := c.manager.getPending(responseID); ok {
+		if pr.childID != agentID {
+			return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownRequest, RequestID: responseID}
 		}
-		waitCtx, cancel := waitContext(ctx, req.TimeoutSeconds)
+		waitCtx, cancel := waitContext(ctx, timeoutSeconds)
 		defer cancel()
 		select {
 		case <-pr.done:
-			c.manager.removePending(requestID)
+			c.manager.removePending(responseID)
 			text, status := pr.result()
-			return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: requestID, Status: status, Output: text}, nil
+			return c.responseResult(s, agentID, responseID, status, text), nil
 		case <-waitCtx.Done():
 			// Recheck before dispatch so an already-observed terminal wins without even
 			// sending control; the actor command remains authoritative for the race after
 			// this check. The pending handle stays collectable either way.
 			select {
 			case <-pr.done:
-				c.manager.removePending(requestID)
+				c.manager.removePending(responseID)
 				text, status := pr.result()
-				return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: requestID, Status: status, Output: text}, nil
+				return c.responseResult(s, agentID, responseID, status, text), nil
 			default:
 			}
-			status := timeoutOrInterrupted(req.TimeoutSeconds, waitCtx)
-			go func() { _, _ = s.cancelDelegateRequest(req.DelegateID, requestID) }()
-			return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: requestID, Status: status}, nil
+			status := timeoutOrInterrupted(timeoutSeconds, waitCtx)
+			go func() { _, _ = s.cancelDelegateRequest(agentID, responseID) }()
+			return c.responseResult(s, agentID, responseID, status, ""), nil
 		}
 	}
 	// Durable fallback (post-restore): the in-memory handle is gone, but the child's turn
 	// terminal survived in the folded history the restore reconstructed. Ownership is
 	// already enforced above; the resolved entry must name the same owned child.
-	if rr, ok := c.manager.getResolved(requestID); ok && rr.childID == req.DelegateID {
-		return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: requestID, Status: rr.status, Output: rr.text}, nil
+	if rr, ok := c.manager.getResolved(responseID); ok && rr.childID == agentID {
+		return c.responseResult(s, agentID, responseID, rr.status, rr.text), nil
 	}
-	return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownRequest, RequestID: requestID}
+	return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownRequest, RequestID: responseID}
 }
 
 // interrupt interrupts an owned child's current turn without destroying the loop.
 func (c *scopedController) interrupt(s *Session, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	if req.DelegateID.IsZero() {
+	if req.AgentID.IsZero() {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateMissingDelegateID}
 	}
-	if err := c.ownsChild(s, req.DelegateID); err != nil {
+	if err := c.ownsChild(s, req.AgentID); err != nil {
 		return tool.DelegateResult{}, err
 	}
-	if err := s.interruptLoopID(req.DelegateID); err != nil {
-		return tool.DelegateResult{}, &DelegateError{Kind: DelegateNotOwned, DelegateID: req.DelegateID}
+	previousState := c.childState(s, req.AgentID)
+	if err := s.interruptLoopID(req.AgentID); err != nil {
+		return tool.DelegateResult{}, &DelegateError{Kind: DelegateNotOwned, DelegateID: req.AgentID}
 	}
-	return tool.DelegateResult{DelegateID: req.DelegateID, Status: tool.DelegateStatusInterrupted}, nil
+	return tool.DelegateResult{AgentID: req.AgentID, PreviousState: previousState, State: tool.AgentStateIdle}, nil
 }
 
 // status reports bounded mechanical status for one owned child, or all owned children
 // when delegate_id is omitted. It never returns a raw event cursor or child transcript.
 func (c *scopedController) status(s *Session, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	if !req.DelegateID.IsZero() {
-		if err := c.ownsChildForStatus(s, req.DelegateID); err != nil {
+	if !req.AgentID.IsZero() {
+		if err := c.ownsChildForStatus(s, req.AgentID); err != nil {
 			return tool.DelegateResult{}, err
 		}
-		return tool.DelegateResult{
-			DelegateID:      req.DelegateID,
-			Status:          c.childStatus(s, req.DelegateID),
-			PendingRequests: c.manager.pendingCount(req.DelegateID),
-		}, nil
+		return tool.DelegateResult{Agents: []tool.DelegateAgent{c.agentSnapshot(s, req.AgentID)}}, nil
 	}
 	owned := c.ownedChildren(s)
 	truncated := len(owned) > maxDelegateStatusChildren
 	if truncated {
 		owned = owned[:maxDelegateStatusChildren]
 	}
-	children := make([]tool.DelegateChildStatus, 0, len(owned))
+	agents := make([]tool.DelegateAgent, 0, len(owned))
 	for _, id := range owned {
-		children = append(children, tool.DelegateChildStatus{
-			DelegateID:      id,
-			Status:          c.childStatus(s, id),
-			PendingRequests: c.manager.pendingCount(id),
-		})
+		agents = append(agents, c.agentSnapshot(s, id))
 	}
-	return tool.DelegateResult{Children: children, ChildrenTruncated: truncated}, nil
+	return tool.DelegateResult{Agents: agents, Truncated: truncated}, nil
 }
 
 // resolveOrQueue waits for the correlated turn (wait:true) or registers a pending
 // request and returns a queued handle (wait:false).
 func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, childID, requestID uuid.UUID, sub event.Subscription, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	if req.Wait {
+	if req.WaitForResponse {
 		defer func() { _ = sub.Close() }()
 		waitCtx, cancel := waitContext(ctx, req.TimeoutSeconds)
 		defer cancel()
@@ -911,12 +902,22 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 		if status == tool.DelegateStatusInterrupted && didTimeout(req.TimeoutSeconds, waitCtx) {
 			status = tool.DelegateStatusTimedOut
 		}
-		return tool.DelegateResult{DelegateID: childID, RequestID: requestID, Status: status, Output: text}, nil
+		result := c.responseResult(s, childID, requestID, status, text)
+		if req.Name != "" {
+			result.Name = req.Name
+		}
+		return result, nil
 	}
 	c.manager.registerPending(requestID, childID, sub, s.sessionCtx, func() {
 		_, _ = s.cancelDelegateRequest(childID, requestID)
 	})
-	return tool.DelegateResult{DelegateID: childID, RequestID: requestID, Status: tool.DelegateStatusQueued}, nil
+	result := c.agentResult(s, childID)
+	result.CorrelationID = requestID
+	result.State = tool.AgentStateWorking
+	if req.Name != "" {
+		result.Name = req.Name
+	}
+	return result, nil
 }
 
 // ownsChild fails closed unless childID is a registered loop whose parent is exactly
@@ -958,6 +959,91 @@ func (c *scopedController) ownedChildren(s *Session) []uuid.UUID {
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
 	return ids
+}
+
+func (c *scopedController) agentResult(s *Session, agentID uuid.UUID) tool.DelegateResult {
+	agent := c.agentSnapshot(s, agentID)
+	return tool.DelegateResult{AgentID: agent.AgentID, Name: agent.Name, State: agent.State}
+}
+
+func (c *scopedController) responseResult(s *Session, agentID, responseID uuid.UUID, status tool.DelegateStatusValue, response string) tool.DelegateResult {
+	result := c.agentResult(s, agentID)
+	result.CorrelationID = responseID
+	result.Response = response
+	result.ResponseStatus = responseStatus(status)
+	return result
+}
+
+func responseStatus(status tool.DelegateStatusValue) tool.DelegateResponseStatus {
+	switch status {
+	case tool.DelegateStatusCompleted:
+		return tool.DelegateResponseCompleted
+	case tool.DelegateStatusInterrupted:
+		return tool.DelegateResponseInterrupted
+	case tool.DelegateStatusTimedOut:
+		return tool.DelegateResponseTimedOut
+	case tool.DelegateStatusFailed:
+		return tool.DelegateResponseFailed
+	default:
+		return tool.DelegateResponseUnknown
+	}
+}
+
+func (c *scopedController) agentSnapshot(s *Session, agentID uuid.UUID) tool.DelegateAgent {
+	s.loopsMu.RLock()
+	handle := s.loops[agentID]
+	s.loopsMu.RUnlock()
+	if handle == nil {
+		return tool.DelegateAgent{AgentID: agentID, State: tool.AgentStateUnavailable}
+	}
+	name := handle.agentName
+	if name == "" {
+		name = handle.bound.DisplayName()
+		if name == "" {
+			name = string(handle.bound.Name())
+		}
+	}
+	agentMode := handle.agentMode
+	if agentMode == "" {
+		agentMode = handle.bound.InitialMode()
+	}
+	return tool.DelegateAgent{
+		AgentID: agentID, Name: name, AgentType: string(handle.bound.Name()),
+		State: c.childState(s, agentID), QueuedMessages: c.manager.pendingCount(agentID),
+		Runtime: c.agentRuntime(handle), AgentMode: string(agentMode),
+	}
+}
+
+func (c *scopedController) agentRuntime(handle *loopHandle) tool.DelegateRuntime {
+	identity := handle.bound.RuntimeIdentity()
+	runtime := tool.DelegateRuntime{
+		Profile: string(identity.Profile), Source: string(identity.Source),
+		SelectionKind: string(identity.SelectionKind), Model: string(identity.ModelAlias),
+	}
+	if identity.Profile != "" || identity.Source != "" || identity.SelectionKind != "" || identity.ModelAlias != "" {
+		runtime.Effort = runtimeEffortString(identity.Effort)
+		if identity.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+			runtime.Effort = ""
+		}
+	}
+	for _, entry := range c.runtimeCatalog.EntriesFor(handle.bound.Name()) {
+		if entry.Profile == identity.Profile {
+			runtime.Harness = string(entry.AgentHarness)
+			break
+		}
+	}
+	return runtime
+}
+
+func (c *scopedController) childState(s *Session, agentID uuid.UUID) tool.AgentState {
+	switch c.childStatus(s, agentID) {
+	case tool.DelegateStatusRunning, tool.DelegateStatusQueued:
+		return tool.AgentStateWorking
+	case tool.DelegateStatusIdle, tool.DelegateStatusCompleted, tool.DelegateStatusInterrupted, tool.DelegateStatusTimedOut:
+		return tool.AgentStateIdle
+	default:
+		return tool.AgentStateUnavailable
+	}
 }
 
 // childStatus maps the child's event-derived mechanical runtime state to a bounded value;
@@ -1048,8 +1134,8 @@ func timeoutOrInterrupted(timeoutSeconds *int, waitCtx context.Context) tool.Del
 // subscription, request mint, backend construction, and initial-command acceptance all
 // precede the checked LoopStarted commit. The backend's publisher remains blocked until
 // that commit, so TurnStarted can neither race ahead nor survive a failed spawn.
-func (s *Session) startDelegate(ctx context.Context, parent loop.Provenance, cfg loop.Definition, mode loop.ModeName, message, parentToolUseID string, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog bool) (childID, requestID uuid.UUID, sub event.Subscription, err error) {
-	admission := &delegateAdmission{ctx: ctx, message: message}
+func (s *Session) startDelegate(ctx context.Context, parent loop.Provenance, cfg loop.Definition, mode loop.ModeName, name, message, parentToolUseID string, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog bool) (childID, requestID uuid.UUID, sub event.Subscription, err error) {
+	admission := &delegateAdmission{ctx: ctx, name: name, message: message}
 	childID, err = s.newLoopWithAdmission(parent, cfg, parentToolUseID, mode, nil, admission, runtime, runtimeCatalog, hasRuntimeCatalog)
 	if err != nil {
 		return uuid.UUID{}, uuid.UUID{}, nil, err
@@ -1218,7 +1304,7 @@ func (e *DelegateError) Error() string {
 }
 
 // ModelFacingError exposes only the fixed, bounded category needed by the
-// model-facing Subagent result. It deliberately omits all request fields;
+// model-facing agent result. It deliberately omits all request fields;
 // ordinary delegation errors continue to use the generic tool-result error.
 func (e *DelegateError) ModelFacingError() string {
 	if e == nil {

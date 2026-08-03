@@ -75,20 +75,16 @@ func TestAttachRestoredTombstonedLoopPublishesOnceAndExposesClosedStatus(t *test
 	}
 
 	controller := &scopedController{manager: manager, parentLoopID: parentID, style: loop.DelegationManaged}
-	status, err := controller.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, DelegateID: childID})
+	status, err := controller.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: childID})
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
-	if status.Status != tool.DelegateStatusFailed {
-		t.Fatalf("status = %v, want failed", status.Status)
+	if len(status.Agents) != 1 || status.Agents[0].State != tool.AgentStateUnavailable {
+		t.Fatalf("agents = %+v, want unavailable", status.Agents)
 	}
 
-	for _, operation := range []tool.DelegateOperation{tool.DelegateSend, tool.DelegateWait, tool.DelegateInterrupt} {
-		req := tool.DelegateRequest{Operation: operation, DelegateID: childID}
-		if operation == tool.DelegateWait {
-			requestID := mustUUID()
-			req.RequestID = &requestID
-		}
+	for _, operation := range []tool.DelegateOperation{tool.DelegateSend, tool.DelegateInterrupt} {
+		req := tool.DelegateRequest{Operation: operation, AgentID: childID}
 		_, err := controller.Execute(context.Background(), req)
 		var delegateErr *DelegateError
 		if !errors.As(err, &delegateErr) || delegateErr.Kind != DelegateClosed {

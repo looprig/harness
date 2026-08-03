@@ -38,7 +38,7 @@ func (s *StopAgentTool) PrepareCall(_ context.Context, _ uuid.UUID, argsJSON str
 	if err != nil {
 		return tool.Request{}, nil, err
 	}
-	return tool.Request{}, tool.DelegateArtifact{Request: tool.DelegateRequest{Operation: tool.DelegateInterrupt, DelegateID: prepared.AgentID}}, nil
+	return tool.Request{}, tool.DelegateArtifact{Request: tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: prepared.AgentID}}, nil
 }
 
 func (s *StopAgentTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
@@ -46,12 +46,13 @@ func (s *StopAgentTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolR
 }
 
 func formatStopAgentResult(_ tool.DelegateRequest, result tool.DelegateResult) string {
-	return marshalResult(interruptResult{DelegateID: result.DelegateID.String(), Status: statusLabel(result.Status)})
+	return marshalResult(stopResult{AgentID: result.AgentID.String(), PreviousState: result.PreviousState, State: result.State})
 }
 
-type interruptResult struct {
-	DelegateID string `json:"delegate_id"`
-	Status     string `json:"status"`
+type stopResult struct {
+	AgentID       string          `json:"agent_id"`
+	PreviousState tool.AgentState `json:"previous_state"`
+	State         tool.AgentState `json:"state"`
 }
 
 var _ tool.InvokableTool = (*StopAgentTool)(nil)

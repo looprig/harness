@@ -38,7 +38,7 @@ func (s *MessageAgentTool) PrepareCall(_ context.Context, _ uuid.UUID, argsJSON 
 	if err != nil {
 		return tool.Request{}, nil, err
 	}
-	request := tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: prepared.AgentID, Message: prepared.Message, Wait: prepared.WaitForResponse, TimeoutSeconds: prepared.TimeoutSeconds}
+	request := tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: prepared.AgentID, Message: prepared.Message, WaitForResponse: prepared.WaitForResponse, TimeoutSeconds: prepared.TimeoutSeconds}
 	return tool.Request{}, tool.DelegateArtifact{Request: request}, nil
 }
 
@@ -47,10 +47,10 @@ func (s *MessageAgentTool) InvokableRun(ctx context.Context, _ string) (*tool.To
 }
 
 func formatMessageAgentResult(req tool.DelegateRequest, result tool.DelegateResult) string {
-	if req.Wait {
-		return formatWaited(result)
+	if req.WaitForResponse {
+		return formatForeground(result)
 	}
-	return formatQueued(result, nil)
+	return formatBackground(result)
 }
 
 var _ tool.InvokableTool = (*MessageAgentTool)(nil)

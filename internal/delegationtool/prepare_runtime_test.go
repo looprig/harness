@@ -27,7 +27,7 @@ func TestPrepareStartAgentRuntimeDefaultsAndExplicitTuple(t *testing.T) {
 		if !reflect.DeepEqual(request, tool.Request{}) {
 			t.Fatalf("PrepareCall() request = %#v, want empty access request", request)
 		}
-		if artifact.Request.Operation != tool.DelegateStart || artifact.Request.Agent != "worker" || artifact.Request.Message != "map the repo" || !artifact.Request.Wait {
+		if artifact.Request.Operation != tool.DelegateStart || artifact.Request.AgentType != "worker" || artifact.Request.Message != "map the repo" || !artifact.Request.WaitForResponse {
 			t.Fatalf("prepared request = %#v, want foreground start request", artifact.Request)
 		}
 		if artifact.Runtime == nil {

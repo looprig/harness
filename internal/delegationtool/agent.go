@@ -76,18 +76,18 @@ func executeAgentCall(ctx context.Context, controller tool.DelegateController, o
 	return tool.TextResult(format(req, result)), nil
 }
 
-func formatWaited(result tool.DelegateResult) string {
-	switch result.Status {
-	case tool.DelegateStatusCompleted:
-		return boundAgentOutput(result.Output)
-	case tool.DelegateStatusFailed:
-		return "error: delegate failed"
-	case tool.DelegateStatusInterrupted:
-		return "error: delegate interrupted"
-	case tool.DelegateStatusTimedOut:
-		return "error: delegate timed out"
+func formatForeground(result tool.DelegateResult) string {
+	switch result.ResponseStatus {
+	case tool.DelegateResponseCompleted:
+		return marshalResult(foregroundResult{AgentID: result.AgentID.String(), Name: result.Name, State: result.State, Response: boundAgentOutput(result.Response)})
+	case tool.DelegateResponseFailed:
+		return "error: agent failed"
+	case tool.DelegateResponseInterrupted:
+		return "error: agent interrupted"
+	case tool.DelegateResponseTimedOut:
+		return "error: agent timed out"
 	default:
-		return "error: delegate returned invalid status"
+		return "error: agent returned invalid response status"
 	}
 }
 
@@ -98,34 +98,21 @@ func boundAgentOutput(value string) string {
 	return value[:maxAgentResultBytes]
 }
 
-type runtimeResult struct {
-	AgentHarness string `json:"agent_harness,omitempty"`
-	Model        string `json:"model,omitempty"`
-	Effort       string `json:"effort,omitempty"`
+type foregroundResult struct {
+	AgentID  string          `json:"agent_id"`
+	Name     string          `json:"name"`
+	State    tool.AgentState `json:"state"`
+	Response string          `json:"response"`
 }
 
-type queuedResult struct {
-	DelegateID string         `json:"delegate_id"`
-	RequestID  string         `json:"request_id"`
-	Status     string         `json:"status"`
-	Runtime    *runtimeResult `json:"runtime,omitempty"`
+type backgroundResult struct {
+	AgentID string          `json:"agent_id"`
+	Name    string          `json:"name"`
+	State   tool.AgentState `json:"state"`
 }
 
-func formatQueued(result tool.DelegateResult, runtime *tool.DelegateRuntime) string {
-	var advertised *runtimeResult
-	if runtime != nil && runtime.Advertised.Any() {
-		advertised = &runtimeResult{}
-		if runtime.Advertised.Harness {
-			advertised.AgentHarness = runtime.Harness
-		}
-		if runtime.Advertised.Model {
-			advertised.Model = runtime.Model
-		}
-		if runtime.Advertised.Effort {
-			advertised.Effort = runtime.Effort
-		}
-	}
-	return marshalResult(queuedResult{DelegateID: result.DelegateID.String(), RequestID: result.RequestID.String(), Status: "queued", Runtime: advertised})
+func formatBackground(result tool.DelegateResult) string {
+	return marshalResult(backgroundResult{AgentID: result.AgentID.String(), Name: result.Name, State: result.State})
 }
 
 func marshalResult(value any) string {
@@ -134,25 +121,4 @@ func marshalResult(value any) string {
 		return "error: agent result unavailable"
 	}
 	return string(encoded)
-}
-
-func statusLabel(status tool.DelegateStatusValue) string {
-	switch status {
-	case tool.DelegateStatusRunning:
-		return "running"
-	case tool.DelegateStatusIdle:
-		return "idle"
-	case tool.DelegateStatusCompleted:
-		return "completed"
-	case tool.DelegateStatusInterrupted:
-		return "interrupted"
-	case tool.DelegateStatusFailed:
-		return "faulted"
-	case tool.DelegateStatusTimedOut:
-		return "timed_out"
-	case tool.DelegateStatusQueued:
-		return "queued"
-	default:
-		return "unknown"
-	}
 }

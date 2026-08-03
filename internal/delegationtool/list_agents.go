@@ -40,7 +40,7 @@ func (s *ListAgentsTool) PrepareCall(_ context.Context, _ uuid.UUID, argsJSON st
 	}
 	request := tool.DelegateRequest{Operation: tool.DelegateStatus}
 	if prepared.AgentID != nil {
-		request.DelegateID = *prepared.AgentID
+		request.AgentID = *prepared.AgentID
 	}
 	return tool.Request{}, tool.DelegateArtifact{Request: request}, nil
 }
@@ -50,31 +50,34 @@ func (s *ListAgentsTool) InvokableRun(ctx context.Context, _ string) (*tool.Tool
 }
 
 func formatListAgentsResult(_ tool.DelegateRequest, result tool.DelegateResult) string {
-	if result.Children != nil {
-		children := make([]statusChildResult, len(result.Children))
-		for i, child := range result.Children {
-			children[i] = statusChildResult{DelegateID: child.DelegateID.String(), Status: statusLabel(child.Status), PendingRequests: child.PendingRequests}
+	agents := make([]agentListItem, len(result.Agents))
+	for i, agent := range result.Agents {
+		agents[i] = agentListItem{
+			AgentID: agent.AgentID.String(), Name: agent.Name, AgentType: agent.AgentType,
+			State: agent.State, QueuedMessages: agent.QueuedMessages,
+			AgentHarness: agent.Runtime.Harness, AgentSource: agent.Runtime.Source,
+			Model: agent.Runtime.Model, Effort: agent.Runtime.Effort, AgentMode: agent.AgentMode,
 		}
-		return marshalResult(statusListResult{Children: children, Truncated: result.ChildrenTruncated})
 	}
-	return marshalResult(statusResult{DelegateID: result.DelegateID.String(), Status: statusLabel(result.Status), PendingRequests: result.PendingRequests})
+	return marshalResult(agentListResult{Agents: agents, Truncated: result.Truncated})
 }
 
-type statusResult struct {
-	DelegateID      string `json:"delegate_id"`
-	Status          string `json:"status"`
-	PendingRequests int    `json:"pending_requests"`
+type agentListItem struct {
+	AgentID        string          `json:"agent_id"`
+	Name           string          `json:"name"`
+	AgentType      string          `json:"agent_type"`
+	State          tool.AgentState `json:"state"`
+	QueuedMessages int             `json:"queued_messages"`
+	AgentHarness   string          `json:"agent_harness,omitempty"`
+	AgentSource    string          `json:"agent_source,omitempty"`
+	Model          string          `json:"model,omitempty"`
+	Effort         string          `json:"effort,omitempty"`
+	AgentMode      string          `json:"agent_mode,omitempty"`
 }
 
-type statusChildResult struct {
-	DelegateID      string `json:"delegate_id"`
-	Status          string `json:"status"`
-	PendingRequests int    `json:"pending_requests"`
-}
-
-type statusListResult struct {
-	Children  []statusChildResult `json:"children"`
-	Truncated bool                `json:"truncated,omitempty"`
+type agentListResult struct {
+	Agents    []agentListItem `json:"agents"`
+	Truncated bool            `json:"truncated"`
 }
 
 var _ tool.InvokableTool = (*ListAgentsTool)(nil)

@@ -236,12 +236,12 @@ func TestSubagentInterruptAffectsOnlyOwnedChild(t *testing.T) {
 	go func() { got <- <-cmds["C"] }()
 
 	ctrl := &scopedController{parentLoopID: ids["P"]}
-	res, err := ctrl.interrupt(s, tool.DelegateRequest{DelegateID: ids["C"]})
+	res, err := ctrl.interrupt(s, tool.DelegateRequest{AgentID: ids["C"]})
 	if err != nil {
 		t.Fatalf("Subagent interrupt returned %v, want nil", err)
 	}
-	if res.Status != tool.DelegateStatusInterrupted {
-		t.Errorf("status = %v, want Interrupted", res.Status)
+	if res.PreviousState != tool.AgentStateIdle || res.State != tool.AgentStateIdle {
+		t.Errorf("states = %v/%v, want idle/idle", res.PreviousState, res.State)
 	}
 
 	select {
@@ -306,11 +306,11 @@ func TestInterruptQueuePolicy(t *testing.T) {
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parentDef)
 
 	// Start one owned child while NOT pending, so `send` has a real target below.
-	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
+	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: true})
 	if err != nil {
 		t.Fatalf("initial start: %v", err)
 	}
-	childID := res.DelegateID
+	childID := res.AgentID
 
 	// Mark the parent (primary) loop interrupt-pending, as a fan-out would.
 	primary := s.ActiveLoopID()
@@ -323,8 +323,8 @@ func TestInterruptQueuePolicy(t *testing.T) {
 		name string
 		req  tool.DelegateRequest
 	}{
-		{name: "start", req: tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "again", Wait: true}},
-		{name: "send", req: tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: childID, Message: "more", Wait: true}},
+		{name: "start", req: tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "again", WaitForResponse: true}},
+		{name: "send", req: tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: childID, Message: "more", WaitForResponse: true}},
 	}
 	for _, tt := range machine {
 		t.Run("machine_"+tt.name+"_flushed", func(t *testing.T) {

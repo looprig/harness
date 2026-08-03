@@ -2,7 +2,6 @@ package delegationtool
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"testing"
 
@@ -116,30 +115,32 @@ func TestAgentToolsPrepareFixedControllerOperations(t *testing.T) {
 	}
 }
 
-func TestAgentToolsInvokePreparedRequests(t *testing.T) {
+func TestAgentToolResultsUseExactPersistentAgentJSONShapes(t *testing.T) {
 	t.Parallel()
-	delegateID := mustParseUUID(t, "55555555-5555-4555-8555-555555555555")
-	requestID := mustParseUUID(t, "66666666-6666-4666-8666-666666666666")
+	agentID := mustParseUUID(t, "55555555-5555-4555-8555-555555555555")
 	tests := []struct {
-		name       string
-		newTool    func(*fakeController) preparedAgentTool
-		args       string
-		result     tool.DelegateResult
-		wantOp     tool.DelegateOperation
-		wantOutput string
+		name     string
+		newTool  func(*fakeController) preparedAgentTool
+		args     string
+		result   tool.DelegateResult
+		wantOp   tool.DelegateOperation
+		wantJSON string
 	}{
 		{name: "start", newTool: func(c *fakeController) preparedAgentTool {
 			return NewStartAgent(c, loop.DelegationManaged, agentCatalog())
-		}, args: `{"name":"map","instructions":"inspect","agent_type":"explorer"}`, result: tool.DelegateResult{Status: tool.DelegateStatusCompleted, Output: "done"}, wantOp: tool.DelegateStart, wantOutput: "done"},
+		}, args: `{"name":"map","instructions":"inspect","agent_type":"explorer"}`, result: tool.DelegateResult{AgentID: agentID, Name: "map", State: tool.AgentStateIdle, ResponseStatus: tool.DelegateResponseCompleted, Response: "done"}, wantOp: tool.DelegateStart, wantJSON: `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"map","state":"idle","response":"done"}`},
 		{name: "message", newTool: func(c *fakeController) preparedAgentTool {
 			return NewMessageAgent(c, loop.DelegationManaged, agentCatalog())
-		}, args: `{"agent_id":"` + delegateID.String() + `","message":"continue","wait_for_response":false}`, result: tool.DelegateResult{DelegateID: delegateID, RequestID: requestID, Status: tool.DelegateStatusQueued}, wantOp: tool.DelegateSend, wantOutput: `"status":"queued"`},
+		}, args: `{"agent_id":"` + agentID.String() + `","message":"continue"}`, result: tool.DelegateResult{AgentID: agentID, Name: "map", State: tool.AgentStateIdle, ResponseStatus: tool.DelegateResponseCompleted, Response: "next"}, wantOp: tool.DelegateSend, wantJSON: `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"map","state":"idle","response":"next"}`},
+		{name: "background admission", newTool: func(c *fakeController) preparedAgentTool {
+			return NewMessageAgent(c, loop.DelegationManaged, agentCatalog())
+		}, args: `{"agent_id":"` + agentID.String() + `","message":"continue","wait_for_response":false}`, result: tool.DelegateResult{AgentID: agentID, Name: "map", State: tool.AgentStateWorking}, wantOp: tool.DelegateSend, wantJSON: `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"map","state":"working"}`},
 		{name: "list", newTool: func(c *fakeController) preparedAgentTool {
 			return NewListAgents(c, loop.DelegationManaged, agentCatalog())
-		}, args: `{}`, result: tool.DelegateResult{Children: []tool.DelegateChildStatus{{DelegateID: delegateID, Status: tool.DelegateStatusIdle}}}, wantOp: tool.DelegateStatus, wantOutput: `"children"`},
+		}, args: `{}`, result: tool.DelegateResult{Agents: []tool.DelegateAgent{{AgentID: agentID, Name: "map", AgentType: "explorer", State: tool.AgentStateWorking, QueuedMessages: 1, Runtime: tool.DelegateRuntime{Harness: "codex", Source: "gateway", Model: "gpt-5.6-sol", Effort: "high"}, AgentMode: "review"}}, Truncated: true}, wantOp: tool.DelegateStatus, wantJSON: `{"agents":[{"agent_id":"55555555-5555-4555-8555-555555555555","name":"map","agent_type":"explorer","state":"working","queued_messages":1,"agent_harness":"codex","agent_source":"gateway","model":"gpt-5.6-sol","effort":"high","agent_mode":"review"}],"truncated":true}`},
 		{name: "stop", newTool: func(c *fakeController) preparedAgentTool {
 			return NewStopAgent(c, loop.DelegationManaged, agentCatalog())
-		}, args: `{"agent_id":"` + delegateID.String() + `"}`, result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusInterrupted}, wantOp: tool.DelegateInterrupt, wantOutput: `"status":"interrupted"`},
+		}, args: `{"agent_id":"` + agentID.String() + `"}`, result: tool.DelegateResult{AgentID: agentID, PreviousState: tool.AgentStateWorking, State: tool.AgentStateIdle}, wantOp: tool.DelegateInterrupt, wantJSON: `{"agent_id":"55555555-5555-4555-8555-555555555555","previous_state":"working","state":"idle"}`},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -153,8 +154,8 @@ func TestAgentToolsInvokePreparedRequests(t *testing.T) {
 			if got := controller.last().Operation; got != tt.wantOp {
 				t.Errorf("controller operation = %v, want %v", got, tt.wantOp)
 			}
-			if got := textOf(t, result); !strings.Contains(got, tt.wantOutput) {
-				t.Errorf("result = %q, want substring %q", got, tt.wantOutput)
+			if got := textOf(t, result); got != tt.wantJSON {
+				t.Errorf("result = %q, want %q", got, tt.wantJSON)
 			}
 		})
 	}
@@ -162,7 +163,7 @@ func TestAgentToolsInvokePreparedRequests(t *testing.T) {
 
 func TestAgentToolExecutionUsesTrustedPreparedArtifact(t *testing.T) {
 	t.Parallel()
-	controller := &fakeController{result: tool.DelegateResult{Status: tool.DelegateStatusCompleted, Output: "ok"}}
+	controller := &fakeController{result: tool.DelegateResult{ResponseStatus: tool.DelegateResponseCompleted, Response: "ok"}}
 	agentTool := NewStartAgent(controller, loop.DelegationManaged, agentCatalog())
 	request, artifact, err := agentTool.PrepareCall(context.Background(), mustParseUUID(t, "11111111-1111-4111-8111-111111111111"), `{"name":"d","instructions":"prepared","agent_type":"explorer"}`)
 	if err != nil {
