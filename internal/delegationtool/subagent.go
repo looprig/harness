@@ -48,14 +48,18 @@ const (
 	actionStatus    SubagentAction = "status"
 )
 
-// SubagentCatalogEntry is one delegate the tool advertises in its Info().Desc: the
+// AgentCatalogEntry is one delegate the tool advertises in its Info().Desc: the
 // name the model passes as {subagent_type} and a one-line description. The rig projects the
 // parent definition's delegate set onto this at the composition root.
-type SubagentCatalogEntry struct {
+type AgentCatalogEntry struct {
 	Name        identity.AgentName
 	Description string
 	Modes       []loop.ModeName
 }
+
+// SubagentCatalogEntry temporarily preserves the existing Subagent construction
+// surface until the agent tool split replaces it.
+type SubagentCatalogEntry = AgentCatalogEntry
 
 const subagentDescPrefix = "Delegate a sub-task to an in-session child agent by name via one action envelope, and optionally wait for its response."
 
@@ -65,7 +69,7 @@ const subagentDescPrefix = "Delegate a sub-task to an in-session child agent by 
 type SubagentTool struct {
 	controller tool.DelegateController
 	style      loop.DelegationStyle
-	catalog    []SubagentCatalogEntry
+	catalog    []AgentCatalogEntry
 
 	runtimeCatalog    loop.RuntimeCatalog
 	hasRuntimeCatalog bool
@@ -74,11 +78,11 @@ type SubagentTool struct {
 // NewSubagent constructs a SubagentTool bound to the parent-scoped controller, with the
 // delegation style and delegate catalog derived from the parent definition at the
 // composition root.
-func NewSubagent(controller tool.DelegateController, style loop.DelegationStyle, catalog []SubagentCatalogEntry, runtimeCatalog ...loop.RuntimeCatalog) *SubagentTool {
+func NewSubagent(controller tool.DelegateController, style loop.DelegationStyle, catalog []AgentCatalogEntry, runtimeCatalog ...loop.RuntimeCatalog) *SubagentTool {
 	// A missing variadic argument is an explicit empty/native catalog, not a
 	// legacy escape hatch. This keeps preparation fail-closed for runtime
 	// selectors even when a product has no optional adapter profiles.
-	s := &SubagentTool{controller: controller, style: style, catalog: cloneSubagentCatalog(catalog), hasRuntimeCatalog: true}
+	s := &SubagentTool{controller: controller, style: style, catalog: cloneAgentCatalog(catalog), hasRuntimeCatalog: true}
 	if len(runtimeCatalog) > 0 {
 		s.runtimeCatalog = runtimeCatalog[0]
 	}
@@ -88,7 +92,7 @@ func NewSubagent(controller tool.DelegateController, style loop.DelegationStyle,
 // NewSubagentWithRuntimeCatalog is the explicit construction path for the
 // parent-scoped preparation boundary. NewSubagent remains source-compatible
 // for native/legacy callers that do not provide a catalog.
-func NewSubagentWithRuntimeCatalog(controller tool.DelegateController, style loop.DelegationStyle, catalog []SubagentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) *SubagentTool {
+func NewSubagentWithRuntimeCatalog(controller tool.DelegateController, style loop.DelegationStyle, catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) *SubagentTool {
 	return NewSubagent(controller, style, catalog, runtimeCatalog)
 }
 
@@ -96,18 +100,18 @@ func (s *SubagentTool) schema() string {
 	return buildSubagentSchema(s.style, s.catalog, s.runtimeCatalog)
 }
 
-func cloneSubagentCatalog(catalog []SubagentCatalogEntry) []SubagentCatalogEntry {
-	result := append([]SubagentCatalogEntry(nil), catalog...)
+func cloneAgentCatalog(catalog []AgentCatalogEntry) []AgentCatalogEntry {
+	result := append([]AgentCatalogEntry(nil), catalog...)
 	for i := range result {
 		result[i].Modes = append([]loop.ModeName(nil), result[i].Modes...)
 	}
 	return result
 }
 
-// subagentDesc renders the static prefix followed by an <available_subagents> block
-// listing each catalog entry. An empty catalog renders just the prefix.
+// subagentDesc is the temporary adapter that exposes the StartAgent capability
+// renderer through the existing tool until the model-facing tool split lands.
 func (s *SubagentTool) subagentDesc() string {
-	return buildSubagentDescription(s.catalog, s.runtimeCatalog)
+	return buildStartAgentDescription(s.catalog, s.runtimeCatalog)
 }
 
 // Info returns the self-description. Name MUST equal "Subagent"; the schema is derived

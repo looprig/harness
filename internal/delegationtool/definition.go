@@ -3,8 +3,8 @@ package delegationtool
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/looprig/harness/pkg/loop"
@@ -13,8 +13,8 @@ import (
 )
 
 // Definition binds the harness-owned delegation control tool to one parent Loop.
-func Definition(style loop.DelegationStyle, catalog []SubagentCatalogEntry, runtimeCatalog ...loop.RuntimeCatalog) tool.Definition {
-	catalog = cloneSubagentCatalog(catalog)
+func Definition(style loop.DelegationStyle, catalog []AgentCatalogEntry, runtimeCatalog ...loop.RuntimeCatalog) tool.Definition {
+	catalog = cloneAgentCatalog(catalog)
 	var snapshot loop.RuntimeCatalog
 	hasSnapshot := len(runtimeCatalog) > 0
 	if hasSnapshot {
@@ -28,12 +28,15 @@ func Definition(style loop.DelegationStyle, catalog []SubagentCatalogEntry, runt
 	})
 }
 
-// maxAvailableSubagentRows bounds the non-default rows rendered in the model-facing
-// capability matrix. One deterministic default row per role is always retained;
-// additional combinations are explicitly elided after this budget.
-const maxAvailableSubagentRows = 64
+const (
+	maxAvailableAgentRows         = 24
+	maxAvailableAgentRuntimeRows  = 64
+	maxAvailableAgentRowBytes     = 768
+	maxStartAgentDescriptionBytes = 32 << 10
+	availableAgentElisionMarker   = "<elided additional agent capabilities>"
+)
 
-func buildSubagentSchema(style loop.DelegationStyle, catalog []SubagentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) string {
+func buildSubagentSchema(style loop.DelegationStyle, catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) string {
 	fieldOrder := []string{"action", "description", "prompt", "subagent_type", "mode", "agent_harness", "agent_source", "model", "effort", "run_in_background", "delegate_id", "request_id", "timeout_seconds"}
 	properties := map[string]any{
 		"action":            map[string]any{"type": "string", "enum": []string{"start", "send", "wait", "interrupt", "status"}},
@@ -129,8 +132,8 @@ func requiredProperties(names []string) []any {
 	return result
 }
 
-func startRoleVariants(catalog []SubagentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) []any {
-	catalog = orderedSubagentCatalog(catalog)
+func startRoleVariants(catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) []any {
+	catalog = orderedAgentCatalog(catalog)
 	variants := make([]any, 0, len(catalog))
 	for _, role := range catalog {
 		entries := runtimeCatalog.EntriesFor(role.Name)
@@ -164,11 +167,11 @@ func startRoleVariants(catalog []SubagentCatalogEntry, runtimeCatalog loop.Runti
 	return variants
 }
 
-func startRoleVariant(role SubagentCatalogEntry, entry *loop.RuntimeCatalogEntry, explicitHarness, defaultBranch bool) map[string]any {
+func startRoleVariant(role AgentCatalogEntry, entry *loop.RuntimeCatalogEntry, explicitHarness, defaultBranch bool) map[string]any {
 	return startRoleVariantWithSelectors(role, entry, explicitHarness, defaultBranch, false, false, false)
 }
 
-func startRoleChoiceForHarness(role SubagentCatalogEntry, entries []loop.RuntimeCatalogEntry, explicitHarness, defaultSource bool) any {
+func startRoleChoiceForHarness(role AgentCatalogEntry, entries []loop.RuntimeCatalogEntry, explicitHarness, defaultSource bool) any {
 	if len(entries) == 0 {
 		return startRoleVariant(role, nil, explicitHarness, !explicitHarness && defaultSource)
 	}
@@ -179,7 +182,7 @@ func startRoleChoiceForHarness(role SubagentCatalogEntry, entries []loop.Runtime
 	return startRoleVariantWithSelectors(role, &entry, explicitHarness, !explicitHarness && defaultSource, false, false, false)
 }
 
-func startRoleSourceVariants(role SubagentCatalogEntry, entries []loop.RuntimeCatalogEntry, explicitHarness, defaultSource bool) map[string]any {
+func startRoleSourceVariants(role AgentCatalogEntry, entries []loop.RuntimeCatalogEntry, explicitHarness, defaultSource bool) map[string]any {
 	branches := make([]any, 0, len(entries)+1)
 	if defaultSource {
 		entry := runtimeDefaultEntry(entries)
@@ -198,7 +201,7 @@ func startRoleSourceVariants(role SubagentCatalogEntry, entries []loop.RuntimeCa
 	return map[string]any{"oneOf": branches}
 }
 
-func startRoleVariantWithSelectors(role SubagentCatalogEntry, entry *loop.RuntimeCatalogEntry, explicitHarness, defaultHarness, explicitSource, sourceSelectable, defaultSource bool) map[string]any {
+func startRoleVariantWithSelectors(role AgentCatalogEntry, entry *loop.RuntimeCatalogEntry, explicitHarness, defaultHarness, explicitSource, sourceSelectable, defaultSource bool) map[string]any {
 	properties := map[string]any{
 		"action":            map[string]any{"const": "start"},
 		"description":       map[string]any{"type": "string"},
@@ -480,7 +483,7 @@ func runtimeAdvertisedSelectors(entries []loop.RuntimeCatalogEntry, selected loo
 	}
 }
 
-func availableRuntimeSelectors(catalog []SubagentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) runtimeSelectorAvailability {
+func availableRuntimeSelectors(catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) runtimeSelectorAvailability {
 	available := runtimeSelectorAvailability{}
 	for _, role := range catalog {
 		entries := runtimeCatalog.EntriesFor(role.Name)
@@ -556,120 +559,226 @@ func effortOrder(effort string) int {
 	}
 }
 
-type availableSubagentRow struct {
-	role, description, harness, source, model, effort string
+type availableAgentRuntimeRow struct {
+	defaultRuntime     bool
+	harness            string
+	source             string
+	model              string
+	efforts            []string
+	harnessDescription string
+	modelDescription   string
 }
 
-func buildSubagentDescription(catalog []SubagentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) string {
+type availableAgentSection struct {
+	agentLine   string
+	defaultLine string
+	runtimeRows []string
+}
+
+func buildStartAgentDescription(catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) string {
 	if len(catalog) == 0 {
 		return subagentDescPrefix
 	}
-	catalog = orderedSubagentCatalog(catalog)
-	rows := make([]availableSubagentRow, 0, len(catalog))
-	nonDefault := make([]availableSubagentRow, 0)
-	for _, role := range catalog {
-		entries := runtimeCatalog.EntriesFor(role.Name)
-		if len(entries) == 0 {
-			if runtimeCatalog.HasEntries() {
-				continue
-			}
-			rows = append(rows, availableSubagentRow{role: string(role.Name), description: role.Description, harness: "native", model: "default", effort: "default"})
+
+	ordered := orderedAgentCatalog(catalog)
+	sections := make([]availableAgentSection, 0, min(len(ordered), maxAvailableAgentRows))
+	elided := false
+	for _, agent := range ordered {
+		entries := runtimeCatalog.EntriesFor(agent.Name)
+		if len(entries) == 0 && runtimeCatalog.HasEntries() {
 			continue
 		}
-		defaultEntry := entries[0]
-		defaultIndex := 0
-		for index, entry := range entries {
-			if entry.Default {
-				defaultEntry = entry
-				defaultIndex = index
-				break
-			}
+		if len(sections) == maxAvailableAgentRows {
+			elided = true
+			break
 		}
-		if defaultEntry.SelectionKind == loop.RuntimeSelectionHarnessManaged {
-			rows = append(rows, availableSubagentRow{
-				role: string(role.Name), description: role.Description,
-				harness: string(defaultEntry.AgentHarness), source: string(defaultEntry.Source),
-			})
-		} else {
-			defaultModel := defaultEntry.DefaultModel
-			defaultEffort := "none"
-			for _, model := range defaultEntry.Models {
-				if model.Alias == defaultModel {
-					defaultEffort = string(model.DefaultEffort)
-					if defaultEffort == "" {
-						defaultEffort = "none"
-					}
-					break
-				}
-			}
-			rows = append(rows, availableSubagentRow{role: string(role.Name), description: role.Description, harness: string(defaultEntry.AgentHarness), model: string(defaultModel), effort: defaultEffort})
+
+		agentLine := "- " + string(agent.Name)
+		if agent.Description != "" {
+			agentLine += ": " + agent.Description
 		}
-		for entryIndex, entry := range entries {
-			if entry.SelectionKind == loop.RuntimeSelectionHarnessManaged {
-				if entryIndex == defaultIndex {
-					continue
-				}
-				nonDefault = append(nonDefault, availableSubagentRow{
-					role: string(role.Name), description: role.Description,
-					harness: string(entry.AgentHarness), source: string(entry.Source),
-				})
+		defaultLine, runtimeRows := availableAgentRuntimeLines(agent, entries)
+		if len(agentLine) > maxAvailableAgentRowBytes || len(defaultLine) > maxAvailableAgentRowBytes {
+			elided = true
+			continue
+		}
+		sections = append(sections, availableAgentSection{agentLine: agentLine, defaultLine: defaultLine, runtimeRows: runtimeRows})
+	}
+
+	runtimeRows := len(sections)
+	for sectionIndex := range sections {
+		kept := sections[sectionIndex].runtimeRows[:0]
+		for _, row := range sections[sectionIndex].runtimeRows {
+			if len(row) > maxAvailableAgentRowBytes || runtimeRows == maxAvailableAgentRuntimeRows {
+				elided = true
 				continue
 			}
-			for _, model := range entry.Models {
-				efforts := model.Efforts
+			kept = append(kept, row)
+			runtimeRows++
+		}
+		sections[sectionIndex].runtimeRows = kept
+	}
+
+	description := renderStartAgentDescription(sections, elided)
+	for len(description) > maxStartAgentDescriptionBytes {
+		removed := false
+		for i := len(sections) - 1; i >= 0; i-- {
+			if len(sections[i].runtimeRows) == 0 {
+				continue
+			}
+			sections[i].runtimeRows = sections[i].runtimeRows[:len(sections[i].runtimeRows)-1]
+			removed = true
+			break
+		}
+		if !removed {
+			if len(sections) == 0 {
+				return subagentDescPrefix
+			}
+			sections = sections[:len(sections)-1]
+		}
+		elided = true
+		description = renderStartAgentDescription(sections, elided)
+	}
+	return description
+}
+
+func availableAgentRuntimeLines(agent AgentCatalogEntry, entries []loop.RuntimeCatalogEntry) (string, []string) {
+	if len(entries) == 0 {
+		return "- agent_type=" + string(agent.Name) + " default: harness=native model=default effort=default",
+			[]string{"  - harness=native model=default efforts=[default]"}
+	}
+
+	defaultEntry := runtimeDefaultEntry(entries)
+	defaultLine := "- agent_type=" + string(agent.Name) + " default: harness=" + string(defaultEntry.AgentHarness)
+	if defaultEntry.Source != "" {
+		defaultLine += " source=" + string(defaultEntry.Source)
+	}
+	if defaultEntry.SelectionKind != loop.RuntimeSelectionHarnessManaged {
+		defaultModel := runtimeModelOption(defaultEntry, defaultEntry.DefaultModel)
+		defaultSource := defaultModel.Source
+		if defaultSource == "" {
+			defaultSource = defaultEntry.Source
+		}
+		if defaultSource != "" && defaultSource != defaultEntry.Source {
+			defaultLine = "- agent_type=" + string(agent.Name) + " default: harness=" + string(defaultEntry.AgentHarness) + " source=" + string(defaultSource)
+		}
+		defaultLine += " model=" + string(defaultEntry.DefaultModel) + " effort=" + renderedEffort(defaultModel.DefaultEffort)
+	}
+
+	rows := make([]availableAgentRuntimeRow, 0)
+	for _, entry := range entries {
+		if entry.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+			rows = append(rows, availableAgentRuntimeRow{
+				defaultRuntime:     entry.Default,
+				harness:            string(entry.AgentHarness),
+				source:             string(entry.Source),
+				harnessDescription: entry.Description,
+			})
+			continue
+		}
+		for _, source := range runtimeEntrySources(entry) {
+			view, ok := runtimeEntryViewForSource(entry, source)
+			if !ok {
+				continue
+			}
+			for _, model := range view.Models {
+				efforts := admittedEfforts([]loop.RuntimeModelOption{model})
 				if len(efforts) == 0 {
-					efforts = []inferencemodel.Effort{model.DefaultEffort}
+					efforts = []string{renderedEffort(model.DefaultEffort)}
 				}
-				for _, effort := range efforts {
-					value := string(effort)
-					if value == "" {
-						value = "none"
-					}
-					candidate := availableSubagentRow{role: string(role.Name), description: role.Description, harness: string(entry.AgentHarness), model: string(model.Alias), effort: value}
-					if entryIndex == defaultIndex && candidate == rows[len(rows)-1] {
-						continue
-					}
-					nonDefault = append(nonDefault, candidate)
-				}
+				rows = append(rows, availableAgentRuntimeRow{
+					defaultRuntime:     entry.Default,
+					harness:            string(entry.AgentHarness),
+					source:             string(source),
+					model:              string(model.Alias),
+					efforts:            efforts,
+					harnessDescription: entry.Description,
+					modelDescription:   model.Description,
+				})
 			}
 		}
 	}
-	elided := len(nonDefault) > maxAvailableSubagentRows
-	if elided {
-		nonDefault = nonDefault[:maxAvailableSubagentRows]
-	}
-	var b strings.Builder
-	b.WriteString(subagentDescPrefix)
-	b.WriteString("\n<available_subagents>\n")
-	for _, row := range append(rows, nonDefault...) {
-		b.WriteString(fmt.Sprintf("- role=%s harness=%s", row.role, row.harness))
+	sort.SliceStable(rows, func(i, j int) bool {
+		left, right := rows[i], rows[j]
+		if left.defaultRuntime != right.defaultRuntime {
+			return left.defaultRuntime
+		}
+		if left.harness != right.harness {
+			return left.harness < right.harness
+		}
+		if left.source != right.source {
+			return left.source < right.source
+		}
+		return left.model < right.model
+	})
+
+	lines := make([]string, 0, len(rows))
+	previousRuntime := ""
+	for _, row := range rows {
+		line := "  - harness=" + row.harness
 		if row.source != "" {
-			b.WriteString(" source=")
-			b.WriteString(row.source)
+			line += " source=" + row.source
 		}
 		if row.model != "" {
-			b.WriteString(" model=")
-			b.WriteString(row.model)
+			line += " model=" + row.model + " efforts=[" + strings.Join(row.efforts, ",") + "]"
 		}
-		if row.effort != "" {
-			b.WriteString(" effort=")
-			b.WriteString(row.effort)
+		runtimeKey := row.harness + "\x00" + row.source
+		if row.harnessDescription != "" && runtimeKey != previousRuntime {
+			line += " harness_description=" + strconv.Quote(row.harnessDescription)
 		}
-		if strings.TrimSpace(row.description) != "" {
-			b.WriteString(": ")
-			b.WriteString(row.description)
+		if row.modelDescription != "" {
+			line += " model_description=" + strconv.Quote(row.modelDescription)
 		}
-		b.WriteString("\n")
+		lines = append(lines, line)
+		previousRuntime = runtimeKey
+	}
+	return defaultLine, lines
+}
+
+func runtimeModelOption(entry loop.RuntimeCatalogEntry, alias loop.ModelAlias) loop.RuntimeModelOption {
+	for _, option := range entry.Models {
+		if option.Alias == alias {
+			return option
+		}
+	}
+	return loop.RuntimeModelOption{}
+}
+
+func renderedEffort(effort inferencemodel.Effort) string {
+	if effort == "" {
+		return "none"
+	}
+	return string(effort)
+}
+
+func renderStartAgentDescription(sections []availableAgentSection, elided bool) string {
+	var b strings.Builder
+	b.WriteString(subagentDescPrefix)
+	b.WriteString("\n<available_agents>\n")
+	for _, section := range sections {
+		b.WriteString(section.agentLine)
+		b.WriteByte('\n')
+	}
+	b.WriteString("</available_agents>\n\n<available_agent_runtimes>\n")
+	for _, section := range sections {
+		b.WriteString(section.defaultLine)
+		b.WriteByte('\n')
+		for _, row := range section.runtimeRows {
+			b.WriteString(row)
+			b.WriteByte('\n')
+		}
 	}
 	if elided {
-		b.WriteString("- <elided non-default runtime combinations>\n")
+		b.WriteString("- ")
+		b.WriteString(availableAgentElisionMarker)
+		b.WriteByte('\n')
 	}
-	b.WriteString("</available_subagents>")
+	b.WriteString("</available_agent_runtimes>")
 	return b.String()
 }
 
-func orderedSubagentCatalog(catalog []SubagentCatalogEntry) []SubagentCatalogEntry {
-	ordered := cloneSubagentCatalog(catalog)
+func orderedAgentCatalog(catalog []AgentCatalogEntry) []AgentCatalogEntry {
+	ordered := cloneAgentCatalog(catalog)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Name < ordered[j].Name })
 	return ordered
 }

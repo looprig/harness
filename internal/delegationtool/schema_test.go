@@ -99,7 +99,7 @@ func TestSchemaRuntimeSelectorsFollowCapabilities(t *testing.T) {
 
 func TestSchemaAndDescriptionOmitRolesMissingFromPopulatedCatalog(t *testing.T) {
 	t.Parallel()
-	roles := []SubagentCatalogEntry{{Name: "worker", Description: "builds"}, {Name: "reviewer", Description: "reviews"}}
+	roles := []AgentCatalogEntry{{Name: "worker", Description: "builds"}, {Name: "reviewer", Description: "reviews"}}
 	catalog := schemaCatalog(t, schemaEntry("worker", "claude-code", true, []string{"sonnet"}, []inferencemodel.Effort{inferencemodel.EffortMedium}))
 	info, err := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, roles, catalog).Info(context.Background())
 	if err != nil {
@@ -108,7 +108,7 @@ func TestSchemaAndDescriptionOmitRolesMissingFromPopulatedCatalog(t *testing.T) 
 	if !strings.Contains(string(info.Schema), "worker") || strings.Contains(string(info.Schema), "reviewer") {
 		t.Fatalf("populated catalog schema = %s, want only catalogued role", info.Schema)
 	}
-	if !strings.Contains(info.Desc, "role=worker") || strings.Contains(info.Desc, "role=reviewer") {
+	if !strings.Contains(info.Desc, "- worker: builds") || strings.Contains(info.Desc, "- reviewer: reviews") {
 		t.Fatalf("populated catalog description = %q, want only catalogued role", info.Desc)
 	}
 
@@ -117,7 +117,7 @@ func TestSchemaAndDescriptionOmitRolesMissingFromPopulatedCatalog(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(nativeInfo.Schema), "reviewer") || !strings.Contains(nativeInfo.Desc, "role=reviewer") {
+	if !strings.Contains(string(nativeInfo.Schema), "reviewer") || !strings.Contains(nativeInfo.Desc, "- reviewer: reviews") {
 		t.Fatalf("empty catalog native fallback omitted reviewer: schema=%s description=%q", nativeInfo.Schema, nativeInfo.Desc)
 	}
 }
@@ -138,7 +138,7 @@ func TestSchemaMixedSourcesAdvertisesAgentSourceWithoutManagedPlaceholders(t *te
 	if strings.Contains(info.Desc, "model=harness-managed") || strings.Contains(info.Desc, "effort=harness-managed") {
 		t.Fatalf("managed description contains a placeholder: %q", info.Desc)
 	}
-	managedRow := "- role=worker harness=codex source=native"
+	managedRow := "  - harness=codex source=native"
 	if !strings.Contains(info.Desc, managedRow) {
 		t.Fatalf("description does not identify the managed native source %q: %s", managedRow, info.Desc)
 	}
@@ -342,21 +342,21 @@ func schemaContainsModelEffortPair(value any, model, effort string) bool {
 	return false
 }
 
-func TestSchemaDescriptionBoundsAvailableSubagentRows(t *testing.T) {
+func TestSchemaDescriptionBoundsAvailableAgentRuntimeRows(t *testing.T) {
 	entries := make([]loop.RuntimeCatalogEntry, 0, 2)
 	entries = append(entries, schemaEntryWithModels("worker", "claude-code", true, []schemaModel{{alias: "default", efforts: []inferencemodel.Effort{inferencemodel.EffortMedium}}}))
-	for i := 0; i < maxAvailableSubagentRows+3; i++ {
+	for i := 0; i < maxAvailableAgentRuntimeRows+3; i++ {
 		entries = append(entries, schemaEntryWithModels("worker", loop.AgentHarnessName(fmt.Sprintf("harness-%02d", i)), false, []schemaModel{{alias: loop.ModelAlias(fmt.Sprintf("model-%02d", i)), efforts: []inferencemodel.Effort{inferencemodel.EffortMedium}}}))
 	}
 	info, err := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker", Description: "builds"}}, schemaCatalog(t, entries...)).Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(info.Desc, "<available_subagents>") || !strings.Contains(info.Desc, "<elided") {
+	if !strings.Contains(info.Desc, "<available_agents>") || !strings.Contains(info.Desc, "<available_agent_runtimes>") || !strings.Contains(info.Desc, availableAgentElisionMarker) {
 		t.Fatalf("description = %q, want bounded matrix with elision marker", info.Desc)
 	}
-	if got := strings.Count(info.Desc, "- role="); got != maxAvailableSubagentRows+1 {
-		t.Fatalf("description rows = %d, want default row plus %d non-default rows", got, maxAvailableSubagentRows)
+	if got := strings.Count(info.Desc, "\n- agent_type=") + strings.Count(info.Desc, "\n  - harness="); got != maxAvailableAgentRuntimeRows {
+		t.Fatalf("description runtime rows = %d, want %d", got, maxAvailableAgentRuntimeRows)
 	}
 }
 
