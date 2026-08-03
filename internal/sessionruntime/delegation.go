@@ -1031,10 +1031,13 @@ func (c *scopedController) agentRuntime(handle *loopHandle) tool.DelegateRuntime
 		}
 	}
 	if identity.SelectionKind == loop.RuntimeSelectionHarnessManaged {
-		for _, entry := range c.runtimeCatalog.EntriesFor(handle.bound.Name()) {
-			if entry.Profile == identity.Profile {
-				runtime.Harness = string(entry.AgentHarness)
-				break
+		runtime.Harness = string(handle.selectedHarness)
+		if runtime.Harness == "" {
+			for _, entry := range c.runtimeCatalog.EntriesFor(handle.bound.Name()) {
+				if entry.Profile == identity.Profile {
+					runtime.Harness = string(entry.AgentHarness)
+					break
+				}
 			}
 		}
 		return runtime

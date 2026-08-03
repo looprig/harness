@@ -609,6 +609,10 @@ type loopHandle struct {
 	state     tool.DelegateStatusValue
 	agentName string
 	agentMode loop.ModeName
+	// selectedHarness is the immutable public harness selected for this loop's
+	// durable runtime identity. Harness-managed RuntimeIdentity intentionally omits
+	// it, so ListAgents cannot reconstruct it from a shared profile.
+	selectedHarness loop.AgentHarnessName
 }
 
 func runtimeForModel(model model.Model) event.ModelRuntime {
@@ -1505,7 +1509,11 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			displayName = string(bound.Name()) + "-" + loopID.String()
 		}
 	}
-	s.loops[loopID] = &loopHandle{id: loopID, owner: s, bound: bound, bindings: bindings, backend: b, parent: parent, cancel: cancel, liveMode: startedMode, liveModel: liveModel, state: initialState, agentName: displayName, agentMode: startedMode}
+	var selectedHarness loop.AgentHarnessName
+	if runtime != nil {
+		selectedHarness = runtime.AgentHarness
+	}
+	s.loops[loopID] = &loopHandle{id: loopID, owner: s, bound: bound, bindings: bindings, backend: b, parent: parent, cancel: cancel, liveMode: startedMode, liveModel: liveModel, state: initialState, agentName: displayName, agentMode: startedMode, selectedHarness: selectedHarness}
 	s.loopsMu.Unlock()
 
 	// Announce the new loop to subscribers active at creation time. Published AFTER

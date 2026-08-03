@@ -90,7 +90,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 	}
 	liveMode, liveModel := liveViewFor(bound, ri)
 	s.loopsMu.Lock()
-	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, bindings: bindings, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle, agentName: started.DisplayName, agentMode: loop.ModeName(started.InitialMode)}
+	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, bindings: bindings, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle, agentName: started.DisplayName, agentMode: loop.ModeName(started.InitialMode), selectedHarness: restoredSelectedHarness(started.AgentRuntime)}
 	s.loopsMu.Unlock()
 	return nil
 }
@@ -966,6 +966,7 @@ func (s *Session) attachRestoredTombstonedLoop(plan loopPlan, parent loop.Proven
 		parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel,
 		state: tool.DelegateStatusFailed, tombstoned: true,
 		agentName: plan.started.DisplayName, agentMode: loop.ModeName(plan.started.InitialMode),
+		selectedHarness: restoredSelectedHarness(plan.started.AgentRuntime),
 	}
 	s.loopsMu.Lock()
 	if existing, ok := s.loops[plan.started.LoopID]; ok && existing.tombstoned {
@@ -1171,9 +1172,16 @@ func buildRestoredSession(
 	// exactly as the live path (session.go) and attachRestoredLoop do for every other loop.
 	// Dropping it would leave a restored root unable to build ANY external tool that
 	// declares a requirement, and would hand the rest a separate observation set.
-	s.loops[rootLoopID] = &loopHandle{id: rootLoopID, owner: s, bound: cfg, bindings: bindings, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
+	s.loops[rootLoopID] = &loopHandle{id: rootLoopID, owner: s, bound: cfg, bindings: bindings, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle, selectedHarness: restoredSelectedHarness(ri.AgentRuntime)}
 	s.activeLoopID = rootLoopID
 	return s, nil
+}
+
+func restoredSelectedHarness(runtime *event.AgentRuntime) loop.AgentHarnessName {
+	if runtime == nil {
+		return ""
+	}
+	return loop.AgentHarnessName(runtime.Harness)
 }
 
 // appendRestoreEvent stamps ev (EventID + CreatedAt) via the Factory and appends it to

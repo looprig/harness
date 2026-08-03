@@ -592,6 +592,48 @@ func TestControllerValidatesHarnessManagedRuntimeSourceAndSelectors(t *testing.T
 	}
 }
 
+func TestDelegateRuntimeProjectsSelectedHarnessManagedHarnessWhenProfileIsShared(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := delegateChild("child", "runtime child")
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType: "child", AgentHarness: "alpha", Profile: "acp/shared", Default: true,
+		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionHarnessManaged,
+	}, {
+		SubagentType: "child", AgentHarness: "codex", Profile: "acp/shared",
+		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionHarnessManaged,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := &fakeForeignBuilder{sid: fixedForeignSID, backend: newFakeBackend()}
+	registry := &foreign.BuilderRegistry{}
+	if err := registry.Register("acp/shared", builder.build, builder.buildRestored); err != nil {
+		t.Fatal(err)
+	}
+	s := newDelegationSession(t, parent, []Option{WithRuntimeCatalog(catalog), WithForeignBuilderRegistry(registry)}, child)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+	result, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: true,
+		Runtime: &tool.DelegateRuntime{
+			Harness: "codex", Profile: "acp/shared", Source: "native", SelectionKind: "harness-managed",
+			Explicit: tool.DelegateRuntimeExplicit{Harness: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	listed, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: result.AgentID})
+	if err != nil || len(listed.Agents) != 1 {
+		t.Fatalf("list selected runtime = %+v, %v", listed.Agents, err)
+	}
+	if got := listed.Agents[0].Runtime.Harness; got != "codex" {
+		t.Fatalf("public runtime harness = %q, want selected harness codex", got)
+	}
+}
+
 func TestControllerValidatesPerModelSourceWithinOneEntry(t *testing.T) {
 	t.Parallel()
 
