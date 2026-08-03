@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"unicode/utf8"
 
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
@@ -79,7 +80,7 @@ func executeAgentCall(ctx context.Context, controller tool.DelegateController, o
 func formatForeground(result tool.DelegateResult) string {
 	switch result.ResponseStatus {
 	case tool.DelegateResponseCompleted:
-		return marshalResult(foregroundResult{AgentID: result.AgentID.String(), Name: result.Name, State: result.State, Response: boundAgentOutput(result.Response)})
+		return marshalForegroundResult(foregroundResult{AgentID: result.AgentID.String(), Name: result.Name, State: result.State, Response: result.Response})
 	case tool.DelegateResponseFailed:
 		return "error: agent failed"
 	case tool.DelegateResponseInterrupted:
@@ -95,7 +96,11 @@ func boundAgentOutput(value string) string {
 	if len(value) <= maxAgentResultBytes {
 		return value
 	}
-	return value[:maxAgentResultBytes]
+	end := maxAgentResultBytes
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end]
 }
 
 type foregroundResult struct {
@@ -109,6 +114,37 @@ type backgroundResult struct {
 	AgentID string          `json:"agent_id"`
 	Name    string          `json:"name"`
 	State   tool.AgentState `json:"state"`
+}
+
+func marshalForegroundResult(result foregroundResult) string {
+	response := boundAgentOutput(result.Response)
+	prefixEnds := make([]int, 1, len(response)+1)
+	for end := 0; end < len(response); {
+		_, size := utf8.DecodeRuneInString(response[end:])
+		end += size
+		prefixEnds = append(prefixEnds, end)
+	}
+
+	var best []byte
+	low, high := 0, len(prefixEnds)
+	for low < high {
+		mid := low + (high-low)/2
+		result.Response = response[:prefixEnds[mid]]
+		encoded, err := json.Marshal(result)
+		if err != nil {
+			return "error: agent result unavailable"
+		}
+		if len(encoded) <= maxAgentResultBytes {
+			best = encoded
+			low = mid + 1
+		} else {
+			high = mid
+		}
+	}
+	if best == nil {
+		return "error: agent result unavailable"
+	}
+	return string(best)
 }
 
 func formatBackground(result tool.DelegateResult) string {

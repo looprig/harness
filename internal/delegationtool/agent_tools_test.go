@@ -2,14 +2,71 @@ package delegationtool
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
+
+func TestFormatForegroundBoundsMultibyteResponseAtRuneBoundary(t *testing.T) {
+	t.Parallel()
+
+	result := formatForeground(tool.DelegateResult{
+		Name:           "map",
+		State:          tool.AgentStateIdle,
+		ResponseStatus: tool.DelegateResponseCompleted,
+		Response:       strings.Repeat("界", maxAgentResultBytes),
+	})
+	if len(result) > maxAgentResultBytes {
+		t.Fatalf("encoded result length = %d, want <= %d", len(result), maxAgentResultBytes)
+	}
+	if !utf8.ValidString(result) {
+		t.Fatal("encoded result is not valid UTF-8")
+	}
+	var decoded foregroundResult
+	if err := json.Unmarshal([]byte(result), &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if !utf8.ValidString(decoded.Response) {
+		t.Fatal("decoded response is not valid UTF-8")
+	}
+	if strings.ContainsRune(decoded.Response, utf8.RuneError) {
+		t.Fatal("decoded response contains a replacement rune from partial truncation")
+	}
+	if decoded.Response == "" || strings.Trim(decoded.Response, "界") != "" {
+		t.Fatal("decoded response did not preserve a complete-rune prefix")
+	}
+}
+
+func TestFormatForegroundBoundsEncodedEscapedResponse(t *testing.T) {
+	t.Parallel()
+
+	result := formatForeground(tool.DelegateResult{
+		Name:           "map",
+		State:          tool.AgentStateIdle,
+		ResponseStatus: tool.DelegateResponseCompleted,
+		Response:       strings.Repeat("\x01", maxAgentResultBytes),
+	})
+	if len(result) > maxAgentResultBytes {
+		t.Fatalf("encoded result length = %d, want <= %d", len(result), maxAgentResultBytes)
+	}
+	if !utf8.ValidString(result) {
+		t.Fatal("encoded result is not valid UTF-8")
+	}
+	var decoded foregroundResult
+	if err := json.Unmarshal([]byte(result), &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if decoded.Response == "" || strings.Trim(decoded.Response, "\x01") != "" {
+		t.Fatal("decoded response did not preserve the escaped response prefix")
+	}
+}
 
 type fakeController struct {
 	mu       sync.Mutex
