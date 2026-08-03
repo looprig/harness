@@ -133,8 +133,6 @@ func delegateCtx(t *testing.T) context.Context {
 	return ctx
 }
 
-func requestIDPtr(id uuid.UUID) *uuid.UUID { return &id }
-
 func waitResponse(ctx context.Context, controller tool.DelegateController, session *Session, agentID, responseID uuid.UUID, timeoutSeconds *int) (tool.DelegateResult, error) {
 	return controller.(*scopedController).waitResponse(ctx, session, agentID, responseID, timeoutSeconds)
 }
