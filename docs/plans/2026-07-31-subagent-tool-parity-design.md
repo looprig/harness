@@ -5,6 +5,13 @@
 **Status:** Approved; revised 2026-08-01 — foreignloops ACP driver placement,
 gateway-side effort binding, hard replacement of the old tool
 
+> **Model-facing surface superseded 2026-08-03.** The single `Subagent`
+> action envelope described in this document is not the intended public tool
+> contract. Its replacement is specified in
+> `2026-08-03-agent-collaboration-tools-design.md`. The runtime catalogue,
+> gateway, ACP, durability, and security analysis here remains applicable where
+> the replacement design does not override it.
+
 ## Goal
 
 Upgrade Harness's model-facing `Subagent` tool toward Claude Code's current
