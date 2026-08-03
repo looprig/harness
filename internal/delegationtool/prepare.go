@@ -431,8 +431,7 @@ func (s *agentToolConfig) resolveDelegateRuntime(prepared PreparedStartAgent) (*
 	return &tool.DelegateRuntime{
 		Harness: string(resolved.AgentHarness), Profile: string(resolved.Profile), Source: string(resolved.Source), SelectionKind: string(resolved.SelectionKind),
 		Model: runtimeModel, SmallModel: string(resolved.SmallModel), Effort: runtimeEffort,
-		Explicit:   tool.DelegateRuntimeExplicit{Harness: prepared.agentHarnessSet, Source: prepared.agentSourceSet, Model: prepared.modelSet, Effort: prepared.effortSet},
-		Advertised: tool.DelegateRuntimeAdvertised{Harness: advertised.Harness, Source: advertised.Source, Model: advertised.Model, Effort: advertised.Effort},
+		Explicit: tool.DelegateRuntimeExplicit{Harness: prepared.agentHarnessSet, Source: prepared.agentSourceSet, Model: prepared.modelSet, Effort: prepared.effortSet},
 	}, nil
 }
 

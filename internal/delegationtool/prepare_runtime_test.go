@@ -33,7 +33,7 @@ func TestPrepareStartAgentRuntimeDefaultsAndExplicitTuple(t *testing.T) {
 		if artifact.Runtime == nil {
 			t.Fatal("prepared runtime is nil")
 		}
-		want := tool.DelegateRuntime{Harness: "claude-code", Profile: "acp/claude-code", Source: "gateway", SelectionKind: "explicit", Model: "sonnet", SmallModel: "sonnet-small", Effort: "medium", Advertised: tool.DelegateRuntimeAdvertised{Harness: true, Model: true, Effort: true}}
+		want := tool.DelegateRuntime{Harness: "claude-code", Profile: "acp/claude-code", Source: "gateway", SelectionKind: "explicit", Model: "sonnet", SmallModel: "sonnet-small", Effort: "medium"}
 		if *artifact.Runtime != want {
 			t.Fatalf("runtime = %#v, want %#v", *artifact.Runtime, want)
 		}
@@ -48,7 +48,7 @@ func TestPrepareStartAgentRuntimeDefaultsAndExplicitTuple(t *testing.T) {
 		if runtime == nil {
 			t.Fatal("prepared runtime is nil")
 		}
-		want := tool.DelegateRuntime{Harness: "codex", Profile: "acp/codex", Source: "gateway", SelectionKind: "explicit", Model: "luna", SmallModel: "luna-small", Effort: "none", Explicit: tool.DelegateRuntimeExplicit{Harness: true, Model: true, Effort: true}, Advertised: tool.DelegateRuntimeAdvertised{Harness: true, Model: true, Effort: true}}
+		want := tool.DelegateRuntime{Harness: "codex", Profile: "acp/codex", Source: "gateway", SelectionKind: "explicit", Model: "luna", SmallModel: "luna-small", Effort: "none", Explicit: tool.DelegateRuntimeExplicit{Harness: true, Model: true, Effort: true}}
 		if *runtime != want {
 			t.Fatalf("runtime = %#v, want %#v", *runtime, want)
 		}
@@ -189,10 +189,6 @@ func TestPrepareStartAgentRuntimeResolvesHarnessManagedNativeWithoutSelectors(t 
 	if runtime.Model != "" || runtime.SmallModel != "" || runtime.Effort != "" {
 		t.Fatalf("runtime concrete selectors = model %q small %q effort %q, want empty/empty/empty", runtime.Model, runtime.SmallModel, runtime.Effort)
 	}
-	if runtime.Advertised.Any() {
-		t.Fatalf("harness-managed runtime advertised selectors = %+v, want none", runtime.Advertised)
-	}
-
 	for _, args := range []string{
 		`{"agent_type":"worker","instructions":"p","model":"luna"}`,
 		`{"agent_type":"worker","instructions":"p","effort":"high"}`,
@@ -238,34 +234,30 @@ func TestPrepareStartAgentRuntimeResolvesMixedSourcesWithAgentSourceSelector(t *
 	}
 
 	tests := []struct {
-		name           string
-		args           string
-		wantSource     string
-		wantKind       string
-		wantModel      string
-		wantEffort     string
-		wantExplicit   tool.DelegateRuntimeExplicit
-		wantAdvertised tool.DelegateRuntimeAdvertised
+		name         string
+		args         string
+		wantSource   string
+		wantKind     string
+		wantModel    string
+		wantEffort   string
+		wantExplicit tool.DelegateRuntimeExplicit
 	}{
 		{
 			name:       "omitted source keeps gateway default",
 			args:       `{"agent_type":"worker","instructions":"p"}`,
 			wantSource: "gateway", wantKind: "explicit", wantModel: "luna", wantEffort: "high",
-			wantAdvertised: tool.DelegateRuntimeAdvertised{Source: true, Model: true, Effort: true},
 		},
 		{
 			name:       "native source delegates model selection",
 			args:       `{"agent_type":"worker","instructions":"p","agent_source":"native"}`,
 			wantSource: "native", wantKind: "harness-managed",
-			wantExplicit:   tool.DelegateRuntimeExplicit{Source: true},
-			wantAdvertised: tool.DelegateRuntimeAdvertised{Source: true},
+			wantExplicit: tool.DelegateRuntimeExplicit{Source: true},
 		},
 		{
 			name:       "gateway source selects concrete default",
 			args:       `{"agent_type":"worker","instructions":"p","agent_source":"gateway"}`,
 			wantSource: "gateway", wantKind: "explicit", wantModel: "luna", wantEffort: "high",
-			wantExplicit:   tool.DelegateRuntimeExplicit{Source: true},
-			wantAdvertised: tool.DelegateRuntimeAdvertised{Source: true, Model: true, Effort: true},
+			wantExplicit: tool.DelegateRuntimeExplicit{Source: true},
 		},
 	}
 	for _, tt := range tests {
@@ -281,8 +273,8 @@ func TestPrepareStartAgentRuntimeResolvesMixedSourcesWithAgentSourceSelector(t *
 			if runtime.Source != tt.wantSource || runtime.SelectionKind != tt.wantKind || runtime.Model != tt.wantModel || runtime.Effort != tt.wantEffort {
 				t.Fatalf("runtime = %+v, want source/kind/model/effort %s/%s/%s/%s", *runtime, tt.wantSource, tt.wantKind, tt.wantModel, tt.wantEffort)
 			}
-			if runtime.Explicit != tt.wantExplicit || runtime.Advertised != tt.wantAdvertised {
-				t.Fatalf("runtime selector metadata = explicit=%+v advertised=%+v, want explicit=%+v advertised=%+v", runtime.Explicit, runtime.Advertised, tt.wantExplicit, tt.wantAdvertised)
+			if runtime.Explicit != tt.wantExplicit {
+				t.Fatalf("runtime explicit selectors = %+v, want %+v", runtime.Explicit, tt.wantExplicit)
 			}
 		})
 	}
@@ -371,8 +363,7 @@ func TestPrepareStartAgentRuntimeDefaultsSourceWithinExplicitHarness(t *testing.
 	want := tool.DelegateRuntime{
 		Harness: "codex", Profile: "acp/codex-gateway", Source: "gateway", SelectionKind: "explicit",
 		Model: "luna", Effort: "high",
-		Explicit:   tool.DelegateRuntimeExplicit{Harness: true},
-		Advertised: tool.DelegateRuntimeAdvertised{Harness: true, Source: true, Model: true, Effort: true},
+		Explicit: tool.DelegateRuntimeExplicit{Harness: true},
 	}
 	if *runtime != want {
 		t.Fatalf("runtime = %#v, want deterministic per-harness default %#v", *runtime, want)
