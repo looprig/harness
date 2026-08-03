@@ -24,7 +24,7 @@ import (
 // delegation.go is the session-runtime delegation manager (design §"Synchronous and
 // managed delegation"/§"Follow-up request and answer semantics"). It vends a SEPARATE
 // parent-scoped tool.DelegateController for each live parent loop and injects it into
-// that loop's Subagent tool. A scoped controller addresses ONLY children owned by its
+// that loop's atomic agent-tool bundle. A scoped controller addresses ONLY children owned by its
 // bound parent (registry-derived ownership, restore-safe): it rejects siblings,
 // ancestors, unrelated loop ids, unavailable actions, and invalid modes. The parent
 // model never receives the session or the manager — only the narrow scoped controller.
@@ -306,10 +306,10 @@ func (m *delegationManager) sess() (*Session, bool) {
 	return m.session, m.session != nil
 }
 
-// delegateExtraTools derives the model-facing delegation tool for a parent definition:
-// a loop with a non-empty Delegates() gets exactly ONE Subagent tool whose catalog is
-// its delegate set and whose action set follows its Delegation().Style. A loop with NO
-// delegates gets nothing (no Subagent capability). It is a pure function of the frozen
+// delegateExtraTools derives the model-facing collaboration tools for a parent definition:
+// a loop with a non-empty Delegates() gets exactly one bundle producing four tools whose
+// immutable catalogue is its delegate set. A loop with no delegates gets no agent
+// collaboration capability. It is a pure function of the frozen
 // definition, so the derivation is deterministic across New and Restore (the delegate set
 // and style are part of the definition fingerprint). The session injects the result via
 // tool.Bindings.ExtraTools at the loop's bind site — the user never hand-adds it.
@@ -318,9 +318,9 @@ func delegateExtraTools(def loop.Definition, manager *delegationManager) []tool.
 	if len(delegates) == 0 {
 		return nil
 	}
-	catalog := make([]delegationtool.SubagentCatalogEntry, len(delegates))
+	catalog := make([]delegationtool.AgentCatalogEntry, len(delegates))
 	for i, name := range delegates {
-		entry := delegationtool.SubagentCatalogEntry{Name: name}
+		entry := delegationtool.AgentCatalogEntry{Name: name}
 		if manager != nil {
 			if target, ok := manager.byName[name]; ok {
 				entry.Modes = []loop.ModeName{""}
@@ -339,10 +339,10 @@ func delegateExtraTools(def loop.Definition, manager *delegationManager) []tool.
 	return []tool.Definition{delegationtool.Definition(def.Delegation().Style, catalog)}
 }
 
-// controllerFor builds the parent-scoped controller injected into one loop's Subagent
-// tool. The allowed delegate set and delegation style are derived from the PARENT
+// controllerFor builds the parent-scoped controller injected into one loop's atomic
+// agent-tool bundle. The allowed delegate set and delegation style are derived from the PARENT
 // definition (least privilege). It tolerates a nil manager receiver so a struct-literal
-// session with no delegation manager can still bind loops that carry no Subagent tool.
+// session with no delegation manager can still bind loops that carry no agent tools.
 func (m *delegationManager) controllerFor(parentLoopID uuid.UUID, parent loop.Definition) tool.DelegateController {
 	allowed := make(map[identity.AgentName]struct{})
 	for _, name := range parent.Delegates() {

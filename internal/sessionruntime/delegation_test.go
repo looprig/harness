@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -526,7 +527,21 @@ func TestDelegateCatalogDerivesAllowedModes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	info, err := built[0].Info(context.Background())
+	var startAgent tool.InvokableTool
+	for _, candidate := range built {
+		candidateInfo, infoErr := candidate.Info(context.Background())
+		if infoErr != nil {
+			t.Fatalf("Info: %v", infoErr)
+		}
+		if candidateInfo.Name == "StartAgent" {
+			startAgent = candidate
+			break
+		}
+	}
+	if startAgent == nil {
+		t.Fatal("built bundle has no StartAgent tool")
+	}
+	info, err := startAgent.Info(context.Background())
 	if err != nil {
 		t.Fatalf("Info: %v", err)
 	}
@@ -534,6 +549,49 @@ func TestDelegateCatalogDerivesAllowedModes(t *testing.T) {
 		if !strings.Contains(string(info.Schema), want) {
 			t.Errorf("schema missing %s: %s", want, info.Schema)
 		}
+	}
+}
+
+func TestDelegateExtraToolsInjectsOneAtomicAgentBundle(t *testing.T) {
+	t.Parallel()
+
+	want := []string{"ListAgents", "MessageAgent", "StartAgent", "StopAgent"}
+	parent := delegateParent(loop.DelegationManaged, "child")
+	manager := newDelegationManager(Topology{Definitions: []loop.Definition{parent, delegateChild("child", "final")}})
+	definitions := delegateExtraTools(parent, manager)
+	if len(definitions) != 1 {
+		t.Fatalf("delegateExtraTools(admitted parent) length = %d, want 1", len(definitions))
+	}
+	if got := definitions[0].ProducedToolNames(); !slices.Equal(got, want) {
+		t.Fatalf("ProducedToolNames() = %q, want %q", got, want)
+	}
+	for _, name := range definitions[0].ProducedToolNames() {
+		if name == "Subagent" {
+			t.Fatal("delegateExtraTools produced removed Subagent tool")
+		}
+	}
+	built, err := definitions[0].Build(context.Background(), tool.Bindings{
+		SessionID: mustUUID(), LoopID: mustUUID(), Delegate: manager.controllerFor(mustUUID(), parent),
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if len(built) != len(want) {
+		t.Fatalf("Build() returned %d tools, want %d", len(built), len(want))
+	}
+	for i, builtTool := range built {
+		info, infoErr := builtTool.Info(context.Background())
+		if infoErr != nil {
+			t.Fatalf("built[%d].Info() error = %v", i, infoErr)
+		}
+		if info.Name != want[i] {
+			t.Errorf("built[%d].Info().Name = %q, want %q", i, info.Name, want[i])
+		}
+	}
+
+	withoutDelegates := delegateParent(loop.DelegationManaged)
+	if got := delegateExtraTools(withoutDelegates, newDelegationManager(Topology{Definitions: []loop.Definition{withoutDelegates}})); len(got) != 0 {
+		t.Fatalf("delegateExtraTools(parent without delegates) length = %d, want 0", len(got))
 	}
 }
 

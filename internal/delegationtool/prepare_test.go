@@ -18,7 +18,7 @@ func TestPrepareEnvelopeActions(t *testing.T) {
 	tests := []struct {
 		name string
 		args string
-		want SubagentAction
+		want agentAction
 	}{
 		{name: "omitted action starts", args: `{"description":"label","prompt":"do work","subagent_type":"worker"}`, want: actionStart},
 		{name: "start", args: `{"action":"start","description":"label","prompt":"do work","subagent_type":"worker","run_in_background":false}`, want: actionStart},

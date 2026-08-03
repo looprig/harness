@@ -2,7 +2,6 @@ package delegationtool
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -37,6 +36,16 @@ const (
 
 var errPreparationSentinel = errors.New("subagent preparation rejected")
 
+type agentAction string
+
+const (
+	actionStart     agentAction = "start"
+	actionSend      agentAction = "send"
+	actionWait      agentAction = "wait"
+	actionInterrupt agentAction = "interrupt"
+	actionStatus    agentAction = "status"
+)
+
 type preparationError struct{ category string }
 
 func (e *preparationError) Error() string {
@@ -47,12 +56,12 @@ func (e *preparationError) Unwrap() error { return errPreparationSentinel }
 
 func preparationFailure(category string) error { return &preparationError{category: category} }
 
-// SubagentEnvelope is the normalized, strictly validated model-facing call.
+// agentEnvelope is the normalized, strictly validated transitional call.
 // Runtime selectors remain opaque strings here; Task 21 resolves them against a
 // parent-scoped catalog. A nil Effort means that effort was omitted, while a
 // non-nil pointer preserves an explicit "none" selection.
-type SubagentEnvelope struct {
-	Action          SubagentAction
+type agentEnvelope struct {
+	Action          agentAction
 	Description     string
 	Prompt          string
 	SubagentType    string
@@ -78,19 +87,19 @@ type SubagentEnvelope struct {
 // Do not add compatibility aliases here: the old agent/message/wait envelope is
 // being hard-replaced in a later task.
 type wireEnvelope struct {
-	Action          SubagentAction `json:"action,omitempty"`
-	Description     string         `json:"description,omitempty"`
-	Prompt          string         `json:"prompt,omitempty"`
-	SubagentType    string         `json:"subagent_type,omitempty"`
-	Mode            string         `json:"mode,omitempty"`
-	AgentHarness    string         `json:"agent_harness,omitempty"`
-	AgentSource     string         `json:"agent_source,omitempty"`
-	Model           string         `json:"model,omitempty"`
-	Effort          *string        `json:"effort,omitempty"`
-	RunInBackground *bool          `json:"run_in_background,omitempty"`
-	DelegateID      *string        `json:"delegate_id,omitempty"`
-	RequestID       *string        `json:"request_id,omitempty"`
-	TimeoutSeconds  *int           `json:"timeout_seconds,omitempty"`
+	Action          agentAction `json:"action,omitempty"`
+	Description     string      `json:"description,omitempty"`
+	Prompt          string      `json:"prompt,omitempty"`
+	SubagentType    string      `json:"subagent_type,omitempty"`
+	Mode            string      `json:"mode,omitempty"`
+	AgentHarness    string      `json:"agent_harness,omitempty"`
+	AgentSource     string      `json:"agent_source,omitempty"`
+	Model           string      `json:"model,omitempty"`
+	Effort          *string     `json:"effort,omitempty"`
+	RunInBackground *bool       `json:"run_in_background,omitempty"`
+	DelegateID      *string     `json:"delegate_id,omitempty"`
+	RequestID       *string     `json:"request_id,omitempty"`
+	TimeoutSeconds  *int        `json:"timeout_seconds,omitempty"`
 }
 
 func fields(names ...string) map[string]struct{} {
@@ -104,23 +113,23 @@ func fields(names ...string) map[string]struct{} {
 // prepareEnvelope performs the untrusted preparation boundary for a Subagent
 // call. It is deliberately independent of the controller and runtime catalog so
 // the same normalized artifact can be extended by Task 21 without re-decoding.
-func prepareEnvelope(argsJSON string) (SubagentEnvelope, error) {
+func prepareEnvelope(argsJSON string) (agentEnvelope, error) {
 	if len(argsJSON) > maxSubagentArgsBytes {
-		return SubagentEnvelope{}, preparationFailure(errCategoryOversized)
+		return agentEnvelope{}, preparationFailure(errCategoryOversized)
 	}
 
 	raw, err := oneJSONValue([]byte(argsJSON))
 	if err != nil {
-		return SubagentEnvelope{}, preparationFailure(errCategoryMalformed)
+		return agentEnvelope{}, preparationFailure(errCategoryMalformed)
 	}
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return SubagentEnvelope{}, preparationFailure(errCategoryMalformed)
+		return agentEnvelope{}, preparationFailure(errCategoryMalformed)
 	}
 
 	present := make(map[string]json.RawMessage)
 	if err := json.Unmarshal(trimmed, &present); err != nil || present == nil {
-		return SubagentEnvelope{}, preparationFailure(errCategoryMalformed)
+		return agentEnvelope{}, preparationFailure(errCategoryMalformed)
 	}
 
 	var wire wireEnvelope
@@ -128,40 +137,40 @@ func prepareEnvelope(argsJSON string) (SubagentEnvelope, error) {
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&wire); err != nil {
 		if strings.Contains(err.Error(), "unknown field") {
-			return SubagentEnvelope{}, preparationFailure(errCategoryUnknownField)
+			return agentEnvelope{}, preparationFailure(errCategoryUnknownField)
 		}
 		if strings.Contains(err.Error(), "delegate_id") || strings.Contains(err.Error(), "request_id") {
-			return SubagentEnvelope{}, preparationFailure(errCategoryInvalidValue)
+			return agentEnvelope{}, preparationFailure(errCategoryInvalidValue)
 		}
-		return SubagentEnvelope{}, preparationFailure(errCategoryMalformed)
+		return agentEnvelope{}, preparationFailure(errCategoryMalformed)
 	}
 
 	action := wire.Action
 	if _, supplied := present["action"]; !supplied {
 		action = actionStart
 	} else if action == "" {
-		return SubagentEnvelope{}, preparationFailure(errCategoryInvalidValue)
+		return agentEnvelope{}, preparationFailure(errCategoryInvalidValue)
 	}
-	if !knownSubagentAction(action) {
-		return SubagentEnvelope{}, preparationFailure(errCategoryInvalidValue)
+	if !knownAgentAction(action) {
+		return agentEnvelope{}, preparationFailure(errCategoryInvalidValue)
 	}
 	delegateID, err := parseWireUUID(wire.DelegateID)
 	if err != nil {
-		return SubagentEnvelope{}, preparationFailure(errCategoryInvalidValue)
+		return agentEnvelope{}, preparationFailure(errCategoryInvalidValue)
 	}
 	requestID, err := parseWireUUID(wire.RequestID)
 	if err != nil {
-		return SubagentEnvelope{}, preparationFailure(errCategoryInvalidValue)
+		return agentEnvelope{}, preparationFailure(errCategoryInvalidValue)
 	}
 
 	if err := validateAllowedFields(action, present); err != nil {
-		return SubagentEnvelope{}, err
+		return agentEnvelope{}, err
 	}
 	if err := validateRequiredFields(action, wire, delegateID, requestID, present); err != nil {
-		return SubagentEnvelope{}, err
+		return agentEnvelope{}, err
 	}
 	if err := validateBounds(action, wire, delegateID, requestID, present); err != nil {
-		return SubagentEnvelope{}, err
+		return agentEnvelope{}, err
 	}
 
 	background := true
@@ -173,7 +182,7 @@ func prepareEnvelope(argsJSON string) (SubagentEnvelope, error) {
 	_, modelSet := present["model"]
 	_, effortSet := present["effort"]
 
-	return SubagentEnvelope{
+	return agentEnvelope{
 		Action:          action,
 		Description:     wire.Description,
 		Prompt:          wire.Prompt,
@@ -207,7 +216,7 @@ func oneJSONValue(input []byte) (json.RawMessage, error) {
 	return raw, nil
 }
 
-func knownSubagentAction(action SubagentAction) bool {
+func knownAgentAction(action agentAction) bool {
 	switch action {
 	case actionStart, actionSend, actionWait, actionInterrupt, actionStatus:
 		return true
@@ -216,8 +225,8 @@ func knownSubagentAction(action SubagentAction) bool {
 	}
 }
 
-func validateAllowedFields(action SubagentAction, present map[string]json.RawMessage) error {
-	allowed := map[SubagentAction]map[string]struct{}{
+func validateAllowedFields(action agentAction, present map[string]json.RawMessage) error {
+	allowed := map[agentAction]map[string]struct{}{
 		actionStart:     fields("action", "description", "prompt", "subagent_type", "mode", "agent_harness", "agent_source", "model", "effort", "run_in_background", "timeout_seconds"),
 		actionSend:      fields("action", "prompt", "run_in_background", "timeout_seconds", "delegate_id"),
 		actionWait:      fields("action", "delegate_id", "request_id", "timeout_seconds"),
@@ -232,7 +241,7 @@ func validateAllowedFields(action SubagentAction, present map[string]json.RawMes
 	return nil
 }
 
-func validateRequiredFields(action SubagentAction, wire wireEnvelope, delegateID, requestID *uuid.UUID, present map[string]json.RawMessage) error {
+func validateRequiredFields(action agentAction, wire wireEnvelope, delegateID, requestID *uuid.UUID, present map[string]json.RawMessage) error {
 	switch action {
 	case actionStart:
 		if err := requireNonBlank("description", wire.Description, present); err != nil {
@@ -258,7 +267,7 @@ func validateRequiredFields(action SubagentAction, wire wireEnvelope, delegateID
 	return validateOptionalUUID("delegate_id", delegateID, present)
 }
 
-func validateBounds(action SubagentAction, wire wireEnvelope, delegateID, requestID *uuid.UUID, present map[string]json.RawMessage) error {
+func validateBounds(action agentAction, wire wireEnvelope, delegateID, requestID *uuid.UUID, present map[string]json.RawMessage) error {
 	if action == actionStart || action == actionSend {
 		if len(wire.Description) > maxDescriptionBytes || len(wire.Prompt) > maxPromptBytes {
 			return preparationFailure(errCategoryInvalidValue)
@@ -340,47 +349,7 @@ func parseWireUUID(value *string) (*uuid.UUID, error) {
 	return &u, nil
 }
 
-// prepareDelegateCall translates the validated envelope exactly once into the
-// controller request and, for starts, resolves the optional runtime tuple from
-// the immutable parent catalog.
-func (s *SubagentTool) prepareDelegateCall(ctx context.Context, envelope SubagentEnvelope) (tool.DelegateRequest, *tool.DelegateRuntime, error) {
-	request := tool.DelegateRequest{
-		Agent:          envelope.SubagentType,
-		Mode:           envelope.Mode,
-		Message:        envelope.Prompt,
-		RequestID:      envelope.RequestID,
-		TimeoutSeconds: envelope.TimeoutSeconds,
-	}
-	if envelope.DelegateID != nil {
-		request.DelegateID = *envelope.DelegateID
-	}
-	var runtime *tool.DelegateRuntime
-	switch envelope.Action {
-	case actionStart:
-		request.Operation = tool.DelegateStart
-		request.Wait = !envelope.RunInBackground
-		var err error
-		runtime, err = s.resolveDelegateRuntime(envelope)
-		if err != nil {
-			return tool.DelegateRequest{}, nil, err
-		}
-	case actionSend:
-		request.Operation = tool.DelegateSend
-		request.Wait = !envelope.RunInBackground
-	case actionWait:
-		request.Operation = tool.DelegateWait
-		request.Wait = true
-	case actionInterrupt:
-		request.Operation = tool.DelegateInterrupt
-	case actionStatus:
-		request.Operation = tool.DelegateStatus
-	default:
-		return tool.DelegateRequest{}, nil, preparationFailure(errCategoryInvalidValue)
-	}
-	return request, runtime, nil
-}
-
-func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.DelegateRuntime, error) {
+func (s *agentToolConfig) resolveDelegateRuntime(envelope agentEnvelope) (*tool.DelegateRuntime, error) {
 	if !s.hasRuntimeCatalog {
 		// A zero catalog is the native/no-choice catalog. An explicitly supplied
 		// selector must never be silently ignored when a caller bypasses the
@@ -517,7 +486,7 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 	}, nil
 }
 
-func (s *SubagentTool) hasSubagentType(agent string) bool {
+func (s *agentToolConfig) hasSubagentType(agent string) bool {
 	for _, entry := range s.catalog {
 		if string(entry.Name) == agent {
 			return true

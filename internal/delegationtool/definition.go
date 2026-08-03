@@ -12,19 +12,20 @@ import (
 	inferencemodel "github.com/looprig/inference/model"
 )
 
-// Definition binds the harness-owned delegation control tool to one parent Loop.
+var agentToolNames = []string{"ListAgents", "MessageAgent", "StartAgent", "StopAgent"}
+
+const startAgentDescPrefix = "Start a new in-session child agent and optionally wait for its response."
+
+// Definition binds the harness-owned agent collaboration tools to one parent Loop.
 func Definition(style loop.DelegationStyle, catalog []AgentCatalogEntry, runtimeCatalog ...loop.RuntimeCatalog) tool.Definition {
-	catalog = cloneAgentCatalog(catalog)
-	var snapshot loop.RuntimeCatalog
-	hasSnapshot := len(runtimeCatalog) > 0
-	if hasSnapshot {
-		snapshot = runtimeCatalog[0]
-	}
-	return tool.NewDefinition(subagentToolName, tool.RequiresDelegateController, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
-		if !hasSnapshot {
-			return []tool.InvokableTool{NewSubagent(bindings.Delegate, style, catalog)}, nil
-		}
-		return []tool.InvokableTool{NewSubagentWithRuntimeCatalog(bindings.Delegate, style, catalog, snapshot)}, nil
+	config := newAgentToolConfig(style, catalog, runtimeCatalog...)
+	return tool.NewBundleDefinition("AgentTools", agentToolNames, tool.RequiresDelegateController, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{
+			newListAgents(bindings.Delegate, config),
+			newMessageAgent(bindings.Delegate, config),
+			newStartAgent(bindings.Delegate, config),
+			newStopAgent(bindings.Delegate, config),
+		}, nil
 	})
 }
 
@@ -36,7 +37,7 @@ const (
 	availableAgentElisionMarker   = "<elided additional agent capabilities>"
 )
 
-func buildSubagentSchema(style loop.DelegationStyle, catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) string {
+func buildAgentTransitionSchema(style loop.DelegationStyle, catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) string {
 	fieldOrder := []string{"action", "description", "prompt", "subagent_type", "mode", "agent_harness", "agent_source", "model", "effort", "run_in_background", "delegate_id", "request_id", "timeout_seconds"}
 	properties := map[string]any{
 		"action":            map[string]any{"type": "string", "enum": []string{"start", "send", "wait", "interrupt", "status"}},
@@ -577,7 +578,7 @@ type availableAgentSection struct {
 
 func buildStartAgentDescription(catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) string {
 	if len(catalog) == 0 {
-		return subagentDescPrefix
+		return startAgentDescPrefix
 	}
 
 	ordered := orderedAgentCatalog(catalog)
@@ -632,7 +633,7 @@ func buildStartAgentDescription(catalog []AgentCatalogEntry, runtimeCatalog loop
 		}
 		if !removed {
 			if len(sections) == 0 {
-				return subagentDescPrefix
+				return startAgentDescPrefix
 			}
 			sections = sections[:len(sections)-1]
 		}
@@ -753,7 +754,7 @@ func renderedEffort(effort inferencemodel.Effort) string {
 
 func renderStartAgentDescription(sections []availableAgentSection, elided bool) string {
 	var b strings.Builder
-	b.WriteString(subagentDescPrefix)
+	b.WriteString(startAgentDescPrefix)
 	b.WriteString("\n<available_agents>\n")
 	for _, section := range sections {
 		b.WriteString(section.agentLine)

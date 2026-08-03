@@ -16,7 +16,7 @@ import (
 func TestPrepareCallResolvesRuntimeDefaultsAndExplicitTuple(t *testing.T) {
 	t.Parallel()
 	catalog := testPreparationCatalog(t)
-	toolInstance := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, subagentCatalog(), catalog)
+	toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog(), catalog)
 
 	t.Run("omitted selectors use defaults", func(t *testing.T) {
 		request, prepared, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"action":"start","description":"inspect","prompt":"map the repo","subagent_type":"worker"}`)
@@ -71,7 +71,7 @@ func TestPrepareCallRuntimeSelectorErrorsAreBounded(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			toolInstance := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, subagentCatalog(), catalog)
+			toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog(), catalog)
 			_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), tt.args)
 			if err == nil || !strings.Contains(err.Error(), tt.category) {
 				t.Fatalf("PrepareCall() error = %v, want category %q", err, tt.category)
@@ -95,7 +95,7 @@ func TestPrepareCallRuntimeIsParentScopedAndOptional(t *testing.T) {
 	}
 
 	t.Run("other parent cannot grant codex", func(t *testing.T) {
-		toolInstance := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, subagentCatalog(), claudeCatalog)
+		toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog(), claudeCatalog)
 		_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"action":"start","description":"d","prompt":"p","subagent_type":"worker","agent_harness":"codex"}`)
 		if err == nil || !strings.Contains(err.Error(), errCategoryFieldNotAllowed) {
 			t.Fatalf("PrepareCall() error = %v, want %s", err, errCategoryFieldNotAllowed)
@@ -103,7 +103,7 @@ func TestPrepareCallRuntimeIsParentScopedAndOptional(t *testing.T) {
 	})
 
 	t.Run("no runtime choices leave runtime nil", func(t *testing.T) {
-		toolInstance := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, subagentCatalog(), noChoice)
+		toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog(), noChoice)
 		_, prepared, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"action":"start","description":"d","prompt":"p","subagent_type":"worker"}`)
 		if err != nil {
 			t.Fatalf("PrepareCall() error = %v", err)
@@ -114,7 +114,7 @@ func TestPrepareCallRuntimeIsParentScopedAndOptional(t *testing.T) {
 	})
 
 	t.Run("explicit harness with no choices is not allowed", func(t *testing.T) {
-		toolInstance := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, subagentCatalog(), noChoice)
+		toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog(), noChoice)
 		_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"action":"start","description":"d","prompt":"p","subagent_type":"worker","agent_harness":"claude-code"}`)
 		if err == nil || !strings.Contains(err.Error(), errCategoryFieldNotAllowed) {
 			t.Fatalf("PrepareCall() error = %v, want %s", err, errCategoryFieldNotAllowed)
@@ -128,7 +128,7 @@ func TestPrepareCallRuntimeIsParentScopedAndOptional(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		toolInstance := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker"}}, unrelated)
+		toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker"}}, unrelated)
 		_, _, err = toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"action":"start","description":"d","prompt":"p","subagent_type":"worker"}`)
 		if err == nil || !strings.Contains(err.Error(), errCategoryUnknownRuntime) {
 			t.Fatalf("PrepareCall() omitted selectors error = %v, want %s", err, errCategoryUnknownRuntime)
@@ -154,7 +154,7 @@ func TestPrepareCallRejectsSelectorsThatAreNotAdvertised(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			toolInstance := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker"}}, catalog)
+			toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker"}}, catalog)
 			_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), tt.args)
 			if err == nil || !strings.Contains(err.Error(), errCategoryFieldNotAllowed) {
 				t.Fatalf("PrepareCall() error = %v, want %s", err, errCategoryFieldNotAllowed)
@@ -178,7 +178,7 @@ func TestPrepareCallResolvesHarnessManagedNativeRuntimeWithoutSelectors(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	toolInstance := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker"}}, catalog)
+	toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker"}}, catalog)
 
 	_, prepared, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"action":"start","description":"inspect","prompt":"use your configured model","subagent_type":"worker"}`)
 	if err != nil {
@@ -231,7 +231,7 @@ func TestPrepareCallResolvesMixedSourcesWithAgentSourceSelector(t *testing.T) {
 	t.Parallel()
 
 	catalog := mixedSourcePreparationCatalog(t)
-	toolInstance := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker"}}, catalog)
+	toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker"}}, catalog)
 
 	info, err := toolInstance.Info(context.Background())
 	if err != nil {
@@ -308,7 +308,7 @@ func TestPrepareCallResolvesPerModelSourcesWithinOneEntry(t *testing.T) {
 	t.Parallel()
 
 	catalog := singleEntryMixedSourcePreparationCatalog(t)
-	toolInstance := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker"}}, catalog)
+	toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker"}}, catalog)
 	info, err := toolInstance.Info(context.Background())
 	if err != nil {
 		t.Fatal(err)

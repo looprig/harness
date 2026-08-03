@@ -13,7 +13,7 @@ import (
 )
 
 func TestNewEnvelopeSchemaUsesOnlyNewWireFields(t *testing.T) {
-	info, err := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, subagentCatalog(), emptyRuntimeCatalog(t)).Info(context.Background())
+	info, err := NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog(), emptyRuntimeCatalog(t)).Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestSchemaRuntimeSelectorsFollowCapabilities(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			info, err := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker", Description: "builds"}}, tt.catalog).Info(context.Background())
+			info, err := NewStartAgent(&fakeController{}, loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker", Description: "builds"}}, tt.catalog).Info(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -101,7 +101,7 @@ func TestSchemaAndDescriptionOmitRolesMissingFromPopulatedCatalog(t *testing.T) 
 	t.Parallel()
 	roles := []AgentCatalogEntry{{Name: "worker", Description: "builds"}, {Name: "reviewer", Description: "reviews"}}
 	catalog := schemaCatalog(t, schemaEntry("worker", "claude-code", true, []string{"sonnet"}, []inferencemodel.Effort{inferencemodel.EffortMedium}))
-	info, err := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, roles, catalog).Info(context.Background())
+	info, err := NewStartAgent(&fakeController{}, loop.DelegationManaged, roles, catalog).Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestSchemaAndDescriptionOmitRolesMissingFromPopulatedCatalog(t *testing.T) 
 	}
 
 	empty := emptyRuntimeCatalog(t)
-	nativeInfo, err := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, roles, empty).Info(context.Background())
+	nativeInfo, err := NewStartAgent(&fakeController{}, loop.DelegationManaged, roles, empty).Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestSchemaMixedSourcesAdvertisesAgentSourceWithoutManagedPlaceholders(t *te
 		SelectionKind: loop.RuntimeSelectionHarnessManaged,
 	}
 	catalog := schemaCatalog(t, gateway, native)
-	info, err := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker"}}, catalog).Info(context.Background())
+	info, err := NewStartAgent(&fakeController{}, loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker"}}, catalog).Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,10 +153,10 @@ func TestSchemaMixedSourcesAdvertisesAgentSourceWithoutManagedPlaceholders(t *te
 }
 
 func TestSchemaMixedSourceOverridesFilterEachAgentSourceBranch(t *testing.T) {
-	info, err := NewSubagentWithRuntimeCatalog(
+	info, err := NewStartAgent(
 		&fakeController{},
 		loop.DelegationManaged,
-		[]SubagentCatalogEntry{{Name: "worker"}},
+		[]AgentCatalogEntry{{Name: "worker"}},
 		singleEntryMixedSourcePreparationCatalog(t),
 	).Info(context.Background())
 	if err != nil {
@@ -294,7 +294,7 @@ func TestSchemaRuntimeSelectorsKeepModelEffortPairsResolvable(t *testing.T) {
 		{alias: "sonnet", efforts: []inferencemodel.Effort{inferencemodel.EffortLow}},
 		{alias: "opus", efforts: []inferencemodel.Effort{inferencemodel.EffortHigh}},
 	}))
-	info, err := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker"}}, catalog).Info(context.Background())
+	info, err := NewStartAgent(&fakeController{}, loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker"}}, catalog).Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +348,7 @@ func TestSchemaDescriptionBoundsAvailableAgentRuntimeRows(t *testing.T) {
 	for i := 0; i < maxAvailableAgentRuntimeRows+3; i++ {
 		entries = append(entries, schemaEntryWithModels("worker", loop.AgentHarnessName(fmt.Sprintf("harness-%02d", i)), false, []schemaModel{{alias: loop.ModelAlias(fmt.Sprintf("model-%02d", i)), efforts: []inferencemodel.Effort{inferencemodel.EffortMedium}}}))
 	}
-	info, err := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker", Description: "builds"}}, schemaCatalog(t, entries...)).Info(context.Background())
+	info, err := NewStartAgent(&fakeController{}, loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker", Description: "builds"}}, schemaCatalog(t, entries...)).Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,7 +361,7 @@ func TestSchemaDescriptionBoundsAvailableAgentRuntimeRows(t *testing.T) {
 }
 
 func TestSyncOnlySchemaIsStartOnlyForeground(t *testing.T) {
-	info, err := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationSyncOnly, []SubagentCatalogEntry{{Name: "worker"}}, emptyRuntimeCatalog(t)).Info(context.Background())
+	info, err := NewStartAgent(&fakeController{}, loop.DelegationSyncOnly, []AgentCatalogEntry{{Name: "worker"}}, emptyRuntimeCatalog(t)).Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
