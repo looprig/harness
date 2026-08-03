@@ -91,8 +91,8 @@ func (a *failChildStartAppender) AppendEvent(_ context.Context, ev event.Event) 
 // REAL child loops (a stub LLM emitting one final message). It exercises the
 // security-critical invariants: agent authorization + resolution, mode validation
 // before quota, ownership (registry-derived) rejection of siblings/ancestors/unrelated
-// loops, the action set per delegation style, quota reservation before construction, and
-// the wait:true / wait:false→wait request correlation.
+// loops, the action set per delegation style, quota reservation before construction,
+// foreground responses, and automatic background hand-back.
 
 func delegateParent(style loop.DelegationStyle, delegates ...identity.AgentName) loop.Definition {
 	return delegateNode("parent", style, delegates...)
@@ -224,10 +224,6 @@ func delegateCtx(t *testing.T) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 	return ctx
-}
-
-func waitResponse(ctx context.Context, controller tool.DelegateController, session *Session, agentID, responseID uuid.UUID, timeoutSeconds *int) (tool.DelegateResult, error) {
-	return controller.(*scopedController).waitResponse(ctx, session, agentID, responseID, timeoutSeconds)
 }
 
 // TestDelegateStartSyncReturnsChildText proves the synchronous start path: the scoped
@@ -983,6 +979,13 @@ func TestFoldDelegateTerminalUsesOnlyTurnDoneMessage(t *testing.T) {
 	}
 }
 
+func durableResolvedRecord(manager *delegationManager, requestID uuid.UUID) (resolvedRequest, bool) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	resolved, ok := manager.resolved[requestID]
+	return resolved, ok
+}
+
 func TestCrashClosureReseedsInterruptedDelegateRequest(t *testing.T) {
 	t.Parallel()
 	requestID, turnID, childID := mustUUID(), mustUUID(), mustUUID()
@@ -996,7 +999,7 @@ func TestCrashClosureReseedsInterruptedDelegateRequest(t *testing.T) {
 	if err := seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), childID, cmd)}, original, []event.Event{closure}); err != nil {
 		t.Fatal(err)
 	}
-	got, ok := manager.getResolved(requestID)
+	got, ok := durableResolvedRecord(manager, requestID)
 	if !ok || got.childID != childID || got.status != tool.DelegateStatusInterrupted {
 		t.Fatalf("resolved = %+v, %v; want interrupted child %v", got, ok, childID)
 	}
@@ -1010,7 +1013,7 @@ func TestRestoreIgnoresUnacceptedDelegateIntent(t *testing.T) {
 	if err := seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), uuid.UUID{}, cmd)}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := manager.getResolved(requestID); ok {
+	if got, ok := durableResolvedRecord(manager, requestID); ok {
 		t.Fatalf("unaccepted intent admitted: %+v", got)
 	}
 }
@@ -1027,7 +1030,7 @@ func TestRestoreDoesNotAdmitOrdinaryTurnTerminalAsDelegateRequest(t *testing.T) 
 	if err := seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), childID, ordinary)}, events, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := manager.getResolved(requestID); ok {
+	if got, ok := durableResolvedRecord(manager, requestID); ok {
 		t.Fatalf("ordinary user request was admitted as delegate result: %+v", got)
 	}
 }
@@ -1055,7 +1058,7 @@ func TestRestoreOverlaysAdmittedQueuedCancellationReason(t *testing.T) {
 			if err := seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), childID, cmd)}, events, nil); err != nil {
 				t.Fatal(err)
 			}
-			got, ok := manager.getResolved(requestID)
+			got, ok := durableResolvedRecord(manager, requestID)
 			if !ok || got.childID != childID || got.status != tt.status {
 				t.Fatalf("resolved = %+v, %v; want child=%v status=%v", got, ok, childID, tt.status)
 			}
@@ -1072,7 +1075,7 @@ func TestRestoreIgnoresUnadmittedQueuedCancellation(t *testing.T) {
 	if err := seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), childID, ordinary)}, events, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := manager.getResolved(requestID); ok {
+	if got, ok := durableResolvedRecord(manager, requestID); ok {
 		t.Fatalf("ordinary cancellation entered delegate index: %+v", got)
 	}
 }
@@ -1086,61 +1089,6 @@ func TestRestoreRejectsDelegateIntentRouteMismatch(t *testing.T) {
 	var mismatch *journal.CommandRouteMismatchError
 	if !errors.As(err, &mismatch) || mismatch.RecordLoopID != wrong || mismatch.TargetLoopID != target {
 		t.Fatalf("error = %T %+v, want typed route mismatch", err, err)
-	}
-}
-
-// TestDelegateWaitFalseThenWaitResolves proves the request correlation: a wait:false
-// start returns a queued request id, and a later wait for that id resolves the SAME
-// request's answer.
-func TestDelegateWaitFalseThenWaitResolves(t *testing.T) {
-	t.Parallel()
-	parent := delegateParent(loop.DelegationManaged, "child")
-	s := newDelegationSession(t, parent, nil, delegateChild("child", "async final"))
-	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-
-	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: false})
-	if err != nil {
-		t.Fatalf("start wait:false: %v", err)
-	}
-	if queued.State != tool.AgentStateWorking {
-		t.Fatalf("state = %v, want working", queued.State)
-	}
-	if queued.CorrelationID.IsZero() || queued.AgentID.IsZero() {
-		t.Fatalf("queued handle missing ids: %+v", queued)
-	}
-	pending, ok := s.delegation.getPending(queued.CorrelationID)
-	if !ok {
-		t.Fatal("queued request was not registered")
-	}
-	select {
-	case <-pending.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("queued request did not resolve")
-	}
-	status, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: queued.AgentID})
-	if err != nil {
-		t.Fatalf("status before collection: %v", err)
-	}
-	if len(status.Agents) != 1 || status.Agents[0].State != tool.AgentStateIdle || status.Agents[0].QueuedMessages != 0 {
-		t.Fatalf("resolved-uncollected agents = %+v, want one idle agent with no queued messages", status.Agents)
-	}
-
-	resolved, err := waitResponse(delegateCtx(t), ctrl, s, queued.AgentID, queued.CorrelationID, nil)
-	if err != nil {
-		t.Fatalf("wait: %v", err)
-	}
-	if resolved.ResponseStatus != tool.DelegateResponseCompleted {
-		t.Errorf("response status = %v, want Completed", resolved.ResponseStatus)
-	}
-	if resolved.Response != "async final" {
-		t.Errorf("output = %q, want %q", resolved.Response, "async final")
-	}
-
-	// An unknown request id for the same owned child is rejected.
-	_, err = waitResponse(delegateCtx(t), ctrl, s, queued.AgentID, mustUUID(), nil)
-	var de *DelegateError
-	if !errors.As(err, &de) || de.Kind != DelegateUnknownRequest {
-		t.Fatalf("wait unknown request error = %v, want DelegateUnknownRequest", err)
 	}
 }
 
@@ -1241,283 +1189,19 @@ func TestDelegateStatusTracksForegroundRequestQueuedBehindActiveTurn(t *testing.
 	}
 	waitDelegateQueuedMessages(t, ctrl, background.AgentID, 0)
 
-	backgroundRequest, ok := s.delegation.getPending(background.CorrelationID)
-	if !ok {
-		t.Fatal("completed background request was not retained")
-	}
-	select {
-	case <-backgroundRequest.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("background request did not reach terminal state")
-	}
-	s.delegation.mu.Lock()
-	tracked := len(s.delegation.requests)
-	s.delegation.mu.Unlock()
-	if tracked != 1 {
-		t.Fatalf("tracked requests after foreground return = %d, want only retained background request", tracked)
-	}
-
-	if _, err := waitResponse(delegateCtx(t), ctrl, s, background.AgentID, background.CorrelationID, nil); err != nil {
-		t.Fatal(err)
-	}
-	s.delegation.mu.Lock()
-	tracked = len(s.delegation.requests)
-	s.delegation.mu.Unlock()
-	if tracked != 0 {
-		t.Fatalf("tracked requests after background collection = %d, want 0", tracked)
-	}
-}
-
-func TestDelegateWaitTimeoutInterruptsRunningChild(t *testing.T) {
-	t.Parallel()
-	parent := delegateParent(loop.DelegationManaged, "child")
-	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
-	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	zero := 0
-	result, err := waitResponse(context.Background(), ctrl, s, queued.AgentID, queued.CorrelationID, &zero)
-	if err != nil || result.ResponseStatus != tool.DelegateResponseTimedOut {
-		t.Fatalf("timed wait = %+v, %v; want TimedOut", result, err)
-	}
-	pending, ok := s.delegation.getPending(queued.CorrelationID)
-	if !ok {
-		t.Fatal("pending request disappeared after timeout")
-	}
-	select {
-	case <-pending.done:
-		_, status := pending.result()
-		if status != tool.DelegateStatusInterrupted {
-			t.Fatalf("post-timeout terminal = %v, want Interrupted", status)
+	deadline := time.After(2 * time.Second)
+	for {
+		s.delegation.mu.Lock()
+		tracked := len(s.delegation.requests)
+		s.delegation.mu.Unlock()
+		if tracked == 0 {
+			break
 		}
-	case <-time.After(300 * time.Millisecond):
-		t.Fatal("timed-out wait did not interrupt the child")
-	}
-}
-
-func TestDelegateQueuedRequestTimeoutCancelsOnlyThatRequest(t *testing.T) {
-	t.Parallel()
-	parent := delegateParent(loop.DelegationManaged, "child")
-	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
-	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitDelegateMechanicalStatus(t, ctrl, active.AgentID, tool.DelegateStatusRunning)
-	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: active.AgentID, Message: "B", WaitForResponse: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	zero := 0
-	timed, err := waitResponse(context.Background(), ctrl, s, active.AgentID, queued.CorrelationID, &zero)
-	if err != nil || timed.ResponseStatus != tool.DelegateResponseTimedOut {
-		t.Fatalf("timed wait = %+v, %v; want TimedOut", timed, err)
-	}
-	pending, ok := s.delegation.getPending(queued.CorrelationID)
-	if !ok {
-		t.Fatal("timed request was not left collectable")
-	}
-	select {
-	case <-pending.done:
-		_, status := pending.result()
-		if status != tool.DelegateStatusInterrupted {
-			t.Fatalf("queued cancellation status = %v, want Interrupted", status)
+		select {
+		case <-deadline:
+			t.Fatalf("live request trackers after automatic hand-back = %d, want 0", tracked)
+		case <-time.After(time.Millisecond):
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("queued request-specific timeout did not resolve")
-	}
-	status, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: active.AgentID})
-	if err != nil || len(status.Agents) != 1 || status.Agents[0].State != tool.AgentStateWorking {
-		t.Fatalf("A status after B timeout = %+v, %v; want Running", status, err)
-	}
-	_, _ = ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: active.AgentID})
-}
-
-func TestDelegateQueuedRequestCallerCancellationTargetsOnlyThatRequest(t *testing.T) {
-	t.Parallel()
-	parent := delegateParent(loop.DelegationManaged, "child")
-	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
-	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitDelegateMechanicalStatus(t, ctrl, active.AgentID, tool.DelegateStatusRunning)
-	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: active.AgentID, Message: "B", WaitForResponse: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cancelledCtx, cancel := context.WithCancel(context.Background())
-	cancel()
-	result, err := waitResponse(cancelledCtx, ctrl, s, active.AgentID, queued.CorrelationID, nil)
-	if err != nil || result.ResponseStatus != tool.DelegateResponseInterrupted {
-		t.Fatalf("cancelled wait = %+v, %v; want Interrupted", result, err)
-	}
-	pending, _ := s.delegation.getPending(queued.CorrelationID)
-	select {
-	case <-pending.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("caller cancellation did not resolve targeted queued request")
-	}
-	status, _ := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: active.AgentID})
-	if len(status.Agents) != 1 || status.Agents[0].State != tool.AgentStateWorking {
-		t.Fatalf("A status after B caller cancellation = %+v, want working", status.Agents)
-	}
-	_, _ = ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: active.AgentID})
-}
-
-func TestDelegateRunningRequestTimeoutStartsNextWithoutCancellingIt(t *testing.T) {
-	t.Parallel()
-	parent := delegateParent(loop.DelegationManaged, "child")
-	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
-	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	running, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "B", WaitForResponse: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitDelegateMechanicalStatus(t, ctrl, running.AgentID, tool.DelegateStatusRunning)
-	next, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: running.AgentID, Message: "C", WaitForResponse: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	zero := 0
-	result, err := waitResponse(context.Background(), ctrl, s, running.AgentID, running.CorrelationID, &zero)
-	if err != nil || result.ResponseStatus != tool.DelegateResponseTimedOut {
-		t.Fatalf("running timeout = %+v, %v; want TimedOut", result, err)
-	}
-	runningPending, _ := s.delegation.getPending(running.CorrelationID)
-	select {
-	case <-runningPending.done:
-		_, status := runningPending.result()
-		if status != tool.DelegateStatusInterrupted {
-			t.Fatalf("running request terminal = %v, want Interrupted", status)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("running request did not resolve after targeted timeout")
-	}
-	waitDelegateMechanicalStatus(t, ctrl, running.AgentID, tool.DelegateStatusRunning)
-	nextPending, ok := s.delegation.getPending(next.CorrelationID)
-	if !ok {
-		t.Fatal("next request handle missing")
-	}
-	select {
-	case <-nextPending.done:
-		t.Fatal("targeting running B also resolved/cancelled C")
-	default:
-	}
-	_, _ = s.cancelDelegateRequest(running.AgentID, next.CorrelationID)
-}
-
-func TestDelegateTerminalWinsCancelledWaitBeforeControlDispatch(t *testing.T) {
-	t.Parallel()
-	parent := delegateParent(loop.DelegationManaged, "child")
-	s := newDelegationSession(t, parent, nil, delegateChild("child", "B done"))
-	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	request, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "B", WaitForResponse: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	pending, _ := s.delegation.getPending(request.CorrelationID)
-	select {
-	case <-pending.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("B did not reach terminal barrier")
-	}
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
-	result, err := waitResponse(cancelled, ctrl, s, request.AgentID, request.CorrelationID, nil)
-	if err != nil || result.ResponseStatus != tool.DelegateResponseCompleted || result.Response != "B done" {
-		t.Fatalf("terminal/deadline race = %+v, %v; want completed B", result, err)
-	}
-	next, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: request.AgentID, Message: "C", WaitForResponse: true})
-	if err != nil || next.ResponseStatus != tool.DelegateResponseCompleted {
-		t.Fatalf("C after terminal race = %+v, %v", next, err)
-	}
-}
-
-func TestNativeQueuedDelegateInterruptResolvesWithoutWaitTimeout(t *testing.T) {
-	t.Parallel()
-	parent := delegateParent(loop.DelegationManaged, "child")
-	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
-	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitDelegateMechanicalStatus(t, ctrl, active.AgentID, tool.DelegateStatusRunning)
-	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: active.AgentID, Message: "B", WaitForResponse: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: active.AgentID}); err != nil {
-		t.Fatal(err)
-	}
-	result := make(chan tool.DelegateResult, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		got, waitErr := waitResponse(context.Background(), ctrl, s, active.AgentID, queued.CorrelationID, nil)
-		result <- got
-		errCh <- waitErr
-	}()
-	select {
-	case got := <-result:
-		if waitErr := <-errCh; waitErr != nil || got.ResponseStatus != tool.DelegateResponseInterrupted {
-			t.Fatalf("wait = %+v, %v; want Interrupted", got, waitErr)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("background wait depended on a context timeout after queued cancellation")
-	}
-}
-
-func TestNativeQueuedDelegateFailedTurnResolvesFailedLiveAndRestore(t *testing.T) {
-	t.Parallel()
-	providerErr := errors.New("injected active-turn failure")
-	client := &releasedFailureLLM{started: make(chan struct{}), release: make(chan struct{}), err: providerErr}
-	parent := delegateParent(loop.DelegationManaged, "child")
-	child := mustDefine(
-		loop.WithName("child"),
-		loop.WithInference(client, validModel("child")),
-		loop.WithDrainTimeout(100*time.Millisecond),
-	)
-	events := &recordingEventAppender{}
-	commands := &fakeCommandAppender{}
-	s := newDelegationSession(t, parent, []Option{WithEventAppender(events), WithCommandAppender(commands)}, child)
-	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-client.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("active turn never reached injected provider")
-	}
-	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: active.AgentID, Message: "B", WaitForResponse: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	close(client.release)
-
-	live, err := waitResponse(context.Background(), ctrl, s, active.AgentID, queued.CorrelationID, nil)
-	if err != nil || live.ResponseStatus != tool.DelegateResponseFailed {
-		t.Fatalf("live wait = %+v, %v; want Failed", live, err)
-	}
-
-	records := commands.snapshot()
-	journalRecords := make([]journal.JournalRecord, len(records))
-	for i := range records {
-		journalRecords[i] = records[i]
-	}
-	restored := newDelegationManager(Topology{})
-	if err := seedResolvedDelegateRecords(restored, journalRecords, events.snapshot(), nil); err != nil {
-		t.Fatal(err)
-	}
-	resolved, ok := restored.getResolved(queued.CorrelationID)
-	if !ok || resolved.childID != active.AgentID || resolved.status != tool.DelegateStatusFailed {
-		t.Fatalf("restored cancellation = %+v, %v; want Failed child %v", resolved, ok, active.AgentID)
 	}
 }
 
@@ -1749,10 +1433,10 @@ func TestEnqueueDelegateTurnCancelsCommittedRequestAfterContextRace(t *testing.T
 
 	var removed atomic.Bool
 	requestID, tracked, err := s.enqueueDelegateTurn(ctx, loopID, delegateBlocks("go"),
-		func(_, childID uuid.UUID) *pendingRequest {
-			return &pendingRequest{childID: childID, done: make(chan struct{}), lifecycle: pendingRequestActive}
+		func(_, childID uuid.UUID) *requestTracker {
+			return &requestTracker{childID: childID, lifecycle: requestActive}
 		},
-		func(uuid.UUID, *pendingRequest) { removed.Store(true) },
+		func(uuid.UUID, *requestTracker) { removed.Store(true) },
 	)
 	if err != nil {
 		t.Fatalf("enqueueDelegateTurn: %v", err)
@@ -2001,11 +1685,10 @@ func TestDelegateSendResolvesDistinctTurns(t *testing.T) {
 	}
 }
 
-// TestDelegateWaitResolvesAfterRestore proves the plan Step-1 requirement that a
-// wait:false request resolves via a later wait INCLUDING after restore: the in-memory
-// pending handle does not survive the restart, but restore reconstructs the durable
-// request→terminal index so the same request id resolves the same answer.
-func TestDelegateWaitResolvesAfterRestore(t *testing.T) {
+// TestDelegateRestoreRetainsPrivateCompletionCorrelation proves restore preserves the
+// durable child-terminal correlation needed for future hand-back idempotence without
+// exposing a request-ID lookup operation to the model-facing controller.
+func TestDelegateRestoreRetainsPrivateCompletionCorrelation(t *testing.T) {
 	t.Parallel()
 	store := newRestoreStore(t)
 	parent := delegateParent(loop.DelegationManaged, "child")
@@ -2046,7 +1729,7 @@ func TestDelegateWaitResolvesAfterRestore(t *testing.T) {
 		t.Fatalf("Shutdown: %v", err)
 	}
 
-	// Restore: the in-memory pending map is empty; wait must resolve from the durable index.
+	// Restore rebuilds private durable correlation; it does not recreate a live collector.
 	r, err := lc.RestoreSession(context.Background(), sid)
 	if err != nil {
 		t.Fatalf("RestoreSession: %v", err)
@@ -2058,12 +1741,9 @@ func TestDelegateWaitResolvesAfterRestore(t *testing.T) {
 	if err != nil || len(roster.Agents) != 1 || roster.Agents[0].AgentID != childID {
 		t.Fatalf("restored direct-child roster = %+v, %v; want child %v", roster, err, childID)
 	}
-	res, err := waitResponse(context.Background(), rctrl, r, childID, reqID, nil)
-	if err != nil {
-		t.Fatalf("wait after restore: %v", err)
-	}
-	if res.ResponseStatus != tool.DelegateResponseCompleted || res.Response != "durable answer" {
-		t.Fatalf("post-restore wait = %v/%q, want Completed/durable answer", res.ResponseStatus, res.Response)
+	resolved, ok := durableResolvedRecord(r.delegation, reqID)
+	if !ok || resolved.childID != childID || resolved.status != tool.DelegateStatusCompleted || resolved.text != "durable answer" {
+		t.Fatalf("restored private correlation = %+v, %v; want completed durable answer for child %v", resolved, ok, childID)
 	}
 }
 
@@ -2120,12 +1800,9 @@ func TestDelegateQueuedRequestRestoresInterruptedWithoutReplay(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = restored.Shutdown(context.Background()) })
 	restoredCtrl := restored.delegation.controllerFor(restored.ActiveLoopID(), parent)
-	result, err := waitResponse(context.Background(), restoredCtrl, restored, a.AgentID, b.CorrelationID, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.ResponseStatus != tool.DelegateResponseInterrupted {
-		t.Fatalf("restored queued request B status = %v, want Interrupted", result.ResponseStatus)
+	resolved, ok := durableResolvedRecord(restored.delegation, b.CorrelationID)
+	if !ok || resolved.childID != a.AgentID || resolved.status != tool.DelegateStatusInterrupted {
+		t.Fatalf("restored private queued correlation = %+v, %v; want interrupted child %v", resolved, ok, a.AgentID)
 	}
 	status, err := restoredCtrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: a.AgentID})
 	if err != nil {
@@ -2269,10 +1946,6 @@ func TestDelegateMessageQueueIsFIFOAndCountsOnlyWaitingNoFoldTurns(t *testing.T)
 	waitDelegateQueuedMessages(t, ctrl, started.AgentID, 0)
 	client.release <- struct{}{}
 
-	result, err := waitResponse(delegateCtx(t), ctrl, s, started.AgentID, c.CorrelationID, nil)
-	if err != nil || result.ResponseStatus != tool.DelegateResponseCompleted || result.Response != "reply C" {
-		t.Fatalf("C result = %+v, %v; want completed reply C", result, err)
-	}
 	client.mu.Lock()
 	seen := append([]string(nil), client.seen...)
 	client.mu.Unlock()

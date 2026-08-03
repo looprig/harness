@@ -50,11 +50,12 @@ type delegationManager struct {
 
 	mu       sync.Mutex
 	session  *Session
-	requests map[uuid.UUID]*pendingRequest
+	requests map[uuid.UUID]*requestTracker
 	// resolved is the DURABLE request→terminal index reconstructed at restore from each
 	// loop's folded history (request id → the terminal of the correlated turn). It is the
-	// post-restore fallback for wait: the in-memory pending handle does not survive a
-	// process restart, but the child's committed turn terminal does. Guarded by mu.
+	// private correlation state needed by future restore idempotence: live request trackers
+	// do not survive a process restart, but committed child terminals do. It is deliberately
+	// not exposed through a request-ID lookup API. Guarded by mu.
 	resolved               map[uuid.UUID]resolvedRequest
 	runtimeCatalog         loop.RuntimeCatalog
 	hasRuntimeCatalog      bool
@@ -69,8 +70,8 @@ type delegateAdmission struct {
 	requestID       uuid.UUID
 	command         command.UserInput
 	publisher       *delegateAdmissionPublisher
-	registerRequest func(requestID, childID uuid.UUID) *pendingRequest
-	tracked         *pendingRequest
+	registerRequest func(requestID, childID uuid.UUID) *requestTracker
+	tracked         *requestTracker
 	background      bool
 }
 
@@ -143,7 +144,7 @@ func newDelegationManager(topology Topology, catalogs ...loop.RuntimeCatalog) *d
 	}
 	manager := &delegationManager{
 		byName:   byName,
-		requests: make(map[uuid.UUID]*pendingRequest),
+		requests: make(map[uuid.UUID]*requestTracker),
 		resolved: make(map[uuid.UUID]resolvedRequest),
 	}
 	if len(catalogs) > 0 {
@@ -256,13 +257,6 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	return nil
 }
 
-func (m *delegationManager) getResolved(requestID uuid.UUID) (resolvedRequest, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	rr, ok := m.resolved[requestID]
-	return rr, ok
-}
-
 // foldDelegateTerminals correlates every turn's opening request id (TurnStarted's
 // Cause.CommandID) to its terminal (TurnDone answer / TurnFailed / TurnInterrupted). A
 // turn with a zero Cause.CommandID (no correlating submit) is skipped. It mirrors the live
@@ -365,78 +359,65 @@ func (m *delegationManager) controllerFor(parentLoopID uuid.UUID, parent loop.De
 	return controller
 }
 
-// pendingRequest tracks one admitted delegate request. Its lifecycle distinguishes work
-// queued behind the child's active turn from the active request and terminal response.
-// Foreground trackers are removed when their result returns; background trackers remain
-// retained until a later wait collects them.
-type pendingRequest struct {
+// requestTracker holds only the live mechanical lifecycle needed to count messages queued
+// behind a child's active turn. Response collection belongs to the foreground drain or the
+// session-owned background hand-back; no response payload is retained here for later lookup.
+type requestTracker struct {
 	childID uuid.UUID
-	done    chan struct{}
 
 	mu        sync.Mutex
-	lifecycle pendingRequestLifecycle
-	text      string
-	status    tool.DelegateStatusValue
+	lifecycle requestLifecycle
 }
 
-type pendingRequestLifecycle uint8
+type requestLifecycle uint8
 
 const (
-	pendingRequestQueued pendingRequestLifecycle = iota
-	pendingRequestActive
-	pendingRequestTerminal
+	requestQueued requestLifecycle = iota
+	requestActive
+	requestTerminal
 )
 
-func (p *pendingRequest) markActive() {
+func (p *requestTracker) markActive() {
 	p.mu.Lock()
-	if p.lifecycle == pendingRequestQueued {
-		p.lifecycle = pendingRequestActive
+	if p.lifecycle == requestQueued {
+		p.lifecycle = requestActive
 	}
 	p.mu.Unlock()
 }
 
-func (p *pendingRequest) resolve(text string, status tool.DelegateStatusValue) {
+func (p *requestTracker) markTerminal() {
 	p.mu.Lock()
-	p.text = text
-	p.status = status
-	p.lifecycle = pendingRequestTerminal
+	p.lifecycle = requestTerminal
 	p.mu.Unlock()
-	close(p.done)
 }
 
-func (p *pendingRequest) result() (string, tool.DelegateStatusValue) {
+func (p *requestTracker) queued() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.text, p.status
+	return p.lifecycle == requestQueued
 }
 
-func (p *pendingRequest) queued() bool {
+func (p *requestTracker) terminal() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.lifecycle == pendingRequestQueued
-}
-
-func (p *pendingRequest) terminal() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.lifecycle == pendingRequestTerminal
+	return p.lifecycle == requestTerminal
 }
 
 // registerRequest records every request immediately after accepted admission, before
 // either foreground or background draining begins. Since callers subscribe before
 // admission, the correlated TurnStarted remains observable even if it raced ahead.
-func (m *delegationManager) registerRequest(requestID, childID uuid.UUID) *pendingRequest {
-	pr := &pendingRequest{childID: childID, done: make(chan struct{}), lifecycle: pendingRequestActive}
+func (m *delegationManager) registerRequest(requestID, childID uuid.UUID) *requestTracker {
+	tracked := &requestTracker{childID: childID, lifecycle: requestActive}
 	m.mu.Lock()
-	for _, tracked := range m.requests {
-		if tracked.childID == childID && !tracked.terminal() {
-			pr.lifecycle = pendingRequestQueued
+	for _, existing := range m.requests {
+		if existing.childID == childID && !existing.terminal() {
+			tracked.lifecycle = requestQueued
 			break
 		}
 	}
-	m.requests[requestID] = pr
+	m.requests[requestID] = tracked
 	m.mu.Unlock()
-	return pr
+	return tracked
 }
 
 // markRequestActive advances only a request already admitted through delegation. An
@@ -453,7 +434,7 @@ func (m *delegationManager) markRequestActive(requestID, childID uuid.UUID) {
 	}
 }
 
-func (m *delegationManager) removeRequest(requestID uuid.UUID, tracked *pendingRequest) {
+func (m *delegationManager) removeRequest(requestID uuid.UUID, tracked *requestTracker) {
 	m.mu.Lock()
 	if m.requests[requestID] == tracked {
 		delete(m.requests, requestID)
@@ -464,20 +445,20 @@ func (m *delegationManager) removeRequest(requestID uuid.UUID, tracked *pendingR
 // handBackRequest starts the session-owned drain for one background response. The drain
 // runs on the session lifetime, not the parent tool-call context. Its only terminal
 // delivery is a machine-originated SubagentResult to the direct parent.
-func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.UUID, name string, pr *pendingRequest, requestID uuid.UUID, sub event.Subscription, timeoutSeconds *int) {
+func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.UUID, name string, tracked *requestTracker, requestID uuid.UUID, sub event.Subscription, timeoutSeconds *int) {
 	go func() {
 		defer func() { _ = sub.Close() }()
-		defer m.removeRequest(requestID, pr)
+		defer m.removeRequest(requestID, tracked)
 		waitCtx, cancel := waitContext(s.sessionCtx, timeoutSeconds)
 		defer cancel()
 		text, err := drainDelegateAnswerObserved(waitCtx, sub, requestID, func() {
 			_, _ = s.cancelDelegateRequest(childID, requestID)
-		}, pr.markActive)
+		}, tracked.markActive)
 		status := statusFromDrain(err)
 		if status == tool.DelegateStatusInterrupted && didTimeout(timeoutSeconds, waitCtx) {
 			status = tool.DelegateStatusTimedOut
 		}
-		pr.resolve(text, status)
+		tracked.markTerminal()
 		if err := s.deliverSubagentResult(s.sessionCtx, parentID, childID, backgroundCompletionBlocks(childID, name, requestID, status, text)); err != nil {
 			// No parent event can release the hand-back token when dispatch itself is
 			// impossible (session shutdown, parent exit, or command-id failure).
@@ -486,21 +467,8 @@ func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.U
 	}()
 }
 
-func (m *delegationManager) getPending(requestID uuid.UUID) (*pendingRequest, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	pr, ok := m.requests[requestID]
-	return pr, ok
-}
-
-func (m *delegationManager) removePending(requestID uuid.UUID) {
-	m.mu.Lock()
-	delete(m.requests, requestID)
-	m.mu.Unlock()
-}
-
 // pendingCount returns the requests waiting behind one child's active turn. Active and
-// terminal-but-uncollected requests remain retained but are not queued messages.
+// terminal requests still crossing the hand-back boundary are not queued messages.
 func (m *delegationManager) pendingCount(childID uuid.UUID) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -892,55 +860,6 @@ func (c *scopedController) send(ctx context.Context, s *Session, req tool.Delega
 	return c.resolveOrQueue(ctx, s, req.AgentID, requestID, sub, tracked, req)
 }
 
-// waitResponse preserves the current internal collector until Phase 3 replaces it
-// with automatic durable hand-back. No tool operation or model-supplied ID reaches it.
-func (c *scopedController) waitResponse(ctx context.Context, s *Session, agentID, responseID uuid.UUID, timeoutSeconds *int) (tool.DelegateResult, error) {
-	if agentID.IsZero() {
-		return tool.DelegateResult{}, &DelegateError{Kind: DelegateMissingDelegateID}
-	}
-	if responseID.IsZero() {
-		return tool.DelegateResult{}, &DelegateError{Kind: DelegateMissingRequestID}
-	}
-	if err := c.ownsChild(s, agentID); err != nil {
-		return tool.DelegateResult{}, err
-	}
-	// Live in-memory handle first: a request registered this process lifetime.
-	if pr, ok := c.manager.getPending(responseID); ok {
-		if pr.childID != agentID {
-			return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownRequest, RequestID: responseID}
-		}
-		waitCtx, cancel := waitContext(ctx, timeoutSeconds)
-		defer cancel()
-		select {
-		case <-pr.done:
-			c.manager.removePending(responseID)
-			text, status := pr.result()
-			return c.responseResult(s, agentID, responseID, status, text), nil
-		case <-waitCtx.Done():
-			// Recheck before dispatch so an already-observed terminal wins without even
-			// sending control; the actor command remains authoritative for the race after
-			// this check. The pending handle stays collectable either way.
-			select {
-			case <-pr.done:
-				c.manager.removePending(responseID)
-				text, status := pr.result()
-				return c.responseResult(s, agentID, responseID, status, text), nil
-			default:
-			}
-			status := timeoutOrInterrupted(timeoutSeconds, waitCtx)
-			go func() { _, _ = s.cancelDelegateRequest(agentID, responseID) }()
-			return c.responseResult(s, agentID, responseID, status, ""), nil
-		}
-	}
-	// Durable fallback (post-restore): the in-memory handle is gone, but the child's turn
-	// terminal survived in the folded history the restore reconstructed. Ownership is
-	// already enforced above; the resolved entry must name the same owned child.
-	if rr, ok := c.manager.getResolved(responseID); ok && rr.childID == agentID {
-		return c.responseResult(s, agentID, responseID, rr.status, rr.text), nil
-	}
-	return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownRequest, RequestID: responseID}
-}
-
 // interrupt interrupts an owned child's current turn without destroying the loop.
 func (c *scopedController) interrupt(s *Session, req tool.DelegateRequest) (tool.DelegateResult, error) {
 	if req.AgentID.IsZero() {
@@ -979,10 +898,10 @@ func (c *scopedController) status(s *Session, req tool.DelegateRequest) (tool.De
 
 // resolveOrQueue receives the tracker installed during admission, then either returns
 // the foreground response or starts the automatic durable parent hand-back.
-func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, childID, requestID uuid.UUID, sub event.Subscription, tracked *pendingRequest, req tool.DelegateRequest) (tool.DelegateResult, error) {
+func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, childID, requestID uuid.UUID, sub event.Subscription, tracked *requestTracker, req tool.DelegateRequest) (tool.DelegateResult, error) {
 	if req.WaitForResponse {
 		defer func() { _ = sub.Close() }()
-		defer c.manager.removePending(requestID)
+		defer c.manager.removeRequest(requestID, tracked)
 		waitCtx, cancel := waitContext(ctx, req.TimeoutSeconds)
 		defer cancel()
 		text, err := drainDelegateAnswerObserved(waitCtx, sub, requestID, func() {
@@ -992,7 +911,7 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 		if status == tool.DelegateStatusInterrupted && didTimeout(req.TimeoutSeconds, waitCtx) {
 			status = tool.DelegateStatusTimedOut
 		}
-		tracked.resolve(text, status)
+		tracked.markTerminal()
 		result := c.responseResult(s, childID, requestID, status, text)
 		if req.Name != "" {
 			result.Name = req.Name
@@ -1342,7 +1261,7 @@ func timeoutOrInterrupted(timeoutSeconds *int, waitCtx context.Context) tool.Del
 // subscription, request mint, backend construction, and initial-command acceptance all
 // precede the checked LoopStarted commit. The backend's publisher remains blocked until
 // that commit, so TurnStarted can neither race ahead nor survive a failed spawn.
-func (s *Session) startDelegate(ctx context.Context, parent loop.Provenance, cfg loop.Definition, mode loop.ModeName, name, message, parentToolUseID string, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog, background bool, registerRequest func(requestID, childID uuid.UUID) *pendingRequest) (childID, requestID uuid.UUID, sub event.Subscription, tracked *pendingRequest, err error) {
+func (s *Session) startDelegate(ctx context.Context, parent loop.Provenance, cfg loop.Definition, mode loop.ModeName, name, message, parentToolUseID string, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog, background bool, registerRequest func(requestID, childID uuid.UUID) *requestTracker) (childID, requestID uuid.UUID, sub event.Subscription, tracked *requestTracker, err error) {
 	admission := &delegateAdmission{ctx: ctx, name: name, message: message, registerRequest: registerRequest, background: background}
 	childID, err = s.newLoopWithAdmission(parent, cfg, parentToolUseID, mode, nil, admission, runtime, runtimeCatalog, hasRuntimeCatalog)
 	if err != nil {
@@ -1368,7 +1287,7 @@ func runtimeEffortString(value inferencemodel.Effort) string {
 // sendDelegate enqueues a distinct NON-FOLDING follow-up turn on an existing owned
 // child. It subscribes BEFORE the enqueue so the correlated turn's opening event is
 // never missed.
-func (s *Session) sendDelegate(ctx context.Context, childID uuid.UUID, message string, background bool, registerRequest func(requestID, childID uuid.UUID) *pendingRequest, removeRequest func(uuid.UUID, *pendingRequest)) (requestID uuid.UUID, sub event.Subscription, tracked *pendingRequest, err error) {
+func (s *Session) sendDelegate(ctx context.Context, childID uuid.UUID, message string, background bool, registerRequest func(requestID, childID uuid.UUID) *requestTracker, removeRequest func(uuid.UUID, *requestTracker)) (requestID uuid.UUID, sub event.Subscription, tracked *requestTracker, err error) {
 	sub, err = s.subscribeLoop(childID)
 	if err != nil {
 		return uuid.UUID{}, nil, nil, err
@@ -1409,7 +1328,7 @@ func (s *Session) subscribeLoop(loopID uuid.UUID) (event.Subscription, error) {
 // running turn (the loop actor's drainInbox skips non-folding entries); it queues behind
 // the running turn and starts its OWN distinct turn when that finishes. The public
 // Session.SubmitToLoop keeps its interactive queue/fold semantics (NoFold=false).
-func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blocks []content.Block, registerRequest func(requestID, childID uuid.UUID) *pendingRequest, removeRequest func(uuid.UUID, *pendingRequest)) (requestID uuid.UUID, tracked *pendingRequest, err error) {
+func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blocks []content.Block, registerRequest func(requestID, childID uuid.UUID) *requestTracker, removeRequest func(uuid.UUID, *requestTracker)) (requestID uuid.UUID, tracked *requestTracker, err error) {
 	if err := s.faultIfFaulted(); err != nil {
 		return uuid.UUID{}, nil, err
 	}
@@ -1501,9 +1420,7 @@ const (
 	DelegateUnknownMode
 	DelegateNotOwned
 	DelegateSessionUnavailable
-	DelegateUnknownRequest
 	DelegateMissingDelegateID
-	DelegateMissingRequestID
 	DelegateUnknownOperation
 	// DelegateInterruptPending: the parent loop is under an interrupt admission barrier, so a
 	// NEW machine-delegate request (start/send) is flushed (refused) until the barrier releases.
@@ -1516,13 +1433,12 @@ const (
 )
 
 // DelegateError is the typed delegation refusal. Callers errors.As to inspect Kind and
-// the offending agent/mode/ids.
+// the offending agent, mode, or delegate ID.
 type DelegateError struct {
 	Kind       DelegateErrorKind
 	Agent      identity.AgentName
 	Mode       loop.ModeName
 	DelegateID uuid.UUID
-	RequestID  uuid.UUID
 }
 
 func (e *DelegateError) Error() string {
@@ -1539,12 +1455,8 @@ func (e *DelegateError) Error() string {
 		return "delegation: delegate " + strconv.Quote(e.DelegateID.String()) + " is not owned by this loop"
 	case DelegateSessionUnavailable:
 		return "delegation: session is not available"
-	case DelegateUnknownRequest:
-		return "delegation: unknown request " + strconv.Quote(e.RequestID.String())
 	case DelegateMissingDelegateID:
 		return "delegation: a delegate_id is required"
-	case DelegateMissingRequestID:
-		return "delegation: a request_id is required"
 	case DelegateUnknownOperation:
 		return "delegation: unknown operation"
 	case DelegateInterruptPending:

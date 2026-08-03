@@ -174,7 +174,7 @@ func TestSeedResolvedDelegateRecordsMarksTombstonedRequestsFailed(t *testing.T) 
 	); err != nil {
 		t.Fatal(err)
 	}
-	resolved, ok := manager.getResolved(requestID)
+	resolved, ok := durableResolvedRecord(manager, requestID)
 	if !ok || resolved.childID != childID || resolved.status != tool.DelegateStatusFailed {
 		t.Fatalf("resolved = %+v, %v; want failed child %v", resolved, ok, childID)
 	}
