@@ -360,21 +360,40 @@ func (m *delegationManager) controllerFor(parentLoopID uuid.UUID, parent loop.De
 	return controller
 }
 
-// pendingRequest is one in-flight wait:false delegate request: a background drain fills
-// its terminal (text + status) and closes done; a later wait reads it.
+// pendingRequest is one wait:false delegate request retained until a later wait collects
+// it. Its lifecycle distinguishes work queued behind the child's active turn from the
+// active request and retained terminal response.
 type pendingRequest struct {
 	childID uuid.UUID
 	done    chan struct{}
 
-	mu     sync.Mutex
-	text   string
-	status tool.DelegateStatusValue
+	mu        sync.Mutex
+	lifecycle pendingRequestLifecycle
+	text      string
+	status    tool.DelegateStatusValue
+}
+
+type pendingRequestLifecycle uint8
+
+const (
+	pendingRequestQueued pendingRequestLifecycle = iota
+	pendingRequestActive
+	pendingRequestTerminal
+)
+
+func (p *pendingRequest) markActive() {
+	p.mu.Lock()
+	if p.lifecycle == pendingRequestQueued {
+		p.lifecycle = pendingRequestActive
+	}
+	p.mu.Unlock()
 }
 
 func (p *pendingRequest) resolve(text string, status tool.DelegateStatusValue) {
 	p.mu.Lock()
 	p.text = text
 	p.status = status
+	p.lifecycle = pendingRequestTerminal
 	p.mu.Unlock()
 	close(p.done)
 }
@@ -383,6 +402,12 @@ func (p *pendingRequest) result() (string, tool.DelegateStatusValue) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.text, p.status
+}
+
+func (p *pendingRequest) queued() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lifecycle == pendingRequestQueued
 }
 
 // registerPending records a wait:false request and starts the background drain that
@@ -395,7 +420,7 @@ func (m *delegationManager) registerPending(requestID, childID uuid.UUID, sub ev
 	m.mu.Unlock()
 	go func() {
 		defer func() { _ = sub.Close() }()
-		text, err := drainDelegateAnswer(sessionCtx, sub, requestID, interrupt)
+		text, err := drainDelegateAnswerObserved(sessionCtx, sub, requestID, interrupt, pr.markActive)
 		pr.resolve(text, statusFromDrain(err))
 	}()
 }
@@ -413,14 +438,14 @@ func (m *delegationManager) removePending(requestID uuid.UUID) {
 	m.mu.Unlock()
 }
 
-// pendingCount returns the number of unresolved (or resolved-but-uncollected) requests
-// for one child — the bounded mechanical figure a status report exposes.
+// pendingCount returns the requests waiting behind one child's active turn. Active and
+// terminal-but-uncollected requests remain retained but are not queued messages.
 func (m *delegationManager) pendingCount(childID uuid.UUID) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	count := 0
 	for _, pr := range m.requests {
-		if pr.childID == childID {
+		if pr.childID == childID && pr.queued() {
 			count++
 		}
 	}

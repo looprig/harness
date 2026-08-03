@@ -995,8 +995,8 @@ func TestDelegateWaitFalseThenWaitResolves(t *testing.T) {
 	if err != nil {
 		t.Fatalf("status before collection: %v", err)
 	}
-	if len(status.Agents) != 1 || status.Agents[0].State != tool.AgentStateIdle || status.Agents[0].QueuedMessages != 1 {
-		t.Fatalf("resolved-uncollected agents = %+v, want one idle agent with one queued message", status.Agents)
+	if len(status.Agents) != 1 || status.Agents[0].State != tool.AgentStateIdle || status.Agents[0].QueuedMessages != 0 {
+		t.Fatalf("resolved-uncollected agents = %+v, want one idle agent with no queued messages", status.Agents)
 	}
 
 	resolved, err := waitResponse(delegateCtx(t), ctrl, s, queued.AgentID, queued.CorrelationID, nil)
@@ -1016,6 +1016,28 @@ func TestDelegateWaitFalseThenWaitResolves(t *testing.T) {
 	if !errors.As(err, &de) || de.Kind != DelegateUnknownRequest {
 		t.Fatalf("wait unknown request error = %v, want DelegateUnknownRequest", err)
 	}
+}
+
+func TestDelegateStatusCountsOnlyRequestsQueuedBehindActiveTurn(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+
+	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: active.AgentID})
+	}()
+	waitDelegateMechanicalStatus(t, ctrl, active.AgentID, tool.DelegateStatusRunning)
+	waitDelegateQueuedMessages(t, ctrl, active.AgentID, 0)
+
+	if _, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: active.AgentID, Message: "B", WaitForResponse: false}); err != nil {
+		t.Fatal(err)
+	}
+	waitDelegateQueuedMessages(t, ctrl, active.AgentID, 1)
 }
 
 func TestDelegateWaitTimeoutInterruptsRunningChild(t *testing.T) {
@@ -1285,6 +1307,25 @@ func waitDelegateMechanicalStatus(t *testing.T, ctrl tool.DelegateController, de
 		select {
 		case <-deadline:
 			t.Fatalf("delegate agents = %+v, want legacy state %v", status.Agents, want)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func waitDelegateQueuedMessages(t *testing.T, ctrl tool.DelegateController, delegateID uuid.UUID, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		status, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: delegateID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(status.Agents) == 1 && status.Agents[0].QueuedMessages == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("delegate agents = %+v, want queued_messages %d", status.Agents, want)
 		case <-time.After(time.Millisecond):
 		}
 	}
