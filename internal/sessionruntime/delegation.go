@@ -360,9 +360,10 @@ func (m *delegationManager) controllerFor(parentLoopID uuid.UUID, parent loop.De
 	return controller
 }
 
-// pendingRequest is one wait:false delegate request retained until a later wait collects
-// it. Its lifecycle distinguishes work queued behind the child's active turn from the
-// active request and retained terminal response.
+// pendingRequest tracks one admitted delegate request. Its lifecycle distinguishes work
+// queued behind the child's active turn from the active request and terminal response.
+// Foreground trackers are removed when their result returns; background trackers remain
+// retained until a later wait collects them.
 type pendingRequest struct {
 	childID uuid.UUID
 	done    chan struct{}
@@ -410,14 +411,21 @@ func (p *pendingRequest) queued() bool {
 	return p.lifecycle == pendingRequestQueued
 }
 
-// registerPending records a wait:false request and starts the background drain that
-// resolves it. The drain runs on the SESSION lifetime (not the parent turn ctx, which
-// ends when the tool call returns), so a later wait can still collect the answer.
-func (m *delegationManager) registerPending(requestID, childID uuid.UUID, sub event.Subscription, sessionCtx context.Context, interrupt func()) {
+// registerRequest records every request immediately after accepted admission, before
+// either foreground or background draining begins. Since callers subscribe before
+// admission, the correlated TurnStarted remains observable even if it raced ahead.
+func (m *delegationManager) registerRequest(requestID, childID uuid.UUID) *pendingRequest {
 	pr := &pendingRequest{childID: childID, done: make(chan struct{})}
 	m.mu.Lock()
 	m.requests[requestID] = pr
 	m.mu.Unlock()
+	return pr
+}
+
+// collectRequest starts the session-owned background drain for a retained request. The
+// drain runs on the SESSION lifetime (not the parent turn ctx, which ends when the tool
+// call returns), so a later wait can still collect the answer.
+func (m *delegationManager) collectRequest(pr *pendingRequest, requestID uuid.UUID, sub event.Subscription, sessionCtx context.Context, interrupt func()) {
 	go func() {
 		defer func() { _ = sub.Close() }()
 		text, err := drainDelegateAnswerObserved(sessionCtx, sub, requestID, interrupt, pr.markActive)
@@ -916,27 +924,30 @@ func (c *scopedController) status(s *Session, req tool.DelegateRequest) (tool.De
 	return tool.DelegateResult{Agents: agents, Truncated: truncated}, nil
 }
 
-// resolveOrQueue waits for the correlated turn (wait:true) or registers a pending
-// request and returns a queued handle (wait:false).
+// resolveOrQueue tracks every admitted request, then waits for the correlated turn
+// (wait:true) or starts a retained background collector (wait:false).
 func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, childID, requestID uuid.UUID, sub event.Subscription, req tool.DelegateRequest) (tool.DelegateResult, error) {
+	tracked := c.manager.registerRequest(requestID, childID)
 	if req.WaitForResponse {
 		defer func() { _ = sub.Close() }()
+		defer c.manager.removePending(requestID)
 		waitCtx, cancel := waitContext(ctx, req.TimeoutSeconds)
 		defer cancel()
-		text, err := drainDelegateAnswer(waitCtx, sub, requestID, func() {
+		text, err := drainDelegateAnswerObserved(waitCtx, sub, requestID, func() {
 			_, _ = s.cancelDelegateRequest(childID, requestID)
-		})
+		}, tracked.markActive)
 		status := statusFromDrain(err)
 		if status == tool.DelegateStatusInterrupted && didTimeout(req.TimeoutSeconds, waitCtx) {
 			status = tool.DelegateStatusTimedOut
 		}
+		tracked.resolve(text, status)
 		result := c.responseResult(s, childID, requestID, status, text)
 		if req.Name != "" {
 			result.Name = req.Name
 		}
 		return result, nil
 	}
-	c.manager.registerPending(requestID, childID, sub, s.sessionCtx, func() {
+	c.manager.collectRequest(tracked, requestID, sub, s.sessionCtx, func() {
 		_, _ = s.cancelDelegateRequest(childID, requestID)
 	})
 	result := c.agentResult(s, childID)

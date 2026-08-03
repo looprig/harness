@@ -1040,6 +1040,77 @@ func TestDelegateStatusCountsOnlyRequestsQueuedBehindActiveTurn(t *testing.T) {
 	waitDelegateQueuedMessages(t, ctrl, active.AgentID, 1)
 }
 
+func TestDelegateStatusTracksForegroundRequestQueuedBehindActiveTurn(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	providerErr := errors.New("released provider")
+	client := &releasedFailureLLM{started: make(chan struct{}), release: make(chan struct{}), err: providerErr}
+	child := mustDefine(
+		loop.WithName("child"),
+		loop.WithInference(client, validModel("child")),
+		loop.WithDrainTimeout(100*time.Millisecond),
+	)
+	s := newDelegationSession(t, parent, nil, child)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+
+	background, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-client.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background request did not start")
+	}
+	waitDelegateQueuedMessages(t, ctrl, background.AgentID, 0)
+
+	foregroundResult := make(chan tool.DelegateResult, 1)
+	foregroundErr := make(chan error, 1)
+	go func() {
+		result, executeErr := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: background.AgentID, Message: "B", WaitForResponse: true})
+		foregroundResult <- result
+		foregroundErr <- executeErr
+	}()
+	waitDelegateQueuedMessages(t, ctrl, background.AgentID, 1)
+
+	close(client.release)
+	select {
+	case result := <-foregroundResult:
+		if executeErr := <-foregroundErr; executeErr != nil || result.ResponseStatus != tool.DelegateResponseFailed {
+			t.Fatalf("foreground result = %+v, %v; want failed response", result, executeErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("foreground request did not finish")
+	}
+	waitDelegateQueuedMessages(t, ctrl, background.AgentID, 0)
+
+	backgroundRequest, ok := s.delegation.getPending(background.CorrelationID)
+	if !ok {
+		t.Fatal("completed background request was not retained")
+	}
+	select {
+	case <-backgroundRequest.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background request did not reach terminal state")
+	}
+	s.delegation.mu.Lock()
+	tracked := len(s.delegation.requests)
+	s.delegation.mu.Unlock()
+	if tracked != 1 {
+		t.Fatalf("tracked requests after foreground return = %d, want only retained background request", tracked)
+	}
+
+	if _, err := waitResponse(delegateCtx(t), ctrl, s, background.AgentID, background.CorrelationID, nil); err != nil {
+		t.Fatal(err)
+	}
+	s.delegation.mu.Lock()
+	tracked = len(s.delegation.requests)
+	s.delegation.mu.Unlock()
+	if tracked != 0 {
+		t.Fatalf("tracked requests after background collection = %d, want 0", tracked)
+	}
+}
+
 func TestDelegateWaitTimeoutInterruptsRunningChild(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")

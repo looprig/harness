@@ -105,9 +105,8 @@ func drainDelegateAnswer(ctx context.Context, sub event.Subscription, commandID 
 	return drainDelegateAnswerObserved(ctx, sub, commandID, interrupt, nil)
 }
 
-// drainDelegateAnswerObserved is the background-collector seam for reporting when the
-// correlated request leaves the child queue and opens a turn. Other drain callers do not
-// observe this lifecycle edge.
+// drainDelegateAnswerObserved reports when the correlated request leaves the child queue
+// and opens a turn. Managed foreground and background drains use the same lifecycle edge.
 func drainDelegateAnswerObserved(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt, onTurnStarted func()) (string, error) {
 	return drainCorrelated(ctx, sub, commandID, interrupt, false, onTurnStarted)
 }
