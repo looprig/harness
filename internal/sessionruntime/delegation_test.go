@@ -601,9 +601,8 @@ func TestDelegateRuntimeProjectsStableModelAliasFromSecondHarnessSharingProfile(
 	if got := withoutMapping.agentRuntime(handle).Model; got != "" {
 		t.Fatalf("public runtime model without stable mapping = %q, want omitted", got)
 	}
-	legacyHandle := *handle
-	legacyHandle.selectedHarness = ""
-	legacyRuntime := scoped.agentRuntime(&legacyHandle)
+	legacyHandle := &loopHandle{bound: handle.bound}
+	legacyRuntime := scoped.agentRuntime(legacyHandle)
 	if legacyRuntime.Harness != "" || legacyRuntime.Model != "" {
 		t.Fatalf("ambiguous legacy public runtime = %+v, want harness and model omitted", legacyRuntime)
 	}
