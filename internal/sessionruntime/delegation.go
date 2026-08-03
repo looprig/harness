@@ -1022,7 +1022,7 @@ func (c *scopedController) agentRuntime(handle *loopHandle) tool.DelegateRuntime
 	identity := handle.bound.RuntimeIdentity()
 	runtime := tool.DelegateRuntime{
 		Profile: string(identity.Profile), Source: string(identity.Source),
-		SelectionKind: string(identity.SelectionKind), Model: string(identity.ModelAlias),
+		SelectionKind: string(identity.SelectionKind),
 	}
 	if identity.Profile != "" || identity.Source != "" || identity.SelectionKind != "" || identity.ModelAlias != "" {
 		runtime.Effort = runtimeEffortString(identity.Effort)
@@ -1030,25 +1030,54 @@ func (c *scopedController) agentRuntime(handle *loopHandle) tool.DelegateRuntime
 			runtime.Effort = ""
 		}
 	}
-	for _, entry := range c.runtimeCatalog.EntriesFor(handle.bound.Name()) {
-		if entry.Profile == identity.Profile {
-			runtime.Harness = string(entry.AgentHarness)
-			break
+	if identity.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+		for _, entry := range c.runtimeCatalog.EntriesFor(handle.bound.Name()) {
+			if entry.Profile == identity.Profile {
+				runtime.Harness = string(entry.AgentHarness)
+				break
+			}
 		}
+		return runtime
 	}
-	if c.hasRuntimeCatalog && identity.SelectionKind != loop.RuntimeSelectionHarnessManaged && runtime.Harness != "" && identity.ModelAlias != "" {
-		resolved, err := c.runtimeCatalog.ResolveTargetAliasWithSource(
-			handle.bound.Name(),
-			loop.AgentHarnessName(runtime.Harness),
-			identity.Source,
-			identity.ModelAlias,
-			identity.Effort,
-		)
-		if err == nil && resolved.Profile == identity.Profile {
-			runtime.Model = string(resolved.ModelAlias)
-		}
+	if resolved, ok := c.publicRuntimeIdentity(handle.bound.Name(), identity); ok {
+		runtime.Harness = string(resolved.AgentHarness)
+		runtime.Model = string(resolved.ModelAlias)
 	}
 	return runtime
+}
+
+func (c *scopedController) publicRuntimeIdentity(agent identity.AgentName, durable loop.RuntimeIdentity) (loop.Resolved, bool) {
+	if !c.hasRuntimeCatalog || durable.ModelAlias == "" {
+		return loop.Resolved{}, false
+	}
+	var match loop.Resolved
+	found := false
+	for _, entry := range c.runtimeCatalog.EntriesFor(agent) {
+		if entry.Profile != durable.Profile || entry.SelectionKind != durable.SelectionKind {
+			continue
+		}
+		resolved, err := c.runtimeCatalog.ResolveTargetAliasWithSource(agent, entry.AgentHarness, durable.Source, durable.ModelAlias, durable.Effort)
+		if err != nil || !resolvedMatchesRuntimeIdentity(resolved, durable) {
+			continue
+		}
+		if found && (match.AgentHarness != resolved.AgentHarness || match.ModelAlias != resolved.ModelAlias) {
+			return loop.Resolved{}, false
+		}
+		match = resolved
+		found = true
+	}
+	return match, found
+}
+
+func resolvedMatchesRuntimeIdentity(resolved loop.Resolved, durable loop.RuntimeIdentity) bool {
+	if resolved.Profile != durable.Profile || resolved.Source != durable.Source || resolved.SelectionKind != durable.SelectionKind ||
+		resolved.Effort != durable.Effort || (resolved.TargetAlias != durable.ModelAlias && resolved.ModelAlias != durable.ModelAlias) {
+		return false
+	}
+	if durable.TargetProvider != "" && resolved.Target.Provider != durable.TargetProvider {
+		return false
+	}
+	return durable.TargetModel == "" || resolved.Target.Name == durable.TargetModel
 }
 
 func (c *scopedController) childState(s *Session, agentID uuid.UUID) tool.AgentState {

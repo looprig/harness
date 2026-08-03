@@ -498,12 +498,19 @@ func TestDelegateRuntimeAcceptsPreparedExplicitSingleChoiceAndRejectsInvalidMemb
 	}
 }
 
-func TestDelegateRuntimeProjectsConcreteTargetAliasAsStableModelAlias(t *testing.T) {
+func TestDelegateRuntimeProjectsStableModelAliasFromSecondHarnessSharingProfile(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	child := delegateChild("child", "runtime child")
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex", Default: true,
+		SubagentType: "child", AgentHarness: "alpha", Profile: "acp/shared", Default: true,
+		Credential: loop.CredentialGatewayBacked, DefaultModel: "nova",
+		Models: []loop.RuntimeModelOption{{
+			Alias: "nova", Target: validModel("nova-target"),
+			DefaultEffort: model.EffortLow, Efforts: []model.Effort{model.EffortLow, model.EffortHigh},
+		}},
+	}, {
+		SubagentType: "child", AgentHarness: "codex", Profile: "acp/shared",
 		Credential: loop.CredentialGatewayBacked, DefaultModel: "luna",
 		Models: []loop.RuntimeModelOption{{
 			Alias: "luna", Target: validModel("luna-target"),
@@ -515,7 +522,7 @@ func TestDelegateRuntimeProjectsConcreteTargetAliasAsStableModelAlias(t *testing
 	}
 	builder := &fakeForeignBuilder{sid: fixedForeignSID, backend: newFakeBackend()}
 	registry := &foreign.BuilderRegistry{}
-	if err := registry.Register("acp/codex", builder.build, builder.buildRestored); err != nil {
+	if err := registry.Register("acp/shared", builder.build, builder.buildRestored); err != nil {
 		t.Fatal(err)
 	}
 	s := newDelegationSession(t, parent, []Option{WithRuntimeCatalog(catalog), WithForeignBuilderRegistry(registry)}, child)
@@ -523,8 +530,8 @@ func TestDelegateRuntimeProjectsConcreteTargetAliasAsStableModelAlias(t *testing
 	result, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
 		Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: true,
 		Runtime: &tool.DelegateRuntime{
-			Harness: "codex", Profile: "acp/codex", Source: "gateway", SelectionKind: "explicit",
-			Model: "luna", Effort: "high", Explicit: tool.DelegateRuntimeExplicit{Model: true, Effort: true},
+			Harness: "codex", Profile: "acp/shared", Source: "gateway", SelectionKind: "explicit",
+			Model: "luna", Effort: "high", Explicit: tool.DelegateRuntimeExplicit{Harness: true, Model: true, Effort: true},
 		},
 	})
 	if err != nil {
@@ -544,7 +551,16 @@ func TestDelegateRuntimeProjectsConcreteTargetAliasAsStableModelAlias(t *testing
 		t.Fatalf("list selected runtime = %+v, %v", listed.Agents, err)
 	}
 	if got := listed.Agents[0].Runtime.Model; got != "luna" {
-		t.Fatalf("public runtime model = %q, want stable alias luna", got)
+		t.Fatalf("public runtime model = %q, want stable alias luna and never concrete alias luna@high", got)
+	}
+	scoped, ok := ctrl.(*scopedController)
+	if !ok {
+		t.Fatalf("controller = %T, want *scopedController", ctrl)
+	}
+	withoutMapping := *scoped
+	withoutMapping.runtimeCatalog = loop.RuntimeCatalog{}
+	if got := withoutMapping.agentRuntime(handle).Model; got != "" {
+		t.Fatalf("public runtime model without stable mapping = %q, want omitted", got)
 	}
 }
 
