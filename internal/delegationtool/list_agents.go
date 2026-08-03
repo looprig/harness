@@ -25,7 +25,7 @@ func NewListAgents(controller tool.DelegateController, style loop.DelegationStyl
 }
 
 func (s *ListAgentsTool) Info(context.Context) (*tool.ToolInfo, error) {
-	return &tool.ToolInfo{Name: listAgentsToolName, Desc: "List child agents directly owned by this loop.", Schema: json.RawMessage(s.config.schema())}, nil
+	return &tool.ToolInfo{Name: listAgentsToolName, Desc: "List child agents directly owned by this loop.", Schema: json.RawMessage(buildListAgentsSchema())}, nil
 }
 
 func (*ListAgentsTool) AuditSummary(string) string { return listAgentsToolName }
@@ -34,22 +34,19 @@ func (s *ListAgentsTool) PrepareCall(_ context.Context, _ uuid.UUID, argsJSON st
 	if s.config.style != loop.DelegationManaged {
 		return tool.Request{}, nil, preparationFailure(errCategoryInvalidValue)
 	}
-	envelope, err := prepareEnvelope(argsJSON)
-	if err != nil || envelope.Action != actionStatus {
-		if err == nil {
-			err = preparationFailure(errCategoryInvalidValue)
-		}
+	prepared, err := prepareListAgents(argsJSON)
+	if err != nil {
 		return tool.Request{}, nil, err
 	}
 	request := tool.DelegateRequest{Operation: tool.DelegateStatus}
-	if envelope.DelegateID != nil {
-		request.DelegateID = *envelope.DelegateID
+	if prepared.AgentID != nil {
+		request.DelegateID = *prepared.AgentID
 	}
 	return tool.Request{}, tool.DelegateArtifact{Request: request}, nil
 }
 
 func (s *ListAgentsTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
-	return executeAgentCall(ctx, s.controller, formatListAgentsResult)
+	return executeAgentCall(ctx, s.controller, tool.DelegateStatus, formatListAgentsResult)
 }
 
 func formatListAgentsResult(_ tool.DelegateRequest, result tool.DelegateResult) string {

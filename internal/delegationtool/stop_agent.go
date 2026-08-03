@@ -25,7 +25,7 @@ func NewStopAgent(controller tool.DelegateController, style loop.DelegationStyle
 }
 
 func (s *StopAgentTool) Info(context.Context) (*tool.ToolInfo, error) {
-	return &tool.ToolInfo{Name: stopAgentToolName, Desc: "Stop an existing child agent's current response.", Schema: json.RawMessage(s.config.schema())}, nil
+	return &tool.ToolInfo{Name: stopAgentToolName, Desc: "Stop an existing child agent's current response.", Schema: json.RawMessage(buildStopAgentSchema())}, nil
 }
 
 func (*StopAgentTool) AuditSummary(string) string { return stopAgentToolName }
@@ -34,18 +34,15 @@ func (s *StopAgentTool) PrepareCall(_ context.Context, _ uuid.UUID, argsJSON str
 	if s.config.style != loop.DelegationManaged {
 		return tool.Request{}, nil, preparationFailure(errCategoryInvalidValue)
 	}
-	envelope, err := prepareEnvelope(argsJSON)
-	if err != nil || envelope.Action != actionInterrupt {
-		if err == nil {
-			err = preparationFailure(errCategoryInvalidValue)
-		}
+	prepared, err := prepareStopAgent(argsJSON)
+	if err != nil {
 		return tool.Request{}, nil, err
 	}
-	return tool.Request{}, tool.DelegateArtifact{Request: tool.DelegateRequest{Operation: tool.DelegateInterrupt, DelegateID: *envelope.DelegateID}}, nil
+	return tool.Request{}, tool.DelegateArtifact{Request: tool.DelegateRequest{Operation: tool.DelegateInterrupt, DelegateID: prepared.AgentID}}, nil
 }
 
 func (s *StopAgentTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
-	return executeAgentCall(ctx, s.controller, formatStopAgentResult)
+	return executeAgentCall(ctx, s.controller, tool.DelegateInterrupt, formatStopAgentResult)
 }
 
 func formatStopAgentResult(_ tool.DelegateRequest, result tool.DelegateResult) string {

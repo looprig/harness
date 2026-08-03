@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
@@ -15,15 +16,14 @@ import (
 )
 
 const (
-	maxSubagentArgsBytes = 256 << 10
-	maxDescriptionBytes  = 256
-	maxPromptBytes       = 192 << 10
+	maxAgentArgsBytes    = 256 << 10
+	maxAgentNameBytes    = 256
+	maxAgentMessageBytes = 192 << 10
+	maxAgentTypeBytes    = 128
+	maxAgentModeBytes    = 128
 	maxTimeoutSeconds    = 24 * 60 * 60
 )
 
-// Preparation error categories are deliberately short and closed. Their strings
-// are the complete model-facing error; decoder details and untrusted values never
-// escape this package.
 const (
 	errCategoryOversized       = "oversized"
 	errCategoryMalformed       = "malformed"
@@ -34,173 +34,197 @@ const (
 	errCategoryUnknownRuntime  = "unknown_runtime"
 )
 
-var errPreparationSentinel = errors.New("subagent preparation rejected")
-
-type agentAction string
-
-const (
-	actionStart     agentAction = "start"
-	actionSend      agentAction = "send"
-	actionWait      agentAction = "wait"
-	actionInterrupt agentAction = "interrupt"
-	actionStatus    agentAction = "status"
-)
+var errPreparationSentinel = errors.New("agent preparation rejected")
 
 type preparationError struct{ category string }
 
-func (e *preparationError) Error() string {
-	return errPreparationSentinel.Error() + ": " + e.category
-}
-
-func (e *preparationError) Unwrap() error { return errPreparationSentinel }
-
+func (e *preparationError) Error() string      { return errPreparationSentinel.Error() + ": " + e.category }
+func (e *preparationError) Unwrap() error      { return errPreparationSentinel }
 func preparationFailure(category string) error { return &preparationError{category: category} }
 
-// agentEnvelope is the normalized, strictly validated transitional call.
-// Runtime selectors remain opaque strings here; Task 21 resolves them against a
-// parent-scoped catalog. A nil Effort means that effort was omitted, while a
-// non-nil pointer preserves an explicit "none" selection.
-type agentEnvelope struct {
-	Action          agentAction
-	Description     string
-	Prompt          string
-	SubagentType    string
-	Mode            string
+type startAgentWire struct {
+	AgentType       string  `json:"agent_type"`
+	Name            string  `json:"name,omitempty"`
+	Instructions    string  `json:"instructions"`
+	WaitForResponse *bool   `json:"wait_for_response,omitempty"`
+	TimeoutSeconds  *int    `json:"timeout_seconds,omitempty"`
+	AgentHarness    string  `json:"agent_harness,omitempty"`
+	AgentSource     string  `json:"agent_source,omitempty"`
+	Model           string  `json:"model,omitempty"`
+	Effort          *string `json:"effort,omitempty"`
+	AgentMode       string  `json:"agent_mode,omitempty"`
+}
+
+type messageAgentWire struct {
+	AgentID         *string `json:"agent_id"`
+	Message         string  `json:"message"`
+	WaitForResponse *bool   `json:"wait_for_response,omitempty"`
+	TimeoutSeconds  *int    `json:"timeout_seconds,omitempty"`
+}
+
+type listAgentsWire struct {
+	AgentID *string `json:"agent_id,omitempty"`
+}
+
+type stopAgentWire struct {
+	AgentID *string `json:"agent_id"`
+}
+
+type PreparedStartAgent struct {
+	AgentType       string
+	Name            string
+	Instructions    string
+	WaitForResponse bool
+	TimeoutSeconds  *int
 	AgentHarness    string
 	AgentSource     string
 	Model           string
 	Effort          *string
-	RunInBackground bool
-	DelegateID      *uuid.UUID
-	RequestID       *uuid.UUID
-	TimeoutSeconds  *int
+	AgentMode       string
+	Runtime         *tool.DelegateRuntime
 
-	// Selector presence is kept separately from the normalized string values so
-	// an explicit selector can never be confused with an omitted selector.
 	agentHarnessSet bool
 	agentSourceSet  bool
 	modelSet        bool
 	effortSet       bool
+	agentModeSet    bool
 }
 
-// wireEnvelope is intentionally the complete and only accepted JSON surface.
-// Do not add compatibility aliases here: the old agent/message/wait envelope is
-// being hard-replaced in a later task.
-type wireEnvelope struct {
-	Action          agentAction `json:"action,omitempty"`
-	Description     string      `json:"description,omitempty"`
-	Prompt          string      `json:"prompt,omitempty"`
-	SubagentType    string      `json:"subagent_type,omitempty"`
-	Mode            string      `json:"mode,omitempty"`
-	AgentHarness    string      `json:"agent_harness,omitempty"`
-	AgentSource     string      `json:"agent_source,omitempty"`
-	Model           string      `json:"model,omitempty"`
-	Effort          *string     `json:"effort,omitempty"`
-	RunInBackground *bool       `json:"run_in_background,omitempty"`
-	DelegateID      *string     `json:"delegate_id,omitempty"`
-	RequestID       *string     `json:"request_id,omitempty"`
-	TimeoutSeconds  *int        `json:"timeout_seconds,omitempty"`
+type PreparedMessageAgent struct {
+	AgentID         uuid.UUID
+	Message         string
+	WaitForResponse bool
+	TimeoutSeconds  *int
 }
 
-func fields(names ...string) map[string]struct{} {
-	result := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		result[name] = struct{}{}
+type PreparedListAgents struct{ AgentID *uuid.UUID }
+type PreparedStopAgent struct{ AgentID uuid.UUID }
+
+func prepareStartAgent(argsJSON string) (PreparedStartAgent, error) {
+	var wire startAgentWire
+	present, err := decodeStrictAgentJSON(argsJSON, &wire)
+	if err != nil {
+		return PreparedStartAgent{}, err
 	}
-	return result
+	if err := requireText("agent_type", wire.AgentType, present, maxAgentTypeBytes); err != nil {
+		return PreparedStartAgent{}, err
+	}
+	if err := requireText("instructions", wire.Instructions, present, maxAgentMessageBytes); err != nil {
+		return PreparedStartAgent{}, err
+	}
+	if err := validateOptionalText("name", wire.Name, present, maxAgentNameBytes); err != nil {
+		return PreparedStartAgent{}, err
+	}
+	if err := validateOptionalText("agent_harness", wire.AgentHarness, present, maxAgentTypeBytes); err != nil {
+		return PreparedStartAgent{}, err
+	}
+	if err := validateOptionalText("agent_source", wire.AgentSource, present, maxAgentTypeBytes); err != nil {
+		return PreparedStartAgent{}, err
+	}
+	if err := validateOptionalText("model", wire.Model, present, maxAgentTypeBytes); err != nil {
+		return PreparedStartAgent{}, err
+	}
+	if err := validateOptionalText("agent_mode", wire.AgentMode, present, maxAgentModeBytes); err != nil {
+		return PreparedStartAgent{}, err
+	}
+	if err := validateWaitAndTimeout(wire.WaitForResponse, wire.TimeoutSeconds, present); err != nil {
+		return PreparedStartAgent{}, err
+	}
+	if wire.Effort != nil {
+		switch *wire.Effort {
+		case "none", "low", "medium", "high", "max":
+		default:
+			return PreparedStartAgent{}, preparationFailure(errCategoryInvalidValue)
+		}
+	} else if _, supplied := present["effort"]; supplied {
+		return PreparedStartAgent{}, preparationFailure(errCategoryInvalidValue)
+	}
+	return PreparedStartAgent{
+		AgentType: wire.AgentType, Name: wire.Name, Instructions: wire.Instructions,
+		WaitForResponse: waitForResponse(wire.WaitForResponse), TimeoutSeconds: wire.TimeoutSeconds,
+		AgentHarness: wire.AgentHarness, AgentSource: wire.AgentSource, Model: wire.Model,
+		Effort: wire.Effort, AgentMode: wire.AgentMode,
+		agentHarnessSet: hasField(present, "agent_harness"), agentSourceSet: hasField(present, "agent_source"),
+		modelSet: hasField(present, "model"), effortSet: hasField(present, "effort"), agentModeSet: hasField(present, "agent_mode"),
+	}, nil
 }
 
-// prepareEnvelope performs the untrusted preparation boundary for a Subagent
-// call. It is deliberately independent of the controller and runtime catalog so
-// the same normalized artifact can be extended by Task 21 without re-decoding.
-func prepareEnvelope(argsJSON string) (agentEnvelope, error) {
-	if len(argsJSON) > maxSubagentArgsBytes {
-		return agentEnvelope{}, preparationFailure(errCategoryOversized)
+func prepareMessageAgent(argsJSON string) (PreparedMessageAgent, error) {
+	var wire messageAgentWire
+	present, err := decodeStrictAgentJSON(argsJSON, &wire)
+	if err != nil {
+		return PreparedMessageAgent{}, err
 	}
+	id, err := requireAgentID(wire.AgentID, present)
+	if err != nil {
+		return PreparedMessageAgent{}, err
+	}
+	if err := requireText("message", wire.Message, present, maxAgentMessageBytes); err != nil {
+		return PreparedMessageAgent{}, err
+	}
+	if err := validateWaitAndTimeout(wire.WaitForResponse, wire.TimeoutSeconds, present); err != nil {
+		return PreparedMessageAgent{}, err
+	}
+	return PreparedMessageAgent{AgentID: id, Message: wire.Message, WaitForResponse: waitForResponse(wire.WaitForResponse), TimeoutSeconds: wire.TimeoutSeconds}, nil
+}
 
+func prepareListAgents(argsJSON string) (PreparedListAgents, error) {
+	var wire listAgentsWire
+	present, err := decodeStrictAgentJSON(argsJSON, &wire)
+	if err != nil {
+		return PreparedListAgents{}, err
+	}
+	if !hasField(present, "agent_id") {
+		return PreparedListAgents{}, nil
+	}
+	id, err := parseAgentID(wire.AgentID)
+	if err != nil {
+		return PreparedListAgents{}, err
+	}
+	return PreparedListAgents{AgentID: &id}, nil
+}
+
+func prepareStopAgent(argsJSON string) (PreparedStopAgent, error) {
+	var wire stopAgentWire
+	present, err := decodeStrictAgentJSON(argsJSON, &wire)
+	if err != nil {
+		return PreparedStopAgent{}, err
+	}
+	id, err := requireAgentID(wire.AgentID, present)
+	if err != nil {
+		return PreparedStopAgent{}, err
+	}
+	return PreparedStopAgent{AgentID: id}, nil
+}
+
+func decodeStrictAgentJSON(argsJSON string, destination any) (map[string]json.RawMessage, error) {
+	if len(argsJSON) > maxAgentArgsBytes {
+		return nil, preparationFailure(errCategoryOversized)
+	}
+	if !utf8.ValidString(argsJSON) {
+		return nil, preparationFailure(errCategoryMalformed)
+	}
 	raw, err := oneJSONValue([]byte(argsJSON))
 	if err != nil {
-		return agentEnvelope{}, preparationFailure(errCategoryMalformed)
+		return nil, preparationFailure(errCategoryMalformed)
 	}
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return agentEnvelope{}, preparationFailure(errCategoryMalformed)
+		return nil, preparationFailure(errCategoryMalformed)
 	}
-
 	present := make(map[string]json.RawMessage)
 	if err := json.Unmarshal(trimmed, &present); err != nil || present == nil {
-		return agentEnvelope{}, preparationFailure(errCategoryMalformed)
+		return nil, preparationFailure(errCategoryMalformed)
 	}
-
-	var wire wireEnvelope
 	decoder := json.NewDecoder(bytes.NewReader(trimmed))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&wire); err != nil {
+	if err := decoder.Decode(destination); err != nil {
 		if strings.Contains(err.Error(), "unknown field") {
-			return agentEnvelope{}, preparationFailure(errCategoryUnknownField)
+			return nil, preparationFailure(errCategoryUnknownField)
 		}
-		if strings.Contains(err.Error(), "delegate_id") || strings.Contains(err.Error(), "request_id") {
-			return agentEnvelope{}, preparationFailure(errCategoryInvalidValue)
-		}
-		return agentEnvelope{}, preparationFailure(errCategoryMalformed)
+		return nil, preparationFailure(errCategoryMalformed)
 	}
-
-	action := wire.Action
-	if _, supplied := present["action"]; !supplied {
-		action = actionStart
-	} else if action == "" {
-		return agentEnvelope{}, preparationFailure(errCategoryInvalidValue)
-	}
-	if !knownAgentAction(action) {
-		return agentEnvelope{}, preparationFailure(errCategoryInvalidValue)
-	}
-	delegateID, err := parseWireUUID(wire.DelegateID)
-	if err != nil {
-		return agentEnvelope{}, preparationFailure(errCategoryInvalidValue)
-	}
-	requestID, err := parseWireUUID(wire.RequestID)
-	if err != nil {
-		return agentEnvelope{}, preparationFailure(errCategoryInvalidValue)
-	}
-
-	if err := validateAllowedFields(action, present); err != nil {
-		return agentEnvelope{}, err
-	}
-	if err := validateRequiredFields(action, wire, delegateID, requestID, present); err != nil {
-		return agentEnvelope{}, err
-	}
-	if err := validateBounds(action, wire, delegateID, requestID, present); err != nil {
-		return agentEnvelope{}, err
-	}
-
-	background := true
-	if wire.RunInBackground != nil {
-		background = *wire.RunInBackground
-	}
-	_, agentHarnessSet := present["agent_harness"]
-	_, agentSourceSet := present["agent_source"]
-	_, modelSet := present["model"]
-	_, effortSet := present["effort"]
-
-	return agentEnvelope{
-		Action:          action,
-		Description:     wire.Description,
-		Prompt:          wire.Prompt,
-		SubagentType:    wire.SubagentType,
-		Mode:            wire.Mode,
-		AgentHarness:    wire.AgentHarness,
-		AgentSource:     wire.AgentSource,
-		Model:           wire.Model,
-		Effort:          wire.Effort,
-		RunInBackground: background,
-		DelegateID:      delegateID,
-		RequestID:       requestID,
-		TimeoutSeconds:  wire.TimeoutSeconds,
-		agentHarnessSet: agentHarnessSet,
-		agentSourceSet:  agentSourceSet,
-		modelSet:        modelSet,
-		effortSet:       effortSet,
-	}, nil
+	return present, nil
 }
 
 func oneJSONValue(input []byte) (json.RawMessage, error) {
@@ -216,174 +240,127 @@ func oneJSONValue(input []byte) (json.RawMessage, error) {
 	return raw, nil
 }
 
-func knownAgentAction(action agentAction) bool {
-	switch action {
-	case actionStart, actionSend, actionWait, actionInterrupt, actionStatus:
-		return true
-	default:
-		return false
-	}
+func waitForResponse(value *bool) bool { return value == nil || *value }
+func hasField(present map[string]json.RawMessage, name string) bool {
+	_, ok := present[name]
+	return ok
 }
 
-func validateAllowedFields(action agentAction, present map[string]json.RawMessage) error {
-	allowed := map[agentAction]map[string]struct{}{
-		actionStart:     fields("action", "description", "prompt", "subagent_type", "mode", "agent_harness", "agent_source", "model", "effort", "run_in_background", "timeout_seconds"),
-		actionSend:      fields("action", "prompt", "run_in_background", "timeout_seconds", "delegate_id"),
-		actionWait:      fields("action", "delegate_id", "request_id", "timeout_seconds"),
-		actionInterrupt: fields("action", "delegate_id"),
-		actionStatus:    fields("action", "delegate_id"),
-	}
-	for name := range present {
-		if _, ok := allowed[action][name]; !ok {
-			return preparationFailure(errCategoryFieldNotAllowed)
-		}
-	}
-	return nil
-}
-
-func validateRequiredFields(action agentAction, wire wireEnvelope, delegateID, requestID *uuid.UUID, present map[string]json.RawMessage) error {
-	switch action {
-	case actionStart:
-		if err := requireNonBlank("description", wire.Description, present); err != nil {
-			return err
-		}
-		if err := requireNonBlank("prompt", wire.Prompt, present); err != nil {
-			return err
-		}
-		return requireNonBlank("subagent_type", wire.SubagentType, present)
-	case actionSend:
-		if err := requireUUID("delegate_id", delegateID, present); err != nil {
-			return err
-		}
-		return requireNonBlank("prompt", wire.Prompt, present)
-	case actionWait:
-		if err := requireUUID("delegate_id", delegateID, present); err != nil {
-			return err
-		}
-		return requireUUID("request_id", requestID, present)
-	case actionInterrupt:
-		return requireUUID("delegate_id", delegateID, present)
-	}
-	return validateOptionalUUID("delegate_id", delegateID, present)
-}
-
-func validateBounds(action agentAction, wire wireEnvelope, delegateID, requestID *uuid.UUID, present map[string]json.RawMessage) error {
-	if action == actionStart || action == actionSend {
-		if len(wire.Description) > maxDescriptionBytes || len(wire.Prompt) > maxPromptBytes {
-			return preparationFailure(errCategoryInvalidValue)
-		}
-	} else if len(wire.Prompt) > maxPromptBytes || len(wire.Description) > maxDescriptionBytes {
+func validateWaitAndTimeout(wait *bool, timeout *int, present map[string]json.RawMessage) error {
+	if wait == nil && hasField(present, "wait_for_response") {
 		return preparationFailure(errCategoryInvalidValue)
 	}
-
-	if wire.Effort != nil {
-		switch *wire.Effort {
-		case "none", "low", "medium", "high", "max":
-		default:
-			return preparationFailure(errCategoryInvalidValue)
-		}
-	} else if _, supplied := present["effort"]; supplied {
+	if timeout == nil && hasField(present, "timeout_seconds") {
 		return preparationFailure(errCategoryInvalidValue)
 	}
-
-	if wire.TimeoutSeconds != nil {
-		if *wire.TimeoutSeconds < 0 || *wire.TimeoutSeconds > maxTimeoutSeconds {
-			return preparationFailure(errCategoryInvalidValue)
-		}
-	} else if _, supplied := present["timeout_seconds"]; supplied {
-		return preparationFailure(errCategoryInvalidValue)
-	}
-	if action == actionStart || action == actionSend {
-		background := true
-		if wire.RunInBackground != nil {
-			background = *wire.RunInBackground
-		} else if _, supplied := present["run_in_background"]; supplied {
-			return preparationFailure(errCategoryInvalidValue)
-		}
-		if background && wire.TimeoutSeconds != nil {
-			return preparationFailure(errCategoryFieldNotAllowed)
-		}
-	}
-
-	if err := validateOptionalUUID("delegate_id", delegateID, present); err != nil {
-		return err
-	}
-	return validateOptionalUUID("request_id", requestID, present)
-}
-
-func requireNonBlank(name, value string, present map[string]json.RawMessage) error {
-	if _, supplied := present[name]; !supplied {
-		return preparationFailure(errCategoryMissingField)
-	}
-	if strings.TrimSpace(value) == "" {
+	if timeout != nil && (*timeout < 0 || *timeout > maxTimeoutSeconds) {
 		return preparationFailure(errCategoryInvalidValue)
 	}
 	return nil
 }
 
-func requireUUID(name string, value *uuid.UUID, present map[string]json.RawMessage) error {
-	if _, supplied := present[name]; !supplied {
+func requireText(name, value string, present map[string]json.RawMessage, limit int) error {
+	if !hasField(present, name) {
 		return preparationFailure(errCategoryMissingField)
 	}
-	return validateOptionalUUID(name, value, present)
+	if strings.TrimSpace(value) == "" || len(value) > limit || !utf8.ValidString(value) {
+		return preparationFailure(errCategoryInvalidValue)
+	}
+	return nil
 }
 
-func validateOptionalUUID(name string, value *uuid.UUID, present map[string]json.RawMessage) error {
-	if _, supplied := present[name]; !supplied {
+func validateOptionalText(name, value string, present map[string]json.RawMessage, limit int) error {
+	if !hasField(present, name) {
 		return nil
 	}
-	if value == nil || value.IsZero() {
+	if strings.TrimSpace(value) == "" || len(value) > limit || !utf8.ValidString(value) {
 		return preparationFailure(errCategoryInvalidValue)
 	}
 	return nil
 }
 
-func parseWireUUID(value *string) (*uuid.UUID, error) {
-	if value == nil {
-		return nil, nil
+func requireAgentID(value *string, present map[string]json.RawMessage) (uuid.UUID, error) {
+	if !hasField(present, "agent_id") {
+		return uuid.UUID{}, preparationFailure(errCategoryMissingField)
 	}
-	u, err := uuid.Parse(*value)
-	if err != nil {
-		return nil, err
-	}
-	return &u, nil
+	return parseAgentID(value)
 }
 
-func (s *agentToolConfig) resolveDelegateRuntime(envelope agentEnvelope) (*tool.DelegateRuntime, error) {
+func parseAgentID(value *string) (uuid.UUID, error) {
+	if value == nil || len(*value) > 36 || !utf8.ValidString(*value) {
+		return uuid.UUID{}, preparationFailure(errCategoryInvalidValue)
+	}
+	id, err := uuid.Parse(*value)
+	if err != nil || id.IsZero() {
+		return uuid.UUID{}, preparationFailure(errCategoryInvalidValue)
+	}
+	return id, nil
+}
+
+func (s *agentToolConfig) prepareStartAgent(argsJSON string) (PreparedStartAgent, error) {
+	prepared, err := prepareStartAgent(argsJSON)
+	if err != nil {
+		return PreparedStartAgent{}, err
+	}
+	if !s.hasSubagentType(prepared.AgentType) {
+		return PreparedStartAgent{}, preparationFailure(errCategoryUnknownRuntime)
+	}
+	if err := s.validateAgentMode(prepared); err != nil {
+		return PreparedStartAgent{}, err
+	}
+	runtime, err := s.resolveDelegateRuntime(prepared)
+	if err != nil {
+		return PreparedStartAgent{}, err
+	}
+	prepared.Runtime = runtime
+	return prepared, nil
+}
+
+func (s *agentToolConfig) validateAgentMode(prepared PreparedStartAgent) error {
+	for _, role := range s.catalog {
+		if string(role.Name) != prepared.AgentType {
+			continue
+		}
+		if !prepared.agentModeSet {
+			return nil
+		}
+		if len(role.Modes) <= 1 {
+			return preparationFailure(errCategoryFieldNotAllowed)
+		}
+		for _, mode := range role.Modes {
+			if string(mode) == prepared.AgentMode {
+				return nil
+			}
+		}
+		return preparationFailure(errCategoryInvalidValue)
+	}
+	return preparationFailure(errCategoryUnknownRuntime)
+}
+
+func (s *agentToolConfig) resolveDelegateRuntime(prepared PreparedStartAgent) (*tool.DelegateRuntime, error) {
 	if !s.hasRuntimeCatalog {
-		// A zero catalog is the native/no-choice catalog. An explicitly supplied
-		// selector must never be silently ignored when a caller bypasses the
-		// composition seam.
-		if envelope.agentHarnessSet || envelope.agentSourceSet || envelope.modelSet || envelope.effortSet {
+		if prepared.agentHarnessSet || prepared.agentSourceSet || prepared.modelSet || prepared.effortSet {
 			return nil, preparationFailure(errCategoryFieldNotAllowed)
 		}
 		return nil, nil
 	}
-
-	entries := s.runtimeCatalog.EntriesFor(identity.AgentName(envelope.SubagentType))
+	entries := s.runtimeCatalog.EntriesFor(identity.AgentName(prepared.AgentType))
 	if len(entries) == 0 {
 		if !s.runtimeCatalog.HasEntries() {
-			if envelope.agentHarnessSet || envelope.agentSourceSet || envelope.modelSet || envelope.effortSet {
+			if prepared.agentHarnessSet || prepared.agentSourceSet || prepared.modelSet || prepared.effortSet {
 				return nil, preparationFailure(errCategoryFieldNotAllowed)
 			}
 			return nil, nil
 		}
-		if !s.hasSubagentType(envelope.SubagentType) {
-			return nil, preparationFailure(errCategoryUnknownRuntime)
-		}
-		// A populated parent catalog is authoritative for every role. Unknown
-		// entries must never leak across the role boundary into native fallback,
-		// including when the envelope omits all runtime selectors.
 		return nil, preparationFailure(errCategoryUnknownRuntime)
 	}
-
 	selected := runtimeDefaultEntry(entries)
 	selectedHarness := selected.AgentHarness
-	if envelope.agentHarnessSet {
+	if prepared.agentHarnessSet {
 		if !runtimeHarnessSelectable(entries) {
 			return nil, preparationFailure(errCategoryFieldNotAllowed)
 		}
-		selectedHarness = loop.AgentHarnessName(envelope.AgentHarness)
+		selectedHarness = loop.AgentHarnessName(prepared.AgentHarness)
 		harnessEntries := runtimeEntriesForHarness(entries, selectedHarness)
 		if len(harnessEntries) == 0 {
 			return nil, preparationFailure(errCategoryUnknownRuntime)
@@ -391,35 +368,34 @@ func (s *agentToolConfig) resolveDelegateRuntime(envelope agentEnvelope) (*tool.
 		selected = runtimeDefaultEntry(harnessEntries)
 	}
 	harnessEntries := runtimeEntriesForHarness(entries, selectedHarness)
-	if envelope.agentSourceSet {
+	if prepared.agentSourceSet {
 		if !runtimeSourceSelectableForEntries(harnessEntries) {
 			return nil, preparationFailure(errCategoryFieldNotAllowed)
 		}
 		var found bool
-		selected, found = runtimeEntryForSource(harnessEntries, loop.RuntimeSourceName(envelope.AgentSource))
+		selected, found = runtimeEntryForSource(harnessEntries, loop.RuntimeSourceName(prepared.AgentSource))
 		if !found {
 			return nil, preparationFailure(errCategoryUnknownRuntime)
 		}
-	} else if envelope.agentHarnessSet && runtimeSourceSelectableForEntries(harnessEntries) && !selected.Default {
+	} else if prepared.agentHarnessSet && runtimeSourceSelectableForEntries(harnessEntries) && !selected.Default {
 		return nil, preparationFailure(errCategoryFieldNotAllowed)
 	}
-	if !envelope.agentSourceSet && runtimeSourceSelectableForEntries(harnessEntries) {
+	if !prepared.agentSourceSet && runtimeSourceSelectableForEntries(harnessEntries) {
 		if filtered, ok := runtimeEntryForSource([]loop.RuntimeCatalogEntry{selected}, selected.Source); ok {
 			selected = filtered
 		}
 	}
 	advertised := runtimeAdvertisedSelectors(entries, selected)
-	if envelope.agentSourceSet && !advertised.Source {
+	if prepared.agentSourceSet && !advertised.Source {
 		return nil, preparationFailure(errCategoryFieldNotAllowed)
 	}
-
-	if envelope.modelSet {
+	if prepared.modelSet {
 		if !advertised.Model {
 			return nil, preparationFailure(errCategoryFieldNotAllowed)
 		}
 		found := false
 		for _, option := range selected.Models {
-			if string(option.Alias) == envelope.Model {
+			if string(option.Alias) == prepared.Model {
 				found = true
 				break
 			}
@@ -428,61 +404,31 @@ func (s *agentToolConfig) resolveDelegateRuntime(envelope agentEnvelope) (*tool.
 			return nil, preparationFailure(errCategoryUnknownRuntime)
 		}
 	}
-
 	var effort inferencemodel.Effort
-	if envelope.effortSet {
+	if prepared.effortSet {
 		if !advertised.Effort {
 			return nil, preparationFailure(errCategoryFieldNotAllowed)
 		}
-		effort = parseDelegateEffort(*envelope.Effort)
+		effort = parseDelegateEffort(*prepared.Effort)
 	}
 	selectedSource := loop.RuntimeSourceName("")
-	if envelope.agentSourceSet {
-		selectedSource = loop.RuntimeSourceName(envelope.AgentSource)
+	if prepared.agentSourceSet {
+		selectedSource = loop.RuntimeSourceName(prepared.AgentSource)
 	}
-	resolveAlias := loop.ModelAlias(envelope.Model)
-	resolved, err := s.runtimeCatalog.ResolveWithExplicitSource(
-		identity.AgentName(envelope.SubagentType),
-		selectedHarness,
-		selectedSource,
-		resolveAlias,
-		effort,
-		envelope.effortSet,
-	)
+	resolved, err := s.runtimeCatalog.ResolveWithExplicitSource(identity.AgentName(prepared.AgentType), selectedHarness, selectedSource, loop.ModelAlias(prepared.Model), effort, prepared.effortSet)
 	if err != nil {
-		var catalogErr *loop.RuntimeCatalogError
-		if errors.As(err, &catalogErr) && catalogErr.Kind != loop.RuntimeCatalogIncompatibleEffort {
-			return nil, preparationFailure(errCategoryUnknownRuntime)
-		}
 		return nil, preparationFailure(errCategoryUnknownRuntime)
 	}
-
 	runtimeModel := string(resolved.ModelAlias)
 	runtimeEffort := delegateEffortString(resolved.Effort)
 	if resolved.SelectionKind == loop.RuntimeSelectionHarnessManaged {
-		runtimeModel = ""
-		runtimeEffort = ""
+		runtimeModel, runtimeEffort = "", ""
 	}
 	return &tool.DelegateRuntime{
-		Harness:       string(resolved.AgentHarness),
-		Profile:       string(resolved.Profile),
-		Source:        string(resolved.Source),
-		SelectionKind: string(resolved.SelectionKind),
-		Model:         runtimeModel,
-		SmallModel:    string(resolved.SmallModel),
-		Effort:        runtimeEffort,
-		Explicit: tool.DelegateRuntimeExplicit{
-			Harness: envelope.agentHarnessSet,
-			Source:  envelope.agentSourceSet,
-			Model:   envelope.modelSet,
-			Effort:  envelope.effortSet,
-		},
-		Advertised: tool.DelegateRuntimeAdvertised{
-			Harness: advertised.Harness,
-			Source:  advertised.Source,
-			Model:   advertised.Model,
-			Effort:  advertised.Effort,
-		},
+		Harness: string(resolved.AgentHarness), Profile: string(resolved.Profile), Source: string(resolved.Source), SelectionKind: string(resolved.SelectionKind),
+		Model: runtimeModel, SmallModel: string(resolved.SmallModel), Effort: runtimeEffort,
+		Explicit:   tool.DelegateRuntimeExplicit{Harness: prepared.agentHarnessSet, Source: prepared.agentSourceSet, Model: prepared.modelSet, Effort: prepared.effortSet},
+		Advertised: tool.DelegateRuntimeAdvertised{Harness: advertised.Harness, Source: advertised.Source, Model: advertised.Model, Effort: advertised.Effort},
 	}, nil
 }
 

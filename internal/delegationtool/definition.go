@@ -37,18 +37,15 @@ const (
 	availableAgentElisionMarker   = "<elided additional agent capabilities>"
 )
 
-func buildAgentTransitionSchema(style loop.DelegationStyle, catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) string {
-	fieldOrder := []string{"action", "description", "prompt", "subagent_type", "mode", "agent_harness", "agent_source", "model", "effort", "run_in_background", "delegate_id", "request_id", "timeout_seconds"}
+func buildStartAgentSchema(style loop.DelegationStyle, catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) string {
 	properties := map[string]any{
-		"action":            map[string]any{"type": "string", "enum": []string{"start", "send", "wait", "interrupt", "status"}},
-		"description":       map[string]any{"type": "string"},
-		"prompt":            map[string]any{"type": "string"},
-		"subagent_type":     map[string]any{"type": "string"},
-		"mode":              map[string]any{"type": "string"},
-		"run_in_background": map[string]any{"type": "boolean", "default": true},
-		"delegate_id":       map[string]any{"type": "string"},
-		"request_id":        map[string]any{"type": "string"},
-		"timeout_seconds":   map[string]any{"type": "integer", "minimum": 0},
+		"agent_type":        map[string]any{"type": "string"},
+		"name":              map[string]any{"type": "string"},
+		"instructions":      map[string]any{"type": "string"},
+		"wait_for_response": map[string]any{"type": "boolean", "default": true},
+		"timeout_seconds":   map[string]any{"type": "integer", "minimum": 0, "maximum": maxTimeoutSeconds},
+		"model":             map[string]any{"type": "string"},
+		"effort":            map[string]any{"type": "string"},
 	}
 	selectors := availableRuntimeSelectors(catalog, runtimeCatalog)
 	if selectors.Harness {
@@ -57,72 +54,60 @@ func buildAgentTransitionSchema(style loop.DelegationStyle, catalog []AgentCatal
 	if selectors.Source {
 		properties["agent_source"] = map[string]any{"type": "string"}
 	}
-	if selectors.Model {
-		properties["model"] = map[string]any{"type": "string"}
-	}
-	if selectors.Effort {
-		properties["effort"] = map[string]any{"type": "string"}
-	}
-	startThen := map[string]any{
-		"not":      map[string]any{"anyOf": requiredProperties([]string{"delegate_id", "request_id"})},
-		"required": []string{"description", "prompt", "subagent_type"},
-		"oneOf":    startRoleVariants(catalog, runtimeCatalog),
-	}
-	actionBranch := func(action string, required, allowed []string) map[string]any {
-		allowedSet := map[string]struct{}{"action": {}}
-		for _, name := range allowed {
-			allowedSet[name] = struct{}{}
-		}
-		forbidden := make([]string, 0, len(fieldOrder))
-		for _, name := range fieldOrder {
-			if _, ok := allowedSet[name]; !ok {
-				forbidden = append(forbidden, name)
-			}
-		}
-		then := map[string]any{"not": map[string]any{"anyOf": requiredProperties(forbidden)}}
-		if len(required) > 0 {
-			then["required"] = required
-		}
-		return map[string]any{
-			"if":   map[string]any{"required": []string{"action"}, "properties": map[string]any{"action": map[string]any{"const": action}}},
-			"then": then,
-		}
-	}
-	startAllowed := []string{"description", "prompt", "subagent_type", "mode", "run_in_background", "timeout_seconds"}
-	if selectors.Harness {
-		startAllowed = append(startAllowed, "agent_harness")
-	}
-	if selectors.Source {
-		startAllowed = append(startAllowed, "agent_source")
-	}
-	if selectors.Model {
-		startAllowed = append(startAllowed, "model")
-	}
-	if selectors.Effort {
-		startAllowed = append(startAllowed, "effort")
-	}
-	startBranch := actionBranch("start", nil, startAllowed)
-	startBranch["then"] = startThen
-	defaultStartBranch := map[string]any{
-		"if":   map[string]any{"not": map[string]any{"required": []string{"action"}}},
-		"then": startThen,
-	}
-	branches := []any{
-		startBranch,
-		defaultStartBranch,
-		actionBranch("send", []string{"delegate_id", "prompt"}, []string{"delegate_id", "prompt", "run_in_background", "timeout_seconds"}),
-		actionBranch("wait", []string{"delegate_id", "request_id"}, []string{"delegate_id", "request_id", "timeout_seconds"}),
-		actionBranch("interrupt", []string{"delegate_id"}, []string{"delegate_id"}),
-		actionBranch("status", nil, []string{"delegate_id"}),
+	if agentModeSelectable(catalog) {
+		properties["agent_mode"] = map[string]any{"type": "string"}
 	}
 	if style == loop.DelegationSyncOnly {
-		properties["action"] = map[string]any{"type": "string", "enum": []string{"start"}}
-		properties["run_in_background"] = map[string]any{"const": false}
-		branches = branches[:2]
+		properties["wait_for_response"] = map[string]any{"type": "boolean", "const": true, "default": true}
 	}
-	schema := map[string]any{"type": "object", "additionalProperties": false, "properties": properties, "allOf": branches}
+	schema := map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"properties":           properties,
+		"required":             []string{"agent_type", "instructions"},
+		"oneOf":                startRoleVariants(catalog, runtimeCatalog),
+	}
 	encoded, _ := json.Marshal(schema)
 	return string(encoded)
+}
+
+func buildMessageAgentSchema(style loop.DelegationStyle) string {
+	wait := map[string]any{"type": "boolean", "default": true}
+	if style == loop.DelegationSyncOnly {
+		wait["const"] = true
+	}
+	return marshalAgentSchema(map[string]any{
+		"agent_id":          map[string]any{"type": "string"},
+		"message":           map[string]any{"type": "string"},
+		"wait_for_response": wait,
+		"timeout_seconds":   map[string]any{"type": "integer", "minimum": 0, "maximum": maxTimeoutSeconds},
+	}, []string{"agent_id", "message"})
+}
+
+func buildListAgentsSchema() string {
+	return marshalAgentSchema(map[string]any{"agent_id": map[string]any{"type": "string"}}, nil)
+}
+
+func buildStopAgentSchema() string {
+	return marshalAgentSchema(map[string]any{"agent_id": map[string]any{"type": "string"}}, []string{"agent_id"})
+}
+
+func marshalAgentSchema(properties map[string]any, required []string) string {
+	schema := map[string]any{"type": "object", "additionalProperties": false, "properties": properties}
+	if len(required) > 0 {
+		schema["required"] = required
+	}
+	encoded, _ := json.Marshal(schema)
+	return string(encoded)
+}
+
+func agentModeSelectable(catalog []AgentCatalogEntry) bool {
+	for _, role := range catalog {
+		if len(role.Modes) > 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func requiredProperties(names []string) []any {
@@ -204,19 +189,18 @@ func startRoleSourceVariants(role AgentCatalogEntry, entries []loop.RuntimeCatal
 
 func startRoleVariantWithSelectors(role AgentCatalogEntry, entry *loop.RuntimeCatalogEntry, explicitHarness, defaultHarness, explicitSource, sourceSelectable, defaultSource bool) map[string]any {
 	properties := map[string]any{
-		"action":            map[string]any{"const": "start"},
-		"description":       map[string]any{"type": "string"},
-		"prompt":            map[string]any{"type": "string"},
-		"subagent_type":     map[string]any{"const": string(role.Name)},
-		"run_in_background": map[string]any{"type": "boolean"},
-		"timeout_seconds":   map[string]any{"type": "integer", "minimum": 0},
+		"agent_type":        map[string]any{"const": string(role.Name)},
+		"name":              map[string]any{"type": "string"},
+		"instructions":      map[string]any{"type": "string"},
+		"wait_for_response": map[string]any{"type": "boolean"},
+		"timeout_seconds":   map[string]any{"type": "integer", "minimum": 0, "maximum": maxTimeoutSeconds},
 	}
 	modes := make([]string, len(role.Modes))
 	for i, mode := range role.Modes {
 		modes[i] = string(mode)
 	}
-	if len(modes) > 0 {
-		properties["mode"] = map[string]any{"type": "string", "enum": modes}
+	if len(modes) > 1 {
+		properties["agent_mode"] = map[string]any{"type": "string", "enum": modes}
 	}
 	if entry != nil {
 		if explicitHarness {
@@ -476,11 +460,12 @@ func runtimeDefaultEntry(entries []loop.RuntimeCatalogEntry) loop.RuntimeCatalog
 }
 
 func runtimeAdvertisedSelectors(entries []loop.RuntimeCatalogEntry, selected loop.RuntimeCatalogEntry) runtimeSelectorAvailability {
+	explicitRuntime := selected.SelectionKind != loop.RuntimeSelectionHarnessManaged && len(selected.Models) > 0
 	return runtimeSelectorAvailability{
 		Harness: runtimeHarnessSelectable(entries),
 		Source:  runtimeSourceSelectableForEntries(runtimeEntriesForHarness(entries, selected.AgentHarness)),
-		Model:   runtimeModelSelectable(selected),
-		Effort:  runtimeEffortSelectable(selected),
+		Model:   explicitRuntime,
+		Effort:  explicitRuntime,
 	}
 }
 
@@ -510,7 +495,7 @@ func availableRuntimeSelectors(catalog []AgentCatalogEntry, runtimeCatalog loop.
 }
 
 func addModelAndEffort(properties map[string]any, entry loop.RuntimeCatalogEntry) {
-	if len(entry.Models) > 1 {
+	if len(entry.Models) > 0 {
 		models := make([]string, len(entry.Models))
 		for i, model := range entry.Models {
 			models[i] = string(model.Alias)
@@ -518,7 +503,7 @@ func addModelAndEffort(properties map[string]any, entry loop.RuntimeCatalogEntry
 		properties["model"] = map[string]any{"type": "string", "enum": models}
 	}
 	efforts := admittedEfforts(entry.Models)
-	if len(efforts) > 1 {
+	if len(efforts) > 0 {
 		properties["effort"] = map[string]any{"type": "string", "enum": efforts}
 	}
 }

@@ -44,17 +44,17 @@ func cloneAgentCatalog(catalog []AgentCatalogEntry) []AgentCatalogEntry {
 	return result
 }
 
-func (c *agentToolConfig) schema() string {
-	return buildAgentTransitionSchema(c.style, c.catalog, c.runtimeCatalog)
+func (c *agentToolConfig) startSchema() string {
+	return buildStartAgentSchema(c.style, c.catalog, c.runtimeCatalog)
 }
 
-func executeAgentCall(ctx context.Context, controller tool.DelegateController, format func(tool.DelegateRequest, tool.DelegateResult) string) (*tool.ToolResult, error) {
+func executeAgentCall(ctx context.Context, controller tool.DelegateController, operation tool.DelegateOperation, format func(tool.DelegateRequest, tool.DelegateResult) string) (*tool.ToolResult, error) {
 	prepared, ok := loop.PreparedCallFromContext(ctx)
 	if !ok {
 		return tool.TextResult("error: agent call unavailable"), nil
 	}
 	artifact, ok := prepared.Artifact.(tool.DelegateArtifact)
-	if !ok {
+	if !ok || artifact.Request.Operation != operation {
 		return tool.TextResult("error: agent call unavailable"), nil
 	}
 	req := artifact.Request

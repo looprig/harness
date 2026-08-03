@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
@@ -12,36 +13,58 @@ import (
 	inferencemodel "github.com/looprig/inference/model"
 )
 
-func TestNewEnvelopeSchemaUsesOnlyNewWireFields(t *testing.T) {
-	info, err := NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog(), emptyRuntimeCatalog(t)).Info(context.Background())
-	if err != nil {
-		t.Fatal(err)
+func TestAgentToolSchemasAreClosedAndOperationSpecific(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		tool       preparedAgentTool
+		properties []string
+		required   []string
+	}{
+		{name: "StartAgent", tool: NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog(), emptyRuntimeCatalog(t)), properties: []string{"agent_mode", "agent_type", "effort", "instructions", "model", "name", "timeout_seconds", "wait_for_response"}, required: []string{"agent_type", "instructions"}},
+		{name: "MessageAgent", tool: NewMessageAgent(&fakeController{}, loop.DelegationManaged, agentCatalog()), properties: []string{"agent_id", "message", "timeout_seconds", "wait_for_response"}, required: []string{"agent_id", "message"}},
+		{name: "ListAgents", tool: NewListAgents(&fakeController{}, loop.DelegationManaged, agentCatalog()), properties: []string{"agent_id"}},
+		{name: "StopAgent", tool: NewStopAgent(&fakeController{}, loop.DelegationManaged, agentCatalog()), properties: []string{"agent_id"}, required: []string{"agent_id"}},
 	}
-	var schema map[string]any
-	if err := json.Unmarshal(info.Schema, &schema); err != nil {
-		t.Fatal(err)
-	}
-	properties, ok := schema["properties"].(map[string]any)
-	if !ok {
-		t.Fatalf("schema properties = %T, want object", schema["properties"])
-	}
-	for _, old := range []string{"agent", "message", "wait"} {
-		if _, present := properties[old]; present {
-			t.Errorf("legacy property %q is present", old)
-		}
-	}
-	for _, field := range []string{"action", "description", "prompt", "subagent_type", "mode", "run_in_background", "delegate_id", "request_id", "timeout_seconds"} {
-		if _, present := properties[field]; !present {
-			t.Errorf("new property %q is missing", field)
-		}
-	}
-	for _, field := range []string{"agent_harness", "model", "effort"} {
-		if _, present := properties[field]; present {
-			t.Errorf("selector property %q is present without a runtime choice", field)
-		}
-	}
-	if schema["additionalProperties"] != false {
-		t.Fatal("schema must set additionalProperties:false")
+	legacy := []string{"action", "subagent_type", "description", "prompt", "run_in_background", "delegate_id", "request_id", "pending"}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			info, err := tt.tool.Info(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var schema map[string]any
+			if err := json.Unmarshal(info.Schema, &schema); err != nil {
+				t.Fatal(err)
+			}
+			if schema["type"] != "object" || schema["additionalProperties"] != false {
+				t.Fatalf("schema is not a closed object: %s", info.Schema)
+			}
+			properties, ok := schema["properties"].(map[string]any)
+			if !ok {
+				t.Fatalf("schema properties = %T, want object", schema["properties"])
+			}
+			if got := sortedMapKeys(properties); !equalStrings(got, tt.properties) {
+				t.Fatalf("properties = %v, want %v", got, tt.properties)
+			}
+			if got := schemaStrings(schema["required"]); !equalStrings(got, tt.required) {
+				t.Fatalf("required = %v, want %v", got, tt.required)
+			}
+			for _, field := range legacy {
+				if strings.Contains(string(info.Schema), `"`+field+`"`) {
+					t.Errorf("legacy field %q is present", field)
+				}
+			}
+			if wait, ok := properties["wait_for_response"].(map[string]any); ok && wait["default"] != true {
+				t.Errorf("wait_for_response default = %v, want true", wait["default"])
+			}
+			if timeout, ok := properties["timeout_seconds"].(map[string]any); ok {
+				if _, present := timeout["default"]; present {
+					t.Errorf("timeout_seconds unexpectedly has a default")
+				}
+			}
+		})
 	}
 }
 
@@ -54,17 +77,19 @@ func TestSchemaRuntimeSelectorsFollowCapabilities(t *testing.T) {
 		wantEnums  map[string][]string
 	}{
 		{
-			name:     "single default harness and model",
-			catalog:  schemaCatalog(t, schemaEntry("worker", "claude-code", true, []string{"sonnet"}, []inferencemodel.Effort{inferencemodel.EffortMedium})),
-			noFields: []string{"agent_harness", "model", "effort"},
+			name:       "single default harness and model",
+			catalog:    schemaCatalog(t, schemaEntry("worker", "claude-code", true, []string{"sonnet"}, []inferencemodel.Effort{inferencemodel.EffortMedium})),
+			wantFields: []string{"model", "effort"},
+			noFields:   []string{"agent_harness", "agent_source"},
+			wantEnums:  map[string][]string{"model": {"sonnet"}, "effort": {"medium"}},
 		},
 		{
 			name: "multiple harnesses only exposes harness",
 			catalog: schemaCatalog(t,
 				schemaEntry("worker", "claude-code", true, []string{"sonnet"}, []inferencemodel.Effort{inferencemodel.EffortMedium}),
 				schemaEntry("worker", "codex", false, []string{"luna"}, []inferencemodel.Effort{inferencemodel.EffortHigh})),
-			wantFields: []string{"agent_harness"},
-			noFields:   []string{"model", "effort"},
+			wantFields: []string{"agent_harness", "model", "effort"},
+			noFields:   []string{"agent_source"},
 			wantEnums:  map[string][]string{"agent_harness": {"claude-code", "codex"}},
 		},
 		{
@@ -133,6 +158,23 @@ func TestSchemaMixedSourcesAdvertisesAgentSourceWithoutManagedPlaceholders(t *te
 	info, err := NewStartAgent(&fakeController{}, loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker"}}, catalog).Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(info.Schema, &schema); err != nil {
+		t.Fatal(err)
+	}
+	properties := schema["properties"].(map[string]any)
+	for _, field := range []string{"model", "effort"} {
+		if _, present := properties[field]; !present {
+			t.Fatalf("StartAgent root does not declare %s: %s", field, info.Schema)
+		}
+	}
+	modelsBySource := schemaSourceModelAliases(schema)
+	if !equalStringSet(modelsBySource["gateway"], map[string]struct{}{"luna": {}}) {
+		t.Fatalf("gateway branch models = %v, want luna", modelsBySource["gateway"])
+	}
+	if len(modelsBySource["native"]) != 0 {
+		t.Fatalf("harness-managed native branch models = %v, want none", modelsBySource["native"])
 	}
 	assertSchemaFieldPresence(t, info.Schema, []string{"agent_source"}, true)
 	if strings.Contains(info.Desc, "model=harness-managed") || strings.Contains(info.Desc, "effort=harness-managed") {
@@ -370,13 +412,9 @@ func TestSyncOnlySchemaIsStartOnlyForeground(t *testing.T) {
 		t.Fatal(err)
 	}
 	properties := schema["properties"].(map[string]any)
-	action := properties["action"].(map[string]any)
-	if got := action["enum"].([]any); len(got) != 1 || got[0] != "start" {
-		t.Fatalf("sync-only action enum = %v, want [start]", got)
-	}
-	background := properties["run_in_background"].(map[string]any)
-	if background["const"] != false {
-		t.Fatalf("sync-only run_in_background = %v, want const false", background)
+	wait := properties["wait_for_response"].(map[string]any)
+	if wait["const"] != true {
+		t.Fatalf("sync-only wait_for_response = %v, want const true", wait)
 	}
 }
 
@@ -420,10 +458,8 @@ func assertSchemaFieldPresence(t *testing.T, raw []byte, fields []string, want b
 	if err := json.Unmarshal(raw, &schema); err != nil {
 		t.Fatal(err)
 	}
-	allOf := schema["allOf"].([]any)
-	start := allOf[0].(map[string]any)["then"].(map[string]any)
 	for _, field := range fields {
-		got := schemaContainsProperty(start, field)
+		got := schemaContainsProperty(schema, field)
 		if got != want {
 			t.Errorf("start schema field %q present=%v, want %v", field, got, want)
 		}
@@ -459,9 +495,26 @@ func schemaEnumValues(t *testing.T, raw []byte, field string) []string {
 	if err := json.Unmarshal(raw, &schema); err != nil {
 		t.Fatal(err)
 	}
-	allOf := schema["allOf"].([]any)
-	start := allOf[0].(map[string]any)["then"].(map[string]any)
-	values := findSchemaEnum(start, field)
+	values := findSchemaEnum(schema, field)
+	return values
+}
+
+func sortedMapKeys(values map[string]any) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func schemaStrings(value any) []string {
+	raw, _ := value.([]any)
+	values := make([]string, len(raw))
+	for i := range raw {
+		values[i], _ = raw[i].(string)
+	}
+	sort.Strings(values)
 	return values
 }
 

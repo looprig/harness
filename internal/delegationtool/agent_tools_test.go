@@ -39,6 +39,7 @@ func agentCatalog() []AgentCatalogEntry {
 	return []AgentCatalogEntry{
 		{Name: "operator", Description: "edits files and runs commands", Modes: []loop.ModeName{"", "build"}},
 		{Name: "explorer", Description: "searches the workspace", Modes: []loop.ModeName{"", "review"}},
+		{Name: "worker", Description: "performs delegated work"},
 	}
 }
 
@@ -94,10 +95,10 @@ func TestAgentToolsPrepareFixedControllerOperations(t *testing.T) {
 		args string
 		want tool.DelegateOperation
 	}{
-		{name: "start", tool: NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog()), args: `{"description":"map","prompt":"inspect","subagent_type":"explorer"}`, want: tool.DelegateStart},
-		{name: "message", tool: NewMessageAgent(&fakeController{}, loop.DelegationManaged, agentCatalog()), args: `{"action":"send","delegate_id":"` + delegateID + `","prompt":"continue"}`, want: tool.DelegateSend},
-		{name: "list", tool: NewListAgents(&fakeController{}, loop.DelegationManaged, agentCatalog()), args: `{"action":"status"}`, want: tool.DelegateStatus},
-		{name: "stop", tool: NewStopAgent(&fakeController{}, loop.DelegationManaged, agentCatalog()), args: `{"action":"interrupt","delegate_id":"` + delegateID + `"}`, want: tool.DelegateInterrupt},
+		{name: "start", tool: NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog()), args: `{"name":"map","instructions":"inspect","agent_type":"explorer"}`, want: tool.DelegateStart},
+		{name: "message", tool: NewMessageAgent(&fakeController{}, loop.DelegationManaged, agentCatalog()), args: `{"agent_id":"` + delegateID + `","message":"continue"}`, want: tool.DelegateSend},
+		{name: "list", tool: NewListAgents(&fakeController{}, loop.DelegationManaged, agentCatalog()), args: `{}`, want: tool.DelegateStatus},
+		{name: "stop", tool: NewStopAgent(&fakeController{}, loop.DelegationManaged, agentCatalog()), args: `{"agent_id":"` + delegateID + `"}`, want: tool.DelegateInterrupt},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -129,16 +130,16 @@ func TestAgentToolsInvokePreparedRequests(t *testing.T) {
 	}{
 		{name: "start", newTool: func(c *fakeController) preparedAgentTool {
 			return NewStartAgent(c, loop.DelegationManaged, agentCatalog())
-		}, args: `{"description":"map","prompt":"inspect","subagent_type":"explorer","run_in_background":false}`, result: tool.DelegateResult{Status: tool.DelegateStatusCompleted, Output: "done"}, wantOp: tool.DelegateStart, wantOutput: "done"},
+		}, args: `{"name":"map","instructions":"inspect","agent_type":"explorer"}`, result: tool.DelegateResult{Status: tool.DelegateStatusCompleted, Output: "done"}, wantOp: tool.DelegateStart, wantOutput: "done"},
 		{name: "message", newTool: func(c *fakeController) preparedAgentTool {
 			return NewMessageAgent(c, loop.DelegationManaged, agentCatalog())
-		}, args: `{"action":"send","delegate_id":"` + delegateID.String() + `","prompt":"continue"}`, result: tool.DelegateResult{DelegateID: delegateID, RequestID: requestID, Status: tool.DelegateStatusQueued}, wantOp: tool.DelegateSend, wantOutput: `"status":"queued"`},
+		}, args: `{"agent_id":"` + delegateID.String() + `","message":"continue","wait_for_response":false}`, result: tool.DelegateResult{DelegateID: delegateID, RequestID: requestID, Status: tool.DelegateStatusQueued}, wantOp: tool.DelegateSend, wantOutput: `"status":"queued"`},
 		{name: "list", newTool: func(c *fakeController) preparedAgentTool {
 			return NewListAgents(c, loop.DelegationManaged, agentCatalog())
-		}, args: `{"action":"status"}`, result: tool.DelegateResult{Children: []tool.DelegateChildStatus{{DelegateID: delegateID, Status: tool.DelegateStatusIdle}}}, wantOp: tool.DelegateStatus, wantOutput: `"children"`},
+		}, args: `{}`, result: tool.DelegateResult{Children: []tool.DelegateChildStatus{{DelegateID: delegateID, Status: tool.DelegateStatusIdle}}}, wantOp: tool.DelegateStatus, wantOutput: `"children"`},
 		{name: "stop", newTool: func(c *fakeController) preparedAgentTool {
 			return NewStopAgent(c, loop.DelegationManaged, agentCatalog())
-		}, args: `{"action":"interrupt","delegate_id":"` + delegateID.String() + `"}`, result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusInterrupted}, wantOp: tool.DelegateInterrupt, wantOutput: `"status":"interrupted"`},
+		}, args: `{"agent_id":"` + delegateID.String() + `"}`, result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusInterrupted}, wantOp: tool.DelegateInterrupt, wantOutput: `"status":"interrupted"`},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -163,7 +164,7 @@ func TestAgentToolExecutionUsesTrustedPreparedArtifact(t *testing.T) {
 	t.Parallel()
 	controller := &fakeController{result: tool.DelegateResult{Status: tool.DelegateStatusCompleted, Output: "ok"}}
 	agentTool := NewStartAgent(controller, loop.DelegationManaged, agentCatalog())
-	request, artifact, err := agentTool.PrepareCall(context.Background(), mustParseUUID(t, "11111111-1111-4111-8111-111111111111"), `{"description":"d","prompt":"prepared","subagent_type":"explorer","run_in_background":false}`)
+	request, artifact, err := agentTool.PrepareCall(context.Background(), mustParseUUID(t, "11111111-1111-4111-8111-111111111111"), `{"name":"d","instructions":"prepared","agent_type":"explorer"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,6 +176,28 @@ func TestAgentToolExecutionUsesTrustedPreparedArtifact(t *testing.T) {
 	got := controller.last()
 	if got.Message != "prepared" || got.ParentToolUseID != "trusted-tool-use-id" {
 		t.Fatalf("controller request = %+v, want prepared message and trusted tool-use id", got)
+	}
+}
+
+func TestAgentToolExecutionRejectsPreparedArtifactForAnotherOperation(t *testing.T) {
+	t.Parallel()
+	controller := &fakeController{}
+	start := NewStartAgent(controller, loop.DelegationManaged, agentCatalog())
+	message := NewMessageAgent(controller, loop.DelegationManaged, agentCatalog())
+	request, artifact, err := message.PrepareCall(context.Background(), mustParseUUID(t, "11111111-1111-4111-8111-111111111111"), `{"agent_id":"55555555-5555-4555-8555-555555555555","message":"prepared"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{Request: request, Artifact: artifact})
+	result, err := start.InvokableRun(ctx, `{"agent_type":"explorer","instructions":"untrusted"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := textOf(t, result); got != "error: agent call unavailable" {
+		t.Fatalf("result = %q, want unavailable", got)
+	}
+	if got := controller.last(); got.Operation != 0 {
+		t.Fatalf("controller received cross-operation request: %+v", got)
 	}
 }
 

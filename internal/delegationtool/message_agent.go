@@ -25,7 +25,7 @@ func NewMessageAgent(controller tool.DelegateController, style loop.DelegationSt
 }
 
 func (s *MessageAgentTool) Info(context.Context) (*tool.ToolInfo, error) {
-	return &tool.ToolInfo{Name: messageAgentToolName, Desc: "Send a message to an existing child agent.", Schema: json.RawMessage(s.config.schema())}, nil
+	return &tool.ToolInfo{Name: messageAgentToolName, Desc: "Send a message to an existing child agent.", Schema: json.RawMessage(buildMessageAgentSchema(s.config.style))}, nil
 }
 
 func (*MessageAgentTool) AuditSummary(string) string { return messageAgentToolName }
@@ -34,19 +34,16 @@ func (s *MessageAgentTool) PrepareCall(_ context.Context, _ uuid.UUID, argsJSON 
 	if s.config.style != loop.DelegationManaged {
 		return tool.Request{}, nil, preparationFailure(errCategoryInvalidValue)
 	}
-	envelope, err := prepareEnvelope(argsJSON)
-	if err != nil || envelope.Action != actionSend {
-		if err == nil {
-			err = preparationFailure(errCategoryInvalidValue)
-		}
+	prepared, err := prepareMessageAgent(argsJSON)
+	if err != nil {
 		return tool.Request{}, nil, err
 	}
-	request := tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: *envelope.DelegateID, Message: envelope.Prompt, Wait: !envelope.RunInBackground, TimeoutSeconds: envelope.TimeoutSeconds}
+	request := tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: prepared.AgentID, Message: prepared.Message, Wait: prepared.WaitForResponse, TimeoutSeconds: prepared.TimeoutSeconds}
 	return tool.Request{}, tool.DelegateArtifact{Request: request}, nil
 }
 
 func (s *MessageAgentTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
-	return executeAgentCall(ctx, s.controller, formatMessageAgentResult)
+	return executeAgentCall(ctx, s.controller, tool.DelegateSend, formatMessageAgentResult)
 }
 
 func formatMessageAgentResult(req tool.DelegateRequest, result tool.DelegateResult) string {
