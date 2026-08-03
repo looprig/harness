@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -93,9 +94,13 @@ func (a *failChildStartAppender) AppendEvent(_ context.Context, ev event.Event) 
 // the wait:true / wait:false→wait request correlation.
 
 func delegateParent(style loop.DelegationStyle, delegates ...identity.AgentName) loop.Definition {
+	return delegateNode("parent", style, delegates...)
+}
+
+func delegateNode(name string, style loop.DelegationStyle, delegates ...identity.AgentName) loop.Definition {
 	return mustDefine(
-		loop.WithName("parent"),
-		loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("parent")}}, validModel("parent")),
+		loop.WithName(identity.AgentName(name)),
+		loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk(name)}}, validModel(name)),
 		loop.WithDelegates(delegates...),
 		loop.WithDelegation(loop.Delegation{Style: style}),
 		loop.WithDrainTimeout(100*time.Millisecond),
@@ -2088,6 +2093,134 @@ func waitLoopsExited(t *testing.T, s *Session) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("loop actor did not exit after crash cancel")
 		}
+	}
+}
+
+func TestAgentForegroundMessageDefaultsToWaiting(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	s := newDelegationSession(t, parent, nil, delegateChild("child", "reply"))
+	childCtrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+	started, err := childCtrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, AgentType: "child", Message: "start", WaitForResponse: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	message := delegationtool.NewMessageAgent(childCtrl, loop.DelegationManaged, nil)
+	_, artifact, err := message.PrepareCall(context.Background(), mustUUID(), `{"agent_id":"`+started.AgentID.String()+`","message":"next"}`)
+	if err != nil {
+		t.Fatalf("PrepareCall: %v", err)
+	}
+	request := artifact.(tool.DelegateArtifact).Request
+	if !request.WaitForResponse {
+		t.Fatal("omitted wait_for_response was not prepared as foreground")
+	}
+	result, err := childCtrl.Execute(delegateCtx(t), request)
+	if err != nil {
+		t.Fatalf("MessageAgent: %v", err)
+	}
+	if result.ResponseStatus != tool.DelegateResponseCompleted || result.Response != "reply" || result.State != tool.AgentStateIdle {
+		t.Fatalf("foreground result = %+v, want completed reply/idle", result)
+	}
+}
+
+func TestAgentForegroundTimeoutPreservesPersistentAgent(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, AgentType: "child", Message: "start", WaitForResponse: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seconds := 0
+	result, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateSend, AgentID: started.AgentID, Message: "timeout", WaitForResponse: true, TimeoutSeconds: &seconds,
+	})
+	if err != nil {
+		t.Fatalf("timed MessageAgent: %v", err)
+	}
+	if result.ResponseStatus != tool.DelegateResponseTimedOut || result.State != tool.AgentStateIdle || result.Response != "" {
+		t.Fatalf("timeout result = %+v, want timed-out empty response/idle", result)
+	}
+	status, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: started.AgentID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Agents) != 1 || status.Agents[0].State == tool.AgentStateUnavailable {
+		t.Fatalf("persistent agent after timeout = %+v, want retained live identity", status.Agents)
+	}
+}
+
+func TestAgentHierarchyRosterAndOwnership(t *testing.T) {
+	t.Parallel()
+	p := delegateNode("p", loop.DelegationManaged, "a", "b")
+	a := delegateNode("a", loop.DelegationManaged, "c")
+	s := newDelegationSession(t, p, nil, a, delegateChild("b", "b reply"), delegateChild("c", "c reply"))
+	pCtrl := s.delegation.controllerFor(s.ActiveLoopID(), p)
+	start := func(ctrl tool.DelegateController, req tool.DelegateRequest) tool.DelegateResult {
+		t.Helper()
+		result, err := ctrl.Execute(delegateCtx(t), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	aResult := start(pCtrl, tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "a", Message: "a", WaitForResponse: true})
+	bResult := start(pCtrl, tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "b", Message: "b", WaitForResponse: true})
+	aCtrl := s.delegation.controllerFor(aResult.AgentID, a)
+	cResult := start(aCtrl, tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "c", Message: "c", WaitForResponse: true})
+
+	list := func(ctrl tool.DelegateController) []tool.DelegateAgent {
+		t.Helper()
+		result, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result.Agents
+	}
+	gotP := list(pCtrl)
+	wantP := []uuid.UUID{aResult.AgentID, bResult.AgentID}
+	sort.Slice(wantP, func(i, j int) bool { return wantP[i].String() < wantP[j].String() })
+	if len(gotP) != 2 || gotP[0].AgentID != wantP[0] || gotP[1].AgentID != wantP[1] {
+		t.Fatalf("P roster = %+v, want direct A/B in UUID order", gotP)
+	}
+	if got := list(aCtrl); len(got) != 1 || got[0].AgentID != cResult.AgentID {
+		t.Fatalf("A roster = %+v, want direct C", got)
+	}
+	// A registry entry alone must not make an agent appear in a caller's roster.
+	// This models a loop owned by another subsystem that happens to carry the same
+	// parent provenance; ListAgents is required to use the controller's direct index.
+	s.loopsMu.Lock()
+	fakeID := mustUUID()
+	fake := *s.loops[aResult.AgentID]
+	fake.id = fakeID
+	s.loops[fakeID] = &fake
+	s.loopsMu.Unlock()
+	if got := list(pCtrl); len(got) != 2 {
+		t.Fatalf("P roster exposed unindexed registry entry: %+v", got)
+	}
+
+	for name, tc := range map[string]struct {
+		ctrl tool.DelegateController
+		id   uuid.UUID
+	}{
+		"P cannot address C":   {pCtrl, cResult.AgentID},
+		"A cannot address P":   {aCtrl, s.ActiveLoopID()},
+		"A cannot address B":   {aCtrl, bResult.AgentID},
+		"unknown is not owned": {pCtrl, mustUUID()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := tc.ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: tc.id})
+			var de *DelegateError
+			if !errors.As(err, &de) || de.Kind != DelegateNotOwned || de.Error() != (&DelegateError{Kind: DelegateNotOwned, DelegateID: tc.id}).Error() {
+				t.Fatalf("status error = %v, want bounded not-owned error", err)
+			}
+		})
 	}
 }
 

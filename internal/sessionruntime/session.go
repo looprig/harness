@@ -64,8 +64,9 @@ type Session struct {
 	// pairs the loop handle with the provenance of whatever spawned it (zero for
 	// a root loop). Today this map holds one entry; multi-agent
 	// orchestration adds subagent loops with a non-zero parent.
-	loops        map[uuid.UUID]*loopHandle
-	constructing bool
+	loops          map[uuid.UUID]*loopHandle
+	directChildren map[uuid.UUID]map[uuid.UUID]struct{}
+	constructing   bool
 
 	// activeLoopID is the mutable default target for Submit.
 	activeLoopID uuid.UUID
@@ -775,6 +776,26 @@ func (s *Session) recoverWorkspaceCheckpointFault() {
 // retries on the next eligible boundary; the failure must still remain observable.
 func (s *Session) observeBestEffortCheckpointError(err error) {
 	slog.ErrorContext(s.sessionCtx, "session: best-effort workspace checkpoint failed", "error", err)
+}
+
+// seedDirectChildren builds the ownership index once loops have been restored.
+func (s *Session) seedDirectChildren() {
+	s.loopsMu.Lock()
+	defer s.loopsMu.Unlock()
+	if s.directChildren == nil {
+		s.directChildren = make(map[uuid.UUID]map[uuid.UUID]struct{})
+	}
+	for id, handle := range s.loops {
+		if handle == nil || handle.parent.LoopID.IsZero() {
+			continue
+		}
+		children := s.directChildren[handle.parent.LoopID]
+		if children == nil {
+			children = make(map[uuid.UUID]struct{})
+			s.directChildren[handle.parent.LoopID] = children
+		}
+		children[id] = struct{}{}
+	}
 }
 
 // FaultErr is the loop actor's post-emit durable-fault probe (loopruntime type-asserts the
@@ -1515,6 +1536,17 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		selectedHarness = runtime.AgentHarness
 	}
 	s.loops[loopID] = &loopHandle{id: loopID, owner: s, bound: bound, bindings: bindings, backend: b, parent: parent, cancel: cancel, liveMode: startedMode, liveModel: liveModel, state: initialState, agentName: displayName, agentMode: startedMode, selectedHarness: selectedHarness}
+	if !parent.LoopID.IsZero() {
+		if s.directChildren == nil {
+			s.directChildren = make(map[uuid.UUID]map[uuid.UUID]struct{})
+		}
+		children := s.directChildren[parent.LoopID]
+		if children == nil {
+			children = make(map[uuid.UUID]struct{})
+			s.directChildren[parent.LoopID] = children
+		}
+		children[loopID] = struct{}{}
+	}
 	s.loopsMu.Unlock()
 
 	// Announce the new loop to subscribers active at creation time. Published AFTER
@@ -1728,6 +1760,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		sessionCancel:            sessionCancel,
 		constructionAbortTimeout: defaultConstructionAbortTimeout,
 		loops:                    make(map[uuid.UUID]*loopHandle),
+		directChildren:           make(map[uuid.UUID]map[uuid.UUID]struct{}),
 		constructing:             true,
 		newID:                    newID,
 		now:                      now,

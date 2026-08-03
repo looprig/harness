@@ -298,6 +298,7 @@ func (m *delegationManager) attach(s *Session) {
 	if m == nil {
 		return
 	}
+	s.seedDirectChildren()
 	m.mu.Lock()
 	m.session = s
 	m.mu.Unlock()
@@ -1025,9 +1026,10 @@ func (c *scopedController) ownsChildWithClosed(s *Session, childID uuid.UUID, al
 func (c *scopedController) ownedChildren(s *Session) []uuid.UUID {
 	s.loopsMu.RLock()
 	defer s.loopsMu.RUnlock()
-	var ids []uuid.UUID
-	for id, handle := range s.loops {
-		if handle.parent.LoopID == c.parentLoopID {
+	children := s.directChildren[c.parentLoopID]
+	ids := make([]uuid.UUID, 0, len(children))
+	for id := range children {
+		if _, ok := s.loops[id]; ok {
 			ids = append(ids, id)
 		}
 	}
