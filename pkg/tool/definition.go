@@ -234,9 +234,10 @@ type Bindings struct {
 	Delegate      DelegateController
 	// ExtraTools are additional tool definitions the LOOP appends to every mode's
 	// toolset at Bind, beyond the definition's own WithTools. The composition root uses
-	// it to inject a derived, definition-scoped tool (the delegation Subagent tool) into
-	// a loop WITHOUT mutating the immutable loop definition. Per-tool factories never see
-	// it (attenuateBindings drops it); only loop.Bind consumes it.
+	// it to inject the derived, definition-scoped atomic agent-tool bundle (StartAgent,
+	// MessageAgent, ListAgents, and StopAgent) into a loop WITHOUT mutating the immutable
+	// loop definition. Per-tool factories never see it (attenuateBindings drops it); only
+	// loop.Bind consumes it.
 	ExtraTools []Definition
 }
 

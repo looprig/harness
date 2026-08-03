@@ -1033,6 +1033,12 @@ func (c *scopedController) responseResult(s *Session, agentID, responseID uuid.U
 	result.CorrelationID = responseID
 	result.Response = response
 	result.ResponseStatus = responseStatus(status)
+	// The response drain can observe a correlated terminal before the hub's commit
+	// observer updates the persistent loop handle. A terminal foreground response is
+	// nevertheless idle by contract; roster snapshots continue to use the live handle.
+	if result.ResponseStatus != tool.DelegateResponseUnknown {
+		result.State = tool.AgentStateIdle
+	}
 	return result
 }
 

@@ -168,6 +168,42 @@ func TestDelegateStartSyncReturnsChildText(t *testing.T) {
 	}
 }
 
+func TestDelegateTerminalResponseResultIsIdleBeforeLiveStateUpdate(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent).(*scopedController)
+
+	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: active.AgentID})
+	}()
+	waitDelegateMechanicalStatus(t, ctrl, active.AgentID, tool.DelegateStatusRunning)
+
+	for _, status := range []tool.DelegateStatusValue{
+		tool.DelegateStatusCompleted,
+		tool.DelegateStatusInterrupted,
+		tool.DelegateStatusFailed,
+		tool.DelegateStatusTimedOut,
+	} {
+		result := ctrl.responseResult(s, active.AgentID, mustUUID(), status, "terminal")
+		if result.State != tool.AgentStateIdle {
+			t.Errorf("responseResult(%v).State = %v, want idle", status, result.State)
+		}
+	}
+
+	persistent, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: active.AgentID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persistent.Agents) != 1 || persistent.Agents[0].State != tool.AgentStateWorking {
+		t.Fatalf("persistent agent state = %+v, want working", persistent.Agents)
+	}
+}
+
 // TestDelegateStartValidation covers the boundary refusals that must NOT spawn: an
 // unauthorized agent, an agent not in the topology, and an undeclared mode.
 func TestDelegateStartValidation(t *testing.T) {
