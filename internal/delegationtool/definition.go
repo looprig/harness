@@ -103,11 +103,26 @@ func marshalAgentSchema(properties map[string]any, required []string) string {
 
 func agentModeSelectable(catalog []AgentCatalogEntry) bool {
 	for _, role := range catalog {
-		if len(role.Modes) > 1 {
+		if len(selectableAgentModes(role.Modes)) > 0 {
 			return true
 		}
 	}
 	return false
+}
+
+func selectableAgentModes(modes []loop.ModeName) []string {
+	distinct := make(map[string]struct{}, len(modes))
+	for _, mode := range modes {
+		if mode != "" {
+			distinct[string(mode)] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(distinct))
+	for mode := range distinct {
+		result = append(result, mode)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func requiredProperties(names []string) []any {
@@ -195,11 +210,8 @@ func startRoleVariantWithSelectors(role AgentCatalogEntry, entry *loop.RuntimeCa
 		"wait_for_response": map[string]any{"type": "boolean"},
 		"timeout_seconds":   map[string]any{"type": "integer", "minimum": 0, "maximum": maxTimeoutSeconds},
 	}
-	modes := make([]string, len(role.Modes))
-	for i, mode := range role.Modes {
-		modes[i] = string(mode)
-	}
-	if len(modes) > 1 {
+	modes := selectableAgentModes(role.Modes)
+	if len(modes) > 0 {
 		properties["agent_mode"] = map[string]any{"type": "string", "enum": modes}
 	}
 	if entry != nil {

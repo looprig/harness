@@ -68,6 +68,26 @@ func TestAgentToolSchemasAreClosedAndOperationSpecific(t *testing.T) {
 	}
 }
 
+func TestStartAgentSchemaAndPreparationUseOnlyExplicitModeNames(t *testing.T) {
+	t.Parallel()
+	catalog := []AgentCatalogEntry{{Name: "worker", Modes: []loop.ModeName{"", "review"}}}
+	config := newAgentToolConfig(loop.DelegationManaged, catalog)
+	info, err := newStartAgent(&fakeController{}, config).Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := schemaEnumValues(t, info.Schema, "agent_mode"); !equalStrings(got, []string{"review"}) {
+		t.Fatalf("agent_mode enum = %q, want only explicit mode review", got)
+	}
+	prepared, err := config.prepareStartAgent(`{"agent_type":"worker","instructions":"review","agent_mode":"review"}`)
+	if err != nil {
+		t.Fatalf("prepare declared agent_mode: %v", err)
+	}
+	if prepared.AgentMode != "review" {
+		t.Fatalf("prepared agent_mode = %q, want review", prepared.AgentMode)
+	}
+}
+
 func TestSchemaRuntimeSelectorsFollowCapabilities(t *testing.T) {
 	tests := []struct {
 		name       string

@@ -324,7 +324,6 @@ func delegateExtraTools(def loop.Definition, manager *delegationManager) []tool.
 		entry := delegationtool.AgentCatalogEntry{Name: name}
 		if manager != nil {
 			if target, ok := manager.byName[name]; ok {
-				entry.Modes = []loop.ModeName{""}
 				for _, mode := range target.Modes() {
 					entry.Modes = append(entry.Modes, mode.Name)
 				}
@@ -1042,21 +1041,21 @@ func (c *scopedController) agentRuntime(handle *loopHandle) tool.DelegateRuntime
 		}
 		return runtime
 	}
-	if resolved, ok := c.publicRuntimeIdentity(handle.bound.Name(), identity); ok {
+	if resolved, ok := c.publicRuntimeIdentity(handle.bound.Name(), handle.selectedHarness, identity); ok {
 		runtime.Harness = string(resolved.AgentHarness)
 		runtime.Model = string(resolved.ModelAlias)
 	}
 	return runtime
 }
 
-func (c *scopedController) publicRuntimeIdentity(agent identity.AgentName, durable loop.RuntimeIdentity) (loop.Resolved, bool) {
+func (c *scopedController) publicRuntimeIdentity(agent identity.AgentName, selectedHarness loop.AgentHarnessName, durable loop.RuntimeIdentity) (loop.Resolved, bool) {
 	if !c.hasRuntimeCatalog || durable.ModelAlias == "" {
 		return loop.Resolved{}, false
 	}
 	var match loop.Resolved
 	found := false
 	for _, entry := range c.runtimeCatalog.EntriesFor(agent) {
-		if entry.Profile != durable.Profile || entry.SelectionKind != durable.SelectionKind {
+		if (selectedHarness != "" && entry.AgentHarness != selectedHarness) || entry.Profile != durable.Profile || entry.SelectionKind != durable.SelectionKind {
 			continue
 		}
 		resolved, err := c.runtimeCatalog.ResolveTargetAliasWithSource(agent, entry.AgentHarness, durable.Source, durable.ModelAlias, durable.Effort)

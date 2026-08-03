@@ -504,9 +504,9 @@ func TestDelegateRuntimeProjectsStableModelAliasFromSecondHarnessSharingProfile(
 	child := delegateChild("child", "runtime child")
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
 		SubagentType: "child", AgentHarness: "alpha", Profile: "acp/shared", Default: true,
-		Credential: loop.CredentialGatewayBacked, DefaultModel: "nova",
+		Credential: loop.CredentialGatewayBacked, DefaultModel: "luna",
 		Models: []loop.RuntimeModelOption{{
-			Alias: "nova", Target: validModel("nova-target"),
+			Alias: "luna", Target: validModel("luna-target"),
 			DefaultEffort: model.EffortLow, Efforts: []model.Effort{model.EffortLow, model.EffortHigh},
 		}},
 	}, {
@@ -553,6 +553,9 @@ func TestDelegateRuntimeProjectsStableModelAliasFromSecondHarnessSharingProfile(
 	if got := listed.Agents[0].Runtime.Model; got != "luna" {
 		t.Fatalf("public runtime model = %q, want stable alias luna and never concrete alias luna@high", got)
 	}
+	if got := listed.Agents[0].Runtime.Harness; got != "codex" {
+		t.Fatalf("public runtime harness = %q, want selected harness codex", got)
+	}
 	scoped, ok := ctrl.(*scopedController)
 	if !ok {
 		t.Fatalf("controller = %T, want *scopedController", ctrl)
@@ -561,6 +564,12 @@ func TestDelegateRuntimeProjectsStableModelAliasFromSecondHarnessSharingProfile(
 	withoutMapping.runtimeCatalog = loop.RuntimeCatalog{}
 	if got := withoutMapping.agentRuntime(handle).Model; got != "" {
 		t.Fatalf("public runtime model without stable mapping = %q, want omitted", got)
+	}
+	legacyHandle := *handle
+	legacyHandle.selectedHarness = ""
+	legacyRuntime := scoped.agentRuntime(&legacyHandle)
+	if legacyRuntime.Harness != "" || legacyRuntime.Model != "" {
+		t.Fatalf("ambiguous legacy public runtime = %+v, want harness and model omitted", legacyRuntime)
 	}
 }
 

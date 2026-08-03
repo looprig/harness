@@ -324,11 +324,12 @@ func (s *agentToolConfig) validateAgentMode(prepared PreparedStartAgent) error {
 		if !prepared.agentModeSet {
 			return nil
 		}
-		if len(role.Modes) <= 1 {
+		modes := selectableAgentModes(role.Modes)
+		if len(modes) == 0 {
 			return preparationFailure(errCategoryFieldNotAllowed)
 		}
-		for _, mode := range role.Modes {
-			if string(mode) == prepared.AgentMode {
+		for _, mode := range modes {
+			if mode == prepared.AgentMode {
 				return nil
 			}
 		}
