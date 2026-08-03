@@ -1272,14 +1272,18 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			return uuid.UUID{}, err
 		}
 		if runtime != nil {
-			runtimeAlias := runtime.TargetAlias
-			if runtimeAlias == "" {
-				// Resolved values created before concrete target aliases were
-				// introduced remain valid and use the model-facing alias as the
-				// compatible durable identity.
-				runtimeAlias = runtime.ModelAlias
+			if runtime.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+				bound, err = loop.OverrideBoundRuntimeManaged(bound, runtime.Profile)
+			} else {
+				runtimeAlias := runtime.TargetAlias
+				if runtimeAlias == "" {
+					// Resolved values created before concrete target aliases were
+					// introduced remain valid and use the model-facing alias as the
+					// compatible durable identity.
+					runtimeAlias = runtime.ModelAlias
+				}
+				bound, err = loop.OverrideBoundRuntimeSelectionWithIdentity(bound, runtime.Profile, runtimeAlias, runtime.Target, runtime.Effort, runtime.Source, runtime.SelectionKind)
 			}
-			bound, err = loop.OverrideBoundRuntimeSelection(bound, runtime.Profile, runtimeAlias, runtime.Target, runtime.Effort)
 			if err == nil && hasRuntimeCatalog {
 				bound, err = loop.OverrideBoundRuntimeCatalog(bound, runtimeCatalog)
 			}
@@ -1513,15 +1517,26 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		if runtimeAlias == "" {
 			runtimeAlias = runtime.ModelAlias
 		}
+		smallModelAlias := runtime.SmallModel
+		if runtime.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+			runtimeAlias = ""
+			smallModelAlias = ""
+		}
 		agentRuntime = &event.AgentRuntime{
 			Harness:         string(runtime.AgentHarness),
 			Profile:         string(runtime.Profile),
 			CredentialMode:  string(runtime.Credential),
+			Source:          string(runtime.Source),
+			SelectionKind:   string(runtime.SelectionKind),
 			ModelAlias:      string(runtimeAlias),
-			SmallModelAlias: string(runtime.SmallModel),
+			SmallModelAlias: string(smallModelAlias),
 		}
 	}
-	ev := event.LoopStarted{Header: startedHeader, Runtime: runtimeForModel(liveModel), AgentRuntime: agentRuntime, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: bound.DisplayName(), Description: bound.Description()}
+	startedRuntime := runtimeForModel(liveModel)
+	if runtime != nil && runtime.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+		startedRuntime = event.ModelRuntime{}
+	}
+	ev := event.LoopStarted{Header: startedHeader, Runtime: startedRuntime, AgentRuntime: agentRuntime, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: bound.DisplayName(), Description: bound.Description()}
 	if admission != nil {
 		ev.InitialRequestID = admission.requestID
 	}

@@ -617,6 +617,8 @@ type BoundDefinition interface {
 	Description() string
 	Engine() Engine
 	RuntimeProfile() RuntimeProfileName
+	RuntimeSource() RuntimeSourceName
+	RuntimeSelectionKind() RuntimeSelectionKind
 	RuntimeCatalogDigest() string
 	RuntimeIdentity() RuntimeIdentity
 	Client() inference.Client
@@ -656,6 +658,8 @@ type boundDefinitionState struct {
 	modes                 []BoundMode
 	accessOverride        AccessGate
 	runtimeProfile        RuntimeProfileName
+	runtimeSource         RuntimeSourceName
+	runtimeSelectionKind  RuntimeSelectionKind
 	runtimeCatalogDigest  string
 	runtimeModelAlias     ModelAlias
 	runtimeTargetProvider model.ProviderName
@@ -669,11 +673,17 @@ func (b *boundDefinitionState) DisplayName() string                { return b.de
 func (b *boundDefinitionState) Description() string                { return b.definition.description }
 func (b *boundDefinitionState) Engine() Engine                     { return b.definition.engine }
 func (b *boundDefinitionState) RuntimeProfile() RuntimeProfileName { return b.runtimeProfile }
-func (b *boundDefinitionState) RuntimeCatalogDigest() string       { return b.runtimeCatalogDigest }
+func (b *boundDefinitionState) RuntimeSource() RuntimeSourceName   { return b.runtimeSource }
+func (b *boundDefinitionState) RuntimeSelectionKind() RuntimeSelectionKind {
+	return b.runtimeSelectionKind
+}
+func (b *boundDefinitionState) RuntimeCatalogDigest() string { return b.runtimeCatalogDigest }
 func (b *boundDefinitionState) RuntimeIdentity() RuntimeIdentity {
 	return RuntimeIdentity{
 		Profile:        b.runtimeProfile,
 		CatalogDigest:  b.runtimeCatalogDigest,
+		Source:         b.runtimeSource,
+		SelectionKind:  b.runtimeSelectionKind,
 		ModelAlias:     b.runtimeModelAlias,
 		TargetProvider: b.runtimeTargetProvider,
 		TargetModel:    b.runtimeTargetModel,

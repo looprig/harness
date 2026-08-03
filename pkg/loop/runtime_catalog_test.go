@@ -171,6 +171,7 @@ func TestRuntimeCatalogResolveDefaultsAndRejectsIncompatibleSelectors(t *testing
 		{
 			name: "all omitted use defaults", want: Resolved{
 				SubagentType: "worker", AgentHarness: "claude-code", Profile: "claude-profile",
+				Source: RuntimeSourceGateway, SelectionKind: RuntimeSelectionExplicit,
 				Credential: CredentialGatewayBacked, ModelAlias: "sonnet", TargetAlias: "sonnet", SmallModel: "sonnet-small",
 				Target: runtimeModel("sonnet-target", model.EffortMedium), Effort: model.EffortMedium,
 			},
@@ -179,6 +180,7 @@ func TestRuntimeCatalogResolveDefaultsAndRejectsIncompatibleSelectors(t *testing
 			name: "explicit complete tuple", harness: "codex", alias: "o3", effort: model.EffortHigh,
 			want: Resolved{
 				SubagentType: "worker", AgentHarness: "codex", Profile: "codex-profile",
+				Source: RuntimeSourceGateway, SelectionKind: RuntimeSelectionExplicit,
 				Credential: CredentialGatewayBacked, ModelAlias: "o3", TargetAlias: "o3@high", SmallModel: "o3",
 				Target: runtimeModel("o3-target", model.EffortLow), Effort: model.EffortHigh,
 			},
@@ -556,6 +558,311 @@ func TestRuntimeCatalogAllowsNativeAndGatewayModelsWithinOneHarness(t *testing.T
 	entries[0].Models[len(entries[0].Models)-1].Alias = entries[1].Models[0].Alias
 	if _, err := NewRuntimeCatalog(entries); err == nil {
 		t.Fatal("native model sharing a gateway alias across harnesses was accepted")
+	}
+}
+
+func TestRuntimeCatalogResolvesNativeHarnessManagedEntryWithoutModelIdentity(t *testing.T) {
+	t.Parallel()
+
+	entry := RuntimeCatalogEntry{
+		SubagentType:  "worker",
+		AgentHarness:  "codex",
+		Profile:       "acp/codex",
+		Credential:    CredentialNativeAuth,
+		Source:        RuntimeSourceNative,
+		SelectionKind: RuntimeSelectionHarnessManaged,
+		Default:       true,
+	}
+	catalog, err := NewRuntimeCatalog([]RuntimeCatalogEntry{entry})
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+
+	resolved, err := catalog.Resolve("worker", "codex", "", model.EffortNone)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if resolved.Source != RuntimeSourceNative || resolved.SelectionKind != RuntimeSelectionHarnessManaged {
+		t.Fatalf("resolved source/selection = %q/%q, want native/harness-managed", resolved.Source, resolved.SelectionKind)
+	}
+	if resolved.ModelAlias != "" || resolved.TargetAlias != "" || resolved.SmallModel != "" || resolved.NativeSmallModel != "" {
+		t.Fatalf("resolved model identity = alias %q target %q small %q native-small %q, want all empty", resolved.ModelAlias, resolved.TargetAlias, resolved.SmallModel, resolved.NativeSmallModel)
+	}
+	if !reflect.DeepEqual(resolved.Target, model.Model{}) || resolved.Effort != model.EffortNone {
+		t.Fatalf("resolved concrete target/effort = %+v/%q, want zero/none", resolved.Target, resolved.Effort)
+	}
+
+	if _, err := catalog.ResolveWithExplicitEffort("worker", "codex", "model", model.EffortNone, false); err == nil {
+		t.Fatal("Resolve() accepted a model selector for a harness-managed entry")
+	}
+	if _, err := catalog.ResolveWithExplicitEffort("worker", "codex", "", model.EffortHigh, true); err == nil {
+		t.Fatal("Resolve() accepted an effort selector for a harness-managed entry")
+	}
+}
+
+func TestRuntimeCatalogAllowsSameHarnessWithDistinctGatewayAndNativeSources(t *testing.T) {
+	t.Parallel()
+
+	native := RuntimeCatalogEntry{
+		SubagentType:  "worker",
+		AgentHarness:  "codex",
+		Profile:       "acp/codex-native",
+		Credential:    CredentialNativeAuth,
+		Source:        RuntimeSourceNative,
+		SelectionKind: RuntimeSelectionHarnessManaged,
+		Default:       true,
+	}
+	gateway := RuntimeCatalogEntry{
+		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-gateway",
+		Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway,
+		DefaultModel: "luna",
+		Models: []RuntimeModelOption{{
+			Alias: "luna", Target: runtimeModel("luna-target", model.EffortMedium),
+			DefaultEffort: model.EffortMedium, Efforts: []model.Effort{model.EffortMedium},
+		}},
+	}
+	catalog, err := NewRuntimeCatalog([]RuntimeCatalogEntry{native, gateway})
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+
+	managed, err := catalog.Resolve("worker", "codex", "", model.EffortNone)
+	if err != nil {
+		t.Fatalf("Resolve(managed) error = %v", err)
+	}
+	if managed.Source != RuntimeSourceNative || managed.SelectionKind != RuntimeSelectionHarnessManaged {
+		t.Fatalf("managed source/selection = %q/%q, want native/harness-managed", managed.Source, managed.SelectionKind)
+	}
+	explicit, err := catalog.Resolve("worker", "codex", "luna", model.EffortNone)
+	if err != nil {
+		t.Fatalf("Resolve(gateway) error = %v", err)
+	}
+	if explicit.Source != RuntimeSourceGateway || explicit.SelectionKind != RuntimeSelectionExplicit {
+		t.Fatalf("explicit source/selection = %q/%q, want gateway/explicit", explicit.Source, explicit.SelectionKind)
+	}
+}
+
+func TestRuntimeCatalogResolvesExplicitSourceForSameHarness(t *testing.T) {
+	t.Parallel()
+
+	gateway := RuntimeCatalogEntry{
+		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-gateway",
+		Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, Default: true,
+		DefaultModel: "luna",
+		Models: []RuntimeModelOption{{
+			Alias: "luna", Target: runtimeModel("luna-target", model.EffortHigh),
+			DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh},
+		}},
+	}
+	native := RuntimeCatalogEntry{
+		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
+		Credential: CredentialNativeAuth, Source: RuntimeSourceNative,
+		SelectionKind: RuntimeSelectionHarnessManaged,
+	}
+	catalog, err := NewRuntimeCatalog([]RuntimeCatalogEntry{gateway, native})
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+
+	explicit, err := catalog.ResolveWithExplicitSource("worker", "codex", RuntimeSourceGateway, "", model.EffortNone, false)
+	if err != nil {
+		t.Fatalf("ResolveWithExplicitSource(gateway) error = %v", err)
+	}
+	if explicit.Source != RuntimeSourceGateway || explicit.SelectionKind != RuntimeSelectionExplicit || explicit.ModelAlias != "luna" {
+		t.Fatalf("gateway resolution = %+v, want gateway/explicit/luna", explicit)
+	}
+
+	managed, err := catalog.ResolveWithExplicitSource("worker", "codex", RuntimeSourceNative, "", model.EffortNone, false)
+	if err != nil {
+		t.Fatalf("ResolveWithExplicitSource(native) error = %v", err)
+	}
+	if managed.Source != RuntimeSourceNative || managed.SelectionKind != RuntimeSelectionHarnessManaged || managed.ModelAlias != "" || managed.TargetAlias != "" {
+		t.Fatalf("native resolution = %+v, want native/harness-managed without model identity", managed)
+	}
+
+	if _, err := catalog.ResolveWithExplicitSource("worker", "codex", RuntimeSourceNative, "luna", model.EffortNone, false); err == nil {
+		t.Fatal("ResolveWithExplicitSource(native, model) accepted a model-less combination")
+	}
+	if _, err := catalog.ResolveWithExplicitSource("worker", "codex", RuntimeSourceNative, "", model.EffortHigh, true); err == nil {
+		t.Fatal("ResolveWithExplicitSource(native, effort) accepted a model-less combination")
+	}
+}
+
+func TestRuntimeCatalogResolvesExplicitSourceUsingSourceLocalDefault(t *testing.T) {
+	t.Parallel()
+
+	catalog, err := NewRuntimeCatalog([]RuntimeCatalogEntry{{
+		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
+		Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, Default: true,
+		DefaultModel: "gateway",
+		Models: []RuntimeModelOption{
+			{Alias: "gateway", Source: RuntimeSourceGateway, Credential: CredentialGatewayBacked, Target: runtimeModel("gateway-target", model.EffortHigh), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
+			{Alias: "native-first", Source: RuntimeSourceNative, Credential: CredentialNativeAuth, Target: runtimeModel("native-first-target", model.EffortMedium), DefaultEffort: model.EffortMedium, Efforts: []model.Effort{model.EffortMedium}},
+			{Alias: "native-second", Source: RuntimeSourceNative, Credential: CredentialNativeAuth, Target: runtimeModel("native-second-target", model.EffortLow), DefaultEffort: model.EffortLow, Efforts: []model.Effort{model.EffortLow}},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+
+	resolved, err := catalog.ResolveWithExplicitSource("worker", "codex", RuntimeSourceNative, "", model.EffortNone, false)
+	if err != nil {
+		t.Fatalf("ResolveWithExplicitSource(native, omitted alias) error = %v", err)
+	}
+	if resolved.Source != RuntimeSourceNative || resolved.SelectionKind != RuntimeSelectionExplicit || resolved.ModelAlias != "native-first" {
+		t.Fatalf("resolved runtime = %+v, want native/explicit/native-first", resolved)
+	}
+	if resolved.Target.Name != "native-first-target" {
+		t.Fatalf("resolved target = %q, want native-first-target", resolved.Target.Name)
+	}
+
+	legacy, err := catalog.Resolve("worker", "codex", "", model.EffortNone)
+	if err != nil {
+		t.Fatalf("Resolve(omitted source) error = %v", err)
+	}
+	if legacy.Source != RuntimeSourceGateway || legacy.ModelAlias != "gateway" {
+		t.Fatalf("Resolve(omitted source) = %+v, want gateway/gateway", legacy)
+	}
+}
+
+func TestRuntimeCatalogRejectsDefaultModelFromDifferentSource(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewRuntimeCatalog([]RuntimeCatalogEntry{{
+		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
+		Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, Default: true,
+		DefaultModel: "native",
+		Models: []RuntimeModelOption{
+			{Alias: "gateway", Source: RuntimeSourceGateway, Credential: CredentialGatewayBacked, Target: runtimeModel("gateway-target", model.EffortHigh), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
+			{Alias: "native", Source: RuntimeSourceNative, Credential: CredentialNativeAuth, Target: runtimeModel("native-target", model.EffortMedium), DefaultEffort: model.EffortMedium, Efforts: []model.Effort{model.EffortMedium}},
+		},
+	}})
+	var catalogErr *RuntimeCatalogError
+	if !errors.As(err, &catalogErr) || catalogErr.Kind != RuntimeCatalogInvalidDefaultModel {
+		t.Fatalf("NewRuntimeCatalog() error = %v, want %s", err, RuntimeCatalogInvalidDefaultModel)
+	}
+}
+
+func TestRuntimeCatalogExplicitSourceDoesNotFallbackToManagedDefault(t *testing.T) {
+	t.Parallel()
+
+	catalog, err := NewRuntimeCatalog([]RuntimeCatalogEntry{{
+		SubagentType:  "worker",
+		AgentHarness:  "codex",
+		Profile:       "acp/codex-native",
+		Credential:    CredentialNativeAuth,
+		Source:        RuntimeSourceNative,
+		SelectionKind: RuntimeSelectionHarnessManaged,
+		Default:       true,
+	}})
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		resolve func() (Resolved, error)
+	}{
+		{
+			name: "model resolution",
+			resolve: func() (Resolved, error) {
+				return catalog.ResolveWithExplicitSource("worker", "codex", RuntimeSourceGateway, "", model.EffortNone, false)
+			},
+		},
+		{
+			name: "target resolution",
+			resolve: func() (Resolved, error) {
+				return catalog.ResolveTargetAliasWithSource("worker", "codex", RuntimeSourceGateway, "", model.EffortNone)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolved, err := tt.resolve()
+			if !reflect.DeepEqual(resolved, Resolved{}) {
+				t.Fatalf("resolved runtime = %+v, want zero value", resolved)
+			}
+			var catalogErr *RuntimeCatalogError
+			if !errors.As(err, &catalogErr) || catalogErr.Kind != RuntimeCatalogUnknownSource {
+				t.Fatalf("error = %v, want %s", err, RuntimeCatalogUnknownSource)
+			}
+		})
+	}
+}
+
+func TestRuntimeCatalogExplicitSourcePrefersExactEntryForModelAndTargetResolution(t *testing.T) {
+	t.Parallel()
+
+	catalog, err := NewRuntimeCatalog([]RuntimeCatalogEntry{
+		{
+			SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
+			Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, Default: true,
+			DefaultModel: "gateway-model",
+			Models: []RuntimeModelOption{
+				{Alias: "gateway-model", Source: RuntimeSourceGateway, Credential: CredentialGatewayBacked, Target: runtimeModel("gateway-target", model.EffortMedium), DefaultEffort: model.EffortMedium, Efforts: []model.Effort{model.EffortMedium}},
+				{Alias: "native-mixed", Source: RuntimeSourceNative, Credential: CredentialNativeAuth, Target: runtimeModel("mixed-native-target", model.EffortLow), DefaultEffort: model.EffortLow, Efforts: []model.Effort{model.EffortLow}},
+			},
+		},
+		{
+			SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
+			Credential: CredentialNativeAuth, Source: RuntimeSourceNative,
+			DefaultModel: "native-dedicated",
+			Models: []RuntimeModelOption{{
+				Alias: "native-dedicated", Source: RuntimeSourceNative, Credential: CredentialNativeAuth,
+				Target:        runtimeModel("dedicated-native-target", model.EffortHigh),
+				DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+
+	resolved, err := catalog.ResolveWithExplicitSource("worker", "codex", RuntimeSourceNative, "", model.EffortNone, false)
+	if err != nil {
+		t.Fatalf("ResolveWithExplicitSource() error = %v", err)
+	}
+	if resolved.Profile != "acp/codex-native" || resolved.ModelAlias != "native-dedicated" || resolved.Target.Name != "dedicated-native-target" {
+		t.Fatalf("resolved runtime = %+v, want dedicated native entry", resolved)
+	}
+
+	resolved, err = catalog.ResolveTargetAliasWithSource("worker", "codex", RuntimeSourceNative, "native-dedicated", model.EffortHigh)
+	if err != nil {
+		t.Fatalf("ResolveTargetAliasWithSource() error = %v", err)
+	}
+	if resolved.Profile != "acp/codex-native" || resolved.ModelAlias != "native-dedicated" || resolved.Target.Name != "dedicated-native-target" {
+		t.Fatalf("target-resolved runtime = %+v, want dedicated native entry", resolved)
+	}
+}
+
+func TestRuntimeCatalogRejectsInvalidSelectionMatrix(t *testing.T) {
+	t.Parallel()
+
+	managed := func() RuntimeCatalogEntry {
+		return RuntimeCatalogEntry{SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialNativeAuth, Source: RuntimeSourceNative, SelectionKind: RuntimeSelectionHarnessManaged, Default: true}
+	}
+	tests := []struct {
+		name  string
+		entry RuntimeCatalogEntry
+		want  RuntimeCatalogErrorKind
+	}{
+		{name: "gateway managed", entry: RuntimeCatalogEntry{SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, SelectionKind: RuntimeSelectionHarnessManaged, Default: true}, want: RuntimeCatalogInvalidSelectionKind},
+		{name: "explicit model-less native", entry: RuntimeCatalogEntry{SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialNativeAuth, Source: RuntimeSourceNative, SelectionKind: RuntimeSelectionExplicit, Default: true}, want: RuntimeCatalogMissingDefaultModel},
+		{name: "managed with model", entry: func() RuntimeCatalogEntry {
+			entry := managed()
+			entry.Models = []RuntimeModelOption{{Alias: "model", Target: runtimeModel("model", model.EffortMedium), DefaultEffort: model.EffortMedium, Efforts: []model.Effort{model.EffortMedium}}}
+			return entry
+		}(), want: RuntimeCatalogInvalidModel},
+		{name: "managed with small model", entry: func() RuntimeCatalogEntry { entry := managed(); entry.SmallModel = "small"; return entry }(), want: RuntimeCatalogInvalidModel},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewRuntimeCatalog([]RuntimeCatalogEntry{tt.entry})
+			var catalogErr *RuntimeCatalogError
+			if !errors.As(err, &catalogErr) || catalogErr.Kind != tt.want {
+				t.Fatalf("NewRuntimeCatalog() error = %v, want %s", err, tt.want)
+			}
+		})
 	}
 }
 

@@ -28,6 +28,10 @@ type RuntimeProfileName string
 // RuntimeModelOption describes one model alias admitted by one catalog entry.
 type RuntimeModelOption struct {
 	Alias ModelAlias
+	// Source optionally overrides the entry source for this model. It is the
+	// stable catalogue discriminator when gateway and native choices share one
+	// harness.
+	Source RuntimeSourceName
 	// Credential optionally overrides the entry credential for this model.
 	// It lets one harness expose its own native-auth catalogue alongside
 	// product-owned gateway targets while each resolved child still has one
@@ -43,10 +47,16 @@ type RuntimeModelOption struct {
 
 // RuntimeCatalogEntry describes one role/harness runtime combination.
 type RuntimeCatalogEntry struct {
-	SubagentType    identity.AgentName
-	AgentHarness    AgentHarnessName
-	Profile         RuntimeProfileName
-	Credential      CredentialMode
+	SubagentType identity.AgentName
+	AgentHarness AgentHarnessName
+	Profile      RuntimeProfileName
+	// Source is the stable catalogue source identity. Empty preserves the
+	// legacy shape and is derived from Credential during normalization.
+	Source     RuntimeSourceName
+	Credential CredentialMode
+	// SelectionKind is explicit by default. Harness-managed entries must be
+	// native-auth and contain no model rows or model aliases.
+	SelectionKind   RuntimeSelectionKind
 	Default         bool
 	DefaultModel    ModelAlias
 	SmallModel      ModelAlias
@@ -57,10 +67,12 @@ type RuntimeCatalogEntry struct {
 // Resolved is the immutable runtime tuple selected from a RuntimeCatalog.
 // Target is a defensive copy of the cataloged model descriptor.
 type Resolved struct {
-	SubagentType identity.AgentName
-	AgentHarness AgentHarnessName
-	Profile      RuntimeProfileName
-	Credential   CredentialMode
+	SubagentType  identity.AgentName
+	AgentHarness  AgentHarnessName
+	Profile       RuntimeProfileName
+	Source        RuntimeSourceName
+	Credential    CredentialMode
+	SelectionKind RuntimeSelectionKind
 	// ModelAlias is the stable model-facing selector accepted by Subagent.
 	ModelAlias ModelAlias
 	// TargetAlias is the concrete alias sent to a gateway or ACP launcher. It
@@ -79,6 +91,8 @@ type RuntimeCatalogErrorKind string
 
 const (
 	RuntimeCatalogInvalidCredential    RuntimeCatalogErrorKind = "invalid_credential" // #nosec G101 -- bounded error category, not a credential
+	RuntimeCatalogInvalidSource        RuntimeCatalogErrorKind = "invalid_source"
+	RuntimeCatalogInvalidSelectionKind RuntimeCatalogErrorKind = "invalid_selection_kind"
 	RuntimeCatalogInvalidIdentifier    RuntimeCatalogErrorKind = "invalid_identifier"
 	RuntimeCatalogInvalidModel         RuntimeCatalogErrorKind = "invalid_model"
 	RuntimeCatalogMissingDefaultModel  RuntimeCatalogErrorKind = "missing_default_model"
@@ -94,6 +108,7 @@ const (
 	RuntimeCatalogDerivedAliasConflict RuntimeCatalogErrorKind = "derived_alias_conflict"
 	RuntimeCatalogUnknownAgent         RuntimeCatalogErrorKind = "unknown_agent"
 	RuntimeCatalogUnknownHarness       RuntimeCatalogErrorKind = "unknown_harness"
+	RuntimeCatalogUnknownSource        RuntimeCatalogErrorKind = "unknown_source"
 	RuntimeCatalogUnknownModel         RuntimeCatalogErrorKind = "unknown_model"
 	RuntimeCatalogIncompatibleEffort   RuntimeCatalogErrorKind = "incompatible_effort"
 )
@@ -130,10 +145,11 @@ func NewRuntimeCatalog(entries []RuntimeCatalogEntry) (RuntimeCatalog, error) {
 
 	for i, source := range entries {
 		entry := cloneRuntimeCatalogEntry(source)
+		normalizeRuntimeCatalogEntry(&entry)
 		if err := validateRuntimeCatalogEntry(entry); err != nil {
 			return RuntimeCatalog{}, err
 		}
-		key := runtimeHarnessKey{agent: entry.SubagentType, harness: entry.AgentHarness}
+		key := runtimeHarnessKey{agent: entry.SubagentType, harness: entry.AgentHarness, source: entry.Source}
 		if _, exists := seenHarnesses[key]; exists {
 			return RuntimeCatalog{}, &RuntimeCatalogError{Kind: RuntimeCatalogDuplicateHarness, Field: "AgentHarness"}
 		}
@@ -163,6 +179,9 @@ func NewRuntimeCatalog(entries []RuntimeCatalogEntry) (RuntimeCatalog, error) {
 		}
 		if left.AgentHarness != right.AgentHarness {
 			return left.AgentHarness < right.AgentHarness
+		}
+		if left.Source != right.Source {
+			return left.Source < right.Source
 		}
 		return left.Profile < right.Profile
 	})
@@ -212,48 +231,70 @@ func (c RuntimeCatalog) Resolve(agent identity.AgentName, harness AgentHarnessNa
 // EffortNone is model.Effort's zero value: omitted effort uses DefaultEffort,
 // while explicit none is valid only when the model advertises none.
 func (c RuntimeCatalog) ResolveWithExplicitEffort(agent identity.AgentName, harness AgentHarnessName, alias ModelAlias, effort model.Effort, explicitEffort bool) (Resolved, error) {
+	return c.ResolveWithExplicitSource(agent, harness, "", alias, effort, explicitEffort)
+}
+
+// ResolveWithExplicitSource selects a runtime tuple while optionally pinning
+// the stable source identity. An omitted source preserves legacy default
+// behavior; a supplied source disambiguates choices that share one harness.
+func (c RuntimeCatalog) ResolveWithExplicitSource(agent identity.AgentName, harness AgentHarnessName, source RuntimeSourceName, alias ModelAlias, effort model.Effort, explicitEffort bool) (Resolved, error) {
 	if agent == "" {
 		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
 	}
-
-	var selected *RuntimeCatalogEntry
-	for i := range c.entries {
-		entry := &c.entries[i]
-		if entry.SubagentType != agent {
-			continue
-		}
-		if harness == "" {
-			if entry.Default {
-				selected = entry
-				break
-			}
-			continue
-		}
-		if entry.AgentHarness == harness {
-			selected = entry
-			break
-		}
+	if source != "" && !source.valid() {
+		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSource, Field: "Source"}
 	}
-	if selected == nil {
+
+	candidates := c.runtimeCandidates(agent, harness, source, alias != "")
+	if len(candidates) == 0 {
+		if source != "" {
+			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownSource, Field: "Source"}
+		}
 		if harness == "" {
 			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
 		}
 		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownHarness, Field: "AgentHarness"}
 	}
 
+	selected := candidates[0]
 	selectedModel := (*RuntimeModelOption)(nil)
-	for i := range selected.Models {
-		candidate := &selected.Models[i]
-		if alias == "" {
-			if candidate.Alias == selected.DefaultModel {
-				selectedModel = candidate
+	if alias == "" {
+		if selected.SelectionKind == RuntimeSelectionHarnessManaged {
+			// A managed entry has no model rows to validate the requested
+			// source against, so validate its entry-level source before the
+			// harness-managed early return.
+			if source != "" && selected.Source != source {
+				return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownSource, Field: "Source"}
+			}
+			if effort != model.EffortNone || explicitEffort {
+				return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogIncompatibleEffort, Field: "Effort"}
+			}
+			return resolvedHarnessManaged(*selected), nil
+		}
+		if source != "" {
+			selectedModel = sourceLocalDefaultModel(*selected, source)
+		} else {
+			for i := range selected.Models {
+				candidate := &selected.Models[i]
+				if candidate.Alias == selected.DefaultModel {
+					selectedModel = candidate
+					break
+				}
+			}
+		}
+	} else {
+		for _, candidateEntry := range candidates {
+			for i := range candidateEntry.Models {
+				candidate := &candidateEntry.Models[i]
+				if candidate.Alias == alias {
+					selected = candidateEntry
+					selectedModel = candidate
+					break
+				}
+			}
+			if selectedModel != nil {
 				break
 			}
-			continue
-		}
-		if candidate.Alias == alias {
-			selectedModel = candidate
-			break
 		}
 	}
 	if selectedModel == nil {
@@ -272,12 +313,18 @@ func (c RuntimeCatalog) ResolveWithExplicitEffort(agent identity.AgentName, harn
 		}
 		selectedEffort = effort
 	}
+	resolvedSource := effectiveRuntimeSource(*selected, *selectedModel)
+	if source != "" && resolvedSource != source {
+		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownSource, Field: "Source"}
+	}
 
 	return Resolved{
 		SubagentType:     selected.SubagentType,
 		AgentHarness:     selected.AgentHarness,
 		Profile:          selected.Profile,
+		Source:           resolvedSource,
 		Credential:       effectiveModelCredential(*selected, *selectedModel),
+		SelectionKind:    RuntimeSelectionExplicit,
 		ModelAlias:       selectedModel.Alias,
 		TargetAlias:      concreteRuntimeAlias(*selectedModel, effectiveModelCredential(*selected, *selectedModel), selectedEffort),
 		NativeSmallModel: selectedModel.NativeSmallModel,
@@ -293,42 +340,51 @@ func (c RuntimeCatalog) ResolveWithExplicitEffort(agent identity.AgentName, harn
 // records remain restorable. This method is intentionally not used by
 // model-facing Subagent preparation or controller validation.
 func (c RuntimeCatalog) ResolveTargetAlias(agent identity.AgentName, harness AgentHarnessName, targetAlias ModelAlias, effort model.Effort) (Resolved, error) {
+	return c.ResolveTargetAliasWithSource(agent, harness, "", targetAlias, effort)
+}
+
+// ResolveTargetAliasWithSource is the source-aware restore counterpart to
+// ResolveTargetAlias. Empty source retains legacy target-alias behavior.
+func (c RuntimeCatalog) ResolveTargetAliasWithSource(agent identity.AgentName, harness AgentHarnessName, source RuntimeSourceName, targetAlias ModelAlias, effort model.Effort) (Resolved, error) {
 	if agent == "" {
 		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
 	}
-
-	var selected *RuntimeCatalogEntry
-	for i := range c.entries {
-		entry := &c.entries[i]
-		if entry.SubagentType != agent {
-			continue
-		}
-		if harness == "" {
-			if entry.Default {
-				selected = entry
-				break
-			}
-			continue
-		}
-		if entry.AgentHarness == harness {
-			selected = entry
-			break
-		}
+	if source != "" && !source.valid() {
+		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSource, Field: "Source"}
 	}
-	if selected == nil {
+
+	candidates := c.runtimeCandidates(agent, harness, source, targetAlias != "")
+	if len(candidates) == 0 {
+		if source != "" {
+			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownSource, Field: "Source"}
+		}
 		if harness == "" {
 			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
 		}
 		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownHarness, Field: "AgentHarness"}
 	}
 
-	for i := range selected.Models {
-		option := &selected.Models[i]
-		credential := effectiveModelCredential(*selected, *option)
-		if targetAlias != option.Alias && targetAlias != concreteRuntimeAlias(*option, credential, effort) {
+	for _, selected := range candidates {
+		if selected.SelectionKind == RuntimeSelectionHarnessManaged {
+			// Keep the source check ahead of the managed shortcut. This is
+			// defensive with respect to candidate construction and prevents a
+			// native managed default from satisfying an explicit other source.
+			if source != "" && selected.Source != source {
+				return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownSource, Field: "Source"}
+			}
+			if targetAlias == "" && effort == model.EffortNone {
+				return resolvedHarnessManaged(*selected), nil
+			}
 			continue
 		}
-		return c.ResolveWithExplicitEffort(agent, harness, option.Alias, effort, true)
+		for i := range selected.Models {
+			option := &selected.Models[i]
+			credential := effectiveModelCredential(*selected, *option)
+			if targetAlias != option.Alias && targetAlias != concreteRuntimeAlias(*option, credential, effort) {
+				continue
+			}
+			return c.ResolveWithExplicitSource(agent, selected.AgentHarness, source, option.Alias, effort, true)
+		}
 	}
 	return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownModel, Field: "ModelAlias"}
 }
@@ -346,11 +402,155 @@ func (c RuntimeCatalog) Digest() string {
 type runtimeHarnessKey struct {
 	agent   identity.AgentName
 	harness AgentHarnessName
+	source  RuntimeSourceName
 }
 
 type runtimeAliasOwner struct {
 	harness    AgentHarnessName
+	source     RuntimeSourceName
 	credential CredentialMode
+}
+
+func normalizeRuntimeCatalogEntry(entry *RuntimeCatalogEntry) {
+	if entry.Source == "" {
+		entry.Source = sourceForCredential(entry.Credential)
+	}
+	if entry.Credential == "" {
+		entry.Credential = credentialForSource(entry.Source)
+	}
+	if entry.SelectionKind == "" {
+		entry.SelectionKind = RuntimeSelectionExplicit
+	}
+	for i := range entry.Models {
+		option := &entry.Models[i]
+		if option.Source == "" {
+			option.Source = sourceForCredential(option.Credential)
+			if option.Source == "" {
+				option.Source = entry.Source
+			}
+		}
+		if option.Credential == "" {
+			option.Credential = credentialForSource(option.Source)
+		}
+	}
+}
+
+func effectiveRuntimeSource(entry RuntimeCatalogEntry, option RuntimeModelOption) RuntimeSourceName {
+	if option.Source != "" {
+		return option.Source
+	}
+	if option.Credential != "" {
+		return sourceForCredential(option.Credential)
+	}
+	return entry.Source
+}
+
+// sourceLocalDefaultModel applies the same deterministic rule as a source-filtered
+// delegation/schema view: keep the entry default when it belongs to the selected
+// source; otherwise choose the first option admitted by that source.
+func sourceLocalDefaultModel(entry RuntimeCatalogEntry, source RuntimeSourceName) *RuntimeModelOption {
+	var first *RuntimeModelOption
+	for i := range entry.Models {
+		candidate := &entry.Models[i]
+		if effectiveRuntimeSource(entry, *candidate) != source {
+			continue
+		}
+		if first == nil {
+			first = candidate
+		}
+		if candidate.Alias == entry.DefaultModel {
+			return candidate
+		}
+	}
+	return first
+}
+
+func effectiveSelectionKind(entry RuntimeCatalogEntry) RuntimeSelectionKind {
+	if entry.SelectionKind == "" {
+		return RuntimeSelectionExplicit
+	}
+	return entry.SelectionKind
+}
+
+func resolvedHarnessManaged(entry RuntimeCatalogEntry) Resolved {
+	return Resolved{
+		SubagentType:  entry.SubagentType,
+		AgentHarness:  entry.AgentHarness,
+		Profile:       entry.Profile,
+		Source:        entry.Source,
+		Credential:    entry.Credential,
+		SelectionKind: RuntimeSelectionHarnessManaged,
+	}
+}
+
+// runtimeCandidates keeps the legacy default-harness behavior while allowing
+// one harness to expose separate source entries. When a model is supplied,
+// only entries for the selected/default harness are searched; another harness
+// is never selected as an alias fallback.
+func (c RuntimeCatalog) runtimeCandidates(agent identity.AgentName, harness AgentHarnessName, source RuntimeSourceName, byModel bool) []*RuntimeCatalogEntry {
+	var defaultEntry *RuntimeCatalogEntry
+	for i := range c.entries {
+		entry := &c.entries[i]
+		if entry.SubagentType == agent && entry.Default {
+			defaultEntry = entry
+			break
+		}
+	}
+	if harness == "" {
+		if defaultEntry == nil {
+			return nil
+		}
+		harness = defaultEntry.AgentHarness
+		if !byModel && source == "" {
+			return []*RuntimeCatalogEntry{defaultEntry}
+		}
+	}
+	result := make([]*RuntimeCatalogEntry, 0, 1)
+	for i := range c.entries {
+		entry := &c.entries[i]
+		if entry.SubagentType != agent || entry.AgentHarness != harness {
+			continue
+		}
+		if source != "" && !runtimeEntryHasSource(*entry, source) {
+			continue
+		}
+		if !byModel && source == "" && defaultEntry != nil && entry.Default {
+			return []*RuntimeCatalogEntry{entry}
+		}
+		result = append(result, entry)
+	}
+	if source != "" && len(result) > 1 {
+		// Match runtimeEntryForSource's source precedence: an entry whose
+		// own source is the requested source wins over a mixed entry that
+		// only contributes a per-model source override. Preserve catalog
+		// order within each group for deterministic legacy behavior.
+		exact := make([]*RuntimeCatalogEntry, 0, len(result))
+		mixed := make([]*RuntimeCatalogEntry, 0, len(result))
+		for _, entry := range result {
+			if entry.Source == source {
+				exact = append(exact, entry)
+			} else {
+				mixed = append(mixed, entry)
+			}
+		}
+		result = append(exact, mixed...)
+	}
+	if source == "" && len(result) == 0 && defaultEntry != nil && defaultEntry.AgentHarness == harness {
+		return []*RuntimeCatalogEntry{defaultEntry}
+	}
+	return result
+}
+
+func runtimeEntryHasSource(entry RuntimeCatalogEntry, source RuntimeSourceName) bool {
+	if entry.Source == source {
+		return true
+	}
+	for _, option := range entry.Models {
+		if effectiveRuntimeSource(entry, option) == source {
+			return true
+		}
+	}
+	return false
 }
 
 func effectiveModelCredential(entry RuntimeCatalogEntry, option RuntimeModelOption) CredentialMode {
@@ -370,8 +570,29 @@ func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
 	if err := validateRuntimeProfile(string(entry.Profile)); err != nil {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "Profile"}
 	}
+	if entry.Credential == "" && entry.Source == "" {
+		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidCredential, Field: "Credential"}
+	}
 	if entry.Credential != CredentialGatewayBacked && entry.Credential != CredentialNativeAuth {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidCredential, Field: "Credential"}
+	}
+	if !entry.Source.valid() {
+		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSource, Field: "Source"}
+	}
+	if sourceForCredential(entry.Credential) != entry.Source {
+		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSource, Field: "Source"}
+	}
+	if !effectiveSelectionKind(entry).valid() {
+		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSelectionKind, Field: "SelectionKind"}
+	}
+	if effectiveSelectionKind(entry) == RuntimeSelectionHarnessManaged {
+		if entry.Source != RuntimeSourceNative || entry.Credential != CredentialNativeAuth {
+			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSelectionKind, Field: "SelectionKind"}
+		}
+		if len(entry.Models) != 0 || entry.DefaultModel != "" || entry.SmallModel != "" || entry.NeedsSmallModel {
+			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidModel, Field: "Models"}
+		}
+		return nil
 	}
 	if len(entry.Models) == 0 {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogMissingDefaultModel, Field: "Models"}
@@ -390,6 +611,7 @@ func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
 
 	aliases := make(map[ModelAlias]struct{}, len(entry.Models))
 	defaultModelFound := false
+	defaultModelSource := RuntimeSourceName("")
 	if entry.NeedsSmallModel && entry.SmallModel == "" {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSmallModel, Field: "SmallModel"}
 	}
@@ -399,8 +621,14 @@ func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
 		if err := validateCatalogIdentifier(string(option.Alias), false); err != nil {
 			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "Models.Alias"}
 		}
+		if !option.Source.valid() {
+			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSource, Field: "Models.Source"}
+		}
 		if option.Credential != "" && option.Credential != CredentialGatewayBacked && option.Credential != CredentialNativeAuth {
 			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidCredential, Field: "Models.Credential"}
+		}
+		if sourceForCredential(option.Credential) != option.Source {
+			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSource, Field: "Models.Source"}
 		}
 		if option.NativeSmallModel != "" {
 			if err := validateCatalogIdentifier(option.NativeSmallModel, false); err != nil {
@@ -413,6 +641,7 @@ func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
 		aliases[option.Alias] = struct{}{}
 		if option.Alias == entry.DefaultModel {
 			defaultModelFound = true
+			defaultModelSource = effectiveRuntimeSource(entry, *option)
 		}
 		if option.Alias == entry.SmallModel {
 			smallModelFound = true
@@ -451,6 +680,9 @@ func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
 	if !defaultModelFound {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidDefaultModel, Field: "DefaultModel"}
 	}
+	if defaultModelSource != entry.Source {
+		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidDefaultModel, Field: "DefaultModel"}
+	}
 	if entry.NeedsSmallModel && !smallModelFound {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSmallModel, Field: "SmallModel"}
 	}
@@ -462,20 +694,22 @@ func validateNativeAliasOwnership(entries []RuntimeCatalogEntry) error {
 	for _, entry := range entries {
 		for _, option := range entry.Models {
 			owners[option.Alias] = append(owners[option.Alias], runtimeAliasOwner{
-				harness: entry.AgentHarness, credential: effectiveModelCredential(entry, option),
+				harness: entry.AgentHarness, source: effectiveRuntimeSource(entry, option), credential: effectiveModelCredential(entry, option),
 			})
 		}
 		if entry.SmallModel != "" {
 			owners[entry.SmallModel] = append(owners[entry.SmallModel], runtimeAliasOwner{
-				harness: entry.AgentHarness, credential: entry.Credential,
+				harness: entry.AgentHarness, source: entry.Source, credential: entry.Credential,
 			})
 		}
 	}
 	for _, aliasOwners := range owners {
 		for i := range aliasOwners {
 			for j := i + 1; j < len(aliasOwners); j++ {
-				if aliasOwners[i].harness != aliasOwners[j].harness &&
-					(aliasOwners[i].credential != CredentialGatewayBacked || aliasOwners[j].credential != CredentialGatewayBacked) {
+				sameHarnessDifferentSource := aliasOwners[i].harness == aliasOwners[j].harness && aliasOwners[i].source != aliasOwners[j].source
+				differentHarnessWithNative := aliasOwners[i].harness != aliasOwners[j].harness &&
+					(aliasOwners[i].credential != CredentialGatewayBacked || aliasOwners[j].credential != CredentialGatewayBacked)
+				if sameHarnessDifferentSource || differentHarnessWithNative {
 					return &RuntimeCatalogError{Kind: RuntimeCatalogNativeAliasConflict, Field: "Models.Alias"}
 				}
 			}
@@ -594,7 +828,9 @@ type runtimeCatalogEntryDigest struct {
 	SubagentType    string                     `json:"subagent_type"`
 	AgentHarness    string                     `json:"agent_harness"`
 	Profile         string                     `json:"profile"`
+	Source          RuntimeSourceName          `json:"source"`
 	Credential      CredentialMode             `json:"credential"`
+	SelectionKind   RuntimeSelectionKind       `json:"selection_kind"`
 	Default         bool                       `json:"default"`
 	DefaultModel    string                     `json:"default_model"`
 	SmallModel      string                     `json:"small_model,omitempty"`
@@ -604,6 +840,7 @@ type runtimeCatalogEntryDigest struct {
 
 type runtimeModelOptionDigest struct {
 	Alias            string              `json:"alias"`
+	Source           RuntimeSourceName   `json:"source,omitempty"`
 	Credential       CredentialMode      `json:"credential,omitempty"`
 	NativeSmallModel string              `json:"native_small_model,omitempty"`
 	Provider         string              `json:"provider"`
@@ -628,7 +865,9 @@ func digestRuntimeCatalog(entries []RuntimeCatalogEntry) string {
 			SubagentType:    string(entry.SubagentType),
 			AgentHarness:    string(entry.AgentHarness),
 			Profile:         string(entry.Profile),
+			Source:          entry.Source,
 			Credential:      entry.Credential,
+			SelectionKind:   entry.SelectionKind,
 			Default:         entry.Default,
 			DefaultModel:    string(entry.DefaultModel),
 			SmallModel:      string(entry.SmallModel),
@@ -638,6 +877,7 @@ func digestRuntimeCatalog(entries []RuntimeCatalogEntry) string {
 		for j, option := range entry.Models {
 			row.Models[j] = runtimeModelOptionDigest{
 				Alias:            string(option.Alias),
+				Source:           effectiveRuntimeSource(entry, option),
 				Credential:       option.Credential,
 				NativeSmallModel: option.NativeSmallModel,
 				Provider:         string(option.Target.Provider),

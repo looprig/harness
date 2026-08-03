@@ -17,6 +17,7 @@ import (
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
+	inferencemodel "github.com/looprig/inference/model"
 )
 
 // RestoreTopology reconstructs the durable loop topology and brings it up idle. It does
@@ -779,13 +780,45 @@ func restoreRuntimeBinding(started event.LoopStarted, bound loop.BoundDefinition
 	if !hasCatalog {
 		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
 	}
-	if !ri.HasRuntime {
+	runtime := ri.AgentRuntime
+	harnessManaged := runtime.SelectionKind == string(loop.RuntimeSelectionHarnessManaged)
+	if harnessManaged && ri.HasRuntime {
 		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeTargetMismatch}
 	}
-	runtime := ri.AgentRuntime
-	resolved, err := catalog.ResolveTargetAlias(
+	if !ri.HasRuntime && !harnessManaged {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeTargetMismatch}
+	}
+	if harnessManaged {
+		if runtime.CredentialMode != string(loop.CredentialNativeAuth) {
+			return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeCredentialMismatch}
+		}
+		if runtime.Source != string(loop.RuntimeSourceNative) || runtime.ModelAlias != "" || runtime.SmallModelAlias != "" {
+			return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+		}
+		resolved, err := catalog.ResolveTargetAliasWithSource(
+			started.AgentName,
+			loop.AgentHarnessName(runtime.Harness),
+			loop.RuntimeSourceName(runtime.Source),
+			"",
+			inferencemodel.EffortNone,
+		)
+		if err != nil || resolved.Profile != loop.RuntimeProfileName(runtime.Profile) || resolved.AgentHarness != loop.AgentHarnessName(runtime.Harness) || resolved.Source != loop.RuntimeSourceNative || resolved.SelectionKind != loop.RuntimeSelectionHarnessManaged || resolved.Credential != loop.CredentialNativeAuth {
+			return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable, Cause: err}
+		}
+		bound, err = loop.OverrideBoundRuntimeManaged(bound, resolved.Profile)
+		if err != nil {
+			return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+		}
+		bound, err = loop.OverrideBoundRuntimeCatalog(bound, catalog)
+		if err != nil {
+			return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+		}
+		return bound, nil
+	}
+	resolved, err := catalog.ResolveTargetAliasWithSource(
 		started.AgentName,
 		loop.AgentHarnessName(runtime.Harness),
+		loop.RuntimeSourceName(runtime.Source),
 		loop.ModelAlias(runtime.ModelAlias),
 		ri.Runtime.Effort,
 	)
@@ -800,6 +833,12 @@ func restoreRuntimeBinding(started event.LoopStarted, bound loop.BoundDefinition
 	if string(resolved.Credential) != runtime.CredentialMode {
 		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeCredentialMismatch}
 	}
+	if runtime.Source != "" && string(resolved.Source) != runtime.Source {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeCredentialMismatch}
+	}
+	if runtime.SelectionKind != "" && string(resolved.SelectionKind) != runtime.SelectionKind {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+	}
 	if resolved.Target.Key() != ri.Runtime.Key {
 		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeTargetMismatch}
 	}
@@ -810,7 +849,7 @@ func restoreRuntimeBinding(started event.LoopStarted, bound loop.BoundDefinition
 	if runtimeAlias == "" {
 		runtimeAlias = resolved.ModelAlias
 	}
-	bound, err = loop.OverrideBoundRuntimeSelection(bound, resolved.Profile, runtimeAlias, resolved.Target, resolved.Effort)
+	bound, err = loop.OverrideBoundRuntimeSelectionWithIdentity(bound, resolved.Profile, runtimeAlias, resolved.Target, resolved.Effort, resolved.Source, resolved.SelectionKind)
 	if err != nil {
 		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
 	}
@@ -829,6 +868,12 @@ func restoreRuntimeBinding(started event.LoopStarted, bound loop.BoundDefinition
 // fault); the caller cancels the session context and records a RestoreErrored. On success
 // s.activeLoopID reflects the durable active loop.
 func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoopID uuid.UUID) error {
+	activeID := rootLoopID
+	for _, ev := range all {
+		if changed, ok := ev.(event.ActiveLoopChanged); ok {
+			activeID = changed.ActiveLoopID
+		}
+	}
 	for i := range plans {
 		plan := &plans[i]
 		if plan.started.LoopID == rootLoopID {
@@ -836,15 +881,21 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 		}
 		parent := loop.Provenance{LoopID: plan.started.Cause.Coordinates.LoopID, TurnID: plan.started.Cause.Coordinates.TurnID, StepID: plan.started.Cause.Coordinates.StepID}
 		if plan.runtimeMismatch != nil || plan.tombstoned {
+			if plan.started.LoopID == activeID {
+				return &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopExited}}
+			}
 			if err := s.attachRestoredTombstonedLoop(*plan, parent); err != nil {
 				return err
 			}
 			continue
 		}
 		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.bindings, plan.folded, foldLoopInference(plan.events), findForeignSID(plan.events)); err != nil {
-			mismatch, runtimeFailure := classifyRestoredChildRuntimeFailure(err)
+			mismatch, runtimeFailure := classifyRestoredChildRuntimeFailure(plan.bound, err)
 			if !runtimeFailure {
 				return err
+			}
+			if plan.started.LoopID == activeID {
+				return &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopExited}}
 			}
 			// A runtime-classified failure can arise after the preflight fold (for
 			// example, an adapter session/load failure). Keep the same per-child
@@ -857,12 +908,6 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 				return tombstoneErr
 			}
 			plan.tombstoned = true
-		}
-	}
-	activeID := rootLoopID
-	for _, ev := range all {
-		if changed, ok := ev.(event.ActiveLoopChanged); ok {
-			activeID = changed.ActiveLoopID
 		}
 	}
 	for _, plan := range plans {
@@ -884,7 +929,7 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 	return nil
 }
 
-func classifyRestoredChildRuntimeFailure(err error) (*RestoreRuntimeMismatchError, bool) {
+func classifyRestoredChildRuntimeFailure(bound loop.BoundDefinition, err error) (*RestoreRuntimeMismatchError, bool) {
 	var mismatch *RestoreRuntimeMismatchError
 	if errors.As(err, &mismatch) {
 		return mismatch, true
@@ -896,9 +941,13 @@ func classifyRestoredChildRuntimeFailure(err error) (*RestoreRuntimeMismatchErro
 	switch restoreErr.Kind {
 	case RestoreForeignBuilderMissing, RestoreForeignSIDMissing:
 		return &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}, true
+	case RestoreLoopFailed:
+		if bound != nil && bound.Engine() == loop.EngineAdapter && bound.RuntimeIdentity().Source == loop.RuntimeSourceNative {
+			return &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}, true
+		}
 	default:
-		return nil, false
 	}
+	return nil, false
 }
 
 func (s *Session) attachRestoredTombstonedLoop(plan loopPlan, parent loop.Provenance) error {

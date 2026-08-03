@@ -478,10 +478,12 @@ func validateDecodedEvent(ev Event, data []byte) error {
 }
 
 // missingLegacyRuntime preserves replay compatibility for lifecycle records
-// that never carried a resolved runtime. Legacy LoopInferenceChanged is not an
-// absence-only case: decodeLoopInferenceChanged migrates its model+effort payload
-// before validation. An explicitly present zero/invalid runtime continues
-// through strict validation.
+// that never carried a resolved runtime. A LoopStarted with agent_runtime is
+// not legacy: native/harness-managed records intentionally omit runtime, but
+// their AgentRuntime must still pass strict validation. Legacy
+// LoopInferenceChanged is not an absence-only case: decodeLoopInferenceChanged
+// migrates its model+effort payload before validation. An explicitly present
+// zero/invalid runtime continues through strict validation.
 func missingLegacyRuntime(ev Event, data []byte) (bool, error) {
 	name := ""
 	switch ev.(type) {
@@ -492,8 +494,15 @@ func missingLegacyRuntime(ev Event, data []byte) (bool, error) {
 	default:
 		return false, nil
 	}
-	present, err := inspectTopLevelField(data, name, "runtime")
-	return !present, err
+	runtimePresent, err := inspectTopLevelField(data, name, "runtime")
+	if err != nil {
+		return false, err
+	}
+	agentRuntimePresent, err := inspectTopLevelField(data, name, "agent_runtime")
+	if err != nil {
+		return false, err
+	}
+	return !runtimePresent && !agentRuntimePresent, nil
 }
 
 func inspectTopLevelField(data []byte, typeName, fieldName string) (bool, error) {

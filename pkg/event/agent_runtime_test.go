@@ -160,3 +160,165 @@ func TestAgentRuntimeValidationRejectsUnboundedAndPathLikeIdentity(t *testing.T)
 		})
 	}
 }
+
+func TestAgentRuntimeRejectsNativeHarnessManagedIdentityWithModelRuntime(t *testing.T) {
+	t.Parallel()
+
+	runtime := AgentRuntime{
+		Harness:        "codex",
+		Profile:        "acp/codex",
+		CredentialMode: "native-auth",
+		Source:         "native",
+		SelectionKind:  "harness-managed",
+	}
+	event := LoopStarted{Header: fullHeaderLoop(), Runtime: sampleRuntime(), AgentRuntime: &runtime}
+	err := ValidateEvent(event)
+	var invalid *InvalidEventError
+	if !errors.As(err, &invalid) || invalid.Rule != RuleInvalid {
+		t.Fatalf("ValidateEvent() error = %T %v, want InvalidEventError/invalid", err, err)
+	}
+
+	if _, err := MarshalEvent(event); err == nil {
+		t.Fatal("MarshalEvent() accepted a native/harness-managed identity with a model runtime")
+	}
+}
+
+func TestNativeHarnessManagedLoopStartedRoundTripOmitsModelRuntime(t *testing.T) {
+	t.Parallel()
+
+	in := LoopStarted{
+		Header: fullHeaderLoop(),
+		AgentRuntime: &AgentRuntime{
+			Harness:        "codex",
+			Profile:        "acp/codex",
+			CredentialMode: "native-auth",
+			Source:         "native",
+			SelectionKind:  "harness-managed",
+		},
+	}
+
+	if err := ValidateEvent(in); err != nil {
+		t.Fatalf("ValidateEvent() error = %v, want nil", err)
+	}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatalf("MarshalEvent() error = %v, want nil", err)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatalf("wire JSON: %v", err)
+	}
+	if _, present := wire["runtime"]; present {
+		t.Fatalf("managed LoopStarted wire contains a model runtime: %s", data)
+	}
+
+	decoded, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent() error = %v", err)
+	}
+	started, ok := decoded.(LoopStarted)
+	if !ok {
+		t.Fatalf("decoded event = %T, want LoopStarted", decoded)
+	}
+	if started.Runtime != (ModelRuntime{}) {
+		t.Fatalf("decoded Runtime = %+v, want empty model runtime", started.Runtime)
+	}
+	if started.AgentRuntime == nil || *started.AgentRuntime != *in.AgentRuntime {
+		t.Fatalf("decoded AgentRuntime = %+v, want %+v", started.AgentRuntime, in.AgentRuntime)
+	}
+}
+
+func TestLoopStartedDecodeRejectsAgentRuntimeWithoutModelRuntime(t *testing.T) {
+	t.Parallel()
+
+	in := LoopStarted{
+		Header: fullHeaderLoop(),
+		AgentRuntime: &AgentRuntime{
+			Harness:        "codex",
+			Profile:        "acp/codex",
+			CredentialMode: "native-auth",
+			Source:         "native",
+			SelectionKind:  "harness-managed",
+		},
+	}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatalf("MarshalEvent() error = %v", err)
+	}
+
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatalf("wire JSON: %v", err)
+	}
+	var baseAgent map[string]json.RawMessage
+	if err := json.Unmarshal(wire["agent_runtime"], &baseAgent); err != nil {
+		t.Fatalf("agent_runtime JSON: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		fields map[string]string
+	}{
+		{
+			name: "native source with mismatched gateway credential",
+			fields: map[string]string{
+				"credential_mode": "gateway-backed",
+			},
+		},
+		{
+			name: "native source with invalid credential",
+			fields: map[string]string{
+				"credential_mode": "not-a-credential",
+			},
+		},
+		{
+			name: "gateway explicit selection",
+			fields: map[string]string{
+				"credential_mode": "gateway-backed",
+				"source":          "gateway",
+				"selection_kind":  "explicit",
+				"model_alias":     "gpt-5.6-luna",
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := make(map[string]json.RawMessage, len(baseAgent)+len(tt.fields))
+			for key, value := range baseAgent {
+				agent[key] = value
+			}
+			for key, value := range tt.fields {
+				raw, marshalErr := json.Marshal(value)
+				if marshalErr != nil {
+					t.Fatalf("marshal %s: %v", key, marshalErr)
+				}
+				agent[key] = raw
+			}
+			mutatedWire := make(map[string]json.RawMessage, len(wire))
+			for key, value := range wire {
+				mutatedWire[key] = value
+			}
+			agentJSON, marshalErr := json.Marshal(agent)
+			if marshalErr != nil {
+				t.Fatalf("marshal agent_runtime: %v", marshalErr)
+			}
+			mutatedWire["agent_runtime"] = agentJSON
+			malformed, err := json.Marshal(mutatedWire)
+			if err != nil {
+				t.Fatalf("marshal wire: %v", err)
+			}
+
+			if _, err := UnmarshalEvent(malformed); err == nil {
+				t.Fatalf("UnmarshalEvent() accepted malformed omitted-runtime record: %s", malformed)
+			} else {
+				var invalid *InvalidEventError
+				if !errors.As(err, &invalid) {
+					t.Fatalf("UnmarshalEvent() error = %T %v, want InvalidEventError", err, err)
+				}
+			}
+		})
+	}
+}

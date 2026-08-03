@@ -490,6 +490,8 @@ type AgentRuntime struct {
 	Harness         string `json:"harness"`
 	Profile         string `json:"profile"`
 	CredentialMode  string `json:"credential_mode"`
+	Source          string `json:"source,omitempty"`
+	SelectionKind   string `json:"selection_kind,omitempty"`
 	ModelAlias      string `json:"model_alias"`
 	SmallModelAlias string `json:"small_model_alias,omitempty"`
 	ACPSessionID    string `json:"acp_session_id,omitempty"`

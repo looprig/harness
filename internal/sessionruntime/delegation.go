@@ -483,9 +483,6 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 	if !known {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownAgent, Agent: agent}
 	}
-	if c.hasRuntimeCatalog && !c.runtimeCatalog.HasEntries() {
-		return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeUnavailable}
-	}
 	mode := loop.ModeName(req.Mode)
 	if err := validateDelegateMode(childDef, mode); err != nil {
 		return tool.DelegateResult{}, err
@@ -493,6 +490,9 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 	var runtime *loop.Resolved
 	if c.hasRuntimeCatalog {
 		entries := c.runtimeCatalog.EntriesFor(agent)
+		if c.runtimeCatalog.HasEntries() && len(entries) == 0 {
+			return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeUnavailable}
+		}
 		if req.Runtime == nil && len(entries) > 0 {
 			resolved, err := c.runtimeCatalog.Resolve(agent, "", "", inferencemodel.EffortNone)
 			if err != nil {
@@ -508,14 +508,19 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 		if !validControllerRuntimeSelection(c.runtimeCatalog, agent, *req.Runtime) {
 			return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeInvalid}
 		}
-		resolved, err := c.runtimeCatalog.ResolveWithExplicitEffort(
+		resolved, err := c.runtimeCatalog.ResolveWithExplicitSource(
 			agent,
 			loop.AgentHarnessName(req.Runtime.Harness),
+			loop.RuntimeSourceName(req.Runtime.Source),
 			loop.ModelAlias(req.Runtime.Model),
 			parseRuntimeEffort(req.Runtime.Effort),
 			req.Runtime.Explicit.Effort,
 		)
-		if err != nil || string(resolved.AgentHarness) != req.Runtime.Harness || string(resolved.Profile) != req.Runtime.Profile || string(resolved.ModelAlias) != req.Runtime.Model || string(resolved.SmallModel) != req.Runtime.SmallModel || runtimeEffortString(resolved.Effort) != req.Runtime.Effort {
+		resolvedEffort := runtimeEffortString(resolved.Effort)
+		if resolved.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+			resolvedEffort = ""
+		}
+		if err != nil || string(resolved.AgentHarness) != req.Runtime.Harness || string(resolved.Profile) != req.Runtime.Profile || string(resolved.ModelAlias) != req.Runtime.Model || string(resolved.SmallModel) != req.Runtime.SmallModel || resolvedEffort != req.Runtime.Effort || (req.Runtime.Source != "" && string(resolved.Source) != req.Runtime.Source) || (req.Runtime.SelectionKind != "" && string(resolved.SelectionKind) != req.Runtime.SelectionKind) {
 			return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeInvalid}
 		}
 		runtime = &resolved
@@ -547,48 +552,215 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 func validControllerRuntimeSelection(catalog loop.RuntimeCatalog, agent identity.AgentName, runtime tool.DelegateRuntime) bool {
 	entries := catalog.EntriesFor(agent)
 	var selected *loop.RuntimeCatalogEntry
+	var selectedModel *loop.RuntimeModelOption
 	for i := range entries {
-		if entries[i].AgentHarness == loop.AgentHarnessName(runtime.Harness) {
-			selected = &entries[i]
+		entry := &entries[i]
+		if entry.AgentHarness != loop.AgentHarnessName(runtime.Harness) {
+			continue
+		}
+		entrySource := controllerRuntimeEntrySource(*entry)
+		if runtime.Source != "" && !controllerRuntimeEntryHasSource(*entry, loop.RuntimeSourceName(runtime.Source)) {
+			continue
+		}
+		if runtime.SelectionKind != "" && string(entry.SelectionKind) != runtime.SelectionKind {
+			continue
+		}
+		if runtime.Model != "" && len(entry.Models) == 0 {
+			continue
+		}
+		if runtime.Model != "" {
+			var foundModel *loop.RuntimeModelOption
+			for optionIndex := range entry.Models {
+				option := &entry.Models[optionIndex]
+				optionSource := controllerRuntimeOptionSource(*entry, *option)
+				if string(option.Alias) != runtime.Model {
+					continue
+				}
+				if runtime.Source != "" && optionSource != loop.RuntimeSourceName(runtime.Source) {
+					continue
+				}
+				if runtime.Source == "" && optionSource != entrySource {
+					continue
+				}
+				foundModel = option
+				break
+			}
+			if foundModel == nil {
+				continue
+			}
+			selectedModel = foundModel
+		}
+		if runtime.Model == "" && runtime.Source == "" && runtime.SelectionKind == "" && !entry.Default {
+			continue
+		}
+		selected = entry
+		if entry.Default {
 			break
 		}
 	}
 	if selected == nil {
 		return false
 	}
-	harnessSelectable := len(entries) > 1 || anyNonDefaultRuntimeHarness(entries)
+	if runtime.Explicit.Source && !controllerRuntimeSourceSelectable(entries, selected.AgentHarness) {
+		return false
+	}
+	if runtime.Explicit.Source && runtime.Source == "" {
+		return false
+	}
+	seenHarnesses := make(map[loop.AgentHarnessName]struct{}, len(entries))
+	for _, entry := range entries {
+		seenHarnesses[entry.AgentHarness] = struct{}{}
+	}
+	harnessSelectable := len(seenHarnesses) > 1
 	if runtime.Explicit.Harness {
 		if !harnessSelectable {
 			return false
 		}
 	} else if !selected.Default {
-		return false
-	}
-	if runtime.Explicit.Model {
-		if len(selected.Models) <= 1 {
+		defaultEntry := runtimeDefaultControllerEntry(entries)
+		if selected.AgentHarness != defaultEntry.AgentHarness || !runtime.Explicit.Source {
 			return false
 		}
-	} else if runtime.Model != string(selected.DefaultModel) {
+	}
+	selectionKind := selected.SelectionKind
+	if selectionKind == "" {
+		selectionKind = loop.RuntimeSelectionExplicit
+	}
+	entrySource := controllerRuntimeEntrySource(*selected)
+	source := entrySource
+	if selectedModel != nil {
+		source = controllerRuntimeOptionSource(*selected, *selectedModel)
+	}
+	if runtime.Source != "" {
+		if source != loop.RuntimeSourceName(runtime.Source) {
+			return false
+		}
+	} else if selectedModel != nil && source != entrySource {
+		// The omitted source means the entry's source. An option whose source
+		// overrides that entry source requires the explicit source branch.
 		return false
 	}
-	var selectedModel *loop.RuntimeModelOption
-	for i := range selected.Models {
-		if selected.Models[i].Alias == loop.ModelAlias(runtime.Model) {
-			selectedModel = &selected.Models[i]
-			break
+	if runtime.SelectionKind != "" && runtime.SelectionKind != string(selectionKind) {
+		return false
+	}
+	if selectionKind == loop.RuntimeSelectionHarnessManaged {
+		return source == loop.RuntimeSourceNative && !runtime.Explicit.Model && !runtime.Explicit.Effort && runtime.Model == "" && runtime.SmallModel == "" && runtime.Effort == ""
+	}
+	sourceModels := controllerRuntimeModelsForSource(*selected, source)
+	if runtime.Explicit.Model {
+		if len(sourceModels) <= 1 {
+			return false
+		}
+	} else {
+		defaultModel := controllerRuntimeDefaultModel(*selected, source)
+		if selectedModel == nil || defaultModel.Alias == "" || runtime.Model != string(defaultModel.Alias) {
+			return false
 		}
 	}
 	if selectedModel == nil {
 		return false
 	}
 	if runtime.Explicit.Effort {
-		if len(runtimeEfforts(selected.Models)) <= 1 {
+		if len(runtimeEfforts(sourceModels)) <= 1 {
 			return false
 		}
 	} else if runtime.Effort != runtimeEffortString(selectedModel.DefaultEffort) {
 		return false
 	}
 	return true
+}
+
+func controllerRuntimeEntrySource(entry loop.RuntimeCatalogEntry) loop.RuntimeSourceName {
+	if entry.Source != "" {
+		return entry.Source
+	}
+	switch entry.Credential {
+	case loop.CredentialGatewayBacked:
+		return loop.RuntimeSourceGateway
+	case loop.CredentialNativeAuth:
+		return loop.RuntimeSourceNative
+	default:
+		return ""
+	}
+}
+
+func controllerRuntimeOptionSource(entry loop.RuntimeCatalogEntry, option loop.RuntimeModelOption) loop.RuntimeSourceName {
+	if option.Source != "" {
+		return option.Source
+	}
+	switch option.Credential {
+	case loop.CredentialGatewayBacked:
+		return loop.RuntimeSourceGateway
+	case loop.CredentialNativeAuth:
+		return loop.RuntimeSourceNative
+	default:
+		return controllerRuntimeEntrySource(entry)
+	}
+}
+
+func controllerRuntimeEntryHasSource(entry loop.RuntimeCatalogEntry, source loop.RuntimeSourceName) bool {
+	if controllerRuntimeEntrySource(entry) == source {
+		return true
+	}
+	for _, option := range entry.Models {
+		if controllerRuntimeOptionSource(entry, option) == source {
+			return true
+		}
+	}
+	return false
+}
+
+func controllerRuntimeModelsForSource(entry loop.RuntimeCatalogEntry, source loop.RuntimeSourceName) []loop.RuntimeModelOption {
+	models := make([]loop.RuntimeModelOption, 0, len(entry.Models))
+	for _, option := range entry.Models {
+		if controllerRuntimeOptionSource(entry, option) == source {
+			models = append(models, option)
+		}
+	}
+	return models
+}
+
+func controllerRuntimeDefaultModel(entry loop.RuntimeCatalogEntry, source loop.RuntimeSourceName) loop.RuntimeModelOption {
+	models := controllerRuntimeModelsForSource(entry, source)
+	for _, option := range models {
+		if option.Alias == entry.DefaultModel {
+			return option
+		}
+	}
+	if len(models) > 0 {
+		return models[0]
+	}
+	return loop.RuntimeModelOption{}
+}
+
+func controllerRuntimeSourceSelectable(entries []loop.RuntimeCatalogEntry, harness loop.AgentHarnessName) bool {
+	sources := make(map[loop.RuntimeSourceName]struct{})
+	for _, entry := range entries {
+		if entry.AgentHarness != harness {
+			continue
+		}
+		sources[entry.Source] = struct{}{}
+		for _, option := range entry.Models {
+			source := option.Source
+			if source == "" {
+				source = entry.Source
+			}
+			sources[source] = struct{}{}
+		}
+	}
+	return len(sources) > 1
+}
+
+func runtimeDefaultControllerEntry(entries []loop.RuntimeCatalogEntry) loop.RuntimeCatalogEntry {
+	for _, entry := range entries {
+		if entry.Default {
+			return entry
+		}
+	}
+	if len(entries) == 0 {
+		return loop.RuntimeCatalogEntry{}
+	}
+	return entries[0]
 }
 
 func anyNonDefaultRuntimeHarness(entries []loop.RuntimeCatalogEntry) bool {

@@ -143,6 +143,40 @@ func TestFingerprintFromProjectsRuntimeIdentity(t *testing.T) {
 	}
 }
 
+func TestFingerprintFromOmitsModelIDForHarnessManagedRuntime(t *testing.T) {
+	t.Parallel()
+
+	bound := bindFingerprintDefinition(fpConfig("base-model", "system"))
+	managed, err := loop.OverrideBoundRuntimeManaged(bound, "acp/codex-native")
+	if err != nil {
+		t.Fatalf("OverrideBoundRuntimeManaged: %v", err)
+	}
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType:  "agent",
+		AgentHarness:  "codex",
+		Profile:       "acp/codex-native",
+		Credential:    loop.CredentialNativeAuth,
+		Source:        loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionHarnessManaged,
+		Default:       true,
+	}})
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog: %v", err)
+	}
+	managed, err = loop.OverrideBoundRuntimeCatalog(managed, catalog)
+	if err != nil {
+		t.Fatalf("OverrideBoundRuntimeCatalog: %v", err)
+	}
+
+	fingerprint := FingerprintFrom(managed)
+	if fingerprint.ModelID != "" {
+		t.Fatalf("managed fingerprint ModelID = %q, want empty", fingerprint.ModelID)
+	}
+	if fingerprint.RuntimeIdentityRev == "" {
+		t.Fatal("managed fingerprint RuntimeIdentityRev is empty")
+	}
+}
+
 func TestFrozenRuntimeIdentityFieldsAgreeWithManifest(t *testing.T) {
 	t.Parallel()
 	fields := ConfigFingerprintFields{

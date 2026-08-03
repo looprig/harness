@@ -68,6 +68,54 @@ func TestOverrideBoundRuntimeSelectionRecordsAliasAndCanonicalNone(t *testing.T)
 	}
 }
 
+func TestOverrideBoundRuntimeManagedRecordsNativeSelectionWithoutModelIdentity(t *testing.T) {
+	t.Parallel()
+
+	definition := mustDefinition(t)
+	bound, err := definition.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind() error = %v", err)
+	}
+
+	managed, err := OverrideBoundRuntimeManaged(bound, "acp/codex")
+	if err != nil {
+		t.Fatalf("OverrideBoundRuntimeManaged() error = %v", err)
+	}
+	if managed.Engine() != EngineAdapter || managed.RuntimeProfile() != "acp/codex" {
+		t.Fatalf("managed engine/profile = %v/%q, want adapter/acp/codex", managed.Engine(), managed.RuntimeProfile())
+	}
+	identity := managed.RuntimeIdentity()
+	if identity.Source != RuntimeSourceNative || identity.SelectionKind != RuntimeSelectionHarnessManaged {
+		t.Fatalf("managed identity source/selection = %q/%q, want native/harness-managed", identity.Source, identity.SelectionKind)
+	}
+	if identity.ModelAlias != "" || identity.TargetProvider != "" || identity.TargetModel != "" || identity.Effort != model.EffortNone {
+		t.Fatalf("managed identity contains concrete selection: %+v", identity)
+	}
+	if identity.Digest() == "" {
+		t.Fatal("managed identity digest is empty")
+	}
+}
+
+func TestRuntimeIdentityManagedDigestOmitsModelAndEffortIdentity(t *testing.T) {
+	t.Parallel()
+
+	managed := RuntimeIdentity{Profile: "acp/codex", Source: RuntimeSourceNative, SelectionKind: RuntimeSelectionHarnessManaged}
+	managedNone := managed
+	managedNone.Effort = model.Effort("none")
+	managedConcrete := managed
+	managedConcrete.ModelAlias = "placeholder"
+	managedConcrete.TargetProvider = "provider"
+	managedConcrete.TargetModel = "model"
+	managedConcrete.Effort = model.EffortHigh
+	if managed.Digest() != managedNone.Digest() || managed.Digest() != managedConcrete.Digest() {
+		t.Fatalf("managed digest changed with concrete/none representation: base=%q none=%q concrete=%q", managed.Digest(), managedNone.Digest(), managedConcrete.Digest())
+	}
+	expected := sha256.Sum256([]byte(`{"domain":"loop/runtime-identity/v1","profile":"acp/codex","source":"native","selection_kind":"harness-managed"}`))
+	if got, want := managed.Digest(), hex.EncodeToString(expected[:]); got != want {
+		t.Fatalf("managed digest = %q, want model/effort-free canonical digest %q", got, want)
+	}
+}
+
 func TestOverrideBoundRuntimeSelectionRejectsInvalidProfilesAndAliases(t *testing.T) {
 	t.Parallel()
 

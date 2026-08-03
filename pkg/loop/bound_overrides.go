@@ -15,6 +15,8 @@ import (
 type RuntimeIdentity struct {
 	Profile        RuntimeProfileName
 	CatalogDigest  string
+	Source         RuntimeSourceName
+	SelectionKind  RuntimeSelectionKind
 	ModelAlias     ModelAlias
 	TargetProvider model.ProviderName
 	TargetModel    string
@@ -27,25 +29,42 @@ type RuntimeIdentity struct {
 // it should carry this opaque digest as its runtime-identity revision rather
 // than hashing a model descriptor, endpoint, or credential.
 func (i RuntimeIdentity) Digest() string {
-	if i.Profile == "" && i.CatalogDigest == "" && i.ModelAlias == "" && i.TargetProvider == "" && i.TargetModel == "" && i.Effort == model.EffortNone {
+	if i.Profile == "" && i.CatalogDigest == "" && i.Source == "" && i.SelectionKind == "" && i.ModelAlias == "" && i.TargetProvider == "" && i.TargetModel == "" && i.Effort == model.EffortNone {
 		return ""
 	}
+	modelAlias := i.ModelAlias
+	targetProvider := i.TargetProvider
+	targetModel := i.TargetModel
+	effort := runtimeEffortString(i.Effort)
+	if i.SelectionKind == RuntimeSelectionHarnessManaged {
+		// A harness-managed ACP runtime has no concrete model or effort
+		// selection. Keep those fields out of the canonical identity even if a
+		// malformed caller supplied values alongside the managed kind.
+		modelAlias = ""
+		targetProvider = ""
+		targetModel = ""
+		effort = ""
+	}
 	projection := struct {
-		Domain         string             `json:"domain"`
-		Profile        RuntimeProfileName `json:"profile,omitempty"`
-		CatalogDigest  string             `json:"catalog_digest,omitempty"`
-		ModelAlias     ModelAlias         `json:"model_alias,omitempty"`
-		TargetProvider model.ProviderName `json:"target_provider,omitempty"`
-		TargetModel    string             `json:"target_model,omitempty"`
-		Effort         string             `json:"effort"`
+		Domain         string               `json:"domain"`
+		Profile        RuntimeProfileName   `json:"profile,omitempty"`
+		CatalogDigest  string               `json:"catalog_digest,omitempty"`
+		Source         RuntimeSourceName    `json:"source,omitempty"`
+		SelectionKind  RuntimeSelectionKind `json:"selection_kind,omitempty"`
+		ModelAlias     ModelAlias           `json:"model_alias,omitempty"`
+		TargetProvider model.ProviderName   `json:"target_provider,omitempty"`
+		TargetModel    string               `json:"target_model,omitempty"`
+		Effort         string               `json:"effort,omitempty"`
 	}{
 		Domain:         "loop/runtime-identity/v1",
 		Profile:        i.Profile,
 		CatalogDigest:  i.CatalogDigest,
-		ModelAlias:     i.ModelAlias,
-		TargetProvider: i.TargetProvider,
-		TargetModel:    i.TargetModel,
-		Effort:         runtimeEffortString(i.Effort),
+		Source:         i.Source,
+		SelectionKind:  i.SelectionKind,
+		ModelAlias:     modelAlias,
+		TargetProvider: targetProvider,
+		TargetModel:    targetModel,
+		Effort:         effort,
 	}
 	encoded, err := json.Marshal(projection)
 	if err != nil {
@@ -111,6 +130,18 @@ func OverrideBoundRuntime(bound BoundDefinition, profile RuntimeProfileName, tar
 // runtime tuple. alias is optional only for compatibility with callers using
 // OverrideBoundRuntime; non-empty aliases use the catalog's identifier rules.
 func OverrideBoundRuntimeSelection(bound BoundDefinition, profile RuntimeProfileName, alias ModelAlias, target model.Model, effort model.Effort) (BoundDefinition, error) {
+	return OverrideBoundRuntimeSelectionWithIdentity(bound, profile, alias, target, effort, "", "")
+}
+
+// OverrideBoundRuntimeSelectionWithIdentity is the source-aware binding seam
+// for a concrete catalogue selection. Empty source and selection kind preserve
+// the legacy helper's identity shape for callers that predate source-aware
+// runtime selection.
+func OverrideBoundRuntimeSelectionWithIdentity(bound BoundDefinition, profile RuntimeProfileName, alias ModelAlias, target model.Model, effort model.Effort, source RuntimeSourceName, selectionKind RuntimeSelectionKind) (BoundDefinition, error) {
+	return overrideBoundRuntimeSelection(bound, profile, alias, target, effort, source, selectionKind)
+}
+
+func overrideBoundRuntimeSelection(bound BoundDefinition, profile RuntimeProfileName, alias ModelAlias, target model.Model, effort model.Effort, source RuntimeSourceName, selectionKind RuntimeSelectionKind) (BoundDefinition, error) {
 	state, ok := bound.(*boundDefinitionState)
 	if !ok || state == nil {
 		return nil, &BindError{Kind: BindInvalidDefinition, Index: -1}
@@ -119,6 +150,15 @@ func OverrideBoundRuntimeSelection(bound BoundDefinition, profile RuntimeProfile
 		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1}
 	}
 	if alias != "" && validateCatalogIdentifier(string(alias), false) != nil {
+		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1}
+	}
+	if source != "" && !source.valid() {
+		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1}
+	}
+	if selectionKind != "" && !selectionKind.valid() {
+		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1}
+	}
+	if selectionKind == RuntimeSelectionHarnessManaged || source == RuntimeSourceNative && selectionKind == RuntimeSelectionHarnessManaged {
 		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1}
 	}
 	if zeroModel(target) {
@@ -140,6 +180,8 @@ func OverrideBoundRuntimeSelection(bound BoundDefinition, profile RuntimeProfile
 	definition.model = cloneModel(target)
 	clone.definition = &definition
 	clone.runtimeProfile = profile
+	clone.runtimeSource = source
+	clone.runtimeSelectionKind = selectionKind
 	clone.runtimeModelAlias = alias
 	clone.runtimeTargetProvider = target.Provider
 	clone.runtimeTargetModel = target.Name
@@ -152,6 +194,34 @@ func OverrideBoundRuntimeSelection(bound BoundDefinition, profile RuntimeProfile
 		pinned.Effort = effort
 		clone.modes[index] = pinned
 	}
+	return &clone, nil
+}
+
+// OverrideBoundRuntimeManaged installs the typed seam used by a native ACP
+// harness-managed selection. It intentionally leaves the definition's base
+// model and modes untouched: those values satisfy the existing BoundDefinition
+// invariant, while the adapter receives no concrete model identity from this
+// runtime selection. Later ACP phases must consume RuntimeIdentity.Source and
+// RuntimeIdentity.SelectionKind and omit model/effort overrides.
+func OverrideBoundRuntimeManaged(bound BoundDefinition, profile RuntimeProfileName) (BoundDefinition, error) {
+	state, ok := bound.(*boundDefinitionState)
+	if !ok || state == nil {
+		return nil, &BindError{Kind: BindInvalidDefinition, Index: -1}
+	}
+	if validateRuntimeProfile(string(profile)) != nil {
+		return nil, &BindError{Kind: BindInvalidRuntime, Index: -1}
+	}
+	clone := *state
+	definition := *state.definition
+	definition.engine = EngineAdapter
+	clone.definition = &definition
+	clone.runtimeProfile = profile
+	clone.runtimeSource = RuntimeSourceNative
+	clone.runtimeSelectionKind = RuntimeSelectionHarnessManaged
+	clone.runtimeModelAlias = ""
+	clone.runtimeTargetProvider = ""
+	clone.runtimeTargetModel = ""
+	clone.runtimeEffort = model.EffortNone
 	return &clone, nil
 }
 

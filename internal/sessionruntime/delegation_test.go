@@ -196,6 +196,55 @@ func TestDelegateStartValidation(t *testing.T) {
 	}
 }
 
+func TestDelegateStartFailsClosedForRoleMissingFromPopulatedCatalog(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := delegateChild("child", "native child")
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType:  "other",
+		AgentHarness:  "codex",
+		Profile:       "acp/codex",
+		Credential:    loop.CredentialNativeAuth,
+		Source:        loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionHarnessManaged,
+		Default:       true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := newDelegationSession(t, parent, []Option{WithRuntimeCatalog(catalog)}, child)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+	before := s.spawnedCount()
+	_, err = ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
+	var runtimeErr *DelegateError
+	if !errors.As(err, &runtimeErr) || runtimeErr.Kind != DelegateRuntimeUnavailable {
+		t.Fatalf("missing-role start error = %v, want DelegateRuntimeUnavailable", err)
+	}
+	if got := s.spawnedCount(); got != before {
+		t.Fatalf("spawned count = %d, want unchanged %d", got, before)
+	}
+}
+
+func TestDelegateStartKeepsNativeFallbackForEmptyCatalog(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := delegateChild("child", "native child")
+	emptyCatalog, err := loop.NewRuntimeCatalog(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newDelegationSession(t, parent, []Option{WithRuntimeCatalog(emptyCatalog)}, child)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+	result, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
+	if err != nil {
+		t.Fatalf("empty-catalog native start error = %v", err)
+	}
+	if result.Output != "native child" {
+		t.Fatalf("empty-catalog output = %q, want %q", result.Output, "native child")
+	}
+}
+
 // TestDelegateActionSetEnforcement proves the parent-scoped controller re-enforces the
 // action set independent of crafted JSON: a sync-only parent's controller rejects every
 // managed action, while a managed controller admits them.
@@ -298,6 +347,10 @@ func TestDelegateRuntimeIsRevalidatedAndPinnedAtChildBind(t *testing.T) {
 			{Alias: "runtime", Target: validModel("runtime-target"), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
 			{Alias: "runtime-small", Target: validModel("runtime-small-target"), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
 		},
+	}, {
+		SubagentType: "child", AgentHarness: "test", Profile: "acp/test",
+		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionHarnessManaged,
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -341,6 +394,120 @@ func TestDelegateRuntimeIsRevalidatedAndPinnedAtChildBind(t *testing.T) {
 	_, err = ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "bad small", Wait: true, Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Model: "runtime", SmallModel: "wrong-small", Effort: "high"}})
 	if !errors.As(err, &runtimeErr) || runtimeErr.Kind != DelegateRuntimeInvalid {
 		t.Fatalf("invalid small model error = %v, want typed runtime refusal", err)
+	}
+	managedResult, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, Agent: "child", Message: "managed", Wait: true,
+		Runtime: &tool.DelegateRuntime{Harness: "test", Profile: "acp/test", Source: "native", SelectionKind: "harness-managed", Explicit: tool.DelegateRuntimeExplicit{Source: true}},
+	})
+	if err != nil {
+		t.Fatalf("managed runtime start: %v", err)
+	}
+	s.loopsMu.RLock()
+	managedHandle := s.loops[managedResult.DelegateID]
+	s.loopsMu.RUnlock()
+	if managedHandle == nil {
+		t.Fatal("managed runtime child not registered")
+	}
+	managedIdentity := managedHandle.bound.RuntimeIdentity()
+	if managedIdentity.Source != loop.RuntimeSourceNative || managedIdentity.SelectionKind != loop.RuntimeSelectionHarnessManaged || managedIdentity.ModelAlias != "" || managedIdentity.TargetModel != "" || managedIdentity.Effort != model.EffortNone {
+		t.Fatalf("managed bound identity = %+v, want native/harness-managed without model/effort", managedIdentity)
+	}
+	for _, runtime := range []*tool.DelegateRuntime{
+		{Harness: "test", Profile: "acp/test", Source: "gateway", SelectionKind: "explicit", Effort: "high", Explicit: tool.DelegateRuntimeExplicit{Source: true}},
+		{Harness: "test", Profile: "acp/test", Source: "native", SelectionKind: "harness-managed", Model: "runtime", Explicit: tool.DelegateRuntimeExplicit{Source: true}},
+		{Harness: "test", Profile: "acp/test", Source: "native", SelectionKind: "harness-managed", Effort: "high", Explicit: tool.DelegateRuntimeExplicit{Source: true}},
+	} {
+		_, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "invalid mixed source", Wait: true, Runtime: runtime})
+		if !errors.As(err, &runtimeErr) || runtimeErr.Kind != DelegateRuntimeInvalid {
+			t.Fatalf("invalid mixed-source runtime %+v error = %v, want typed runtime refusal", runtime, err)
+		}
+	}
+}
+
+func TestControllerValidatesHarnessManagedRuntimeSourceAndSelectors(t *testing.T) {
+	t.Parallel()
+
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex",
+		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionHarnessManaged, Default: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := tool.DelegateRuntime{
+		Harness: "codex", Profile: "acp/codex", Source: "native", SelectionKind: "harness-managed",
+	}
+	if !validControllerRuntimeSelection(catalog, "child", base) {
+		t.Fatal("validControllerRuntimeSelection() rejected harness-managed native runtime")
+	}
+	for _, invalid := range []tool.DelegateRuntime{
+		{Harness: "codex", Profile: "acp/codex", Source: "native", SelectionKind: "harness-managed", Model: "luna", Effort: "none"},
+		{Harness: "codex", Profile: "acp/codex", Source: "native", SelectionKind: "harness-managed", Effort: "high"},
+		{Harness: "codex", Profile: "acp/codex", Source: "gateway", SelectionKind: "harness-managed", Effort: "none"},
+	} {
+		if validControllerRuntimeSelection(catalog, "child", invalid) {
+			t.Fatalf("validControllerRuntimeSelection() accepted invalid runtime %+v", invalid)
+		}
+	}
+}
+
+func TestControllerValidatesPerModelSourceWithinOneEntry(t *testing.T) {
+	t.Parallel()
+
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex-mixed",
+		Credential: loop.CredentialGatewayBacked, Source: loop.RuntimeSourceGateway, Default: true,
+		DefaultModel: "gateway",
+		Models: []loop.RuntimeModelOption{
+			{Alias: "gateway", Source: loop.RuntimeSourceGateway, Credential: loop.CredentialGatewayBacked, Target: validModel("gateway"), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
+			{Alias: "native", Source: loop.RuntimeSourceNative, Credential: loop.CredentialNativeAuth, Target: validModel("native"), DefaultEffort: model.EffortMedium, Efforts: []model.Effort{model.EffortMedium}},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, runtime := range []tool.DelegateRuntime{
+		{Harness: "codex", Profile: "acp/codex-mixed", Source: "gateway", SelectionKind: "explicit", Model: "gateway", Effort: "high", Explicit: tool.DelegateRuntimeExplicit{Source: true}},
+		{Harness: "codex", Profile: "acp/codex-mixed", Source: "native", SelectionKind: "explicit", Model: "native", Effort: "medium", Explicit: tool.DelegateRuntimeExplicit{Source: true}},
+	} {
+		if !validControllerRuntimeSelection(catalog, "child", runtime) {
+			t.Fatalf("validControllerRuntimeSelection() rejected per-model runtime %+v", runtime)
+		}
+	}
+	for _, runtime := range []tool.DelegateRuntime{
+		{Harness: "codex", Profile: "acp/codex-mixed", Source: "native", SelectionKind: "explicit", Effort: "medium", Explicit: tool.DelegateRuntimeExplicit{Source: true}},
+		{Harness: "codex", Profile: "acp/codex-mixed", Source: "native", SelectionKind: "explicit", Model: "gateway", Effort: "high", Explicit: tool.DelegateRuntimeExplicit{Source: true}},
+	} {
+		if validControllerRuntimeSelection(catalog, "child", runtime) {
+			t.Fatalf("validControllerRuntimeSelection() accepted invalid per-model runtime %+v", runtime)
+		}
+	}
+}
+
+func TestControllerRejectsEffectiveSourceOverrideWithoutAgentSource(t *testing.T) {
+	t.Parallel()
+
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex-mixed",
+		Credential: loop.CredentialGatewayBacked, Source: loop.RuntimeSourceGateway, Default: true,
+		DefaultModel: "gateway",
+		Models: []loop.RuntimeModelOption{
+			{Alias: "gateway", Source: loop.RuntimeSourceGateway, Credential: loop.CredentialGatewayBacked, Target: validModel("gateway"), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
+			{Alias: "native", Source: loop.RuntimeSourceNative, Credential: loop.CredentialNativeAuth, Target: validModel("native"), DefaultEffort: model.EffortMedium, Efforts: []model.Effort{model.EffortMedium}},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := tool.DelegateRuntime{
+		Harness: "codex", Profile: "acp/codex-mixed", SelectionKind: "explicit",
+		Model: "native", Effort: "medium",
+	}
+	if validControllerRuntimeSelection(catalog, "child", runtime) {
+		t.Fatal("validControllerRuntimeSelection() accepted a native override without agent_source")
 	}
 }
 

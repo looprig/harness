@@ -82,6 +82,117 @@ func TestRestoreRuntimeBindingAcceptsConcreteTargetAlias(t *testing.T) {
 	}
 }
 
+func TestRestoreRuntimeBindingPreservesNativeHarnessManagedSelection(t *testing.T) {
+	t.Parallel()
+
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
+		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionHarnessManaged, Default: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := event.LoopStarted{
+		Header: event.Header{
+			AgentName: "worker",
+			Coordinates: identity.Coordinates{
+				SessionID: mustUUID(),
+				LoopID:    mustUUID(),
+			},
+			EventID: mustUUID(),
+		},
+		AgentRuntime: &event.AgentRuntime{
+			Harness: "codex", Profile: "acp/codex", CredentialMode: "native-auth",
+			Source: "native", SelectionKind: "harness-managed",
+		},
+	}
+	wire, err := event.MarshalEvent(started)
+	if err != nil {
+		t.Fatalf("MarshalEvent() error = %v", err)
+	}
+	decoded, err := event.UnmarshalEvent(wire)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent() error = %v", err)
+	}
+	var ok bool
+	started, ok = decoded.(event.LoopStarted)
+	if !ok {
+		t.Fatalf("decoded event = %T, want event.LoopStarted", decoded)
+	}
+	bound := bindCfg(engineCfg(&stubLLM{}, loop.EngineNative, "system"), mustUUID(), started.LoopID)
+	ri := foldLoopInference([]event.Event{started})
+	if ri.HasRuntime || ri.Runtime != (event.ModelRuntime{}) {
+		t.Fatalf("foldLoopInference() persisted runtime = has=%v runtime=%+v, want no runtime", ri.HasRuntime, ri.Runtime)
+	}
+	got, err := restoreRuntimeBinding(started, bound, ri, catalog, true, false)
+	if err != nil {
+		t.Fatalf("restoreRuntimeBinding() error = %v", err)
+	}
+	if got.Engine() != loop.EngineAdapter || got.RuntimeProfile() != "acp/codex" {
+		t.Fatalf("restored engine/profile = %v/%q, want adapter/acp/codex", got.Engine(), got.RuntimeProfile())
+	}
+	runtime := got.RuntimeIdentity()
+	if runtime.Source != loop.RuntimeSourceNative || runtime.SelectionKind != loop.RuntimeSelectionHarnessManaged || runtime.ModelAlias != "" || runtime.TargetModel != "" || runtime.Effort != model.EffortNone {
+		t.Fatalf("restored managed identity = %+v, want native/harness-managed without model/effort", runtime)
+	}
+}
+
+func TestRestoreRuntimeBindingRejectsNativeHarnessManagedCredentialMismatch(t *testing.T) {
+	t.Parallel()
+
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
+		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionHarnessManaged, Default: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := event.LoopStarted{
+		Header: event.Header{AgentName: "worker", Coordinates: identity.Coordinates{LoopID: mustUUID()}},
+		AgentRuntime: &event.AgentRuntime{
+			Harness: "codex", Profile: "acp/codex", CredentialMode: "gateway-backed",
+			Source: "native", SelectionKind: "harness-managed",
+		},
+	}
+	bound := bindCfg(engineCfg(&stubLLM{}, loop.EngineNative, "system"), mustUUID(), started.LoopID)
+	_, err = restoreRuntimeBinding(started, bound, foldLoopInference([]event.Event{started}), catalog, true, false)
+	var mismatch *RestoreRuntimeMismatchError
+	if !errors.As(err, &mismatch) || mismatch.Kind != RestoreRuntimeCredentialMismatch {
+		t.Fatalf("restoreRuntimeBinding() error = %T %v, want credential mismatch", err, err)
+	}
+}
+
+func TestRestoreRuntimeBindingRejectsNativeHarnessManagedPersistedRuntime(t *testing.T) {
+	t.Parallel()
+
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
+		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionHarnessManaged, Default: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := event.LoopStarted{
+		Header: event.Header{AgentName: "worker", Coordinates: identity.Coordinates{LoopID: mustUUID()}},
+		AgentRuntime: &event.AgentRuntime{
+			Harness: "codex", Profile: "acp/codex", CredentialMode: "native-auth",
+			Source: "native", SelectionKind: "harness-managed",
+		},
+	}
+	bound := bindCfg(engineCfg(&stubLLM{}, loop.EngineNative, "system"), mustUUID(), started.LoopID)
+	ri := foldLoopInference([]event.Event{started})
+	ri.Runtime = event.ModelRuntime{Key: model.ModelKey{Provider: "provider", Model: "should-not-persist"}, Effort: model.EffortMedium}
+	ri.HasRuntime = true
+	_, err = restoreRuntimeBinding(started, bound, ri, catalog, true, false)
+	var mismatch *RestoreRuntimeMismatchError
+	if !errors.As(err, &mismatch) || mismatch.Kind != RestoreRuntimeTargetMismatch {
+		t.Fatalf("restoreRuntimeBinding() error = %T %v, want target mismatch", err, err)
+	}
+}
+
 func TestRestoreRuntimeBindingRejectsDriftAndUnavailableCatalog(t *testing.T) {
 	t.Parallel()
 	base := restoreRuntimeStarted(model.ModelKey{Provider: "provider", Model: "different"})

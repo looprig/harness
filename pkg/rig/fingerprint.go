@@ -71,12 +71,16 @@ type ConfigFingerprintFields struct {
 
 // FingerprintFrom derives the stable, secret-free behavior fingerprint of a bound loop.
 func FingerprintFrom(definition loop.BoundDefinition) event.ConfigFingerprint {
+	runtime := definition.RuntimeIdentity()
+	modelID := definition.Model().Name
+	if runtime.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+		modelID = ""
+	}
 	fingerprint := event.ConfigFingerprint{
-		ModelID:         definition.Model().Name,
+		ModelID:         modelID,
 		SystemPromptRev: hexSHA256(definition.EffectiveSystem()),
 		ToolPolicyRev:   toolPolicyRev(definition.Tools()),
 	}
-	runtime := definition.RuntimeIdentity()
 	fingerprint.RuntimeProfile = string(runtime.Profile)
 	fingerprint.RuntimeCatalogRev = runtime.CatalogDigest
 	fingerprint.RuntimeIdentityRev = runtime.Digest()

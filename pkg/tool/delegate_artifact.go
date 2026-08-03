@@ -5,13 +5,15 @@ package tool
 // these stable aliases at the preparation boundary; pkg/tool deliberately does
 // not import pkg/loop.
 type DelegateRuntime struct {
-	Harness    string
-	Profile    string
-	Model      string
-	SmallModel string
-	Effort     string
-	Explicit   DelegateRuntimeExplicit
-	Advertised DelegateRuntimeAdvertised
+	Harness       string
+	Profile       string
+	Source        string
+	SelectionKind string
+	Model         string
+	SmallModel    string
+	Effort        string
+	Explicit      DelegateRuntimeExplicit
+	Advertised    DelegateRuntimeAdvertised
 }
 
 // DelegateRuntimeExplicit records which selectors were supplied by the caller.
@@ -19,6 +21,7 @@ type DelegateRuntime struct {
 // distinguishable for downstream pinning and audit decisions.
 type DelegateRuntimeExplicit struct {
 	Harness bool
+	Source  bool
 	Model   bool
 	Effort  bool
 }
@@ -28,12 +31,13 @@ type DelegateRuntimeExplicit struct {
 // controller ignores it and revalidates the concrete runtime tuple itself.
 type DelegateRuntimeAdvertised struct {
 	Harness bool
+	Source  bool
 	Model   bool
 	Effort  bool
 }
 
 func (a DelegateRuntimeAdvertised) Any() bool {
-	return a.Harness || a.Model || a.Effort
+	return a.Harness || a.Source || a.Model || a.Effort
 }
 
 // DelegateArtifact is the prepared, fully validated Subagent call. It is

@@ -97,6 +97,198 @@ func TestSchemaRuntimeSelectorsFollowCapabilities(t *testing.T) {
 	}
 }
 
+func TestSchemaAndDescriptionOmitRolesMissingFromPopulatedCatalog(t *testing.T) {
+	t.Parallel()
+	roles := []SubagentCatalogEntry{{Name: "worker", Description: "builds"}, {Name: "reviewer", Description: "reviews"}}
+	catalog := schemaCatalog(t, schemaEntry("worker", "claude-code", true, []string{"sonnet"}, []inferencemodel.Effort{inferencemodel.EffortMedium}))
+	info, err := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, roles, catalog).Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(info.Schema), "worker") || strings.Contains(string(info.Schema), "reviewer") {
+		t.Fatalf("populated catalog schema = %s, want only catalogued role", info.Schema)
+	}
+	if !strings.Contains(info.Desc, "role=worker") || strings.Contains(info.Desc, "role=reviewer") {
+		t.Fatalf("populated catalog description = %q, want only catalogued role", info.Desc)
+	}
+
+	empty := emptyRuntimeCatalog(t)
+	nativeInfo, err := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, roles, empty).Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(nativeInfo.Schema), "reviewer") || !strings.Contains(nativeInfo.Desc, "role=reviewer") {
+		t.Fatalf("empty catalog native fallback omitted reviewer: schema=%s description=%q", nativeInfo.Schema, nativeInfo.Desc)
+	}
+}
+
+func TestSchemaMixedSourcesAdvertisesAgentSourceWithoutManagedPlaceholders(t *testing.T) {
+	gateway := schemaEntry("worker", "codex", true, []string{"luna"}, []inferencemodel.Effort{inferencemodel.EffortHigh})
+	native := loop.RuntimeCatalogEntry{
+		SubagentType: "worker", AgentHarness: "codex", Profile: "profile/codex-native",
+		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionHarnessManaged,
+	}
+	catalog := schemaCatalog(t, gateway, native)
+	info, err := NewSubagentWithRuntimeCatalog(&fakeController{}, loop.DelegationManaged, []SubagentCatalogEntry{{Name: "worker"}}, catalog).Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSchemaFieldPresence(t, info.Schema, []string{"agent_source"}, true)
+	if strings.Contains(info.Desc, "model=harness-managed") || strings.Contains(info.Desc, "effort=harness-managed") {
+		t.Fatalf("managed description contains a placeholder: %q", info.Desc)
+	}
+	managedRow := "- role=worker harness=codex source=native"
+	if !strings.Contains(info.Desc, managedRow) {
+		t.Fatalf("description does not identify the managed native source %q: %s", managedRow, info.Desc)
+	}
+	for _, line := range strings.Split(info.Desc, "\n") {
+		if !strings.HasPrefix(line, managedRow) {
+			continue
+		}
+		if strings.Contains(line, " model=") || strings.Contains(line, " effort=") {
+			t.Fatalf("managed description row contains a model/effort selector: %q", line)
+		}
+	}
+}
+
+func TestSchemaMixedSourceOverridesFilterEachAgentSourceBranch(t *testing.T) {
+	info, err := NewSubagentWithRuntimeCatalog(
+		&fakeController{},
+		loop.DelegationManaged,
+		[]SubagentCatalogEntry{{Name: "worker"}},
+		singleEntryMixedSourcePreparationCatalog(t),
+	).Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var schema map[string]any
+	if err := json.Unmarshal(info.Schema, &schema); err != nil {
+		t.Fatal(err)
+	}
+	branches := schemaSourceModelAliases(schema)
+	if got := branches["gateway"]; !equalStringSet(got, map[string]struct{}{"gateway": {}, "gateway-alt": {}}) {
+		t.Fatalf("gateway source branch models = %v, want only gateway options", got)
+	}
+	if got := branches["native"]; !equalStringSet(got, map[string]struct{}{"native": {}, "native-alt": {}}) {
+		t.Fatalf("native source branch models = %v, want only native options", got)
+	}
+}
+
+func schemaContainsSourceModelPair(value any, source, model string) bool {
+	return schemaContainsSourceModelPairWithContext(value, "", "", source, model)
+}
+
+func schemaSourceModelAliases(value any) map[string]map[string]struct{} {
+	result := make(map[string]map[string]struct{})
+	var walk func(any)
+	walk = func(node any) {
+		switch object := node.(type) {
+		case map[string]any:
+			properties, _ := object["properties"].(map[string]any)
+			sourceProperty, _ := properties["agent_source"].(map[string]any)
+			source, _ := sourceProperty["const"].(string)
+			if source != "" {
+				models := result[source]
+				if models == nil {
+					models = make(map[string]struct{})
+					result[source] = models
+				}
+				collectSchemaModelAliases(object, models)
+			}
+			for _, child := range object {
+				walk(child)
+			}
+		case []any:
+			for _, child := range object {
+				walk(child)
+			}
+		}
+	}
+	walk(value)
+	return result
+}
+
+func collectSchemaModelAliases(value any, models map[string]struct{}) {
+	switch node := value.(type) {
+	case map[string]any:
+		if properties, ok := node["properties"].(map[string]any); ok {
+			if modelProperty, ok := properties["model"].(map[string]any); ok {
+				if alias, ok := modelProperty["const"].(string); ok {
+					models[alias] = struct{}{}
+				}
+				if aliases, ok := modelProperty["enum"].([]any); ok {
+					for _, alias := range aliases {
+						if value, ok := alias.(string); ok {
+							models[value] = struct{}{}
+						}
+					}
+				}
+			}
+		}
+		for _, child := range node {
+			collectSchemaModelAliases(child, models)
+		}
+	case []any:
+		for _, child := range node {
+			collectSchemaModelAliases(child, models)
+		}
+	}
+}
+
+func equalStringSet(got, want map[string]struct{}) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for value := range want {
+		if _, ok := got[value]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func schemaContainsSourceModelPairWithContext(value any, currentSource, currentModel, wantSource, wantModel string) bool {
+	switch node := value.(type) {
+	case map[string]any:
+		if properties, ok := node["properties"].(map[string]any); ok {
+			if property, ok := properties["agent_source"].(map[string]any); ok {
+				if constant, ok := property["const"].(string); ok {
+					currentSource = constant
+				}
+			}
+			if property, ok := properties["model"].(map[string]any); ok {
+				if constant, ok := property["const"].(string); ok {
+					currentModel = constant
+				}
+				if aliases, ok := property["enum"].([]any); ok {
+					for _, alias := range aliases {
+						if value, ok := alias.(string); ok && value == wantModel {
+							currentModel = value
+						}
+					}
+				}
+			}
+		}
+		if currentSource == wantSource && currentModel == wantModel {
+			return true
+		}
+		for _, child := range node {
+			if schemaContainsSourceModelPairWithContext(child, currentSource, currentModel, wantSource, wantModel) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range node {
+			if schemaContainsSourceModelPairWithContext(child, currentSource, currentModel, wantSource, wantModel) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func TestSchemaRuntimeSelectorsKeepModelEffortPairsResolvable(t *testing.T) {
 	catalog := schemaCatalog(t, schemaEntryWithModels("worker", "claude-code", true, []schemaModel{
 		{alias: "sonnet", efforts: []inferencemodel.Effort{inferencemodel.EffortLow}},

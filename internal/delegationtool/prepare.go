@@ -58,6 +58,7 @@ type SubagentEnvelope struct {
 	SubagentType    string
 	Mode            string
 	AgentHarness    string
+	AgentSource     string
 	Model           string
 	Effort          *string
 	RunInBackground bool
@@ -68,6 +69,7 @@ type SubagentEnvelope struct {
 	// Selector presence is kept separately from the normalized string values so
 	// an explicit selector can never be confused with an omitted selector.
 	agentHarnessSet bool
+	agentSourceSet  bool
 	modelSet        bool
 	effortSet       bool
 }
@@ -82,6 +84,7 @@ type wireEnvelope struct {
 	SubagentType    string         `json:"subagent_type,omitempty"`
 	Mode            string         `json:"mode,omitempty"`
 	AgentHarness    string         `json:"agent_harness,omitempty"`
+	AgentSource     string         `json:"agent_source,omitempty"`
 	Model           string         `json:"model,omitempty"`
 	Effort          *string        `json:"effort,omitempty"`
 	RunInBackground *bool          `json:"run_in_background,omitempty"`
@@ -166,6 +169,7 @@ func prepareEnvelope(argsJSON string) (SubagentEnvelope, error) {
 		background = *wire.RunInBackground
 	}
 	_, agentHarnessSet := present["agent_harness"]
+	_, agentSourceSet := present["agent_source"]
 	_, modelSet := present["model"]
 	_, effortSet := present["effort"]
 
@@ -176,6 +180,7 @@ func prepareEnvelope(argsJSON string) (SubagentEnvelope, error) {
 		SubagentType:    wire.SubagentType,
 		Mode:            wire.Mode,
 		AgentHarness:    wire.AgentHarness,
+		AgentSource:     wire.AgentSource,
 		Model:           wire.Model,
 		Effort:          wire.Effort,
 		RunInBackground: background,
@@ -183,6 +188,7 @@ func prepareEnvelope(argsJSON string) (SubagentEnvelope, error) {
 		RequestID:       requestID,
 		TimeoutSeconds:  wire.TimeoutSeconds,
 		agentHarnessSet: agentHarnessSet,
+		agentSourceSet:  agentSourceSet,
 		modelSet:        modelSet,
 		effortSet:       effortSet,
 	}, nil
@@ -212,7 +218,7 @@ func knownSubagentAction(action SubagentAction) bool {
 
 func validateAllowedFields(action SubagentAction, present map[string]json.RawMessage) error {
 	allowed := map[SubagentAction]map[string]struct{}{
-		actionStart:     fields("action", "description", "prompt", "subagent_type", "mode", "agent_harness", "model", "effort", "run_in_background", "timeout_seconds"),
+		actionStart:     fields("action", "description", "prompt", "subagent_type", "mode", "agent_harness", "agent_source", "model", "effort", "run_in_background", "timeout_seconds"),
 		actionSend:      fields("action", "prompt", "run_in_background", "timeout_seconds", "delegate_id"),
 		actionWait:      fields("action", "delegate_id", "request_id", "timeout_seconds"),
 		actionInterrupt: fields("action", "delegate_id"),
@@ -379,7 +385,7 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 		// A zero catalog is the native/no-choice catalog. An explicitly supplied
 		// selector must never be silently ignored when a caller bypasses the
 		// composition seam.
-		if envelope.agentHarnessSet || envelope.modelSet || envelope.effortSet {
+		if envelope.agentHarnessSet || envelope.agentSourceSet || envelope.modelSet || envelope.effortSet {
 			return nil, preparationFailure(errCategoryFieldNotAllowed)
 		}
 		return nil, nil
@@ -388,7 +394,7 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 	entries := s.runtimeCatalog.EntriesFor(identity.AgentName(envelope.SubagentType))
 	if len(entries) == 0 {
 		if !s.runtimeCatalog.HasEntries() {
-			if envelope.agentHarnessSet || envelope.modelSet || envelope.effortSet {
+			if envelope.agentHarnessSet || envelope.agentSourceSet || envelope.modelSet || envelope.effortSet {
 				return nil, preparationFailure(errCategoryFieldNotAllowed)
 			}
 			return nil, nil
@@ -396,39 +402,47 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 		if !s.hasSubagentType(envelope.SubagentType) {
 			return nil, preparationFailure(errCategoryUnknownRuntime)
 		}
-		if envelope.agentHarnessSet || envelope.modelSet || envelope.effortSet {
-			return nil, preparationFailure(errCategoryFieldNotAllowed)
-		}
-		// A parent may expose runtime choices for other roles while this role is
-		// native-only. Unknown entries must never leak across the role boundary.
-		return nil, nil
+		// A populated parent catalog is authoritative for every role. Unknown
+		// entries must never leak across the role boundary into native fallback,
+		// including when the envelope omits all runtime selectors.
+		return nil, preparationFailure(errCategoryUnknownRuntime)
 	}
 
-	if envelope.agentHarnessSet && !runtimeHarnessSelectable(entries) {
-		return nil, preparationFailure(errCategoryFieldNotAllowed)
+	selected := runtimeDefaultEntry(entries)
+	selectedHarness := selected.AgentHarness
+	if envelope.agentHarnessSet {
+		if !runtimeHarnessSelectable(entries) {
+			return nil, preparationFailure(errCategoryFieldNotAllowed)
+		}
+		selectedHarness = loop.AgentHarnessName(envelope.AgentHarness)
+		harnessEntries := runtimeEntriesForHarness(entries, selectedHarness)
+		if len(harnessEntries) == 0 {
+			return nil, preparationFailure(errCategoryUnknownRuntime)
+		}
+		selected = runtimeDefaultEntry(harnessEntries)
 	}
-	selected := entries[0]
-	if !envelope.agentHarnessSet {
-		for _, entry := range entries {
-			if entry.Default {
-				selected = entry
-				break
-			}
+	harnessEntries := runtimeEntriesForHarness(entries, selectedHarness)
+	if envelope.agentSourceSet {
+		if !runtimeSourceSelectableForEntries(harnessEntries) {
+			return nil, preparationFailure(errCategoryFieldNotAllowed)
 		}
-	} else {
-		found := false
-		for _, entry := range entries {
-			if string(entry.AgentHarness) == envelope.AgentHarness {
-				selected = entry
-				found = true
-				break
-			}
-		}
+		var found bool
+		selected, found = runtimeEntryForSource(harnessEntries, loop.RuntimeSourceName(envelope.AgentSource))
 		if !found {
 			return nil, preparationFailure(errCategoryUnknownRuntime)
 		}
+	} else if envelope.agentHarnessSet && runtimeSourceSelectableForEntries(harnessEntries) && !selected.Default {
+		return nil, preparationFailure(errCategoryFieldNotAllowed)
+	}
+	if !envelope.agentSourceSet && runtimeSourceSelectableForEntries(harnessEntries) {
+		if filtered, ok := runtimeEntryForSource([]loop.RuntimeCatalogEntry{selected}, selected.Source); ok {
+			selected = filtered
+		}
 	}
 	advertised := runtimeAdvertisedSelectors(entries, selected)
+	if envelope.agentSourceSet && !advertised.Source {
+		return nil, preparationFailure(errCategoryFieldNotAllowed)
+	}
 
 	if envelope.modelSet {
 		if !advertised.Model {
@@ -453,10 +467,16 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 		}
 		effort = parseDelegateEffort(*envelope.Effort)
 	}
-	resolved, err := s.runtimeCatalog.ResolveWithExplicitEffort(
+	selectedSource := loop.RuntimeSourceName("")
+	if envelope.agentSourceSet {
+		selectedSource = loop.RuntimeSourceName(envelope.AgentSource)
+	}
+	resolveAlias := loop.ModelAlias(envelope.Model)
+	resolved, err := s.runtimeCatalog.ResolveWithExplicitSource(
 		identity.AgentName(envelope.SubagentType),
-		loop.AgentHarnessName(envelope.AgentHarness),
-		loop.ModelAlias(envelope.Model),
+		selectedHarness,
+		selectedSource,
+		resolveAlias,
 		effort,
 		envelope.effortSet,
 	)
@@ -468,19 +488,29 @@ func (s *SubagentTool) resolveDelegateRuntime(envelope SubagentEnvelope) (*tool.
 		return nil, preparationFailure(errCategoryUnknownRuntime)
 	}
 
+	runtimeModel := string(resolved.ModelAlias)
+	runtimeEffort := delegateEffortString(resolved.Effort)
+	if resolved.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+		runtimeModel = ""
+		runtimeEffort = ""
+	}
 	return &tool.DelegateRuntime{
-		Harness:    string(resolved.AgentHarness),
-		Profile:    string(resolved.Profile),
-		Model:      string(resolved.ModelAlias),
-		SmallModel: string(resolved.SmallModel),
-		Effort:     delegateEffortString(resolved.Effort),
+		Harness:       string(resolved.AgentHarness),
+		Profile:       string(resolved.Profile),
+		Source:        string(resolved.Source),
+		SelectionKind: string(resolved.SelectionKind),
+		Model:         runtimeModel,
+		SmallModel:    string(resolved.SmallModel),
+		Effort:        runtimeEffort,
 		Explicit: tool.DelegateRuntimeExplicit{
 			Harness: envelope.agentHarnessSet,
+			Source:  envelope.agentSourceSet,
 			Model:   envelope.modelSet,
 			Effort:  envelope.effortSet,
 		},
 		Advertised: tool.DelegateRuntimeAdvertised{
 			Harness: advertised.Harness,
+			Source:  advertised.Source,
 			Model:   advertised.Model,
 			Effort:  advertised.Effort,
 		},

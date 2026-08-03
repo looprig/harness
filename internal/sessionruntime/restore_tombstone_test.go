@@ -202,6 +202,177 @@ func TestAttachAndActivateTombstonesRuntimeMismatchFromRestoredBuilder(t *testin
 	}
 }
 
+func TestAttachAndActivateNativeRestoreFailureTombstonesNonActiveChildAndContinues(t *testing.T) {
+	t.Parallel()
+	sessionID, rootID, failedID, siblingID := mustUUID(), mustUUID(), mustUUID(), mustUUID()
+	failedPlan := nativeRestoreFailurePlan(t, sessionID, rootID, failedID)
+	siblingPlan := nativeRestoreFailurePlan(t, sessionID, rootID, siblingID)
+	siblingBackend := newFakeBackend()
+	t.Cleanup(func() {
+		for _, backend := range []*fakeBackend{siblingBackend} {
+			backend.CommandSink() <- command.Shutdown{Ack: make(chan error, 1)}
+		}
+	})
+
+	builder := &fakeForeignBuilder{}
+	var registry foreign.BuilderRegistry
+	if err := registry.Register("acp/codex", builder.build, func(_ context.Context, _ uuid.UUID, loopID uuid.UUID,
+		_ loop.Provenance, _ foreign.EventPublisher, _ loop.BoundDefinition,
+		_ func() (uuid.UUID, error), _ *event.Factory, _ foreign.RestoredForeign) (loop.Backend, error) {
+		if loopID == failedID {
+			return nil, errors.New("native ACP restore unavailable")
+		}
+		return siblingBackend, nil
+	}); err != nil {
+		t.Fatalf("registry.Register: %v", err)
+	}
+
+	s := &Session{
+		sessionID:       sessionID,
+		sessionCtx:      context.Background(),
+		factory:         event.NewFactory(uuid.New, time.Now),
+		hub:             hub.New(sessionID),
+		loops:           make(map[uuid.UUID]*loopHandle),
+		foreignRegistry: &registry,
+	}
+	rootBackend := newFakeBackend()
+	s.loops[rootID] = &loopHandle{id: rootID, owner: s, backend: rootBackend, bound: failedPlan.bound, state: tool.DelegateStatusIdle}
+	t.Cleanup(func() { rootBackend.CommandSink() <- command.Shutdown{Ack: make(chan error, 1)} })
+
+	err := attachAndActivate(s, []event.Event{failedPlan.started, siblingPlan.started}, []loopPlan{failedPlan, siblingPlan}, rootID)
+	if err != nil {
+		t.Fatalf("attachAndActivate: %v", err)
+	}
+	failedHandle, ok := s.Loop(failedID)
+	if !ok || !failedHandle.(*loopHandle).tombstoned {
+		t.Fatalf("failed child handle = %#v, %v; want native runtime tombstone", failedHandle, ok)
+	}
+	siblingHandle, ok := s.Loop(siblingID)
+	if !ok || siblingHandle.(*loopHandle).backend != siblingBackend {
+		t.Fatalf("sibling handle = %#v, %v; want restored backend after failed sibling", siblingHandle, ok)
+	}
+	if got := s.ActiveLoopID(); got != rootID {
+		t.Fatalf("active loop = %v, want root %v", got, rootID)
+	}
+}
+
+func nativeRestoreFailurePlan(t *testing.T, sessionID, rootID, childID uuid.UUID) loopPlan {
+	t.Helper()
+	started := restoreRuntimeStarted(model.ModelKey{Provider: "provider", Model: "luna-target"})
+	started.Header = event.Header{
+		AgentName:   "worker",
+		Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: childID},
+		Cause:       identity.Cause{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: rootID}},
+	}
+	started.Runtime.Effort = model.EffortNone
+	started.AgentRuntime = &event.AgentRuntime{
+		Harness:        "codex",
+		Profile:        "acp/codex",
+		CredentialMode: "native-auth",
+		Source:         "native",
+		SelectionKind:  "explicit",
+		ModelAlias:     "luna",
+	}
+	bound := bindCfg(engineCfg(&stubLLM{}, loop.EngineNative, "system"), sessionID, childID)
+	var err error
+	bound, err = restoreRuntimeBinding(started, bound, foldLoopInference([]event.Event{started}), nativeRestoreRuntimeCatalog(t), true, false)
+	if err != nil {
+		t.Fatalf("restoreRuntimeBinding: %v", err)
+	}
+	events := []event.Event{
+		started,
+		event.LoopAgentSessionBound{Header: started.Header, ACPSessionID: "native-child-session"},
+	}
+	return loopPlan{
+		started:  started,
+		bound:    bound,
+		bindings: tool.Bindings{SessionID: sessionID, LoopID: childID},
+		folded:   foldLoop(events),
+		events:   events,
+	}
+}
+
+func nativeRestoreRuntimeCatalog(t *testing.T) loop.RuntimeCatalog {
+	t.Helper()
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
+		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionExplicit, Default: true, DefaultModel: "luna",
+		Models: []loop.RuntimeModelOption{{
+			Alias: "luna", Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
+			Target:        model.Model{Provider: "provider", Name: "luna-target"},
+			DefaultEffort: model.EffortNone, Efforts: []model.Effort{model.EffortNone},
+		}},
+	}})
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog: %v", err)
+	}
+	return catalog
+}
+
+func TestAttachAndActivateActiveNativeRestoreFailureIsFatal(t *testing.T) {
+	t.Parallel()
+	var tombstonePublished bool
+	s, rootID, childID, plan := nativeRuntimeFailureRestoreFixture(t,
+		errors.New("native ACP restore unavailable"),
+		func(_ *Session, _ uuid.UUID, ev event.Event) {
+			if _, ok := ev.(event.LoopRestoreTombstoned); ok {
+				tombstonePublished = true
+			}
+		})
+
+	err := attachAndActivate(s, []event.Event{
+		plan.started,
+		event.ActiveLoopChanged{ActiveLoopID: childID},
+	}, []loopPlan{plan}, rootID)
+	var restoreErr *RestoreError
+	var sessionErr *SessionError
+	if !errors.As(err, &restoreErr) || restoreErr.Kind != RestoreLoopFailed ||
+		!errors.As(err, &sessionErr) || sessionErr.Kind != SessionLoopExited {
+		t.Fatalf("attachAndActivate error = %v, want RestoreLoopFailed wrapping SessionLoopExited", err)
+	}
+	if got := s.ActiveLoopID(); got != rootID {
+		t.Fatalf("active loop = %v, want root %v after failed activation", got, rootID)
+	}
+	if tombstonePublished {
+		t.Fatal("active native restore failure published a tombstone")
+	}
+	if _, ok := s.Loop(childID); ok {
+		t.Fatal("active native restore failure registered a tombstoned child")
+	}
+}
+
+func nativeRuntimeFailureRestoreFixture(
+	t *testing.T,
+	builderErr error,
+	observer func(*Session, uuid.UUID, event.Event),
+) (*Session, uuid.UUID, uuid.UUID, loopPlan) {
+	t.Helper()
+	sessionID, rootID, childID := mustUUID(), mustUUID(), mustUUID()
+	plan := nativeRestoreFailurePlan(t, sessionID, rootID, childID)
+	builder := &fakeForeignBuilder{err: builderErr}
+	var registry foreign.BuilderRegistry
+	if err := registry.Register("acp/codex", builder.build, builder.buildRestored); err != nil {
+		t.Fatalf("registry.Register: %v", err)
+	}
+	s := &Session{
+		sessionID:       sessionID,
+		sessionCtx:      context.Background(),
+		factory:         event.NewFactory(uuid.New, time.Now),
+		hub:             hub.New(sessionID),
+		loops:           make(map[uuid.UUID]*loopHandle),
+		foreignRegistry: &registry,
+	}
+	if observer != nil {
+		s.hub = hub.New(sessionID, hub.WithCommitObserver(func(ev event.Event) { observer(s, childID, ev) }))
+	}
+	rootBackend := newFakeBackend()
+	s.loops[rootID] = &loopHandle{id: rootID, owner: s, backend: rootBackend, bound: plan.bound, state: tool.DelegateStatusIdle}
+	s.activeLoopID = rootID
+	t.Cleanup(func() { rootBackend.CommandSink() <- command.Shutdown{Ack: make(chan error, 1)} })
+	return s, rootID, childID, plan
+}
+
 func TestAttachAndActivateActiveChildRuntimeFailureIsFatal(t *testing.T) {
 	t.Parallel()
 	s, rootID, childID, plan := runtimeFailureRestoreFixture(t,

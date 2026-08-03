@@ -203,14 +203,28 @@ func validateEventBody(ev Event) error {
 	case IntegrationStatus:
 		return validateIntegrationStatus(e)
 	case LoopStarted:
-		if e.Runtime == (ModelRuntime{}) && e.AgentRuntime == nil {
+		if e.Runtime == (ModelRuntime{}) {
+			if e.AgentRuntime == nil {
+				return nil
+			}
+			if err := validateAgentRuntime(*e.AgentRuntime); err != nil {
+				return err
+			}
+			if e.AgentRuntime.Source != "native" || e.AgentRuntime.SelectionKind != "harness-managed" {
+				return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+			}
 			return nil
 		}
 		if err := validateModelRuntime("LoopStarted", e.Runtime); err != nil {
 			return err
 		}
 		if e.AgentRuntime != nil {
-			return validateAgentRuntime(*e.AgentRuntime)
+			if err := validateAgentRuntime(*e.AgentRuntime); err != nil {
+				return err
+			}
+			if e.AgentRuntime.Source == "native" && e.AgentRuntime.SelectionKind == "harness-managed" {
+				return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+			}
 		}
 	case LoopAgentSessionBound:
 		if !validAgentRuntimeIdentifier(e.ACPSessionID, false) || e.ACPSessionID == "" {
@@ -411,11 +425,36 @@ const (
 )
 
 func validateAgentRuntime(v AgentRuntime) error {
-	if v.Harness == "" || v.Profile == "" || v.CredentialMode == "" || v.ModelAlias == "" {
+	if v.Harness == "" || v.Profile == "" || v.CredentialMode == "" {
 		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleRequired}
 	}
 	if v.CredentialMode != "native-auth" && v.CredentialMode != "gateway-backed" {
 		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+	}
+	if (v.Source == "") != (v.SelectionKind == "") {
+		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+	}
+	if v.Source != "" && v.Source != "gateway" && v.Source != "native" {
+		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+	}
+	if v.SelectionKind != "" && v.SelectionKind != "explicit" && v.SelectionKind != "harness-managed" {
+		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+	}
+	if v.Source != "" {
+		if (v.Source == "gateway" && v.CredentialMode != "gateway-backed") || (v.Source == "native" && v.CredentialMode != "native-auth") {
+			return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+		}
+		if v.SelectionKind == "harness-managed" {
+			if v.Source != "native" || v.ModelAlias != "" || v.SmallModelAlias != "" {
+				return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+			}
+		} else if v.ModelAlias == "" {
+			return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleRequired}
+		}
+	} else if v.ModelAlias == "" {
+		// Legacy AgentRuntime records predate source and selection_kind and
+		// always carried a concrete model alias.
+		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleRequired}
 	}
 	for _, candidate := range []struct {
 		value      string
@@ -424,6 +463,8 @@ func validateAgentRuntime(v AgentRuntime) error {
 		{v.Harness, false},
 		{v.Profile, true},
 		{v.CredentialMode, false},
+		{v.Source, false},
+		{v.SelectionKind, false},
 		{v.ModelAlias, false},
 		{v.SmallModelAlias, false},
 		{v.ACPSessionID, false},

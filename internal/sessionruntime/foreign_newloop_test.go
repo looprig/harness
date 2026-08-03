@@ -357,8 +357,85 @@ func TestForeignBuilderEmitsAgentSessionBindingOnce(t *testing.T) {
 	}
 	if got := *started.AgentRuntime; got != (event.AgentRuntime{
 		Harness: "codex", Profile: "acp/codex", CredentialMode: "gateway-backed",
+		Source: "gateway", SelectionKind: "explicit",
 		ModelAlias: "luna@high", SmallModelAlias: "small",
 	}) {
 		t.Fatalf("LoopStarted.AgentRuntime = %+v, want resolved identity", got)
+	}
+}
+
+func TestHarnessManagedForeignLoopStartedOmitsModelRuntime(t *testing.T) {
+	t.Parallel()
+
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := delegateChild("child", "child")
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex",
+		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionHarnessManaged, Default: true,
+	}, {
+		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex-gateway",
+		Credential: loop.CredentialGatewayBacked, Source: loop.RuntimeSourceGateway,
+		DefaultModel: "gateway",
+		Models: []loop.RuntimeModelOption{{
+			Alias: "gateway", Target: validModel("gateway-target"),
+			DefaultEffort: model.EffortNone, Efforts: []model.Effort{model.EffortNone},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recordingEventAppender{}
+	builder := &fakeForeignBuilder{sid: fixedForeignSID, backend: newFakeBackend()}
+	registry := &foreign.BuilderRegistry{}
+	if err := registry.Register("acp/codex", builder.build, builder.buildRestored); err != nil {
+		t.Fatal(err)
+	}
+	s := newDelegationSession(t, parent, []Option{
+		WithEventAppender(rec),
+		WithRuntimeCatalog(catalog),
+		WithForeignBuilderRegistry(registry),
+	}, child)
+
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+	result, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart,
+		Agent:     "child",
+		Message:   "go",
+		Wait:      false,
+		Runtime: &tool.DelegateRuntime{
+			Harness:       "codex",
+			Profile:       "acp/codex",
+			Source:        "native",
+			SelectionKind: "harness-managed",
+			Explicit:      tool.DelegateRuntimeExplicit{Source: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("managed start: %v", err)
+	}
+
+	var started *event.LoopStarted
+	for _, ev := range rec.snapshot() {
+		candidate, ok := ev.(event.LoopStarted)
+		if ok && candidate.LoopID == result.DelegateID {
+			started = &candidate
+			break
+		}
+	}
+	if started == nil {
+		t.Fatal("managed child LoopStarted was not recorded")
+	}
+	if started.Runtime != (event.ModelRuntime{}) {
+		t.Fatalf("managed LoopStarted.Runtime = %+v, want empty model runtime", started.Runtime)
+	}
+	if started.AgentRuntime == nil {
+		t.Fatal("managed LoopStarted.AgentRuntime = nil, want authoritative identity")
+	}
+	if got := *started.AgentRuntime; got != (event.AgentRuntime{
+		Harness: "codex", Profile: "acp/codex", CredentialMode: "native-auth",
+		Source: "native", SelectionKind: "harness-managed",
+	}) {
+		t.Fatalf("managed LoopStarted.AgentRuntime = %+v, want native/harness-managed identity", got)
 	}
 }
