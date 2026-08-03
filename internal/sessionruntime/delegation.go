@@ -2,11 +2,13 @@ package sessionruntime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"strconv"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -69,6 +71,7 @@ type delegateAdmission struct {
 	publisher       *delegateAdmissionPublisher
 	registerRequest func(requestID, childID uuid.UUID) *pendingRequest
 	tracked         *pendingRequest
+	background      bool
 }
 
 // delegateAdmissionPublisher is a one-shot start barrier. A fresh child may accept its
@@ -458,14 +461,28 @@ func (m *delegationManager) removeRequest(requestID uuid.UUID, tracked *pendingR
 	m.mu.Unlock()
 }
 
-// collectRequest starts the session-owned background drain for a retained request. The
-// drain runs on the SESSION lifetime (not the parent turn ctx, which ends when the tool
-// call returns), so a later wait can still collect the answer.
-func (m *delegationManager) collectRequest(pr *pendingRequest, requestID uuid.UUID, sub event.Subscription, sessionCtx context.Context, interrupt func()) {
+// handBackRequest starts the session-owned drain for one background response. The drain
+// runs on the session lifetime, not the parent tool-call context. Its only terminal
+// delivery is a machine-originated SubagentResult to the direct parent.
+func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.UUID, name string, pr *pendingRequest, requestID uuid.UUID, sub event.Subscription, timeoutSeconds *int) {
 	go func() {
 		defer func() { _ = sub.Close() }()
-		text, err := drainDelegateAnswerObserved(sessionCtx, sub, requestID, interrupt, pr.markActive)
-		pr.resolve(text, statusFromDrain(err))
+		defer m.removeRequest(requestID, pr)
+		waitCtx, cancel := waitContext(s.sessionCtx, timeoutSeconds)
+		defer cancel()
+		text, err := drainDelegateAnswerObserved(waitCtx, sub, requestID, func() {
+			_, _ = s.cancelDelegateRequest(childID, requestID)
+		}, pr.markActive)
+		status := statusFromDrain(err)
+		if status == tool.DelegateStatusInterrupted && didTimeout(timeoutSeconds, waitCtx) {
+			status = tool.DelegateStatusTimedOut
+		}
+		pr.resolve(text, status)
+		if err := s.deliverSubagentResult(s.sessionCtx, parentID, childID, backgroundCompletionBlocks(childID, name, requestID, status, text)); err != nil {
+			// No parent event can release the hand-back token when dispatch itself is
+			// impossible (session shutdown, parent exit, or command-id failure).
+			s.cancelExpectTurn(context.Background(), childID)
+		}
 	}()
 }
 
@@ -604,7 +621,7 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateInterruptPending, DelegateID: c.parentLoopID}
 	}
 	parent := loop.Provenance{LoopID: c.parentLoopID}
-	childID, requestID, sub, tracked, err := s.startDelegate(ctx, parent, childDef, mode, req.Name, req.Message, req.ParentToolUseID, runtime, c.runtimeCatalog, c.hasRuntimeCatalog, c.manager.registerRequest)
+	childID, requestID, sub, tracked, err := s.startDelegate(ctx, parent, childDef, mode, req.Name, req.Message, req.ParentToolUseID, runtime, c.runtimeCatalog, c.hasRuntimeCatalog, !req.WaitForResponse, c.manager.registerRequest)
 	if err != nil {
 		return tool.DelegateResult{}, err
 	}
@@ -868,7 +885,7 @@ func (c *scopedController) send(ctx context.Context, s *Session, req tool.Delega
 	if s.loopInterruptPending(c.parentLoopID) {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateInterruptPending, DelegateID: c.parentLoopID}
 	}
-	requestID, sub, tracked, err := s.sendDelegate(ctx, req.AgentID, req.Message, c.manager.registerRequest, c.manager.removeRequest)
+	requestID, sub, tracked, err := s.sendDelegate(ctx, req.AgentID, req.Message, !req.WaitForResponse, c.manager.registerRequest, c.manager.removeRequest)
 	if err != nil {
 		return tool.DelegateResult{}, err
 	}
@@ -960,8 +977,8 @@ func (c *scopedController) status(s *Session, req tool.DelegateRequest) (tool.De
 	return tool.DelegateResult{Agents: agents, Truncated: truncated}, nil
 }
 
-// resolveOrQueue receives the tracker installed during admission, then waits for the
-// correlated turn (wait:true) or starts a retained background collector (wait:false).
+// resolveOrQueue receives the tracker installed during admission, then either returns
+// the foreground response or starts the automatic durable parent hand-back.
 func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, childID, requestID uuid.UUID, sub event.Subscription, tracked *pendingRequest, req tool.DelegateRequest) (tool.DelegateResult, error) {
 	if req.WaitForResponse {
 		defer func() { _ = sub.Close() }()
@@ -982,9 +999,11 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 		}
 		return result, nil
 	}
-	c.manager.collectRequest(tracked, requestID, sub, s.sessionCtx, func() {
-		_, _ = s.cancelDelegateRequest(childID, requestID)
-	})
+	name := req.Name
+	if name == "" {
+		name = c.agentSnapshot(s, childID).Name
+	}
+	c.manager.handBackRequest(s, c.parentLoopID, childID, name, tracked, requestID, sub, req.TimeoutSeconds)
 	result := c.agentResult(s, childID)
 	result.CorrelationID = requestID
 	result.State = tool.AgentStateWorking
@@ -992,6 +1011,71 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 		result.Name = req.Name
 	}
 	return result, nil
+}
+
+type backgroundCompletionEnvelope struct {
+	AgentID        string                      `json:"agent_id"`
+	Name           string                      `json:"name"`
+	State          tool.AgentState             `json:"state"`
+	ResponseStatus tool.DelegateResponseStatus `json:"response_status"`
+	CorrelationID  string                      `json:"correlation_id"`
+	Response       string                      `json:"response"`
+}
+
+// backgroundCompletionBlocks creates the single bounded, structured machine input
+// delivered to a parent. Correlation stays internal to durable orchestration: agent
+// tools never expose or accept it, while the persisted SubagentResult blocks retain it
+// for restore-time idempotence.
+func backgroundCompletionBlocks(agentID uuid.UUID, name string, correlationID uuid.UUID, status tool.DelegateStatusValue, response string) []content.Block {
+	envelope := backgroundCompletionEnvelope{
+		AgentID: agentID.String(), Name: boundUTF8(name, 4096), State: tool.AgentStateIdle,
+		ResponseStatus: responseStatus(status), CorrelationID: correlationID.String(),
+	}
+	response = boundUTF8(response, maxDelegateOutputBytes)
+	ends := runePrefixEnds(response)
+	var best []byte
+	low, high := 0, len(ends)
+	for low < high {
+		mid := low + (high-low)/2
+		envelope.Response = response[:ends[mid]]
+		encoded, err := json.Marshal(envelope)
+		if err != nil {
+			break
+		}
+		if len(encoded) <= maxDelegateOutputBytes {
+			best = encoded
+			low = mid + 1
+		} else {
+			high = mid
+		}
+	}
+	if best == nil {
+		envelope.Name = ""
+		envelope.Response = ""
+		best, _ = json.Marshal(envelope)
+	}
+	return []content.Block{&content.TextBlock{Text: string(best)}}
+}
+
+func boundUTF8(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	end := limit
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end]
+}
+
+func runePrefixEnds(value string) []int {
+	ends := make([]int, 1, utf8.RuneCountInString(value)+1)
+	for end := 0; end < len(value); {
+		_, size := utf8.DecodeRuneInString(value[end:])
+		end += size
+		ends = append(ends, end)
+	}
+	return ends
 }
 
 // ownsChild fails closed unless childID is a registered loop whose parent is exactly
@@ -1258,8 +1342,8 @@ func timeoutOrInterrupted(timeoutSeconds *int, waitCtx context.Context) tool.Del
 // subscription, request mint, backend construction, and initial-command acceptance all
 // precede the checked LoopStarted commit. The backend's publisher remains blocked until
 // that commit, so TurnStarted can neither race ahead nor survive a failed spawn.
-func (s *Session) startDelegate(ctx context.Context, parent loop.Provenance, cfg loop.Definition, mode loop.ModeName, name, message, parentToolUseID string, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog bool, registerRequest func(requestID, childID uuid.UUID) *pendingRequest) (childID, requestID uuid.UUID, sub event.Subscription, tracked *pendingRequest, err error) {
-	admission := &delegateAdmission{ctx: ctx, name: name, message: message, registerRequest: registerRequest}
+func (s *Session) startDelegate(ctx context.Context, parent loop.Provenance, cfg loop.Definition, mode loop.ModeName, name, message, parentToolUseID string, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog, background bool, registerRequest func(requestID, childID uuid.UUID) *pendingRequest) (childID, requestID uuid.UUID, sub event.Subscription, tracked *pendingRequest, err error) {
+	admission := &delegateAdmission{ctx: ctx, name: name, message: message, registerRequest: registerRequest, background: background}
 	childID, err = s.newLoopWithAdmission(parent, cfg, parentToolUseID, mode, nil, admission, runtime, runtimeCatalog, hasRuntimeCatalog)
 	if err != nil {
 		return uuid.UUID{}, uuid.UUID{}, nil, nil, err
@@ -1284,16 +1368,26 @@ func runtimeEffortString(value inferencemodel.Effort) string {
 // sendDelegate enqueues a distinct NON-FOLDING follow-up turn on an existing owned
 // child. It subscribes BEFORE the enqueue so the correlated turn's opening event is
 // never missed.
-func (s *Session) sendDelegate(ctx context.Context, childID uuid.UUID, message string, registerRequest func(requestID, childID uuid.UUID) *pendingRequest, removeRequest func(uuid.UUID, *pendingRequest)) (requestID uuid.UUID, sub event.Subscription, tracked *pendingRequest, err error) {
+func (s *Session) sendDelegate(ctx context.Context, childID uuid.UUID, message string, background bool, registerRequest func(requestID, childID uuid.UUID) *pendingRequest, removeRequest func(uuid.UUID, *pendingRequest)) (requestID uuid.UUID, sub event.Subscription, tracked *pendingRequest, err error) {
 	sub, err = s.subscribeLoop(childID)
 	if err != nil {
 		return uuid.UUID{}, nil, nil, err
+	}
+	wakeOwned := background
+	if background {
+		s.expectTurn(ctx, childID)
+		defer func() {
+			if wakeOwned {
+				s.cancelExpectTurn(context.Background(), childID)
+			}
+		}()
 	}
 	requestID, tracked, err = s.enqueueDelegateTurn(ctx, childID, delegateBlocks(message), registerRequest, removeRequest)
 	if err != nil {
 		_ = sub.Close()
 		return uuid.UUID{}, nil, nil, err
 	}
+	wakeOwned = false
 	return requestID, sub, tracked, nil
 }
 

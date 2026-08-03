@@ -1625,6 +1625,12 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		}
 	}
 	if admission != nil {
+		if admission.background {
+			// The publisher barrier still prevents the child from emitting TurnStarted,
+			// so acquiring the wake token here is early enough to cover even an
+			// immediately-terminal first turn.
+			s.expectTurn(admission.ctx, loopID)
+		}
 		admission.tracked = admission.registerRequest(admission.requestID, loopID)
 		admission.publisher.release()
 		admissionSubscriptionOwned = false
