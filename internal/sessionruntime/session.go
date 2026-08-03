@@ -960,6 +960,9 @@ func (s *Session) recordLoopMechanicalState(ev event.Event) {
 	if loopID.IsZero() {
 		return
 	}
+	if started, ok := ev.(event.TurnStarted); ok {
+		s.delegation.markRequestActive(started.Cause.CommandID, loopID)
+	}
 	var status tool.DelegateStatusValue
 	switch ev.(type) {
 	case event.TurnStarted:
@@ -1589,6 +1592,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		}
 	}
 	if admission != nil {
+		admission.tracked = admission.registerRequest(admission.requestID, loopID)
 		admission.publisher.release()
 	}
 	return loopID, nil

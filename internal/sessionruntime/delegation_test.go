@@ -1040,6 +1040,46 @@ func TestDelegateStatusCountsOnlyRequestsQueuedBehindActiveTurn(t *testing.T) {
 	waitDelegateQueuedMessages(t, ctrl, active.AgentID, 1)
 }
 
+func TestDelegateStatusDoesNotCountStartedRequestBeforeDrainObservesTurnStarted(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	client := &releasedFailureLLM{started: make(chan struct{}), release: make(chan struct{}), err: errors.New("released provider")}
+	child := mustDefine(
+		loop.WithName("child"),
+		loop.WithInference(client, validModel("child")),
+		loop.WithDrainTimeout(100*time.Millisecond),
+	)
+	s := newDelegationSession(t, parent, nil, child)
+	// Keep the result drain from observing TurnStarted. The authoritative lifecycle
+	// callback must still mark the tracked request active on the publication path.
+	s.delegateSubscribe = func(event.EventFilter) (event.Subscription, error) {
+		return newFakeSubscription(0), nil
+	}
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+
+	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		close(client.release)
+		_, _ = ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: active.AgentID})
+	}()
+	select {
+	case <-client.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("request did not become active")
+	}
+
+	status, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: active.AgentID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Agents) != 1 || status.Agents[0].QueuedMessages != 0 {
+		t.Fatalf("active request agents = %+v, want queued_messages 0", status.Agents)
+	}
+}
+
 func TestDelegateStatusTracksForegroundRequestQueuedBehindActiveTurn(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")

@@ -60,13 +60,15 @@ type delegationManager struct {
 }
 
 type delegateAdmission struct {
-	ctx       context.Context
-	name      string
-	message   string
-	sub       event.Subscription
-	requestID uuid.UUID
-	command   command.UserInput
-	publisher *delegateAdmissionPublisher
+	ctx             context.Context
+	name            string
+	message         string
+	sub             event.Subscription
+	requestID       uuid.UUID
+	command         command.UserInput
+	publisher       *delegateAdmissionPublisher
+	registerRequest func(requestID, childID uuid.UUID) *pendingRequest
+	tracked         *pendingRequest
 }
 
 // delegateAdmissionPublisher is a one-shot start barrier. A fresh child may accept its
@@ -422,6 +424,28 @@ func (m *delegationManager) registerRequest(requestID, childID uuid.UUID) *pendi
 	return pr
 }
 
+// markRequestActive advances only a request already admitted through delegation. An
+// unrelated TurnStarted command id never creates tracker state.
+func (m *delegationManager) markRequestActive(requestID, childID uuid.UUID) {
+	if m == nil || requestID.IsZero() {
+		return
+	}
+	m.mu.Lock()
+	tracked := m.requests[requestID]
+	m.mu.Unlock()
+	if tracked != nil && tracked.childID == childID {
+		tracked.markActive()
+	}
+}
+
+func (m *delegationManager) removeRequest(requestID uuid.UUID, tracked *pendingRequest) {
+	m.mu.Lock()
+	if m.requests[requestID] == tracked {
+		delete(m.requests, requestID)
+	}
+	m.mu.Unlock()
+}
+
 // collectRequest starts the session-owned background drain for a retained request. The
 // drain runs on the SESSION lifetime (not the parent turn ctx, which ends when the tool
 // call returns), so a later wait can still collect the answer.
@@ -568,11 +592,11 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateInterruptPending, DelegateID: c.parentLoopID}
 	}
 	parent := loop.Provenance{LoopID: c.parentLoopID}
-	childID, requestID, sub, err := s.startDelegate(ctx, parent, childDef, mode, req.Name, req.Message, req.ParentToolUseID, runtime, c.runtimeCatalog, c.hasRuntimeCatalog)
+	childID, requestID, sub, tracked, err := s.startDelegate(ctx, parent, childDef, mode, req.Name, req.Message, req.ParentToolUseID, runtime, c.runtimeCatalog, c.hasRuntimeCatalog, c.manager.registerRequest)
 	if err != nil {
 		return tool.DelegateResult{}, err
 	}
-	return c.resolveOrQueue(ctx, s, childID, requestID, sub, req)
+	return c.resolveOrQueue(ctx, s, childID, requestID, sub, tracked, req)
 }
 
 // validControllerRuntimeSelection re-applies the model-facing capability rules
@@ -832,11 +856,11 @@ func (c *scopedController) send(ctx context.Context, s *Session, req tool.Delega
 	if s.loopInterruptPending(c.parentLoopID) {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateInterruptPending, DelegateID: c.parentLoopID}
 	}
-	requestID, sub, err := s.sendDelegate(ctx, req.AgentID, req.Message)
+	requestID, sub, tracked, err := s.sendDelegate(ctx, req.AgentID, req.Message, c.manager.registerRequest, c.manager.removeRequest)
 	if err != nil {
 		return tool.DelegateResult{}, err
 	}
-	return c.resolveOrQueue(ctx, s, req.AgentID, requestID, sub, req)
+	return c.resolveOrQueue(ctx, s, req.AgentID, requestID, sub, tracked, req)
 }
 
 // waitResponse preserves the current internal collector until Phase 3 replaces it
@@ -924,10 +948,9 @@ func (c *scopedController) status(s *Session, req tool.DelegateRequest) (tool.De
 	return tool.DelegateResult{Agents: agents, Truncated: truncated}, nil
 }
 
-// resolveOrQueue tracks every admitted request, then waits for the correlated turn
-// (wait:true) or starts a retained background collector (wait:false).
-func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, childID, requestID uuid.UUID, sub event.Subscription, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	tracked := c.manager.registerRequest(requestID, childID)
+// resolveOrQueue receives the tracker installed during admission, then waits for the
+// correlated turn (wait:true) or starts a retained background collector (wait:false).
+func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, childID, requestID uuid.UUID, sub event.Subscription, tracked *pendingRequest, req tool.DelegateRequest) (tool.DelegateResult, error) {
 	if req.WaitForResponse {
 		defer func() { _ = sub.Close() }()
 		defer c.manager.removePending(requestID)
@@ -1217,13 +1240,13 @@ func timeoutOrInterrupted(timeoutSeconds *int, waitCtx context.Context) tool.Del
 // subscription, request mint, backend construction, and initial-command acceptance all
 // precede the checked LoopStarted commit. The backend's publisher remains blocked until
 // that commit, so TurnStarted can neither race ahead nor survive a failed spawn.
-func (s *Session) startDelegate(ctx context.Context, parent loop.Provenance, cfg loop.Definition, mode loop.ModeName, name, message, parentToolUseID string, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog bool) (childID, requestID uuid.UUID, sub event.Subscription, err error) {
-	admission := &delegateAdmission{ctx: ctx, name: name, message: message}
+func (s *Session) startDelegate(ctx context.Context, parent loop.Provenance, cfg loop.Definition, mode loop.ModeName, name, message, parentToolUseID string, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog bool, registerRequest func(requestID, childID uuid.UUID) *pendingRequest) (childID, requestID uuid.UUID, sub event.Subscription, tracked *pendingRequest, err error) {
+	admission := &delegateAdmission{ctx: ctx, name: name, message: message, registerRequest: registerRequest}
 	childID, err = s.newLoopWithAdmission(parent, cfg, parentToolUseID, mode, nil, admission, runtime, runtimeCatalog, hasRuntimeCatalog)
 	if err != nil {
-		return uuid.UUID{}, uuid.UUID{}, nil, err
+		return uuid.UUID{}, uuid.UUID{}, nil, nil, err
 	}
-	return childID, admission.requestID, admission.sub, nil
+	return childID, admission.requestID, admission.sub, admission.tracked, nil
 }
 
 func parseRuntimeEffort(value string) inferencemodel.Effort {
@@ -1243,17 +1266,17 @@ func runtimeEffortString(value inferencemodel.Effort) string {
 // sendDelegate enqueues a distinct NON-FOLDING follow-up turn on an existing owned
 // child. It subscribes BEFORE the enqueue so the correlated turn's opening event is
 // never missed.
-func (s *Session) sendDelegate(ctx context.Context, childID uuid.UUID, message string) (requestID uuid.UUID, sub event.Subscription, err error) {
+func (s *Session) sendDelegate(ctx context.Context, childID uuid.UUID, message string, registerRequest func(requestID, childID uuid.UUID) *pendingRequest, removeRequest func(uuid.UUID, *pendingRequest)) (requestID uuid.UUID, sub event.Subscription, tracked *pendingRequest, err error) {
 	sub, err = s.subscribeLoop(childID)
 	if err != nil {
-		return uuid.UUID{}, nil, err
+		return uuid.UUID{}, nil, nil, err
 	}
-	requestID, err = s.enqueueDelegateTurn(ctx, childID, delegateBlocks(message))
+	requestID, tracked, err = s.enqueueDelegateTurn(ctx, childID, delegateBlocks(message), registerRequest, removeRequest)
 	if err != nil {
 		_ = sub.Close()
-		return uuid.UUID{}, nil, err
+		return uuid.UUID{}, nil, nil, err
 	}
-	return requestID, sub, nil
+	return requestID, sub, tracked, nil
 }
 
 // subscribeLoop opens a loop-scoped Enduring subscription (the StepDone + terminals a
@@ -1274,43 +1297,52 @@ func (s *Session) subscribeLoop(loopID uuid.UUID) (event.Subscription, error) {
 // running turn (the loop actor's drainInbox skips non-folding entries); it queues behind
 // the running turn and starts its OWN distinct turn when that finishes. The public
 // Session.SubmitToLoop keeps its interactive queue/fold semantics (NoFold=false).
-func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blocks []content.Block) (uuid.UUID, error) {
+func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blocks []content.Block, registerRequest func(requestID, childID uuid.UUID) *pendingRequest, removeRequest func(uuid.UUID, *pendingRequest)) (requestID uuid.UUID, tracked *pendingRequest, err error) {
 	if err := s.faultIfFaulted(); err != nil {
-		return uuid.UUID{}, err
+		return uuid.UUID{}, nil, err
 	}
 	backend, ok := s.loopFor(loopID)
 	if !ok {
-		return uuid.UUID{}, &SessionError{Kind: SessionLoopNotFound}
+		return uuid.UUID{}, nil, &SessionError{Kind: SessionLoopNotFound}
 	}
 	if backend == nil {
-		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+		return uuid.UUID{}, nil, &SessionError{Kind: SessionLoopExited}
 	}
 	id, err := s.newCommandID()
 	if err != nil {
-		return uuid.UUID{}, err
+		return uuid.UUID{}, nil, err
 	}
 	accepted := make(chan error, 1)
 	cmd := command.UserInput{Header: command.Header{CommandID: id, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()}, Blocks: blocks, NoFold: true, TargetLoopID: loopID, Accepted: accepted}
 	if err := s.appendDelegateCommand(ctx, loopID, cmd); err != nil {
-		return uuid.UUID{}, err
+		return uuid.UUID{}, nil, err
 	}
+	tracked = registerRequest(id, loopID)
+	registered := tracked
+	admitted := false
+	defer func() {
+		if !admitted {
+			removeRequest(id, registered)
+		}
+	}()
 	select {
 	case backend.CommandSink() <- cmd:
 		select {
 		case err := <-accepted:
 			if err != nil {
-				return uuid.UUID{}, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: err}
+				return uuid.UUID{}, nil, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: err}
 			}
-			return id, nil
+			admitted = true
+			return id, tracked, nil
 		case <-ctx.Done():
-			return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+			return uuid.UUID{}, nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 		case <-backend.DoneChan():
-			return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+			return uuid.UUID{}, nil, &SessionError{Kind: SessionLoopExited}
 		}
 	case <-ctx.Done():
-		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+		return uuid.UUID{}, nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	case <-backend.DoneChan():
-		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+		return uuid.UUID{}, nil, &SessionError{Kind: SessionLoopExited}
 	}
 }
 
