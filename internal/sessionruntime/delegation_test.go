@@ -42,6 +42,22 @@ type blockingChildTurnStartedAppender struct {
 	once    sync.Once
 }
 
+type trackingDelegateSubscription struct {
+	events chan event.Delivery
+	closed atomic.Int32
+}
+
+func newTrackingDelegateSubscription() *trackingDelegateSubscription {
+	return &trackingDelegateSubscription{events: make(chan event.Delivery)}
+}
+
+func (s *trackingDelegateSubscription) Events() <-chan event.Delivery { return s.events }
+func (s *trackingDelegateSubscription) Close() error {
+	s.closed.Add(1)
+	return nil
+}
+func (s *trackingDelegateSubscription) Err() error { return nil }
+
 func (a *blockingChildTurnStartedAppender) AppendEvent(ctx context.Context, ev event.Event) (uint64, error) {
 	if _, ok := ev.(event.TurnStarted); !ok || !a.enabled.Load() {
 		return 1, nil
@@ -1604,6 +1620,121 @@ func TestDelegateStartSetupFailuresLeaveNoChildQuotaOrDurablePhantom(t *testing.
 				}
 			}
 		})
+	}
+}
+
+func TestAwaitDelegateAcceptanceReconcilesCanceledContext(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	accepted := make(chan error, 1)
+	accepted <- nil
+
+	canceled, err := awaitDelegateAcceptance(ctx, accepted, make(chan struct{}))
+	if err != nil {
+		t.Fatalf("awaitDelegateAcceptance: %v", err)
+	}
+	if !canceled {
+		t.Fatal("canceled = false, want true after a committed admission races cancellation")
+	}
+}
+
+func TestAwaitDelegateAcceptanceDoesNotPromoteRejectedAdmission(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sentinel := errors.New("durable acceptance failed")
+	accepted := make(chan error, 1)
+	accepted <- sentinel
+
+	_, err := awaitDelegateAcceptance(ctx, accepted, make(chan struct{}))
+	var sessionErr *SessionError
+	if !errors.As(err, &sessionErr) || sessionErr.Kind != SessionDelegateAdmissionCommitFailed {
+		t.Fatalf("error = %v, want SessionDelegateAdmissionCommitFailed", err)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("error = %v, want wrapped acceptance error", err)
+	}
+}
+
+func TestEnqueueDelegateTurnCancelsCommittedRequestAfterContextRace(t *testing.T) {
+	t.Parallel()
+	loopID := mustUUID()
+	backend := &channelBackend{Commands: make(chan command.Command), Done: make(chan struct{})}
+	s := &Session{
+		sessionID:  mustUUID(),
+		sessionCtx: context.Background(),
+		newID:      uuid.New,
+		loops:      map[uuid.UUID]*loopHandle{loopID: {id: loopID, backend: backend}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	actorErr := make(chan error, 1)
+	go func() {
+		input, ok := (<-backend.Commands).(command.UserInput)
+		if !ok {
+			actorErr <- errors.New("first command was not UserInput")
+			return
+		}
+		cancel()
+		input.Accepted <- nil
+		cancelRequest, ok := (<-backend.Commands).(command.CancelDelegateRequest)
+		if !ok {
+			actorErr <- errors.New("second command was not CancelDelegateRequest")
+			return
+		}
+		if cancelRequest.TargetCommandID != input.CommandID {
+			actorErr <- errors.New("cancel targeted a different request")
+			return
+		}
+		cancelRequest.Ack <- command.DelegateCancelActive
+		actorErr <- nil
+	}()
+
+	var removed atomic.Bool
+	requestID, tracked, err := s.enqueueDelegateTurn(ctx, loopID, delegateBlocks("go"),
+		func(_, childID uuid.UUID) *pendingRequest {
+			return &pendingRequest{childID: childID, done: make(chan struct{}), lifecycle: pendingRequestActive}
+		},
+		func(uuid.UUID, *pendingRequest) { removed.Store(true) },
+	)
+	if err != nil {
+		t.Fatalf("enqueueDelegateTurn: %v", err)
+	}
+	if requestID.IsZero() || tracked == nil {
+		t.Fatalf("admitted request = (%v, %v), want retained identity and tracker", requestID, tracked)
+	}
+	if removed.Load() {
+		t.Fatal("committed request tracker was rolled back")
+	}
+	if err := <-actorErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDelegateStartClosesSubscriptionWhenStartedHeaderMintFails(t *testing.T) {
+	parent := delegateParent(loop.DelegationManaged, "child")
+	s := newDelegationSession(t, parent, nil, delegateChild("child", "answer"))
+	sub := newTrackingDelegateSubscription()
+	s.delegateSubscribe = func(event.EventFilter) (event.Subscription, error) { return sub, nil }
+
+	sentinel := errors.New("injected started-header mint failure")
+	var calls int
+	s.newID = func() (uuid.UUID, error) {
+		calls++
+		if calls == 3 {
+			return uuid.UUID{}, sentinel
+		}
+		return uuid.New()
+	}
+	s.factory = event.NewFactory(func() (uuid.UUID, error) { return s.newID() }, s.now)
+
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+	_, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: false})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("start error = %v, want injected sentinel", err)
+	}
+	if got := sub.closed.Load(); got != 1 {
+		t.Fatalf("subscription close count = %d, want 1", got)
 	}
 }
 

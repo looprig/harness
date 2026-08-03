@@ -1307,15 +1307,21 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	// consumer configuring different gates per definition (or OverrideBoundAccess
 	// at a binding seam); harness performs no cross-loop attenuation.
 	var eventTarget loopEventPublisher = s
+	admissionSubscriptionOwned := false
 	if admission != nil {
 		admission.sub, err = s.subscribeLoop(loopID)
 		if err != nil {
 			release()
 			return uuid.UUID{}, err
 		}
+		admissionSubscriptionOwned = true
+		defer func() {
+			if admissionSubscriptionOwned {
+				_ = admission.sub.Close()
+			}
+		}()
 		admission.requestID, err = s.newCommandID()
 		if err != nil {
-			_ = admission.sub.Close()
 			release()
 			return uuid.UUID{}, err
 		}
@@ -1433,9 +1439,6 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	if err != nil {
 		release()
 		cancel()
-		if admission != nil {
-			_ = admission.sub.Close()
-		}
 		return uuid.UUID{}, err
 	}
 	if foreignSID != "" && runtime != nil && runtime.Profile != "" {
@@ -1445,9 +1448,6 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		if err != nil {
 			release()
 			cancel()
-			if admission != nil {
-				_ = admission.sub.Close()
-			}
 			return uuid.UUID{}, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 		}
 	}
@@ -1455,13 +1455,11 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		if err := s.appendDelegateCommand(admission.ctx, loopID, admission.command); err != nil {
 			release()
 			cancel()
-			_ = admission.sub.Close()
 			return uuid.UUID{}, err
 		}
 		if err := s.enqueuePreparedDelegate(admission.ctx, b, admission.command); err != nil {
 			release()
 			cancel()
-			_ = admission.sub.Close()
 			return uuid.UUID{}, err
 		}
 	}
@@ -1571,9 +1569,6 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		s.loopsMu.Unlock()
 		release()
 		cancel()
-		if admission != nil {
-			_ = admission.sub.Close()
-		}
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: err}
 	}
 	if foreignSID != "" && runtime != nil && runtime.Profile != "" {
@@ -1585,15 +1580,13 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			s.loopsMu.Unlock()
 			release()
 			cancel()
-			if admission != nil {
-				_ = admission.sub.Close()
-			}
 			return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: err}
 		}
 	}
 	if admission != nil {
 		admission.tracked = admission.registerRequest(admission.requestID, loopID)
 		admission.publisher.release()
+		admissionSubscriptionOwned = false
 	}
 	return loopID, nil
 }

@@ -1345,22 +1345,50 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 	}()
 	select {
 	case backend.CommandSink() <- cmd:
-		select {
-		case err := <-accepted:
-			if err != nil {
-				return uuid.UUID{}, nil, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: err}
-			}
-			admitted = true
-			return id, tracked, nil
-		case <-ctx.Done():
-			return uuid.UUID{}, nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
-		case <-backend.DoneChan():
-			return uuid.UUID{}, nil, &SessionError{Kind: SessionLoopExited}
+		canceled, err := awaitDelegateAcceptance(ctx, accepted, backend.DoneChan())
+		if err != nil {
+			return uuid.UUID{}, nil, err
 		}
+		admitted = true
+		if canceled {
+			_, _ = s.cancelDelegateRequest(loopID, id)
+		}
+		return id, tracked, nil
 	case <-ctx.Done():
 		return uuid.UUID{}, nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	case <-backend.DoneChan():
 		return uuid.UUID{}, nil, &SessionError{Kind: SessionLoopExited}
+	}
+}
+
+// awaitDelegateAcceptance treats the actor's durable acceptance decision as
+// authoritative once the command handoff has completed. Context cancellation is
+// remembered, but cannot roll back a request the actor may already have committed.
+func awaitDelegateAcceptance(ctx context.Context, accepted <-chan error, backendDone <-chan struct{}) (canceled bool, err error) {
+	ctxDone := ctx.Done()
+	for {
+		select {
+		case acceptErr := <-accepted:
+			if acceptErr != nil {
+				return canceled, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: acceptErr}
+			}
+			return canceled || ctx.Err() != nil, nil
+		case <-ctxDone:
+			canceled = true
+			ctxDone = nil
+		case <-backendDone:
+			// A buffered acceptance may become observable with actor exit. Prefer that
+			// durable decision before classifying the loop as exited.
+			select {
+			case acceptErr := <-accepted:
+				if acceptErr != nil {
+					return canceled, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: acceptErr}
+				}
+				return canceled || ctx.Err() != nil, nil
+			default:
+				return canceled, &SessionError{Kind: SessionLoopExited}
+			}
+		}
 	}
 }
 
