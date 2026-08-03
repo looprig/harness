@@ -789,12 +789,27 @@ func (s *Session) seedDirectChildren() {
 		if handle == nil || handle.parent.LoopID.IsZero() {
 			continue
 		}
-		children := s.directChildren[handle.parent.LoopID]
-		if children == nil {
-			children = make(map[uuid.UUID]struct{})
-			s.directChildren[handle.parent.LoopID] = children
-		}
-		children[id] = struct{}{}
+		s.addDirectChildUnderLock(handle.parent.LoopID, id)
+	}
+}
+
+func (s *Session) addDirectChildUnderLock(parentID, childID uuid.UUID) {
+	if s.directChildren == nil {
+		s.directChildren = make(map[uuid.UUID]map[uuid.UUID]struct{})
+	}
+	children := s.directChildren[parentID]
+	if children == nil {
+		children = make(map[uuid.UUID]struct{})
+		s.directChildren[parentID] = children
+	}
+	children[childID] = struct{}{}
+}
+
+func (s *Session) removeDirectChildUnderLock(parentID, childID uuid.UUID) {
+	children := s.directChildren[parentID]
+	delete(children, childID)
+	if len(children) == 0 {
+		delete(s.directChildren, parentID)
 	}
 }
 
@@ -1537,15 +1552,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	}
 	s.loops[loopID] = &loopHandle{id: loopID, owner: s, bound: bound, bindings: bindings, backend: b, parent: parent, cancel: cancel, liveMode: startedMode, liveModel: liveModel, state: initialState, agentName: displayName, agentMode: startedMode, selectedHarness: selectedHarness}
 	if !parent.LoopID.IsZero() {
-		if s.directChildren == nil {
-			s.directChildren = make(map[uuid.UUID]map[uuid.UUID]struct{})
-		}
-		children := s.directChildren[parent.LoopID]
-		if children == nil {
-			children = make(map[uuid.UUID]struct{})
-			s.directChildren[parent.LoopID] = children
-		}
-		children[loopID] = struct{}{}
+		s.addDirectChildUnderLock(parent.LoopID, loopID)
 	}
 	s.loopsMu.Unlock()
 
@@ -1597,6 +1604,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		s.loopsMu.Lock()
 		if !s.constructing {
 			delete(s.loops, loopID)
+			s.removeDirectChildUnderLock(parent.LoopID, loopID)
 		}
 		s.loopsMu.Unlock()
 		release()
@@ -1608,6 +1616,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			s.loopsMu.Lock()
 			if !s.constructing {
 				delete(s.loops, loopID)
+				s.removeDirectChildUnderLock(parent.LoopID, loopID)
 			}
 			s.loopsMu.Unlock()
 			release()

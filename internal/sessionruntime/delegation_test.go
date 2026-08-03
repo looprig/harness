@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"io"
 	"slices"
 	"sort"
 	"strings"
@@ -128,6 +129,57 @@ type releasedFailureLLM struct {
 	release chan struct{}
 	err     error
 	once    sync.Once
+}
+
+type queuedMessageLLM struct {
+	mu      sync.Mutex
+	started chan string
+	release chan struct{}
+	seen    []string
+}
+
+func newQueuedMessageLLM() *queuedMessageLLM {
+	return &queuedMessageLLM{started: make(chan string, 3), release: make(chan struct{}, 3)}
+}
+
+func (*queuedMessageLLM) Invoke(context.Context, inference.Request) (*inference.Response, error) {
+	return nil, errors.New("queuedMessageLLM.Invoke not used")
+}
+
+func (l *queuedMessageLLM) Stream(ctx context.Context, req inference.Request) (*stream.StreamReader[content.Chunk], error) {
+	message := latestUserText(req.Messages)
+	l.mu.Lock()
+	l.seen = append(l.seen, message)
+	l.mu.Unlock()
+	l.started <- message
+	released := false
+	return stream.NewStreamReader(func() (content.Chunk, error) {
+		if !released {
+			select {
+			case <-l.release:
+				released = true
+				return textChunk("reply " + message), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return nil, io.EOF
+	}, nil), nil
+}
+
+func latestUserText(messages content.AgenticMessages) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		user, ok := messages[i].(*content.UserMessage)
+		if !ok {
+			continue
+		}
+		for j := len(user.Blocks) - 1; j >= 0; j-- {
+			if block, ok := user.Blocks[j].(*content.TextBlock); ok {
+				return block.Text
+			}
+		}
+	}
+	return ""
 }
 
 func (l *releasedFailureLLM) Invoke(context.Context, inference.Request) (*inference.Response, error) {
@@ -1789,7 +1841,8 @@ func TestDelegateStartAppendFailureRollsBackPreparedChild(t *testing.T) {
 	// The root LoopStarted has already committed. Fail exactly the next child creation
 	// commit without replacing the live session hub beneath running loop publishers.
 	appender.enabled.Store(true)
-	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent).(*scopedController)
+	parentID := s.ActiveLoopID()
+	ctrl := s.delegation.controllerFor(parentID, parent).(*scopedController)
 	beforeQuota := s.spawnedCount()
 	_, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: false})
 	if !errors.Is(err, sentinel) {
@@ -1797,6 +1850,12 @@ func TestDelegateStartAppendFailureRollsBackPreparedChild(t *testing.T) {
 	}
 	if s.spawnedCount() != beforeQuota || len(ctrl.ownedChildren(s)) != 0 {
 		t.Fatalf("failed durable commit left quota=%d children=%d", s.spawnedCount(), len(ctrl.ownedChildren(s)))
+	}
+	s.loopsMu.RLock()
+	indexed := len(s.directChildren[parentID])
+	s.loopsMu.RUnlock()
+	if indexed != 0 {
+		t.Fatalf("failed durable commit left %d stale direct-child index entries", indexed)
 	}
 }
 
@@ -1995,6 +2054,10 @@ func TestDelegateWaitResolvesAfterRestore(t *testing.T) {
 	t.Cleanup(func() { _ = r.Shutdown(context.Background()) })
 
 	rctrl := r.delegation.controllerFor(r.ActiveLoopID(), parent)
+	roster, err := rctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus})
+	if err != nil || len(roster.Agents) != 1 || roster.Agents[0].AgentID != childID {
+		t.Fatalf("restored direct-child roster = %+v, %v; want child %v", roster, err, childID)
+	}
 	res, err := waitResponse(context.Background(), rctrl, r, childID, reqID, nil)
 	if err != nil {
 		t.Fatalf("wait after restore: %v", err)
@@ -2156,11 +2219,106 @@ func TestAgentForegroundTimeoutPreservesPersistentAgent(t *testing.T) {
 	}
 }
 
+func TestDelegateMessageQueueIsFIFOAndCountsOnlyWaitingNoFoldTurns(t *testing.T) {
+	t.Parallel()
+	client := newQueuedMessageLLM()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := mustDefine(
+		loop.WithName("child"),
+		loop.WithInference(client, validModel("child")),
+		loop.WithDrainTimeout(100*time.Millisecond),
+	)
+	s := newDelegationSession(t, parent, nil, child)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+
+	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := <-client.started; got != "A" {
+		t.Fatalf("first turn = %q, want A", got)
+	}
+	b, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateSend, AgentID: started.AgentID, Message: "B", WaitForResponse: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateSend, AgentID: started.AgentID, Message: "C", WaitForResponse: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.CorrelationID.IsZero() || c.CorrelationID.IsZero() || b.CorrelationID == c.CorrelationID {
+		t.Fatalf("queued messages are not distinct: B=%v C=%v", b.CorrelationID, c.CorrelationID)
+	}
+	waitDelegateQueuedMessages(t, ctrl, started.AgentID, 2)
+
+	client.release <- struct{}{}
+	if got := <-client.started; got != "B" {
+		t.Fatalf("second turn = %q, want B", got)
+	}
+	waitDelegateQueuedMessages(t, ctrl, started.AgentID, 1)
+	client.release <- struct{}{}
+	if got := <-client.started; got != "C" {
+		t.Fatalf("third turn = %q, want C", got)
+	}
+	waitDelegateQueuedMessages(t, ctrl, started.AgentID, 0)
+	client.release <- struct{}{}
+
+	result, err := waitResponse(delegateCtx(t), ctrl, s, started.AgentID, c.CorrelationID, nil)
+	if err != nil || result.ResponseStatus != tool.DelegateResponseCompleted || result.Response != "reply C" {
+		t.Fatalf("C result = %+v, %v; want completed reply C", result, err)
+	}
+	client.mu.Lock()
+	seen := append([]string(nil), client.seen...)
+	client.mu.Unlock()
+	if !slices.Equal(seen, []string{"A", "B", "C"}) {
+		t.Fatalf("turn order = %v, want [A B C]", seen)
+	}
+}
+
+func TestDelegateReuseAfterAgentStopKeepsIdentityAndRuntime(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	s := newDelegationSession(t, parent, nil, delegateChild("child", "reply"))
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: started.AgentID})
+	if err != nil || len(before.Agents) != 1 {
+		t.Fatalf("status before stop = %+v, %v", before, err)
+	}
+	stopped, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: started.AgentID})
+	if err != nil || stopped.AgentID != started.AgentID || stopped.State != tool.AgentStateIdle {
+		t.Fatalf("stop = %+v, %v", stopped, err)
+	}
+	reused, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateSend, AgentID: started.AgentID, Message: "B", WaitForResponse: true,
+	})
+	if err != nil || reused.AgentID != started.AgentID || reused.Response != "reply" || reused.State != tool.AgentStateIdle {
+		t.Fatalf("reused agent = %+v, %v", reused, err)
+	}
+	after, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: started.AgentID})
+	if err != nil || len(after.Agents) != 1 || after.Agents[0].Runtime != before.Agents[0].Runtime {
+		t.Fatalf("runtime changed across stop/reuse: before=%+v after=%+v err=%v", before.Agents, after.Agents, err)
+	}
+}
+
 func TestAgentHierarchyRosterAndOwnership(t *testing.T) {
 	t.Parallel()
 	p := delegateNode("p", loop.DelegationManaged, "a", "b")
 	a := delegateNode("a", loop.DelegationManaged, "c")
-	s := newDelegationSession(t, p, nil, a, delegateChild("b", "b reply"), delegateChild("c", "c reply"))
+	b := delegateNode("b", loop.DelegationManaged)
+	c := delegateNode("c", loop.DelegationManaged)
+	s := newDelegationSession(t, p, nil, a, b, c)
 	pCtrl := s.delegation.controllerFor(s.ActiveLoopID(), p)
 	start := func(ctrl tool.DelegateController, req tool.DelegateRequest) tool.DelegateResult {
 		t.Helper()
@@ -2174,6 +2332,8 @@ func TestAgentHierarchyRosterAndOwnership(t *testing.T) {
 	bResult := start(pCtrl, tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "b", Message: "b", WaitForResponse: true})
 	aCtrl := s.delegation.controllerFor(aResult.AgentID, a)
 	cResult := start(aCtrl, tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "c", Message: "c", WaitForResponse: true})
+	bCtrl := s.delegation.controllerFor(bResult.AgentID, b)
+	cCtrl := s.delegation.controllerFor(cResult.AgentID, c)
 
 	list := func(ctrl tool.DelegateController) []tool.DelegateAgent {
 		t.Helper()
@@ -2192,15 +2352,25 @@ func TestAgentHierarchyRosterAndOwnership(t *testing.T) {
 	if got := list(aCtrl); len(got) != 1 || got[0].AgentID != cResult.AgentID {
 		t.Fatalf("A roster = %+v, want direct C", got)
 	}
+	if got := list(bCtrl); len(got) != 0 {
+		t.Fatalf("B roster = %+v, want empty", got)
+	}
+	if got := list(cCtrl); len(got) != 0 {
+		t.Fatalf("C roster = %+v, want empty", got)
+	}
 	// A registry entry alone must not make an agent appear in a caller's roster.
 	// This models a loop owned by another subsystem that happens to carry the same
 	// parent provenance; ListAgents is required to use the controller's direct index.
 	s.loopsMu.Lock()
 	fakeID := mustUUID()
-	fake := *s.loops[aResult.AgentID]
-	fake.id = fakeID
-	s.loops[fakeID] = &fake
+	fakeSource := s.loops[aResult.AgentID]
+	s.loops[fakeID] = &loopHandle{id: fakeID, bound: fakeSource.bound, parent: fakeSource.parent}
 	s.loopsMu.Unlock()
+	defer func() {
+		s.loopsMu.Lock()
+		delete(s.loops, fakeID)
+		s.loopsMu.Unlock()
+	}()
 	if got := list(pCtrl); len(got) != 2 {
 		t.Fatalf("P roster exposed unindexed registry entry: %+v", got)
 	}
@@ -2215,12 +2385,85 @@ func TestAgentHierarchyRosterAndOwnership(t *testing.T) {
 		"unknown is not owned": {pCtrl, mustUUID()},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := tc.ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: tc.id})
-			var de *DelegateError
-			if !errors.As(err, &de) || de.Kind != DelegateNotOwned || de.Error() != (&DelegateError{Kind: DelegateNotOwned, DelegateID: tc.id}).Error() {
-				t.Fatalf("status error = %v, want bounded not-owned error", err)
+			var want string
+			for _, operation := range []tool.DelegateOperation{tool.DelegateStatus, tool.DelegateSend, tool.DelegateInterrupt} {
+				_, err := tc.ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: operation, AgentID: tc.id, Message: "rejected"})
+				var de *DelegateError
+				if !errors.As(err, &de) || de.Kind != DelegateNotOwned {
+					t.Fatalf("operation %v error = %v, want not-owned", operation, err)
+				}
+				if want == "" {
+					want = de.Error()
+				}
+				if de.Error() != want || len(de.Error()) > 128 {
+					t.Fatalf("operation %v error = %q, want identical bounded %q", operation, de.Error(), want)
+				}
 			}
 		})
+	}
+}
+
+func TestListAgentsIsDeterministicAndBounded(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	s := newDelegationSession(t, parent, nil, delegateChild("child", "reply"))
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, AgentType: "child", Message: "A", WaitForResponse: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	injected := make([]uuid.UUID, 0, maxDelegateStatusChildren+2)
+	parentID := s.ActiveLoopID()
+	s.loopsMu.Lock()
+	template := s.loops[started.AgentID]
+	children := s.directChildren[parentID]
+	for i := 0; i < maxDelegateStatusChildren+2; i++ {
+		var id uuid.UUID
+		id[0] = 0x80
+		id[14] = byte(i >> 8)
+		id[15] = byte(i)
+		injected = append(injected, id)
+		s.loops[id] = &loopHandle{
+			id: id, bound: template.bound, parent: template.parent,
+			state: tool.DelegateStatusIdle, agentName: "injected", agentMode: template.agentMode,
+		}
+		children[id] = struct{}{}
+	}
+	s.loopsMu.Unlock()
+	defer func() {
+		s.loopsMu.Lock()
+		for _, id := range injected {
+			delete(s.loops, id)
+			delete(s.directChildren[parentID], id)
+		}
+		s.loopsMu.Unlock()
+	}()
+
+	first, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Truncated || len(first.Agents) != maxDelegateStatusChildren {
+		t.Fatalf("list size=%d truncated=%v, want %d/true", len(first.Agents), first.Truncated, maxDelegateStatusChildren)
+	}
+	firstIDs := make([]uuid.UUID, len(first.Agents))
+	secondIDs := make([]uuid.UUID, len(second.Agents))
+	for i := range first.Agents {
+		firstIDs[i] = first.Agents[i].AgentID
+		secondIDs[i] = second.Agents[i].AgentID
+		if i > 0 && firstIDs[i].String() <= firstIDs[i-1].String() {
+			t.Fatalf("list is not strictly ordered at %d: %v then %v", i, firstIDs[i-1], firstIDs[i])
+		}
+	}
+	if !slices.Equal(firstIDs, secondIDs) {
+		t.Fatalf("list order changed: first=%v second=%v", firstIDs, secondIDs)
 	}
 }
 

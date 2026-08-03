@@ -563,6 +563,10 @@ func restoreTopologySession(
 	if err := attachAndActivate(s, all, plans, rootLoopID); err != nil {
 		return abortAccepted(s, err)
 	}
+	// Restored children are registered after the delegation manager is attached.
+	// Build the direct-child ownership index only after every live or tombstoned
+	// handle has been installed, before the restored session can escape.
+	s.seedDirectChildren()
 	// Correlation is seeded only after every checked crash closure committed AND every
 	// restored loop was attached. A child can fail during restored backend construction
 	// after the initial fold (and be tombstoned by attachAndActivate), so seeding before

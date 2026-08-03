@@ -29,8 +29,8 @@ import (
 // ancestors, unrelated loop ids, unavailable actions, and invalid modes. The parent
 // model never receives the session or the manager — only the narrow scoped controller.
 //
-// OWNERSHIP survives restore because it is derived from the loop registry's parent
-// links (attachRestoredLoop re-seeds each loop's parent), not a separate map. The
+// OWNERSHIP survives restore because the direct-child index is rebuilt from the loop
+// registry's durable parent links after attachRestoredLoop re-seeds each loop. The
 // cumulative spawn quota also survives restore (countSpawnedLoops re-seeds it). The
 // Live pending handles are process-local. Durable machine NoFold intent records plus
 // correlated turn terminals reconstruct request resolution across restore; queued work
@@ -298,7 +298,6 @@ func (m *delegationManager) attach(s *Session) {
 	if m == nil {
 		return
 	}
-	s.seedDirectChildren()
 	m.mu.Lock()
 	m.session = s
 	m.mu.Unlock()
@@ -1021,8 +1020,7 @@ func (c *scopedController) ownsChildWithClosed(s *Session, childID uuid.UUID, al
 	return nil
 }
 
-// ownedChildren returns the registered loop ids whose parent is this controller's bound
-// parent.
+// ownedChildren returns registered loop ids from this controller's direct-child index.
 func (c *scopedController) ownedChildren(s *Session) []uuid.UUID {
 	s.loopsMu.RLock()
 	defer s.loopsMu.RUnlock()
