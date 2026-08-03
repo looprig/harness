@@ -647,7 +647,7 @@ func validControllerRuntimeSelection(catalog loop.RuntimeCatalog, agent identity
 	}
 	sourceModels := controllerRuntimeModelsForSource(*selected, source)
 	if runtime.Explicit.Model {
-		if len(sourceModels) <= 1 {
+		if !controllerRuntimeModelAdmitted(sourceModels, loop.ModelAlias(runtime.Model)) {
 			return false
 		}
 	} else {
@@ -660,13 +660,35 @@ func validControllerRuntimeSelection(catalog loop.RuntimeCatalog, agent identity
 		return false
 	}
 	if runtime.Explicit.Effort {
-		if len(runtimeEfforts(sourceModels)) <= 1 {
+		if !controllerRuntimeEffortAdmitted(*selectedModel, parseRuntimeEffort(runtime.Effort)) {
 			return false
 		}
 	} else if runtime.Effort != runtimeEffortString(selectedModel.DefaultEffort) {
 		return false
 	}
 	return true
+}
+
+func controllerRuntimeModelAdmitted(models []loop.RuntimeModelOption, alias loop.ModelAlias) bool {
+	for _, option := range models {
+		if option.Alias == alias {
+			return true
+		}
+	}
+	return false
+}
+
+func controllerRuntimeEffortAdmitted(option loop.RuntimeModelOption, effort inferencemodel.Effort) bool {
+	efforts := option.Efforts
+	if len(efforts) == 0 {
+		efforts = []inferencemodel.Effort{option.DefaultEffort}
+	}
+	for _, admitted := range efforts {
+		if admitted == effort {
+			return true
+		}
+	}
+	return false
 }
 
 func controllerRuntimeEntrySource(entry loop.RuntimeCatalogEntry) loop.RuntimeSourceName {
@@ -760,24 +782,6 @@ func runtimeDefaultControllerEntry(entries []loop.RuntimeCatalogEntry) loop.Runt
 		return loop.RuntimeCatalogEntry{}
 	}
 	return entries[0]
-}
-
-func runtimeEfforts(models []loop.RuntimeModelOption) []inferencemodel.Effort {
-	seen := make(map[inferencemodel.Effort]struct{})
-	for _, option := range models {
-		efforts := option.Efforts
-		if len(efforts) == 0 {
-			efforts = []inferencemodel.Effort{option.DefaultEffort}
-		}
-		for _, effort := range efforts {
-			seen[effort] = struct{}{}
-		}
-	}
-	result := make([]inferencemodel.Effort, 0, len(seen))
-	for effort := range seen {
-		result = append(result, effort)
-	}
-	return result
 }
 
 // send enqueues a distinct NON-FOLDING follow-up turn on an owned child and waits or
@@ -1030,6 +1034,18 @@ func (c *scopedController) agentRuntime(handle *loopHandle) tool.DelegateRuntime
 		if entry.Profile == identity.Profile {
 			runtime.Harness = string(entry.AgentHarness)
 			break
+		}
+	}
+	if c.hasRuntimeCatalog && identity.SelectionKind != loop.RuntimeSelectionHarnessManaged && runtime.Harness != "" && identity.ModelAlias != "" {
+		resolved, err := c.runtimeCatalog.ResolveTargetAliasWithSource(
+			handle.bound.Name(),
+			loop.AgentHarnessName(runtime.Harness),
+			identity.Source,
+			identity.ModelAlias,
+			identity.Effort,
+		)
+		if err == nil && resolved.Profile == identity.Profile {
+			runtime.Model = string(resolved.ModelAlias)
 		}
 	}
 	return runtime

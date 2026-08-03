@@ -12,6 +12,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/delegationtool"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreign"
@@ -437,6 +438,113 @@ func TestDelegateRuntimeIsRevalidatedAndPinnedAtChildBind(t *testing.T) {
 		if !errors.As(err, &runtimeErr) || runtimeErr.Kind != DelegateRuntimeInvalid {
 			t.Fatalf("invalid mixed-source runtime %+v error = %v, want typed runtime refusal", runtime, err)
 		}
+	}
+}
+
+func TestDelegateRuntimeAcceptsPreparedExplicitSingleChoiceAndRejectsInvalidMembership(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := delegateChild("child", "runtime child")
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType: "child", AgentHarness: "test", Profile: "acp/test", Default: true,
+		Credential: loop.CredentialGatewayBacked, DefaultModel: "runtime",
+		Models: []loop.RuntimeModelOption{{
+			Alias: "runtime", Target: validModel("runtime-target"),
+			DefaultEffort: model.EffortMedium, Efforts: []model.Effort{model.EffortMedium},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := &fakeForeignBuilder{sid: fixedForeignSID, backend: newFakeBackend()}
+	registry := &foreign.BuilderRegistry{}
+	if err := registry.Register("acp/test", builder.build, builder.buildRestored); err != nil {
+		t.Fatal(err)
+	}
+	s := newDelegationSession(t, parent, []Option{WithRuntimeCatalog(catalog), WithForeignBuilderRegistry(registry)}, child)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+	startTool := delegationtool.NewStartAgent(ctrl, loop.DelegationManaged, []delegationtool.AgentCatalogEntry{{Name: "child"}}, catalog)
+	_, prepared, err := startTool.PrepareCall(context.Background(), mustUUID(), `{"agent_type":"child","instructions":"go","model":"runtime","effort":"medium"}`)
+	if err != nil {
+		t.Fatalf("PrepareCall() error = %v", err)
+	}
+	artifact, ok := prepared.(tool.DelegateArtifact)
+	if !ok || artifact.Runtime == nil || !artifact.Runtime.Explicit.Model || !artifact.Runtime.Explicit.Effort {
+		t.Fatalf("prepared artifact = %#v, want explicit model and effort", prepared)
+	}
+	result, err := ctrl.Execute(delegateCtx(t), artifact.Request)
+	if err != nil {
+		t.Fatalf("Execute(prepared request) error = %v", err)
+	}
+	if result.AgentID.IsZero() {
+		t.Fatal("Execute(prepared request) returned zero agent id")
+	}
+
+	for name, mutate := range map[string]func(*tool.DelegateRuntime){
+		"model":  func(runtime *tool.DelegateRuntime) { runtime.Model = "missing" },
+		"effort": func(runtime *tool.DelegateRuntime) { runtime.Effort = "high" },
+	} {
+		t.Run("invalid "+name+" membership", func(t *testing.T) {
+			invalid := *artifact.Runtime
+			mutate(&invalid)
+			_, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+				Operation: tool.DelegateStart, AgentType: "child", Message: "bad", WaitForResponse: true, Runtime: &invalid,
+			})
+			var runtimeErr *DelegateError
+			if !errors.As(err, &runtimeErr) || runtimeErr.Kind != DelegateRuntimeInvalid {
+				t.Fatalf("Execute(invalid %s) error = %v, want typed runtime refusal", name, err)
+			}
+		})
+	}
+}
+
+func TestDelegateRuntimeProjectsConcreteTargetAliasAsStableModelAlias(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := delegateChild("child", "runtime child")
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex", Default: true,
+		Credential: loop.CredentialGatewayBacked, DefaultModel: "luna",
+		Models: []loop.RuntimeModelOption{{
+			Alias: "luna", Target: validModel("luna-target"),
+			DefaultEffort: model.EffortLow, Efforts: []model.Effort{model.EffortLow, model.EffortHigh},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := &fakeForeignBuilder{sid: fixedForeignSID, backend: newFakeBackend()}
+	registry := &foreign.BuilderRegistry{}
+	if err := registry.Register("acp/codex", builder.build, builder.buildRestored); err != nil {
+		t.Fatal(err)
+	}
+	s := newDelegationSession(t, parent, []Option{WithRuntimeCatalog(catalog), WithForeignBuilderRegistry(registry)}, child)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+	result, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: true,
+		Runtime: &tool.DelegateRuntime{
+			Harness: "codex", Profile: "acp/codex", Source: "gateway", SelectionKind: "explicit",
+			Model: "luna", Effort: "high", Explicit: tool.DelegateRuntimeExplicit{Model: true, Effort: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	s.loopsMu.RLock()
+	handle := s.loops[result.AgentID]
+	s.loopsMu.RUnlock()
+	if handle == nil {
+		t.Fatal("runtime child not registered")
+	}
+	if got := handle.bound.RuntimeIdentity().ModelAlias; got != "luna@high" {
+		t.Fatalf("durable runtime model alias = %q, want luna@high", got)
+	}
+	listed, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: result.AgentID})
+	if err != nil || len(listed.Agents) != 1 {
+		t.Fatalf("list selected runtime = %+v, %v", listed.Agents, err)
+	}
+	if got := listed.Agents[0].Runtime.Model; got != "luna" {
+		t.Fatalf("public runtime model = %q, want stable alias luna", got)
 	}
 }
 
