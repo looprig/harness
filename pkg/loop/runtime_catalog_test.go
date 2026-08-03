@@ -404,6 +404,8 @@ func TestRuntimeCatalogDefensiveCopiesAndDigest(t *testing.T) {
 		name   string
 		mutate func(*model.Model)
 	}{
+		{name: "provider", mutate: func(target *model.Model) { target.Provider = "different-provider" }},
+		{name: "API format", mutate: func(target *model.Model) { target.APIFormat = "different-api-format" }},
 		{name: "temperature", mutate: func(target *model.Model) { value := 0.25; target.Sampling.Temperature = &value }},
 		{name: "top-p", mutate: func(target *model.Model) { value := 0.75; target.Sampling.TopP = &value }},
 		{name: "max tokens", mutate: func(target *model.Model) { value := 321; target.Sampling.MaxTokens = &value }},
@@ -420,6 +422,19 @@ func TestRuntimeCatalogDefensiveCopiesAndDigest(t *testing.T) {
 		if changedCatalog.Digest() == digest {
 			t.Errorf("catalog digest did not change for %s mutation", mutation.name)
 		}
+	}
+
+	changedWiring := testCatalogEntries()
+	changedWiring[0].Source = RuntimeSourceNative
+	changedWiring[0].Credential = CredentialNativeAuth
+	changedWiring[0].Models[0].Source = RuntimeSourceNative
+	changedWiring[0].Models[0].Credential = CredentialNativeAuth
+	wiringCatalog, err := NewRuntimeCatalog(changedWiring)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog(changed wiring) error = %v", err)
+	}
+	if wiringCatalog.Digest() == digest {
+		t.Fatal("catalog digest did not change for source and credential wiring")
 	}
 }
 
@@ -556,6 +571,54 @@ func TestRuntimeCatalogDescriptionDigest(t *testing.T) {
 	for _, forbidden := range []string{"https://endpoint.example/v1", "base_url", "api_key", "secret"} {
 		if strings.Contains(string(encoded), forbidden) {
 			t.Fatalf("digest JSON contains forbidden provider wiring %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestRuntimeCatalogDigestProjectionOmitsRuntimeWiring(t *testing.T) {
+	entries := testCatalogEntries()
+	option := &entries[0].Models[0]
+	option.NativeSmallModel = "private-native-small-model"
+	option.Target.Provider = "private-provider-id"
+	option.Target.APIFormat = "private-api-format"
+	option.Target.BaseURL = "https://private-endpoint.example/v1"
+	option.Target.Name = "private-provider-model-id"
+	temperature := 0.25
+	option.Target.Sampling.Temperature = &temperature
+	option.Target.Sampling.Stop = []string{"private-stop-sequence"}
+
+	catalog, err := NewRuntimeCatalog(entries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+	encoded, err := runtimeCatalogDigestJSON(catalog.entries)
+	if err != nil {
+		t.Fatalf("runtimeCatalogDigestJSON() error = %v", err)
+	}
+	var projection any
+	if err := json.Unmarshal(encoded, &projection); err != nil {
+		t.Fatalf("unmarshal digest JSON: %v", err)
+	}
+	if got, want := countJSONKey(projection, "configuration_fingerprint"), len(catalog.entries); got != want {
+		t.Fatalf("digest JSON configuration fingerprint count = %d, want %d: %s", got, want, encoded)
+	}
+
+	for _, forbidden := range []string{
+		"source", "credential", "native_small_model",
+		"provider", "api_format", "name", "origin", "capabilities", "limits",
+		"temperature", "top_p", "max_tokens", "stop", "sampling_effort",
+	} {
+		if got := countJSONKey(projection, forbidden); got != 0 {
+			t.Errorf("digest JSON contains forbidden field %q %d time(s): %s", forbidden, got, encoded)
+		}
+	}
+	for _, forbidden := range []string{
+		"gateway-backed", "gateway",
+		"private-native-small-model", "private-provider-id", "private-api-format",
+		"https://private-endpoint.example/v1", "private-provider-model-id", "private-stop-sequence",
+	} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Errorf("digest JSON contains forbidden runtime wiring value %q: %s", forbidden, encoded)
 		}
 	}
 }

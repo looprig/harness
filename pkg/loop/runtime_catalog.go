@@ -854,39 +854,30 @@ type runtimeCatalogDigest struct {
 }
 
 type runtimeCatalogEntryDigest struct {
-	SubagentType    string                     `json:"subagent_type"`
-	AgentHarness    string                     `json:"agent_harness"`
-	Profile         string                     `json:"profile"`
-	Description     string                     `json:"description,omitempty"`
-	Source          RuntimeSourceName          `json:"source"`
-	Credential      CredentialMode             `json:"credential"`
-	SelectionKind   RuntimeSelectionKind       `json:"selection_kind"`
-	Default         bool                       `json:"default"`
-	DefaultModel    string                     `json:"default_model"`
-	SmallModel      string                     `json:"small_model,omitempty"`
-	NeedsSmallModel bool                       `json:"needs_small_model,omitempty"`
-	Models          []runtimeModelOptionDigest `json:"models"`
+	SubagentType             string                     `json:"subagent_type"`
+	AgentHarness             string                     `json:"agent_harness"`
+	Profile                  string                     `json:"profile"`
+	Description              string                     `json:"description,omitempty"`
+	ConfigurationFingerprint string                     `json:"configuration_fingerprint"`
+	SelectionKind            RuntimeSelectionKind       `json:"selection_kind"`
+	Default                  bool                       `json:"default"`
+	DefaultModel             string                     `json:"default_model"`
+	SmallModel               string                     `json:"small_model,omitempty"`
+	NeedsSmallModel          bool                       `json:"needs_small_model,omitempty"`
+	Models                   []runtimeModelOptionDigest `json:"models"`
 }
 
 type runtimeModelOptionDigest struct {
-	Alias            string              `json:"alias"`
-	Description      string              `json:"description,omitempty"`
-	Source           RuntimeSourceName   `json:"source,omitempty"`
-	Credential       CredentialMode      `json:"credential,omitempty"`
-	NativeSmallModel string              `json:"native_small_model,omitempty"`
-	Provider         string              `json:"provider"`
-	APIFormat        string              `json:"api_format"`
-	Name             string              `json:"name"`
-	Origin           model.Origin        `json:"origin"`
-	Capabilities     model.Capabilities  `json:"capabilities"`
-	Limits           model.ContextLimits `json:"limits"`
-	DefaultEffort    string              `json:"default_effort"`
-	Efforts          []string            `json:"efforts"`
-	Temperature      *float64            `json:"temperature,omitempty"`
-	TopP             *float64            `json:"top_p,omitempty"`
-	MaxTokens        *int                `json:"max_tokens,omitempty"`
-	Stop             []string            `json:"stop,omitempty"`
-	SamplingEffort   string              `json:"sampling_effort"`
+	Alias         string   `json:"alias"`
+	Description   string   `json:"description,omitempty"`
+	DefaultEffort string   `json:"default_effort"`
+	Efforts       []string `json:"efforts"`
+}
+
+type runtimeCatalogEntryConfiguration struct {
+	Source     RuntimeSourceName
+	Credential CredentialMode
+	Models     []RuntimeModelOption
 }
 
 func digestRuntimeCatalog(entries []RuntimeCatalogEntry) string {
@@ -903,45 +894,52 @@ func digestRuntimeCatalog(entries []RuntimeCatalogEntry) string {
 func runtimeCatalogDigestJSON(entries []RuntimeCatalogEntry) ([]byte, error) {
 	projection := runtimeCatalogDigest{Entries: make([]runtimeCatalogEntryDigest, len(entries))}
 	for i, entry := range entries {
+		configurationFingerprint, err := runtimeCatalogConfigurationFingerprint(entry)
+		if err != nil {
+			return nil, err
+		}
 		row := runtimeCatalogEntryDigest{
-			SubagentType:    string(entry.SubagentType),
-			AgentHarness:    string(entry.AgentHarness),
-			Profile:         string(entry.Profile),
-			Description:     entry.Description,
-			Source:          entry.Source,
-			Credential:      entry.Credential,
-			SelectionKind:   entry.SelectionKind,
-			Default:         entry.Default,
-			DefaultModel:    string(entry.DefaultModel),
-			SmallModel:      string(entry.SmallModel),
-			NeedsSmallModel: entry.NeedsSmallModel,
-			Models:          make([]runtimeModelOptionDigest, len(entry.Models)),
+			SubagentType:             string(entry.SubagentType),
+			AgentHarness:             string(entry.AgentHarness),
+			Profile:                  string(entry.Profile),
+			Description:              entry.Description,
+			ConfigurationFingerprint: configurationFingerprint,
+			SelectionKind:            entry.SelectionKind,
+			Default:                  entry.Default,
+			DefaultModel:             string(entry.DefaultModel),
+			SmallModel:               string(entry.SmallModel),
+			NeedsSmallModel:          entry.NeedsSmallModel,
+			Models:                   make([]runtimeModelOptionDigest, len(entry.Models)),
 		}
 		for j, option := range entry.Models {
 			row.Models[j] = runtimeModelOptionDigest{
-				Alias:            string(option.Alias),
-				Description:      option.Description,
-				Source:           effectiveRuntimeSource(entry, option),
-				Credential:       option.Credential,
-				NativeSmallModel: option.NativeSmallModel,
-				Provider:         string(option.Target.Provider),
-				APIFormat:        string(option.Target.APIFormat),
-				Name:             option.Target.Name,
-				Origin:           option.Target.Origin,
-				Capabilities:     option.Target.Caps,
-				Limits:           option.Target.Limits,
-				DefaultEffort:    catalogEffortString(option.DefaultEffort),
-				Efforts:          catalogEffortStrings(option.Efforts),
-				Temperature:      option.Target.Sampling.Temperature,
-				TopP:             option.Target.Sampling.TopP,
-				MaxTokens:        option.Target.Sampling.MaxTokens,
-				Stop:             append([]string(nil), option.Target.Sampling.Stop...),
-				SamplingEffort:   catalogEffortString(option.Target.Sampling.Effort),
+				Alias:         string(option.Alias),
+				Description:   option.Description,
+				DefaultEffort: catalogEffortString(option.DefaultEffort),
+				Efforts:       catalogEffortStrings(option.Efforts),
 			}
 		}
 		projection.Entries[i] = row
 	}
 	return json.Marshal(projection)
+}
+
+func runtimeCatalogConfigurationFingerprint(entry RuntimeCatalogEntry) (string, error) {
+	models := cloneRuntimeCatalogEntry(entry).Models
+	for i := range models {
+		models[i].Target.BaseURL = ""
+	}
+	configuration := runtimeCatalogEntryConfiguration{
+		Source:     entry.Source,
+		Credential: entry.Credential,
+		Models:     models,
+	}
+	encoded, err := json.Marshal(configuration)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func catalogEffortString(effort model.Effort) string {
