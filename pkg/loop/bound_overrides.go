@@ -180,7 +180,7 @@ func overrideBoundRuntimeSelection(bound BoundDefinition, profile RuntimeProfile
 	// changes the bound model/effort but must remain on the native backend. ACP
 	// and other adapter profiles continue to use EngineAdapter.
 	definition.engine = EngineAdapter
-	if source == RuntimeSourceNative && selectionKind == RuntimeSelectionExplicit {
+	if profile == RuntimeProfileName("looprig/native") && source == RuntimeSourceNative && selectionKind == RuntimeSelectionExplicit {
 		definition.engine = EngineNative
 	}
 	definition.model = cloneModel(target)

@@ -119,6 +119,25 @@ func TestOverrideBoundRuntimeSelectionKeepsExplicitNativeRuntimeOnNativeEngine(t
 	}
 }
 
+func TestOverrideBoundRuntimeSelectionKeepsNativeACPOnAdapterEngine(t *testing.T) {
+	t.Parallel()
+
+	definition := mustDefinition(t)
+	bound, err := definition.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind() error = %v", err)
+	}
+	target := testModel()
+	target.Name = "native-acp-model"
+	selected, err := OverrideBoundRuntimeSelectionWithIdentity(bound, "acp/codex", "native", target, model.EffortMedium, RuntimeSourceNative, RuntimeSelectionExplicit)
+	if err != nil {
+		t.Fatalf("OverrideBoundRuntimeSelectionWithIdentity() error = %v", err)
+	}
+	if selected.Engine() != EngineAdapter {
+		t.Fatalf("Engine() = %v, want EngineAdapter for native-auth ACP", selected.Engine())
+	}
+}
+
 func TestRuntimeIdentityManagedDigestOmitsModelAndEffortIdentity(t *testing.T) {
 	t.Parallel()
 
