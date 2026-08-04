@@ -995,7 +995,7 @@ func TestCrashClosureReseedsInterruptedDelegateRequest(t *testing.T) {
 	}
 	closure := event.TurnInterrupted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}}}
 	manager := newDelegationManager(Topology{})
-	cmd := command.UserInput{Header: command.Header{CommandID: requestID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: childID}
+	cmd := command.UserInput{Header: command.Header{CommandID: requestID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: childID, BackgroundHandBack: true}
 	if err := seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), childID, cmd)}, original, []event.Event{closure}); err != nil {
 		t.Fatal(err)
 	}
@@ -1008,7 +1008,7 @@ func TestCrashClosureReseedsInterruptedDelegateRequest(t *testing.T) {
 func TestRestoreIgnoresUnacceptedDelegateIntent(t *testing.T) {
 	t.Parallel()
 	requestID, childID := mustUUID(), mustUUID()
-	cmd := command.UserInput{Header: command.Header{CommandID: requestID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: childID}
+	cmd := command.UserInput{Header: command.Header{CommandID: requestID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: childID, BackgroundHandBack: true}
 	manager := newDelegationManager(Topology{})
 	if err := seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), uuid.UUID{}, cmd)}, nil, nil); err != nil {
 		t.Fatal(err)
@@ -1035,6 +1035,22 @@ func TestRestoreDoesNotAdmitOrdinaryTurnTerminalAsDelegateRequest(t *testing.T) 
 	}
 }
 
+func TestRestoreDoesNotAdmitForegroundDelegateIntentAsBackgroundHandBack(t *testing.T) {
+	t.Parallel()
+	requestID, childID := mustUUID(), mustUUID()
+	foreground := command.UserInput{Header: command.Header{CommandID: requestID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: childID}
+	events := []event.Event{
+		event.DelegateRequestAccepted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID}, Cause: identity.Cause{CommandID: requestID}}},
+	}
+	manager := newDelegationManager(Topology{})
+	if err := seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), childID, foreground)}, events, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := durableResolvedRecord(manager, requestID); ok {
+		t.Fatalf("foreground delegate intent was admitted as background hand-back: %+v", got)
+	}
+}
+
 func TestRestoreOverlaysAdmittedQueuedCancellationReason(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -1049,7 +1065,7 @@ func TestRestoreOverlaysAdmittedQueuedCancellationReason(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			requestID, childID := mustUUID(), mustUUID()
-			cmd := command.UserInput{Header: command.Header{CommandID: requestID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: childID}
+			cmd := command.UserInput{Header: command.Header{CommandID: requestID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: childID, BackgroundHandBack: true}
 			events := []event.Event{
 				event.DelegateRequestAccepted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID}, Cause: identity.Cause{CommandID: requestID}}},
 				event.InputCancelled{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID}, Cause: identity.Cause{CommandID: requestID}}, Reason: tt.reason},
@@ -1083,7 +1099,7 @@ func TestRestoreIgnoresUnadmittedQueuedCancellation(t *testing.T) {
 func TestRestoreRejectsDelegateIntentRouteMismatch(t *testing.T) {
 	t.Parallel()
 	requestID, target, wrong := mustUUID(), mustUUID(), mustUUID()
-	cmd := command.UserInput{Header: command.Header{CommandID: requestID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: target}
+	cmd := command.UserInput{Header: command.Header{CommandID: requestID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: target, BackgroundHandBack: true}
 	manager := newDelegationManager(Topology{})
 	err := seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), wrong, cmd)}, nil, nil)
 	var mismatch *journal.CommandRouteMismatchError
@@ -1432,7 +1448,7 @@ func TestEnqueueDelegateTurnCancelsCommittedRequestAfterContextRace(t *testing.T
 	}()
 
 	var removed atomic.Bool
-	requestID, tracked, err := s.enqueueDelegateTurn(ctx, loopID, delegateBlocks("go"),
+	requestID, tracked, err := s.enqueueDelegateTurn(ctx, loopID, delegateBlocks("go"), false,
 		func(_, childID uuid.UUID) *requestTracker {
 			return &requestTracker{childID: childID, lifecycle: requestActive}
 		},

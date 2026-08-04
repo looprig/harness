@@ -190,7 +190,7 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 			return err
 		}
 		input, ok := commandRecord.Command().(command.UserInput)
-		if !ok || !input.NoFold || input.Agency != identity.AgencyMachine || input.TargetLoopID.IsZero() || input.CommandID.IsZero() {
+		if !ok || !input.BackgroundHandBack || !input.NoFold || input.Agency != identity.AgencyMachine || input.TargetLoopID.IsZero() || input.CommandID.IsZero() {
 			continue
 		}
 		intents[input.CommandID] = input.TargetLoopID
@@ -1301,7 +1301,7 @@ func (s *Session) sendDelegate(ctx context.Context, childID uuid.UUID, message s
 			}
 		}()
 	}
-	requestID, tracked, err = s.enqueueDelegateTurn(ctx, childID, delegateBlocks(message), registerRequest, removeRequest)
+	requestID, tracked, err = s.enqueueDelegateTurn(ctx, childID, delegateBlocks(message), background, registerRequest, removeRequest)
 	if err != nil {
 		_ = sub.Close()
 		return uuid.UUID{}, nil, nil, err
@@ -1328,7 +1328,7 @@ func (s *Session) subscribeLoop(loopID uuid.UUID) (event.Subscription, error) {
 // running turn (the loop actor's drainInbox skips non-folding entries); it queues behind
 // the running turn and starts its OWN distinct turn when that finishes. The public
 // Session.SubmitToLoop keeps its interactive queue/fold semantics (NoFold=false).
-func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blocks []content.Block, registerRequest func(requestID, childID uuid.UUID) *requestTracker, removeRequest func(uuid.UUID, *requestTracker)) (requestID uuid.UUID, tracked *requestTracker, err error) {
+func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blocks []content.Block, background bool, registerRequest func(requestID, childID uuid.UUID) *requestTracker, removeRequest func(uuid.UUID, *requestTracker)) (requestID uuid.UUID, tracked *requestTracker, err error) {
 	if err := s.faultIfFaulted(); err != nil {
 		return uuid.UUID{}, nil, err
 	}
@@ -1344,7 +1344,14 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 		return uuid.UUID{}, nil, err
 	}
 	accepted := make(chan error, 1)
-	cmd := command.UserInput{Header: command.Header{CommandID: id, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()}, Blocks: blocks, NoFold: true, TargetLoopID: loopID, Accepted: accepted}
+	cmd := command.UserInput{
+		Header:             command.Header{CommandID: id, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()},
+		Blocks:             blocks,
+		NoFold:             true,
+		TargetLoopID:       loopID,
+		BackgroundHandBack: background,
+		Accepted:           accepted,
+	}
 	if err := s.appendDelegateCommand(ctx, loopID, cmd); err != nil {
 		return uuid.UUID{}, nil, err
 	}

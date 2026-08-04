@@ -30,6 +30,10 @@ type UserInput struct {
 	// TargetLoopID durably carries the dispatch target for machine NoFold delegate
 	// requests because storage replay cannot recover CommandRecord's transport-only loop.
 	TargetLoopID uuid.UUID `json:"target_loop_id,omitzero"`
+	// BackgroundHandBack durably marks the narrow managed-delegation request shape that
+	// requires automatic background parent hand-back after the child terminal commits.
+	// Foreground delegate requests and ordinary user input leave it false.
+	BackgroundHandBack bool `json:"background_hand_back,omitzero"`
 	// Accepted is the transient durable-acceptance ack used only by managed delegate
 	// sends. It is never serialized; prepared starts use LoopStarted.InitialRequestID.
 	Accepted chan error `json:"-"`

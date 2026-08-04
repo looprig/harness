@@ -1361,7 +1361,13 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			release()
 			return uuid.UUID{}, err
 		}
-		admission.command = command.UserInput{Header: command.Header{CommandID: admission.requestID, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()}, Blocks: delegateBlocks(admission.message), NoFold: true, TargetLoopID: loopID}
+		admission.command = command.UserInput{
+			Header:             command.Header{CommandID: admission.requestID, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()},
+			Blocks:             delegateBlocks(admission.message),
+			NoFold:             true,
+			TargetLoopID:       loopID,
+			BackgroundHandBack: admission.background,
+		}
 		admission.publisher = newDelegateAdmissionPublisher(s)
 		eventTarget = admission.publisher
 	}
