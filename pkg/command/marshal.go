@@ -167,9 +167,10 @@ func marshalPlain(name CommandName, cmd Command) ([]byte, error) {
 // codec, so it cannot ride as a plain field).
 type userInputWire struct {
 	Header
-	Blocks       json.RawMessage `json:"blocks,omitempty"`
-	NoFold       bool            `json:"no_fold,omitzero"`
-	TargetLoopID uuid.UUID       `json:"target_loop_id,omitzero"`
+	Blocks             json.RawMessage `json:"blocks,omitempty"`
+	NoFold             bool            `json:"no_fold,omitzero"`
+	TargetLoopID       uuid.UUID       `json:"target_loop_id,omitzero"`
+	BackgroundHandBack bool            `json:"background_hand_back,omitzero"`
 }
 
 func marshalUserInput(c UserInput) ([]byte, error) {
@@ -177,7 +178,13 @@ func marshalUserInput(c UserInput) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, err := json.Marshal(userInputWire{Header: c.Header, Blocks: blocks, NoFold: c.NoFold, TargetLoopID: c.TargetLoopID})
+	out, err := json.Marshal(userInputWire{
+		Header:             c.Header,
+		Blocks:             blocks,
+		NoFold:             c.NoFold,
+		TargetLoopID:       c.TargetLoopID,
+		BackgroundHandBack: c.BackgroundHandBack,
+	})
 	if err != nil {
 		return nil, &CommandEncodeError{Type: CommandUserInput, Cause: err}
 	}
@@ -323,7 +330,13 @@ func decodeUserInput(data []byte) (Command, error) {
 	if err != nil {
 		return nil, err
 	}
-	return UserInput{Header: w.Header, Blocks: blocks, NoFold: w.NoFold, TargetLoopID: w.TargetLoopID}, nil
+	return UserInput{
+		Header:             w.Header,
+		Blocks:             blocks,
+		NoFold:             w.NoFold,
+		TargetLoopID:       w.TargetLoopID,
+		BackgroundHandBack: w.BackgroundHandBack,
+	}, nil
 }
 
 func decodeSubagentResult(data []byte) (Command, error) {

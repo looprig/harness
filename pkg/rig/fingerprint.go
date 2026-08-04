@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/looprig/harness/internal/delegationtool"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
@@ -149,15 +150,15 @@ func frozenInitial(definitions []loop.Definition, active string) loop.InitialFin
 // frozenToolNames is the SINGLE source of the restore-time tool-name list shared by
 // frozenFingerprint (its ToolPolicyRev) and frozenManifest (its name-only Tools), so
 // the two can never drift apart. It reads the active loop's produced tool names,
-// appends the literal "Subagent" when the active loop is delegate-capable (that
-// built-in is injected structurally at Bind, without constructing the tool or its
-// collaborators), and returns them sorted. The returned slice is a fresh copy.
+// appends the declared agent-tool bundle names when the active loop is delegate-capable,
+// and returns them sorted. Definition only exposes immutable produced-name metadata here;
+// it does not build runtime tools or collaborators. The returned slice is a fresh copy.
 func frozenToolNames(definitions []loop.Definition, active string) []string {
 	initial := frozenInitial(definitions, active)
 	toolNames := append([]string(nil), initial.ToolNames...)
 	for _, definition := range definitions {
 		if string(definition.Name()) == active && len(definition.Delegates()) > 0 {
-			toolNames = append(toolNames, "Subagent")
+			toolNames = append(toolNames, delegationtool.Definition(loop.DelegationManaged, nil).ProducedToolNames()...)
 			break
 		}
 	}
@@ -548,6 +549,11 @@ func writeLoopTopology(material *strings.Builder, definitions []loop.Definition,
 		material.WriteString("loop:")
 		material.WriteString(string(candidate.Name()))
 		material.WriteByte('\n')
+		if description := candidate.Description(); description != "" {
+			material.WriteString("description:")
+			material.WriteString(description)
+			material.WriteByte('\n')
+		}
 		material.WriteString("policy:")
 		material.WriteString(candidate.PolicyRevision())
 		material.WriteByte('\n')

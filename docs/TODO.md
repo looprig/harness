@@ -95,7 +95,8 @@ approved design is already linked.
 - [ ] **End-user guides and runnable examples** — after the rig lifecycle and workspace
   implementation lands, document how `rig`, `loop`, `session`, `storage`,
   `workspacestore`, and `tools` compose; the complete Rig/Session/Loop model; primers,
-  modes, delegates, and controllers; synchronous and managed Subagent communication;
+  modes, delegates, and controllers; foreground and background agent collaboration
+  through StartAgent, MessageAgent, ListAgents, and StopAgent;
   workspace placement, snapshots, rewind, and file freshness; security boundaries;
   and migration from the legacy harness APIs. Compile and test example programs in CI
   to prevent drift. Extend these guides as MCP/hooks/memory/artifacts/tracing land.

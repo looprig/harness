@@ -19,7 +19,7 @@ import (
 func restoreRuntimeCatalog(t *testing.T) loop.RuntimeCatalog {
 	t.Helper()
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
 		Credential: loop.CredentialGatewayBacked, Default: true, DefaultModel: "luna", SmallModel: "small",
 		Models: []loop.RuntimeModelOption{
 			{Alias: "luna", Target: model.Model{Provider: "provider", Name: "luna-target"}, DefaultEffort: model.EffortLow, Efforts: []model.Effort{model.EffortLow, model.EffortHigh}},
@@ -86,7 +86,7 @@ func TestRestoreRuntimeBindingPreservesNativeHarnessManagedSelection(t *testing.
 	t.Parallel()
 
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionHarnessManaged, Default: true,
 	}})
@@ -142,7 +142,7 @@ func TestRestoreRuntimeBindingRejectsNativeHarnessManagedCredentialMismatch(t *t
 	t.Parallel()
 
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionHarnessManaged, Default: true,
 	}})
@@ -168,7 +168,7 @@ func TestRestoreRuntimeBindingRejectsNativeHarnessManagedPersistedRuntime(t *tes
 	t.Parallel()
 
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionHarnessManaged, Default: true,
 	}})

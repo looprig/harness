@@ -108,7 +108,7 @@ func WithLeaseRelease(release func(context.Context) error) Option {
 	}
 }
 
-// WithLimits sets the in-session subagent-spawn safety caps (depth + quota) NewLoop
+// WithLimits sets the in-session agent-spawn safety caps (depth + quota) NewLoop
 // enforces. A zero (or negative) field in the supplied Limits adopts the package default
 // (Depth 3 / Quota 64) when newSession applies withDefaults, so a caller can never disable
 // a cap with a missing or bad value. Without this option a session uses the defaults. It
@@ -240,7 +240,7 @@ func WithForeignBuilderRegistry(registry *foreign.BuilderRegistry) Option {
 }
 
 // WithRuntimeCatalog installs one immutable parent-scoped catalog snapshot. The
-// same value feeds Subagent schema/preparation and controller revalidation.
+// same value feeds agent schema/preparation and controller revalidation.
 func WithRuntimeCatalog(catalog loop.RuntimeCatalog) Option {
 	return func(s *Session) {
 		s.runtimeCatalog = catalog

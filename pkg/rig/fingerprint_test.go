@@ -89,7 +89,7 @@ func runtimeBoundDefinition(t *testing.T, d loop.Definition) loop.BoundDefinitio
 		t.Fatalf("OverrideBoundRuntime: %v", err)
 	}
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "agent",
+		AgentType:    "agent",
 		AgentHarness: "codex",
 		Profile:      "acp-codex",
 		Credential:   loop.CredentialGatewayBacked,
@@ -152,7 +152,7 @@ func TestFingerprintFromOmitsModelIDForHarnessManagedRuntime(t *testing.T) {
 		t.Fatalf("OverrideBoundRuntimeManaged: %v", err)
 	}
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType:  "agent",
+		AgentType:     "agent",
 		AgentHarness:  "codex",
 		Profile:       "acp/codex-native",
 		Credential:    loop.CredentialNativeAuth,
@@ -635,15 +635,15 @@ func TestFrozenFingerprintNormalizesProducedToolNames(t *testing.T) {
 	}
 }
 
-func TestFrozenFingerprintIncludesStructurallyInjectedSubagent(t *testing.T) {
+func TestFrozenFingerprintIncludesStructurallyInjectedAgentTools(t *testing.T) {
 	t.Parallel()
 
 	primer := mustDefine(loop.WithName("primer"), loop.WithInference(&stubLLM{}, validModel("model")), loop.WithDelegates("delegate"))
 	delegate := mustDefine(loop.WithName("delegate"), loop.WithInference(&stubLLM{}, validModel("delegate-model")))
 	fingerprint := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{primer, delegate}, []string{"primer"}, "primer")
 
-	if want := hexSHA256("Subagent"); fingerprint.ToolPolicyRev != want {
-		t.Fatalf("ToolPolicyRev = %q, want injected Subagent digest %q", fingerprint.ToolPolicyRev, want)
+	if want := hexSHA256("ListAgents\nMessageAgent\nStartAgent\nStopAgent"); fingerprint.ToolPolicyRev != want {
+		t.Fatalf("ToolPolicyRev = %q, want injected agent-tools digest %q", fingerprint.ToolPolicyRev, want)
 	}
 }
 
@@ -663,6 +663,38 @@ func TestTopologyRevisionIncludesDelegateProducedToolMetadata(t *testing.T) {
 	b := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{primer, workerB}, []string{"primer"}, "primer")
 	if a.TopologyRev == b.TopologyRev {
 		t.Fatal("TopologyRev ignored delegate definition produced-name drift")
+	}
+}
+
+func TestTopologyRevisionIncludesDelegateDescription(t *testing.T) {
+	t.Parallel()
+
+	define := func(description string) []loop.Definition {
+		primer := mustDefine(
+			loop.WithName("primer"),
+			loop.WithInference(&stubLLM{}, validModel("primer")),
+			loop.WithDelegates("worker"),
+		)
+		worker := mustDefine(
+			loop.WithName("worker"),
+			loop.WithDescription(description),
+			loop.WithInference(&stubLLM{}, validModel("worker")),
+		)
+		return []loop.Definition{primer, worker}
+	}
+
+	baseDefinitions := define("Builds implementation changes.")
+	changedDefinitions := define("Reviews implementation changes.")
+	baseFrozen := frozenFingerprint(ConfigFingerprintFields{}, baseDefinitions, []string{"primer"}, "primer")
+	changedFrozen := frozenFingerprint(ConfigFingerprintFields{}, changedDefinitions, []string{"primer"}, "primer")
+	if baseFrozen.TopologyRev == changedFrozen.TopologyRev {
+		t.Fatal("TopologyRev ignored delegate description drift")
+	}
+
+	baseLive := fingerprintWithTopology(bindFingerprintDefinition(baseDefinitions[0]), ConfigFingerprintFields{}, baseDefinitions, []string{"primer"}, "primer")
+	changedLive := fingerprintWithTopology(bindFingerprintDefinition(changedDefinitions[0]), ConfigFingerprintFields{}, changedDefinitions, []string{"primer"}, "primer")
+	if baseLive.TopologyRev != baseFrozen.TopologyRev || changedLive.TopologyRev != changedFrozen.TopologyRev {
+		t.Fatalf("frozen/live topology mismatch: base frozen=%q live=%q changed frozen=%q live=%q", baseFrozen.TopologyRev, baseLive.TopologyRev, changedFrozen.TopologyRev, changedLive.TopologyRev)
 	}
 }
 
@@ -804,7 +836,7 @@ func TestExternalCapabilityRevReachesBothFingerprintPaths(t *testing.T) {
 // ConfigFingerprint frozenFingerprint produces from the SAME immutable inputs. The
 // load-bearing assertion is manifest.ToolNamesRev() == legacy.ToolPolicyRev — it
 // proves the manifest's names-only tool digest reproduces rig's toolPolicyRev
-// byte-for-byte, INCLUDING the structurally injected "Subagent" entry for a
+// byte-for-byte, INCLUDING the structurally injected agent-tool entries for a
 // delegate-capable active loop. A drift here would make every restore compare a
 // manifest that was never stamped.
 func TestManifestMatchesFingerprint(t *testing.T) {
@@ -828,8 +860,8 @@ func TestManifestMatchesFingerprint(t *testing.T) {
 	}
 
 	// A non-delegate active loop with a produced tool set, plus a delegate-capable
-	// active loop that receives the structural "Subagent" — so the Subagent parity
-	// is actually exercised (mirrors TestFrozenFingerprintIncludesStructurallyInjectedSubagent).
+	// active loop that receives the structural agent-tool bundle — so the parity is
+	// actually exercised (mirrors TestFrozenFingerprintIncludesStructurallyInjectedAgentTools).
 	filesBundle := tool.NewBundleDefinition("Files", []string{"ReadFile", "WriteFile"}, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 		return []tool.InvokableTool{fpTool{name: "ReadFile"}, fpTool{name: "WriteFile"}}, nil
 	})
@@ -845,7 +877,7 @@ func TestManifestMatchesFingerprint(t *testing.T) {
 		active      string
 	}{
 		{name: "non-delegate active loop", definitions: []loop.Definition{plainAgent}, primers: []string{"agent"}, active: "agent"},
-		{name: "delegate-capable active loop injects Subagent", definitions: []loop.Definition{primer, delegate}, primers: []string{"primer"}, active: "primer"},
+		{name: "delegate-capable active loop injects agent tools", definitions: []loop.Definition{primer, delegate}, primers: []string{"primer"}, active: "primer"},
 	}
 
 	for _, tt := range tests {

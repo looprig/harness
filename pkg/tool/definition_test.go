@@ -56,12 +56,52 @@ func TestDefinitionInterfaceIsSealed(t *testing.T) {
 	t.Fatal("Definition interface has no unexported sealing method; external packages can implement it")
 }
 
-func TestDelegateStatusDoneAliasesCompleted(t *testing.T) {
+func TestDelegateControllerUsesAgentLanguageWithoutWaitCollection(t *testing.T) {
 	t.Parallel()
 
-	if tool.DelegateStatusDone != tool.DelegateStatusCompleted {
-		t.Fatalf("DelegateStatusDone = %d, want alias value %d", tool.DelegateStatusDone, tool.DelegateStatusCompleted)
+	wantRequestFields := []string{
+		"Operation", "AgentID", "AgentType", "Name", "AgentMode", "Message",
+		"WaitForResponse", "TimeoutSeconds", "ParentToolUseID", "Runtime",
 	}
+	requestType := reflect.TypeOf(tool.DelegateRequest{})
+	if got := exportedFieldNames(requestType); !reflect.DeepEqual(got, wantRequestFields) {
+		t.Fatalf("DelegateRequest fields = %v, want %v", got, wantRequestFields)
+	}
+
+	wantResultFields := []string{
+		"AgentID", "Name", "State", "Response", "ResponseStatus",
+		"CorrelationID", "PreviousState", "Agents", "Truncated",
+	}
+	resultType := reflect.TypeOf(tool.DelegateResult{})
+	if got := exportedFieldNames(resultType); !reflect.DeepEqual(got, wantResultFields) {
+		t.Fatalf("DelegateResult fields = %v, want %v", got, wantResultFields)
+	}
+
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller() did not return the test source path")
+	}
+	parsed, err := parser.ParseFile(token.NewFileSet(), filepath.Join(filepath.Dir(filename), "definition.go"), nil, 0)
+	if err != nil {
+		t.Fatalf("parse definition.go: %v", err)
+	}
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		if ident, ok := node.(*ast.Ident); ok && ident.Name == "DelegateWait" {
+			t.Errorf("definition.go still declares model-facing DelegateWait")
+		}
+		return true
+	})
+}
+
+func exportedFieldNames(typ reflect.Type) []string {
+	fields := make([]string, 0, typ.NumField())
+	for index := 0; index < typ.NumField(); index++ {
+		field := typ.Field(index)
+		if field.IsExported() {
+			fields = append(fields, field.Name)
+		}
+	}
+	return fields
 }
 
 func TestReadWorkspaceBindingIsStructurallyReadOnly(t *testing.T) {

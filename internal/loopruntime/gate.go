@@ -207,7 +207,7 @@ func withCallID(ctx context.Context, callID uuid.UUID) context.Context {
 
 // withToolUseID returns a child ctx carrying the active tool call's provider
 // tool-use id (content.ToolUseBlock.ID), the durable handle a spawned subagent
-// loop links back to the parent Subagent tool call.
+// loop links back to the parent agent tool call.
 func withToolUseID(ctx context.Context, id string) context.Context {
 	return WithToolUseID(ctx, id)
 }

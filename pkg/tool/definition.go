@@ -95,12 +95,35 @@ type DelegateOperation uint8
 const (
 	DelegateStart DelegateOperation = iota + 1
 	DelegateSend
-	DelegateWait
 	DelegateInterrupt
 	DelegateStatus
 )
 
-// DelegateStatusValue is the lifecycle state returned by a delegate controller.
+// AgentState is the bounded mechanical lifecycle state of a persistent child agent.
+type AgentState string
+
+const (
+	AgentStateStarting    AgentState = "starting"
+	AgentStateWorking     AgentState = "working"
+	AgentStateIdle        AgentState = "idle"
+	AgentStateUnavailable AgentState = "unavailable"
+)
+
+// DelegateResponseStatus is the terminal status of one agent response. It is
+// intentionally separate from the persistent agent's lifecycle state.
+type DelegateResponseStatus uint8
+
+const (
+	DelegateResponseUnknown DelegateResponseStatus = iota
+	DelegateResponseCompleted
+	DelegateResponseInterrupted
+	DelegateResponseFailed
+	DelegateResponseTimedOut
+)
+
+// DelegateStatusValue is the pre-agent mechanical/terminal vocabulary retained
+// temporarily inside session orchestration. It is not part of DelegateResult and
+// cannot reach model-facing agent JSON. Phase 3 removes its wait collector.
 type DelegateStatusValue uint8
 
 const (
@@ -111,40 +134,29 @@ const (
 	DelegateStatusFailed
 	DelegateStatusTimedOut
 	DelegateStatusQueued
-	// DelegateStatusIdle is the mechanical "warm but not running a turn" state a
-	// status operation reports for an owned child with no in-flight turn.
 	DelegateStatusIdle
-	// DelegateStatusDone is a compatibility alias for the canonical completed
-	// state. It deliberately has no distinct wire or persisted value.
-	DelegateStatusDone = DelegateStatusCompleted
 )
 
 // DelegateRequest is the typed command passed to a parent-scoped delegate
 // controller. Fields not used by the selected Operation remain zero-valued.
 //
-// Mode is the requested initial mode for a DelegateStart; the empty string means
-// "use the target definition's initial mode". Agent and Mode carry the untrusted
+// AgentMode is the requested initial mode for a DelegateStart; the empty string means
+// "use the target definition's initial mode". AgentType and AgentMode carry the untrusted
 // model selection as plain strings (this package does not import the loop/identity
 // domain types); the controller resolves and validates them.
 //
-// RequestID is meaningful only for DelegateWait, where it names one previously
-// returned request: nil means "not supplied" (rejected for a wait), a non-nil
-// pointer to the zero UUID means "supplied but invalid" (also rejected). For
-// DelegateStart/DelegateSend the controller MINTS the request id and returns it in
-// the DelegateResult.
-//
-// TimeoutSeconds bounds a waiting operation. nil means an interruptible, unbounded
-// wait (only the parent turn's own cancellation can end it); a non-nil value is a
+// TimeoutSeconds bounds one response. nil means an interruptible, unbounded
+// response (only the parent turn's own cancellation can end it); a non-nil value is a
 // non-negative second count after which the controller returns a typed timed-out
 // result. A negative value is invalid and rejected by the envelope boundary.
 type DelegateRequest struct {
 	Operation       DelegateOperation
-	DelegateID      uuid.UUID
-	Agent           string
-	Mode            string
+	AgentID         uuid.UUID
+	AgentType       string
+	Name            string
+	AgentMode       string
 	Message         string
-	Wait            bool
-	RequestID       *uuid.UUID
+	WaitForResponse bool
 	TimeoutSeconds  *int
 	ParentToolUseID string
 	// Runtime is the prepared, catalog-resolved agent-harness/model/effort tuple
@@ -155,30 +167,31 @@ type DelegateRequest struct {
 	Runtime *DelegateRuntime
 }
 
-// DelegateChildStatus is the bounded mechanical status of one owned child returned
-// by a DelegateStatus that omitted DelegateID (report every owned child). It never
-// carries a raw event cursor or child transcript.
-type DelegateChildStatus struct {
-	DelegateID      uuid.UUID
-	Status          DelegateStatusValue
-	PendingRequests int
+// DelegateAgent is the bounded immutable identity and live mechanical state of
+// one directly owned child agent.
+type DelegateAgent struct {
+	AgentID        uuid.UUID
+	Name           string
+	AgentType      string
+	State          AgentState
+	QueuedMessages int
+	Runtime        DelegateRuntime
+	AgentMode      string
 }
 
 // DelegateResult is the typed result of a delegate-controller operation.
-//
-// RequestID is the minted (DelegateStart/DelegateSend) or echoed (DelegateWait)
-// request id that correlates a follow-up wait to its turn. PendingRequests and
-// Children carry bounded mechanical status only: PendingRequests is the count of
-// unresolved requests for a single addressed child, and Children is the per-child
-// status list for a DelegateStatus that omitted DelegateID.
 type DelegateResult struct {
-	DelegateID        uuid.UUID
-	RequestID         uuid.UUID
-	Status            DelegateStatusValue
-	Output            string
-	PendingRequests   int
-	Children          []DelegateChildStatus
-	ChildrenTruncated bool
+	AgentID        uuid.UUID
+	Name           string
+	State          AgentState
+	Response       string
+	ResponseStatus DelegateResponseStatus
+	// CorrelationID is an internal command/response identity used by session
+	// orchestration. Agent tools never encode or accept it.
+	CorrelationID uuid.UUID
+	PreviousState AgentState
+	Agents        []DelegateAgent
+	Truncated     bool
 }
 
 // DelegateController is the only delegation capability exposed to a built tool.
@@ -221,9 +234,10 @@ type Bindings struct {
 	Delegate      DelegateController
 	// ExtraTools are additional tool definitions the LOOP appends to every mode's
 	// toolset at Bind, beyond the definition's own WithTools. The composition root uses
-	// it to inject a derived, definition-scoped tool (the delegation Subagent tool) into
-	// a loop WITHOUT mutating the immutable loop definition. Per-tool factories never see
-	// it (attenuateBindings drops it); only loop.Bind consumes it.
+	// it to inject the derived, definition-scoped atomic agent-tool bundle (StartAgent,
+	// MessageAgent, ListAgents, and StopAgent) into a loop WITHOUT mutating the immutable
+	// loop definition. Per-tool factories never see it (attenuateBindings drops it); only
+	// loop.Bind consumes it.
 	ExtraTools []Definition
 }
 

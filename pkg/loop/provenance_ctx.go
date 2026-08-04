@@ -8,7 +8,7 @@ import "context"
 type provenanceKey struct{}
 
 // WithProvenance returns a child ctx carrying the current loop/turn/step
-// coordinates, so a tool (e.g. the Subagent tool) can learn its OWN provenance and
+// coordinates, so a tool (e.g. an agent collaboration tool) can learn its OWN provenance and
 // pass it as the `parent` when spawning a sub-loop. The loop injects it at the
 // tool-batch boundary, where all three ids are unambiguously the running step's.
 func WithProvenance(ctx context.Context, p Provenance) context.Context {

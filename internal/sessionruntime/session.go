@@ -62,10 +62,11 @@ type Session struct {
 
 	// loops are the loop handles in this session, keyed by loop id. Each entry
 	// pairs the loop handle with the provenance of whatever spawned it (zero for
-	// a root loop). Today this map holds one entry; multi-agent
-	// orchestration adds subagent loops with a non-zero parent.
-	loops        map[uuid.UUID]*loopHandle
-	constructing bool
+	// a root loop). Today this map holds one entry; agent orchestration adds
+	// child loops with a non-zero parent.
+	loops          map[uuid.UUID]*loopHandle
+	directChildren map[uuid.UUID]map[uuid.UUID]struct{}
+	constructing   bool
 
 	// activeLoopID is the mutable default target for Submit.
 	activeLoopID uuid.UUID
@@ -184,7 +185,7 @@ type Session struct {
 	// §22.4's "stale live cancellation handles do not survive restore".
 	review reviewLifecycle
 
-	// limits are the in-session subagent-spawn safety caps NewLoop enforces (depth +
+	// limits are the in-session agent-spawn safety caps NewLoop enforces (depth +
 	// quota). Defaulted in newSession (withDefaults) so the live values are always
 	// positive caps, and overridable via WithLimits. Read under loopsMu inside NewLoop's
 	// authoritative critical section (the same lock that gates closing/faulted), so the
@@ -387,7 +388,7 @@ type Session struct {
 	topology Topology
 
 	// delegation is the parent-to-child delegation mediator: it vends the parent-scoped
-	// tool.DelegateController injected into each loop's Subagent tool, and owns the
+	// tool.DelegateController injected into each loop's agent collaboration bundle, and owns the
 	// in-flight delegate-request map. It is created before the loops (so restore can bind
 	// loop tools against it) and attached to this session once the session exists. Never
 	// nil for a constructed session.
@@ -395,7 +396,7 @@ type Session struct {
 
 	// interruptPending REFCOUNTS the loop ids currently under an interrupt admission barrier:
 	// a marked loop's current turn was interrupted and its NEW machine-delegate admission
-	// (Subagent start/send) is refused while the count is positive. The count (not a set) lets
+	// (agent start/send) is refused while the count is positive. The count (not a set) lets
 	// overlapping interrupt scopes each hold a shared loop independently — the mark clears only
 	// when the last holding barrier releases. It is guarded by loopsMu — the SAME lock that gates
 	// the registry, closing, and faulted — so the mark-before-fanout select-and-mark is atomic
@@ -607,6 +608,12 @@ type loopHandle struct {
 	liveModel model.Model
 	stateMu   sync.RWMutex
 	state     tool.DelegateStatusValue
+	agentName string
+	agentMode loop.ModeName
+	// selectedHarness is the immutable public harness selected for this loop's
+	// durable runtime identity. Harness-managed RuntimeIdentity intentionally omits
+	// it, so ListAgents cannot reconstruct it from a shared profile.
+	selectedHarness loop.AgentHarnessName
 }
 
 func runtimeForModel(model model.Model) event.ModelRuntime {
@@ -769,6 +776,41 @@ func (s *Session) recoverWorkspaceCheckpointFault() {
 // retries on the next eligible boundary; the failure must still remain observable.
 func (s *Session) observeBestEffortCheckpointError(err error) {
 	slog.ErrorContext(s.sessionCtx, "session: best-effort workspace checkpoint failed", "error", err)
+}
+
+// seedDirectChildren builds the ownership index once loops have been restored.
+func (s *Session) seedDirectChildren() {
+	s.loopsMu.Lock()
+	defer s.loopsMu.Unlock()
+	if s.directChildren == nil {
+		s.directChildren = make(map[uuid.UUID]map[uuid.UUID]struct{})
+	}
+	for id, handle := range s.loops {
+		if handle == nil || handle.parent.LoopID.IsZero() {
+			continue
+		}
+		s.addDirectChildUnderLock(handle.parent.LoopID, id)
+	}
+}
+
+func (s *Session) addDirectChildUnderLock(parentID, childID uuid.UUID) {
+	if s.directChildren == nil {
+		s.directChildren = make(map[uuid.UUID]map[uuid.UUID]struct{})
+	}
+	children := s.directChildren[parentID]
+	if children == nil {
+		children = make(map[uuid.UUID]struct{})
+		s.directChildren[parentID] = children
+	}
+	children[childID] = struct{}{}
+}
+
+func (s *Session) removeDirectChildUnderLock(parentID, childID uuid.UUID) {
+	children := s.directChildren[parentID]
+	delete(children, childID)
+	if len(children) == 0 {
+		delete(s.directChildren, parentID)
+	}
 }
 
 // FaultErr is the loop actor's post-emit durable-fault probe (loopruntime type-asserts the
@@ -954,6 +996,9 @@ func (s *Session) recordLoopMechanicalState(ev event.Event) {
 	if loopID.IsZero() {
 		return
 	}
+	if started, ok := ev.(event.TurnStarted); ok {
+		s.delegation.markRequestActive(started.Cause.CommandID, loopID)
+	}
 	var status tool.DelegateStatusValue
 	switch ev.(type) {
 	case event.TurnStarted:
@@ -1086,22 +1131,22 @@ func (s *Session) WaitIdle(ctx context.Context) error {
 	return s.hub.WaitIdle(ctx)
 }
 
-// expectTurn takes a hand-back wake token for a subagent loop at spawn so its
+// expectTurn takes a hand-back wake token for an agent loop at spawn so its
 // in-flight result cannot empty the quiescence set and fire a false idle. It is
 // session-internal — loops never call it (they hold only the narrow eventPublisher);
-// only the session's subagent orchestration does.
+// only the session's agent orchestration does.
 //
-// TODO(Open Items A): async subagent spawn must call expectTurn(subagentLoopID)
+// TODO(Open Items A): async agent spawn must call expectTurn(agentLoopID)
 // before the child can complete its first turn, so the {wake} token guards the
 // quiescence set across the hand-back. That async-spawn orchestration is deferred;
 // when it lands, NewLoop's async-spawn path is where this call wires in. Today no loop
-// spawns an async subagent, so this method has no production caller yet — it is
+// spawns an async agent, so this method has no production caller yet — it is
 // exercised by the round-trip and the session+hub quiescence tests.
-func (s *Session) expectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
-	s.hub.ExpectTurn(ctx, subagentLoopID)
+func (s *Session) expectTurn(ctx context.Context, agentLoopID uuid.UUID) {
+	s.hub.ExpectTurn(ctx, agentLoopID)
 }
 
-// cancelExpectTurn releases a subagent's wake token off the publish path. It is
+// cancelExpectTurn releases an agent's wake token off the publish path. It is
 // session-internal (loops never call it) and is NO LONGER on the SubagentResult
 // hand-back path: a SubagentResult is never rejected, so its {wake} token always
 // releases on the publish path via the resulting TurnStarted/TurnFoldedInto/
@@ -1109,12 +1154,12 @@ func (s *Session) expectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 // async-spawn DISCARD path (a child spawned but abandoned before it ever hands back,
 // so no event ever carries its Cause.LoopID). Today it has no production caller;
 // it is exercised by the session+hub quiescence tests.
-func (s *Session) cancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
-	s.hub.CancelExpectTurn(ctx, subagentLoopID)
+func (s *Session) cancelExpectTurn(ctx context.Context, agentLoopID uuid.UUID) {
+	s.hub.CancelExpectTurn(ctx, agentLoopID)
 }
 
 // deliverSubagentResult is the session-owned SubagentResult hand-back: it routes a
-// finished subagent's output (blocks) to its parent loop as a command.SubagentResult
+// finished child agent's output (blocks) to its parent loop as a command.SubagentResult
 // and returns only a transport error (the loop is gone, or ctx is done). It is
 // FIRE-AND-FORGET: a SubagentResult is NEVER rejected, so there is no outcome to wait
 // for off the publish path. The parent loop always starts (idle) or queues
@@ -1128,7 +1173,7 @@ func (s *Session) cancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUID
 //
 // parentLoopID selects the parent loop's command channel — it rides as the command's
 // embedded Coordinates.LoopID (the delivery target). fromLoopID is the producing
-// subagent (the CHILD); it rides as Header.Cause.LoopID and is stamped onto the events
+// child agent; it rides as Header.Cause.LoopID and is stamped onto the events
 // the hand-back causes. The submit carries no per-turn stream — the parent's events flow
 // to the session fan-in. ctx governs the send only (the loop derives the turn ctx from
 // its own loopCtx).
@@ -1163,6 +1208,29 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 	}
 }
 
+// replaySubagentResult re-admits an already durable hand-back command without
+// appending a second intent record. Restore uses this when the prior parent actor
+// accepted the command but no durable turn/fold event proves that it processed the
+// completion. The restored actor has no ephemeral inbox to rebuild, so the original
+// command crosses the actor boundary again with its original id.
+func (s *Session) replaySubagentResult(ctx context.Context, cmd command.SubagentResult) error {
+	l, ok := s.loopFor(cmd.Coordinates.LoopID)
+	if !ok {
+		return &SessionError{Kind: SessionLoopNotFound}
+	}
+	if l == nil {
+		return &SessionError{Kind: SessionLoopExited}
+	}
+	select {
+	case commandSinkFor(l, cmd) <- cmd:
+		return nil
+	case <-l.DoneChan():
+		return &SessionError{Kind: SessionLoopExited}
+	case <-ctx.Done():
+		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	}
+}
+
 // NewLoop creates another loop inside this session. The new loop shares
 // SessionID but receives its own loop id and loop goroutine. parent is the
 // provenance of the spawning turn/step (zero for a root loop); the session
@@ -1170,18 +1238,18 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 // loop handle and returns only the loop id, because callers route through
 // session methods rather than writing to a loop command channel directly.
 func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Definition) (uuid.UUID, error) {
-	// A plain NewLoop is never spawned by a Subagent tool call, so it carries no
-	// parent tool-use id; the private newLoop does the real work. RunSubagent is the
+	// A plain NewLoop is never spawned by an agent collaboration tool call, so it carries no
+	// parent tool-use id; the private newLoop does the real work. RunAgent is the
 	// only path that threads a non-empty id (its child's LoopStarted correlates back
 	// to the spawning tool call).
 	return s.newLoop(parent, cfg, "", "", nil)
 }
 
-// newLoop is the private loop-creation core behind NewLoop and RunSubagent. It is
+// newLoop is the private loop-creation core behind NewLoop and RunAgent. It is
 // identical to the public NewLoop except that parentToolUseID is stamped onto the new
 // loop's LoopStarted (event.LoopStarted.ParentToolUseID): the durable carrier that
-// correlates a tool-spawned child loop back to its parent Subagent tool call. NewLoop
-// passes ""; RunSubagent passes the provider tool-use id of the spawning call. The id
+// correlates a tool-spawned child loop back to its parent agent tool call. NewLoop
+// passes ""; RunAgent passes the provider tool-use id of the spawning call. The id
 // rides as a plain parameter into the LoopStarted build only — it touches no identity /
 // Provenance / Header struct, so it never perturbs the loop tree or the quota/depth math.
 func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, selectedMode loop.ModeName, prepared *preparedLoop) (uuid.UUID, error) {
@@ -1191,7 +1259,7 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToo
 func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, selectedMode loop.ModeName, prepared *preparedLoop, admission *delegateAdmission, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog bool) (uuid.UUID, error) {
 	// Whether this spawn counts toward the cumulative spawn quota. The initial root loop is
 	// built by newSession via NewLoop with zero provenance and must not consume a quota slot;
-	// every subagent spawn
+	// every agent spawn
 	// carries a non-zero parent.LoopID. This is the SAME root/non-root discriminator the
 	// durable recount uses on restore (a non-root LoopStarted has a non-zero Header.Cause),
 	// so the live counter and the restored counter count exactly the same set.
@@ -1293,24 +1361,36 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			}
 		}
 	}
-	// A spawned subagent keeps its OWN definition's access gate — never the
+	// A spawned child agent keeps its OWN definition's access gate — never the
 	// parent's. Authority differences between loops are expressed by the
 	// consumer configuring different gates per definition (or OverrideBoundAccess
 	// at a binding seam); harness performs no cross-loop attenuation.
 	var eventTarget loopEventPublisher = s
+	admissionSubscriptionOwned := false
 	if admission != nil {
 		admission.sub, err = s.subscribeLoop(loopID)
 		if err != nil {
 			release()
 			return uuid.UUID{}, err
 		}
+		admissionSubscriptionOwned = true
+		defer func() {
+			if admissionSubscriptionOwned {
+				_ = admission.sub.Close()
+			}
+		}()
 		admission.requestID, err = s.newCommandID()
 		if err != nil {
-			_ = admission.sub.Close()
 			release()
 			return uuid.UUID{}, err
 		}
-		admission.command = command.UserInput{Header: command.Header{CommandID: admission.requestID, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()}, Blocks: delegateBlocks(admission.message), NoFold: true, TargetLoopID: loopID}
+		admission.command = command.UserInput{
+			Header:             command.Header{CommandID: admission.requestID, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()},
+			Blocks:             delegateBlocks(admission.message),
+			NoFold:             true,
+			TargetLoopID:       loopID,
+			BackgroundHandBack: admission.background,
+		}
 		admission.publisher = newDelegateAdmissionPublisher(s)
 		eventTarget = admission.publisher
 	}
@@ -1424,9 +1504,6 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	if err != nil {
 		release()
 		cancel()
-		if admission != nil {
-			_ = admission.sub.Close()
-		}
 		return uuid.UUID{}, err
 	}
 	if foreignSID != "" && runtime != nil && runtime.Profile != "" {
@@ -1436,9 +1513,6 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		if err != nil {
 			release()
 			cancel()
-			if admission != nil {
-				_ = admission.sub.Close()
-			}
 			return uuid.UUID{}, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 		}
 	}
@@ -1446,13 +1520,11 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		if err := s.appendDelegateCommand(admission.ctx, loopID, admission.command); err != nil {
 			release()
 			cancel()
-			_ = admission.sub.Close()
 			return uuid.UUID{}, err
 		}
 		if err := s.enqueuePreparedDelegate(admission.ctx, b, admission.command); err != nil {
 			release()
 			cancel()
-			_ = admission.sub.Close()
 			return uuid.UUID{}, err
 		}
 	}
@@ -1493,12 +1565,24 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		liveModel = selected.Model
 	}
 	initialState := tool.DelegateStatusIdle
+	displayName := bound.DisplayName()
 	if admission != nil {
 		// The initial command has already been accepted behind the publication barrier;
 		// the child is mechanically running even before TurnStarted is released.
 		initialState = tool.DelegateStatusRunning
+		displayName = admission.name
+		if displayName == "" {
+			displayName = string(bound.Name()) + "-" + loopID.String()
+		}
 	}
-	s.loops[loopID] = &loopHandle{id: loopID, owner: s, bound: bound, bindings: bindings, backend: b, parent: parent, cancel: cancel, liveMode: startedMode, liveModel: liveModel, state: initialState}
+	var selectedHarness loop.AgentHarnessName
+	if runtime != nil {
+		selectedHarness = runtime.AgentHarness
+	}
+	s.loops[loopID] = &loopHandle{id: loopID, owner: s, bound: bound, bindings: bindings, backend: b, parent: parent, cancel: cancel, liveMode: startedMode, liveModel: liveModel, state: initialState, agentName: displayName, agentMode: startedMode, selectedHarness: selectedHarness}
+	if !parent.LoopID.IsZero() {
+		s.addDirectChildUnderLock(parent.LoopID, loopID)
+	}
 	s.loopsMu.Unlock()
 
 	// Announce the new loop to subscribers active at creation time. Published AFTER
@@ -1536,7 +1620,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	if runtime != nil && runtime.SelectionKind == loop.RuntimeSelectionHarnessManaged {
 		startedRuntime = event.ModelRuntime{}
 	}
-	ev := event.LoopStarted{Header: startedHeader, Runtime: startedRuntime, AgentRuntime: agentRuntime, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: bound.DisplayName(), Description: bound.Description()}
+	ev := event.LoopStarted{Header: startedHeader, Runtime: startedRuntime, AgentRuntime: agentRuntime, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: displayName, Description: bound.Description()}
 	if admission != nil {
 		ev.InitialRequestID = admission.requestID
 	}
@@ -1549,13 +1633,11 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		s.loopsMu.Lock()
 		if !s.constructing {
 			delete(s.loops, loopID)
+			s.removeDirectChildUnderLock(parent.LoopID, loopID)
 		}
 		s.loopsMu.Unlock()
 		release()
 		cancel()
-		if admission != nil {
-			_ = admission.sub.Close()
-		}
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: err}
 	}
 	if foreignSID != "" && runtime != nil && runtime.Profile != "" {
@@ -1563,18 +1645,24 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			s.loopsMu.Lock()
 			if !s.constructing {
 				delete(s.loops, loopID)
+				s.removeDirectChildUnderLock(parent.LoopID, loopID)
 			}
 			s.loopsMu.Unlock()
 			release()
 			cancel()
-			if admission != nil {
-				_ = admission.sub.Close()
-			}
 			return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: err}
 		}
 	}
 	if admission != nil {
+		if admission.background {
+			// The publisher barrier still prevents the child from emitting TurnStarted,
+			// so acquiring the wake token here is early enough to cover even an
+			// immediately-terminal first turn.
+			s.expectTurn(admission.ctx, loopID)
+		}
+		admission.tracked = admission.registerRequest(admission.requestID, loopID)
 		admission.publisher.release()
+		admissionSubscriptionOwned = false
 	}
 	return loopID, nil
 }
@@ -1716,6 +1804,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		sessionCancel:            sessionCancel,
 		constructionAbortTimeout: defaultConstructionAbortTimeout,
 		loops:                    make(map[uuid.UUID]*loopHandle),
+		directChildren:           make(map[uuid.UUID]map[uuid.UUID]struct{}),
 		constructing:             true,
 		newID:                    newID,
 		now:                      now,
@@ -1754,7 +1843,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// configured value never silently disables the depth/quota backstop.
 	s.limits = s.limits.withDefaults()
 	// Store the immutable topology and stand up the delegation manager BEFORE any loop is
-	// bound, so each loop's Subagent tool is built against a parent-scoped controller. The
+	// bound, so each loop's agent collaboration tools are built against a parent-scoped controller. The
 	// manager is attached to this session so its scoped controllers can spawn + address
 	// children through it.
 	s.topology = cloneTopology(topology)
@@ -1884,7 +1973,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 
 // interruptLoop sends a best-effort Interrupt to the loop to cancel its active
 // turn, escaping on the loop's Done so a stopped loop never wedges the send. It is
-// the loop-targeted cancel primitive interruptLoopID delegates to (the subagent
+// the loop-targeted cancel primitive interruptLoopID delegates to (the agent
 // drain's ctx-cancel fail-safe). The ack is buffered(1) and unread here: the
 // caller observes the cancellation through the resulting TurnInterrupted terminal,
 // not this command's reply. An id-gen failure is swallowed (best-effort): the worst
@@ -1915,7 +2004,7 @@ func (s *Session) interruptLoop(loopID uuid.UUID, l loop.Backend) {
 // interruptLoopID interrupts a SPECIFIC loop's active turn by id (machine-originated,
 // fire-and-forget). It resolves loopID then delegates to interruptLoop. Returns
 // SessionLoopNotFound if no such loop is registered. It is the per-loop lever the
-// subagent drain uses as a fail-safe (drainToFinalText, later task), and the
+// agent drain uses as a fail-safe (drainToFinalText, later task), and the
 // loop-targeted counterpart to the distributed Session.Interrupt.
 //
 // There is deliberately no ctx parameter: interruptLoop is best-effort and already
@@ -1990,7 +2079,7 @@ func (s *Session) cancelDelegateRequest(loopID, requestID uuid.UUID) (command.De
 
 // Submit is the HUMAN-ONLY submit entry point: it stamps Agency=AgencyUser (a
 // person authored this input). Programmatic/machine callers go through
-// submitToLoop with Agency=AgencyMachine (the subagent path).
+// submitToLoop with Agency=AgencyMachine (the agent path).
 //
 // Submit sends input as a queueable UserInput to the active loop,
 // FIRE-AND-FORGET: it returns the InputID (the submit command's id, == the
@@ -2011,7 +2100,7 @@ func (s *Session) cancelDelegateRequest(loopID, requestID uuid.UUID) (command.De
 func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID, error) {
 	// Submit is the active-loop, human-authored (AgencyUser) case of submitToLoop:
 	// the interactive submit targets the active loop and stamps user agency. The
-	// loop-targeted core (a sub-loop, machine agency) is the subagent path.
+	// loop-targeted core (a sub-loop, machine agency) is the agent path.
 	s.loopsMu.RLock()
 	active := s.activeLoopID
 	s.loopsMu.RUnlock()
@@ -2021,8 +2110,8 @@ func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID,
 // SubmitToLoop is the loop-targeted counterpart of Submit: it sends human-authored
 // (AgencyUser) input to a SPECIFIC loop's CommandSink rather than the active selection. It is the
 // modern viewport's "submit to the FOCUSED loop" primitive — a submit while focused on a
-// subagent runs a NEW turn on THAT loop (accepted: a submit to an idle-but-tracked
-// subagent starts a fresh turn on it), while a submit to the active loop id behaves
+// agent runs a NEW turn on THAT loop (accepted: a submit to an idle-but-tracked
+// agent starts a fresh turn on it), while a submit to the active loop id behaves
 // exactly like Submit.
 //
 // Like Submit it stamps command.UserInput with Agency=AgencyUser and is FIRE-AND-FORGET:
@@ -2093,7 +2182,7 @@ func (s *Session) CompactToLoop(ctx context.Context, loopID uuid.UUID) (uuid.UUI
 // submitToLoop submits a UserInput to a SPECIFIC loop with the given Agency,
 // returning the minted CommandID (correlate Reply events via Cause.CommandID).
 // It is the loop-targeted core of Submit: public Submit is the active-loop,
-// AgencyUser case; the subagent path targets a sub-loop with AgencyMachine.
+// AgencyUser case; the agent path targets a sub-loop with AgencyMachine.
 //
 // Like Submit it is FIRE-AND-FORGET: the outcome —
 // InputQueued / TurnStarted / TurnFoldedInto / TurnRejected / InputCancelled — is
@@ -2121,7 +2210,7 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 	}
 	// Queueable submit: Cause.CommandID is zero (root); the outcome is observed on the
 	// session fan-in. Agency is caller-chosen — AgencyUser for the interactive human
-	// Submit, AgencyMachine for the subagent task submit — so a machine path never
+	// Submit, AgencyMachine for the agent task submit — so a machine path never
 	// claims user agency. noFold is true only for the delegate follow-up path, which must
 	// start a distinct correlated turn rather than fold into the child's running turn.
 	cmd := command.UserInput{Header: command.Header{CommandID: id, Agency: agency, CreatedAt: s.stampNow()}, Blocks: blocks, NoFold: noFold}
@@ -2138,22 +2227,22 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 	}
 }
 
-// RunSubagent creates an in-session sub-loop, runs one turn on it for the given
+// RunAgent creates an in-session sub-loop, runs one turn on it for the given
 // blocks (machine-originated), and returns the sub-loop's final assistant text. It
-// is the SOLE exported entry point of the subagent composition: it wires together
+// is the SOLE exported entry point of the agent composition: it wires together
 // the unexported building blocks (NewLoop + SubscribeEvents + submitToLoop +
-// drainToFinalText + interruptLoopID) so the Subagent tool's injected capability
+// drainToFinalText + interruptLoopID) so the agent collaboration tools' injected capability
 // (a later task) has one method to call and the blocks stay package-private.
 //
 // cfg is the sub-loop's loop.Definition — the CALLER builds a FRESH cfg per call (its
 // own ToolSet and access gate) so each sub-loop has independent approval state;
-// RunSubagent never reuses a shared ToolSet. parent is the spawning loop/turn/step
+// RunAgent never reuses a shared ToolSet. parent is the spawning loop/turn/step
 // provenance (recorded on the sub-loop's registry entry and stamped on its
-// LoopStarted). The submit is stamped Agency=AgencyMachine — a subagent turn is a
+// LoopStarted). The submit is stamped Agency=AgencyMachine — an agent turn is a
 // machine action, never falsely attributed to a human.
 //
 // The sub-loop PERSISTS idle after the turn (loops are never deleted, design §8):
-// RunSubagent closes only the SUBSCRIPTION, never the loop. The ordering is
+// RunAgent closes only the SUBSCRIPTION, never the loop. The ordering is
 // load-bearing: it subscribes (scoped to the new sub-loop) BEFORE submitting, so the
 // opening TurnStarted the drain correlates on cannot be missed — the hub has no
 // replay (design §4).
@@ -2165,11 +2254,11 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 // because submits carry no ctx, a ctx cancel cannot reach the sub-loop's turn — the
 // drain translates it into a single loop-targeted Interrupt (the closure below) and
 // drains to the resulting TurnInterrupted terminal.
-func (s *Session) RunSubagent(ctx context.Context, parent loop.Provenance, cfg loop.Definition, blocks []content.Block, parentToolUseID string) (string, error) {
+func (s *Session) RunAgent(ctx context.Context, parent loop.Provenance, cfg loop.Definition, blocks []content.Block, parentToolUseID string) (string, error) {
 	// newLoop publishes LoopStarted and fails SessionClosing if the session is
 	// shutting down; either way no sub-loop is left behind a returned error.
 	// parentToolUseID is stamped onto that LoopStarted so the sub-loop correlates back
-	// to the spawning Subagent tool call across persist/restore.
+	// to the spawning agent tool call across persist/restore.
 	subLoopID, err := s.newLoop(parent, cfg, parentToolUseID, "", nil)
 	if err != nil {
 		return "", err
@@ -2193,7 +2282,7 @@ func (s *Session) RunSubagent(ctx context.Context, parent loop.Provenance, cfg l
 	// sub.Close() call site in the package.
 	defer func() { _ = sub.Close() }()
 
-	// Machine-originated submit: a subagent turn is our code's action, so it stamps
+	// Machine-originated submit: an agent turn is our code's action, so it stamps
 	// AgencyMachine (the submitToLoop core, not the human-only Submit).
 	cmdID, err := s.submitToLoop(ctx, subLoopID, blocks, identity.AgencyMachine, false)
 	if err != nil {
@@ -2207,7 +2296,7 @@ func (s *Session) RunSubagent(ctx context.Context, parent loop.Provenance, cfg l
 	// with _) rather than failing the drain.
 	return drainToFinalText(ctx, sub, cmdID, func() {
 		if ierr := s.interruptLoopID(subLoopID); ierr != nil {
-			slog.WarnContext(ctx, "subagent interrupt failed", "loop", subLoopID, "err", ierr)
+			slog.WarnContext(ctx, "agent interrupt failed", "loop", subLoopID, "err", ierr)
 		}
 	})
 }

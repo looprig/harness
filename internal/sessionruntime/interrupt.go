@@ -2,10 +2,12 @@ package sessionruntime
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 )
 
@@ -279,6 +281,19 @@ func (s *Session) deliverInterrupt(ctx context.Context, t preparedInterrupt) int
 // (nil when no barrier was armed), and a typed error. The exported entry points discard the barrier
 // channel; in-package tests await it to assert release deterministically.
 func (s *Session) runInterrupt(ctx context.Context, selectLocked func() ([]loopSnapshot, bool), agency identity.Agency) (bool, <-chan struct{}, error) {
+	any, barrier, err := s.runInterruptWithBarrier(ctx, selectLocked, agency)
+	if barrier == nil {
+		return any, nil, err
+	}
+	return any, barrier.done, err
+}
+
+// runInterruptWithBarrier is runInterrupt's owned-barrier form. Most interrupt scopes expose
+// only the completion channel and let the session/checkpoint release policy clear their mark. A
+// persistent-agent stop has a narrower lifecycle: it must release its own mark at the target's
+// LoopIdle edge, without leaving the later policy goroutine able to consume an overlapping scope's
+// refcount. Returning the barrier gives that caller a single-owner release operation.
+func (s *Session) runInterruptWithBarrier(ctx context.Context, selectLocked func() ([]loopSnapshot, bool), agency identity.Agency) (bool, *interruptBarrier, error) {
 	s.loopsMu.Lock()
 	snapshot, ok := selectLocked()
 	if ok {
@@ -321,26 +336,59 @@ func (s *Session) runInterrupt(ctx context.Context, selectLocked func() ([]loopS
 	return true, s.armInterruptBarrier(ids, checkpointSweep), nil
 }
 
+// interruptBarrier owns exactly one interrupt-pending ref per target id. Release is idempotent
+// because the policy waiter and an owner such as StopAgent may race to settle the same scope.
+type interruptBarrier struct {
+	session         *Session
+	ids             []uuid.UUID
+	checkpointSweep *interruptCheckpointSweep
+	cancel          context.CancelFunc
+	done            chan struct{}
+	releaseOnce     sync.Once
+}
+
 // armInterruptBarrier holds the interrupt-pending marks for ids until the release policy returns,
 // then clears them. It runs the wait on the SESSION lifetime (not the interrupt caller's ctx, which
 // may be short-lived) so the barrier tracks the session reaching idle. It returns a channel that
 // closes once the marks are cleared.
-func (s *Session) armInterruptBarrier(ids []uuid.UUID, checkpointSweep *interruptCheckpointSweep) <-chan struct{} {
+func (s *Session) armInterruptBarrier(ids []uuid.UUID, checkpointSweep *interruptCheckpointSweep) *interruptBarrier {
 	policy := s.interruptRelease
 	if policy == nil {
 		policy = sessionIdleRelease{session: s}
 	}
-	done := make(chan struct{})
+	barrierCtx, cancel := context.WithCancel(s.sessionCtx)
+	b := &interruptBarrier{
+		session:         s,
+		ids:             append([]uuid.UUID(nil), ids...),
+		checkpointSweep: checkpointSweep,
+		cancel:          cancel,
+		done:            make(chan struct{}),
+	}
 	go func() {
-		defer close(done)
+		defer close(b.done)
 		if checkpointSweep != nil {
-			_, _ = checkpointSweep.await(s.sessionCtx)
+			_, _ = checkpointSweep.await(barrierCtx)
 		} else {
-			_ = policy.AwaitRelease(s.sessionCtx)
+			_ = policy.AwaitRelease(barrierCtx)
 		}
-		s.clearInterruptPending(ids)
+		b.release()
 	}()
-	return done
+	return b
+}
+
+// release settles this barrier's one ownership unit. It also cancels the wait context so the
+// policy goroutine exits when an owner releases at a narrower lifecycle edge than session idle.
+func (b *interruptBarrier) release() {
+	if b == nil {
+		return
+	}
+	b.releaseOnce.Do(func() {
+		b.cancel()
+		if b.checkpointSweep != nil {
+			b.checkpointSweep.cancel()
+		}
+		b.session.clearInterruptPending(b.ids)
+	})
 }
 
 // interruptSubtree cancels the current turn of rootLoopID AND every loop below it in the delegate
@@ -352,4 +400,49 @@ func (s *Session) interruptSubtree(ctx context.Context, root uuid.UUID) error {
 		return s.subtreeSnapshotLocked(root)
 	}, identity.AgencyMachine)
 	return err
+}
+
+// interruptSingle applies the session's mark-before-fanout and queue-disposition
+// guarantees to exactly one loop. It is the persistent-agent StopAgent scope: the
+// target's active turn and machine queue are interrupted, while descendants and
+// siblings remain untouched.
+func (s *Session) interruptSingle(ctx context.Context, loopID uuid.UUID) error {
+	sub, err := s.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{Loops: map[uuid.UUID]struct{}{loopID: {}}}})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = sub.Close() }()
+
+	any, barrier, err := s.runInterruptWithBarrier(ctx, func() ([]loopSnapshot, bool) {
+		handle, ok := s.loops[loopID]
+		if !ok {
+			return nil, false
+		}
+		return []loopSnapshot{{loopID: loopID, handle: handle}}, true
+	}, identity.AgencyMachine)
+	if err != nil || !any {
+		return err
+	}
+	// The fan-out acknowledgement means cancelTurn was invoked, not that the
+	// target has finished its terminal and queued-input disposition. StopAgent
+	// must not report idle, or permit immediate reuse, until that target-specific
+	// edge commits. The normal interrupt barrier remains armed for the broader
+	// session/checkpoint policy; consume this scope's one ref as soon as the
+	// target itself is idle so a parent tool turn cannot deadlock the stop.
+	for {
+		select {
+		case delivery, ok := <-sub.Events():
+			if !ok {
+				return &SessionError{Kind: SessionLoopExited}
+			}
+			if _, idle := delivery.Event.(event.LoopIdle); idle {
+				barrier.release()
+				return nil
+			}
+		case <-ctx.Done():
+			return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+		case <-s.sessionCtx.Done():
+			return &SessionError{Kind: SessionContextDone, Cause: s.sessionCtx.Err()}
+		}
+	}
 }

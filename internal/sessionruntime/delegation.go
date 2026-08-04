@@ -2,11 +2,13 @@ package sessionruntime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"strconv"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -24,13 +26,13 @@ import (
 // delegation.go is the session-runtime delegation manager (design §"Synchronous and
 // managed delegation"/§"Follow-up request and answer semantics"). It vends a SEPARATE
 // parent-scoped tool.DelegateController for each live parent loop and injects it into
-// that loop's Subagent tool. A scoped controller addresses ONLY children owned by its
+// that loop's atomic agent-tool bundle. A scoped controller addresses ONLY children owned by its
 // bound parent (registry-derived ownership, restore-safe): it rejects siblings,
 // ancestors, unrelated loop ids, unavailable actions, and invalid modes. The parent
 // model never receives the session or the manager — only the narrow scoped controller.
 //
-// OWNERSHIP survives restore because it is derived from the loop registry's parent
-// links (attachRestoredLoop re-seeds each loop's parent), not a separate map. The
+// OWNERSHIP survives restore because the direct-child index is rebuilt from the loop
+// registry's durable parent links after attachRestoredLoop re-seeds each loop. The
 // cumulative spawn quota also survives restore (countSpawnedLoops re-seeds it). The
 // Live pending handles are process-local. Durable machine NoFold intent records plus
 // correlated turn terminals reconstruct request resolution across restore; queued work
@@ -48,11 +50,12 @@ type delegationManager struct {
 
 	mu       sync.Mutex
 	session  *Session
-	requests map[uuid.UUID]*pendingRequest
+	requests map[uuid.UUID]*requestTracker
 	// resolved is the DURABLE request→terminal index reconstructed at restore from each
 	// loop's folded history (request id → the terminal of the correlated turn). It is the
-	// post-restore fallback for wait: the in-memory pending handle does not survive a
-	// process restart, but the child's committed turn terminal does. Guarded by mu.
+	// private correlation state needed by future restore idempotence: live request trackers
+	// do not survive a process restart, but committed child terminals do. It is deliberately
+	// not exposed through a request-ID lookup API. Guarded by mu.
 	resolved               map[uuid.UUID]resolvedRequest
 	runtimeCatalog         loop.RuntimeCatalog
 	hasRuntimeCatalog      bool
@@ -60,12 +63,16 @@ type delegationManager struct {
 }
 
 type delegateAdmission struct {
-	ctx       context.Context
-	message   string
-	sub       event.Subscription
-	requestID uuid.UUID
-	command   command.UserInput
-	publisher *delegateAdmissionPublisher
+	ctx             context.Context
+	name            string
+	message         string
+	sub             event.Subscription
+	requestID       uuid.UUID
+	command         command.UserInput
+	publisher       *delegateAdmissionPublisher
+	registerRequest func(requestID, childID uuid.UUID) *requestTracker
+	tracked         *requestTracker
+	background      bool
 }
 
 // delegateAdmissionPublisher is a one-shot start barrier. A fresh child may accept its
@@ -137,7 +144,7 @@ func newDelegationManager(topology Topology, catalogs ...loop.RuntimeCatalog) *d
 	}
 	manager := &delegationManager{
 		byName:   byName,
-		requests: make(map[uuid.UUID]*pendingRequest),
+		requests: make(map[uuid.UUID]*requestTracker),
 		resolved: make(map[uuid.UUID]resolvedRequest),
 	}
 	if len(catalogs) > 0 {
@@ -173,20 +180,9 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	if len(tombstonedSet) > 0 && tombstonedSet[0] != nil {
 		tombstoned = tombstonedSet[0]
 	}
-	intents := make(map[uuid.UUID]uuid.UUID)
-	for _, record := range records {
-		commandRecord, ok := record.(journal.CommandRecord)
-		if !ok {
-			continue
-		}
-		if err := journal.ValidateCommandRecordRoute(commandRecord); err != nil {
-			return err
-		}
-		input, ok := commandRecord.Command().(command.UserInput)
-		if !ok || !input.NoFold || input.Agency != identity.AgencyMachine || input.TargetLoopID.IsZero() || input.CommandID.IsZero() {
-			continue
-		}
-		intents[input.CommandID] = input.TargetLoopID
+	intents, err := backgroundDelegateIntents(records)
+	if err != nil {
+		return err
 	}
 	combined := make([]event.Event, 0, len(replayed)+len(closures))
 	combined = append(combined, replayed...)
@@ -250,11 +246,246 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	return nil
 }
 
+// backgroundDelegateIntents returns the durable request-to-child map for the one
+// managed request shape whose completion must cross the child-to-parent boundary
+// after a process restart. The marker is intentionally narrower than "machine
+// NoFold": foreground responses and ordinary machine input must never be replayed
+// as parent hand-backs.
+func backgroundDelegateIntents(records []journal.JournalRecord) (map[uuid.UUID]uuid.UUID, error) {
+	intents := make(map[uuid.UUID]uuid.UUID)
+	for _, record := range records {
+		commandRecord, ok := record.(journal.CommandRecord)
+		if !ok {
+			continue
+		}
+		if err := journal.ValidateCommandRecordRoute(commandRecord); err != nil {
+			return nil, err
+		}
+		input, ok := commandRecord.Command().(command.UserInput)
+		if !ok || !input.BackgroundHandBack || !input.NoFold || input.Agency != identity.AgencyMachine || input.TargetLoopID.IsZero() || input.CommandID.IsZero() {
+			continue
+		}
+		intents[input.CommandID] = input.TargetLoopID
+	}
+	return intents, nil
+}
+
 func (m *delegationManager) getResolved(requestID uuid.UUID) (resolvedRequest, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	rr, ok := m.resolved[requestID]
-	return rr, ok
+	resolved, ok := m.resolved[requestID]
+	return resolved, ok
+}
+
+// restoredBackgroundPlan is the durable work that must be reconciled after a
+// successful restore. A hand-back command is retained verbatim when it exists so
+// replay does not mint a second completion command for the same response.
+type restoredBackgroundPlan struct {
+	requestID uuid.UUID
+	childID   uuid.UUID
+	parentID  uuid.UUID
+	name      string
+	resolved  resolvedRequest
+	handBack  *command.SubagentResult
+}
+
+// planRestoredBackgroundRequests reconstructs the durable child-terminal to
+// parent-input correlation before RestoreDone. The plan deliberately treats
+// TurnStarted/TurnFoldedInto as processed completion evidence. InputQueued is
+// ephemeral and therefore cannot be an idempotence key; a durable
+// DelegateRequestAccepted may prove admission, but the original command is still
+// replayed because the restored actor does not reconstruct its ephemeral inbox.
+func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records []journal.JournalRecord, replayed, closures []event.Event) ([]restoredBackgroundPlan, error) {
+	intents, err := backgroundDelegateIntents(records)
+	if err != nil {
+		return nil, err
+	}
+
+	type childInfo struct {
+		parent uuid.UUID
+		name   string
+	}
+	children := make(map[uuid.UUID]childInfo)
+	for _, ev := range replayed {
+		started, ok := ev.(event.LoopStarted)
+		if !ok || started.LoopID.IsZero() {
+			continue
+		}
+		name := started.DisplayName
+		if name == "" {
+			name = string(started.AgentName)
+		}
+		children[started.LoopID] = childInfo{parent: started.Cause.Coordinates.LoopID, name: name}
+	}
+	// A degraded/tombstoned child is still registered before this planner runs. Use
+	// the live registry as a fallback for legacy LoopStarted records that predate the
+	// durable display-name field.
+	s.loopsMu.RLock()
+	for childID := range intents {
+		if _, ok := children[childID]; ok {
+			continue
+		}
+		if handle := s.loops[childID]; handle != nil {
+			name := handle.agentName
+			if name == "" && handle.bound != nil {
+				name = handle.bound.DisplayName()
+			}
+			if name == "" && handle.bound != nil {
+				name = string(handle.bound.Name())
+			}
+			children[childID] = childInfo{parent: handle.parent.LoopID, name: name}
+		}
+	}
+	s.loopsMu.RUnlock()
+
+	// Keep the latest durable hand-back command for each response. The normal live
+	// path appends at most one; choosing the latest makes recovery deterministic even
+	// for a journal produced by an older retrying implementation.
+	type handBackRecord struct {
+		commandID uuid.UUID
+		command   command.SubagentResult
+		childID   uuid.UUID
+		parentID  uuid.UUID
+	}
+	handBacks := make(map[uuid.UUID]handBackRecord)
+	for _, record := range records {
+		commandRecord, ok := record.(journal.CommandRecord)
+		if !ok {
+			continue
+		}
+		handBack, ok := commandRecord.Command().(command.SubagentResult)
+		if !ok {
+			continue
+		}
+		envelope, ok := decodeBackgroundCompletion(handBack.Blocks)
+		if !ok {
+			continue
+		}
+		requestID, parseErr := uuid.Parse(envelope.CorrelationID)
+		if parseErr != nil || requestID.IsZero() {
+			continue
+		}
+		childID := handBack.Cause.LoopID
+		parentID := handBack.Coordinates.LoopID
+		if childID.IsZero() || parentID.IsZero() {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: parentID, TargetLoopID: childID}
+		}
+		if target, admitted := intents[requestID]; admitted && target != childID {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: childID, TargetLoopID: target}
+		}
+		if info, known := children[childID]; known && !info.parent.IsZero() && info.parent != parentID {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: parentID, TargetLoopID: info.parent}
+		}
+		if envelope.AgentID != "" {
+			agentID, agentErr := uuid.Parse(envelope.AgentID)
+			if agentErr != nil || agentID != childID {
+				return nil, &journal.CommandRouteMismatchError{RecordLoopID: childID, TargetLoopID: childID}
+			}
+		}
+		handBacks[requestID] = handBackRecord{commandID: handBack.CommandID, command: handBack, childID: childID, parentID: parentID}
+	}
+
+	processed := make(map[uuid.UUID]struct{})
+	for _, ev := range append(append([]event.Event(nil), replayed...), closures...) {
+		commandID := ev.EventHeader().Cause.CommandID
+		// The completion envelope is also durable in the parent turn input.
+		// This correlation survives even when the audit-only SubagentResult
+		// command append failed, so a processed completion cannot be replayed
+		// merely because its command record is absent.
+		var message *content.UserMessage
+		switch typed := ev.(type) {
+		case event.TurnStarted:
+			message = typed.Message
+		case event.TurnFoldedInto:
+			message = typed.Message
+		}
+		if message != nil {
+			if envelope, ok := decodeBackgroundCompletion(message.Blocks); ok {
+				if requestID, parseErr := uuid.Parse(envelope.CorrelationID); parseErr == nil && !requestID.IsZero() {
+					processed[requestID] = struct{}{}
+				}
+			}
+		}
+		if commandID.IsZero() {
+			continue
+		}
+		var isProcessed bool
+		switch ev.(type) {
+		case event.TurnStarted, event.TurnFoldedInto, event.TurnRejected:
+			isProcessed = true
+		}
+		if !isProcessed {
+			continue
+		}
+		for _, handBack := range handBacks {
+			if handBack.commandID == commandID && ev.EventHeader().LoopID == handBack.parentID {
+				processed[commandID] = struct{}{}
+			}
+		}
+	}
+
+	requestIDs := make([]uuid.UUID, 0, len(intents))
+	for requestID := range intents {
+		if _, resolved := m.getResolved(requestID); resolved {
+			requestIDs = append(requestIDs, requestID)
+		}
+	}
+	sort.Slice(requestIDs, func(i, j int) bool { return requestIDs[i].String() < requestIDs[j].String() })
+
+	plan := make([]restoredBackgroundPlan, 0, len(requestIDs))
+	for _, requestID := range requestIDs {
+		if _, done := processed[requestID]; done {
+			continue
+		}
+		resolved, ok := m.getResolved(requestID)
+		if !ok {
+			continue
+		}
+		childID := intents[requestID]
+		if resolved.childID != childID {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: resolved.childID, TargetLoopID: childID}
+		}
+		info, known := children[childID]
+		if !known || info.parent.IsZero() {
+			// A malformed legacy record cannot be safely routed. Leave it in the
+			// private resolution index for diagnostics, but do not invent a parent.
+			continue
+		}
+		entry := restoredBackgroundPlan{requestID: requestID, childID: childID, parentID: info.parent, name: info.name, resolved: resolved}
+		if handBack, exists := handBacks[requestID]; exists {
+			if _, done := processed[handBack.commandID]; !done {
+				copy := handBack.command
+				entry.handBack = &copy
+			}
+			// A processed hand-back is intentionally omitted from the plan.
+			if _, done := processed[handBack.commandID]; done {
+				continue
+			}
+		}
+		plan = append(plan, entry)
+	}
+	return plan, nil
+}
+
+// reconcileRestoredBackgroundRequests admits each planned completion once. Existing
+// command records are re-sent verbatim; only a response with no prior hand-back
+// command mints and appends a new SubagentResult. Wake ownership is restored before
+// dispatch and released by the normal parent event path.
+func (m *delegationManager) reconcileRestoredBackgroundRequests(s *Session, plan []restoredBackgroundPlan) {
+	for _, entry := range plan {
+		s.expectTurn(s.sessionCtx, entry.childID)
+		var err error
+		if entry.handBack != nil {
+			err = s.replaySubagentResult(s.sessionCtx, *entry.handBack)
+		} else {
+			err = s.deliverSubagentResult(s.sessionCtx, entry.parentID, entry.childID, backgroundCompletionBlocks(entry.childID, entry.name, entry.requestID, entry.resolved.status, entry.resolved.text))
+		}
+		if err != nil {
+			// No parent event can release the restored wake token when transport
+			// fails. The next restore can retry from the durable terminal/command.
+			s.cancelExpectTurn(context.Background(), entry.childID)
+		}
+	}
 }
 
 // foldDelegateTerminals correlates every turn's opening request id (TurnStarted's
@@ -306,10 +537,10 @@ func (m *delegationManager) sess() (*Session, bool) {
 	return m.session, m.session != nil
 }
 
-// delegateExtraTools derives the model-facing delegation tool for a parent definition:
-// a loop with a non-empty Delegates() gets exactly ONE Subagent tool whose catalog is
-// its delegate set and whose action set follows its Delegation().Style. A loop with NO
-// delegates gets nothing (no Subagent capability). It is a pure function of the frozen
+// delegateExtraTools derives the model-facing collaboration tools for a parent definition:
+// a loop with a non-empty Delegates() gets exactly one bundle producing four tools whose
+// immutable catalogue is its delegate set. A loop with no delegates gets no agent
+// collaboration capability. It is a pure function of the frozen
 // definition, so the derivation is deterministic across New and Restore (the delegate set
 // and style are part of the definition fingerprint). The session injects the result via
 // tool.Bindings.ExtraTools at the loop's bind site — the user never hand-adds it.
@@ -318,12 +549,12 @@ func delegateExtraTools(def loop.Definition, manager *delegationManager) []tool.
 	if len(delegates) == 0 {
 		return nil
 	}
-	catalog := make([]delegationtool.SubagentCatalogEntry, len(delegates))
+	catalog := make([]delegationtool.AgentCatalogEntry, len(delegates))
 	for i, name := range delegates {
-		entry := delegationtool.SubagentCatalogEntry{Name: name}
+		entry := delegationtool.AgentCatalogEntry{Name: name}
 		if manager != nil {
 			if target, ok := manager.byName[name]; ok {
-				entry.Modes = []loop.ModeName{""}
+				entry.Description = target.Description()
 				for _, mode := range target.Modes() {
 					entry.Modes = append(entry.Modes, mode.Name)
 				}
@@ -339,10 +570,10 @@ func delegateExtraTools(def loop.Definition, manager *delegationManager) []tool.
 	return []tool.Definition{delegationtool.Definition(def.Delegation().Style, catalog)}
 }
 
-// controllerFor builds the parent-scoped controller injected into one loop's Subagent
-// tool. The allowed delegate set and delegation style are derived from the PARENT
+// controllerFor builds the parent-scoped controller injected into one loop's atomic
+// agent-tool bundle. The allowed delegate set and delegation style are derived from the PARENT
 // definition (least privilege). It tolerates a nil manager receiver so a struct-literal
-// session with no delegation manager can still bind loops that carry no Subagent tool.
+// session with no delegation manager can still bind loops that carry no agent tools.
 func (m *delegationManager) controllerFor(parentLoopID uuid.UUID, parent loop.Definition) tool.DelegateController {
 	allowed := make(map[identity.AgentName]struct{})
 	for _, name := range parent.Delegates() {
@@ -360,67 +591,122 @@ func (m *delegationManager) controllerFor(parentLoopID uuid.UUID, parent loop.De
 	return controller
 }
 
-// pendingRequest is one in-flight wait:false delegate request: a background drain fills
-// its terminal (text + status) and closes done; a later wait reads it.
-type pendingRequest struct {
+// requestTracker holds only the live mechanical lifecycle needed to count messages queued
+// behind a child's active turn. Response collection belongs to the foreground drain or the
+// session-owned background hand-back; no response payload is retained here for later lookup.
+type requestTracker struct {
 	childID uuid.UUID
-	done    chan struct{}
 
-	mu     sync.Mutex
-	text   string
-	status tool.DelegateStatusValue
+	mu        sync.Mutex
+	lifecycle requestLifecycle
 }
 
-func (p *pendingRequest) resolve(text string, status tool.DelegateStatusValue) {
+type requestLifecycle uint8
+
+const (
+	requestQueued requestLifecycle = iota
+	requestActive
+	requestTerminal
+)
+
+func (p *requestTracker) markActive() {
 	p.mu.Lock()
-	p.text = text
-	p.status = status
+	if p.lifecycle == requestQueued {
+		p.lifecycle = requestActive
+	}
 	p.mu.Unlock()
-	close(p.done)
 }
 
-func (p *pendingRequest) result() (string, tool.DelegateStatusValue) {
+func (p *requestTracker) markTerminal() {
+	p.mu.Lock()
+	p.lifecycle = requestTerminal
+	p.mu.Unlock()
+}
+
+func (p *requestTracker) queued() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.text, p.status
+	return p.lifecycle == requestQueued
 }
 
-// registerPending records a wait:false request and starts the background drain that
-// resolves it. The drain runs on the SESSION lifetime (not the parent turn ctx, which
-// ends when the tool call returns), so a later wait can still collect the answer.
-func (m *delegationManager) registerPending(requestID, childID uuid.UUID, sub event.Subscription, sessionCtx context.Context, interrupt func()) {
-	pr := &pendingRequest{childID: childID, done: make(chan struct{})}
+func (p *requestTracker) terminal() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lifecycle == requestTerminal
+}
+
+// registerRequest records every request immediately after accepted admission, before
+// either foreground or background draining begins. Since callers subscribe before
+// admission, the correlated TurnStarted remains observable even if it raced ahead.
+func (m *delegationManager) registerRequest(requestID, childID uuid.UUID) *requestTracker {
+	tracked := &requestTracker{childID: childID, lifecycle: requestActive}
 	m.mu.Lock()
-	m.requests[requestID] = pr
+	for _, existing := range m.requests {
+		if existing.childID == childID && !existing.terminal() {
+			tracked.lifecycle = requestQueued
+			break
+		}
+	}
+	m.requests[requestID] = tracked
 	m.mu.Unlock()
+	return tracked
+}
+
+// markRequestActive advances only a request already admitted through delegation. An
+// unrelated TurnStarted command id never creates tracker state.
+func (m *delegationManager) markRequestActive(requestID, childID uuid.UUID) {
+	if m == nil || requestID.IsZero() {
+		return
+	}
+	m.mu.Lock()
+	tracked := m.requests[requestID]
+	m.mu.Unlock()
+	if tracked != nil && tracked.childID == childID {
+		tracked.markActive()
+	}
+}
+
+func (m *delegationManager) removeRequest(requestID uuid.UUID, tracked *requestTracker) {
+	m.mu.Lock()
+	if m.requests[requestID] == tracked {
+		delete(m.requests, requestID)
+	}
+	m.mu.Unlock()
+}
+
+// handBackRequest starts the session-owned drain for one background response. The drain
+// runs on the session lifetime, not the parent tool-call context. Its only terminal
+// delivery is a machine-originated SubagentResult to the direct parent.
+func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.UUID, name string, tracked *requestTracker, requestID uuid.UUID, sub event.Subscription, timeoutSeconds *int) {
 	go func() {
 		defer func() { _ = sub.Close() }()
-		text, err := drainDelegateAnswer(sessionCtx, sub, requestID, interrupt)
-		pr.resolve(text, statusFromDrain(err))
+		defer m.removeRequest(requestID, tracked)
+		waitCtx, cancel := waitContext(s.sessionCtx, timeoutSeconds)
+		defer cancel()
+		text, err := drainDelegateAnswerObserved(waitCtx, sub, requestID, func() {
+			_, _ = s.cancelDelegateRequest(childID, requestID)
+		}, tracked.markActive)
+		status := statusFromDrain(err)
+		if status == tool.DelegateStatusInterrupted && didTimeout(timeoutSeconds, waitCtx) {
+			status = tool.DelegateStatusTimedOut
+		}
+		tracked.markTerminal()
+		if err := s.deliverSubagentResult(s.sessionCtx, parentID, childID, backgroundCompletionBlocks(childID, name, requestID, status, text)); err != nil {
+			// No parent event can release the hand-back token when dispatch itself is
+			// impossible (session shutdown, parent exit, or command-id failure).
+			s.cancelExpectTurn(context.Background(), childID)
+		}
 	}()
 }
 
-func (m *delegationManager) getPending(requestID uuid.UUID) (*pendingRequest, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	pr, ok := m.requests[requestID]
-	return pr, ok
-}
-
-func (m *delegationManager) removePending(requestID uuid.UUID) {
-	m.mu.Lock()
-	delete(m.requests, requestID)
-	m.mu.Unlock()
-}
-
-// pendingCount returns the number of unresolved (or resolved-but-uncollected) requests
-// for one child — the bounded mechanical figure a status report exposes.
+// pendingCount returns the requests waiting behind one child's active turn. Active and
+// terminal requests still crossing the hand-back boundary are not queued messages.
 func (m *delegationManager) pendingCount(childID uuid.UUID) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	count := 0
 	for _, pr := range m.requests {
-		if pr.childID == childID {
+		if pr.childID == childID && pr.queued() {
 			count++
 		}
 	}
@@ -448,7 +734,7 @@ var _ tool.DelegateController = (*scopedController)(nil)
 // that re-enforces the action set, agent authorization, mode validity, and ownership
 // regardless of crafted JSON.
 func (c *scopedController) Execute(ctx context.Context, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	if c.style == loop.DelegationSyncOnly && (req.Operation != tool.DelegateStart || !req.Wait) {
+	if c.style == loop.DelegationSyncOnly && (req.Operation != tool.DelegateStart || !req.WaitForResponse) {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateActionUnavailable}
 	}
 	s, ok := c.manager.sess()
@@ -460,8 +746,6 @@ func (c *scopedController) Execute(ctx context.Context, req tool.DelegateRequest
 		return c.start(ctx, s, req)
 	case tool.DelegateSend:
 		return c.send(ctx, s, req)
-	case tool.DelegateWait:
-		return c.wait(ctx, s, req)
 	case tool.DelegateInterrupt:
 		return c.interrupt(s, req)
 	case tool.DelegateStatus:
@@ -475,7 +759,7 @@ func (c *scopedController) Execute(ctx context.Context, req tool.DelegateRequest
 // child (newLoop reserves the quota slot before construction and records the selected
 // mode on LoopStarted), then waits or returns a queued handle.
 func (c *scopedController) start(ctx context.Context, s *Session, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	agent := identity.AgentName(req.Agent)
+	agent := identity.AgentName(req.AgentType)
 	if _, authorized := c.allowed[agent]; !authorized {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnauthorizedAgent, Agent: agent}
 	}
@@ -483,7 +767,7 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 	if !known {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownAgent, Agent: agent}
 	}
-	mode := loop.ModeName(req.Mode)
+	mode := loop.ModeName(req.AgentMode)
 	if err := validateDelegateMode(childDef, mode); err != nil {
 		return tool.DelegateResult{}, err
 	}
@@ -537,11 +821,11 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateInterruptPending, DelegateID: c.parentLoopID}
 	}
 	parent := loop.Provenance{LoopID: c.parentLoopID}
-	childID, requestID, sub, err := s.startDelegate(ctx, parent, childDef, mode, req.Message, req.ParentToolUseID, runtime, c.runtimeCatalog, c.hasRuntimeCatalog)
+	childID, requestID, sub, tracked, err := s.startDelegate(ctx, parent, childDef, mode, req.Name, req.Message, req.ParentToolUseID, runtime, c.runtimeCatalog, c.hasRuntimeCatalog, !req.WaitForResponse, c.manager.registerRequest)
 	if err != nil {
 		return tool.DelegateResult{}, err
 	}
-	return c.resolveOrQueue(ctx, s, childID, requestID, sub, req)
+	return c.resolveOrQueue(ctx, s, childID, requestID, sub, tracked, req)
 }
 
 // validControllerRuntimeSelection re-applies the model-facing capability rules
@@ -648,7 +932,7 @@ func validControllerRuntimeSelection(catalog loop.RuntimeCatalog, agent identity
 	}
 	sourceModels := controllerRuntimeModelsForSource(*selected, source)
 	if runtime.Explicit.Model {
-		if len(sourceModels) <= 1 {
+		if !controllerRuntimeModelAdmitted(sourceModels, loop.ModelAlias(runtime.Model)) {
 			return false
 		}
 	} else {
@@ -661,13 +945,35 @@ func validControllerRuntimeSelection(catalog loop.RuntimeCatalog, agent identity
 		return false
 	}
 	if runtime.Explicit.Effort {
-		if len(runtimeEfforts(sourceModels)) <= 1 {
+		if !controllerRuntimeEffortAdmitted(*selectedModel, parseRuntimeEffort(runtime.Effort)) {
 			return false
 		}
 	} else if runtime.Effort != runtimeEffortString(selectedModel.DefaultEffort) {
 		return false
 	}
 	return true
+}
+
+func controllerRuntimeModelAdmitted(models []loop.RuntimeModelOption, alias loop.ModelAlias) bool {
+	for _, option := range models {
+		if option.Alias == alias {
+			return true
+		}
+	}
+	return false
+}
+
+func controllerRuntimeEffortAdmitted(option loop.RuntimeModelOption, effort inferencemodel.Effort) bool {
+	efforts := option.Efforts
+	if len(efforts) == 0 {
+		efforts = []inferencemodel.Effort{option.DefaultEffort}
+	}
+	for _, admitted := range efforts {
+		if admitted == effort {
+			return true
+		}
+	}
+	return false
 }
 
 func controllerRuntimeEntrySource(entry loop.RuntimeCatalogEntry) loop.RuntimeSourceName {
@@ -763,40 +1069,13 @@ func runtimeDefaultControllerEntry(entries []loop.RuntimeCatalogEntry) loop.Runt
 	return entries[0]
 }
 
-func anyNonDefaultRuntimeHarness(entries []loop.RuntimeCatalogEntry) bool {
-	for _, entry := range entries {
-		if !entry.Default {
-			return true
-		}
-	}
-	return false
-}
-
-func runtimeEfforts(models []loop.RuntimeModelOption) []inferencemodel.Effort {
-	seen := make(map[inferencemodel.Effort]struct{})
-	for _, option := range models {
-		efforts := option.Efforts
-		if len(efforts) == 0 {
-			efforts = []inferencemodel.Effort{option.DefaultEffort}
-		}
-		for _, effort := range efforts {
-			seen[effort] = struct{}{}
-		}
-	}
-	result := make([]inferencemodel.Effort, 0, len(seen))
-	for effort := range seen {
-		result = append(result, effort)
-	}
-	return result
-}
-
 // send enqueues a distinct NON-FOLDING follow-up turn on an owned child and waits or
 // returns a queued handle.
 func (c *scopedController) send(ctx context.Context, s *Session, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	if req.DelegateID.IsZero() {
+	if req.AgentID.IsZero() {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateMissingDelegateID}
 	}
-	if err := c.ownsChild(s, req.DelegateID); err != nil {
+	if err := c.ownsChild(s, req.AgentID); err != nil {
 		return tool.DelegateResult{}, err
 	}
 	// Interrupt admission gate: same machine-side flush as start — a parent under an interrupt
@@ -806,126 +1085,172 @@ func (c *scopedController) send(ctx context.Context, s *Session, req tool.Delega
 	if s.loopInterruptPending(c.parentLoopID) {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateInterruptPending, DelegateID: c.parentLoopID}
 	}
-	requestID, sub, err := s.sendDelegate(ctx, req.DelegateID, req.Message)
+	requestID, sub, tracked, err := s.sendDelegate(ctx, req.AgentID, req.Message, !req.WaitForResponse, c.manager.registerRequest, c.manager.removeRequest)
 	if err != nil {
 		return tool.DelegateResult{}, err
 	}
-	return c.resolveOrQueue(ctx, s, req.DelegateID, requestID, sub, req)
-}
-
-// wait resolves one previously returned request id for an owned child. The request id
-// is required because a child may have several queued turns.
-func (c *scopedController) wait(ctx context.Context, s *Session, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	if req.DelegateID.IsZero() {
-		return tool.DelegateResult{}, &DelegateError{Kind: DelegateMissingDelegateID}
-	}
-	if req.RequestID == nil || req.RequestID.IsZero() {
-		return tool.DelegateResult{}, &DelegateError{Kind: DelegateMissingRequestID}
-	}
-	if err := c.ownsChild(s, req.DelegateID); err != nil {
-		return tool.DelegateResult{}, err
-	}
-	requestID := *req.RequestID
-	// Live in-memory handle first: a request registered this process lifetime.
-	if pr, ok := c.manager.getPending(requestID); ok {
-		if pr.childID != req.DelegateID {
-			return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownRequest, RequestID: requestID}
-		}
-		waitCtx, cancel := waitContext(ctx, req.TimeoutSeconds)
-		defer cancel()
-		select {
-		case <-pr.done:
-			c.manager.removePending(requestID)
-			text, status := pr.result()
-			return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: requestID, Status: status, Output: text}, nil
-		case <-waitCtx.Done():
-			// Recheck before dispatch so an already-observed terminal wins without even
-			// sending control; the actor command remains authoritative for the race after
-			// this check. The pending handle stays collectable either way.
-			select {
-			case <-pr.done:
-				c.manager.removePending(requestID)
-				text, status := pr.result()
-				return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: requestID, Status: status, Output: text}, nil
-			default:
-			}
-			status := timeoutOrInterrupted(req.TimeoutSeconds, waitCtx)
-			go func() { _, _ = s.cancelDelegateRequest(req.DelegateID, requestID) }()
-			return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: requestID, Status: status}, nil
-		}
-	}
-	// Durable fallback (post-restore): the in-memory handle is gone, but the child's turn
-	// terminal survived in the folded history the restore reconstructed. Ownership is
-	// already enforced above; the resolved entry must name the same owned child.
-	if rr, ok := c.manager.getResolved(requestID); ok && rr.childID == req.DelegateID {
-		return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: requestID, Status: rr.status, Output: rr.text}, nil
-	}
-	return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownRequest, RequestID: requestID}
+	return c.resolveOrQueue(ctx, s, req.AgentID, requestID, sub, tracked, req)
 }
 
 // interrupt interrupts an owned child's current turn without destroying the loop.
 func (c *scopedController) interrupt(s *Session, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	if req.DelegateID.IsZero() {
+	if req.AgentID.IsZero() {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateMissingDelegateID}
 	}
-	if err := c.ownsChild(s, req.DelegateID); err != nil {
+	if err := c.ownsChild(s, req.AgentID); err != nil {
 		return tool.DelegateResult{}, err
 	}
-	if err := s.interruptLoopID(req.DelegateID); err != nil {
-		return tool.DelegateResult{}, &DelegateError{Kind: DelegateNotOwned, DelegateID: req.DelegateID}
+	previousState := c.childState(s, req.AgentID)
+	var err error
+	if s.hub == nil {
+		// Keep struct-literal controller tests and other headless seams on the
+		// original best-effort primitive; runInterrupt's release policy needs the
+		// live session hub/idle model.
+		err = s.interruptLoopID(req.AgentID)
+	} else {
+		err = s.interruptSingle(context.Background(), req.AgentID)
 	}
-	return tool.DelegateResult{DelegateID: req.DelegateID, Status: tool.DelegateStatusInterrupted}, nil
+	if err != nil {
+		return tool.DelegateResult{}, &DelegateError{Kind: DelegateNotOwned, DelegateID: req.AgentID}
+	}
+	return tool.DelegateResult{AgentID: req.AgentID, PreviousState: previousState, State: tool.AgentStateIdle}, nil
 }
 
 // status reports bounded mechanical status for one owned child, or all owned children
 // when delegate_id is omitted. It never returns a raw event cursor or child transcript.
 func (c *scopedController) status(s *Session, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	if !req.DelegateID.IsZero() {
-		if err := c.ownsChildForStatus(s, req.DelegateID); err != nil {
+	if !req.AgentID.IsZero() {
+		if err := c.ownsChildForStatus(s, req.AgentID); err != nil {
 			return tool.DelegateResult{}, err
 		}
-		return tool.DelegateResult{
-			DelegateID:      req.DelegateID,
-			Status:          c.childStatus(s, req.DelegateID),
-			PendingRequests: c.manager.pendingCount(req.DelegateID),
-		}, nil
+		return tool.DelegateResult{Agents: []tool.DelegateAgent{c.agentSnapshot(s, req.AgentID)}}, nil
 	}
 	owned := c.ownedChildren(s)
 	truncated := len(owned) > maxDelegateStatusChildren
 	if truncated {
 		owned = owned[:maxDelegateStatusChildren]
 	}
-	children := make([]tool.DelegateChildStatus, 0, len(owned))
+	agents := make([]tool.DelegateAgent, 0, len(owned))
 	for _, id := range owned {
-		children = append(children, tool.DelegateChildStatus{
-			DelegateID:      id,
-			Status:          c.childStatus(s, id),
-			PendingRequests: c.manager.pendingCount(id),
-		})
+		agents = append(agents, c.agentSnapshot(s, id))
 	}
-	return tool.DelegateResult{Children: children, ChildrenTruncated: truncated}, nil
+	return tool.DelegateResult{Agents: agents, Truncated: truncated}, nil
 }
 
-// resolveOrQueue waits for the correlated turn (wait:true) or registers a pending
-// request and returns a queued handle (wait:false).
-func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, childID, requestID uuid.UUID, sub event.Subscription, req tool.DelegateRequest) (tool.DelegateResult, error) {
-	if req.Wait {
+// resolveOrQueue receives the tracker installed during admission, then either returns
+// the foreground response or starts the automatic durable parent hand-back.
+func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, childID, requestID uuid.UUID, sub event.Subscription, tracked *requestTracker, req tool.DelegateRequest) (tool.DelegateResult, error) {
+	if req.WaitForResponse {
 		defer func() { _ = sub.Close() }()
+		defer c.manager.removeRequest(requestID, tracked)
 		waitCtx, cancel := waitContext(ctx, req.TimeoutSeconds)
 		defer cancel()
-		text, err := drainDelegateAnswer(waitCtx, sub, requestID, func() {
+		text, err := drainDelegateAnswerObserved(waitCtx, sub, requestID, func() {
 			_, _ = s.cancelDelegateRequest(childID, requestID)
-		})
+		}, tracked.markActive)
 		status := statusFromDrain(err)
 		if status == tool.DelegateStatusInterrupted && didTimeout(req.TimeoutSeconds, waitCtx) {
 			status = tool.DelegateStatusTimedOut
 		}
-		return tool.DelegateResult{DelegateID: childID, RequestID: requestID, Status: status, Output: text}, nil
+		tracked.markTerminal()
+		result := c.responseResult(s, childID, requestID, status, text)
+		if req.Name != "" {
+			result.Name = req.Name
+		}
+		return result, nil
 	}
-	c.manager.registerPending(requestID, childID, sub, s.sessionCtx, func() {
-		_, _ = s.cancelDelegateRequest(childID, requestID)
-	})
-	return tool.DelegateResult{DelegateID: childID, RequestID: requestID, Status: tool.DelegateStatusQueued}, nil
+	name := req.Name
+	if name == "" {
+		name = c.agentSnapshot(s, childID).Name
+	}
+	c.manager.handBackRequest(s, c.parentLoopID, childID, name, tracked, requestID, sub, req.TimeoutSeconds)
+	result := c.agentResult(s, childID)
+	result.CorrelationID = requestID
+	result.State = tool.AgentStateWorking
+	if req.Name != "" {
+		result.Name = req.Name
+	}
+	return result, nil
+}
+
+type backgroundCompletionEnvelope struct {
+	AgentID        string                      `json:"agent_id"`
+	Name           string                      `json:"name"`
+	State          tool.AgentState             `json:"state"`
+	ResponseStatus tool.DelegateResponseStatus `json:"response_status"`
+	CorrelationID  string                      `json:"correlation_id"`
+	Response       string                      `json:"response"`
+}
+
+func decodeBackgroundCompletion(blocks []content.Block) (backgroundCompletionEnvelope, bool) {
+	for _, block := range blocks {
+		text, ok := block.(*content.TextBlock)
+		if !ok || text == nil || text.Text == "" {
+			continue
+		}
+		var envelope backgroundCompletionEnvelope
+		if err := json.Unmarshal([]byte(text.Text), &envelope); err != nil || envelope.CorrelationID == "" {
+			continue
+		}
+		return envelope, true
+	}
+	return backgroundCompletionEnvelope{}, false
+}
+
+// backgroundCompletionBlocks creates the single bounded, structured machine input
+// delivered to a parent. Correlation stays internal to durable orchestration: agent
+// tools never expose or accept it, while the persisted SubagentResult blocks retain it
+// for restore-time idempotence.
+func backgroundCompletionBlocks(agentID uuid.UUID, name string, correlationID uuid.UUID, status tool.DelegateStatusValue, response string) []content.Block {
+	envelope := backgroundCompletionEnvelope{
+		AgentID: agentID.String(), Name: boundUTF8(name, 4096), State: tool.AgentStateIdle,
+		ResponseStatus: responseStatus(status), CorrelationID: correlationID.String(),
+	}
+	response = boundUTF8(response, maxDelegateOutputBytes)
+	ends := runePrefixEnds(response)
+	var best []byte
+	low, high := 0, len(ends)
+	for low < high {
+		mid := low + (high-low)/2
+		envelope.Response = response[:ends[mid]]
+		encoded, err := json.Marshal(envelope)
+		if err != nil {
+			break
+		}
+		if len(encoded) <= maxDelegateOutputBytes {
+			best = encoded
+			low = mid + 1
+		} else {
+			high = mid
+		}
+	}
+	if best == nil {
+		envelope.Name = ""
+		envelope.Response = ""
+		best, _ = json.Marshal(envelope)
+	}
+	return []content.Block{&content.TextBlock{Text: string(best)}}
+}
+
+func boundUTF8(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	end := limit
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end]
+}
+
+func runePrefixEnds(value string) []int {
+	ends := make([]int, 1, utf8.RuneCountInString(value)+1)
+	for end := 0; end < len(value); {
+		_, size := utf8.DecodeRuneInString(value[end:])
+		end += size
+		ends = append(ends, end)
+	}
+	return ends
 }
 
 // ownsChild fails closed unless childID is a registered loop whose parent is exactly
@@ -954,19 +1279,154 @@ func (c *scopedController) ownsChildWithClosed(s *Session, childID uuid.UUID, al
 	return nil
 }
 
-// ownedChildren returns the registered loop ids whose parent is this controller's bound
-// parent.
+// ownedChildren returns registered loop ids from this controller's direct-child index.
 func (c *scopedController) ownedChildren(s *Session) []uuid.UUID {
 	s.loopsMu.RLock()
 	defer s.loopsMu.RUnlock()
-	var ids []uuid.UUID
-	for id, handle := range s.loops {
-		if handle.parent.LoopID == c.parentLoopID {
+	children := s.directChildren[c.parentLoopID]
+	ids := make([]uuid.UUID, 0, len(children))
+	for id := range children {
+		if _, ok := s.loops[id]; ok {
 			ids = append(ids, id)
 		}
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
 	return ids
+}
+
+func (c *scopedController) agentResult(s *Session, agentID uuid.UUID) tool.DelegateResult {
+	agent := c.agentSnapshot(s, agentID)
+	return tool.DelegateResult{AgentID: agent.AgentID, Name: agent.Name, State: agent.State}
+}
+
+func (c *scopedController) responseResult(s *Session, agentID, responseID uuid.UUID, status tool.DelegateStatusValue, response string) tool.DelegateResult {
+	result := c.agentResult(s, agentID)
+	result.CorrelationID = responseID
+	result.Response = response
+	result.ResponseStatus = responseStatus(status)
+	// The response drain can observe a correlated terminal before the hub's commit
+	// observer updates the persistent loop handle. A terminal foreground response is
+	// nevertheless idle by contract; roster snapshots continue to use the live handle.
+	if result.ResponseStatus != tool.DelegateResponseUnknown {
+		result.State = tool.AgentStateIdle
+	}
+	return result
+}
+
+func responseStatus(status tool.DelegateStatusValue) tool.DelegateResponseStatus {
+	switch status {
+	case tool.DelegateStatusCompleted:
+		return tool.DelegateResponseCompleted
+	case tool.DelegateStatusInterrupted:
+		return tool.DelegateResponseInterrupted
+	case tool.DelegateStatusTimedOut:
+		return tool.DelegateResponseTimedOut
+	case tool.DelegateStatusFailed:
+		return tool.DelegateResponseFailed
+	default:
+		return tool.DelegateResponseUnknown
+	}
+}
+
+func (c *scopedController) agentSnapshot(s *Session, agentID uuid.UUID) tool.DelegateAgent {
+	s.loopsMu.RLock()
+	handle := s.loops[agentID]
+	s.loopsMu.RUnlock()
+	if handle == nil {
+		return tool.DelegateAgent{AgentID: agentID, State: tool.AgentStateUnavailable}
+	}
+	name := handle.agentName
+	if name == "" {
+		name = handle.bound.DisplayName()
+		if name == "" {
+			name = string(handle.bound.Name())
+		}
+	}
+	agentMode := handle.agentMode
+	if agentMode == "" {
+		agentMode = handle.bound.InitialMode()
+	}
+	return tool.DelegateAgent{
+		AgentID: agentID, Name: name, AgentType: string(handle.bound.Name()),
+		State: c.childState(s, agentID), QueuedMessages: c.manager.pendingCount(agentID),
+		Runtime: c.agentRuntime(handle), AgentMode: string(agentMode),
+	}
+}
+
+func (c *scopedController) agentRuntime(handle *loopHandle) tool.DelegateRuntime {
+	identity := handle.bound.RuntimeIdentity()
+	runtime := tool.DelegateRuntime{
+		Profile: string(identity.Profile), Source: string(identity.Source),
+		SelectionKind: string(identity.SelectionKind),
+	}
+	if identity.Profile != "" || identity.Source != "" || identity.SelectionKind != "" || identity.ModelAlias != "" {
+		runtime.Effort = runtimeEffortString(identity.Effort)
+		if identity.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+			runtime.Effort = ""
+		}
+	}
+	if identity.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+		runtime.Harness = string(handle.selectedHarness)
+		if runtime.Harness == "" {
+			for _, entry := range c.runtimeCatalog.EntriesFor(handle.bound.Name()) {
+				if entry.Profile == identity.Profile {
+					runtime.Harness = string(entry.AgentHarness)
+					break
+				}
+			}
+		}
+		return runtime
+	}
+	if resolved, ok := c.publicRuntimeIdentity(handle.bound.Name(), handle.selectedHarness, identity); ok {
+		runtime.Harness = string(resolved.AgentHarness)
+		runtime.Model = string(resolved.ModelAlias)
+	}
+	return runtime
+}
+
+func (c *scopedController) publicRuntimeIdentity(agent identity.AgentName, selectedHarness loop.AgentHarnessName, durable loop.RuntimeIdentity) (loop.Resolved, bool) {
+	if !c.hasRuntimeCatalog || durable.ModelAlias == "" {
+		return loop.Resolved{}, false
+	}
+	var match loop.Resolved
+	found := false
+	for _, entry := range c.runtimeCatalog.EntriesFor(agent) {
+		if (selectedHarness != "" && entry.AgentHarness != selectedHarness) || entry.Profile != durable.Profile || entry.SelectionKind != durable.SelectionKind {
+			continue
+		}
+		resolved, err := c.runtimeCatalog.ResolveTargetAliasWithSource(agent, entry.AgentHarness, durable.Source, durable.ModelAlias, durable.Effort)
+		if err != nil || !resolvedMatchesRuntimeIdentity(resolved, durable) {
+			continue
+		}
+		if found && (match.AgentHarness != resolved.AgentHarness || match.ModelAlias != resolved.ModelAlias) {
+			return loop.Resolved{}, false
+		}
+		match = resolved
+		found = true
+	}
+	return match, found
+}
+
+func resolvedMatchesRuntimeIdentity(resolved loop.Resolved, durable loop.RuntimeIdentity) bool {
+	if resolved.Profile != durable.Profile || resolved.Source != durable.Source || resolved.SelectionKind != durable.SelectionKind ||
+		resolved.Effort != durable.Effort || (resolved.TargetAlias != durable.ModelAlias && resolved.ModelAlias != durable.ModelAlias) {
+		return false
+	}
+	if durable.TargetProvider != "" && resolved.Target.Provider != durable.TargetProvider {
+		return false
+	}
+	return durable.TargetModel == "" || resolved.Target.Name == durable.TargetModel
+}
+
+func (c *scopedController) childState(s *Session, agentID uuid.UUID) tool.AgentState {
+	switch c.childStatus(s, agentID) {
+	case tool.DelegateStatusRunning, tool.DelegateStatusQueued:
+		return tool.AgentStateWorking
+	case tool.DelegateStatusIdle, tool.DelegateStatusCompleted, tool.DelegateStatusInterrupted, tool.DelegateStatusTimedOut:
+		return tool.AgentStateIdle
+	default:
+		return tool.AgentStateUnavailable
+	}
 }
 
 // childStatus maps the child's event-derived mechanical runtime state to a bounded value;
@@ -1046,24 +1506,17 @@ func didTimeout(timeoutSeconds *int, waitCtx context.Context) bool {
 	return timeoutSeconds != nil && errors.Is(waitCtx.Err(), context.DeadlineExceeded)
 }
 
-func timeoutOrInterrupted(timeoutSeconds *int, waitCtx context.Context) tool.DelegateStatusValue {
-	if didTimeout(timeoutSeconds, waitCtx) {
-		return tool.DelegateStatusTimedOut
-	}
-	return tool.DelegateStatusInterrupted
-}
-
 // startDelegate runs the transactional child admission path: quota reservation and bind,
 // subscription, request mint, backend construction, and initial-command acceptance all
 // precede the checked LoopStarted commit. The backend's publisher remains blocked until
 // that commit, so TurnStarted can neither race ahead nor survive a failed spawn.
-func (s *Session) startDelegate(ctx context.Context, parent loop.Provenance, cfg loop.Definition, mode loop.ModeName, message, parentToolUseID string, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog bool) (childID, requestID uuid.UUID, sub event.Subscription, err error) {
-	admission := &delegateAdmission{ctx: ctx, message: message}
+func (s *Session) startDelegate(ctx context.Context, parent loop.Provenance, cfg loop.Definition, mode loop.ModeName, name, message, parentToolUseID string, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog, background bool, registerRequest func(requestID, childID uuid.UUID) *requestTracker) (childID, requestID uuid.UUID, sub event.Subscription, tracked *requestTracker, err error) {
+	admission := &delegateAdmission{ctx: ctx, name: name, message: message, registerRequest: registerRequest, background: background}
 	childID, err = s.newLoopWithAdmission(parent, cfg, parentToolUseID, mode, nil, admission, runtime, runtimeCatalog, hasRuntimeCatalog)
 	if err != nil {
-		return uuid.UUID{}, uuid.UUID{}, nil, err
+		return uuid.UUID{}, uuid.UUID{}, nil, nil, err
 	}
-	return childID, admission.requestID, admission.sub, nil
+	return childID, admission.requestID, admission.sub, admission.tracked, nil
 }
 
 func parseRuntimeEffort(value string) inferencemodel.Effort {
@@ -1083,17 +1536,27 @@ func runtimeEffortString(value inferencemodel.Effort) string {
 // sendDelegate enqueues a distinct NON-FOLDING follow-up turn on an existing owned
 // child. It subscribes BEFORE the enqueue so the correlated turn's opening event is
 // never missed.
-func (s *Session) sendDelegate(ctx context.Context, childID uuid.UUID, message string) (requestID uuid.UUID, sub event.Subscription, err error) {
+func (s *Session) sendDelegate(ctx context.Context, childID uuid.UUID, message string, background bool, registerRequest func(requestID, childID uuid.UUID) *requestTracker, removeRequest func(uuid.UUID, *requestTracker)) (requestID uuid.UUID, sub event.Subscription, tracked *requestTracker, err error) {
 	sub, err = s.subscribeLoop(childID)
 	if err != nil {
-		return uuid.UUID{}, nil, err
+		return uuid.UUID{}, nil, nil, err
 	}
-	requestID, err = s.enqueueDelegateTurn(ctx, childID, delegateBlocks(message))
+	wakeOwned := background
+	if background {
+		s.expectTurn(ctx, childID)
+		defer func() {
+			if wakeOwned {
+				s.cancelExpectTurn(context.Background(), childID)
+			}
+		}()
+	}
+	requestID, tracked, err = s.enqueueDelegateTurn(ctx, childID, delegateBlocks(message), background, registerRequest, removeRequest)
 	if err != nil {
 		_ = sub.Close()
-		return uuid.UUID{}, nil, err
+		return uuid.UUID{}, nil, nil, err
 	}
-	return requestID, sub, nil
+	wakeOwned = false
+	return requestID, sub, tracked, nil
 }
 
 // subscribeLoop opens a loop-scoped Enduring subscription (the StepDone + terminals a
@@ -1114,43 +1577,87 @@ func (s *Session) subscribeLoop(loopID uuid.UUID) (event.Subscription, error) {
 // running turn (the loop actor's drainInbox skips non-folding entries); it queues behind
 // the running turn and starts its OWN distinct turn when that finishes. The public
 // Session.SubmitToLoop keeps its interactive queue/fold semantics (NoFold=false).
-func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blocks []content.Block) (uuid.UUID, error) {
+func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blocks []content.Block, background bool, registerRequest func(requestID, childID uuid.UUID) *requestTracker, removeRequest func(uuid.UUID, *requestTracker)) (requestID uuid.UUID, tracked *requestTracker, err error) {
 	if err := s.faultIfFaulted(); err != nil {
-		return uuid.UUID{}, err
+		return uuid.UUID{}, nil, err
 	}
 	backend, ok := s.loopFor(loopID)
 	if !ok {
-		return uuid.UUID{}, &SessionError{Kind: SessionLoopNotFound}
+		return uuid.UUID{}, nil, &SessionError{Kind: SessionLoopNotFound}
 	}
 	if backend == nil {
-		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+		return uuid.UUID{}, nil, &SessionError{Kind: SessionLoopExited}
 	}
 	id, err := s.newCommandID()
 	if err != nil {
-		return uuid.UUID{}, err
+		return uuid.UUID{}, nil, err
 	}
 	accepted := make(chan error, 1)
-	cmd := command.UserInput{Header: command.Header{CommandID: id, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()}, Blocks: blocks, NoFold: true, TargetLoopID: loopID, Accepted: accepted}
-	if err := s.appendDelegateCommand(ctx, loopID, cmd); err != nil {
-		return uuid.UUID{}, err
+	cmd := command.UserInput{
+		Header:             command.Header{CommandID: id, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()},
+		Blocks:             blocks,
+		NoFold:             true,
+		TargetLoopID:       loopID,
+		BackgroundHandBack: background,
+		Accepted:           accepted,
 	}
+	if err := s.appendDelegateCommand(ctx, loopID, cmd); err != nil {
+		return uuid.UUID{}, nil, err
+	}
+	tracked = registerRequest(id, loopID)
+	registered := tracked
+	admitted := false
+	defer func() {
+		if !admitted {
+			removeRequest(id, registered)
+		}
+	}()
 	select {
 	case backend.CommandSink() <- cmd:
-		select {
-		case err := <-accepted:
-			if err != nil {
-				return uuid.UUID{}, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: err}
-			}
-			return id, nil
-		case <-ctx.Done():
-			return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
-		case <-backend.DoneChan():
-			return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+		canceled, err := awaitDelegateAcceptance(ctx, accepted, backend.DoneChan())
+		if err != nil {
+			return uuid.UUID{}, nil, err
 		}
+		admitted = true
+		if canceled {
+			_, _ = s.cancelDelegateRequest(loopID, id)
+		}
+		return id, tracked, nil
 	case <-ctx.Done():
-		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+		return uuid.UUID{}, nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	case <-backend.DoneChan():
-		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+		return uuid.UUID{}, nil, &SessionError{Kind: SessionLoopExited}
+	}
+}
+
+// awaitDelegateAcceptance treats the actor's durable acceptance decision as
+// authoritative once the command handoff has completed. Context cancellation is
+// remembered, but cannot roll back a request the actor may already have committed.
+func awaitDelegateAcceptance(ctx context.Context, accepted <-chan error, backendDone <-chan struct{}) (canceled bool, err error) {
+	ctxDone := ctx.Done()
+	for {
+		select {
+		case acceptErr := <-accepted:
+			if acceptErr != nil {
+				return canceled, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: acceptErr}
+			}
+			return canceled || ctx.Err() != nil, nil
+		case <-ctxDone:
+			canceled = true
+			ctxDone = nil
+		case <-backendDone:
+			// A buffered acceptance may become observable with actor exit. Prefer that
+			// durable decision before classifying the loop as exited.
+			select {
+			case acceptErr := <-accepted:
+				if acceptErr != nil {
+					return canceled, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: acceptErr}
+				}
+				return canceled || ctx.Err() != nil, nil
+			default:
+				return canceled, &SessionError{Kind: SessionLoopExited}
+			}
+		}
 	}
 }
 
@@ -1169,9 +1676,7 @@ const (
 	DelegateUnknownMode
 	DelegateNotOwned
 	DelegateSessionUnavailable
-	DelegateUnknownRequest
 	DelegateMissingDelegateID
-	DelegateMissingRequestID
 	DelegateUnknownOperation
 	// DelegateInterruptPending: the parent loop is under an interrupt admission barrier, so a
 	// NEW machine-delegate request (start/send) is flushed (refused) until the barrier releases.
@@ -1184,13 +1689,12 @@ const (
 )
 
 // DelegateError is the typed delegation refusal. Callers errors.As to inspect Kind and
-// the offending agent/mode/ids.
+// the offending agent, mode, or delegate ID.
 type DelegateError struct {
 	Kind       DelegateErrorKind
 	Agent      identity.AgentName
 	Mode       loop.ModeName
 	DelegateID uuid.UUID
-	RequestID  uuid.UUID
 }
 
 func (e *DelegateError) Error() string {
@@ -1207,12 +1711,8 @@ func (e *DelegateError) Error() string {
 		return "delegation: delegate " + strconv.Quote(e.DelegateID.String()) + " is not owned by this loop"
 	case DelegateSessionUnavailable:
 		return "delegation: session is not available"
-	case DelegateUnknownRequest:
-		return "delegation: unknown request " + strconv.Quote(e.RequestID.String())
 	case DelegateMissingDelegateID:
 		return "delegation: a delegate_id is required"
-	case DelegateMissingRequestID:
-		return "delegation: a request_id is required"
 	case DelegateUnknownOperation:
 		return "delegation: unknown operation"
 	case DelegateInterruptPending:
@@ -1227,7 +1727,7 @@ func (e *DelegateError) Error() string {
 }
 
 // ModelFacingError exposes only the fixed, bounded category needed by the
-// model-facing Subagent result. It deliberately omits all request fields;
+// model-facing agent result. It deliberately omits all request fields;
 // ordinary delegation errors continue to use the generic tool-result error.
 func (e *DelegateError) ModelFacingError() string {
 	if e == nil {

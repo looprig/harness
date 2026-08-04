@@ -29,6 +29,8 @@ func TestValidateCommandValid(t *testing.T) {
 		cmd  command.Command
 	}{
 		{"UserInput", command.UserInput{Header: hdr}},
+		{"UserInput foreground delegate default marker", command.UserInput{Header: command.Header{CommandID: cmdID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: target}},
+		{"UserInput background delegate marker", command.UserInput{Header: command.Header{CommandID: cmdID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: target, BackgroundHandBack: true}},
 		{"SubagentResult", command.SubagentResult{Header: hdr, Coordinates: identity.Coordinates{LoopID: loop}}},
 		{"CancelQueuedInput", command.CancelQueuedInput{Header: hdr, Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop}, TargetCommandID: target}},
 		{"CancelDelegateRequest", command.CancelDelegateRequest{Header: hdr, Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop}, TargetCommandID: target}},
@@ -84,6 +86,13 @@ func TestValidateCommandInvalid(t *testing.T) {
 			wantCmd:   command.CommandUserInput,
 			wantField: command.FieldTargetLoopID,
 			wantRule:  command.RuleRequired,
+		},
+		{
+			name:      "background hand-back marker requires machine NoFold delegate input",
+			cmd:       command.UserInput{Header: hdr, BackgroundHandBack: true},
+			wantCmd:   command.CommandUserInput,
+			wantField: command.FieldBackgroundHandBack,
+			wantRule:  command.RuleInvalid,
 		},
 		{
 			name:      "SubagentResult missing parent LoopID",

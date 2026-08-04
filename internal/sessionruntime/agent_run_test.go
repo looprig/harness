@@ -12,8 +12,8 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 )
 
-// TestRunSubagentReturnsFinalText drives the exported composition end-to-end on a
-// REAL sub-loop: RunSubagent creates the sub-loop, runs one machine-originated turn
+// TestRunAgentReturnsFinalText drives the exported composition end-to-end on a
+// REAL sub-loop: RunAgent creates the sub-loop, runs one machine-originated turn
 // against a stub LLM that emits a single no-tool final message, and returns that
 // message's text with a nil error. It also asserts, via a SEPARATE whole-session
 // subscription set up BEFORE the call, that the sub-loop announced itself
@@ -21,7 +21,7 @@ import (
 // attributed to the sub-loop (TurnStarted on the SAME loop id) with machine agency
 // (Cause.Agency == AgencyMachine) — proving the submit was AgencyMachine, never a
 // human's.
-func TestRunSubagentReturnsFinalText(t *testing.T) {
+func TestRunAgentReturnsFinalText(t *testing.T) {
 	t.Parallel()
 
 	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}))
@@ -30,7 +30,7 @@ func TestRunSubagentReturnsFinalText(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
-	// Whole-session observer attached BEFORE RunSubagent, so the sub-loop's opening
+	// Whole-session observer attached BEFORE RunAgent, so the sub-loop's opening
 	// LoopStarted + TurnStarted (the hub has no replay) cannot be missed.
 	obs, err := s.SubscribeEvents(allFilter())
 	if err != nil {
@@ -49,12 +49,12 @@ func TestRunSubagentReturnsFinalText(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	got, err := s.RunSubagent(ctx, parent, subCfg, textBlocks("do the thing"), "")
+	got, err := s.RunAgent(ctx, parent, subCfg, textBlocks("do the thing"), "")
 	if err != nil {
-		t.Fatalf("RunSubagent: %v", err)
+		t.Fatalf("RunAgent: %v", err)
 	}
 	if got != "subagent final" {
-		t.Errorf("RunSubagent text = %q, want %q", got, "subagent final")
+		t.Errorf("RunAgent text = %q, want %q", got, "subagent final")
 	}
 
 	// On the observer: find the sub-loop's LoopStarted (a non-primary loop id) and the
@@ -76,14 +76,14 @@ func TestRunSubagentReturnsFinalText(t *testing.T) {
 	}
 }
 
-// TestRunSubagentStampsParentToolUseID proves the durable correlation carrier:
-// RunSubagent's parentToolUseID rides through the private loop-creation path onto
+// TestRunAgentStampsParentToolUseID proves the durable correlation carrier:
+// RunAgent's parentToolUseID rides through the private loop-creation path onto
 // the child sub-loop's LoopStarted (ParentToolUseID == the supplied id), while a
 // plain loop not spawned by a tool call (the primary) carries the empty string.
 // It asserts against the REAL LoopStarted observed via a whole-session
 // subscription (never a struct copy), so the field is proven end-to-end through
 // PublishEvent.
-func TestRunSubagentStampsParentToolUseID(t *testing.T) {
+func TestRunAgentStampsParentToolUseID(t *testing.T) {
 	t.Parallel()
 
 	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}))
@@ -92,7 +92,7 @@ func TestRunSubagentStampsParentToolUseID(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
-	// Observer attached BEFORE RunSubagent so the sub-loop's opening LoopStarted
+	// Observer attached BEFORE RunAgent so the sub-loop's opening LoopStarted
 	// (no hub replay) cannot be missed.
 	obs, err := s.SubscribeEvents(allFilter())
 	if err != nil {
@@ -106,8 +106,8 @@ func TestRunSubagentStampsParentToolUseID(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if _, err := s.RunSubagent(ctx, parent, subCfg, textBlocks("do the thing"), "toolu_7"); err != nil {
-		t.Fatalf("RunSubagent: %v", err)
+	if _, err := s.RunAgent(ctx, parent, subCfg, textBlocks("do the thing"), "toolu_7"); err != nil {
+		t.Fatalf("RunAgent: %v", err)
 	}
 
 	// The sub-loop's LoopStarted carries the supplied tool-use id.
@@ -133,10 +133,10 @@ func TestRunSubagentStampsParentToolUseID(t *testing.T) {
 	}
 }
 
-// TestRunSubagentPropagatesSessionClosing proves error propagation from the first
-// building block: when the session is closing, NewLoop refuses, so RunSubagent must
+// TestRunAgentPropagatesSessionClosing proves error propagation from the first
+// building block: when the session is closing, NewLoop refuses, so RunAgent must
 // surface that *SessionError{SessionClosing} and never create a sub-loop or block.
-func TestRunSubagentPropagatesSessionClosing(t *testing.T) {
+func TestRunAgentPropagatesSessionClosing(t *testing.T) {
 	t.Parallel()
 
 	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
@@ -152,20 +152,20 @@ func TestRunSubagentPropagatesSessionClosing(t *testing.T) {
 	s.loopsMu.Unlock()
 
 	subCfg := cfg(&stubLLM{chunks: []content.Chunk{textChunk("never runs")}})
-	got, err := s.RunSubagent(context.Background(), loop.Provenance{LoopID: s.ActiveLoopID()}, subCfg, textBlocks("go"), "")
+	got, err := s.RunAgent(context.Background(), loop.Provenance{LoopID: s.ActiveLoopID()}, subCfg, textBlocks("go"), "")
 	if got != "" {
-		t.Errorf("RunSubagent text = %q, want empty on closing", got)
+		t.Errorf("RunAgent text = %q, want empty on closing", got)
 	}
 	var se *SessionError
 	if !errors.As(err, &se) || se.Kind != SessionClosing {
-		t.Fatalf("RunSubagent err = %v, want *SessionError{SessionClosing}", err)
+		t.Fatalf("RunAgent err = %v, want *SessionError{SessionClosing}", err)
 	}
 }
 
 // waitLoopStartedNonPrimaryEvent reads the observer until a LoopStarted for a loop
 // id other than primary arrives, returning that whole event so the caller can inspect
 // ParentToolUseID. The session emits a LoopStarted for every NewLoop; the sub-loop is
-// the only non-primary one when this is called right after one RunSubagent.
+// the only non-primary one when this is called right after one RunAgent.
 func waitLoopStartedNonPrimaryEvent(t *testing.T, sub interface {
 	Events() <-chan event.Delivery
 }, primary [16]byte) (event.LoopStarted, bool) {

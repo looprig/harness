@@ -1,6 +1,6 @@
 package sessionruntime
 
-// Subagent-spawn safety caps. They are the two independent backstops against a runaway
+// Child-agent spawn safety caps. They are the two independent backstops against a runaway
 // agent tree: Depth bounds how DEEP the spawn chain can nest (a sub-loop spawning a
 // sub-loop spawning a sub-loop…), and Quota bounds the TOTAL number of sub-loops a
 // single session may ever spawn (a fan-out bound across the whole tree). Both are
@@ -21,7 +21,7 @@ const (
 	defaultQuota = 64
 )
 
-// Limits are the in-session subagent-spawn safety caps applied by NewLoop: Depth bounds
+// Limits are the in-session agent-spawn safety caps applied by NewLoop: Depth bounds
 // the spawn-chain nesting and Quota bounds the total sub-loops a session may spawn. A zero
 // (or negative — a wiring slip) field adopts the package default via withDefaults, so a
 // caller can never accidentally disable a cap; an explicit positive value overrides it.

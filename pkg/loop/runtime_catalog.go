@@ -28,6 +28,9 @@ type RuntimeProfileName string
 // RuntimeModelOption describes one model alias admitted by one catalog entry.
 type RuntimeModelOption struct {
 	Alias ModelAlias
+	// Description is bounded, secret-free presentation guidance for selecting
+	// this model. Empty means no guidance is available.
+	Description string
 	// Source optionally overrides the entry source for this model. It is the
 	// stable catalogue discriminator when gateway and native choices share one
 	// harness.
@@ -47,9 +50,12 @@ type RuntimeModelOption struct {
 
 // RuntimeCatalogEntry describes one role/harness runtime combination.
 type RuntimeCatalogEntry struct {
-	SubagentType identity.AgentName
+	AgentType    identity.AgentName
 	AgentHarness AgentHarnessName
 	Profile      RuntimeProfileName
+	// Description is bounded, secret-free presentation guidance for this
+	// harness. Empty means no guidance is available.
+	Description string
 	// Source is the stable catalogue source identity. Empty preserves the
 	// legacy shape and is derived from Credential during normalization.
 	Source     RuntimeSourceName
@@ -67,13 +73,13 @@ type RuntimeCatalogEntry struct {
 // Resolved is the immutable runtime tuple selected from a RuntimeCatalog.
 // Target is a defensive copy of the cataloged model descriptor.
 type Resolved struct {
-	SubagentType  identity.AgentName
+	AgentType     identity.AgentName
 	AgentHarness  AgentHarnessName
 	Profile       RuntimeProfileName
 	Source        RuntimeSourceName
 	Credential    CredentialMode
 	SelectionKind RuntimeSelectionKind
-	// ModelAlias is the stable model-facing selector accepted by Subagent.
+	// ModelAlias is the stable model-facing selector accepted by StartAgent.
 	ModelAlias ModelAlias
 	// TargetAlias is the concrete alias sent to a gateway or ACP launcher. It
 	// is derived from the selected effort for gateway-backed runtimes and is
@@ -94,6 +100,7 @@ const (
 	RuntimeCatalogInvalidSource        RuntimeCatalogErrorKind = "invalid_source"
 	RuntimeCatalogInvalidSelectionKind RuntimeCatalogErrorKind = "invalid_selection_kind"
 	RuntimeCatalogInvalidIdentifier    RuntimeCatalogErrorKind = "invalid_identifier"
+	RuntimeCatalogInvalidDescription   RuntimeCatalogErrorKind = "invalid_description"
 	RuntimeCatalogInvalidModel         RuntimeCatalogErrorKind = "invalid_model"
 	RuntimeCatalogMissingDefaultModel  RuntimeCatalogErrorKind = "missing_default_model"
 	RuntimeCatalogInvalidDefaultModel  RuntimeCatalogErrorKind = "invalid_default_model"
@@ -149,19 +156,19 @@ func NewRuntimeCatalog(entries []RuntimeCatalogEntry) (RuntimeCatalog, error) {
 		if err := validateRuntimeCatalogEntry(entry); err != nil {
 			return RuntimeCatalog{}, err
 		}
-		key := runtimeHarnessKey{agent: entry.SubagentType, harness: entry.AgentHarness, source: entry.Source}
+		key := runtimeHarnessKey{agent: entry.AgentType, harness: entry.AgentHarness, source: entry.Source}
 		if _, exists := seenHarnesses[key]; exists {
 			return RuntimeCatalog{}, &RuntimeCatalogError{Kind: RuntimeCatalogDuplicateHarness, Field: "AgentHarness"}
 		}
 		seenHarnesses[key] = struct{}{}
 		if entry.Default {
-			defaultCounts[entry.SubagentType]++
+			defaultCounts[entry.AgentType]++
 		}
 		cloned[i] = entry
 	}
 
 	for _, entry := range cloned {
-		if defaultCounts[entry.SubagentType] != 1 {
+		if defaultCounts[entry.AgentType] != 1 {
 			return RuntimeCatalog{}, &RuntimeCatalogError{Kind: RuntimeCatalogDefaultHarnessCount, Field: "Default"}
 		}
 	}
@@ -174,8 +181,8 @@ func NewRuntimeCatalog(entries []RuntimeCatalogEntry) (RuntimeCatalog, error) {
 
 	sort.Slice(cloned, func(i, j int) bool {
 		left, right := cloned[i], cloned[j]
-		if left.SubagentType != right.SubagentType {
-			return left.SubagentType < right.SubagentType
+		if left.AgentType != right.AgentType {
+			return left.AgentType < right.AgentType
 		}
 		if left.AgentHarness != right.AgentHarness {
 			return left.AgentHarness < right.AgentHarness
@@ -205,7 +212,7 @@ func (c RuntimeCatalog) EntriesFor(agent identity.AgentName) []RuntimeCatalogEnt
 	}
 	var result []RuntimeCatalogEntry
 	for _, entry := range c.entries {
-		if entry.SubagentType == agent {
+		if entry.AgentType == agent {
 			result = append(result, cloneRuntimeCatalogEntry(entry))
 		}
 	}
@@ -239,7 +246,7 @@ func (c RuntimeCatalog) ResolveWithExplicitEffort(agent identity.AgentName, harn
 // behavior; a supplied source disambiguates choices that share one harness.
 func (c RuntimeCatalog) ResolveWithExplicitSource(agent identity.AgentName, harness AgentHarnessName, source RuntimeSourceName, alias ModelAlias, effort model.Effort, explicitEffort bool) (Resolved, error) {
 	if agent == "" {
-		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
+		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "AgentType"}
 	}
 	if source != "" && !source.valid() {
 		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSource, Field: "Source"}
@@ -251,7 +258,7 @@ func (c RuntimeCatalog) ResolveWithExplicitSource(agent identity.AgentName, harn
 			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownSource, Field: "Source"}
 		}
 		if harness == "" {
-			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
+			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "AgentType"}
 		}
 		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownHarness, Field: "AgentHarness"}
 	}
@@ -319,7 +326,7 @@ func (c RuntimeCatalog) ResolveWithExplicitSource(agent identity.AgentName, harn
 	}
 
 	return Resolved{
-		SubagentType:     selected.SubagentType,
+		AgentType:        selected.AgentType,
 		AgentHarness:     selected.AgentHarness,
 		Profile:          selected.Profile,
 		Source:           resolvedSource,
@@ -338,7 +345,7 @@ func (c RuntimeCatalog) ResolveWithExplicitSource(agent identity.AgentName, harn
 // to its model-facing catalog selector. New gateway-backed records use the
 // concrete per-effort alias; the bare model alias is also accepted so legacy
 // records remain restorable. This method is intentionally not used by
-// model-facing Subagent preparation or controller validation.
+// model-facing agent preparation or controller validation.
 func (c RuntimeCatalog) ResolveTargetAlias(agent identity.AgentName, harness AgentHarnessName, targetAlias ModelAlias, effort model.Effort) (Resolved, error) {
 	return c.ResolveTargetAliasWithSource(agent, harness, "", targetAlias, effort)
 }
@@ -347,7 +354,7 @@ func (c RuntimeCatalog) ResolveTargetAlias(agent identity.AgentName, harness Age
 // ResolveTargetAlias. Empty source retains legacy target-alias behavior.
 func (c RuntimeCatalog) ResolveTargetAliasWithSource(agent identity.AgentName, harness AgentHarnessName, source RuntimeSourceName, targetAlias ModelAlias, effort model.Effort) (Resolved, error) {
 	if agent == "" {
-		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
+		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "AgentType"}
 	}
 	if source != "" && !source.valid() {
 		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSource, Field: "Source"}
@@ -359,7 +366,7 @@ func (c RuntimeCatalog) ResolveTargetAliasWithSource(agent identity.AgentName, h
 			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownSource, Field: "Source"}
 		}
 		if harness == "" {
-			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
+			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "AgentType"}
 		}
 		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownHarness, Field: "AgentHarness"}
 	}
@@ -474,7 +481,7 @@ func effectiveSelectionKind(entry RuntimeCatalogEntry) RuntimeSelectionKind {
 
 func resolvedHarnessManaged(entry RuntimeCatalogEntry) Resolved {
 	return Resolved{
-		SubagentType:  entry.SubagentType,
+		AgentType:     entry.AgentType,
 		AgentHarness:  entry.AgentHarness,
 		Profile:       entry.Profile,
 		Source:        entry.Source,
@@ -491,7 +498,7 @@ func (c RuntimeCatalog) runtimeCandidates(agent identity.AgentName, harness Agen
 	var defaultEntry *RuntimeCatalogEntry
 	for i := range c.entries {
 		entry := &c.entries[i]
-		if entry.SubagentType == agent && entry.Default {
+		if entry.AgentType == agent && entry.Default {
 			defaultEntry = entry
 			break
 		}
@@ -508,7 +515,7 @@ func (c RuntimeCatalog) runtimeCandidates(agent identity.AgentName, harness Agen
 	result := make([]*RuntimeCatalogEntry, 0, 1)
 	for i := range c.entries {
 		entry := &c.entries[i]
-		if entry.SubagentType != agent || entry.AgentHarness != harness {
+		if entry.AgentType != agent || entry.AgentHarness != harness {
 			continue
 		}
 		if source != "" && !runtimeEntryHasSource(*entry, source) {
@@ -561,14 +568,17 @@ func effectiveModelCredential(entry RuntimeCatalogEntry, option RuntimeModelOpti
 }
 
 func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
-	if err := validateCatalogIdentifier(string(entry.SubagentType), true); err != nil {
-		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "SubagentType"}
+	if err := validateCatalogIdentifier(string(entry.AgentType), true); err != nil {
+		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "AgentType"}
 	}
 	if err := validateCatalogIdentifier(string(entry.AgentHarness), false); err != nil {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "AgentHarness"}
 	}
 	if err := validateRuntimeProfile(string(entry.Profile)); err != nil {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "Profile"}
+	}
+	if err := validatePresentationText(entry.Description); err != nil {
+		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidDescription, Field: "Description"}
 	}
 	if entry.Credential == "" && entry.Source == "" {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidCredential, Field: "Credential"}
@@ -620,6 +630,9 @@ func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
 		option := &entry.Models[i]
 		if err := validateCatalogIdentifier(string(option.Alias), false); err != nil {
 			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "Models.Alias"}
+		}
+		if err := validatePresentationText(option.Description); err != nil {
+			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidDescription, Field: "Models.Description"}
 		}
 		if !option.Source.valid() {
 			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSource, Field: "Models.Source"}
@@ -708,7 +721,8 @@ func validateNativeAliasOwnership(entries []RuntimeCatalogEntry) error {
 			for j := i + 1; j < len(aliasOwners); j++ {
 				sameHarnessDifferentSource := aliasOwners[i].harness == aliasOwners[j].harness && aliasOwners[i].source != aliasOwners[j].source
 				differentHarnessWithNative := aliasOwners[i].harness != aliasOwners[j].harness &&
-					(aliasOwners[i].credential != CredentialGatewayBacked || aliasOwners[j].credential != CredentialGatewayBacked)
+					(aliasOwners[i].credential != CredentialGatewayBacked || aliasOwners[j].credential != CredentialGatewayBacked) &&
+					!looprigNativeGatewayAliasPair(aliasOwners[i], aliasOwners[j])
 				if sameHarnessDifferentSource || differentHarnessWithNative {
 					return &RuntimeCatalogError{Kind: RuntimeCatalogNativeAliasConflict, Field: "Models.Alias"}
 				}
@@ -716,6 +730,15 @@ func validateNativeAliasOwnership(entries []RuntimeCatalogEntry) error {
 		}
 	}
 	return nil
+}
+
+// looprigNativeGatewayAliasPair is the one intentional cross-harness alias
+// overlap: CodeRig's in-process native runtime and a gateway-backed ACP row
+// may expose the same configured model alias. The selected harness is an
+// explicit part of the runtime tuple, so the two rows remain unambiguous.
+func looprigNativeGatewayAliasPair(left, right runtimeAliasOwner) bool {
+	return (left.harness == "looprig" && left.credential == CredentialNativeAuth && right.credential == CredentialGatewayBacked) ||
+		(right.harness == "looprig" && right.credential == CredentialNativeAuth && left.credential == CredentialGatewayBacked)
 }
 
 func validateDerivedAliasOwnership(entries []RuntimeCatalogEntry) error {
@@ -762,6 +785,22 @@ func validateCatalogIdentifier(value string, allowInternalSpaces bool) error {
 	for _, r := range value {
 		if r == '/' || r == '\\' || r == ':' || r == 0 || unicode.IsControl(r) || (!allowInternalSpaces && unicode.IsSpace(r)) {
 			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier}
+		}
+	}
+	return nil
+}
+
+func validatePresentationText(value string) error {
+	const maxPresentationBytes = 256
+	if value == "" {
+		return nil
+	}
+	if len(value) > maxPresentationBytes || !utf8.ValidString(value) || strings.TrimSpace(value) != value {
+		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidDescription}
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+			return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidDescription}
 		}
 	}
 	return nil
@@ -825,79 +864,51 @@ type runtimeCatalogDigest struct {
 }
 
 type runtimeCatalogEntryDigest struct {
-	SubagentType    string                     `json:"subagent_type"`
-	AgentHarness    string                     `json:"agent_harness"`
-	Profile         string                     `json:"profile"`
-	Source          RuntimeSourceName          `json:"source"`
-	Credential      CredentialMode             `json:"credential"`
-	SelectionKind   RuntimeSelectionKind       `json:"selection_kind"`
-	Default         bool                       `json:"default"`
-	DefaultModel    string                     `json:"default_model"`
-	SmallModel      string                     `json:"small_model,omitempty"`
-	NeedsSmallModel bool                       `json:"needs_small_model,omitempty"`
-	Models          []runtimeModelOptionDigest `json:"models"`
+	AgentType                string                     `json:"agent_type"`
+	AgentHarness             string                     `json:"agent_harness"`
+	Profile                  string                     `json:"profile"`
+	Description              string                     `json:"description,omitempty"`
+	ConfigurationFingerprint string                     `json:"configuration_fingerprint"`
+	SelectionKind            RuntimeSelectionKind       `json:"selection_kind"`
+	Default                  bool                       `json:"default"`
+	DefaultModel             string                     `json:"default_model"`
+	SmallModel               string                     `json:"small_model,omitempty"`
+	NeedsSmallModel          bool                       `json:"needs_small_model,omitempty"`
+	Models                   []runtimeModelOptionDigest `json:"models"`
 }
 
 type runtimeModelOptionDigest struct {
-	Alias            string              `json:"alias"`
-	Source           RuntimeSourceName   `json:"source,omitempty"`
-	Credential       CredentialMode      `json:"credential,omitempty"`
-	NativeSmallModel string              `json:"native_small_model,omitempty"`
-	Provider         string              `json:"provider"`
-	APIFormat        string              `json:"api_format"`
-	Name             string              `json:"name"`
-	Origin           model.Origin        `json:"origin"`
-	Capabilities     model.Capabilities  `json:"capabilities"`
-	Limits           model.ContextLimits `json:"limits"`
-	DefaultEffort    string              `json:"default_effort"`
-	Efforts          []string            `json:"efforts"`
-	Temperature      *float64            `json:"temperature,omitempty"`
-	TopP             *float64            `json:"top_p,omitempty"`
-	MaxTokens        *int                `json:"max_tokens,omitempty"`
-	Stop             []string            `json:"stop,omitempty"`
-	SamplingEffort   string              `json:"sampling_effort"`
+	Alias         string   `json:"alias"`
+	Description   string   `json:"description,omitempty"`
+	DefaultEffort string   `json:"default_effort"`
+	Efforts       []string `json:"efforts"`
+}
+
+type runtimeCatalogEntryConfiguration struct {
+	Source     RuntimeSourceName                 `json:"source"`
+	Credential CredentialMode                    `json:"credential"`
+	Models     []runtimeModelOptionConfiguration `json:"models"`
+}
+
+type runtimeModelOptionConfiguration struct {
+	Source           RuntimeSourceName         `json:"source"`
+	Credential       CredentialMode            `json:"credential"`
+	NativeSmallModel string                    `json:"native_small_model,omitempty"`
+	Target           runtimeModelConfiguration `json:"target"`
+}
+
+type runtimeModelConfiguration struct {
+	Provider     model.ProviderName  `json:"provider"`
+	APIFormat    model.APIFormat     `json:"api_format"`
+	Name         string              `json:"name"`
+	Origin       model.Origin        `json:"origin"`
+	Capabilities model.Capabilities  `json:"capabilities"`
+	Limits       model.ContextLimits `json:"limits"`
+	Sampling     model.Sampling      `json:"sampling"`
 }
 
 func digestRuntimeCatalog(entries []RuntimeCatalogEntry) string {
-	projection := runtimeCatalogDigest{Entries: make([]runtimeCatalogEntryDigest, len(entries))}
-	for i, entry := range entries {
-		row := runtimeCatalogEntryDigest{
-			SubagentType:    string(entry.SubagentType),
-			AgentHarness:    string(entry.AgentHarness),
-			Profile:         string(entry.Profile),
-			Source:          entry.Source,
-			Credential:      entry.Credential,
-			SelectionKind:   entry.SelectionKind,
-			Default:         entry.Default,
-			DefaultModel:    string(entry.DefaultModel),
-			SmallModel:      string(entry.SmallModel),
-			NeedsSmallModel: entry.NeedsSmallModel,
-			Models:          make([]runtimeModelOptionDigest, len(entry.Models)),
-		}
-		for j, option := range entry.Models {
-			row.Models[j] = runtimeModelOptionDigest{
-				Alias:            string(option.Alias),
-				Source:           effectiveRuntimeSource(entry, option),
-				Credential:       option.Credential,
-				NativeSmallModel: option.NativeSmallModel,
-				Provider:         string(option.Target.Provider),
-				APIFormat:        string(option.Target.APIFormat),
-				Name:             option.Target.Name,
-				Origin:           option.Target.Origin,
-				Capabilities:     option.Target.Caps,
-				Limits:           option.Target.Limits,
-				DefaultEffort:    catalogEffortString(option.DefaultEffort),
-				Efforts:          catalogEffortStrings(option.Efforts),
-				Temperature:      option.Target.Sampling.Temperature,
-				TopP:             option.Target.Sampling.TopP,
-				MaxTokens:        option.Target.Sampling.MaxTokens,
-				Stop:             append([]string(nil), option.Target.Sampling.Stop...),
-				SamplingEffort:   catalogEffortString(option.Target.Sampling.Effort),
-			}
-		}
-		projection.Entries[i] = row
-	}
-	encoded, err := json.Marshal(projection)
+	encoded, err := runtimeCatalogDigestJSON(entries)
 	if err != nil {
 		// The projection consists only of fixed JSON values. Keep Digest total if
 		// a future field accidentally violates that contract.
@@ -905,6 +916,69 @@ func digestRuntimeCatalog(entries []RuntimeCatalogEntry) string {
 	}
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
+}
+
+func runtimeCatalogDigestJSON(entries []RuntimeCatalogEntry) ([]byte, error) {
+	projection := runtimeCatalogDigest{Entries: make([]runtimeCatalogEntryDigest, len(entries))}
+	for i, entry := range entries {
+		configurationFingerprint, err := runtimeCatalogConfigurationFingerprint(entry)
+		if err != nil {
+			return nil, err
+		}
+		row := runtimeCatalogEntryDigest{
+			AgentType:                string(entry.AgentType),
+			AgentHarness:             string(entry.AgentHarness),
+			Profile:                  string(entry.Profile),
+			Description:              entry.Description,
+			ConfigurationFingerprint: configurationFingerprint,
+			SelectionKind:            entry.SelectionKind,
+			Default:                  entry.Default,
+			DefaultModel:             string(entry.DefaultModel),
+			SmallModel:               string(entry.SmallModel),
+			NeedsSmallModel:          entry.NeedsSmallModel,
+			Models:                   make([]runtimeModelOptionDigest, len(entry.Models)),
+		}
+		for j, option := range entry.Models {
+			row.Models[j] = runtimeModelOptionDigest{
+				Alias:         string(option.Alias),
+				Description:   option.Description,
+				DefaultEffort: catalogEffortString(option.DefaultEffort),
+				Efforts:       catalogEffortStrings(option.Efforts),
+			}
+		}
+		projection.Entries[i] = row
+	}
+	return json.Marshal(projection)
+}
+
+func runtimeCatalogConfigurationFingerprint(entry RuntimeCatalogEntry) (string, error) {
+	configuration := runtimeCatalogEntryConfiguration{
+		Source:     entry.Source,
+		Credential: entry.Credential,
+		Models:     make([]runtimeModelOptionConfiguration, len(entry.Models)),
+	}
+	for i, option := range entry.Models {
+		configuration.Models[i] = runtimeModelOptionConfiguration{
+			Source:           effectiveRuntimeSource(entry, option),
+			Credential:       option.Credential,
+			NativeSmallModel: option.NativeSmallModel,
+			Target: runtimeModelConfiguration{
+				Provider:     option.Target.Provider,
+				APIFormat:    option.Target.APIFormat,
+				Name:         option.Target.Name,
+				Origin:       option.Target.Origin,
+				Capabilities: option.Target.Caps,
+				Limits:       option.Target.Limits,
+				Sampling:     option.Target.Sampling.Clone(),
+			},
+		}
+	}
+	encoded, err := json.Marshal(configuration)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func catalogEffortString(effort model.Effort) string {

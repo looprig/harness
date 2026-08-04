@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -20,7 +21,7 @@ func TestNewRuntimeCatalogInvariants(t *testing.T) {
 		{name: "empty catalog is allowed", wantNoErr: true},
 		{name: "empty credential", mutate: func(entries []RuntimeCatalogEntry) { entries[0].Credential = "" }, wantKind: RuntimeCatalogInvalidCredential},
 		{name: "unknown credential", mutate: func(entries []RuntimeCatalogEntry) { entries[0].Credential = "credential-file" }, wantKind: RuntimeCatalogInvalidCredential},
-		{name: "empty subagent type", mutate: func(entries []RuntimeCatalogEntry) { entries[0].SubagentType = "" }, wantKind: RuntimeCatalogInvalidIdentifier},
+		{name: "empty agent type", mutate: func(entries []RuntimeCatalogEntry) { entries[0].AgentType = "" }, wantKind: RuntimeCatalogInvalidIdentifier},
 		{name: "empty harness", mutate: func(entries []RuntimeCatalogEntry) { entries[0].AgentHarness = "" }, wantKind: RuntimeCatalogInvalidIdentifier},
 		{name: "empty profile", mutate: func(entries []RuntimeCatalogEntry) { entries[0].Profile = "" }, wantKind: RuntimeCatalogInvalidIdentifier},
 		{name: "path-like harness", mutate: func(entries []RuntimeCatalogEntry) { entries[0].AgentHarness = "/tmp/child" }, wantKind: RuntimeCatalogInvalidIdentifier},
@@ -83,6 +84,43 @@ func TestNewRuntimeCatalogInvariants(t *testing.T) {
 				t.Fatalf("error kind = %q, want %q", catalogErr.Kind, tt.wantKind)
 			}
 		})
+	}
+}
+
+func TestRuntimeCatalogAllowsLooprigNativeAliasAlongsideGatewayACP(t *testing.T) {
+	t.Parallel()
+
+	entries := []RuntimeCatalogEntry{
+		{
+			AgentType: "worker", AgentHarness: "looprig", Profile: "looprig/native",
+			Description: "In-process Harness loop.", Credential: CredentialNativeAuth, Source: RuntimeSourceNative,
+			Default: true, DefaultModel: "shared",
+			Models: []RuntimeModelOption{{
+				Alias: "shared", Source: RuntimeSourceNative, Credential: CredentialNativeAuth,
+				Target: runtimeModel("looprig-target", model.EffortMedium), DefaultEffort: model.EffortMedium,
+				Efforts: []model.Effort{model.EffortMedium},
+			}},
+		},
+		{
+			AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
+			Description: "Codex ACP harness.", Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway,
+			DefaultModel: "shared",
+			Models: []RuntimeModelOption{{
+				Alias: "shared", Source: RuntimeSourceGateway, Credential: CredentialGatewayBacked,
+				Target: runtimeModel("codex-target", model.EffortMedium), DefaultEffort: model.EffortMedium,
+				Efforts: []model.Effort{model.EffortMedium},
+			}},
+		},
+	}
+	catalog, err := NewRuntimeCatalog(entries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+	for _, harness := range []AgentHarnessName{"looprig", "codex"} {
+		resolved, err := catalog.Resolve("worker", harness, "shared", model.EffortMedium)
+		if err != nil || resolved.AgentHarness != harness || resolved.ModelAlias != "shared" {
+			t.Fatalf("Resolve(%q) = %+v, %v", harness, resolved, err)
+		}
 	}
 }
 
@@ -170,7 +208,7 @@ func TestRuntimeCatalogResolveDefaultsAndRejectsIncompatibleSelectors(t *testing
 	}{
 		{
 			name: "all omitted use defaults", want: Resolved{
-				SubagentType: "worker", AgentHarness: "claude-code", Profile: "claude-profile",
+				AgentType: "worker", AgentHarness: "claude-code", Profile: "claude-profile",
 				Source: RuntimeSourceGateway, SelectionKind: RuntimeSelectionExplicit,
 				Credential: CredentialGatewayBacked, ModelAlias: "sonnet", TargetAlias: "sonnet", SmallModel: "sonnet-small",
 				Target: runtimeModel("sonnet-target", model.EffortMedium), Effort: model.EffortMedium,
@@ -179,7 +217,7 @@ func TestRuntimeCatalogResolveDefaultsAndRejectsIncompatibleSelectors(t *testing
 		{
 			name: "explicit complete tuple", harness: "codex", alias: "o3", effort: model.EffortHigh,
 			want: Resolved{
-				SubagentType: "worker", AgentHarness: "codex", Profile: "codex-profile",
+				AgentType: "worker", AgentHarness: "codex", Profile: "codex-profile",
 				Source: RuntimeSourceGateway, SelectionKind: RuntimeSelectionExplicit,
 				Credential: CredentialGatewayBacked, ModelAlias: "o3", TargetAlias: "o3@high", SmallModel: "o3",
 				Target: runtimeModel("o3-target", model.EffortLow), Effort: model.EffortHigh,
@@ -214,7 +252,7 @@ func TestRuntimeCatalogResolveDefaultsAndRejectsIncompatibleSelectors(t *testing
 			if err != nil {
 				t.Fatalf("Resolve() error = %v", err)
 			}
-			if tt.want.SubagentType != "" {
+			if tt.want.AgentType != "" {
 				if !reflect.DeepEqual(got, tt.want) {
 					t.Fatalf("Resolve() = %#v, want %#v", got, tt.want)
 				}
@@ -403,6 +441,8 @@ func TestRuntimeCatalogDefensiveCopiesAndDigest(t *testing.T) {
 		name   string
 		mutate func(*model.Model)
 	}{
+		{name: "provider", mutate: func(target *model.Model) { target.Provider = "different-provider" }},
+		{name: "API format", mutate: func(target *model.Model) { target.APIFormat = "different-api-format" }},
 		{name: "temperature", mutate: func(target *model.Model) { value := 0.25; target.Sampling.Temperature = &value }},
 		{name: "top-p", mutate: func(target *model.Model) { value := 0.75; target.Sampling.TopP = &value }},
 		{name: "max tokens", mutate: func(target *model.Model) { value := 321; target.Sampling.MaxTokens = &value }},
@@ -420,6 +460,285 @@ func TestRuntimeCatalogDefensiveCopiesAndDigest(t *testing.T) {
 			t.Errorf("catalog digest did not change for %s mutation", mutation.name)
 		}
 	}
+
+	changedWiring := testCatalogEntries()
+	changedWiring[0].Source = RuntimeSourceNative
+	changedWiring[0].Credential = CredentialNativeAuth
+	changedWiring[0].Models[0].Source = RuntimeSourceNative
+	changedWiring[0].Models[0].Credential = CredentialNativeAuth
+	wiringCatalog, err := NewRuntimeCatalog(changedWiring)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog(changed wiring) error = %v", err)
+	}
+	if wiringCatalog.Digest() == digest {
+		t.Fatal("catalog digest did not change for source and credential wiring")
+	}
+}
+
+func TestRuntimeCatalogDescriptionCloning(t *testing.T) {
+	entries := testCatalogEntries()
+	entries[0].Description = "Codex harness guidance"
+	entries[0].Models[0].Description = "Use o3 for difficult implementation work"
+
+	catalog, err := NewRuntimeCatalog(entries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+	entries[0].Description = "changed input harness description"
+	entries[0].Models[0].Description = "changed input model description"
+
+	got := catalog.EntriesFor("worker")
+	codex := runtimeCatalogEntryForHarness(t, got, "codex")
+	if codex.Description != "Codex harness guidance" {
+		t.Fatalf("entry description = %q, want original description", codex.Description)
+	}
+	if codex.Models[0].Description != "Use o3 for difficult implementation work" {
+		t.Fatalf("model description = %q, want original description", codex.Models[0].Description)
+	}
+
+	codex.Description = "changed returned harness description"
+	codex.Models[0].Description = "changed returned model description"
+	again := runtimeCatalogEntryForHarness(t, catalog.EntriesFor("worker"), "codex")
+	if again.Description != "Codex harness guidance" || again.Models[0].Description != "Use o3 for difficult implementation work" {
+		t.Fatalf("returned descriptions mutated catalog: entry=%q model=%q", again.Description, again.Models[0].Description)
+	}
+}
+
+func TestRuntimeCatalogDescriptionValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		description string
+		wantErr     bool
+	}{
+		{name: "absent"},
+		{name: "single line", description: "Use for focused implementation work."},
+		{name: "maximum bytes", description: strings.Repeat("a", 256)},
+		{name: "invalid UTF-8", description: string([]byte{0xff}), wantErr: true},
+		{name: "blank present", description: "   ", wantErr: true},
+		{name: "leading whitespace", description: " guidance", wantErr: true},
+		{name: "trailing whitespace", description: "guidance ", wantErr: true},
+		{name: "newline", description: "first\nsecond", wantErr: true},
+		{name: "carriage return", description: "first\rsecond", wantErr: true},
+		{name: "tab", description: "first\tsecond", wantErr: true},
+		{name: "unicode line separator", description: "first\u2028second", wantErr: true},
+		{name: "over maximum bytes", description: strings.Repeat("a", 257), wantErr: true},
+	}
+
+	fields := []struct {
+		name   string
+		field  string
+		mutate func([]RuntimeCatalogEntry, string)
+	}{
+		{name: "harness", field: "Description", mutate: func(entries []RuntimeCatalogEntry, description string) {
+			entries[0].Description = description
+		}},
+		{name: "model", field: "Models.Description", mutate: func(entries []RuntimeCatalogEntry, description string) {
+			entries[0].Models[0].Description = description
+		}},
+	}
+
+	for _, field := range fields {
+		for _, tt := range tests {
+			t.Run(field.name+"/"+tt.name, func(t *testing.T) {
+				entries := testCatalogEntries()
+				field.mutate(entries, tt.description)
+				_, err := NewRuntimeCatalog(entries)
+				if !tt.wantErr {
+					if err != nil {
+						t.Fatalf("NewRuntimeCatalog() error = %v", err)
+					}
+					return
+				}
+				var catalogErr *RuntimeCatalogError
+				if !errors.As(err, &catalogErr) {
+					t.Fatalf("NewRuntimeCatalog() error = %T %v, want *RuntimeCatalogError", err, err)
+				}
+				if catalogErr.Kind != RuntimeCatalogInvalidDescription || catalogErr.Field != field.field {
+					t.Fatalf("catalog error = %#v, want kind %q field %q", catalogErr, RuntimeCatalogInvalidDescription, field.field)
+				}
+			})
+		}
+	}
+}
+
+func TestRuntimeCatalogDescriptionDigest(t *testing.T) {
+	entries := testCatalogEntries()
+	entries[0].Description = "Codex harness guidance"
+	entries[0].Models[0].Description = "Use o3 for difficult implementation work"
+	entries[0].Models[0].Target.BaseURL = "https://endpoint.example/v1"
+
+	catalog, err := NewRuntimeCatalog(entries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+	baseDigest := catalog.Digest()
+
+	changedHarness := testCatalogEntries()
+	changedHarness[0].Description = "Different Codex harness guidance"
+	changedHarness[0].Models[0].Description = entries[0].Models[0].Description
+	harnessCatalog, err := NewRuntimeCatalog(changedHarness)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog(changed harness) error = %v", err)
+	}
+	if harnessCatalog.Digest() == baseDigest {
+		t.Fatal("catalog digest did not change for harness description")
+	}
+
+	changedModel := entries
+	changedModel[0].Models[0].Description = "Different o3 model guidance"
+	modelCatalog, err := NewRuntimeCatalog(changedModel)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog(changed model) error = %v", err)
+	}
+	if modelCatalog.Digest() == baseDigest {
+		t.Fatal("catalog digest did not change for model description")
+	}
+
+	encoded, err := runtimeCatalogDigestJSON(catalog.entries)
+	if err != nil {
+		t.Fatalf("runtimeCatalogDigestJSON() error = %v", err)
+	}
+	var projection any
+	if err := json.Unmarshal(encoded, &projection); err != nil {
+		t.Fatalf("unmarshal digest JSON: %v", err)
+	}
+	if got, want := countJSONKey(projection, "description"), 2; got != want {
+		t.Fatalf("digest JSON description count = %d, want %d: %s", got, want, encoded)
+	}
+	changedEncoded, err := runtimeCatalogDigestJSON(modelCatalog.entries)
+	if err != nil {
+		t.Fatalf("runtimeCatalogDigestJSON(changed model) error = %v", err)
+	}
+	var baseProjection, changedProjection runtimeCatalogDigest
+	if err := json.Unmarshal(encoded, &baseProjection); err != nil {
+		t.Fatalf("unmarshal base digest JSON: %v", err)
+	}
+	if err := json.Unmarshal(changedEncoded, &changedProjection); err != nil {
+		t.Fatalf("unmarshal changed digest JSON: %v", err)
+	}
+	baseCodex := runtimeCatalogDigestEntryForHarness(t, baseProjection, "codex")
+	changedCodex := runtimeCatalogDigestEntryForHarness(t, changedProjection, "codex")
+	if baseCodex.ConfigurationFingerprint != changedCodex.ConfigurationFingerprint {
+		t.Fatalf("description-only change altered configuration fingerprint: base=%q changed=%q", baseCodex.ConfigurationFingerprint, changedCodex.ConfigurationFingerprint)
+	}
+	if string(encoded) == string(changedEncoded) || catalog.Digest() == modelCatalog.Digest() {
+		t.Fatal("description-only change did not alter the outer digest projection and digest")
+	}
+	for _, digestJSON := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "base", data: encoded},
+		{name: "changed", data: changedEncoded},
+	} {
+		var value any
+		if err := json.Unmarshal(digestJSON.data, &value); err != nil {
+			t.Fatalf("unmarshal %s digest JSON: %v", digestJSON.name, err)
+		}
+		if got, want := countJSONKey(value, "description"), 2; got != want {
+			t.Fatalf("%s digest JSON description count = %d, want %d: %s", digestJSON.name, got, want, digestJSON.data)
+		}
+	}
+	for _, forbidden := range []string{"https://endpoint.example/v1", "base_url", "api_key", "secret"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("digest JSON contains forbidden provider wiring %q: %s", forbidden, encoded)
+		}
+	}
+	if strings.Contains(string(encoded), "subagent_type") || !strings.Contains(string(encoded), "agent_type") {
+		t.Fatalf("digest JSON role field = %s, want agent_type and no subagent_type", encoded)
+	}
+}
+
+func TestRuntimeCatalogDigestProjectionOmitsRuntimeWiring(t *testing.T) {
+	entries := testCatalogEntries()
+	option := &entries[0].Models[0]
+	option.NativeSmallModel = "private-native-small-model"
+	option.Target.Provider = "private-provider-id"
+	option.Target.APIFormat = "private-api-format"
+	option.Target.BaseURL = "https://private-endpoint.example/v1"
+	option.Target.Name = "private-provider-model-id"
+	temperature := 0.25
+	option.Target.Sampling.Temperature = &temperature
+	option.Target.Sampling.Stop = []string{"private-stop-sequence"}
+
+	catalog, err := NewRuntimeCatalog(entries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+	encoded, err := runtimeCatalogDigestJSON(catalog.entries)
+	if err != nil {
+		t.Fatalf("runtimeCatalogDigestJSON() error = %v", err)
+	}
+	var projection any
+	if err := json.Unmarshal(encoded, &projection); err != nil {
+		t.Fatalf("unmarshal digest JSON: %v", err)
+	}
+	if got, want := countJSONKey(projection, "configuration_fingerprint"), len(catalog.entries); got != want {
+		t.Fatalf("digest JSON configuration fingerprint count = %d, want %d: %s", got, want, encoded)
+	}
+
+	for _, forbidden := range []string{
+		"source", "credential", "native_small_model",
+		"provider", "api_format", "name", "origin", "capabilities", "limits",
+		"temperature", "top_p", "max_tokens", "stop", "sampling_effort",
+	} {
+		if got := countJSONKey(projection, forbidden); got != 0 {
+			t.Errorf("digest JSON contains forbidden field %q %d time(s): %s", forbidden, got, encoded)
+		}
+	}
+	for _, forbidden := range []string{
+		"gateway-backed", "gateway",
+		"private-native-small-model", "private-provider-id", "private-api-format",
+		"https://private-endpoint.example/v1", "private-provider-model-id", "private-stop-sequence",
+	} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Errorf("digest JSON contains forbidden runtime wiring value %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func runtimeCatalogEntryForHarness(t *testing.T, entries []RuntimeCatalogEntry, harness AgentHarnessName) *RuntimeCatalogEntry {
+	t.Helper()
+	for i := range entries {
+		if entries[i].AgentHarness == harness {
+			return &entries[i]
+		}
+	}
+	t.Fatalf("no entry for harness %q", harness)
+	return nil
+}
+
+func countJSONKey(value any, wanted string) int {
+	switch value := value.(type) {
+	case []any:
+		count := 0
+		for _, item := range value {
+			count += countJSONKey(item, wanted)
+		}
+		return count
+	case map[string]any:
+		count := 0
+		for key, item := range value {
+			if key == wanted {
+				count++
+			}
+			count += countJSONKey(item, wanted)
+		}
+		return count
+	default:
+		return 0
+	}
+}
+
+func runtimeCatalogDigestEntryForHarness(t *testing.T, projection runtimeCatalogDigest, harness AgentHarnessName) runtimeCatalogEntryDigest {
+	t.Helper()
+	for _, entry := range projection.Entries {
+		if entry.AgentHarness == string(harness) {
+			return entry
+		}
+	}
+	t.Fatalf("no digest entry for harness %q", harness)
+	return runtimeCatalogEntryDigest{}
 }
 
 func TestRuntimeCatalogNeedsSmallModel(t *testing.T) {
@@ -565,7 +884,7 @@ func TestRuntimeCatalogResolvesNativeHarnessManagedEntryWithoutModelIdentity(t *
 	t.Parallel()
 
 	entry := RuntimeCatalogEntry{
-		SubagentType:  "worker",
+		AgentType:     "worker",
 		AgentHarness:  "codex",
 		Profile:       "acp/codex",
 		Credential:    CredentialNativeAuth,
@@ -604,7 +923,7 @@ func TestRuntimeCatalogAllowsSameHarnessWithDistinctGatewayAndNativeSources(t *t
 	t.Parallel()
 
 	native := RuntimeCatalogEntry{
-		SubagentType:  "worker",
+		AgentType:     "worker",
 		AgentHarness:  "codex",
 		Profile:       "acp/codex-native",
 		Credential:    CredentialNativeAuth,
@@ -613,7 +932,7 @@ func TestRuntimeCatalogAllowsSameHarnessWithDistinctGatewayAndNativeSources(t *t
 		Default:       true,
 	}
 	gateway := RuntimeCatalogEntry{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-gateway",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-gateway",
 		Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway,
 		DefaultModel: "luna",
 		Models: []RuntimeModelOption{{
@@ -646,7 +965,7 @@ func TestRuntimeCatalogResolvesExplicitSourceForSameHarness(t *testing.T) {
 	t.Parallel()
 
 	gateway := RuntimeCatalogEntry{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-gateway",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-gateway",
 		Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, Default: true,
 		DefaultModel: "luna",
 		Models: []RuntimeModelOption{{
@@ -655,7 +974,7 @@ func TestRuntimeCatalogResolvesExplicitSourceForSameHarness(t *testing.T) {
 		}},
 	}
 	native := RuntimeCatalogEntry{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
 		Credential: CredentialNativeAuth, Source: RuntimeSourceNative,
 		SelectionKind: RuntimeSelectionHarnessManaged,
 	}
@@ -692,7 +1011,7 @@ func TestRuntimeCatalogResolvesExplicitSourceUsingSourceLocalDefault(t *testing.
 	t.Parallel()
 
 	catalog, err := NewRuntimeCatalog([]RuntimeCatalogEntry{{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
 		Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, Default: true,
 		DefaultModel: "gateway",
 		Models: []RuntimeModelOption{
@@ -729,7 +1048,7 @@ func TestRuntimeCatalogRejectsDefaultModelFromDifferentSource(t *testing.T) {
 	t.Parallel()
 
 	_, err := NewRuntimeCatalog([]RuntimeCatalogEntry{{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
 		Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, Default: true,
 		DefaultModel: "native",
 		Models: []RuntimeModelOption{
@@ -747,7 +1066,7 @@ func TestRuntimeCatalogExplicitSourceDoesNotFallbackToManagedDefault(t *testing.
 	t.Parallel()
 
 	catalog, err := NewRuntimeCatalog([]RuntimeCatalogEntry{{
-		SubagentType:  "worker",
+		AgentType:     "worker",
 		AgentHarness:  "codex",
 		Profile:       "acp/codex-native",
 		Credential:    CredentialNativeAuth,
@@ -795,7 +1114,7 @@ func TestRuntimeCatalogExplicitSourcePrefersExactEntryForModelAndTargetResolutio
 
 	catalog, err := NewRuntimeCatalog([]RuntimeCatalogEntry{
 		{
-			SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
+			AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
 			Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, Default: true,
 			DefaultModel: "gateway-model",
 			Models: []RuntimeModelOption{
@@ -804,7 +1123,7 @@ func TestRuntimeCatalogExplicitSourcePrefersExactEntryForModelAndTargetResolutio
 			},
 		},
 		{
-			SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
+			AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
 			Credential: CredentialNativeAuth, Source: RuntimeSourceNative,
 			DefaultModel: "native-dedicated",
 			Models: []RuntimeModelOption{{
@@ -839,15 +1158,15 @@ func TestRuntimeCatalogRejectsInvalidSelectionMatrix(t *testing.T) {
 	t.Parallel()
 
 	managed := func() RuntimeCatalogEntry {
-		return RuntimeCatalogEntry{SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialNativeAuth, Source: RuntimeSourceNative, SelectionKind: RuntimeSelectionHarnessManaged, Default: true}
+		return RuntimeCatalogEntry{AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialNativeAuth, Source: RuntimeSourceNative, SelectionKind: RuntimeSelectionHarnessManaged, Default: true}
 	}
 	tests := []struct {
 		name  string
 		entry RuntimeCatalogEntry
 		want  RuntimeCatalogErrorKind
 	}{
-		{name: "gateway managed", entry: RuntimeCatalogEntry{SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, SelectionKind: RuntimeSelectionHarnessManaged, Default: true}, want: RuntimeCatalogInvalidSelectionKind},
-		{name: "explicit model-less native", entry: RuntimeCatalogEntry{SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialNativeAuth, Source: RuntimeSourceNative, SelectionKind: RuntimeSelectionExplicit, Default: true}, want: RuntimeCatalogMissingDefaultModel},
+		{name: "gateway managed", entry: RuntimeCatalogEntry{AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, SelectionKind: RuntimeSelectionHarnessManaged, Default: true}, want: RuntimeCatalogInvalidSelectionKind},
+		{name: "explicit model-less native", entry: RuntimeCatalogEntry{AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialNativeAuth, Source: RuntimeSourceNative, SelectionKind: RuntimeSelectionExplicit, Default: true}, want: RuntimeCatalogMissingDefaultModel},
 		{name: "managed with model", entry: func() RuntimeCatalogEntry {
 			entry := managed()
 			entry.Models = []RuntimeModelOption{{Alias: "model", Target: runtimeModel("model", model.EffortMedium), DefaultEffort: model.EffortMedium, Efforts: []model.Effort{model.EffortMedium}}}
@@ -869,12 +1188,12 @@ func TestRuntimeCatalogRejectsInvalidSelectionMatrix(t *testing.T) {
 func testCatalogEntries() []RuntimeCatalogEntry {
 	return []RuntimeCatalogEntry{
 		{
-			SubagentType: "worker", AgentHarness: "codex", Profile: "codex-profile",
+			AgentType: "worker", AgentHarness: "codex", Profile: "codex-profile",
 			Credential: CredentialGatewayBacked, Default: false, DefaultModel: "o3", SmallModel: "o3",
 			Models: []RuntimeModelOption{{Alias: "o3", Target: runtimeModel("o3-target", model.EffortLow), DefaultEffort: model.EffortLow, Efforts: []model.Effort{model.EffortLow, model.EffortHigh}}},
 		},
 		{
-			SubagentType: "worker", AgentHarness: "claude-code", Profile: "claude-profile",
+			AgentType: "worker", AgentHarness: "claude-code", Profile: "claude-profile",
 			Credential: CredentialGatewayBacked, Default: true, DefaultModel: "sonnet", SmallModel: "sonnet-small",
 			Models: []RuntimeModelOption{
 				{Alias: "sonnet", Target: runtimeModel("sonnet-target", model.EffortMedium), DefaultEffort: model.EffortMedium, Efforts: []model.Effort{model.EffortMedium, model.EffortHigh}},

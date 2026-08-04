@@ -434,7 +434,7 @@ func WithLifecycleHooks(runner *hook.Runner) LifecycleOption {
 	}
 }
 
-// WithLifecycleLimits captures the in-session subagent-spawn safety caps (depth + quota) the
+// WithLifecycleLimits captures the in-session agent-spawn safety caps (depth + quota) the
 // session enforces. Forwarded to both NewSession and RestoreSession as WithLimits.
 func WithLifecycleLimits(l Limits) LifecycleOption {
 	return func(r *Lifecycle) {

@@ -75,20 +75,16 @@ func TestAttachRestoredTombstonedLoopPublishesOnceAndExposesClosedStatus(t *test
 	}
 
 	controller := &scopedController{manager: manager, parentLoopID: parentID, style: loop.DelegationManaged}
-	status, err := controller.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, DelegateID: childID})
+	status, err := controller.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: childID})
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
-	if status.Status != tool.DelegateStatusFailed {
-		t.Fatalf("status = %v, want failed", status.Status)
+	if len(status.Agents) != 1 || status.Agents[0].State != tool.AgentStateUnavailable {
+		t.Fatalf("agents = %+v, want unavailable", status.Agents)
 	}
 
-	for _, operation := range []tool.DelegateOperation{tool.DelegateSend, tool.DelegateWait, tool.DelegateInterrupt} {
-		req := tool.DelegateRequest{Operation: operation, DelegateID: childID}
-		if operation == tool.DelegateWait {
-			requestID := mustUUID()
-			req.RequestID = &requestID
-		}
+	for _, operation := range []tool.DelegateOperation{tool.DelegateSend, tool.DelegateInterrupt} {
+		req := tool.DelegateRequest{Operation: operation, AgentID: childID}
 		_, err := controller.Execute(context.Background(), req)
 		var delegateErr *DelegateError
 		if !errors.As(err, &delegateErr) || delegateErr.Kind != DelegateClosed {
@@ -97,14 +93,74 @@ func TestAttachRestoredTombstonedLoopPublishesOnceAndExposesClosedStatus(t *test
 	}
 }
 
+func TestAttachRestoredTombstonedLoopProjectsDurableSelectedHarness(t *testing.T) {
+	t.Parallel()
+	sessionID, parentID, childID := mustUUID(), mustUUID(), mustUUID()
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		AgentType: "agent", AgentHarness: "alpha", Profile: "acp/shared", Default: true,
+		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionHarnessManaged,
+	}, {
+		AgentType: "agent", AgentHarness: "codex", Profile: "acp/shared",
+		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
+		SelectionKind: loop.RuntimeSelectionHarnessManaged,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := event.LoopStarted{
+		Header: event.Header{
+			AgentName:   "agent",
+			Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: childID},
+			Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: parentID}},
+		},
+		AgentRuntime: &event.AgentRuntime{
+			Harness: "codex", Profile: "acp/shared", CredentialMode: "native-auth",
+			Source: "native", SelectionKind: "harness-managed",
+		},
+	}
+	bound := bindCfg(engineCfg(&stubLLM{}, loop.EngineNative, "system"), sessionID, childID)
+	bound, err = restoreRuntimeBinding(started, bound, foldLoopInference([]event.Event{started}), catalog, true, false)
+	if err != nil {
+		t.Fatalf("restoreRuntimeBinding: %v", err)
+	}
+	s := &Session{
+		sessionID: sessionID, sessionCtx: context.Background(), factory: event.NewFactory(uuid.New, time.Now),
+		hub: hub.New(sessionID), loops: make(map[uuid.UUID]*loopHandle),
+	}
+	manager := newDelegationManager(Topology{})
+	manager.attach(s)
+	s.delegation = manager
+	plan := loopPlan{
+		started: started, bound: bound,
+		bindings:   tool.Bindings{SessionID: sessionID, LoopID: childID},
+		tombstoned: true,
+	}
+	if err := s.attachRestoredTombstonedLoop(plan, loop.Provenance{LoopID: parentID}); err != nil {
+		t.Fatalf("attachRestoredTombstonedLoop: %v", err)
+	}
+	controller := &scopedController{
+		manager: manager, parentLoopID: parentID, style: loop.DelegationManaged,
+		runtimeCatalog: catalog, hasRuntimeCatalog: true,
+	}
+	status, err := controller.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: childID})
+	if err != nil || len(status.Agents) != 1 {
+		t.Fatalf("status = %+v, %v", status.Agents, err)
+	}
+	if got := status.Agents[0].Runtime.Harness; got != "codex" {
+		t.Fatalf("restored public runtime harness = %q, want durable harness codex", got)
+	}
+}
+
 func TestSeedResolvedDelegateRecordsMarksTombstonedRequestsFailed(t *testing.T) {
 	t.Parallel()
 	requestID, childID := mustUUID(), mustUUID()
 	manager := newDelegationManager(Topology{})
 	cmd := command.UserInput{
-		Header:       command.Header{CommandID: requestID, Agency: identity.AgencyMachine},
-		NoFold:       true,
-		TargetLoopID: childID,
+		Header:             command.Header{CommandID: requestID, Agency: identity.AgencyMachine},
+		NoFold:             true,
+		TargetLoopID:       childID,
+		BackgroundHandBack: true,
 	}
 	accepted := event.LoopStarted{
 		Header:           event.Header{Coordinates: identity.Coordinates{LoopID: childID}},
@@ -119,7 +175,7 @@ func TestSeedResolvedDelegateRecordsMarksTombstonedRequestsFailed(t *testing.T) 
 	); err != nil {
 		t.Fatal(err)
 	}
-	resolved, ok := manager.getResolved(requestID)
+	resolved, ok := durableResolvedRecord(manager, requestID)
 	if !ok || resolved.childID != childID || resolved.status != tool.DelegateStatusFailed {
 		t.Fatalf("resolved = %+v, %v; want failed child %v", resolved, ok, childID)
 	}
@@ -295,7 +351,7 @@ func nativeRestoreFailurePlan(t *testing.T, sessionID, rootID, childID uuid.UUID
 func nativeRestoreRuntimeCatalog(t *testing.T) loop.RuntimeCatalog {
 	t.Helper()
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionExplicit, Default: true, DefaultModel: "luna",
 		Models: []loop.RuntimeModelOption{{

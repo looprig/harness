@@ -270,7 +270,7 @@ func findForeignSID(events []event.Event) string {
 }
 
 // countSpawnedLoops counts the durable NON-ROOT LoopStarted events in the replayed
-// stream — those whose Header.Cause.Coordinates is non-zero (a subagent spawn carries the
+// stream — those whose Header.Cause.Coordinates is non-zero (an agent spawn carries the
 // spawning loop/turn/step in its Cause). It is the restore-time re-seed of the session's
 // cumulative spawn counter: the live counter increments only on a successful NewLoop spawn
 // (a rejected or rolled-back spawn emits NO LoopStarted, §6d), so counting the durable

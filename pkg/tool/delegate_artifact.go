@@ -13,7 +13,6 @@ type DelegateRuntime struct {
 	SmallModel    string
 	Effort        string
 	Explicit      DelegateRuntimeExplicit
-	Advertised    DelegateRuntimeAdvertised
 }
 
 // DelegateRuntimeExplicit records which selectors were supplied by the caller.
@@ -26,22 +25,9 @@ type DelegateRuntimeExplicit struct {
 	Effort  bool
 }
 
-// DelegateRuntimeAdvertised records which resolved selectors were visible in
-// the parent-scoped Subagent schema. It is presentation metadata only; the
-// controller ignores it and revalidates the concrete runtime tuple itself.
-type DelegateRuntimeAdvertised struct {
-	Harness bool
-	Source  bool
-	Model   bool
-	Effort  bool
-}
-
-func (a DelegateRuntimeAdvertised) Any() bool {
-	return a.Harness || a.Source || a.Model || a.Effort
-}
-
-// DelegateArtifact is the prepared, fully validated Subagent call. It is
-// created once in PrepareCall and consumed once in execution.
+// DelegateArtifact is a prepared, fully validated agent-tool call. It is
+// created once in PrepareCall and consumed once in execution by StartAgent,
+// MessageAgent, ListAgents, or StopAgent.
 type DelegateArtifact struct {
 	Request DelegateRequest
 	Runtime *DelegateRuntime

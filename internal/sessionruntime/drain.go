@@ -96,16 +96,22 @@ func (e *drainLostError) Unwrap() error { return e.Cause }
 // helper would then block until ctx-cancel or subscription loss. The helper does
 // not — and cannot — enforce this ordering; it is the one subtlety the caller owns.
 func drainToFinalText(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func()) (string, error) {
-	return drainCorrelated(ctx, sub, commandID, interrupt, true)
+	return drainCorrelated(ctx, sub, commandID, interrupt, true, nil)
 }
 
 // drainDelegateAnswer resolves delegation requests from the correlated TurnDone.Message
 // only. StepDone is progress, never a substitute terminal answer.
 func drainDelegateAnswer(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func()) (string, error) {
-	return drainCorrelated(ctx, sub, commandID, interrupt, false)
+	return drainDelegateAnswerObserved(ctx, sub, commandID, interrupt, nil)
 }
 
-func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func(), stepFallback bool) (string, error) {
+// drainDelegateAnswerObserved reports when the correlated request leaves the child queue
+// and opens a turn. Managed foreground and background drains use the same lifecycle edge.
+func drainDelegateAnswerObserved(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt, onTurnStarted func()) (string, error) {
+	return drainCorrelated(ctx, sub, commandID, interrupt, false, onTurnStarted)
+}
+
+func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func(), stepFallback bool, onTurnStarted func()) (string, error) {
 	var (
 		turnID    uuid.UUID // captured from the opening TurnStarted (phase-1 -> phase-2 edge)
 		loopID    uuid.UUID // captured alongside turnID; phase-2 cross-checks it (fail-secure)
@@ -124,7 +130,7 @@ func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid
 			if !ok {
 				return "", &drainLostError{Cause: sub.Err()}
 			}
-			if text, done, err := handleCorrelatedEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep, stepFallback); done {
+			if text, done, err := handleCorrelatedEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep, stepFallback, onTurnStarted); done {
 				return text, err
 			}
 			continue
@@ -135,7 +141,7 @@ func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid
 			if !ok {
 				return "", &drainLostError{Cause: sub.Err()}
 			}
-			if text, done, err := handleCorrelatedEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep, stepFallback); done {
+			if text, done, err := handleCorrelatedEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep, stepFallback, onTurnStarted); done {
 				return text, err
 			}
 		case <-ctx.Done():
@@ -167,6 +173,7 @@ func handleCorrelatedEvent(
 	haveTurn *bool,
 	lastStep *string,
 	stepFallback bool,
+	onTurnStarted func(),
 ) (text string, done bool, err error) {
 	if !*haveTurn {
 		// Phase 1: await the opening resolution event for our submit.
@@ -176,6 +183,9 @@ func handleCorrelatedEvent(
 				*turnID = e.Coordinates.TurnID
 				*loopID = e.Coordinates.LoopID
 				*haveTurn = true
+				if onTurnStarted != nil {
+					onTurnStarted()
+				}
 			}
 		case event.TurnRejected:
 			if e.Cause.CommandID == commandID {

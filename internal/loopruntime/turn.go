@@ -478,7 +478,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		stepEmit := stepStampingEmit(cfg.emit, st.id)
 		stepEmitContext := stepStampingContextEmit(cfg.emitContext, st.id)
 		// Inject the running step's coordinates so every tool in the batch can read
-		// its OWN provenance via ProvenanceFrom(ctx) — the Subagent tool passes this
+		// its OWN provenance via ProvenanceFrom(ctx) — the agent tool passes this
 		// as the `parent` when spawning a sub-loop. This is the one seam where all
 		// three ids are unambiguously the running step's (st.id is this step's id),
 		// so we wrap once at the batch boundary rather than per-tool in the runner.

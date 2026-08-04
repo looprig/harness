@@ -176,7 +176,13 @@ func overrideBoundRuntimeSelection(bound BoundDefinition, profile RuntimeProfile
 
 	clone := *state
 	definition := *state.definition
+	// An explicit native catalogue row is an in-process runtime selection: it
+	// changes the bound model/effort but must remain on the native backend. ACP
+	// and other adapter profiles continue to use EngineAdapter.
 	definition.engine = EngineAdapter
+	if profile == RuntimeProfileName("looprig/native") && source == RuntimeSourceNative && selectionKind == RuntimeSelectionExplicit {
+		definition.engine = EngineNative
+	}
 	definition.model = cloneModel(target)
 	clone.definition = &definition
 	clone.runtimeProfile = profile

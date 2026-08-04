@@ -90,7 +90,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 	}
 	liveMode, liveModel := liveViewFor(bound, ri)
 	s.loopsMu.Lock()
-	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, bindings: bindings, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
+	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, bindings: bindings, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle, agentName: started.DisplayName, agentMode: loop.ModeName(started.InitialMode), selectedHarness: restoredSelectedHarness(started.AgentRuntime)}
 	s.loopsMu.Unlock()
 	return nil
 }
@@ -242,9 +242,9 @@ func restoreTopologySession(
 	}
 
 	// (2) Replay the whole stream once for discovery (the persisted fingerprint + the
-	// root loop id + the subagent spawn count) and gate recovery. A ZERO LoopID leaves
+	// root loop id + the agent spawn count) and gate recovery. A ZERO LoopID leaves
 	// the event projection UNNARROWED — every loop's events — so findRootLoopStarted and
-	// countSpawnedLoops see the subagent LoopStarted events, not just the root's. Fail
+	// countSpawnedLoops see the agent LoopStarted events, not just the root's. Fail
 	// closed on any error.
 	allRecords, err := drainRecordReplay(ctx, replayer, journal.ReplayRequest{Follow: false})
 	if err != nil {
@@ -364,7 +364,7 @@ func restoreTopologySession(
 		adoptOnAccept = len(assessment.Changes) > 0 || assessment.BaselineUpgrade
 	}
 	// Stand up the delegation manager BEFORE binding any loop so each restored loop's
-	// Subagent tool is bound against a parent-scoped controller; it is attached to the
+	// agent collaboration tools are bound against a parent-scoped controller; they are attached to the
 	// live session once buildRestoredSession creates it. Seed its durable request→terminal
 	// index from the full stream so a wait for a wait:false request submitted before the
 	// restart resolves after restore.
@@ -416,9 +416,9 @@ func restoreTopologySession(
 	bound := activePlan.bound
 
 	// Re-seed the cumulative spawn counter from the durable log so the quota SURVIVES the
-	// restart: count the non-root LoopStarted events (subagent spawns). `all` is the
+	// restart: count the non-root LoopStarted events (agent spawns). `all` is the
 	// full-stream replay (every loop's events, not loop-scoped), so it already carries
-	// every subagent LoopStarted — no extra read. Without this, `spawned` would reset to 0
+	// every agent LoopStarted — no extra read. Without this, `spawned` would reset to 0
 	// and a restart would grant a fresh quota (a trivial cap bypass, design §16.3).
 	spawnedCount := countSpawnedLoops(all)
 
@@ -563,6 +563,10 @@ func restoreTopologySession(
 	if err := attachAndActivate(s, all, plans, rootLoopID); err != nil {
 		return abortAccepted(s, err)
 	}
+	// Restored children are registered after the delegation manager is attached.
+	// Build the direct-child ownership index only after every live or tombstoned
+	// handle has been installed, before the restored session can escape.
+	s.seedDirectChildren()
 	// Correlation is seeded only after every checked crash closure committed AND every
 	// restored loop was attached. A child can fail during restored backend construction
 	// after the initial fold (and be tombstoned by attachAndActivate), so seeding before
@@ -577,6 +581,10 @@ func restoreTopologySession(
 	if err := seedResolvedDelegateRecords(manager, allRecords, all, crashClosures, tombstoned); err != nil {
 		return abortAccepted(s, &RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
+	backgroundPlan, err := manager.planRestoredBackgroundRequests(s, allRecords, all, crashClosures)
+	if err != nil {
+		return abortAccepted(s, &RestoreError{Kind: RestoreReplayFailed, Cause: err})
+	}
 	// RestoreDone is the commit point: every loop is bound, crash-closed, built,
 	// attached, and the active selection has been validated before this append.
 	if err := appendRestoreEvent(ctx, j, factory, event.RestoreDone{
@@ -589,6 +597,7 @@ func restoreTopologySession(
 	// offload-GC runner now the hub exists (bound to hub.IsIdle).
 	s.watchRootLease()
 	s.startOffloadGC()
+	manager.reconcileRestoredBackgroundRequests(s, backgroundPlan)
 	contextTransferred = true
 	return s, nil
 }
@@ -683,7 +692,7 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 // planLoops binds and independently folds every durable loop into a loopPlan (in stream
 // order) and identifies the active primer's plan. For a single-definition topology it maps
 // the configured root onto the sole definition and skips non-root loops whose AgentName is
-// unknown (subagents of a single-definition run). It is the single Bind of each loop,
+// unknown (children of a single-definition run). It is the single Bind of each loop,
 // performed inside the restore lease. It returns the ordered plans and the active plan, or a
 // typed error the caller records as a RestoreErrored.
 func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
@@ -713,7 +722,7 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		if nameErr := checkAgentName(started.AgentName, bound.Name(), allowMismatch); nameErr != nil {
 			return nil, loopPlan{}, nameErr
 		}
-		// A restored subagent keeps its OWN definition's access gate: authority
+		// A restored child agent keeps its OWN definition's access gate: authority
 		// differences between loops are expressed by the consumer configuring
 		// different gates per definition (or OverrideBoundAccess at a binding
 		// seam), never by harness-side attenuation against the parent.
@@ -965,6 +974,8 @@ func (s *Session) attachRestoredTombstonedLoop(plan loopPlan, parent loop.Proven
 		id: plan.started.LoopID, owner: s, bound: plan.bound, bindings: plan.bindings,
 		parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel,
 		state: tool.DelegateStatusFailed, tombstoned: true,
+		agentName: plan.started.DisplayName, agentMode: loop.ModeName(plan.started.InitialMode),
+		selectedHarness: restoredSelectedHarness(plan.started.AgentRuntime),
 	}
 	s.loopsMu.Lock()
 	if existing, ok := s.loops[plan.started.LoopID]; ok && existing.tombstoned {
@@ -1170,9 +1181,16 @@ func buildRestoredSession(
 	// exactly as the live path (session.go) and attachRestoredLoop do for every other loop.
 	// Dropping it would leave a restored root unable to build ANY external tool that
 	// declares a requirement, and would hand the rest a separate observation set.
-	s.loops[rootLoopID] = &loopHandle{id: rootLoopID, owner: s, bound: cfg, bindings: bindings, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
+	s.loops[rootLoopID] = &loopHandle{id: rootLoopID, owner: s, bound: cfg, bindings: bindings, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle, selectedHarness: restoredSelectedHarness(ri.AgentRuntime)}
 	s.activeLoopID = rootLoopID
 	return s, nil
+}
+
+func restoredSelectedHarness(runtime *event.AgentRuntime) loop.AgentHarnessName {
+	if runtime == nil {
+		return ""
+	}
+	return loop.AgentHarnessName(runtime.Harness)
 }
 
 // appendRestoreEvent stamps ev (EventID + CreatedAt) via the Factory and appends it to

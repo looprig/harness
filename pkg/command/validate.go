@@ -27,14 +27,15 @@ const (
 	CommandCompact           CommandName = "Compact"
 	CommandUnknown           CommandName = "Command"
 
-	FieldCommandID       CommandField = "CommandID"
-	FieldSessionID       CommandField = "SessionID"
-	FieldLoopID          CommandField = "LoopID"
-	FieldTargetCommandID CommandField = "TargetCommandID"
-	FieldTargetLoopID    CommandField = "TargetLoopID"
-	FieldToolExecutionID CommandField = "ToolExecutionID"
-	FieldAgency          CommandField = "Agency"
-	FieldAction          CommandField = "Action"
+	FieldCommandID          CommandField = "CommandID"
+	FieldSessionID          CommandField = "SessionID"
+	FieldLoopID             CommandField = "LoopID"
+	FieldTargetCommandID    CommandField = "TargetCommandID"
+	FieldTargetLoopID       CommandField = "TargetLoopID"
+	FieldBackgroundHandBack CommandField = "BackgroundHandBack"
+	FieldToolExecutionID    CommandField = "ToolExecutionID"
+	FieldAgency             CommandField = "Agency"
+	FieldAction             CommandField = "Action"
 )
 
 // CommandValidationError reports that a command violates the ID fill matrix: Field
@@ -68,6 +69,9 @@ func ValidateCommand(cmd Command) error {
 	}
 	switch c := cmd.(type) {
 	case UserInput:
+		if c.BackgroundHandBack && (!c.NoFold || c.Agency != identity.AgencyMachine) {
+			return &CommandValidationError{Command: CommandUserInput, Field: FieldBackgroundHandBack, Rule: RuleInvalid}
+		}
 		if c.NoFold && c.Agency == identity.AgencyMachine && c.TargetLoopID.IsZero() {
 			return &CommandValidationError{Command: CommandUserInput, Field: FieldTargetLoopID, Rule: RuleRequired}
 		}

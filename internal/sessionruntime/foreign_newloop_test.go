@@ -110,11 +110,11 @@ func TestForeignDelegateBuilderReceivesSelectedEffectiveMode(t *testing.T) {
 	)
 	s := newDelegationSession(t, parent, []Option{WithEventAppender(rec), WithForeignBuilders(builder.build, builder.buildRestored)}, child)
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
-	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Mode: "review", Message: "inspect", Wait: false})
+	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: "child", AgentMode: "review", Message: "inspect", WaitForResponse: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if queued.DelegateID.IsZero() {
+	if queued.AgentID.IsZero() {
 		t.Fatal("missing child id")
 	}
 	builder.mu.Lock()
@@ -130,11 +130,11 @@ func TestForeignDelegateBuilderReceivesSelectedEffectiveMode(t *testing.T) {
 	for _, ev := range rec.snapshot() {
 		switch e := ev.(type) {
 		case event.LoopStarted:
-			if e.LoopID == queued.DelegateID {
+			if e.LoopID == queued.AgentID {
 				startedMode = e.InitialMode
 			}
 		case event.LoopModeChanged:
-			if e.LoopID == queued.DelegateID {
+			if e.LoopID == queued.AgentID {
 				t.Fatal("selected foreign start emitted synthetic LoopModeChanged")
 			}
 		}
@@ -277,7 +277,7 @@ func TestForeignBuilderEmitsAgentSessionBindingOnce(t *testing.T) {
 	parent := delegateParent(loop.DelegationManaged, "child")
 	child := delegateChild("child", "child")
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex", Default: true,
+		AgentType: "child", AgentHarness: "codex", Profile: "acp/codex", Default: true,
 		Credential: loop.CredentialGatewayBacked, DefaultModel: "luna", SmallModel: "small",
 		Models: []loop.RuntimeModelOption{
 			{Alias: "luna", Target: validModel("luna-target"), DefaultEffort: model.EffortLow, Efforts: []model.Effort{model.EffortLow, model.EffortHigh}},
@@ -300,10 +300,10 @@ func TestForeignBuilderEmitsAgentSessionBindingOnce(t *testing.T) {
 	}, child)
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	result, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
-		Operation: tool.DelegateStart,
-		Agent:     "child",
-		Message:   "go",
-		Wait:      false,
+		Operation:       tool.DelegateStart,
+		AgentType:       "child",
+		Message:         "go",
+		WaitForResponse: false,
 		Runtime: &tool.DelegateRuntime{
 			Harness:    "codex",
 			Profile:    "acp/codex",
@@ -323,12 +323,12 @@ func TestForeignBuilderEmitsAgentSessionBindingOnce(t *testing.T) {
 	for index, ev := range rec.snapshot() {
 		switch typed := ev.(type) {
 		case event.LoopStarted:
-			if typed.LoopID == result.DelegateID {
+			if typed.LoopID == result.AgentID {
 				started = typed
 				startedIndex = index
 			}
 		case event.LoopAgentSessionBound:
-			if typed.LoopID == result.DelegateID {
+			if typed.LoopID == result.AgentID {
 				bound = append(bound, typed)
 				boundIndex = index
 			}
@@ -370,11 +370,11 @@ func TestHarnessManagedForeignLoopStartedOmitsModelRuntime(t *testing.T) {
 	parent := delegateParent(loop.DelegationManaged, "child")
 	child := delegateChild("child", "child")
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex",
+		AgentType: "child", AgentHarness: "codex", Profile: "acp/codex",
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionHarnessManaged, Default: true,
 	}, {
-		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex-gateway",
+		AgentType: "child", AgentHarness: "codex", Profile: "acp/codex-gateway",
 		Credential: loop.CredentialGatewayBacked, Source: loop.RuntimeSourceGateway,
 		DefaultModel: "gateway",
 		Models: []loop.RuntimeModelOption{{
@@ -399,10 +399,10 @@ func TestHarnessManagedForeignLoopStartedOmitsModelRuntime(t *testing.T) {
 
 	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	result, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
-		Operation: tool.DelegateStart,
-		Agent:     "child",
-		Message:   "go",
-		Wait:      false,
+		Operation:       tool.DelegateStart,
+		AgentType:       "child",
+		Message:         "go",
+		WaitForResponse: false,
 		Runtime: &tool.DelegateRuntime{
 			Harness:       "codex",
 			Profile:       "acp/codex",
@@ -418,7 +418,7 @@ func TestHarnessManagedForeignLoopStartedOmitsModelRuntime(t *testing.T) {
 	var started *event.LoopStarted
 	for _, ev := range rec.snapshot() {
 		candidate, ok := ev.(event.LoopStarted)
-		if ok && candidate.LoopID == result.DelegateID {
+		if ok && candidate.LoopID == result.AgentID {
 			started = &candidate
 			break
 		}

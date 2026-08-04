@@ -31,7 +31,7 @@ type Controller interface {
 	// Interrupt cancels this loop's current turn AND every loop below it in the delegate
 	// subtree, marking the whole subtree interrupt-pending so a parent whose interrupted
 	// delegate wait resolves cannot open a fresh delegate step. It is the subtree-scoped
-	// counterpart to the session-wide Session.Interrupt and the single-child Subagent
+	// counterpart to the session-wide Session.Interrupt and the single-child agent
 	// interrupt. The runtime holds an admission barrier over the subtree until it is idle.
 	Interrupt(context.Context) error
 }

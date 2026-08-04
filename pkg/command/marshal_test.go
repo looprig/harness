@@ -40,6 +40,12 @@ func fullHeader() Header {
 	}
 }
 
+func fullMachineHeader() Header {
+	header := fullHeader()
+	header.Agency = identity.AgencyMachine
+	return header
+}
+
 // sampleBlocks is a representative content slice exercising the block-delegation
 // path (the content codec tags each block by type).
 func sampleBlocks(text string) []content.Block {
@@ -62,6 +68,7 @@ func TestMarshalCommandRoundTrip(t *testing.T) {
 		cmd  Command
 	}{
 		{"UserInput delegate route", UserInput{Header: fullHeader(), Blocks: sampleBlocks("hello"), NoFold: true, TargetLoopID: seededUUID(0x44)}},
+		{"UserInput background hand-back marker", UserInput{Header: fullMachineHeader(), Blocks: sampleBlocks("hello"), NoFold: true, TargetLoopID: seededUUID(0x44), BackgroundHandBack: true}},
 		{"UserInput nil blocks", UserInput{Header: fullHeader()}},
 		{"SubagentResult", SubagentResult{
 			Header:      fullHeader(),
@@ -113,6 +120,37 @@ func TestMarshalCommandRoundTrip(t *testing.T) {
 				t.Errorf("round-trip(%s) mismatch:\n got = %#v\nwant = %#v\nwire: %s", tt.name, got, tt.cmd, data)
 			}
 		})
+	}
+}
+
+func TestMarshalUserInputBackgroundHandBackOmitsFalseAndRoundTripsTrue(t *testing.T) {
+	t.Parallel()
+
+	foreground := UserInput{Header: fullHeader(), NoFold: true, TargetLoopID: seededUUID(0x44)}
+	background := UserInput{Header: fullMachineHeader(), NoFold: true, TargetLoopID: seededUUID(0x44), BackgroundHandBack: true}
+
+	foregroundWire, err := MarshalCommand(foreground)
+	if err != nil {
+		t.Fatalf("MarshalCommand(foreground) error = %v", err)
+	}
+	if strings.Contains(string(foregroundWire), "background_hand_back") {
+		t.Fatalf("foreground wire unexpectedly carries background_hand_back: %s", foregroundWire)
+	}
+
+	backgroundWire, err := MarshalCommand(background)
+	if err != nil {
+		t.Fatalf("MarshalCommand(background) error = %v", err)
+	}
+	if !strings.Contains(string(backgroundWire), `"background_hand_back":true`) {
+		t.Fatalf("background wire missing background_hand_back marker: %s", backgroundWire)
+	}
+
+	got, err := UnmarshalCommand(backgroundWire)
+	if err != nil {
+		t.Fatalf("UnmarshalCommand(background) error = %v\nwire: %s", err, backgroundWire)
+	}
+	if !reflect.DeepEqual(got, background) {
+		t.Fatalf("background round-trip mismatch:\n got = %#v\nwant = %#v", got, background)
 	}
 }
 

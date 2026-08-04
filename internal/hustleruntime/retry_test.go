@@ -447,14 +447,20 @@ func TestRetryDoesNotResetExhaustedDeadlineOrChangeToollessBehavior(t *testing.T
 
 	t.Run("deadline exhausted before retry", func(t *testing.T) {
 		sessionID, loopID := mustRuntimeTestID(t), mustRuntimeTestID(t)
+		var executionCtx *runtimeManualContext
 		client := &runtimeTestClient{invoke: func(ctx context.Context, _ inference.Request) (*inference.Response, error) {
+			executionCtx.trigger(context.DeadlineExceeded)
 			<-ctx.Done()
 			return nil, &failure.NetworkError{Err: ctx.Err()}
 		}}
-		definition := runtimeRetryEvidenceDefinition(t, client, 10*time.Millisecond, func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
+		definition := runtimeRetryEvidenceDefinition(t, client, time.Second, func(context.Context, tool.EvidenceFactoryBindings) ([]tool.InvokableTool, error) {
 			return []tool.InvokableTool{newPreparedEvidenceTool("workspace_read", "ok")}, nil
 		})
 		controller := runtimeEvidenceController(t, sessionID, definition)
+		controller.runtime.newExecutionContext = func(parent context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+			executionCtx = newRuntimeManualContext(parent)
+			return executionCtx, func() {}
+		}
 		err := controller.RunAndFinalize(context.Background(), runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID), acceptResult, noOpFinalizer)
 		var runErr *RunError
 		if !errors.As(err, &runErr) || runErr.ReasonCode != hustle.ReasonTimeout {
