@@ -221,3 +221,140 @@ func TestWithContextTransports_RequiresBaseMember(t *testing.T) {
 		})
 	}
 }
+
+// TestWithContextTransports_RequiresContextCounter proves the fix for the gap
+// found during Task 1.2's code review: declaring WithContextTransports with no
+// WithContextCounter must fail Define (not silently discard the declared
+// transports and succeed).
+func TestWithContextTransports_RequiresContextCounter(t *testing.T) {
+	t.Parallel()
+	base := testModel()
+	transports := []ContextTransport{
+		{Provider: base.Provider, APIFormat: base.APIFormat, BaseURL: base.BaseURL, Capability: localInferenceCapability()},
+	}
+	_, err := Define(WithName("agent"), WithInference(&fakeLLM{}, base), WithContextTransports(transports...))
+	var target *DefinitionError
+	if !errors.As(err, &target) || target.Kind != DefinitionMissingContextCounter {
+		t.Fatalf("Define() error = %T %v, want DefinitionMissingContextCounter", err, err)
+	}
+}
+
+func TestWithContextTransports_InvalidMemberCapability(t *testing.T) {
+	t.Parallel()
+	base := testModel()
+	baseTransport := ContextTransport{Provider: base.Provider, APIFormat: base.APIFormat, BaseURL: base.BaseURL, Capability: localInferenceCapability()}
+	// Zero-value Capability has Transport == InferenceTransportUnknown, which
+	// InferenceCapability.Validate() rejects outright.
+	invalidTransport := ContextTransport{Provider: "second-provider", APIFormat: model.APIFormatAnthropic, BaseURL: "https://api.second.example"}
+	counter := &policyCounter{capability: exactCounterCapability()}
+	opts := append(contextDefinitionOptions(counter, localInferenceCapability(), manualCompactionPolicy()),
+		WithContextTransports(baseTransport, invalidTransport))
+	_, err := Define(opts...)
+	var target *DefinitionError
+	if !errors.As(err, &target) || target.Kind != DefinitionInvalidContextTransport {
+		t.Fatalf("Define() error = %T %v, want DefinitionInvalidContextTransport", err, err)
+	}
+	var capErr *contextcount.CapabilityValidationError
+	if !errors.As(err, &capErr) {
+		t.Fatalf("Define() cause = %T, want *contextcount.CapabilityValidationError", err)
+	}
+}
+
+func TestWithContextTransports_DuplicateMembers(t *testing.T) {
+	t.Parallel()
+	base := testModel()
+	baseTransport := ContextTransport{Provider: base.Provider, APIFormat: base.APIFormat, BaseURL: base.BaseURL, Capability: localInferenceCapability()}
+	counter := &policyCounter{capability: exactCounterCapability()}
+	opts := append(contextDefinitionOptions(counter, localInferenceCapability(), manualCompactionPolicy()),
+		WithContextTransports(baseTransport, baseTransport))
+	_, err := Define(opts...)
+	var target *DefinitionError
+	if !errors.As(err, &target) || target.Kind != DefinitionDuplicateContextTransport {
+		t.Fatalf("Define() error = %T %v, want DefinitionDuplicateContextTransport", err, err)
+	}
+}
+
+func TestWithContextTransports_IncompatibleMemberCounter(t *testing.T) {
+	t.Parallel()
+	// A non-provider-neutral CounterCapability, built the same way the
+	// existing "incompatible counter" fake is built in
+	// compaction_policy_test.go: starting from the neutral exact capability
+	// and overriding Transport/Provider/SecurityIdentity so
+	// providerNeutralCounter is false and CounterTransportSeparateEndpoint's
+	// rules apply.
+	separate := exactCounterCapability()
+	separate.Provider = "second-provider"
+	separate.Transport = contextcount.CounterTransportSeparateEndpoint
+	separate.SecurityIdentity = contextcount.SecurityIdentity{9}
+
+	base := testModel()
+	baseCapability := contextcount.InferenceCapability{
+		Transport: contextcount.InferenceTransportTLS, Provider: "second-provider",
+		SecurityIdentity: contextcount.SecurityIdentity{9}, Retention: contextcount.RetentionNone,
+	}
+	baseTransport := ContextTransport{Provider: base.Provider, APIFormat: base.APIFormat, BaseURL: base.BaseURL, Capability: baseCapability}
+	// A second, non-base transport whose Capability (local transport) is
+	// incompatible with the separate-endpoint counter above.
+	incompatibleTransport := ContextTransport{
+		Provider: "second-provider", APIFormat: model.APIFormatAnthropic, BaseURL: "https://api.second.example",
+		Capability: localInferenceCapability(),
+	}
+
+	counter := &policyCounter{capability: separate}
+	opts := append(contextDefinitionOptions(counter, baseCapability, manualCompactionPolicy()),
+		WithContextTransports(baseTransport, incompatibleTransport))
+	_, err := Define(opts...)
+	var target *DefinitionError
+	if !errors.As(err, &target) || target.Kind != DefinitionIncompatibleContextCounter {
+		t.Fatalf("Define() error = %T %v, want DefinitionIncompatibleContextCounter", err, err)
+	}
+	var compatErr *contextcount.CounterCompatibilityError
+	if !errors.As(err, &compatErr) {
+		t.Fatalf("Define() cause = %T, want *contextcount.CounterCompatibilityError", err)
+	}
+}
+
+// TestWithContextTransports_ModeBindingAcrossDeclaredTransports is the
+// regression proving the capability the whole feature exists to unlock: a
+// predeclared mode's model can now live on a SECOND declared transport, not
+// just the base transport, while a mode on an undeclared third transport
+// still fails.
+func TestWithContextTransports_ModeBindingAcrossDeclaredTransports(t *testing.T) {
+	t.Parallel()
+	base := testModel()
+	baseTransport := ContextTransport{Provider: base.Provider, APIFormat: base.APIFormat, BaseURL: base.BaseURL, Capability: localInferenceCapability()}
+
+	secondModel := base
+	secondModel.Provider = "second-provider"
+	secondModel.BaseURL = "https://api.second.example"
+	secondCapability := contextcount.InferenceCapability{
+		Transport: contextcount.InferenceTransportTLS, Provider: "second-provider",
+		SecurityIdentity: contextcount.SecurityIdentity{7}, Retention: contextcount.RetentionNone,
+	}
+	secondTransport := ContextTransport{Provider: secondModel.Provider, APIFormat: secondModel.APIFormat, BaseURL: secondModel.BaseURL, Capability: secondCapability}
+
+	thirdModel := base
+	thirdModel.Provider = "undeclared-provider"
+	thirdModel.BaseURL = "https://api.undeclared.example"
+
+	counter := &policyCounter{capability: exactCounterCapability()}
+	buildOpts := func(modeModel model.Model) []Option {
+		return append(contextDefinitionOptions(counter, localInferenceCapability(), manualCompactionPolicy()),
+			WithContextTransports(baseTransport, secondTransport),
+			WithModes(Mode{Name: "alternate", Model: modeModel}), WithInitialMode("alternate"))
+	}
+
+	if _, err := Define(buildOpts(secondModel)...); err != nil {
+		t.Fatalf("Define() with mode on second declared transport: %v", err)
+	}
+
+	_, err := Define(buildOpts(thirdModel)...)
+	var definitionErr *DefinitionError
+	if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionInvalidModeBinding {
+		t.Fatalf("Define() error = %T %v, want DefinitionInvalidModeBinding", err, err)
+	}
+	var notDeclared *ContextTransportNotDeclaredError
+	if !errors.As(err, &notDeclared) {
+		t.Fatalf("Define() cause = %T, want *ContextTransportNotDeclaredError", err)
+	}
+}

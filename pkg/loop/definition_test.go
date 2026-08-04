@@ -687,6 +687,41 @@ type nilRuntimeContext struct{}
 
 func (*nilRuntimeContext) Blocks(context.Context) []content.Block { return nil }
 
+// TestContextTransportSynthesizedDefaultSet proves that omitting
+// WithContextTransports synthesizes a real, enforceable one-element set from
+// the base model + WithInferenceCapability, rather than leaving mode-binding
+// permissive. It replaces the mode-binding assertion the Task 1.2 code review
+// noted as intentionally relaxed in TestContextTransportBinding
+// (compaction_policy_test.go): a mode on the base transport still validates,
+// and (newly, as of this task) a mode on a different transport now correctly
+// fails, proving the synthesized set is populated and enforced, not an empty
+// no-op set.
+func TestContextTransportSynthesizedDefaultSet(t *testing.T) {
+	t.Parallel()
+	counter := &policyCounter{capability: exactCounterCapability()}
+	base := testModel()
+	otherTransportModel := base
+	otherTransportModel.Provider = "other-provider"
+
+	sameTransportOpts := append(contextDefinitionOptions(counter, localInferenceCapability(), manualCompactionPolicy()),
+		WithModes(Mode{Name: "same-transport", Model: base}), WithInitialMode("same-transport"))
+	if _, err := Define(sameTransportOpts...); err != nil {
+		t.Fatalf("Define() with mode on synthesized base transport: %v", err)
+	}
+
+	otherTransportOpts := append(contextDefinitionOptions(counter, localInferenceCapability(), manualCompactionPolicy()),
+		WithModes(Mode{Name: "other-transport", Model: otherTransportModel}), WithInitialMode("other-transport"))
+	_, err := Define(otherTransportOpts...)
+	var definitionErr *DefinitionError
+	if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionInvalidModeBinding {
+		t.Fatalf("Define() error = %T %v, want DefinitionInvalidModeBinding", err, err)
+	}
+	var notDeclared *ContextTransportNotDeclaredError
+	if !errors.As(err, &notDeclared) {
+		t.Fatalf("Define() cause = %T, want *ContextTransportNotDeclaredError", err)
+	}
+}
+
 func TestEffectiveSystemComposition(t *testing.T) {
 	t.Parallel()
 	tests := []struct{ name, system, instructions, want string }{

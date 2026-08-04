@@ -193,10 +193,11 @@ func validateContextDefinition(resolved *definitionOptions) error {
 	_, hasCapability := resolved.seen["inference_capability"]
 	_, hasObservation := resolved.seen["context_observation"]
 	_, hasCompaction := resolved.seen["compaction"]
+	_, hasContextTransports := resolved.seen["context_transports"]
 	if hasObservation && hasCompaction {
 		return &DefinitionError{Kind: DefinitionConflictingContextPolicy, Field: "context_policy"}
 	}
-	if (hasCapability || hasObservation || hasCompaction) && !hasCounter {
+	if (hasCapability || hasObservation || hasCompaction || hasContextTransports) && !hasCounter {
 		return &DefinitionError{Kind: DefinitionMissingContextCounter, Field: "context_counter"}
 	}
 	if hasCounter && !hasCapability {
@@ -221,23 +222,40 @@ func validateContextDefinition(resolved *definitionOptions) error {
 	if err := contextcount.CompatibleCounter(resolved.inferenceCapability, capability); err != nil {
 		return &DefinitionError{Kind: DefinitionIncompatibleContextCounter, Field: "context_counter", Cause: err}
 	}
-	// base-member/capability check added in Task 1.2: a caller-supplied
-	// WithContextTransports set must contain a member matching the base
-	// model's own transport identity, with a Capability matching
+	// Resolve the complete admitted ContextTransport set for this loop and
+	// freeze it onto resolved.contextTransports, which the mode-binding loop
+	// below reads directly. Omitting WithContextTransports synthesizes a
+	// one-element set from the base WithInference model and
+	// WithInferenceCapability value, byte-identical to the historical
+	// single-transport behavior. A caller-supplied set must: contain no
+	// duplicate (Provider, APIFormat, BaseURL) members; have every member's
+	// Capability pass Capability.Validate(); have every member's Capability
+	// compatible with the declared context counter via
+	// contextcount.CompatibleCounter; and contain a member matching the base
+	// model's own transport identity whose Capability matches
 	// WithInferenceCapability exactly.
-	//
-	// TODO(task-1.3): extend this block, do not duplicate it. Task 1.3 adds
-	// uniqueness detection across members, per-member Capability.Validate(),
-	// and per-member contextcount.CompatibleCounter checks alongside this
-	// same check, and synthesizes a one-element default set when none is
-	// declared (this block intentionally does nothing when
-	// resolved.contextTransports is empty, preserving today's
-	// no-declared-set behavior until then).
-	if len(resolved.contextTransports) > 0 {
+	transports := resolved.contextTransports
+	if len(transports) == 0 {
+		transports = []ContextTransport{{
+			Provider: resolved.model.Provider, APIFormat: resolved.model.APIFormat, BaseURL: resolved.model.BaseURL,
+			Capability: resolved.inferenceCapability,
+		}}
+	} else {
 		baseKey := transportKeyOf(resolved.model)
 		foundBase := false
-		for _, transport := range resolved.contextTransports {
+		seen := make(map[contextTransportKey]struct{}, len(transports))
+		for _, transport := range transports {
 			key := contextTransportKey{Provider: transport.Provider, APIFormat: transport.APIFormat, BaseURL: transport.BaseURL}
+			if _, duplicate := seen[key]; duplicate {
+				return &DefinitionError{Kind: DefinitionDuplicateContextTransport, Field: "context_transports"}
+			}
+			seen[key] = struct{}{}
+			if err := transport.Capability.Validate(); err != nil {
+				return &DefinitionError{Kind: DefinitionInvalidContextTransport, Field: "context_transports", Cause: err}
+			}
+			if err := contextcount.CompatibleCounter(transport.Capability, capability); err != nil {
+				return &DefinitionError{Kind: DefinitionIncompatibleContextCounter, Field: "context_transports", Cause: err}
+			}
 			if key != baseKey {
 				continue
 			}
@@ -245,12 +263,12 @@ func validateContextDefinition(resolved *definitionOptions) error {
 			if transport.Capability != resolved.inferenceCapability {
 				return &DefinitionError{Kind: DefinitionInvalidContextTransport, Field: "context_transports"}
 			}
-			break
 		}
 		if !foundBase {
 			return &DefinitionError{Kind: DefinitionInvalidContextTransport, Field: "context_transports"}
 		}
 	}
+	resolved.contextTransports = transports
 	if hasCompaction {
 		if err := resolved.compaction.Validate(capability); err != nil {
 			return &DefinitionError{Kind: DefinitionInvalidCompaction, Field: "compaction", Cause: err}
@@ -865,7 +883,9 @@ func WithInferenceCapability(capability contextcount.InferenceCapability) Option
 // posture) pairs a live model switch or predeclared mode is allowed to move
 // to. Omitting it synthesizes a one-element set from the base WithInference
 // model and WithInferenceCapability value, byte-identical to today's
-// single-transport behavior (Task 1.3).
+// single-transport behavior. Requires WithContextCounter; see
+// validateContextDefinition for the full set of validations applied to a
+// declared set.
 func WithContextTransports(transports ...ContextTransport) Option {
 	transports = append([]ContextTransport(nil), transports...)
 	return func(o *definitionOptions) error {
