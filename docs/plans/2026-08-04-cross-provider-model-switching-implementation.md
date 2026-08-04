@@ -24,11 +24,18 @@ For every numbered task below:
 Use:
 
 ```bash
-GOFLAGS=-mod=vendor go test -race ./path/to/package -run '<Focused test>'
-GOFLAGS=-mod=vendor go test -race ./path/to/package
+GOWORK=off GOFLAGS=-mod=vendor go test -race ./path/to/package -run '<Focused test>'
+GOWORK=off GOFLAGS=-mod=vendor go test -race ./path/to/package
 ```
 
-At the end of each phase, run the full suite (`GOFLAGS=-mod=vendor go test -race ./...`) and `make secure` before moving to the next phase. Do not start a phase with a red full suite or an open `make secure` finding.
+**`GOWORK=off` is required, not optional.** This worktree sits outside the
+top-level `~/code/looprig/go.work` workspace's tracked module paths.
+`GOFLAGS=-mod=vendor` alone resolves against the wrong (top-level looprig)
+vendor tree and fails with "inconsistent vendoring" errors. Always set
+`GOWORK=off` alongside `GOFLAGS=-mod=vendor` for every build/test/vet/lint
+command in this plan.
+
+At the end of each phase, run the full suite (`GOWORK=off GOFLAGS=-mod=vendor go test -race ./...`) and `make secure` before moving to the next phase. Do not start a phase with a red full suite or an open `make secure` finding.
 
 Work in the existing worktree `~/code/looprig/harness/.worktrees/cross-provider-model-switching`, branch `feat/cross-provider-model-switching`. Do not touch vendored files except via `make vendor` (not needed here — no new external dependency).
 
