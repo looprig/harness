@@ -224,16 +224,23 @@ func TestControllerInterruptUnknownRoot(t *testing.T) {
 	}
 }
 
-// TestSubagentInterruptAffectsOnlyOwnedChild proves (behavior 3) that a Subagent `interrupt`
-// affects ONLY the owned child's current turn — never the parent above it, never a grandchild
-// below it. It goes through the parent-scoped controller, which does NOT cascade to the subtree.
-func TestSubagentInterruptAffectsOnlyOwnedChild(t *testing.T) {
+// TestStopAgentInterruptTargetsOnlyOwnedChild proves StopAgent uses the production
+// single-loop interruption path: it affects ONLY the owned child's current turn —
+// never the parent, grandchild, or sibling.
+func TestStopAgentInterruptTargetsOnlyOwnedChild(t *testing.T) {
 	t.Parallel()
 	s, ids, cmds := fakeTreeSession(t, blockingRelease{},
-		treeLoop{name: "P"}, treeLoop{name: "C", parent: "P"}, treeLoop{name: "G", parent: "C"})
+		treeLoop{name: "P"}, treeLoop{name: "C", parent: "P"}, treeLoop{name: "G", parent: "C"}, treeLoop{name: "E", parent: "P"})
+	if s.hub == nil {
+		t.Fatal("production StopAgent test unexpectedly has no session hub")
+	}
 
 	got := make(chan command.Command, 1)
-	go func() { got <- <-cmds["C"] }()
+	go func() {
+		cmd := <-cmds["C"]
+		got <- cmd
+		cmd.(command.Interrupt).Ack <- false
+	}()
 
 	ctrl := &scopedController{parentLoopID: ids["P"]}
 	res, err := ctrl.interrupt(s, tool.DelegateRequest{AgentID: ids["C"]})
@@ -252,16 +259,13 @@ func TestSubagentInterruptAffectsOnlyOwnedChild(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("owned child C never received its interrupt")
 	}
-	// The parent and the grandchild must be untouched (single-hop, no subtree cascade).
-	select {
-	case cmd := <-cmds["P"]:
-		t.Fatalf("parent P received %T; a Subagent interrupt must not reach the parent", cmd)
-	default:
-	}
-	select {
-	case cmd := <-cmds["G"]:
-		t.Fatalf("grandchild G received %T; a Subagent interrupt must not cascade to the subtree", cmd)
-	default:
+	// The parent, grandchild, and sibling must be untouched (single-loop scope).
+	for _, name := range []string{"P", "G", "E"} {
+		select {
+		case cmd := <-cmds[name]:
+			t.Fatalf("loop %s received %T; StopAgent must target only its owned child", name, cmd)
+		default:
+		}
 	}
 }
 
@@ -421,6 +425,41 @@ func TestInterruptPendingRefcountedAcrossOverlappingScopes(t *testing.T) {
 	}
 	if s.loopInterruptPending(ids["Z"]) {
 		t.Fatal("Z still pending after scope B released")
+	}
+}
+
+func TestInterruptBarrierOwnerReleasePreservesOverlappingScope(t *testing.T) {
+	t.Parallel()
+	s, ids, _ := fakeTreeSession(t, blockingRelease{}, treeLoop{name: "X"})
+	id := ids["X"]
+	s.loopsMu.Lock()
+	s.markInterruptPendingLocked([]loopSnapshot{{loopID: id, handle: s.loops[id]}})
+	s.markInterruptPendingLocked([]loopSnapshot{{loopID: id, handle: s.loops[id]}})
+	s.loopsMu.Unlock()
+
+	first := s.armInterruptBarrier([]uuid.UUID{id}, nil)
+	second := s.armInterruptBarrier([]uuid.UUID{id}, nil)
+	first.release()
+	select {
+	case <-first.done:
+	case <-time.After(time.Second):
+		t.Fatal("first interrupt barrier did not settle after owner release")
+	}
+	s.loopsMu.RLock()
+	refs := s.interruptPending[id]
+	s.loopsMu.RUnlock()
+	if refs != 1 {
+		t.Fatalf("remaining interrupt refs after first owner release = %d, want one", refs)
+	}
+
+	second.release()
+	select {
+	case <-second.done:
+	case <-time.After(time.Second):
+		t.Fatal("second interrupt barrier did not settle after owner release")
+	}
+	if s.loopInterruptPending(id) {
+		t.Fatal("interrupt mark remained after both owners released")
 	}
 }
 

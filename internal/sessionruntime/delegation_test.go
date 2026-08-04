@@ -1970,7 +1970,7 @@ func TestDelegateMessageQueueIsFIFOAndCountsOnlyWaitingNoFoldTurns(t *testing.T)
 	}
 }
 
-func TestDelegateReuseAfterAgentStopKeepsIdentityAndRuntime(t *testing.T) {
+func TestStopAgentIdleReuseKeepsIdentityAndRuntime(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateChild("child", "reply"))
@@ -1998,6 +1998,311 @@ func TestDelegateReuseAfterAgentStopKeepsIdentityAndRuntime(t *testing.T) {
 	after, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: started.AgentID})
 	if err != nil || len(after.Agents) != 1 || after.Agents[0].Runtime != before.Agents[0].Runtime {
 		t.Fatalf("runtime changed across stop/reuse: before=%+v after=%+v err=%v", before.Agents, after.Agents, err)
+	}
+}
+
+func waitQueuedInputsForLoop(t *testing.T, sub interface{ Events() <-chan event.Delivery }, loopID uuid.UUID, want int) {
+	t.Helper()
+	count := 0
+	deadline := time.After(5 * time.Second)
+	for count < want {
+		select {
+		case delivery, ok := <-sub.Events():
+			if !ok {
+				t.Fatal("event subscription closed while waiting for queued inputs")
+			}
+			queued, ok := delivery.Event.(event.InputQueued)
+			if ok && queued.LoopID == loopID {
+				count++
+			}
+		case <-deadline:
+			t.Fatalf("queued inputs = %d, want %d", count, want)
+		}
+	}
+}
+
+func countBackgroundCompletionEvents(events []event.Event, correlationID uuid.UUID) int {
+	count := 0
+	for _, ev := range events {
+		var message *content.UserMessage
+		switch typed := ev.(type) {
+		case event.TurnStarted:
+			message = typed.Message
+		case event.TurnFoldedInto:
+			message = typed.Message
+		}
+		if message == nil {
+			continue
+		}
+		envelope, ok := decodeBackgroundCompletion(message.Blocks)
+		if !ok || envelope.CorrelationID != correlationID.String() {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func TestStopAgentCancelsQueuedBackgroundMessage(t *testing.T) {
+	t.Parallel()
+	parentLLM := newControlledAgentLLM()
+	childLLM := newControlledAgentLLM()
+	events := &recordingEventAppender{}
+	parent := backgroundNode("parent", parentLLM, "child")
+	child := backgroundNode("child", childLLM)
+	s := newDelegationSession(t, parent, []Option{WithEventAppender(events)}, child)
+	obs, err := s.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = obs.Close() }()
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+
+	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, AgentType: "child", Name: "worker", Message: "active", WaitForResponse: false,
+	})
+	if err != nil {
+		t.Fatalf("StartAgent: %v", err)
+	}
+	select {
+	case got := <-childLLM.started:
+		if got != "active" {
+			t.Fatalf("active child input = %q, want active", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("active child did not start")
+	}
+
+	// Reopen the observation after the active turn began so this assertion only
+	// counts the queued follow-up, not the initial StartAgent input.
+	_ = obs.Close()
+	obs, err = s.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatal(err)
+	}
+	queuedDone := make(chan struct {
+		result tool.DelegateResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+			Operation: tool.DelegateSend, AgentID: started.AgentID, Message: "queued-background", WaitForResponse: false,
+		})
+		queuedDone <- struct {
+			result tool.DelegateResult
+			err    error
+		}{result: result, err: err}
+	}()
+	waitQueuedInputsForLoop(t, obs, started.AgentID, 1)
+	var queued struct {
+		result tool.DelegateResult
+		err    error
+	}
+	select {
+	case queued = <-queuedDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued background admission did not resolve")
+	}
+	if queued.err != nil || queued.result.AgentID != started.AgentID || queued.result.State != tool.AgentStateWorking || queued.result.CorrelationID.IsZero() {
+		t.Fatalf("queued background admission = %+v, %v; want working with correlation", queued.result, queued.err)
+	}
+
+	stopped, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: started.AgentID})
+	if err != nil {
+		t.Fatalf("StopAgent: %v", err)
+	}
+	if stopped.State != tool.AgentStateIdle {
+		t.Fatalf("StopAgent state = %v, want idle", stopped.State)
+	}
+
+	completions := make(map[string]backgroundCompletion, 2)
+	for i := 0; i < 2; i++ {
+		completion := receiveBackgroundCompletion(t, parentLLM)
+		if _, duplicate := completions[completion.CorrelationID]; duplicate {
+			t.Fatalf("duplicate background correlation %q", completion.CorrelationID)
+		}
+		completions[completion.CorrelationID] = completion
+		parentLLM.release <- struct{}{}
+	}
+	activeCompletion, ok := completions[started.CorrelationID.String()]
+	if !ok || activeCompletion.ResponseStatus != tool.DelegateResponseInterrupted {
+		t.Fatalf("active completion = %+v, want interrupted", activeCompletion)
+	}
+	queuedCompletion, ok := completions[queued.result.CorrelationID.String()]
+	if !ok || queuedCompletion.ResponseStatus != tool.DelegateResponseInterrupted || queuedCompletion.Response != "" {
+		t.Fatalf("queued background completion = %+v, want one empty interrupted outcome", queuedCompletion)
+	}
+	if got := countBackgroundCompletionEvents(events.snapshot(), queued.result.CorrelationID); got != 1 {
+		t.Fatalf("queued background durable completion count = %d, want exactly one", got)
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.WaitIdle(waitCtx); err != nil {
+		t.Fatalf("WaitIdle after queued StopAgent: %v", err)
+	}
+	cancelled := 0
+	for _, ev := range events.snapshot() {
+		input, ok := ev.(event.InputCancelled)
+		if ok && input.LoopID == started.AgentID && input.Cause.CommandID == queued.result.CorrelationID && input.Reason == event.CancelTurnInterrupted {
+			cancelled++
+		}
+	}
+	if cancelled != 1 {
+		t.Fatalf("queued background InputCancelled events = %d, want exactly one", cancelled)
+	}
+	select {
+	case duplicate := <-parentLLM.started:
+		t.Fatalf("queued background completion delivered more than once: %q", duplicate)
+	default:
+	}
+}
+
+func TestStopAgentInterruptsActiveAndCancelsQueuedMessages(t *testing.T) {
+	t.Parallel()
+	parentLLM := newControlledAgentLLM()
+	childLLM := newControlledAgentLLM()
+	events := &recordingEventAppender{}
+	parent := backgroundNode("parent", parentLLM, "child")
+	child := backgroundNode("child", childLLM)
+	s := newDelegationSession(t, parent, []Option{WithEventAppender(events)}, child)
+	obs, err := s.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = obs.Close() }()
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+
+	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, AgentType: "child", Name: "worker", Message: "active", WaitForResponse: false,
+	})
+	if err != nil {
+		t.Fatalf("StartAgent: %v", err)
+	}
+	select {
+	case got := <-childLLM.started:
+		if got != "active" {
+			t.Fatalf("active child input = %q, want active", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("active child did not start")
+	}
+
+	type response struct {
+		result tool.DelegateResult
+		err    error
+	}
+	responses := make(chan response, 2)
+	for _, message := range []string{"queued-a", "queued-b"} {
+		message := message
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			result, err := ctrl.Execute(ctx, tool.DelegateRequest{
+				Operation: tool.DelegateSend, AgentID: started.AgentID, Message: message, WaitForResponse: true,
+			})
+			responses <- response{result: result, err: err}
+		}()
+	}
+	waitQueuedInputsForLoop(t, obs, started.AgentID, 2)
+
+	stopped, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, AgentID: started.AgentID})
+	if err != nil {
+		t.Fatalf("StopAgent: %v", err)
+	}
+	if stopped.AgentID != started.AgentID || stopped.PreviousState != tool.AgentStateWorking || stopped.State != tool.AgentStateIdle {
+		t.Fatalf("StopAgent result = %+v, want working -> idle for %v", stopped, started.AgentID)
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case got := <-responses:
+			if got.err != nil || got.result.AgentID != started.AgentID || got.result.ResponseStatus != tool.DelegateResponseInterrupted || got.result.State != tool.AgentStateIdle || got.result.Response != "" {
+				t.Fatalf("queued response %d = %+v, %v; want one interrupted terminal", i, got.result, got.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("queued response %d did not resolve after StopAgent", i)
+		}
+	}
+
+	// StopAgent must not reopen the identity before the target actor has drained
+	// its interrupted turn and queued machine inputs. Once StopAgent returns, an
+	// immediate follow-up is nevertheless valid even though the parent's
+	// background hand-back may still be crossing its own boundary.
+	immediateDone := make(chan response, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		result, err := ctrl.Execute(ctx, tool.DelegateRequest{
+			Operation: tool.DelegateSend, AgentID: started.AgentID, Message: "immediate", WaitForResponse: true,
+		})
+		immediateDone <- response{result: result, err: err}
+	}()
+	select {
+	case got := <-childLLM.started:
+		if got != "immediate" {
+			t.Fatalf("immediate reuse input = %q, want immediate", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopAgent returned before the target became reusable")
+	}
+	childLLM.release <- struct{}{}
+	select {
+	case got := <-immediateDone:
+		if got.err != nil || got.result.ResponseStatus != tool.DelegateResponseCompleted || got.result.Response != "reply immediate" || got.result.State != tool.AgentStateIdle {
+			t.Fatalf("immediate reuse response = %+v, %v; want completed reply/idle", got.result, got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("immediate reuse response did not resolve")
+	}
+
+	completion := receiveBackgroundCompletion(t, parentLLM)
+	if completion.AgentID != started.AgentID.String() || completion.ResponseStatus != tool.DelegateResponseInterrupted {
+		t.Fatalf("active background completion = %+v, want interrupted for %v", completion, started.AgentID)
+	}
+	parentLLM.release <- struct{}{}
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.WaitIdle(waitCtx); err != nil {
+		t.Fatalf("WaitIdle after StopAgent: %v", err)
+	}
+
+	cancelled := 0
+	for _, ev := range events.snapshot() {
+		input, ok := ev.(event.InputCancelled)
+		if ok && input.LoopID == started.AgentID && input.Reason == event.CancelTurnInterrupted {
+			cancelled++
+		}
+	}
+	if cancelled != 2 {
+		t.Fatalf("queued InputCancelled events = %d, want exactly two", cancelled)
+	}
+
+	reusedDone := make(chan response, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		result, err := ctrl.Execute(ctx, tool.DelegateRequest{
+			Operation: tool.DelegateSend, AgentID: started.AgentID, Message: "reused", WaitForResponse: true,
+		})
+		reusedDone <- response{result: result, err: err}
+	}()
+	select {
+	case got := <-childLLM.started:
+		if got != "reused" {
+			t.Fatalf("reused child input = %q, want reused", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stopped agent did not accept a later message")
+	}
+	childLLM.release <- struct{}{}
+	select {
+	case got := <-reusedDone:
+		if got.err != nil || got.result.AgentID != started.AgentID || got.result.ResponseStatus != tool.DelegateResponseCompleted || got.result.Response != "reply reused" || got.result.State != tool.AgentStateIdle {
+			t.Fatalf("reused response = %+v, %v; want completed reply/idle", got.result, got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reused agent response did not resolve")
 	}
 }
 

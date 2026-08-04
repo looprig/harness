@@ -1637,7 +1637,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	// declines the work (fail-secure): it publishes event.TurnRejected{RejectInternal}
 	// (the loop is healthy and the caller MAY retry — distinct from RejectShuttingDown,
 	// which says the loop is going away).
-	decideSubmit := func(qi queuedInput, bypassReject bool) {
+	decideSubmit := func(qi queuedInput, bypassReject, durableAcceptance bool) {
 		if probe, ok := cfg.events.(admissionFaultProbe); ok {
 			if err := probe.AdmissionFaultErr(); err != nil {
 				if bypassReject {
@@ -1645,6 +1645,17 @@ func runLoop(cfg loopConfig, state loopState) {
 				} else {
 					rejectSubmit(qi, event.RejectInternal)
 				}
+				return
+			}
+		}
+		if durableAcceptance {
+			// SubagentResult has no transient Accepted channel. Persist its
+			// actor-side admission before placing it in the ephemeral inbox so a
+			// restore can distinguish an admitted hand-back from a command that
+			// was only appended by the sender. The restored actor still replays
+			// the original command when no durable turn/fold proves processing.
+			if err := publishAcceptance(qi.inputID); err != nil {
+				returnEntry(qi, event.CancelTurnFailed, uuid.UUID{})
 				return
 			}
 		}
@@ -2222,7 +2233,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				admitDelegate(c, qi)
 				return false
 			}
-			decideSubmit(qi, false)
+			decideSubmit(qi, false, false)
 
 		case command.SubagentResult:
 			// A hand-back from a finished subagent loop. triggeredBy is the producing
@@ -2238,7 +2249,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				agency:      c.CommandHeader().Agency, // a hand-back is machine; copy verbatim
 				msg:         userMessageFromBlocks(c.Blocks),
 			}
-			decideSubmit(qi, true)
+			decideSubmit(qi, true, true)
 
 		case command.CancelQueuedInput:
 			// Retract a still-queued submit. Resolved by the actor against its own
@@ -2324,10 +2335,22 @@ func runLoop(cfg loopConfig, state loopState) {
 				c.Ack <- true
 			} else if state.status == loopWaitingAdmission && state.cancelAdmission != nil {
 				// This loop is idle with accepted work waiting on session admission.
-				// Keep the existing cancellable waiter: loop-scoped admission rechecks
-				// every retained interrupt ref before returning. Ack false because no
-				// current turn was canceled; fan-out keeps this scope's provisional ref
-				// only when another target genuinely acknowledges cancellation.
+				retainUserQueuedInbox(uuid.UUID{})
+				if len(state.inbox) == 0 {
+					state.cancelAdmission()
+					state.cancelAdmission = nil
+					state.status = loopIdle
+					emitLoopIdle()
+				}
+				// Ack false because no current turn was canceled. The interrupt
+				// caller still owns the mark-before-fanout disposition; clearing the
+				// admission here makes an accepted-but-stopped loop reusable.
+				c.Ack <- false
+			} else if state.status == loopIdle && (len(state.inbox) > 0 || len(state.draining) > 0) {
+				// Compaction can leave accepted work in the inbox while the loop is
+				// otherwise idle. StopAgent has the same queue disposition as an
+				// ordinary interrupt in that window: retain human input and resolve
+				// every machine continuation/hand-back as interrupted.
 				retainUserQueuedInbox(uuid.UUID{})
 				c.Ack <- false
 			} else {

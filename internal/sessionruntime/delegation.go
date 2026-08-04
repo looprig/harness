@@ -180,20 +180,9 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	if len(tombstonedSet) > 0 && tombstonedSet[0] != nil {
 		tombstoned = tombstonedSet[0]
 	}
-	intents := make(map[uuid.UUID]uuid.UUID)
-	for _, record := range records {
-		commandRecord, ok := record.(journal.CommandRecord)
-		if !ok {
-			continue
-		}
-		if err := journal.ValidateCommandRecordRoute(commandRecord); err != nil {
-			return err
-		}
-		input, ok := commandRecord.Command().(command.UserInput)
-		if !ok || !input.BackgroundHandBack || !input.NoFold || input.Agency != identity.AgencyMachine || input.TargetLoopID.IsZero() || input.CommandID.IsZero() {
-			continue
-		}
-		intents[input.CommandID] = input.TargetLoopID
+	intents, err := backgroundDelegateIntents(records)
+	if err != nil {
+		return err
 	}
 	combined := make([]event.Event, 0, len(replayed)+len(closures))
 	combined = append(combined, replayed...)
@@ -255,6 +244,248 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	m.resolved = index
 	m.mu.Unlock()
 	return nil
+}
+
+// backgroundDelegateIntents returns the durable request-to-child map for the one
+// managed request shape whose completion must cross the child-to-parent boundary
+// after a process restart. The marker is intentionally narrower than "machine
+// NoFold": foreground responses and ordinary machine input must never be replayed
+// as parent hand-backs.
+func backgroundDelegateIntents(records []journal.JournalRecord) (map[uuid.UUID]uuid.UUID, error) {
+	intents := make(map[uuid.UUID]uuid.UUID)
+	for _, record := range records {
+		commandRecord, ok := record.(journal.CommandRecord)
+		if !ok {
+			continue
+		}
+		if err := journal.ValidateCommandRecordRoute(commandRecord); err != nil {
+			return nil, err
+		}
+		input, ok := commandRecord.Command().(command.UserInput)
+		if !ok || !input.BackgroundHandBack || !input.NoFold || input.Agency != identity.AgencyMachine || input.TargetLoopID.IsZero() || input.CommandID.IsZero() {
+			continue
+		}
+		intents[input.CommandID] = input.TargetLoopID
+	}
+	return intents, nil
+}
+
+func (m *delegationManager) getResolved(requestID uuid.UUID) (resolvedRequest, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	resolved, ok := m.resolved[requestID]
+	return resolved, ok
+}
+
+// restoredBackgroundPlan is the durable work that must be reconciled after a
+// successful restore. A hand-back command is retained verbatim when it exists so
+// replay does not mint a second completion command for the same response.
+type restoredBackgroundPlan struct {
+	requestID uuid.UUID
+	childID   uuid.UUID
+	parentID  uuid.UUID
+	name      string
+	resolved  resolvedRequest
+	handBack  *command.SubagentResult
+}
+
+// planRestoredBackgroundRequests reconstructs the durable child-terminal to
+// parent-input correlation before RestoreDone. The plan deliberately treats
+// TurnStarted/TurnFoldedInto as processed completion evidence. InputQueued is
+// ephemeral and therefore cannot be an idempotence key; a durable
+// DelegateRequestAccepted may prove admission, but the original command is still
+// replayed because the restored actor does not reconstruct its ephemeral inbox.
+func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records []journal.JournalRecord, replayed, closures []event.Event) ([]restoredBackgroundPlan, error) {
+	intents, err := backgroundDelegateIntents(records)
+	if err != nil {
+		return nil, err
+	}
+
+	type childInfo struct {
+		parent uuid.UUID
+		name   string
+	}
+	children := make(map[uuid.UUID]childInfo)
+	for _, ev := range replayed {
+		started, ok := ev.(event.LoopStarted)
+		if !ok || started.LoopID.IsZero() {
+			continue
+		}
+		name := started.DisplayName
+		if name == "" {
+			name = string(started.AgentName)
+		}
+		children[started.LoopID] = childInfo{parent: started.Cause.Coordinates.LoopID, name: name}
+	}
+	// A degraded/tombstoned child is still registered before this planner runs. Use
+	// the live registry as a fallback for legacy LoopStarted records that predate the
+	// durable display-name field.
+	s.loopsMu.RLock()
+	for childID := range intents {
+		if _, ok := children[childID]; ok {
+			continue
+		}
+		if handle := s.loops[childID]; handle != nil {
+			name := handle.agentName
+			if name == "" && handle.bound != nil {
+				name = handle.bound.DisplayName()
+			}
+			if name == "" && handle.bound != nil {
+				name = string(handle.bound.Name())
+			}
+			children[childID] = childInfo{parent: handle.parent.LoopID, name: name}
+		}
+	}
+	s.loopsMu.RUnlock()
+
+	// Keep the latest durable hand-back command for each response. The normal live
+	// path appends at most one; choosing the latest makes recovery deterministic even
+	// for a journal produced by an older retrying implementation.
+	type handBackRecord struct {
+		commandID uuid.UUID
+		command   command.SubagentResult
+		childID   uuid.UUID
+		parentID  uuid.UUID
+	}
+	handBacks := make(map[uuid.UUID]handBackRecord)
+	for _, record := range records {
+		commandRecord, ok := record.(journal.CommandRecord)
+		if !ok {
+			continue
+		}
+		handBack, ok := commandRecord.Command().(command.SubagentResult)
+		if !ok {
+			continue
+		}
+		envelope, ok := decodeBackgroundCompletion(handBack.Blocks)
+		if !ok {
+			continue
+		}
+		requestID, parseErr := uuid.Parse(envelope.CorrelationID)
+		if parseErr != nil || requestID.IsZero() {
+			continue
+		}
+		childID := handBack.Cause.LoopID
+		parentID := handBack.Coordinates.LoopID
+		if childID.IsZero() || parentID.IsZero() {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: parentID, TargetLoopID: childID}
+		}
+		if target, admitted := intents[requestID]; admitted && target != childID {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: childID, TargetLoopID: target}
+		}
+		if info, known := children[childID]; known && !info.parent.IsZero() && info.parent != parentID {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: parentID, TargetLoopID: info.parent}
+		}
+		if envelope.AgentID != "" {
+			agentID, agentErr := uuid.Parse(envelope.AgentID)
+			if agentErr != nil || agentID != childID {
+				return nil, &journal.CommandRouteMismatchError{RecordLoopID: childID, TargetLoopID: childID}
+			}
+		}
+		handBacks[requestID] = handBackRecord{commandID: handBack.CommandID, command: handBack, childID: childID, parentID: parentID}
+	}
+
+	processed := make(map[uuid.UUID]struct{})
+	for _, ev := range append(append([]event.Event(nil), replayed...), closures...) {
+		commandID := ev.EventHeader().Cause.CommandID
+		// The completion envelope is also durable in the parent turn input.
+		// This correlation survives even when the audit-only SubagentResult
+		// command append failed, so a processed completion cannot be replayed
+		// merely because its command record is absent.
+		var message *content.UserMessage
+		switch typed := ev.(type) {
+		case event.TurnStarted:
+			message = typed.Message
+		case event.TurnFoldedInto:
+			message = typed.Message
+		}
+		if message != nil {
+			if envelope, ok := decodeBackgroundCompletion(message.Blocks); ok {
+				if requestID, parseErr := uuid.Parse(envelope.CorrelationID); parseErr == nil && !requestID.IsZero() {
+					processed[requestID] = struct{}{}
+				}
+			}
+		}
+		if commandID.IsZero() {
+			continue
+		}
+		var isProcessed bool
+		switch ev.(type) {
+		case event.TurnStarted, event.TurnFoldedInto, event.TurnRejected:
+			isProcessed = true
+		}
+		if !isProcessed {
+			continue
+		}
+		for _, handBack := range handBacks {
+			if handBack.commandID == commandID && ev.EventHeader().LoopID == handBack.parentID {
+				processed[commandID] = struct{}{}
+			}
+		}
+	}
+
+	requestIDs := make([]uuid.UUID, 0, len(intents))
+	for requestID := range intents {
+		if _, resolved := m.getResolved(requestID); resolved {
+			requestIDs = append(requestIDs, requestID)
+		}
+	}
+	sort.Slice(requestIDs, func(i, j int) bool { return requestIDs[i].String() < requestIDs[j].String() })
+
+	plan := make([]restoredBackgroundPlan, 0, len(requestIDs))
+	for _, requestID := range requestIDs {
+		if _, done := processed[requestID]; done {
+			continue
+		}
+		resolved, ok := m.getResolved(requestID)
+		if !ok {
+			continue
+		}
+		childID := intents[requestID]
+		if resolved.childID != childID {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: resolved.childID, TargetLoopID: childID}
+		}
+		info, known := children[childID]
+		if !known || info.parent.IsZero() {
+			// A malformed legacy record cannot be safely routed. Leave it in the
+			// private resolution index for diagnostics, but do not invent a parent.
+			continue
+		}
+		entry := restoredBackgroundPlan{requestID: requestID, childID: childID, parentID: info.parent, name: info.name, resolved: resolved}
+		if handBack, exists := handBacks[requestID]; exists {
+			if _, done := processed[handBack.commandID]; !done {
+				copy := handBack.command
+				entry.handBack = &copy
+			}
+			// A processed hand-back is intentionally omitted from the plan.
+			if _, done := processed[handBack.commandID]; done {
+				continue
+			}
+		}
+		plan = append(plan, entry)
+	}
+	return plan, nil
+}
+
+// reconcileRestoredBackgroundRequests admits each planned completion once. Existing
+// command records are re-sent verbatim; only a response with no prior hand-back
+// command mints and appends a new SubagentResult. Wake ownership is restored before
+// dispatch and released by the normal parent event path.
+func (m *delegationManager) reconcileRestoredBackgroundRequests(s *Session, plan []restoredBackgroundPlan) {
+	for _, entry := range plan {
+		s.expectTurn(s.sessionCtx, entry.childID)
+		var err error
+		if entry.handBack != nil {
+			err = s.replaySubagentResult(s.sessionCtx, *entry.handBack)
+		} else {
+			err = s.deliverSubagentResult(s.sessionCtx, entry.parentID, entry.childID, backgroundCompletionBlocks(entry.childID, entry.name, entry.requestID, entry.resolved.status, entry.resolved.text))
+		}
+		if err != nil {
+			// No parent event can release the restored wake token when transport
+			// fails. The next restore can retry from the durable terminal/command.
+			s.cancelExpectTurn(context.Background(), entry.childID)
+		}
+	}
 }
 
 // foldDelegateTerminals correlates every turn's opening request id (TurnStarted's
@@ -869,7 +1100,16 @@ func (c *scopedController) interrupt(s *Session, req tool.DelegateRequest) (tool
 		return tool.DelegateResult{}, err
 	}
 	previousState := c.childState(s, req.AgentID)
-	if err := s.interruptLoopID(req.AgentID); err != nil {
+	var err error
+	if s.hub == nil {
+		// Keep struct-literal controller tests and other headless seams on the
+		// original best-effort primitive; runInterrupt's release policy needs the
+		// live session hub/idle model.
+		err = s.interruptLoopID(req.AgentID)
+	} else {
+		err = s.interruptSingle(context.Background(), req.AgentID)
+	}
+	if err != nil {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateNotOwned, DelegateID: req.AgentID}
 	}
 	return tool.DelegateResult{AgentID: req.AgentID, PreviousState: previousState, State: tool.AgentStateIdle}, nil
@@ -939,6 +1179,21 @@ type backgroundCompletionEnvelope struct {
 	ResponseStatus tool.DelegateResponseStatus `json:"response_status"`
 	CorrelationID  string                      `json:"correlation_id"`
 	Response       string                      `json:"response"`
+}
+
+func decodeBackgroundCompletion(blocks []content.Block) (backgroundCompletionEnvelope, bool) {
+	for _, block := range blocks {
+		text, ok := block.(*content.TextBlock)
+		if !ok || text == nil || text.Text == "" {
+			continue
+		}
+		var envelope backgroundCompletionEnvelope
+		if err := json.Unmarshal([]byte(text.Text), &envelope); err != nil || envelope.CorrelationID == "" {
+			continue
+		}
+		return envelope, true
+	}
+	return backgroundCompletionEnvelope{}, false
 }
 
 // backgroundCompletionBlocks creates the single bounded, structured machine input

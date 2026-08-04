@@ -581,6 +581,10 @@ func restoreTopologySession(
 	if err := seedResolvedDelegateRecords(manager, allRecords, all, crashClosures, tombstoned); err != nil {
 		return abortAccepted(s, &RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
+	backgroundPlan, err := manager.planRestoredBackgroundRequests(s, allRecords, all, crashClosures)
+	if err != nil {
+		return abortAccepted(s, &RestoreError{Kind: RestoreReplayFailed, Cause: err})
+	}
 	// RestoreDone is the commit point: every loop is bound, crash-closed, built,
 	// attached, and the active selection has been validated before this append.
 	if err := appendRestoreEvent(ctx, j, factory, event.RestoreDone{
@@ -593,6 +597,7 @@ func restoreTopologySession(
 	// offload-GC runner now the hub exists (bound to hub.IsIdle).
 	s.watchRootLease()
 	s.startOffloadGC()
+	manager.reconcileRestoredBackgroundRequests(s, backgroundPlan)
 	contextTransferred = true
 	return s, nil
 }

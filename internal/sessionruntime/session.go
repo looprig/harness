@@ -1208,6 +1208,29 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 	}
 }
 
+// replaySubagentResult re-admits an already durable hand-back command without
+// appending a second intent record. Restore uses this when the prior parent actor
+// accepted the command but no durable turn/fold event proves that it processed the
+// completion. The restored actor has no ephemeral inbox to rebuild, so the original
+// command crosses the actor boundary again with its original id.
+func (s *Session) replaySubagentResult(ctx context.Context, cmd command.SubagentResult) error {
+	l, ok := s.loopFor(cmd.Coordinates.LoopID)
+	if !ok {
+		return &SessionError{Kind: SessionLoopNotFound}
+	}
+	if l == nil {
+		return &SessionError{Kind: SessionLoopExited}
+	}
+	select {
+	case commandSinkFor(l, cmd) <- cmd:
+		return nil
+	case <-l.DoneChan():
+		return &SessionError{Kind: SessionLoopExited}
+	case <-ctx.Done():
+		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	}
+}
+
 // NewLoop creates another loop inside this session. The new loop shares
 // SessionID but receives its own loop id and loop goroutine. parent is the
 // provenance of the spawning turn/step (zero for a root loop); the session

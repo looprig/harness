@@ -157,9 +157,10 @@ func TestSeedResolvedDelegateRecordsMarksTombstonedRequestsFailed(t *testing.T) 
 	requestID, childID := mustUUID(), mustUUID()
 	manager := newDelegationManager(Topology{})
 	cmd := command.UserInput{
-		Header:       command.Header{CommandID: requestID, Agency: identity.AgencyMachine},
-		NoFold:       true,
-		TargetLoopID: childID,
+		Header:             command.Header{CommandID: requestID, Agency: identity.AgencyMachine},
+		NoFold:             true,
+		TargetLoopID:       childID,
+		BackgroundHandBack: true,
 	}
 	accepted := event.LoopStarted{
 		Header:           event.Header{Coordinates: identity.Coordinates{LoopID: childID}},
