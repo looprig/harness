@@ -16,7 +16,12 @@ type ContextTransport struct {
 
 // contextTransportKey projects the transport-identifying fields of a model,
 // ignoring fields (Name, Sampling, Caps, Limits, Origin) that do not change
-// the wire transport or trust posture.
+// the wire transport or trust posture. This is a deliberate product decision,
+// not an oversight: Sampling.Effort in particular is never part of transport
+// or trust identity — it is a per-request sampling parameter, validated
+// separately by each model's own declared effort set, and switching effort
+// never crosses a security/retention boundary the way switching transport
+// does. Name varies freely within one transport (many models, one endpoint).
 type contextTransportKey struct {
 	Provider  model.ProviderName
 	APIFormat model.APIFormat
