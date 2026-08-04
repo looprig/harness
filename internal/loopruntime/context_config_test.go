@@ -132,7 +132,7 @@ func TestChangeInferenceRejectsContextTransportSwap(t *testing.T) {
 			tt.mutate(&candidate)
 			res := sendChange(t, l, command.ChangeLoopInference{Model: candidate, SetModel: true})
 			var changeErr *loop.ChangeError
-			var bindingErr *loop.ContextTransportBindingError
+			var bindingErr *loop.ContextTransportNotDeclaredError
 			if !errors.As(res.Err, &changeErr) || changeErr.Kind != loop.ChangeInvalidModel || !errors.As(res.Err, &bindingErr) {
 				t.Fatalf("error = %T %v", res.Err, res.Err)
 			}

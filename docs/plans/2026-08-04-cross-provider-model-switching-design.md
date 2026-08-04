@@ -587,9 +587,12 @@ projection fields). This is called out explicitly rather than left implicit.
 `ContextTransportBindingError` is removed and replaced by
 `ContextTransportNotDeclaredError`. This is a breaking Go API rename of an
 already-exported type. It is acceptable here because (a) the type is a
-narrow, mechanical validation-failure descriptor with no known external
-`errors.As` dependents yet (the feature that would create the first live
-cross-provider switch does not exist until this plan ships), and (b) keeping
+narrow, mechanical validation-failure descriptor whose only known external
+`errors.As` dependent — `internal/loopruntime/context_config_test.go`
+(`TestChangeInferenceRejectsContextTransportSwap`) — is a same-module
+mechanical rename handled inline by Task 1.2 (the feature that would create
+the first live cross-provider switch does not exist until this plan ships),
+and (b) keeping
 the old name with re-purposed multi-member semantics would be more confusing
 than a clean rename. No wire-format/journal compatibility is affected — this
 type never crosses the durable-event boundary.

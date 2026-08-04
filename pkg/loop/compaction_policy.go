@@ -107,31 +107,6 @@ func (p CompactionPolicy) Validate(capability contextcount.CounterCapability) er
 	return nil
 }
 
-// ContextTransportBindingError reports a live or predeclared model that would
-// replace the fixed provider transport used by the bound client and counter.
-type ContextTransportBindingError struct {
-	Field     string
-	Bound     string
-	Candidate string
-}
-
-func (e *ContextTransportBindingError) Error() string {
-	return "loop: context model changes fixed transport field " + e.Field
-}
-
-func validateContextTransportBinding(bound, candidate model.Model) error {
-	if bound.Provider != candidate.Provider {
-		return &ContextTransportBindingError{Field: "Provider", Bound: string(bound.Provider), Candidate: string(candidate.Provider)}
-	}
-	if bound.APIFormat != candidate.APIFormat {
-		return &ContextTransportBindingError{Field: "APIFormat", Bound: string(bound.APIFormat), Candidate: string(candidate.APIFormat)}
-	}
-	if bound.BaseURL != candidate.BaseURL {
-		return &ContextTransportBindingError{Field: "BaseURL", Bound: bound.BaseURL, Candidate: candidate.BaseURL}
-	}
-	return nil
-}
-
 // RequestFingerprintInput is the complete secret-free request-shape projection
 // used to identify one measurement. Revisions identify opaque prompt/tool/runtime
 // context producers; model and capabilities are included in full.

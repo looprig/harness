@@ -58,6 +58,7 @@ type definitionState struct {
 	contextCounter      contextcount.ContextCounter
 	counterCapability   contextcount.CounterCapability
 	inferenceCapability contextcount.InferenceCapability
+	contextTransports   []ContextTransport
 	contextObservation  ContextObservationPolicy
 	compaction          CompactionPolicy
 	output              *inference.OutputSchema
@@ -220,6 +221,33 @@ func validateContextDefinition(resolved *definitionOptions) error {
 	if err := contextcount.CompatibleCounter(resolved.inferenceCapability, capability); err != nil {
 		return &DefinitionError{Kind: DefinitionIncompatibleContextCounter, Field: "context_counter", Cause: err}
 	}
+	// base-member/capability check added in Task 1.2: a caller-supplied
+	// WithContextTransports set must contain a member matching the base
+	// model's own transport identity, with a Capability matching
+	// WithInferenceCapability exactly. Task 1.3 adds uniqueness detection
+	// across members, per-member Capability.Validate(), and per-member
+	// contextcount.CompatibleCounter checks alongside this same check, and
+	// synthesizes a one-element default set when none is declared (this
+	// block intentionally does nothing when resolved.contextTransports is
+	// empty, preserving today's no-declared-set behavior until then).
+	if len(resolved.contextTransports) > 0 {
+		baseKey := transportKeyOf(resolved.model)
+		foundBase := false
+		for _, transport := range resolved.contextTransports {
+			key := contextTransportKey{Provider: transport.Provider, APIFormat: transport.APIFormat, BaseURL: transport.BaseURL}
+			if key != baseKey {
+				continue
+			}
+			foundBase = true
+			if transport.Capability != resolved.inferenceCapability {
+				return &DefinitionError{Kind: DefinitionInvalidContextTransport, Field: "context_transports"}
+			}
+			break
+		}
+		if !foundBase {
+			return &DefinitionError{Kind: DefinitionInvalidContextTransport, Field: "context_transports"}
+		}
+	}
 	if hasCompaction {
 		if err := resolved.compaction.Validate(capability); err != nil {
 			return &DefinitionError{Kind: DefinitionInvalidCompaction, Field: "compaction", Cause: err}
@@ -234,7 +262,7 @@ func validateContextDefinition(resolved *definitionOptions) error {
 		if zeroModel(mode.Model) {
 			continue
 		}
-		if err := validateContextTransportBinding(resolved.model, mode.Model); err != nil {
+		if err := validateContextTransportMembership(resolved.contextTransports, mode.Model); err != nil {
 			return &DefinitionError{Kind: DefinitionInvalidModeBinding, Field: "mode.model", Value: string(mode.Name), Cause: err}
 		}
 	}
@@ -830,6 +858,22 @@ func WithInferenceCapability(capability contextcount.InferenceCapability) Option
 	}
 }
 
+// WithContextTransports declares the complete set of (wire transport -> trust
+// posture) pairs a live model switch or predeclared mode is allowed to move
+// to. Omitting it synthesizes a one-element set from the base WithInference
+// model and WithInferenceCapability value, byte-identical to today's
+// single-transport behavior (Task 1.3).
+func WithContextTransports(transports ...ContextTransport) Option {
+	transports = append([]ContextTransport(nil), transports...)
+	return func(o *definitionOptions) error {
+		if err := o.singleton("context_transports"); err != nil {
+			return err
+		}
+		o.contextTransports = transports
+		return nil
+	}
+}
+
 // WithContextObservation installs explicit hard-admission policy without
 // enabling conversation compaction.
 func WithContextObservation(policy ContextObservationPolicy) Option {
@@ -887,7 +931,10 @@ func validateDefinitionContextModel(state *definitionState, model model.Model) e
 	if state.contextCounter == nil {
 		return nil
 	}
-	return validateContextTransportBinding(state.model, model)
+	// Interim (Task 1.2/1.3) strict single-transport check; Task 1.4 rewrites
+	// this to a real lookupTransport-based set-membership check once
+	// definitionState carries its own frozen contextTransports.
+	return validateContextTransportUnchanged(state.model, model)
 }
 
 // WithDisplayName sets the loop's user-facing presentation label. Purely

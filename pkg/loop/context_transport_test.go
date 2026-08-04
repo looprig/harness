@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"errors"
 	"testing"
 
 	contextcount "github.com/looprig/inference/contextcount"
@@ -164,6 +165,58 @@ func TestLookupTransport(t *testing.T) {
 			}
 			if gotCap != tt.wantCap {
 				t.Fatalf("lookupTransport() capability = %+v, want %+v", gotCap, tt.wantCap)
+			}
+		})
+	}
+}
+
+func TestWithContextTransports_Singleton(t *testing.T) {
+	t.Parallel()
+	counter := &policyCounter{capability: exactCounterCapability()}
+	base := testModel()
+	transports := []ContextTransport{
+		{Provider: base.Provider, APIFormat: base.APIFormat, BaseURL: base.BaseURL, Capability: localInferenceCapability()},
+	}
+	opts := append(contextDefinitionOptions(counter, localInferenceCapability(), manualCompactionPolicy()),
+		WithContextTransports(transports...), WithContextTransports(transports...))
+	_, err := Define(opts...)
+	var target *DefinitionError
+	if !errors.As(err, &target) || target.Kind != DefinitionDuplicateOption {
+		t.Fatalf("Define() error = %T %v, want DefinitionDuplicateOption", err, err)
+	}
+}
+
+func TestWithContextTransports_RequiresBaseMember(t *testing.T) {
+	t.Parallel()
+	base := testModel()
+	baseTransport := ContextTransport{Provider: base.Provider, APIFormat: base.APIFormat, BaseURL: base.BaseURL, Capability: localInferenceCapability()}
+	otherTransport := ContextTransport{Provider: "other", APIFormat: model.APIFormatAnthropic, BaseURL: "https://api.other.example", Capability: localInferenceCapability()}
+	mismatchedCapability := baseTransport
+	mismatchedCapability.Capability = contextcount.InferenceCapability{Transport: contextcount.InferenceTransportTLS, Retention: contextcount.RetentionNone}
+
+	tests := []struct {
+		name       string
+		transports []ContextTransport
+		wantErr    bool
+	}{
+		{name: "base member present with matching capability", transports: []ContextTransport{baseTransport}},
+		{name: "missing base member", transports: []ContextTransport{otherTransport}, wantErr: true},
+		{name: "base member capability mismatch", transports: []ContextTransport{mismatchedCapability}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			counter := &policyCounter{capability: exactCounterCapability()}
+			opts := append(contextDefinitionOptions(counter, localInferenceCapability(), manualCompactionPolicy()), WithContextTransports(tt.transports...))
+			_, err := Define(opts...)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Define() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				var target *DefinitionError
+				if !errors.As(err, &target) || target.Kind != DefinitionInvalidContextTransport {
+					t.Fatalf("Define() error = %T %v, want DefinitionInvalidContextTransport", err, err)
+				}
 			}
 		})
 	}

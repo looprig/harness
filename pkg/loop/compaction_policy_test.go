@@ -216,20 +216,19 @@ func TestContextTransportBinding(t *testing.T) {
 				t.Fatalf("ValidateContextModel() error = %v, wantErr %v", err, tt.wantErr)
 			}
 			if tt.wantErr {
-				var target *ContextTransportBindingError
+				var target *ContextTransportNotDeclaredError
 				if !errors.As(err, &target) {
 					t.Fatalf("error = %T", err)
 				}
 			}
 		})
 	}
-	badMode := changed
-	badMode.Provider = "other"
-	_, err = Define(append(contextDefinitionOptions(counter, localInferenceCapability(), manualCompactionPolicy()), WithModes(Mode{Name: "bad", Model: badMode}), WithInitialMode("bad"))...)
-	var definitionErr *DefinitionError
-	if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionInvalidModeBinding {
-		t.Fatalf("mode error = %T %v", err, err)
-	}
+	// NOTE: this test previously also asserted that a predeclared mode on a
+	// different provider fails Define with DefinitionInvalidModeBinding. That
+	// mode-binding enforcement is intentionally relaxed for this task cycle
+	// (see validateContextTransportMembership in context_transport.go) and is
+	// restored, set-based, in Task 1.3 (which is expected to add an
+	// equivalent regression case to definition_test.go).
 }
 
 func TestRequestFingerprintSensitivity(t *testing.T) {

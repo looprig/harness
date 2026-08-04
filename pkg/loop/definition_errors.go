@@ -38,6 +38,8 @@ const (
 	DefinitionInvalidModeBinding         DefinitionErrorKind = "invalid_mode_binding"
 	DefinitionInvalidOutputSchema        DefinitionErrorKind = "invalid_output_schema"
 	DefinitionReservedToolName           DefinitionErrorKind = "reserved_tool_name"
+	DefinitionDuplicateContextTransport  DefinitionErrorKind = "duplicate_context_transport"
+	DefinitionInvalidContextTransport    DefinitionErrorKind = "invalid_context_transport"
 )
 
 // DefinitionError reports an invalid immutable definition.
