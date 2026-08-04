@@ -73,6 +73,9 @@ const ChatModelGPT5_6Terra = shared.ChatModelGPT5_6Terra
 // Equals "gpt-5.6-luna"
 const ChatModelGPT5_6Luna = shared.ChatModelGPT5_6Luna
 
+// Equals "gpt-5.5"
+const ChatModelGPT5_5 = shared.ChatModelGPT5_5
+
 // Equals "gpt-5.4"
 const ChatModelGPT5_4 = shared.ChatModelGPT5_4
 
@@ -474,7 +477,10 @@ const OAuthErrorCodeInvalidSubjectToken = shared.OAuthErrorCodeInvalidSubjectTok
 // This is an alias to an internal type.
 type Reasoning = shared.Reasoning
 
-// Controls which reasoning items are rendered back to the model on later turns.
+// Controls which reasoning items are rendered back to the model on later turns. If
+// omitted or set to `auto`, the model determines the context mode. The `gpt-5.6`
+// model family defaults to `all_turns`; earlier models default to `current_turn`.
+//
 // When returned on a response, this is the effective reasoning context mode used
 // for the response.
 //

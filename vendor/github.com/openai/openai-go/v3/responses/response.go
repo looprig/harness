@@ -3396,7 +3396,7 @@ type Response struct {
 	// Used by OpenAI to cache responses for similar requests to optimize your cache
 	// hit rates. Replaces the `user` field.
 	// [Learn more](https://platform.openai.com/docs/guides/prompt-caching).
-	PromptCacheKey string `json:"prompt_cache_key"`
+	PromptCacheKey string `json:"prompt_cache_key" api:"nullable"`
 	// The prompt-caching options that were applied to the response. Supported for
 	// `gpt-5.6` and later models.
 	PromptCacheOptions ResponsePromptCacheOptions `json:"prompt_cache_options"`
@@ -3433,7 +3433,7 @@ type Response struct {
 	// hashing their username or email address, in order to avoid sending us any
 	// identifying information.
 	// [Learn more](https://platform.openai.com/docs/guides/safety-best-practices#safety-identifiers).
-	SafetyIdentifier string `json:"safety_identifier"`
+	SafetyIdentifier string `json:"safety_identifier" api:"nullable"`
 	// Specifies the processing type used for serving the request.
 	//
 	//   - If set to 'auto', then the request will be processed with the service tier
@@ -3441,9 +3441,13 @@ type Response struct {
 	//     will use 'default'.
 	//   - If set to 'default', then the request will be processed with the standard
 	//     pricing and performance for the selected model.
-	//   - If set to '[flex](https://platform.openai.com/docs/guides/flex-processing)' or
-	//     '[priority](https://openai.com/api-priority-processing/)', then the request
-	//     will be processed with the corresponding service tier.
+	//   - If set to '[flex](https://platform.openai.com/docs/guides/flex-processing)',
+	//     then the request will be processed with the Flex Processing service tier.
+	//   - To opt-in to [Fast mode](/api/docs/guides/fast-mode) at the request level,
+	//     include the `service_tier=fast` or `service_tier=priority` parameter for
+	//     Responses or Chat Completions. The response will show `service_tier=priority`
+	//     regardless of if you specify `service_tier=fast` or `priority` in your
+	//     request.
 	//   - When not set, the default behavior is 'auto'.
 	//
 	// When the `service_tier` parameter is set, the response body will include the
@@ -3451,7 +3455,7 @@ type Response struct {
 	// request. This response value may be different from the value set in the
 	// parameter.
 	//
-	// Any of "auto", "default", "flex", "scale", "priority".
+	// Any of "auto", "default", "flex", "scale", "priority", "fast".
 	ServiceTier ResponseServiceTier `json:"service_tier" api:"nullable"`
 	// The status of the response generation. One of `completed`, `failed`,
 	// `in_progress`, `cancelled`, `queued`, or `incomplete`.
@@ -4086,9 +4090,13 @@ const (
 //     will use 'default'.
 //   - If set to 'default', then the request will be processed with the standard
 //     pricing and performance for the selected model.
-//   - If set to '[flex](https://platform.openai.com/docs/guides/flex-processing)' or
-//     '[priority](https://openai.com/api-priority-processing/)', then the request
-//     will be processed with the corresponding service tier.
+//   - If set to '[flex](https://platform.openai.com/docs/guides/flex-processing)',
+//     then the request will be processed with the Flex Processing service tier.
+//   - To opt-in to [Fast mode](/api/docs/guides/fast-mode) at the request level,
+//     include the `service_tier=fast` or `service_tier=priority` parameter for
+//     Responses or Chat Completions. The response will show `service_tier=priority`
+//     regardless of if you specify `service_tier=fast` or `priority` in your
+//     request.
 //   - When not set, the default behavior is 'auto'.
 //
 // When the `service_tier` parameter is set, the response body will include the
@@ -4103,6 +4111,7 @@ const (
 	ResponseServiceTierFlex     ResponseServiceTier = "flex"
 	ResponseServiceTierScale    ResponseServiceTier = "scale"
 	ResponseServiceTierPriority ResponseServiceTier = "priority"
+	ResponseServiceTierFast     ResponseServiceTier = "fast"
 )
 
 // The truncation strategy to use for the model response.
@@ -7694,12 +7703,13 @@ func (r *ResponseCustomToolCallOutputItem) UnmarshalJSON(data []byte) error {
 type ResponseError struct {
 	// The error code for the response.
 	//
-	// Any of "server_error", "rate_limit_exceeded", "invalid_prompt", "bio_policy",
-	// "vector_store_timeout", "invalid_image", "invalid_image_format",
-	// "invalid_base64_image", "invalid_image_url", "image_too_large",
-	// "image_too_small", "image_parse_error", "image_content_policy_violation",
-	// "invalid_image_mode", "image_file_too_large", "unsupported_image_media_type",
-	// "empty_image_file", "failed_to_download_image", "image_file_not_found".
+	// Any of "server_error", "rate_limit_exceeded", "invalid_prompt",
+	// "data_residency_mismatch", "bio_policy", "vector_store_timeout",
+	// "invalid_image", "invalid_image_format", "invalid_base64_image",
+	// "invalid_image_url", "image_too_large", "image_too_small", "image_parse_error",
+	// "image_content_policy_violation", "invalid_image_mode", "image_file_too_large",
+	// "unsupported_image_media_type", "empty_image_file", "failed_to_download_image",
+	// "image_file_not_found".
 	Code ResponseErrorCode `json:"code" api:"required"`
 	// A human-readable description of the error.
 	Message string `json:"message" api:"required"`
@@ -7725,6 +7735,7 @@ const (
 	ResponseErrorCodeServerError                 ResponseErrorCode = "server_error"
 	ResponseErrorCodeRateLimitExceeded           ResponseErrorCode = "rate_limit_exceeded"
 	ResponseErrorCodeInvalidPrompt               ResponseErrorCode = "invalid_prompt"
+	ResponseErrorCodeDataResidencyMismatch       ResponseErrorCode = "data_residency_mismatch"
 	ResponseErrorCodeBioPolicy                   ResponseErrorCode = "bio_policy"
 	ResponseErrorCodeVectorStoreTimeout          ResponseErrorCode = "vector_store_timeout"
 	ResponseErrorCodeInvalidImage                ResponseErrorCode = "invalid_image"
@@ -9850,6 +9861,10 @@ type ResponseFunctionToolCallOutputItem struct {
 	Caller ResponseFunctionToolCallOutputItemCallerUnion `json:"caller" api:"nullable"`
 	// The identifier of the actor that created the item.
 	CreatedBy string `json:"created_by"`
+	// The name of the tool that produced the output.
+	Name string `json:"name"`
+	// The namespace of the tool that produced the output.
+	Namespace string `json:"namespace"`
 	// JSON contains metadata for fields, check presence with [respjson.Field.Valid].
 	JSON struct {
 		ID          respjson.Field
@@ -9859,6 +9874,8 @@ type ResponseFunctionToolCallOutputItem struct {
 		Type        respjson.Field
 		Caller      respjson.Field
 		CreatedBy   respjson.Field
+		Name        respjson.Field
+		Namespace   respjson.Field
 		ExtraFields map[string]respjson.Field
 		raw         string
 	} `json:"-"`
@@ -12558,6 +12575,10 @@ type ResponseInputItemFunctionCallOutput struct {
 	ID string `json:"id" api:"nullable"`
 	// The execution context that produced this tool call.
 	Caller ResponseInputItemFunctionCallOutputCallerUnion `json:"caller" api:"nullable"`
+	// The name of the tool that produced the output.
+	Name string `json:"name" api:"nullable"`
+	// The namespace of the tool that produced the output.
+	Namespace string `json:"namespace" api:"nullable"`
 	// The status of the item. One of `in_progress`, `completed`, or `incomplete`.
 	// Populated when items are returned via API.
 	//
@@ -12570,6 +12591,8 @@ type ResponseInputItemFunctionCallOutput struct {
 		Type        respjson.Field
 		ID          respjson.Field
 		Caller      respjson.Field
+		Name        respjson.Field
+		Namespace   respjson.Field
 		Status      respjson.Field
 		ExtraFields map[string]respjson.Field
 		raw         string
@@ -14700,6 +14723,8 @@ func (u ResponseInputItemUnionParam) GetCallID() *string {
 func (u ResponseInputItemUnionParam) GetName() *string {
 	if vt := u.OfFunctionCall; vt != nil {
 		return (*string)(&vt.Name)
+	} else if vt := u.OfFunctionCallOutput; vt != nil && vt.Name.Valid() {
+		return &vt.Name.Value
 	} else if vt := u.OfMcpApprovalRequest; vt != nil {
 		return (*string)(&vt.Name)
 	} else if vt := u.OfMcpCall; vt != nil {
@@ -14713,6 +14738,8 @@ func (u ResponseInputItemUnionParam) GetName() *string {
 // Returns a pointer to the underlying variant's property, if present.
 func (u ResponseInputItemUnionParam) GetNamespace() *string {
 	if vt := u.OfFunctionCall; vt != nil && vt.Namespace.Valid() {
+		return &vt.Namespace.Value
+	} else if vt := u.OfFunctionCallOutput; vt != nil && vt.Namespace.Valid() {
 		return &vt.Namespace.Value
 	} else if vt := u.OfCustomToolCall; vt != nil && vt.Namespace.Valid() {
 		return &vt.Namespace.Value
@@ -15439,6 +15466,10 @@ type ResponseInputItemFunctionCallOutputParam struct {
 	// The unique ID of the function tool call output. Populated when this item is
 	// returned via API.
 	ID param.Opt[string] `json:"id,omitzero"`
+	// The name of the tool that produced the output.
+	Name param.Opt[string] `json:"name,omitzero"`
+	// The namespace of the tool that produced the output.
+	Namespace param.Opt[string] `json:"namespace,omitzero"`
 	// The execution context that produced this tool call.
 	Caller ResponseInputItemFunctionCallOutputCallerUnionParam `json:"caller,omitzero"`
 	// The status of the item. One of `in_progress`, `completed`, or `incomplete`.
@@ -20637,8 +20668,9 @@ type ResponseReasoningItem struct {
 	Type constant.Reasoning `json:"type" default:"reasoning"`
 	// Reasoning text content.
 	Content []ResponseReasoningItemContent `json:"content"`
-	// The encrypted content of the reasoning item - populated when a response is
-	// generated with `reasoning.encrypted_content` in the `include` parameter.
+	// The encrypted content of the reasoning item. This is populated by default for
+	// reasoning items returned by `POST /v1/responses` and WebSocket `response.create`
+	// requests.
 	EncryptedContent string `json:"encrypted_content" api:"nullable"`
 	// The status of the item. One of `in_progress`, `completed`, or `incomplete`.
 	// Populated when items are returned via API.
@@ -20738,8 +20770,9 @@ type ResponseReasoningItemParam struct {
 	ID string `json:"id" api:"required"`
 	// Reasoning summary content.
 	Summary []ResponseReasoningItemSummaryParam `json:"summary,omitzero" api:"required"`
-	// The encrypted content of the reasoning item - populated when a response is
-	// generated with `reasoning.encrypted_content` in the `include` parameter.
+	// The encrypted content of the reasoning item. This is populated by default for
+	// reasoning items returned by `POST /v1/responses` and WebSocket `response.create`
+	// requests.
 	EncryptedContent param.Opt[string] `json:"encrypted_content,omitzero"`
 	// Reasoning text content.
 	Content []ResponseReasoningItemContentParam `json:"content,omitzero"`
@@ -21861,7 +21894,8 @@ type ResponseTextConfig struct {
 	Format ResponseFormatTextConfigUnion `json:"format"`
 	// Constrains the verbosity of the model's response. Lower values will result in
 	// more concise responses, while higher values will result in more verbose
-	// responses. Currently supported values are `low`, `medium`, and `high`.
+	// responses. Currently supported values are `low`, `medium`, and `high`. The
+	// default is `medium`.
 	//
 	// Any of "low", "medium", "high".
 	Verbosity ResponseTextConfigVerbosity `json:"verbosity" api:"nullable"`
@@ -21891,7 +21925,8 @@ func (r ResponseTextConfig) ToParam() ResponseTextConfigParam {
 
 // Constrains the verbosity of the model's response. Lower values will result in
 // more concise responses, while higher values will result in more verbose
-// responses. Currently supported values are `low`, `medium`, and `high`.
+// responses. Currently supported values are `low`, `medium`, and `high`. The
+// default is `medium`.
 type ResponseTextConfigVerbosity string
 
 const (
@@ -21908,7 +21943,8 @@ const (
 type ResponseTextConfigParam struct {
 	// Constrains the verbosity of the model's response. Lower values will result in
 	// more concise responses, while higher values will result in more verbose
-	// responses. Currently supported values are `low`, `medium`, and `high`.
+	// responses. Currently supported values are `low`, `medium`, and `high`. The
+	// default is `medium`.
 	//
 	// Any of "low", "medium", "high".
 	Verbosity ResponseTextConfigVerbosity `json:"verbosity,omitzero"`
@@ -25719,6 +25755,17 @@ type ResponseNewParams struct {
 	// [conversation state](https://platform.openai.com/docs/guides/conversation-state).
 	// Cannot be used in conjunction with `conversation`.
 	PreviousResponseID param.Opt[string] `json:"previous_response_id,omitzero"`
+	// Used by OpenAI to cache responses for similar requests to optimize your cache
+	// hit rates. Replaces the `user` field.
+	// [Learn more](https://platform.openai.com/docs/guides/prompt-caching).
+	PromptCacheKey param.Opt[string] `json:"prompt_cache_key,omitzero"`
+	// A stable identifier used to help detect users of your application that may be
+	// violating OpenAI's usage policies. The IDs should be a string that uniquely
+	// identifies each user, with a maximum length of 64 characters. We recommend
+	// hashing their username or email address, in order to avoid sending us any
+	// identifying information.
+	// [Learn more](https://platform.openai.com/docs/guides/safety-best-practices#safety-identifiers).
+	SafetyIdentifier param.Opt[string] `json:"safety_identifier,omitzero"`
 	// Whether to store the generated model response for later retrieval via API.
 	Store param.Opt[bool] `json:"store,omitzero"`
 	// What sampling temperature to use, between 0 and 2. Higher values like 0.8 will
@@ -25736,17 +25783,6 @@ type ResponseNewParams struct {
 	//
 	// We generally recommend altering this or `temperature` but not both.
 	TopP param.Opt[float64] `json:"top_p,omitzero"`
-	// Used by OpenAI to cache responses for similar requests to optimize your cache
-	// hit rates. Replaces the `user` field.
-	// [Learn more](https://platform.openai.com/docs/guides/prompt-caching).
-	PromptCacheKey param.Opt[string] `json:"prompt_cache_key,omitzero"`
-	// A stable identifier used to help detect users of your application that may be
-	// violating OpenAI's usage policies. The IDs should be a string that uniquely
-	// identifies each user, with a maximum length of 64 characters. We recommend
-	// hashing their username or email address, in order to avoid sending us any
-	// identifying information.
-	// [Learn more](https://platform.openai.com/docs/guides/safety-best-practices#safety-identifiers).
-	SafetyIdentifier param.Opt[string] `json:"safety_identifier,omitzero"`
 	// This field is being replaced by `safety_identifier` and `prompt_cache_key`. Use
 	// `prompt_cache_key` instead to maintain caching optimizations. A stable
 	// identifier for your end-users. Used to boost cache hit rates by better bucketing
@@ -25818,9 +25854,13 @@ type ResponseNewParams struct {
 	//     will use 'default'.
 	//   - If set to 'default', then the request will be processed with the standard
 	//     pricing and performance for the selected model.
-	//   - If set to '[flex](https://platform.openai.com/docs/guides/flex-processing)' or
-	//     '[priority](https://openai.com/api-priority-processing/)', then the request
-	//     will be processed with the corresponding service tier.
+	//   - If set to '[flex](https://platform.openai.com/docs/guides/flex-processing)',
+	//     then the request will be processed with the Flex Processing service tier.
+	//   - To opt-in to [Fast mode](/api/docs/guides/fast-mode) at the request level,
+	//     include the `service_tier=fast` or `service_tier=priority` parameter for
+	//     Responses or Chat Completions. The response will show `service_tier=priority`
+	//     regardless of if you specify `service_tier=fast` or `priority` in your
+	//     request.
 	//   - When not set, the default behavior is 'auto'.
 	//
 	// When the `service_tier` parameter is set, the response body will include the
@@ -25828,7 +25868,7 @@ type ResponseNewParams struct {
 	// request. This response value may be different from the value set in the
 	// parameter.
 	//
-	// Any of "auto", "default", "flex", "scale", "priority".
+	// Any of "auto", "default", "flex", "scale", "priority", "fast".
 	ServiceTier ResponseNewParamsServiceTier `json:"service_tier,omitzero"`
 	// Options for streaming responses. Only set this when you set `stream: true`.
 	StreamOptions ResponseNewParamsStreamOptions `json:"stream_options,omitzero"`
@@ -26140,9 +26180,13 @@ const (
 //     will use 'default'.
 //   - If set to 'default', then the request will be processed with the standard
 //     pricing and performance for the selected model.
-//   - If set to '[flex](https://platform.openai.com/docs/guides/flex-processing)' or
-//     '[priority](https://openai.com/api-priority-processing/)', then the request
-//     will be processed with the corresponding service tier.
+//   - If set to '[flex](https://platform.openai.com/docs/guides/flex-processing)',
+//     then the request will be processed with the Flex Processing service tier.
+//   - To opt-in to [Fast mode](/api/docs/guides/fast-mode) at the request level,
+//     include the `service_tier=fast` or `service_tier=priority` parameter for
+//     Responses or Chat Completions. The response will show `service_tier=priority`
+//     regardless of if you specify `service_tier=fast` or `priority` in your
+//     request.
 //   - When not set, the default behavior is 'auto'.
 //
 // When the `service_tier` parameter is set, the response body will include the
@@ -26157,6 +26201,7 @@ const (
 	ResponseNewParamsServiceTierFlex     ResponseNewParamsServiceTier = "flex"
 	ResponseNewParamsServiceTierScale    ResponseNewParamsServiceTier = "scale"
 	ResponseNewParamsServiceTierPriority ResponseNewParamsServiceTier = "priority"
+	ResponseNewParamsServiceTierFast     ResponseNewParamsServiceTier = "fast"
 )
 
 // Options for streaming responses. Only set this when you set `stream: true`.
@@ -26387,9 +26432,23 @@ type ResponseCompactParams struct {
 	//
 	// Any of "in_memory", "24h".
 	PromptCacheRetention ResponseCompactParamsPromptCacheRetention `json:"prompt_cache_retention,omitzero"`
-	// The service tier to use for this request.
+	// Specifies the processing type used for serving the request. - If set to 'auto',
+	// then the request will be processed with the service tier configured in the
+	// Project settings. Unless otherwise configured, the Project will use 'default'. -
+	// If set to 'default', then the request will be processed with the standard
+	// pricing and performance for the selected model. - If set to
+	// '[flex](https://platform.openai.com/docs/guides/flex-processing)', then the
+	// request will be processed with the Flex Processing service tier. - To opt-in to
+	// [Fast mode](/api/docs/guides/fast-mode) at the request level, include the
+	// `service_tier=fast` or `service_tier=priority` parameter for Responses or Chat
+	// Completions. The response will show `service_tier=priority` regardless of if you
+	// specify `service_tier=fast` or `priority` in your request. - When not set, the
+	// default behavior is 'auto'. When the `service_tier` parameter is set, the
+	// response body will include the `service_tier` value based on the processing mode
+	// actually used to serve the request. This response value may be different from
+	// the value set in the parameter.
 	//
-	// Any of "auto", "default", "flex", "priority".
+	// Any of "auto", "default", "fast", "flex", "priority".
 	ServiceTier ResponseCompactParamsServiceTier `json:"service_tier,omitzero"`
 	paramObj
 }
@@ -26413,6 +26472,7 @@ const (
 	ResponseCompactParamsModelGPT5_6Sol                        ResponseCompactParamsModel = "gpt-5.6-sol"
 	ResponseCompactParamsModelGPT5_6Terra                      ResponseCompactParamsModel = "gpt-5.6-terra"
 	ResponseCompactParamsModelGPT5_6Luna                       ResponseCompactParamsModel = "gpt-5.6-luna"
+	ResponseCompactParamsModelGPT5_5                           ResponseCompactParamsModel = "gpt-5.5"
 	ResponseCompactParamsModelGPT5_4                           ResponseCompactParamsModel = "gpt-5.4"
 	ResponseCompactParamsModelGPT5_4Mini                       ResponseCompactParamsModel = "gpt-5.4-mini"
 	ResponseCompactParamsModelGPT5_4Nano                       ResponseCompactParamsModel = "gpt-5.4-nano"
@@ -26585,12 +26645,27 @@ const (
 	ResponseCompactParamsPromptCacheRetention24h      ResponseCompactParamsPromptCacheRetention = "24h"
 )
 
-// The service tier to use for this request.
+// Specifies the processing type used for serving the request. - If set to 'auto',
+// then the request will be processed with the service tier configured in the
+// Project settings. Unless otherwise configured, the Project will use 'default'. -
+// If set to 'default', then the request will be processed with the standard
+// pricing and performance for the selected model. - If set to
+// '[flex](https://platform.openai.com/docs/guides/flex-processing)', then the
+// request will be processed with the Flex Processing service tier. - To opt-in to
+// [Fast mode](/api/docs/guides/fast-mode) at the request level, include the
+// `service_tier=fast` or `service_tier=priority` parameter for Responses or Chat
+// Completions. The response will show `service_tier=priority` regardless of if you
+// specify `service_tier=fast` or `priority` in your request. - When not set, the
+// default behavior is 'auto'. When the `service_tier` parameter is set, the
+// response body will include the `service_tier` value based on the processing mode
+// actually used to serve the request. This response value may be different from
+// the value set in the parameter.
 type ResponseCompactParamsServiceTier string
 
 const (
 	ResponseCompactParamsServiceTierAuto     ResponseCompactParamsServiceTier = "auto"
 	ResponseCompactParamsServiceTierDefault  ResponseCompactParamsServiceTier = "default"
+	ResponseCompactParamsServiceTierFast     ResponseCompactParamsServiceTier = "fast"
 	ResponseCompactParamsServiceTierFlex     ResponseCompactParamsServiceTier = "flex"
 	ResponseCompactParamsServiceTierPriority ResponseCompactParamsServiceTier = "priority"
 )

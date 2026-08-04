@@ -1,5 +1,63 @@
 # Changelog
 
+## 1.61.0 (2026-07-24)
+
+Full Changelog: [v1.60.0...v1.61.0](https://github.com/anthropics/anthropic-sdk-go/compare/v1.60.0...v1.61.0)
+
+### Features
+
+* **api:** add claude-opus-5 model ([bb7dc83](https://github.com/anthropics/anthropic-sdk-go/commit/bb7dc8379e9acf920d865c3a63eedfdbabf8f976))
+* **api:** add tool addition/removal blocks and tool_change events ([bb7dc83](https://github.com/anthropics/anthropic-sdk-go/commit/bb7dc8379e9acf920d865c3a63eedfdbabf8f976))
+* **api:** expand client-side fallback credit token types and add server-side fallbacks default option ([bb7dc83](https://github.com/anthropics/anthropic-sdk-go/commit/bb7dc8379e9acf920d865c3a63eedfdbabf8f976))
+
+## 1.60.0 (2026-07-23)
+
+Full Changelog: [v1.59.0...v1.60.0](https://github.com/anthropics/anthropic-sdk-go/compare/v1.59.0...v1.60.0)
+
+### Features
+
+* **api:** add new stop reason 'model_context_window_exceeded' ([94caa5d](https://github.com/anthropics/anthropic-sdk-go/commit/94caa5dd2c259b4fac101f4ee44632157669fa23))
+
+
+### Bug Fixes
+
+* **apijson:** correct unmarshaling for param types ([#73](https://github.com/anthropics/anthropic-sdk-go/issues/73)) ([661be2e](https://github.com/anthropics/anthropic-sdk-go/commit/661be2e4d0e956585ca0d5474675d55dfc6a079a))
+* **client:** escape HTML in RawJSON overrides of nested properties ([3b163e2](https://github.com/anthropics/anthropic-sdk-go/commit/3b163e2c1453b127801abe67745d6109c6ee0b2c))
+* refer to the CLI as `ant` in auth error messages ([#194](https://github.com/anthropics/anthropic-sdk-go/issues/194)) ([d6508c7](https://github.com/anthropics/anthropic-sdk-go/commit/d6508c729ea131600b758bd140a49548c6d30946))
+
+## 1.59.0 (2026-07-22)
+
+Full Changelog: [v1.58.1...v1.59.0](https://github.com/anthropics/anthropic-sdk-go/compare/v1.58.1...v1.59.0)
+
+### Features
+
+* **api:** add support for Managed Agents model effort, initial session events, and threads delta streaming ([abca19a](https://github.com/anthropics/anthropic-sdk-go/commit/abca19a766bd7dadcd3cdb12a97d62c4861b29dd))
+
+## 1.58.1 (2026-07-21)
+
+Full Changelog: [v1.58.0...v1.58.1](https://github.com/anthropics/anthropic-sdk-go/compare/v1.58.0...v1.58.1)
+
+### Bug Fixes
+
+* **client:** copy all citation fields in ToParam conversions ([#191](https://github.com/anthropics/anthropic-sdk-go/issues/191)) ([26ac1f9](https://github.com/anthropics/anthropic-sdk-go/commit/26ac1f9c150b980b5df4c0b3c826ecde38f2affe))
+* **vertex:** default to the cloud-platform scope in WithGoogleAuth ([#190](https://github.com/anthropics/anthropic-sdk-go/issues/190)) ([7931e70](https://github.com/anthropics/anthropic-sdk-go/commit/7931e705abad1f245d7362cbc17ef281647b0bb9))
+
+
+### Chores
+
+* **api:** add support for new refusal category ([f77159c](https://github.com/anthropics/anthropic-sdk-go/commit/f77159cf64b7965f6c6be42ae2d25fb690c134c2))
+* **docs:** small updates ([576dc36](https://github.com/anthropics/anthropic-sdk-go/commit/576dc36ce84f1a842a728fcb11636342407b3f63))
+* **docs:** small updates ([f618082](https://github.com/anthropics/anthropic-sdk-go/commit/f6180825ac983aebfb0d0e09e3784145698d4cdc))
+* **internal:** codegen related update ([03fee5d](https://github.com/anthropics/anthropic-sdk-go/commit/03fee5d99295612792d12d60e5fca0a798e723d5))
+
+## 1.58.0 (2026-07-16)
+
+Full Changelog: [v1.57.0...v1.58.0](https://github.com/anthropics/anthropic-sdk-go/compare/v1.57.0...v1.58.0)
+
+### Features
+
+* **api:** add support for MCP Tunnels ([3465b89](https://github.com/anthropics/anthropic-sdk-go/commit/3465b897f12872663b0f61c0c3edb277e2efbe44))
+
 ## 1.57.0 (2026-07-10)
 
 Full Changelog: [v1.56.0...v1.57.0](https://github.com/anthropics/anthropic-sdk-go/compare/v1.56.0...v1.57.0)

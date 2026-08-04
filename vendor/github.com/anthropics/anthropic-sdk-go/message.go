@@ -3533,12 +3533,13 @@ type Message struct {
 	//     back as-is in a subsequent request to let the model continue.
 	//   - `"refusal"`: when streaming classifiers intervene to handle potential policy
 	//     violations
+	//   - `"model_context_window_exceeded"`: we exceeded the model's context window
 	//
 	// In non-streaming mode this value is always non-null. In streaming mode, it is
 	// null in the `message_start` event and non-null otherwise.
 	//
 	// Any of "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn",
-	// "refusal".
+	// "refusal", "model_context_window_exceeded".
 	StopReason StopReason `json:"stop_reason" api:"required"`
 	// Which custom stop sequence was generated, if any.
 	//
@@ -4285,6 +4286,7 @@ const (
 	ModelClaudeSonnet5 Model = "claude-sonnet-5"
 	ModelClaudeFable5  Model = "claude-fable-5"
 	ModelClaudeMythos5 Model = "claude-mythos-5"
+	ModelClaudeOpus5   Model = "claude-opus-5"
 	ModelClaudeOpus4_8 Model = "claude-opus-4-8"
 	ModelClaudeOpus4_7 Model = "claude-opus-4-7"
 	// Deprecated: Will reach end-of-life on June 30, 2026. Please migrate to
@@ -4955,7 +4957,7 @@ type MessageDeltaEventDelta struct {
 	// Structured information about a refusal.
 	StopDetails RefusalStopDetails `json:"stop_details" api:"required"`
 	// Any of "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn",
-	// "refusal".
+	// "refusal", "model_context_window_exceeded".
 	StopReason   StopReason `json:"stop_reason" api:"required"`
 	StopSequence string     `json:"stop_sequence" api:"required"`
 	// JSON contains metadata for fields, check presence with [respjson.Field.Valid].
@@ -5205,7 +5207,7 @@ func (r *RedactedThinkingBlockParam) UnmarshalJSON(data []byte) error {
 type RefusalStopDetails struct {
 	// The policy category that triggered a refusal.
 	//
-	// Any of "cyber", "bio", "frontier_llm", "reasoning_extraction".
+	// Any of "cyber", "bio", "frontier_llm", "reasoning_extraction", "general_harms".
 	Category RefusalStopDetailsCategory `json:"category" api:"required"`
 	// Human-readable explanation of the refusal.
 	//
@@ -5237,6 +5239,7 @@ const (
 	RefusalStopDetailsCategoryBio                 RefusalStopDetailsCategory = "bio"
 	RefusalStopDetailsCategoryFrontierLLM         RefusalStopDetailsCategory = "frontier_llm"
 	RefusalStopDetailsCategoryReasoningExtraction RefusalStopDetailsCategory = "reasoning_extraction"
+	RefusalStopDetailsCategoryGeneralHarms        RefusalStopDetailsCategory = "general_harms"
 )
 
 // The properties Content, Source, Title, Type are required.
@@ -5598,12 +5601,13 @@ func (r *SignatureDelta) UnmarshalJSON(data []byte) error {
 type StopReason string
 
 const (
-	StopReasonEndTurn      StopReason = "end_turn"
-	StopReasonMaxTokens    StopReason = "max_tokens"
-	StopReasonStopSequence StopReason = "stop_sequence"
-	StopReasonToolUse      StopReason = "tool_use"
-	StopReasonPauseTurn    StopReason = "pause_turn"
-	StopReasonRefusal      StopReason = "refusal"
+	StopReasonEndTurn                    StopReason = "end_turn"
+	StopReasonMaxTokens                  StopReason = "max_tokens"
+	StopReasonStopSequence               StopReason = "stop_sequence"
+	StopReasonToolUse                    StopReason = "tool_use"
+	StopReasonPauseTurn                  StopReason = "pause_turn"
+	StopReasonRefusal                    StopReason = "refusal"
+	StopReasonModelContextWindowExceeded StopReason = "model_context_window_exceeded"
 )
 
 type TextBlock struct {
