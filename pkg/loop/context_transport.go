@@ -73,13 +73,15 @@ func validateContextTransportMembership(transports []ContextTransport, m model.M
 	return nil
 }
 
-// validateContextTransportUnchanged is the interim (Task 1.2/1.3) fixed-
+// validateContextTransportUnchanged is TEMPORARY interim (Task 1.2/1.3) fixed-
 // single-transport check backing Definition/BoundDefinition.ValidateContextModel.
 // It preserves today's exact behavior (candidate must share bound's transport
-// identity) under the new ContextTransportNotDeclaredError shape. Task 1.4
-// replaces this call site's body wholesale with a real lookupTransport-based
-// set-membership check once definitionState carries its own frozen, possibly
-// multi-member contextTransports.
+// identity) under the new ContextTransportNotDeclaredError shape.
+//
+// TODO(task-1.4): delete this function. Task 1.4 replaces this call site's
+// body wholesale with a real lookupTransport-based set-membership check once
+// definitionState carries its own frozen, possibly multi-member
+// contextTransports. This function must not survive Task 1.4.
 func validateContextTransportUnchanged(bound, candidate model.Model) error {
 	if transportKeyOf(bound) == transportKeyOf(candidate) {
 		return nil

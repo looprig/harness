@@ -224,12 +224,15 @@ func validateContextDefinition(resolved *definitionOptions) error {
 	// base-member/capability check added in Task 1.2: a caller-supplied
 	// WithContextTransports set must contain a member matching the base
 	// model's own transport identity, with a Capability matching
-	// WithInferenceCapability exactly. Task 1.3 adds uniqueness detection
-	// across members, per-member Capability.Validate(), and per-member
-	// contextcount.CompatibleCounter checks alongside this same check, and
-	// synthesizes a one-element default set when none is declared (this
-	// block intentionally does nothing when resolved.contextTransports is
-	// empty, preserving today's no-declared-set behavior until then).
+	// WithInferenceCapability exactly.
+	//
+	// TODO(task-1.3): extend this block, do not duplicate it. Task 1.3 adds
+	// uniqueness detection across members, per-member Capability.Validate(),
+	// and per-member contextcount.CompatibleCounter checks alongside this
+	// same check, and synthesizes a one-element default set when none is
+	// declared (this block intentionally does nothing when
+	// resolved.contextTransports is empty, preserving today's
+	// no-declared-set behavior until then).
 	if len(resolved.contextTransports) > 0 {
 		baseKey := transportKeyOf(resolved.model)
 		foundBase := false
@@ -931,9 +934,11 @@ func validateDefinitionContextModel(state *definitionState, model model.Model) e
 	if state.contextCounter == nil {
 		return nil
 	}
-	// Interim (Task 1.2/1.3) strict single-transport check; Task 1.4 rewrites
-	// this to a real lookupTransport-based set-membership check once
-	// definitionState carries its own frozen contextTransports.
+	// TEMPORARY (Task 1.2/1.3) strict single-transport check.
+	//
+	// TODO(task-1.4): replace this call with a real lookupTransport-based
+	// set-membership check once definitionState carries its own frozen
+	// contextTransports.
 	return validateContextTransportUnchanged(state.model, model)
 }
 
