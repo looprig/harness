@@ -96,6 +96,29 @@ func TestOverrideBoundRuntimeManagedRecordsNativeSelectionWithoutModelIdentity(t
 	}
 }
 
+func TestOverrideBoundRuntimeSelectionKeepsExplicitNativeRuntimeOnNativeEngine(t *testing.T) {
+	t.Parallel()
+
+	definition := mustDefinition(t)
+	bound, err := definition.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind() error = %v", err)
+	}
+	target := testModel()
+	target.Name = "native-runtime-model"
+	selected, err := OverrideBoundRuntimeSelectionWithIdentity(bound, "looprig/native", "shared", target, model.EffortMedium, RuntimeSourceNative, RuntimeSelectionExplicit)
+	if err != nil {
+		t.Fatalf("OverrideBoundRuntimeSelectionWithIdentity() error = %v", err)
+	}
+	if selected.Engine() != EngineNative {
+		t.Fatalf("Engine() = %v, want EngineNative", selected.Engine())
+	}
+	identity := selected.RuntimeIdentity()
+	if identity.Source != RuntimeSourceNative || identity.SelectionKind != RuntimeSelectionExplicit || identity.ModelAlias != "shared" {
+		t.Fatalf("RuntimeIdentity() = %+v, want explicit native selection", identity)
+	}
+}
+
 func TestRuntimeIdentityManagedDigestOmitsModelAndEffortIdentity(t *testing.T) {
 	t.Parallel()
 

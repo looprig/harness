@@ -721,7 +721,8 @@ func validateNativeAliasOwnership(entries []RuntimeCatalogEntry) error {
 			for j := i + 1; j < len(aliasOwners); j++ {
 				sameHarnessDifferentSource := aliasOwners[i].harness == aliasOwners[j].harness && aliasOwners[i].source != aliasOwners[j].source
 				differentHarnessWithNative := aliasOwners[i].harness != aliasOwners[j].harness &&
-					(aliasOwners[i].credential != CredentialGatewayBacked || aliasOwners[j].credential != CredentialGatewayBacked)
+					(aliasOwners[i].credential != CredentialGatewayBacked || aliasOwners[j].credential != CredentialGatewayBacked) &&
+					!looprigNativeGatewayAliasPair(aliasOwners[i], aliasOwners[j])
 				if sameHarnessDifferentSource || differentHarnessWithNative {
 					return &RuntimeCatalogError{Kind: RuntimeCatalogNativeAliasConflict, Field: "Models.Alias"}
 				}
@@ -729,6 +730,15 @@ func validateNativeAliasOwnership(entries []RuntimeCatalogEntry) error {
 		}
 	}
 	return nil
+}
+
+// looprigNativeGatewayAliasPair is the one intentional cross-harness alias
+// overlap: CodeRig's in-process native runtime and a gateway-backed ACP row
+// may expose the same configured model alias. The selected harness is an
+// explicit part of the runtime tuple, so the two rows remain unambiguous.
+func looprigNativeGatewayAliasPair(left, right runtimeAliasOwner) bool {
+	return (left.harness == "looprig" && left.credential == CredentialNativeAuth && right.credential == CredentialGatewayBacked) ||
+		(right.harness == "looprig" && right.credential == CredentialNativeAuth && left.credential == CredentialGatewayBacked)
 }
 
 func validateDerivedAliasOwnership(entries []RuntimeCatalogEntry) error {

@@ -87,6 +87,43 @@ func TestNewRuntimeCatalogInvariants(t *testing.T) {
 	}
 }
 
+func TestRuntimeCatalogAllowsLooprigNativeAliasAlongsideGatewayACP(t *testing.T) {
+	t.Parallel()
+
+	entries := []RuntimeCatalogEntry{
+		{
+			AgentType: "worker", AgentHarness: "looprig", Profile: "looprig/native",
+			Description: "In-process Harness loop.", Credential: CredentialNativeAuth, Source: RuntimeSourceNative,
+			Default: true, DefaultModel: "shared",
+			Models: []RuntimeModelOption{{
+				Alias: "shared", Source: RuntimeSourceNative, Credential: CredentialNativeAuth,
+				Target: runtimeModel("looprig-target", model.EffortMedium), DefaultEffort: model.EffortMedium,
+				Efforts: []model.Effort{model.EffortMedium},
+			}},
+		},
+		{
+			AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
+			Description: "Codex ACP harness.", Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway,
+			DefaultModel: "shared",
+			Models: []RuntimeModelOption{{
+				Alias: "shared", Source: RuntimeSourceGateway, Credential: CredentialGatewayBacked,
+				Target: runtimeModel("codex-target", model.EffortMedium), DefaultEffort: model.EffortMedium,
+				Efforts: []model.Effort{model.EffortMedium},
+			}},
+		},
+	}
+	catalog, err := NewRuntimeCatalog(entries)
+	if err != nil {
+		t.Fatalf("NewRuntimeCatalog() error = %v", err)
+	}
+	for _, harness := range []AgentHarnessName{"looprig", "codex"} {
+		resolved, err := catalog.Resolve("worker", harness, "shared", model.EffortMedium)
+		if err != nil || resolved.AgentHarness != harness || resolved.ModelAlias != "shared" {
+			t.Fatalf("Resolve(%q) = %+v, %v", harness, resolved, err)
+		}
+	}
+}
+
 func TestRuntimeCatalogAcceptsSafeProfileSegmentsAndRejectsPathLikeProfiles(t *testing.T) {
 	t.Parallel()
 
