@@ -263,10 +263,20 @@ func TestWithContextTransports_InvalidMemberCapability(t *testing.T) {
 func TestWithContextTransports_DuplicateMembers(t *testing.T) {
 	t.Parallel()
 	base := testModel()
+	// The two members share (Provider, APIFormat, BaseURL) but deliberately
+	// carry DIFFERENT Capability values, so this regression-guards that
+	// duplicate detection keys on contextTransportKey's three fields only —
+	// not on full ContextTransport struct equality, which would let two
+	// members disagreeing on trust posture for the same wire endpoint slip
+	// through undetected.
+	duplicateKeyDifferentCapability := ContextTransport{
+		Provider: base.Provider, APIFormat: base.APIFormat, BaseURL: base.BaseURL,
+		Capability: contextcount.InferenceCapability{Transport: contextcount.InferenceTransportTLS, Retention: contextcount.RetentionNone},
+	}
 	baseTransport := ContextTransport{Provider: base.Provider, APIFormat: base.APIFormat, BaseURL: base.BaseURL, Capability: localInferenceCapability()}
 	counter := &policyCounter{capability: exactCounterCapability()}
 	opts := append(contextDefinitionOptions(counter, localInferenceCapability(), manualCompactionPolicy()),
-		WithContextTransports(baseTransport, baseTransport))
+		WithContextTransports(baseTransport, duplicateKeyDifferentCapability))
 	_, err := Define(opts...)
 	var target *DefinitionError
 	if !errors.As(err, &target) || target.Kind != DefinitionDuplicateContextTransport {
