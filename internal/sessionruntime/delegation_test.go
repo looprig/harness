@@ -330,7 +330,7 @@ func TestDelegateStartFailsClosedForRoleMissingFromPopulatedCatalog(t *testing.T
 	parent := delegateParent(loop.DelegationManaged, "child")
 	child := delegateChild("child", "native child")
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType:  "other",
+		AgentType:     "other",
 		AgentHarness:  "codex",
 		Profile:       "acp/codex",
 		Credential:    loop.CredentialNativeAuth,
@@ -473,14 +473,14 @@ func TestDelegateRuntimeIsRevalidatedAndPinnedAtChildBind(t *testing.T) {
 	parent := delegateParent(loop.DelegationManaged, "child")
 	child := delegateChild("child", "runtime child")
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "child", AgentHarness: "test", Profile: "acp/test", Default: true, DefaultModel: "runtime", SmallModel: "runtime-small",
+		AgentType: "child", AgentHarness: "test", Profile: "acp/test", Default: true, DefaultModel: "runtime", SmallModel: "runtime-small",
 		Credential: loop.CredentialGatewayBacked,
 		Models: []loop.RuntimeModelOption{
 			{Alias: "runtime", Target: validModel("runtime-target"), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
 			{Alias: "runtime-small", Target: validModel("runtime-small-target"), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh}},
 		},
 	}, {
-		SubagentType: "child", AgentHarness: "test", Profile: "acp/test",
+		AgentType: "child", AgentHarness: "test", Profile: "acp/test",
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionHarnessManaged,
 	}})
@@ -569,7 +569,7 @@ func TestDelegateRuntimeAcceptsPreparedExplicitSingleChoiceAndRejectsInvalidMemb
 	parent := delegateParent(loop.DelegationManaged, "child")
 	child := delegateChild("child", "runtime child")
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "child", AgentHarness: "test", Profile: "acp/test", Default: true,
+		AgentType: "child", AgentHarness: "test", Profile: "acp/test", Default: true,
 		Credential: loop.CredentialGatewayBacked, DefaultModel: "runtime",
 		Models: []loop.RuntimeModelOption{{
 			Alias: "runtime", Target: validModel("runtime-target"),
@@ -626,14 +626,14 @@ func TestDelegateRuntimeProjectsStableModelAliasFromSecondHarnessSharingProfile(
 	parent := delegateParent(loop.DelegationManaged, "child")
 	child := delegateChild("child", "runtime child")
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "child", AgentHarness: "alpha", Profile: "acp/shared", Default: true,
+		AgentType: "child", AgentHarness: "alpha", Profile: "acp/shared", Default: true,
 		Credential: loop.CredentialGatewayBacked, DefaultModel: "luna",
 		Models: []loop.RuntimeModelOption{{
 			Alias: "luna", Target: validModel("luna-target"),
 			DefaultEffort: model.EffortLow, Efforts: []model.Effort{model.EffortLow, model.EffortHigh},
 		}},
 	}, {
-		SubagentType: "child", AgentHarness: "codex", Profile: "acp/shared",
+		AgentType: "child", AgentHarness: "codex", Profile: "acp/shared",
 		Credential: loop.CredentialGatewayBacked, DefaultModel: "luna",
 		Models: []loop.RuntimeModelOption{{
 			Alias: "luna", Target: validModel("luna-target"),
@@ -699,7 +699,7 @@ func TestControllerValidatesHarnessManagedRuntimeSourceAndSelectors(t *testing.T
 	t.Parallel()
 
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex",
+		AgentType: "child", AgentHarness: "codex", Profile: "acp/codex",
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionHarnessManaged, Default: true,
 	}})
@@ -728,11 +728,11 @@ func TestDelegateRuntimeProjectsSelectedHarnessManagedHarnessWhenProfileIsShared
 	parent := delegateParent(loop.DelegationManaged, "child")
 	child := delegateChild("child", "runtime child")
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "child", AgentHarness: "alpha", Profile: "acp/shared", Default: true,
+		AgentType: "child", AgentHarness: "alpha", Profile: "acp/shared", Default: true,
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionHarnessManaged,
 	}, {
-		SubagentType: "child", AgentHarness: "codex", Profile: "acp/shared",
+		AgentType: "child", AgentHarness: "codex", Profile: "acp/shared",
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionHarnessManaged,
 	}})
@@ -769,7 +769,7 @@ func TestControllerValidatesPerModelSourceWithinOneEntry(t *testing.T) {
 	t.Parallel()
 
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex-mixed",
+		AgentType: "child", AgentHarness: "codex", Profile: "acp/codex-mixed",
 		Credential: loop.CredentialGatewayBacked, Source: loop.RuntimeSourceGateway, Default: true,
 		DefaultModel: "gateway",
 		Models: []loop.RuntimeModelOption{
@@ -803,7 +803,7 @@ func TestControllerRejectsEffectiveSourceOverrideWithoutAgentSource(t *testing.T
 	t.Parallel()
 
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex-mixed",
+		AgentType: "child", AgentHarness: "codex", Profile: "acp/codex-mixed",
 		Credential: loop.CredentialGatewayBacked, Source: loop.RuntimeSourceGateway, Default: true,
 		DefaultModel: "gateway",
 		Models: []loop.RuntimeModelOption{
@@ -864,6 +864,41 @@ func TestDelegateCatalogDerivesAllowedModes(t *testing.T) {
 	}
 }
 
+func TestDelegateCatalogIncludesChildDescription(t *testing.T) {
+	t.Parallel()
+
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := mustDefine(
+		loop.WithName("child"),
+		loop.WithDescription("Builds focused implementation changes."),
+		loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("child")}}, validModel("child")),
+	)
+	manager := newDelegationManager(Topology{Definitions: []loop.Definition{parent, child}})
+	definitions := delegateExtraTools(parent, manager)
+	if len(definitions) != 1 {
+		t.Fatalf("delegateExtraTools length = %d, want 1", len(definitions))
+	}
+	built, err := definitions[0].Build(context.Background(), tool.Bindings{
+		SessionID: mustUUID(), LoopID: mustUUID(), Delegate: manager.controllerFor(mustUUID(), parent),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, candidate := range built {
+		info, infoErr := candidate.Info(context.Background())
+		if infoErr != nil {
+			t.Fatalf("Info: %v", infoErr)
+		}
+		if info.Name == "StartAgent" {
+			if !strings.Contains(info.Desc, "Builds focused implementation changes.") {
+				t.Fatalf("StartAgent description = %q, want child role description", info.Desc)
+			}
+			return
+		}
+	}
+	t.Fatal("built bundle has no StartAgent tool")
+}
+
 func TestDelegateExtraToolsInjectsOneAtomicAgentBundle(t *testing.T) {
 	t.Parallel()
 
@@ -919,7 +954,7 @@ func TestDelegateRuntimeCatalogProviderIsParentScoped(t *testing.T) {
 	child := delegateChild("child", "child")
 	catalog := func(harness loop.AgentHarnessName, profile loop.RuntimeProfileName) loop.RuntimeCatalog {
 		result, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-			SubagentType: "child", AgentHarness: harness, Profile: profile, Credential: loop.CredentialGatewayBacked,
+			AgentType: "child", AgentHarness: harness, Profile: profile, Credential: loop.CredentialGatewayBacked,
 			Default: true, DefaultModel: "model", Models: []loop.RuntimeModelOption{{
 				Alias: "model", Target: validModel(string(harness)), DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortHigh},
 			}},

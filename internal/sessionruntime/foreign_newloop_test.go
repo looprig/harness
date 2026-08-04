@@ -277,7 +277,7 @@ func TestForeignBuilderEmitsAgentSessionBindingOnce(t *testing.T) {
 	parent := delegateParent(loop.DelegationManaged, "child")
 	child := delegateChild("child", "child")
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex", Default: true,
+		AgentType: "child", AgentHarness: "codex", Profile: "acp/codex", Default: true,
 		Credential: loop.CredentialGatewayBacked, DefaultModel: "luna", SmallModel: "small",
 		Models: []loop.RuntimeModelOption{
 			{Alias: "luna", Target: validModel("luna-target"), DefaultEffort: model.EffortLow, Efforts: []model.Effort{model.EffortLow, model.EffortHigh}},
@@ -370,11 +370,11 @@ func TestHarnessManagedForeignLoopStartedOmitsModelRuntime(t *testing.T) {
 	parent := delegateParent(loop.DelegationManaged, "child")
 	child := delegateChild("child", "child")
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex",
+		AgentType: "child", AgentHarness: "codex", Profile: "acp/codex",
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionHarnessManaged, Default: true,
 	}, {
-		SubagentType: "child", AgentHarness: "codex", Profile: "acp/codex-gateway",
+		AgentType: "child", AgentHarness: "codex", Profile: "acp/codex-gateway",
 		Credential: loop.CredentialGatewayBacked, Source: loop.RuntimeSourceGateway,
 		DefaultModel: "gateway",
 		Models: []loop.RuntimeModelOption{{

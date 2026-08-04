@@ -123,7 +123,7 @@ func TestPrepareStartAgentRuntimeIsParentScopedAndOptional(t *testing.T) {
 
 	t.Run("unrelated role entries make the missing role unavailable", func(t *testing.T) {
 		entry := testPreparationEntry("claude-code", "acp/claude-code", "sonnet", inferencemodel.EffortMedium)
-		entry.SubagentType = "other"
+		entry.AgentType = "other"
 		unrelated, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{entry})
 		if err != nil {
 			t.Fatal(err)
@@ -162,7 +162,7 @@ func TestPrepareStartAgentRuntimeResolvesHarnessManagedNativeWithoutSelectors(t 
 	t.Parallel()
 
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType:  "worker",
+		AgentType:     "worker",
 		AgentHarness:  "codex",
 		Profile:       "acp/codex-native",
 		Credential:    loop.CredentialNativeAuth,
@@ -398,7 +398,7 @@ func testPreparationEntry(harness loop.AgentHarnessName, profile loop.RuntimePro
 	}
 	modelName := string(alias)
 	return loop.RuntimeCatalogEntry{
-		SubagentType: "worker", AgentHarness: harness, Profile: profile, Credential: loop.CredentialGatewayBacked,
+		AgentType: "worker", AgentHarness: harness, Profile: profile, Credential: loop.CredentialGatewayBacked,
 		Default: harness == "claude-code", DefaultModel: alias, SmallModel: alias + "-small",
 		Models: []loop.RuntimeModelOption{
 			{Alias: alias, Target: inferencemodel.Model{Provider: "provider", Name: modelName, Sampling: inferencemodel.Sampling{Effort: defaultEffort}}, DefaultEffort: defaultEffort, Efforts: efforts},
@@ -428,7 +428,7 @@ func mixedSourcePreparationCatalog(t *testing.T) loop.RuntimeCatalog {
 	t.Helper()
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{
 		{
-			SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-gateway",
+			AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-gateway",
 			Credential: loop.CredentialGatewayBacked, Source: loop.RuntimeSourceGateway, Default: true,
 			DefaultModel: "luna",
 			Models: []loop.RuntimeModelOption{{
@@ -437,7 +437,7 @@ func mixedSourcePreparationCatalog(t *testing.T) loop.RuntimeCatalog {
 			}},
 		},
 		{
-			SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
+			AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
 			Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 			SelectionKind: loop.RuntimeSelectionHarnessManaged,
 		},
@@ -457,7 +457,7 @@ func explicitHarnessMixedSourcePreparationCatalog(t *testing.T) loop.RuntimeCata
 	gateway.SmallModel = ""
 	gateway.Models = gateway.Models[:1]
 	native := loop.RuntimeCatalogEntry{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionHarnessManaged,
 	}
@@ -471,7 +471,7 @@ func explicitHarnessMixedSourcePreparationCatalog(t *testing.T) loop.RuntimeCata
 func singleEntryMixedSourcePreparationCatalog(t *testing.T) loop.RuntimeCatalog {
 	t.Helper()
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
 		Credential: loop.CredentialGatewayBacked, Source: loop.RuntimeSourceGateway, Default: true,
 		DefaultModel: "gateway",
 		Models: []loop.RuntimeModelOption{

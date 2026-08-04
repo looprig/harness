@@ -5,7 +5,7 @@ import "github.com/looprig/core/uuid"
 // EventFilter is a subscriber's declared interest: which loop producers it wants
 // events from, separated by class. It is declared interest (deterministic,
 // evaluated at fan-out before the bounded send), distinct from backpressure drop.
-// A subagent's token firehose excluded by Ephemeral never even enters that
+// An agent's token firehose excluded by Ephemeral never even enters that
 // subscriber's egress buffer.
 type EventFilter struct {
 	Ephemeral LoopScope // TokenDelta + tool lifecycle (ToolCallStarted/Completed) delivery

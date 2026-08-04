@@ -21,7 +21,7 @@ func TestNewRuntimeCatalogInvariants(t *testing.T) {
 		{name: "empty catalog is allowed", wantNoErr: true},
 		{name: "empty credential", mutate: func(entries []RuntimeCatalogEntry) { entries[0].Credential = "" }, wantKind: RuntimeCatalogInvalidCredential},
 		{name: "unknown credential", mutate: func(entries []RuntimeCatalogEntry) { entries[0].Credential = "credential-file" }, wantKind: RuntimeCatalogInvalidCredential},
-		{name: "empty subagent type", mutate: func(entries []RuntimeCatalogEntry) { entries[0].SubagentType = "" }, wantKind: RuntimeCatalogInvalidIdentifier},
+		{name: "empty agent type", mutate: func(entries []RuntimeCatalogEntry) { entries[0].AgentType = "" }, wantKind: RuntimeCatalogInvalidIdentifier},
 		{name: "empty harness", mutate: func(entries []RuntimeCatalogEntry) { entries[0].AgentHarness = "" }, wantKind: RuntimeCatalogInvalidIdentifier},
 		{name: "empty profile", mutate: func(entries []RuntimeCatalogEntry) { entries[0].Profile = "" }, wantKind: RuntimeCatalogInvalidIdentifier},
 		{name: "path-like harness", mutate: func(entries []RuntimeCatalogEntry) { entries[0].AgentHarness = "/tmp/child" }, wantKind: RuntimeCatalogInvalidIdentifier},
@@ -171,7 +171,7 @@ func TestRuntimeCatalogResolveDefaultsAndRejectsIncompatibleSelectors(t *testing
 	}{
 		{
 			name: "all omitted use defaults", want: Resolved{
-				SubagentType: "worker", AgentHarness: "claude-code", Profile: "claude-profile",
+				AgentType: "worker", AgentHarness: "claude-code", Profile: "claude-profile",
 				Source: RuntimeSourceGateway, SelectionKind: RuntimeSelectionExplicit,
 				Credential: CredentialGatewayBacked, ModelAlias: "sonnet", TargetAlias: "sonnet", SmallModel: "sonnet-small",
 				Target: runtimeModel("sonnet-target", model.EffortMedium), Effort: model.EffortMedium,
@@ -180,7 +180,7 @@ func TestRuntimeCatalogResolveDefaultsAndRejectsIncompatibleSelectors(t *testing
 		{
 			name: "explicit complete tuple", harness: "codex", alias: "o3", effort: model.EffortHigh,
 			want: Resolved{
-				SubagentType: "worker", AgentHarness: "codex", Profile: "codex-profile",
+				AgentType: "worker", AgentHarness: "codex", Profile: "codex-profile",
 				Source: RuntimeSourceGateway, SelectionKind: RuntimeSelectionExplicit,
 				Credential: CredentialGatewayBacked, ModelAlias: "o3", TargetAlias: "o3@high", SmallModel: "o3",
 				Target: runtimeModel("o3-target", model.EffortLow), Effort: model.EffortHigh,
@@ -215,7 +215,7 @@ func TestRuntimeCatalogResolveDefaultsAndRejectsIncompatibleSelectors(t *testing
 			if err != nil {
 				t.Fatalf("Resolve() error = %v", err)
 			}
-			if tt.want.SubagentType != "" {
+			if tt.want.AgentType != "" {
 				if !reflect.DeepEqual(got, tt.want) {
 					t.Fatalf("Resolve() = %#v, want %#v", got, tt.want)
 				}
@@ -607,6 +607,9 @@ func TestRuntimeCatalogDescriptionDigest(t *testing.T) {
 			t.Fatalf("digest JSON contains forbidden provider wiring %q: %s", forbidden, encoded)
 		}
 	}
+	if strings.Contains(string(encoded), "subagent_type") || !strings.Contains(string(encoded), "agent_type") {
+		t.Fatalf("digest JSON role field = %s, want agent_type and no subagent_type", encoded)
+	}
 }
 
 func TestRuntimeCatalogDigestProjectionOmitsRuntimeWiring(t *testing.T) {
@@ -844,7 +847,7 @@ func TestRuntimeCatalogResolvesNativeHarnessManagedEntryWithoutModelIdentity(t *
 	t.Parallel()
 
 	entry := RuntimeCatalogEntry{
-		SubagentType:  "worker",
+		AgentType:     "worker",
 		AgentHarness:  "codex",
 		Profile:       "acp/codex",
 		Credential:    CredentialNativeAuth,
@@ -883,7 +886,7 @@ func TestRuntimeCatalogAllowsSameHarnessWithDistinctGatewayAndNativeSources(t *t
 	t.Parallel()
 
 	native := RuntimeCatalogEntry{
-		SubagentType:  "worker",
+		AgentType:     "worker",
 		AgentHarness:  "codex",
 		Profile:       "acp/codex-native",
 		Credential:    CredentialNativeAuth,
@@ -892,7 +895,7 @@ func TestRuntimeCatalogAllowsSameHarnessWithDistinctGatewayAndNativeSources(t *t
 		Default:       true,
 	}
 	gateway := RuntimeCatalogEntry{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-gateway",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-gateway",
 		Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway,
 		DefaultModel: "luna",
 		Models: []RuntimeModelOption{{
@@ -925,7 +928,7 @@ func TestRuntimeCatalogResolvesExplicitSourceForSameHarness(t *testing.T) {
 	t.Parallel()
 
 	gateway := RuntimeCatalogEntry{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-gateway",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-gateway",
 		Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, Default: true,
 		DefaultModel: "luna",
 		Models: []RuntimeModelOption{{
@@ -934,7 +937,7 @@ func TestRuntimeCatalogResolvesExplicitSourceForSameHarness(t *testing.T) {
 		}},
 	}
 	native := RuntimeCatalogEntry{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
 		Credential: CredentialNativeAuth, Source: RuntimeSourceNative,
 		SelectionKind: RuntimeSelectionHarnessManaged,
 	}
@@ -971,7 +974,7 @@ func TestRuntimeCatalogResolvesExplicitSourceUsingSourceLocalDefault(t *testing.
 	t.Parallel()
 
 	catalog, err := NewRuntimeCatalog([]RuntimeCatalogEntry{{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
 		Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, Default: true,
 		DefaultModel: "gateway",
 		Models: []RuntimeModelOption{
@@ -1008,7 +1011,7 @@ func TestRuntimeCatalogRejectsDefaultModelFromDifferentSource(t *testing.T) {
 	t.Parallel()
 
 	_, err := NewRuntimeCatalog([]RuntimeCatalogEntry{{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
 		Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, Default: true,
 		DefaultModel: "native",
 		Models: []RuntimeModelOption{
@@ -1026,7 +1029,7 @@ func TestRuntimeCatalogExplicitSourceDoesNotFallbackToManagedDefault(t *testing.
 	t.Parallel()
 
 	catalog, err := NewRuntimeCatalog([]RuntimeCatalogEntry{{
-		SubagentType:  "worker",
+		AgentType:     "worker",
 		AgentHarness:  "codex",
 		Profile:       "acp/codex-native",
 		Credential:    CredentialNativeAuth,
@@ -1074,7 +1077,7 @@ func TestRuntimeCatalogExplicitSourcePrefersExactEntryForModelAndTargetResolutio
 
 	catalog, err := NewRuntimeCatalog([]RuntimeCatalogEntry{
 		{
-			SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
+			AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-mixed",
 			Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, Default: true,
 			DefaultModel: "gateway-model",
 			Models: []RuntimeModelOption{
@@ -1083,7 +1086,7 @@ func TestRuntimeCatalogExplicitSourcePrefersExactEntryForModelAndTargetResolutio
 			},
 		},
 		{
-			SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
+			AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex-native",
 			Credential: CredentialNativeAuth, Source: RuntimeSourceNative,
 			DefaultModel: "native-dedicated",
 			Models: []RuntimeModelOption{{
@@ -1118,15 +1121,15 @@ func TestRuntimeCatalogRejectsInvalidSelectionMatrix(t *testing.T) {
 	t.Parallel()
 
 	managed := func() RuntimeCatalogEntry {
-		return RuntimeCatalogEntry{SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialNativeAuth, Source: RuntimeSourceNative, SelectionKind: RuntimeSelectionHarnessManaged, Default: true}
+		return RuntimeCatalogEntry{AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialNativeAuth, Source: RuntimeSourceNative, SelectionKind: RuntimeSelectionHarnessManaged, Default: true}
 	}
 	tests := []struct {
 		name  string
 		entry RuntimeCatalogEntry
 		want  RuntimeCatalogErrorKind
 	}{
-		{name: "gateway managed", entry: RuntimeCatalogEntry{SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, SelectionKind: RuntimeSelectionHarnessManaged, Default: true}, want: RuntimeCatalogInvalidSelectionKind},
-		{name: "explicit model-less native", entry: RuntimeCatalogEntry{SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialNativeAuth, Source: RuntimeSourceNative, SelectionKind: RuntimeSelectionExplicit, Default: true}, want: RuntimeCatalogMissingDefaultModel},
+		{name: "gateway managed", entry: RuntimeCatalogEntry{AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialGatewayBacked, Source: RuntimeSourceGateway, SelectionKind: RuntimeSelectionHarnessManaged, Default: true}, want: RuntimeCatalogInvalidSelectionKind},
+		{name: "explicit model-less native", entry: RuntimeCatalogEntry{AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex", Credential: CredentialNativeAuth, Source: RuntimeSourceNative, SelectionKind: RuntimeSelectionExplicit, Default: true}, want: RuntimeCatalogMissingDefaultModel},
 		{name: "managed with model", entry: func() RuntimeCatalogEntry {
 			entry := managed()
 			entry.Models = []RuntimeModelOption{{Alias: "model", Target: runtimeModel("model", model.EffortMedium), DefaultEffort: model.EffortMedium, Efforts: []model.Effort{model.EffortMedium}}}
@@ -1148,12 +1151,12 @@ func TestRuntimeCatalogRejectsInvalidSelectionMatrix(t *testing.T) {
 func testCatalogEntries() []RuntimeCatalogEntry {
 	return []RuntimeCatalogEntry{
 		{
-			SubagentType: "worker", AgentHarness: "codex", Profile: "codex-profile",
+			AgentType: "worker", AgentHarness: "codex", Profile: "codex-profile",
 			Credential: CredentialGatewayBacked, Default: false, DefaultModel: "o3", SmallModel: "o3",
 			Models: []RuntimeModelOption{{Alias: "o3", Target: runtimeModel("o3-target", model.EffortLow), DefaultEffort: model.EffortLow, Efforts: []model.Effort{model.EffortLow, model.EffortHigh}}},
 		},
 		{
-			SubagentType: "worker", AgentHarness: "claude-code", Profile: "claude-profile",
+			AgentType: "worker", AgentHarness: "claude-code", Profile: "claude-profile",
 			Credential: CredentialGatewayBacked, Default: true, DefaultModel: "sonnet", SmallModel: "sonnet-small",
 			Models: []RuntimeModelOption{
 				{Alias: "sonnet", Target: runtimeModel("sonnet-target", model.EffortMedium), DefaultEffort: model.EffortMedium, Efforts: []model.Effort{model.EffortMedium, model.EffortHigh}},

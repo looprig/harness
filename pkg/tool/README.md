@@ -21,13 +21,15 @@ select the `TaskDefinitions()` bundle from
 four task model-facing names from one selected definition. Each bound Loop gets
 its own task graph, while modes within that Loop share the graph.
 
-`Subagent` is intentionally different: it is the Harness-owned model-facing
-control tool. Harness derives its schema and catalog from the frozen delegate
-topology and binds it to the parent-scoped delegate controller, so its authority
-cannot be supplied by optional task tracking. Harness therefore does not import
-`github.com/looprig/tools`. `Subagent` is automatically injected into each
-applicable Loop; consumers must not add it manually. Agents coordinate task
-work through Subagent messages rather than shared task memory.
+Agent collaboration is intentionally different: `ListAgents`, `MessageAgent`,
+`StartAgent`, and `StopAgent` are Harness-owned model-facing control tools.
+Harness derives their schemas, and the `StartAgent` capability catalog, from the
+frozen delegate topology and binds them to the parent-scoped delegate
+controller, so their authority cannot be supplied by optional task tracking.
+Harness therefore does not import `github.com/looprig/tools`. The four tools are
+automatically injected as one bundle into each applicable Loop; consumers must
+not add them manually. Agents coordinate task work through agent messages
+rather than shared task memory.
 
 ## What is tool?
 

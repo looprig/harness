@@ -549,6 +549,11 @@ func writeLoopTopology(material *strings.Builder, definitions []loop.Definition,
 		material.WriteString("loop:")
 		material.WriteString(string(candidate.Name()))
 		material.WriteByte('\n')
+		if description := candidate.Description(); description != "" {
+			material.WriteString("description:")
+			material.WriteString(description)
+			material.WriteByte('\n')
+		}
 		material.WriteString("policy:")
 		material.WriteString(candidate.PolicyRevision())
 		material.WriteByte('\n')

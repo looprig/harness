@@ -21,7 +21,7 @@ const (
 	defaultQuota = 64
 )
 
-// Limits are the in-session subagent-spawn safety caps applied by NewLoop: Depth bounds
+// Limits are the in-session agent-spawn safety caps applied by NewLoop: Depth bounds
 // the spawn-chain nesting and Quota bounds the total sub-loops a session may spawn. A zero
 // (or negative — a wiring slip) field adopts the package default via withDefaults, so a
 // caller can never accidentally disable a cap; an explicit positive value overrides it.

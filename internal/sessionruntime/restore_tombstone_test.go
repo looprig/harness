@@ -97,11 +97,11 @@ func TestAttachRestoredTombstonedLoopProjectsDurableSelectedHarness(t *testing.T
 	t.Parallel()
 	sessionID, parentID, childID := mustUUID(), mustUUID(), mustUUID()
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "agent", AgentHarness: "alpha", Profile: "acp/shared", Default: true,
+		AgentType: "agent", AgentHarness: "alpha", Profile: "acp/shared", Default: true,
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionHarnessManaged,
 	}, {
-		SubagentType: "agent", AgentHarness: "codex", Profile: "acp/shared",
+		AgentType: "agent", AgentHarness: "codex", Profile: "acp/shared",
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionHarnessManaged,
 	}})
@@ -351,7 +351,7 @@ func nativeRestoreFailurePlan(t *testing.T, sessionID, rootID, childID uuid.UUID
 func nativeRestoreRuntimeCatalog(t *testing.T) loop.RuntimeCatalog {
 	t.Helper()
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
+		AgentType: "worker", AgentHarness: "codex", Profile: "acp/codex",
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionExplicit, Default: true, DefaultModel: "luna",
 		Models: []loop.RuntimeModelOption{{

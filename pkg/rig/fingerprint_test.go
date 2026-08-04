@@ -89,7 +89,7 @@ func runtimeBoundDefinition(t *testing.T, d loop.Definition) loop.BoundDefinitio
 		t.Fatalf("OverrideBoundRuntime: %v", err)
 	}
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType: "agent",
+		AgentType:    "agent",
 		AgentHarness: "codex",
 		Profile:      "acp-codex",
 		Credential:   loop.CredentialGatewayBacked,
@@ -152,7 +152,7 @@ func TestFingerprintFromOmitsModelIDForHarnessManagedRuntime(t *testing.T) {
 		t.Fatalf("OverrideBoundRuntimeManaged: %v", err)
 	}
 	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
-		SubagentType:  "agent",
+		AgentType:     "agent",
 		AgentHarness:  "codex",
 		Profile:       "acp/codex-native",
 		Credential:    loop.CredentialNativeAuth,
@@ -663,6 +663,38 @@ func TestTopologyRevisionIncludesDelegateProducedToolMetadata(t *testing.T) {
 	b := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{primer, workerB}, []string{"primer"}, "primer")
 	if a.TopologyRev == b.TopologyRev {
 		t.Fatal("TopologyRev ignored delegate definition produced-name drift")
+	}
+}
+
+func TestTopologyRevisionIncludesDelegateDescription(t *testing.T) {
+	t.Parallel()
+
+	define := func(description string) []loop.Definition {
+		primer := mustDefine(
+			loop.WithName("primer"),
+			loop.WithInference(&stubLLM{}, validModel("primer")),
+			loop.WithDelegates("worker"),
+		)
+		worker := mustDefine(
+			loop.WithName("worker"),
+			loop.WithDescription(description),
+			loop.WithInference(&stubLLM{}, validModel("worker")),
+		)
+		return []loop.Definition{primer, worker}
+	}
+
+	baseDefinitions := define("Builds implementation changes.")
+	changedDefinitions := define("Reviews implementation changes.")
+	baseFrozen := frozenFingerprint(ConfigFingerprintFields{}, baseDefinitions, []string{"primer"}, "primer")
+	changedFrozen := frozenFingerprint(ConfigFingerprintFields{}, changedDefinitions, []string{"primer"}, "primer")
+	if baseFrozen.TopologyRev == changedFrozen.TopologyRev {
+		t.Fatal("TopologyRev ignored delegate description drift")
+	}
+
+	baseLive := fingerprintWithTopology(bindFingerprintDefinition(baseDefinitions[0]), ConfigFingerprintFields{}, baseDefinitions, []string{"primer"}, "primer")
+	changedLive := fingerprintWithTopology(bindFingerprintDefinition(changedDefinitions[0]), ConfigFingerprintFields{}, changedDefinitions, []string{"primer"}, "primer")
+	if baseLive.TopologyRev != baseFrozen.TopologyRev || changedLive.TopologyRev != changedFrozen.TopologyRev {
+		t.Fatalf("frozen/live topology mismatch: base frozen=%q live=%q changed frozen=%q live=%q", baseFrozen.TopologyRev, baseLive.TopologyRev, changedFrozen.TopologyRev, changedLive.TopologyRev)
 	}
 }
 

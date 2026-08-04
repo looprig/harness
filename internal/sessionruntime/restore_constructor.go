@@ -242,9 +242,9 @@ func restoreTopologySession(
 	}
 
 	// (2) Replay the whole stream once for discovery (the persisted fingerprint + the
-	// root loop id + the subagent spawn count) and gate recovery. A ZERO LoopID leaves
+	// root loop id + the agent spawn count) and gate recovery. A ZERO LoopID leaves
 	// the event projection UNNARROWED — every loop's events — so findRootLoopStarted and
-	// countSpawnedLoops see the subagent LoopStarted events, not just the root's. Fail
+	// countSpawnedLoops see the agent LoopStarted events, not just the root's. Fail
 	// closed on any error.
 	allRecords, err := drainRecordReplay(ctx, replayer, journal.ReplayRequest{Follow: false})
 	if err != nil {
@@ -416,9 +416,9 @@ func restoreTopologySession(
 	bound := activePlan.bound
 
 	// Re-seed the cumulative spawn counter from the durable log so the quota SURVIVES the
-	// restart: count the non-root LoopStarted events (subagent spawns). `all` is the
+	// restart: count the non-root LoopStarted events (agent spawns). `all` is the
 	// full-stream replay (every loop's events, not loop-scoped), so it already carries
-	// every subagent LoopStarted — no extra read. Without this, `spawned` would reset to 0
+	// every agent LoopStarted — no extra read. Without this, `spawned` would reset to 0
 	// and a restart would grant a fresh quota (a trivial cap bypass, design §16.3).
 	spawnedCount := countSpawnedLoops(all)
 
@@ -692,7 +692,7 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 // planLoops binds and independently folds every durable loop into a loopPlan (in stream
 // order) and identifies the active primer's plan. For a single-definition topology it maps
 // the configured root onto the sole definition and skips non-root loops whose AgentName is
-// unknown (subagents of a single-definition run). It is the single Bind of each loop,
+// unknown (children of a single-definition run). It is the single Bind of each loop,
 // performed inside the restore lease. It returns the ordered plans and the active plan, or a
 // typed error the caller records as a RestoreErrored.
 func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
@@ -722,7 +722,7 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		if nameErr := checkAgentName(started.AgentName, bound.Name(), allowMismatch); nameErr != nil {
 			return nil, loopPlan{}, nameErr
 		}
-		// A restored subagent keeps its OWN definition's access gate: authority
+		// A restored child agent keeps its OWN definition's access gate: authority
 		// differences between loops are expressed by the consumer configuring
 		// different gates per definition (or OverrideBoundAccess at a binding
 		// seam), never by harness-side attenuation against the parent.

@@ -211,7 +211,7 @@ func descriptionEntry(agent identity.AgentName, harness loop.AgentHarnessName, s
 		credential = loop.CredentialNativeAuth
 	}
 	return loop.RuntimeCatalogEntry{
-		SubagentType: agent,
+		AgentType:    agent,
 		AgentHarness: harness,
 		Profile:      loop.RuntimeProfileName(fmt.Sprintf("profile/%s/%s", harness, source)),
 		Description:  description,

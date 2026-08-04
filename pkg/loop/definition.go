@@ -252,6 +252,15 @@ func (d Definition) Name() identity.AgentName {
 	return d.state.name
 }
 
+// Description returns the immutable user-facing guidance attached to this
+// definition. It is used when compiling parent-scoped agent capabilities.
+func (d Definition) Description() string {
+	if d.state == nil {
+		return ""
+	}
+	return d.state.description
+}
+
 // Delegates returns a defensive copy of the definition's allowed delegate names.
 func (d Definition) Delegates() []identity.AgentName {
 	if d.state == nil {
@@ -650,7 +659,7 @@ type BoundDefinition interface {
 
 // boundDefinitionState is the sealed bound view. accessOverride, when non-nil,
 // is a binding-time per-loop gate override installed by OverrideBoundAccess;
-// otherwise Access() resolves the loop's OWN definition gate — a subagent
+// otherwise Access() resolves the loop's OWN definition gate — a child agent
 // binding without an explicit override always inherits its own definition's
 // gate, never another loop's.
 type boundDefinitionState struct {
@@ -895,8 +904,10 @@ func WithDisplayName(name string) Option {
 	}
 }
 
-// WithDescription sets the loop's user-facing description. Purely presentational;
-// excluded from PolicyRevision for the same restore-compat reason as WithDisplayName.
+// WithDescription sets the loop's user-facing description. It remains excluded
+// from PolicyRevision because it is not execution policy, but topology
+// compatibility fingerprints include it so injected agent guidance stays bound
+// to the definition that produced it.
 func WithDescription(desc string) Option {
 	return func(o *definitionOptions) error {
 		if err := o.singleton("description"); err != nil {

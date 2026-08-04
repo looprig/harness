@@ -554,6 +554,7 @@ func delegateExtraTools(def loop.Definition, manager *delegationManager) []tool.
 		entry := delegationtool.AgentCatalogEntry{Name: name}
 		if manager != nil {
 			if target, ok := manager.byName[name]; ok {
+				entry.Description = target.Description()
 				for _, mode := range target.Modes() {
 					entry.Modes = append(entry.Modes, mode.Name)
 				}

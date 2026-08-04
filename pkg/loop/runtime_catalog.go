@@ -50,7 +50,7 @@ type RuntimeModelOption struct {
 
 // RuntimeCatalogEntry describes one role/harness runtime combination.
 type RuntimeCatalogEntry struct {
-	SubagentType identity.AgentName
+	AgentType    identity.AgentName
 	AgentHarness AgentHarnessName
 	Profile      RuntimeProfileName
 	// Description is bounded, secret-free presentation guidance for this
@@ -73,7 +73,7 @@ type RuntimeCatalogEntry struct {
 // Resolved is the immutable runtime tuple selected from a RuntimeCatalog.
 // Target is a defensive copy of the cataloged model descriptor.
 type Resolved struct {
-	SubagentType  identity.AgentName
+	AgentType     identity.AgentName
 	AgentHarness  AgentHarnessName
 	Profile       RuntimeProfileName
 	Source        RuntimeSourceName
@@ -156,19 +156,19 @@ func NewRuntimeCatalog(entries []RuntimeCatalogEntry) (RuntimeCatalog, error) {
 		if err := validateRuntimeCatalogEntry(entry); err != nil {
 			return RuntimeCatalog{}, err
 		}
-		key := runtimeHarnessKey{agent: entry.SubagentType, harness: entry.AgentHarness, source: entry.Source}
+		key := runtimeHarnessKey{agent: entry.AgentType, harness: entry.AgentHarness, source: entry.Source}
 		if _, exists := seenHarnesses[key]; exists {
 			return RuntimeCatalog{}, &RuntimeCatalogError{Kind: RuntimeCatalogDuplicateHarness, Field: "AgentHarness"}
 		}
 		seenHarnesses[key] = struct{}{}
 		if entry.Default {
-			defaultCounts[entry.SubagentType]++
+			defaultCounts[entry.AgentType]++
 		}
 		cloned[i] = entry
 	}
 
 	for _, entry := range cloned {
-		if defaultCounts[entry.SubagentType] != 1 {
+		if defaultCounts[entry.AgentType] != 1 {
 			return RuntimeCatalog{}, &RuntimeCatalogError{Kind: RuntimeCatalogDefaultHarnessCount, Field: "Default"}
 		}
 	}
@@ -181,8 +181,8 @@ func NewRuntimeCatalog(entries []RuntimeCatalogEntry) (RuntimeCatalog, error) {
 
 	sort.Slice(cloned, func(i, j int) bool {
 		left, right := cloned[i], cloned[j]
-		if left.SubagentType != right.SubagentType {
-			return left.SubagentType < right.SubagentType
+		if left.AgentType != right.AgentType {
+			return left.AgentType < right.AgentType
 		}
 		if left.AgentHarness != right.AgentHarness {
 			return left.AgentHarness < right.AgentHarness
@@ -212,7 +212,7 @@ func (c RuntimeCatalog) EntriesFor(agent identity.AgentName) []RuntimeCatalogEnt
 	}
 	var result []RuntimeCatalogEntry
 	for _, entry := range c.entries {
-		if entry.SubagentType == agent {
+		if entry.AgentType == agent {
 			result = append(result, cloneRuntimeCatalogEntry(entry))
 		}
 	}
@@ -246,7 +246,7 @@ func (c RuntimeCatalog) ResolveWithExplicitEffort(agent identity.AgentName, harn
 // behavior; a supplied source disambiguates choices that share one harness.
 func (c RuntimeCatalog) ResolveWithExplicitSource(agent identity.AgentName, harness AgentHarnessName, source RuntimeSourceName, alias ModelAlias, effort model.Effort, explicitEffort bool) (Resolved, error) {
 	if agent == "" {
-		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
+		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "AgentType"}
 	}
 	if source != "" && !source.valid() {
 		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSource, Field: "Source"}
@@ -258,7 +258,7 @@ func (c RuntimeCatalog) ResolveWithExplicitSource(agent identity.AgentName, harn
 			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownSource, Field: "Source"}
 		}
 		if harness == "" {
-			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
+			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "AgentType"}
 		}
 		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownHarness, Field: "AgentHarness"}
 	}
@@ -326,7 +326,7 @@ func (c RuntimeCatalog) ResolveWithExplicitSource(agent identity.AgentName, harn
 	}
 
 	return Resolved{
-		SubagentType:     selected.SubagentType,
+		AgentType:        selected.AgentType,
 		AgentHarness:     selected.AgentHarness,
 		Profile:          selected.Profile,
 		Source:           resolvedSource,
@@ -354,7 +354,7 @@ func (c RuntimeCatalog) ResolveTargetAlias(agent identity.AgentName, harness Age
 // ResolveTargetAlias. Empty source retains legacy target-alias behavior.
 func (c RuntimeCatalog) ResolveTargetAliasWithSource(agent identity.AgentName, harness AgentHarnessName, source RuntimeSourceName, targetAlias ModelAlias, effort model.Effort) (Resolved, error) {
 	if agent == "" {
-		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
+		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "AgentType"}
 	}
 	if source != "" && !source.valid() {
 		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogInvalidSource, Field: "Source"}
@@ -366,7 +366,7 @@ func (c RuntimeCatalog) ResolveTargetAliasWithSource(agent identity.AgentName, h
 			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownSource, Field: "Source"}
 		}
 		if harness == "" {
-			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "SubagentType"}
+			return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownAgent, Field: "AgentType"}
 		}
 		return Resolved{}, &RuntimeCatalogError{Kind: RuntimeCatalogUnknownHarness, Field: "AgentHarness"}
 	}
@@ -481,7 +481,7 @@ func effectiveSelectionKind(entry RuntimeCatalogEntry) RuntimeSelectionKind {
 
 func resolvedHarnessManaged(entry RuntimeCatalogEntry) Resolved {
 	return Resolved{
-		SubagentType:  entry.SubagentType,
+		AgentType:     entry.AgentType,
 		AgentHarness:  entry.AgentHarness,
 		Profile:       entry.Profile,
 		Source:        entry.Source,
@@ -498,7 +498,7 @@ func (c RuntimeCatalog) runtimeCandidates(agent identity.AgentName, harness Agen
 	var defaultEntry *RuntimeCatalogEntry
 	for i := range c.entries {
 		entry := &c.entries[i]
-		if entry.SubagentType == agent && entry.Default {
+		if entry.AgentType == agent && entry.Default {
 			defaultEntry = entry
 			break
 		}
@@ -515,7 +515,7 @@ func (c RuntimeCatalog) runtimeCandidates(agent identity.AgentName, harness Agen
 	result := make([]*RuntimeCatalogEntry, 0, 1)
 	for i := range c.entries {
 		entry := &c.entries[i]
-		if entry.SubagentType != agent || entry.AgentHarness != harness {
+		if entry.AgentType != agent || entry.AgentHarness != harness {
 			continue
 		}
 		if source != "" && !runtimeEntryHasSource(*entry, source) {
@@ -568,8 +568,8 @@ func effectiveModelCredential(entry RuntimeCatalogEntry, option RuntimeModelOpti
 }
 
 func validateRuntimeCatalogEntry(entry RuntimeCatalogEntry) error {
-	if err := validateCatalogIdentifier(string(entry.SubagentType), true); err != nil {
-		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "SubagentType"}
+	if err := validateCatalogIdentifier(string(entry.AgentType), true); err != nil {
+		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "AgentType"}
 	}
 	if err := validateCatalogIdentifier(string(entry.AgentHarness), false); err != nil {
 		return &RuntimeCatalogError{Kind: RuntimeCatalogInvalidIdentifier, Field: "AgentHarness"}
@@ -854,7 +854,7 @@ type runtimeCatalogDigest struct {
 }
 
 type runtimeCatalogEntryDigest struct {
-	SubagentType             string                     `json:"subagent_type"`
+	AgentType                string                     `json:"agent_type"`
 	AgentHarness             string                     `json:"agent_harness"`
 	Profile                  string                     `json:"profile"`
 	Description              string                     `json:"description,omitempty"`
@@ -916,7 +916,7 @@ func runtimeCatalogDigestJSON(entries []RuntimeCatalogEntry) ([]byte, error) {
 			return nil, err
 		}
 		row := runtimeCatalogEntryDigest{
-			SubagentType:             string(entry.SubagentType),
+			AgentType:                string(entry.AgentType),
 			AgentHarness:             string(entry.AgentHarness),
 			Profile:                  string(entry.Profile),
 			Description:              entry.Description,

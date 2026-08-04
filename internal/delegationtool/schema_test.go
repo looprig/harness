@@ -185,7 +185,7 @@ func TestSchemaAndDescriptionOmitRolesMissingFromPopulatedCatalog(t *testing.T) 
 func TestSchemaMixedSourcesAdvertisesAgentSourceWithoutManagedPlaceholders(t *testing.T) {
 	gateway := schemaEntry("worker", "codex", true, []string{"luna"}, []inferencemodel.Effort{inferencemodel.EffortHigh})
 	native := loop.RuntimeCatalogEntry{
-		SubagentType: "worker", AgentHarness: "codex", Profile: "profile/codex-native",
+		AgentType: "worker", AgentHarness: "codex", Profile: "profile/codex-native",
 		Credential: loop.CredentialNativeAuth, Source: loop.RuntimeSourceNative,
 		SelectionKind: loop.RuntimeSelectionHarnessManaged,
 	}
@@ -547,7 +547,7 @@ func schemaEntryWithModels(agent loopAgentName, harness loop.AgentHarnessName, d
 	for _, model := range models {
 		options = append(options, loop.RuntimeModelOption{Alias: model.alias, DefaultEffort: model.efforts[0], Efforts: append([]inferencemodel.Effort(nil), model.efforts...), Target: inferencemodel.Model{Provider: "provider", Name: string(model.alias), Sampling: inferencemodel.Sampling{Effort: model.efforts[0]}}})
 	}
-	return loop.RuntimeCatalogEntry{SubagentType: agent, AgentHarness: harness, Profile: loop.RuntimeProfileName("profile/" + string(harness)), Credential: loop.CredentialGatewayBacked, Default: defaultHarness, DefaultModel: models[0].alias, Models: options}
+	return loop.RuntimeCatalogEntry{AgentType: agent, AgentHarness: harness, Profile: loop.RuntimeProfileName("profile/" + string(harness)), Credential: loop.CredentialGatewayBacked, Default: defaultHarness, DefaultModel: models[0].alias, Models: options}
 }
 
 func schemaCatalog(t *testing.T, entries ...loop.RuntimeCatalogEntry) loop.RuntimeCatalog {

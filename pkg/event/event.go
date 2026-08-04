@@ -109,7 +109,7 @@ type Header struct {
 	// Cause is the direct cause of this event. For UserInput/SubagentResult
 	// resolution events (TurnStarted, TurnFoldedInto, InputCancelled, InputQueued,
 	// TurnRejected), Cause.CommandID is the submit command id. For an event caused by
-	// a SubagentResult, Cause.LoopID is the producing subagent's loop id (its
+	// a SubagentResult, Cause.LoopID is the producing agent's loop id (its
 	// quiescence wake token). Cause.Agency surfaces who caused it, but ONLY the turn-
 	// resolution events stamp it — TurnStarted, TurnFoldedInto, and InputCancelled
 	// (per design §444-446); InputQueued and TurnRejected carry Cause.CommandID but
@@ -458,7 +458,7 @@ type LoopStarted struct {
 	// durable so restore and catalog repair never consult a mutable catalog.
 	Runtime      ModelRuntime  `json:"runtime,omitzero"`
 	AgentRuntime *AgentRuntime `json:"agent_runtime,omitempty"`
-	// ParentToolUseID is the durable provider tool-use id of the Subagent tool call
+	// ParentToolUseID is the durable provider tool-use id of the agent tool call
 	// that spawned this loop (content.ToolUseBlock.ID), empty for loops not spawned by
 	// a tool call (e.g. the primary/root). It is the durable carrier that correlates a
 	// child loop back to its parent tool call across persist/restore; omitzero so old
