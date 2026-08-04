@@ -245,7 +245,7 @@ func TestStopAgentInterruptTargetsOnlyOwnedChild(t *testing.T) {
 	ctrl := &scopedController{parentLoopID: ids["P"]}
 	res, err := ctrl.interrupt(s, tool.DelegateRequest{AgentID: ids["C"]})
 	if err != nil {
-		t.Fatalf("Subagent interrupt returned %v, want nil", err)
+		t.Fatalf("agent interrupt returned %v, want nil", err)
 	}
 	if res.PreviousState != tool.AgentStateIdle || res.State != tool.AgentStateIdle {
 		t.Errorf("states = %v/%v, want idle/idle", res.PreviousState, res.State)

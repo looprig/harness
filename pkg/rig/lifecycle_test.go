@@ -931,7 +931,7 @@ func TestRestoreAcceptsPreFrozenFullFingerprintFixture(t *testing.T) {
 	}
 }
 
-func TestRestoreAcceptsLegacyBoundFingerprintForFilesAndInjectedSubagent(t *testing.T) {
+func TestRestoreAcceptsLegacyBoundFingerprintForFilesAndInjectedAgentTools(t *testing.T) {
 	store, _ := lifecycleStore(t)
 	workspace, err := workspacestore.Open(memstore.New().Blobs)
 	if err != nil {

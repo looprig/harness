@@ -1505,13 +1505,6 @@ func didTimeout(timeoutSeconds *int, waitCtx context.Context) bool {
 	return timeoutSeconds != nil && errors.Is(waitCtx.Err(), context.DeadlineExceeded)
 }
 
-func timeoutOrInterrupted(timeoutSeconds *int, waitCtx context.Context) tool.DelegateStatusValue {
-	if didTimeout(timeoutSeconds, waitCtx) {
-		return tool.DelegateStatusTimedOut
-	}
-	return tool.DelegateStatusInterrupted
-}
-
 // startDelegate runs the transactional child admission path: quota reservation and bind,
 // subscription, request mint, backend construction, and initial-command acceptance all
 // precede the checked LoopStarted commit. The backend's publisher remains blocked until

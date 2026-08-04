@@ -37,9 +37,6 @@ func TestAgentToolDefinitionProducesFourInvokableTools(t *testing.T) {
 		if info.Name != want[i] {
 			t.Errorf("tools[%d].Info().Name = %q, want %q", i, info.Name, want[i])
 		}
-		if info.Name == "Subagent" {
-			t.Error("Definition produced removed Subagent tool")
-		}
 	}
 }
 

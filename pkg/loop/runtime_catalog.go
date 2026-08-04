@@ -79,7 +79,7 @@ type Resolved struct {
 	Source        RuntimeSourceName
 	Credential    CredentialMode
 	SelectionKind RuntimeSelectionKind
-	// ModelAlias is the stable model-facing selector accepted by Subagent.
+	// ModelAlias is the stable model-facing selector accepted by StartAgent.
 	ModelAlias ModelAlias
 	// TargetAlias is the concrete alias sent to a gateway or ACP launcher. It
 	// is derived from the selected effort for gateway-backed runtimes and is
@@ -345,7 +345,7 @@ func (c RuntimeCatalog) ResolveWithExplicitSource(agent identity.AgentName, harn
 // to its model-facing catalog selector. New gateway-backed records use the
 // concrete per-effort alias; the bare model alias is also accepted so legacy
 // records remain restorable. This method is intentionally not used by
-// model-facing Subagent preparation or controller validation.
+// model-facing agent preparation or controller validation.
 func (c RuntimeCatalog) ResolveTargetAlias(agent identity.AgentName, harness AgentHarnessName, targetAlias ModelAlias, effort model.Effort) (Resolved, error) {
 	return c.ResolveTargetAliasWithSource(agent, harness, "", targetAlias, effort)
 }

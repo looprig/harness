@@ -505,7 +505,7 @@ func TestBindRejectsReservedInjectedProducedToolName(t *testing.T) {
 	bindings := validToolBindings(t)
 	builds := 0
 	bindings.ExtraTools = []tool.Definition{tool.NewBundleDefinition(
-		"injected", []string{"Subagent", inference.StructuredOutputToolName}, 0,
+		"injected", []string{"StartAgent", inference.StructuredOutputToolName}, 0,
 		func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 			builds++
 			return nil, nil

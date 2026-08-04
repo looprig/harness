@@ -561,7 +561,7 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 		return selected, nil
 	}
 
-	// withExtra appends the caller-injected ExtraTools (the derived delegation Subagent
+	// withExtra appends the caller-injected ExtraTools (the derived delegation agent-tools
 	// tool) to a mode's tool set, so a delegate-bearing loop exposes it in EVERY mode
 	// without the definition hand-listing it. The same immutable ExtraTools definitions
 	// are appended to base + every mode, so build's by-name cache builds each once and

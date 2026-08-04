@@ -35,7 +35,7 @@ func (e *ConfigError) Unwrap() error { return e.Cause }
 // IDGenerationError is the typed cause logged when the actor cannot mint a TurnID
 // from crypto/rand while starting a turn from an accepted submit. The turn is not
 // started; the submit's outcome is a published event.TurnRejected{RejectInternal}
-// (or, for a never-rejected SubagentResult, event.InputCancelled{CancelTurnFailed}).
+// (or, for a never-rejected agent hand-back, event.InputCancelled{CancelTurnFailed}).
 // It remains a distinct typed error so the failure is greppable/testable, even though
 // it is only logged — no event carries the error cause itself.
 type IDGenerationError struct{ Cause error }

@@ -1,6 +1,6 @@
 package sessionruntime
 
-// Subagent-spawn safety caps. They are the two independent backstops against a runaway
+// Child-agent spawn safety caps. They are the two independent backstops against a runaway
 // agent tree: Depth bounds how DEEP the spawn chain can nest (a sub-loop spawning a
 // sub-loop spawning a sub-loop…), and Quota bounds the TOTAL number of sub-loops a
 // single session may ever spawn (a fan-out bound across the whole tree). Both are

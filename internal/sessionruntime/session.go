@@ -388,7 +388,7 @@ type Session struct {
 	topology Topology
 
 	// delegation is the parent-to-child delegation mediator: it vends the parent-scoped
-	// tool.DelegateController injected into each loop's Subagent tool, and owns the
+	// tool.DelegateController injected into each loop's agent collaboration bundle, and owns the
 	// in-flight delegate-request map. It is created before the loops (so restore can bind
 	// loop tools against it) and attached to this session once the session exists. Never
 	// nil for a constructed session.
@@ -396,7 +396,7 @@ type Session struct {
 
 	// interruptPending REFCOUNTS the loop ids currently under an interrupt admission barrier:
 	// a marked loop's current turn was interrupted and its NEW machine-delegate admission
-	// (Subagent start/send) is refused while the count is positive. The count (not a set) lets
+	// (agent start/send) is refused while the count is positive. The count (not a set) lets
 	// overlapping interrupt scopes each hold a shared loop independently — the mark clears only
 	// when the last holding barrier releases. It is guarded by loopsMu — the SAME lock that gates
 	// the registry, closing, and faulted — so the mark-before-fanout select-and-mark is atomic
@@ -1238,7 +1238,7 @@ func (s *Session) replaySubagentResult(ctx context.Context, cmd command.Subagent
 // loop handle and returns only the loop id, because callers route through
 // session methods rather than writing to a loop command channel directly.
 func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Definition) (uuid.UUID, error) {
-	// A plain NewLoop is never spawned by a Subagent tool call, so it carries no
+	// A plain NewLoop is never spawned by an agent collaboration tool call, so it carries no
 	// parent tool-use id; the private newLoop does the real work. RunSubagent is the
 	// only path that threads a non-empty id (its child's LoopStarted correlates back
 	// to the spawning tool call).
@@ -1248,7 +1248,7 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Definition) (uuid.UUI
 // newLoop is the private loop-creation core behind NewLoop and RunSubagent. It is
 // identical to the public NewLoop except that parentToolUseID is stamped onto the new
 // loop's LoopStarted (event.LoopStarted.ParentToolUseID): the durable carrier that
-// correlates a tool-spawned child loop back to its parent Subagent tool call. NewLoop
+// correlates a tool-spawned child loop back to its parent agent tool call. NewLoop
 // passes ""; RunSubagent passes the provider tool-use id of the spawning call. The id
 // rides as a plain parameter into the LoopStarted build only — it touches no identity /
 // Provenance / Header struct, so it never perturbs the loop tree or the quota/depth math.
@@ -1843,7 +1843,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// configured value never silently disables the depth/quota backstop.
 	s.limits = s.limits.withDefaults()
 	// Store the immutable topology and stand up the delegation manager BEFORE any loop is
-	// bound, so each loop's Subagent tool is built against a parent-scoped controller. The
+	// bound, so each loop's agent collaboration tools are built against a parent-scoped controller. The
 	// manager is attached to this session so its scoped controllers can spawn + address
 	// children through it.
 	s.topology = cloneTopology(topology)
@@ -2231,7 +2231,7 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 // blocks (machine-originated), and returns the sub-loop's final assistant text. It
 // is the SOLE exported entry point of the subagent composition: it wires together
 // the unexported building blocks (NewLoop + SubscribeEvents + submitToLoop +
-// drainToFinalText + interruptLoopID) so the Subagent tool's injected capability
+// drainToFinalText + interruptLoopID) so the agent collaboration tools' injected capability
 // (a later task) has one method to call and the blocks stay package-private.
 //
 // cfg is the sub-loop's loop.Definition — the CALLER builds a FRESH cfg per call (its
@@ -2258,7 +2258,7 @@ func (s *Session) RunSubagent(ctx context.Context, parent loop.Provenance, cfg l
 	// newLoop publishes LoopStarted and fails SessionClosing if the session is
 	// shutting down; either way no sub-loop is left behind a returned error.
 	// parentToolUseID is stamped onto that LoopStarted so the sub-loop correlates back
-	// to the spawning Subagent tool call across persist/restore.
+	// to the spawning agent tool call across persist/restore.
 	subLoopID, err := s.newLoop(parent, cfg, parentToolUseID, "", nil)
 	if err != nil {
 		return "", err

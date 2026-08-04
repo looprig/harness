@@ -877,11 +877,6 @@ func TestDelegateExtraToolsInjectsOneAtomicAgentBundle(t *testing.T) {
 	if got := definitions[0].ProducedToolNames(); !slices.Equal(got, want) {
 		t.Fatalf("ProducedToolNames() = %q, want %q", got, want)
 	}
-	for _, name := range definitions[0].ProducedToolNames() {
-		if name == "Subagent" {
-			t.Fatal("delegateExtraTools produced removed Subagent tool")
-		}
-	}
 	built, err := definitions[0].Build(context.Background(), tool.Bindings{
 		SessionID: mustUUID(), LoopID: mustUUID(), Delegate: manager.controllerFor(mustUUID(), parent),
 	})

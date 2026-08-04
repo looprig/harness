@@ -3,6 +3,7 @@ package rig
 import (
 	"context"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -19,8 +20,8 @@ import (
 
 // captureLLM records the tools offered on the FIRST request and returns a one-chunk
 // stream so the turn completes. It is the end-to-end observable for what the model
-// actually receives (the tool schemas), proving the rig derives + injects the Subagent
-// tool from the parent definition's delegates.
+// actually receives (the tool schemas), proving the rig derives + injects the agent
+// collaboration tools from the parent definition's delegates.
 type captureLLM struct {
 	mu    sync.Mutex
 	tools []inference.Tool
@@ -74,10 +75,10 @@ func findInferenceTool(tools []inference.Tool, name string) (inference.Tool, boo
 	return inference.Tool{}, false
 }
 
-// TestRigInjectsSubagentToolForDelegates proves the rig derives + injects the Subagent
-// tool at the session bind site for a delegate-bearing primer, WITHOUT the user hand-adding
-// it. The tool's catalog is exactly the parent's Delegates().
-func TestRigInjectsSubagentToolForDelegates(t *testing.T) {
+// TestRigInjectsAgentToolsForDelegates proves the rig derives + injects the four agent
+// collaboration tools at the session bind site for a delegate-bearing primer, WITHOUT
+// the user hand-adding them. The StartAgent catalog is exactly the parent's Delegates().
+func TestRigInjectsAgentToolsForDelegates(t *testing.T) {
 	t.Parallel()
 	store, err := sessionstore.Open(memstore.New())
 	if err != nil {
@@ -117,20 +118,26 @@ func TestRigInjectsSubagentToolForDelegates(t *testing.T) {
 	}
 	tools := planner.waitTools(t)
 
-	sub, ok := findInferenceTool(tools, "Subagent")
+	wantNames := []string{"ListAgents", "MessageAgent", "StartAgent", "StopAgent"}
+	gotNames := toolNames(tools)
+	sort.Strings(gotNames)
+	if strings.Join(gotNames, "\n") != strings.Join(wantNames, "\n") {
+		t.Fatalf("delegate-bearing primer tools = %v, want exactly %v", gotNames, wantNames)
+	}
+	start, ok := findInferenceTool(tools, "StartAgent")
 	if !ok {
-		t.Fatalf("delegate-bearing primer did NOT receive a Subagent tool; tools = %v", toolNames(tools))
+		t.Fatalf("delegate-bearing primer did NOT receive StartAgent; tools = %v", gotNames)
 	}
 	for _, delegate := range []string{"builder", "reviewer"} {
-		if !strings.Contains(sub.Description, delegate) {
-			t.Errorf("Subagent catalog missing delegate %q; description = %q", delegate, sub.Description)
+		if !strings.Contains(start.Description, delegate) {
+			t.Errorf("StartAgent catalog missing delegate %q; description = %q", delegate, start.Description)
 		}
 	}
 }
 
-// TestRigNoSubagentToolWithoutDelegates proves a loop with NO delegates receives NO
-// Subagent tool — the "no tool when no delegates" requirement.
-func TestRigNoSubagentToolWithoutDelegates(t *testing.T) {
+// TestRigNoAgentToolsWithoutDelegates proves a loop with NO delegates receives none
+// of the agent collaboration tools.
+func TestRigNoAgentToolsWithoutDelegates(t *testing.T) {
 	t.Parallel()
 	store, err := sessionstore.Open(memstore.New())
 	if err != nil {
@@ -161,8 +168,10 @@ func TestRigNoSubagentToolWithoutDelegates(t *testing.T) {
 		t.Fatalf("Submit: %v", err)
 	}
 	tools := solo.waitTools(t)
-	if _, ok := findInferenceTool(tools, "Subagent"); ok {
-		t.Fatalf("no-delegate loop received a Subagent tool; tools = %v", toolNames(tools))
+	for _, name := range []string{"ListAgents", "MessageAgent", "StartAgent", "StopAgent"} {
+		if _, ok := findInferenceTool(tools, name); ok {
+			t.Fatalf("no-delegate loop received %s; tools = %v", name, toolNames(tools))
+		}
 	}
 }
 

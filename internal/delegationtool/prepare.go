@@ -307,7 +307,7 @@ func (s *agentToolConfig) prepareStartAgent(argsJSON string) (PreparedStartAgent
 	if err != nil {
 		return PreparedStartAgent{}, err
 	}
-	if !s.hasSubagentType(prepared.AgentType) {
+	if !s.hasAgentType(prepared.AgentType) {
 		return PreparedStartAgent{}, preparationFailure(errCategoryUnknownRuntime)
 	}
 	if err := s.validateAgentMode(prepared); err != nil {
@@ -435,7 +435,7 @@ func (s *agentToolConfig) resolveDelegateRuntime(prepared PreparedStartAgent) (*
 	}, nil
 }
 
-func (s *agentToolConfig) hasSubagentType(agent string) bool {
+func (s *agentToolConfig) hasAgentType(agent string) bool {
 	for _, entry := range s.catalog {
 		if string(entry.Name) == agent {
 			return true

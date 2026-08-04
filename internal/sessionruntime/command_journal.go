@@ -240,7 +240,7 @@ func WithForeignBuilderRegistry(registry *foreign.BuilderRegistry) Option {
 }
 
 // WithRuntimeCatalog installs one immutable parent-scoped catalog snapshot. The
-// same value feeds Subagent schema/preparation and controller revalidation.
+// same value feeds agent schema/preparation and controller revalidation.
 func WithRuntimeCatalog(catalog loop.RuntimeCatalog) Option {
 	return func(s *Session) {
 		s.runtimeCatalog = catalog

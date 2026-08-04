@@ -364,7 +364,7 @@ func restoreTopologySession(
 		adoptOnAccept = len(assessment.Changes) > 0 || assessment.BaselineUpgrade
 	}
 	// Stand up the delegation manager BEFORE binding any loop so each restored loop's
-	// Subagent tool is bound against a parent-scoped controller; it is attached to the
+	// agent collaboration tools are bound against a parent-scoped controller; they are attached to the
 	// live session once buildRestoredSession creates it. Seed its durable request→terminal
 	// index from the full stream so a wait for a wait:false request submitted before the
 	// restart resolves after restore.
