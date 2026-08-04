@@ -2,6 +2,7 @@ package sessionruntime
 
 import (
 	"context"
+	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
@@ -42,17 +43,45 @@ type InterruptReleasePolicy interface {
 	AwaitRelease(ctx context.Context) error
 }
 
-// sessionIdleRelease is the default InterruptReleasePolicy: it releases the admission barrier
-// once the session next reaches idle. A hub-less struct-literal session (a test seam) has no
-// idle model, so it parks on ctx instead of nil-dereferencing the hub.
-type sessionIdleRelease struct{ session *Session }
+// defaultInterruptReleaseBound caps how long the default policy waits for the session-idle
+// edge before failing open. It exists to make the fail-open guarantee in InterruptReleasePolicy
+// TRUE: the session-idle edge depends on EVERY live loop reaching idle, so a single loop that
+// does not observe cancellation (a tool or provider ignoring ctx) would otherwise hold the
+// barrier for the session's whole lifetime — and with it the retained human input on every
+// OTHER loop, which is accepted and queued but cannot be admitted. That presents to the user as
+// an interrupt that appears to work followed by messages that queue forever.
+//
+// It is deliberately far longer than a healthy interrupt-to-idle settle (cancel the stream, tear
+// down in-flight tools, append the terminal), so a well-behaved session ALWAYS releases on the
+// real SessionIdle edge and this bound never fires. It is a wedge backstop, not a deadline.
+const defaultInterruptReleaseBound = 30 * time.Second
 
+// sessionIdleRelease is the default InterruptReleasePolicy: it releases the admission barrier
+// once the session next reaches idle, or after bound elapses — whichever comes first. A hub-less
+// struct-literal session (a test seam) has no idle model, so it parks on ctx instead of
+// nil-dereferencing the hub. A non-positive bound means defaultInterruptReleaseBound; tests set
+// it directly to exercise the backstop without waiting out the production value.
+type sessionIdleRelease struct {
+	session *Session
+	bound   time.Duration
+}
+
+// AwaitRelease blocks until the session reaches idle or the bound elapses. Timing out is NOT an
+// error the caller must handle: armInterruptBarrier clears the marks once this returns whatever
+// the error, which is exactly the documented fail-open-on-release behavior. The returned error
+// stays advisory so a caller could log the distinction.
 func (r sessionIdleRelease) AwaitRelease(ctx context.Context) error {
 	if r.session.hub == nil {
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	return r.session.WaitIdle(ctx)
+	bound := r.bound
+	if bound <= 0 {
+		bound = defaultInterruptReleaseBound
+	}
+	bounded, cancel := context.WithTimeout(ctx, bound)
+	defer cancel()
+	return r.session.WaitIdle(bounded)
 }
 
 // loopInterruptPending reports whether loopID is under an interrupt admission barrier — a loop
