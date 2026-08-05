@@ -408,6 +408,9 @@ func (d Definition) Delegation() Delegation {
 // PolicyRevision returns a deterministic, secret-free digest of immutable loop
 // behavior used by a rig topology fingerprint. Opaque function-valued collaborators
 // require WithPolicyRevision, whose caller-supplied identity is included here.
+// Adding, removing, or changing a hashed field here shifts this digest for
+// every existing consumer once, surfacing as an ordinary one-time
+// Info-severity DriftTopology on their next restore — expected, not a bug.
 func (d Definition) PolicyRevision() string {
 	if d.state == nil {
 		return ""
@@ -478,6 +481,11 @@ func (d Definition) PolicyRevision() string {
 		PolicyRevision: d.state.policyRevision,
 		OutputPolicy:   d.state.outputPolicy,
 	}
+	// ContextTransports (and its siblings below) only ever populate here:
+	// validateContextDefinition rejects WithContextTransports without
+	// WithContextCounter (DefinitionMissingContextCounter), so
+	// d.state.contextTransports is provably empty whenever contextCounter is
+	// nil — a future change to that coupling must touch both sites together.
 	if d.state.contextCounter != nil {
 		counter := d.state.counterCapability
 		capability := d.state.inferenceCapability
