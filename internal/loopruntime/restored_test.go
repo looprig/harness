@@ -9,6 +9,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
+	model "github.com/looprig/inference/model"
 )
 
 // seededUser builds the committed UserMessage form the loop appends for a turn.
@@ -204,5 +205,64 @@ func TestLoopSnapshot(t *testing.T) {
 	}
 	if !reflect.DeepEqual(msgs, seeded) {
 		t.Errorf("snapshot msgs =\n  %#v\nwant\n  %#v", msgs, seeded)
+	}
+}
+
+// TestNewRestoredSeedsTransportOverride proves NewRestoredWithRuntime (via NewRestored)
+// grafts a seeded ModelRuntime's APIFormat/BaseURL onto the restored loop's ACTUAL
+// running model, not just the lightweight reported view: a non-empty seeded
+// APIFormat/BaseURL overrides the base mode's transport, and a seed that leaves both
+// zero (exactly what every pre-Task-3.1 durable record folds to) must leave the base
+// model's transport untouched. The seam is the same one TestNewRestoredSeedsModeAndInference
+// uses: the recordingLLM's last request carries the actor's real effective model.
+func TestNewRestoredSeedsTransportOverride(t *testing.T) {
+	t.Parallel()
+	base := testModel() // Provider: lmstudio, APIFormat: openai, BaseURL: http://localhost:1234
+	tests := []struct {
+		name          string
+		runtime       event.ModelRuntime
+		wantAPIFormat model.APIFormat
+		wantBaseURL   string
+	}{
+		{
+			name: "seeded APIFormat/BaseURL override the base transport",
+			runtime: event.ModelRuntime{
+				Key:       base.Key(),
+				APIFormat: model.APIFormatAnthropic,
+				BaseURL:   "https://example.com",
+			},
+			wantAPIFormat: model.APIFormatAnthropic,
+			wantBaseURL:   "https://example.com",
+		},
+		{
+			name: "zero seeded APIFormat/BaseURL leave the base transport untouched (regression)",
+			runtime: event.ModelRuntime{
+				Key: base.Key(),
+			},
+			wantAPIFormat: base.APIFormat,
+			wantBaseURL:   base.BaseURL,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
+			bound := modeDefinition(t, llm)
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			rec := &recordingPublisher{}
+			seed := RestoredState{HasRuntime: true, Runtime: tt.runtime}
+			l, err := NewRestored(ctx, mustID(t), mustID(t), Provenance{}, rec, bound, seed)
+			if err != nil {
+				t.Fatalf("NewRestored: %v", err)
+			}
+			runOneTurn(t, l, rec, "turn1")
+			got := llm.lastReq().Model
+			if got.APIFormat != tt.wantAPIFormat || got.BaseURL != tt.wantBaseURL {
+				t.Fatalf("restored turn model APIFormat/BaseURL = %q/%q, want %q/%q",
+					got.APIFormat, got.BaseURL, tt.wantAPIFormat, tt.wantBaseURL)
+			}
+		})
 	}
 }

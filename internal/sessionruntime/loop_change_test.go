@@ -300,6 +300,53 @@ func TestRestoreSeedingAgreesWithLiveView(t *testing.T) {
 	}
 }
 
+// TestApplyModelRuntime proves applyModelRuntime grafts a non-empty seeded
+// APIFormat/BaseURL onto the base model, and leaves the base model's transport fields
+// untouched when the runtime carries neither (the fold every durable record written
+// before Task 3.1 produces). This is the SAME fold rule loopruntime.NewRestoredWithRuntime
+// applies to the actor's real running model at Site 1 — the two grafting sites are kept
+// in lockstep by design, not consolidated into one shared helper.
+func TestApplyModelRuntime(t *testing.T) {
+	t.Parallel()
+	base := validModel("base")
+	tests := []struct {
+		name          string
+		runtime       event.ModelRuntime
+		wantAPIFormat model.APIFormat
+		wantBaseURL   string
+	}{
+		{
+			name: "non-empty seeded APIFormat/BaseURL override the base transport",
+			runtime: event.ModelRuntime{
+				Key:       base.Key(),
+				APIFormat: model.APIFormatAnthropic,
+				BaseURL:   "https://example.com",
+			},
+			wantAPIFormat: model.APIFormatAnthropic,
+			wantBaseURL:   "https://example.com",
+		},
+		{
+			name: "zero seeded APIFormat/BaseURL leave the base transport untouched (regression)",
+			runtime: event.ModelRuntime{
+				Key: base.Key(),
+			},
+			wantAPIFormat: base.APIFormat,
+			wantBaseURL:   base.BaseURL,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := applyModelRuntime(base, tt.runtime)
+			if got.APIFormat != tt.wantAPIFormat || got.BaseURL != tt.wantBaseURL {
+				t.Fatalf("applyModelRuntime APIFormat/BaseURL = %q/%q, want %q/%q",
+					got.APIFormat, got.BaseURL, tt.wantAPIFormat, tt.wantBaseURL)
+			}
+		})
+	}
+}
+
 // TestFoldLoopInferenceLastWriteWins proves the restore fold reproduces the live
 // precedence: last mode wins, a later inference change overrides the mode's model/effort,
 // and a mode change AFTER an inference change resets it.

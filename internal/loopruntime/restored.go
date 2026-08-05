@@ -132,6 +132,12 @@ func NewRestoredWithRuntime(
 		return nil, err
 	}
 	if seed.HasRuntime {
+		if seed.Runtime.APIFormat != "" {
+			cfg.Model.APIFormat = seed.Runtime.APIFormat
+		}
+		if seed.Runtime.BaseURL != "" {
+			cfg.Model.BaseURL = seed.Runtime.BaseURL
+		}
 		cfg.Model.Provider = seed.Runtime.Key.Provider
 		cfg.Model.Name = seed.Runtime.Key.Model
 		cfg.Model.Limits = seed.Runtime.Limits

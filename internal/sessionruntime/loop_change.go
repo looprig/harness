@@ -129,6 +129,12 @@ func liveViewFor(bound loop.BoundDefinition, ri restoredInference) (loop.ModeNam
 }
 
 func applyModelRuntime(model model.Model, runtime event.ModelRuntime) model.Model {
+	if runtime.APIFormat != "" {
+		model.APIFormat = runtime.APIFormat
+	}
+	if runtime.BaseURL != "" {
+		model.BaseURL = runtime.BaseURL
+	}
 	model.Provider = runtime.Key.Provider
 	model.Name = runtime.Key.Model
 	model.Limits = runtime.Limits
