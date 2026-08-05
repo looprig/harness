@@ -202,17 +202,21 @@ type runtimeConfig struct {
 	// production. effectiveConfig carries no other external observation seam (the
 	// only production query, Snapshot, exposes committed msgs/turnIndex, not the
 	// live effective config) and the actor goroutine owns loopState exclusively, so
-	// this exists only so a test can race-freely observe a field of effectiveConfig
-	// — such as inferenceCapability — that has no other reader yet. The callback
-	// runs strictly BEFORE the command's Ack send (same goroutine, sequential
-	// statements), so a test that captures the passed value before calling the
-	// change and blocks on the Ack reply observes it race-free per Go's channel
-	// happens-before guarantee.
+	// this exists so a test can race-freely observe a field of effectiveConfig
+	// synchronously, without driving a full turn. The callback runs strictly
+	// BEFORE the command's Ack send (same goroutine, sequential statements), so
+	// a test that captures the passed value before calling the change and blocks
+	// on the Ack reply observes it race-free per Go's channel happens-before
+	// guarantee.
 	//
-	// TODO(task-2.3): once inferenceCapability gets a real production reader
-	// (the request-measurement call sites this task deliberately left
-	// untouched), reassess whether this seam is still needed or whether tests
-	// can observe the change through that reader instead.
+	// inferenceCapability gained a real production reader in task 2.3
+	// (loop.go's two measureRequestContext call sites) and 2.4
+	// (compactionExecutionCandidate.InferenceCapability) — reassessed and kept:
+	// TestSetModeReResolvesCapabilityAcrossTransport,
+	// TestChangeInferenceReResolvesCapabilityAcrossTransport, and
+	// TestChangeInferenceUndeclaredTransportRefusedAndCapabilityUnchanged still
+	// want to observe the commit synchronously without driving a full turn
+	// through to measurement, which this seam is the only way to do.
 	afterEffectiveConfigChange func(effectiveConfig)
 
 	// reviewContext, when non-nil, turns on live-only permission-review
