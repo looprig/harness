@@ -944,7 +944,9 @@ func (d Definition) ContextObservationPolicy() (ContextObservationPolicy, bool) 
 	return d.state.contextObservation, true
 }
 
-// ValidateContextModel checks structural validity and the fixed transport binding.
+// ValidateContextModel checks structural validity and that model's transport
+// identity (Provider/APIFormat/BaseURL) is a member of this definition's
+// declared ContextTransport set (see WithContextTransports).
 func (d Definition) ValidateContextModel(model model.Model) error {
 	if d.state == nil {
 		return &DefinitionError{Kind: DefinitionInvalidModel, Field: "model"}
