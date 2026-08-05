@@ -189,6 +189,13 @@ type idleCompactionPreparation struct {
 	request    inference.Request
 	tools      ToolSet
 	transcript content.AgenticMessages
+
+	// inferenceCapability is snapshotted from state.effective.inferenceCapability on the
+	// actor goroutine, synchronously, at the same point model/system are captured into
+	// request above — never read from state.effective inside the off-actor preparation
+	// goroutine, which would race the actor's own concurrent writes (SetMode/
+	// ChangeLoopInference can mutate state.effective while this preparation runs).
+	inferenceCapability contextcount.InferenceCapability
 }
 
 type idleCompactionCountResult struct {

@@ -236,10 +236,14 @@ type admissionFaultProbe interface {
 // at construction, and re-resolved by applySetMode/applyChangeInference (via
 // BoundDefinition.ContextTransportCapability) whenever a mode or inference change moves
 // the effective model onto a different declared ContextTransport. It always reflects the
-// CURRENTLY selected mode/model's transport capability. Nothing reads it for real
-// measurement purposes yet — the request-measurement call sites (measureRequestContext)
-// still read the frozen runtimeConfig.InferenceCapability; threading this per-turn value
-// into those call sites is separate follow-up work.
+// CURRENTLY selected mode/model's transport capability. Both request-measurement call
+// sites (measureRequestContext, in the contextRequests case and the idle-compaction
+// preparation goroutine) read a per-actor-turn snapshot of this field — captured
+// synchronously on the actor goroutine before any off-actor goroutine spawns — rather
+// than the frozen runtimeConfig.InferenceCapability, which never re-resolves across a
+// transport-crossing change. The frozen config.InferenceCapability remains the seed value
+// above and is also still read by compaction_executor.go's own frozen config, a separate
+// (deliberately out of scope here) mechanism.
 type effectiveConfig struct {
 	mode                loop.ModeName
 	model               model.Model
@@ -1109,6 +1113,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				Messages: cloneMessages(transcript),
 			},
 			tools: tools, transcript: transcript,
+			inferenceCapability: state.effective.inferenceCapability,
 		}
 		idleCompaction = &preparation
 		go func(preparationCtx context.Context, prepared idleCompactionPreparation, admission contextAdmissionSettings) {
@@ -1116,7 +1121,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			request.Tools = toolDefs(preparationCtx, prepared.tools.Registry)
 			runtimeRevision := revisionDigest(nil)
 			measurement, err := measureRequestContext(
-				preparationCtx, config.ContextCounter, config.CounterCapability, config.InferenceCapability,
+				preparationCtx, config.ContextCounter, config.CounterCapability, prepared.inferenceCapability,
 				admission, prepared.basis, request, runtimeRevision,
 			)
 			result := idleCompactionCountResult{
@@ -2555,12 +2560,13 @@ func runLoop(cfg loopConfig, state loopState) {
 			}
 			basis := state.contextTracker.currentBasis()
 			generation := state.contextGeneration
-			go func(request contextMeasureRequest, admission contextAdmissionSettings, measuredBasis event.ContextBasis, measuredGeneration uint64) {
+			capability := state.effective.inferenceCapability
+			go func(request contextMeasureRequest, admission contextAdmissionSettings, measuredBasis event.ContextBasis, measuredGeneration uint64, measuredCapability contextcount.InferenceCapability) {
 				measurement, err := measureRequestContext(
 					request.ctx,
 					config.ContextCounter,
 					config.CounterCapability,
-					config.InferenceCapability,
+					measuredCapability,
 					admission,
 					measuredBasis,
 					request.request,
@@ -2572,7 +2578,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				case <-request.ctx.Done():
 				case <-ctx.Done():
 				}
-			}(req, settings, basis, generation)
+			}(req, settings, basis, generation, capability)
 
 		case result := <-idleCompactionResults:
 			preparing := idleCompaction

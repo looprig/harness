@@ -9,6 +9,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
@@ -78,8 +79,16 @@ func newBoundLoopWithConfig(t *testing.T, bound loop.BoundDefinition, configure 
 // secondTransportModel is a distinct, VALID model.Model whose transport identity
 // (Provider/APIFormat/BaseURL) differs from testModel()'s. crossTransportDefinition declares
 // it as a second member of the loop's ContextTransport set.
+// Limits are set (unlike testModel(), which carries none) because this fixture's second
+// transport is exercised through a REAL turn by TestContextMeasurementUsesEffectiveCapabilityAfterTransportSwitch,
+// and loop.ResolveContextLimits fails closed (*loop.ContextLimitUnknownError) on a
+// zero-value model.ContextLimits — a live turn on this model needs a resolvable limit to
+// reach measureRequestContext at all.
 func secondTransportModel() model.Model {
-	return model.Model{Provider: "second-provider", APIFormat: model.APIFormatAnthropic, BaseURL: "https://second.example.test", Name: "second-model"}
+	return model.Model{
+		Provider: "second-provider", APIFormat: model.APIFormatAnthropic, BaseURL: "https://second.example.test", Name: "second-model",
+		Limits: testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20},
+	}
 }
 
 // thirdTransportModel is a distinct, VALID model.Model whose transport is deliberately NEVER
@@ -222,5 +231,82 @@ func TestChangeInferenceUndeclaredTransportRefusedAndCapabilityUnchanged(t *test
 	want := contextTestInferenceCapability()
 	if got := capture.last(t); got.inferenceCapability != want {
 		t.Fatalf("effective capability after refused undeclared-transport change = %+v, want unchanged %+v", got.inferenceCapability, want)
+	}
+}
+
+// TestContextMeasurementUsesEffectiveCapabilityAfterTransportSwitch proves that a LIVE
+// context measurement taken during a turn started AFTER a transport-crossing
+// ChangeLoopInference reflects state.effective.inferenceCapability (the newly re-resolved
+// transport's capability), not the frozen construction-time runtimeConfig.InferenceCapability
+// call site 2 (the `case req := <-contextRequests:` goroutine in loop.go) used to read. Every
+// live turn's context measurement goes through this exact call site, so it is the
+// simplest real behavioral drive available — no extra plumbing is needed to reach it.
+//
+// The proof works through the RequestFingerprint: measureRequestContext folds
+// InferenceCapability into the returned event.ContextMeasurement.RequestFingerprint (see
+// contextRequestFingerprint / contextFingerprintTemplateForRequest in context.go). This
+// fixture configures no RuntimeContextProvider, so runtimeContextTail is always nil and
+// runtimeContextRevision is therefore the FIXED constant revisionDigest(nil) — the one
+// otherwise-nondeterministic fingerprint input becomes reproducible, so the test can
+// recompute the EXACT expected fingerprint from the actually-counted request (captured by
+// loopContextCounter) and the actually-published Basis, once with the correct (new,
+// post-switch) capability and once with the WRONG (frozen, base-transport) capability the
+// bug would have used — and show the measured fingerprint matches only the former.
+func TestContextMeasurementUsesEffectiveCapabilityAfterTransportSwitch(t *testing.T) {
+	t.Parallel()
+	llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
+	bound := crossTransportDefinition(t, llm)
+	var counter *loopContextCounter
+	l, rec := newBoundLoopWithConfig(t, bound, func(cfg *runtimeConfig) {
+		counter = cfg.ContextCounter.(*loopContextCounter)
+	})
+
+	if res := sendChange(t, l, command.ChangeLoopInference{Model: secondTransportModel(), SetModel: true}); res.Err != nil {
+		t.Fatalf("ChangeLoopInference(second) err = %v", res.Err)
+	}
+
+	startTurn(t, l, rec, []content.Block{&content.TextBlock{Text: "hello"}})
+	terminal := drainToTerminal(t, rec)
+	if _, ok := terminal.(event.TurnDone); !ok {
+		t.Fatalf("terminal = %T %+v, want TurnDone", terminal, terminal)
+	}
+
+	measured, _ := contextEvents(rec.events())
+	if measured == nil {
+		t.Fatal("ContextMeasured was not published for the post-switch turn")
+	}
+
+	// A single turn measures context TWICE (turn.go: once before the primary inference
+	// candidate, once more after the final response completes), each admission a
+	// distinct Basis, so contextEvents' LAST-wins scan (context_loop_test.go) surfaces the
+	// SECOND publish. The measurements run strictly sequentially on the turn goroutine
+	// (each measure() call blocks for its reply before the turn proceeds), so the LAST
+	// recorded request corresponds exactly to the LAST published ContextMeasured.
+	counter.mu.Lock()
+	if len(counter.requests) < 1 {
+		counter.mu.Unlock()
+		t.Fatal("counted requests = 0, want at least 1")
+	}
+	gotRequest := counter.requests[len(counter.requests)-1]
+	counter.mu.Unlock()
+
+	wantFingerprint, err := contextRequestFingerprint(
+		gotRequest, measured.Measurement.Basis, revisionDigest(nil), counter.capability, secondTransportCapability(),
+	)
+	if err != nil {
+		t.Fatalf("contextRequestFingerprint(post-switch capability) error = %v", err)
+	}
+	if measured.Measurement.RequestFingerprint != wantFingerprint {
+		t.Fatalf("measured fingerprint = %x, want fingerprint computed with the post-switch capability %x", measured.Measurement.RequestFingerprint, wantFingerprint)
+	}
+
+	staleFingerprint, err := contextRequestFingerprint(
+		gotRequest, measured.Measurement.Basis, revisionDigest(nil), counter.capability, contextTestInferenceCapability(),
+	)
+	if err != nil {
+		t.Fatalf("contextRequestFingerprint(frozen base capability) error = %v", err)
+	}
+	if measured.Measurement.RequestFingerprint == staleFingerprint {
+		t.Fatal("measured fingerprint matches the frozen base-transport capability; call site did not read the re-resolved effective capability")
 	}
 }
