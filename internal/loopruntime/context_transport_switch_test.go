@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
@@ -74,6 +76,68 @@ func newBoundLoopWithConfig(t *testing.T, bound loop.BoundDefinition, configure 
 		t.Fatalf("newLoopWithSeed: %v", err)
 	}
 	return l, rec
+}
+
+// newBoundLoopWithSeedAndConfig is newBoundLoopWithConfig plus a RestoredState seed.
+// startIdleCompactionPreparation (loop.go) requires a non-zero ContextBasis before it will
+// run at all (basis.Revision != 0 && !basis.ThroughEventID.IsZero()), and a
+// freshly-constructed (unseeded) loop's basis starts at the zero value — so exercising the
+// IDLE-compaction preparation path (as opposed to newBoundLoopWithConfig's callers, which
+// only exercise SetMode/ChangeLoopInference bookkeeping) needs a loop that is already
+// seeded with committed history and a basis, exactly like a restored loop.
+func newBoundLoopWithSeedAndConfig(t *testing.T, bound loop.BoundDefinition, seed RestoredState, configure func(*runtimeConfig)) (*Loop, *recordingPublisher) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	rec := &recordingPublisher{}
+	cfg, err := configFromBound(bound, "")
+	if err != nil {
+		t.Fatalf("configFromBound: %v", err)
+	}
+	if configure != nil {
+		configure(&cfg)
+	}
+	l, err := newLoopWithSeed(ctx, mustID(t), mustID(t), Provenance{}, rec, cfg, bound, bound.InitialMode(), &seed)
+	if err != nil {
+		t.Fatalf("newLoopWithSeed: %v", err)
+	}
+	return l, rec
+}
+
+// idleCandidateCapturingSink is a compactionCandidateSink + contextCompactionAwaiter test
+// double modeled on idleCandidateRecordingSink (safe_boundary_compaction_test.go), but it
+// captures the FULL compactionExecutionCandidate handed to CoordinateCompactionCandidate —
+// the idle-compaction preparation goroutine's output, i.e. call site 1 in loop.go — so a
+// test can inspect candidate.Measurement.RequestFingerprint and candidate.Request directly.
+// It never awaits a real compaction outcome: proving the pre-execution measurement is
+// correct doesn't require driving a full compaction commit.
+type idleCandidateCapturingSink struct {
+	*recordingCompactionSink
+	mu        sync.Mutex
+	candidate *compactionExecutionCandidate
+}
+
+func (s *idleCandidateCapturingSink) CoordinateCompactionCandidate(_ context.Context, disposition compactionDisposition, candidate compactionExecutionCandidate) error {
+	s.mu.Lock()
+	captured := candidate
+	captured.Transcript = cloneMessages(candidate.Transcript)
+	s.candidate = &captured
+	s.mu.Unlock()
+	return s.CoordinateCompaction(context.Background(), disposition)
+}
+
+func (*idleCandidateCapturingSink) AwaitCompaction(context.Context, event.CompactAttemptID) (contextCompactionAwaitResult, error) {
+	return contextCompactionAwaitResult{}, errors.New("idleCandidateCapturingSink: await not supported")
+}
+
+func (s *idleCandidateCapturingSink) capturedCandidate(t *testing.T) compactionExecutionCandidate {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.candidate == nil {
+		t.Fatal("CoordinateCompactionCandidate was never invoked")
+	}
+	return *s.candidate
 }
 
 // secondTransportModel is a distinct, VALID model.Model whose transport identity
@@ -308,5 +372,80 @@ func TestContextMeasurementUsesEffectiveCapabilityAfterTransportSwitch(t *testin
 	}
 	if measured.Measurement.RequestFingerprint == staleFingerprint {
 		t.Fatal("measured fingerprint matches the frozen base-transport capability; call site did not read the re-resolved effective capability")
+	}
+}
+
+// TestIdleCompactionPreparationUsesEffectiveCapabilityAfterTransportSwitch is the companion
+// to TestContextMeasurementUsesEffectiveCapabilityAfterTransportSwitch above: it proves call
+// site 1 (the idle-compaction preparation goroutine spawned from startIdleCompactionPreparation
+// in loop.go) ALSO reads the per-turn state.effective.inferenceCapability snapshotted into
+// idleCompactionPreparation.inferenceCapability (context.go), rather than the frozen
+// runtimeConfig.InferenceCapability, once a transport-crossing ChangeLoopInference has run.
+// Nothing exercised call site 1 directly before this test — the reviewer flagged that
+// confidence in the fix there rested purely on structural symmetry with call site 2, not on
+// an executed proof.
+//
+// The loop must already carry a non-zero ContextBasis for startIdleCompactionPreparation to
+// run at all, so this uses newBoundLoopWithSeedAndConfig (a restored-like seed) rather than
+// the plain newBoundLoopWithConfig the other tests in this file use. A command.Compact sent
+// while idle drives compaction admission straight into startIdleCompactionPreparation
+// (loop.go: `if state.status == loopIdle { ... startIdleCompactionPreparation(...) }`), and
+// idleCandidateCapturingSink (a compactionCandidateSink + contextCompactionAwaiter, the two
+// interfaces startIdleCompactionPreparation requires of the sink) captures the resulting
+// compactionExecutionCandidate — the direct output of the measureRequestContext call this
+// task's fix touches — without needing a real compaction executor.
+//
+// As in the call-site-2 test, the proof is via RequestFingerprint: this fixture configures
+// no RuntimeContextProvider, so runtimeContextRevision is the fixed constant
+// revisionDigest(nil), letting the test recompute the exact expected fingerprint from the
+// captured candidate's Request and Measurement.Basis for both the correct (new, post-switch)
+// capability and the wrong (frozen, base-transport) capability the bug would have used.
+func TestIdleCompactionPreparationUsesEffectiveCapabilityAfterTransportSwitch(t *testing.T) {
+	t.Parallel()
+	llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
+	bound := crossTransportDefinition(t, llm)
+	sink := &idleCandidateCapturingSink{recordingCompactionSink: newRecordingCompactionSink()}
+	seed := RestoredState{
+		Msgs:      content.AgenticMessages{replacementTestMessage("history")},
+		TurnIndex: 1,
+		Basis:     event.ContextBasis{Revision: 1, ThroughEventID: uuid.UUID{0xd0}},
+		HasBasis:  true,
+	}
+	l, _ := newBoundLoopWithSeedAndConfig(t, bound, seed, func(cfg *runtimeConfig) {
+		cfg.compactionSink = sink
+	})
+
+	if res := sendChange(t, l, command.ChangeLoopInference{Model: secondTransportModel(), SetModel: true}); res.Err != nil {
+		t.Fatalf("ChangeLoopInference(second) err = %v", res.Err)
+	}
+
+	sendCompact(t, l, mustID(t), mustID(t), mustID(t), identity.AgencyUser)
+	select {
+	case <-sink.notify:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle compaction candidate was never coordinated")
+	}
+
+	candidate := sink.capturedCandidate(t)
+	counterCapability := contextTestCapability(contextcount.CountQualityExactLocal)
+
+	wantFingerprint, err := contextRequestFingerprint(
+		candidate.Request, candidate.Measurement.Basis, revisionDigest(nil), counterCapability, secondTransportCapability(),
+	)
+	if err != nil {
+		t.Fatalf("contextRequestFingerprint(post-switch capability) error = %v", err)
+	}
+	if candidate.Measurement.RequestFingerprint != wantFingerprint {
+		t.Fatalf("idle-compaction measured fingerprint = %x, want fingerprint computed with the post-switch capability %x", candidate.Measurement.RequestFingerprint, wantFingerprint)
+	}
+
+	staleFingerprint, err := contextRequestFingerprint(
+		candidate.Request, candidate.Measurement.Basis, revisionDigest(nil), counterCapability, contextTestInferenceCapability(),
+	)
+	if err != nil {
+		t.Fatalf("contextRequestFingerprint(frozen base capability) error = %v", err)
+	}
+	if candidate.Measurement.RequestFingerprint == staleFingerprint {
+		t.Fatal("idle-compaction measured fingerprint matches the frozen base-transport capability; call site 1 did not read the re-resolved effective capability")
 	}
 }
