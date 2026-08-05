@@ -161,6 +161,12 @@ func secondTransportCapability() contextcount.InferenceCapability {
 func crossTransportDefinition(t *testing.T, client inference.Client) loop.BoundDefinition {
 	t.Helper()
 	base := testModel()
+	// Unlike bare testModel(), this fixture's base carries Limits: Task 4.1's end-to-end
+	// scenarios (context_transport_switch_integration_test.go) run a REAL live turn on the
+	// BASE transport (mid-conversation, before switching), and loop.ResolveContextLimits
+	// fails closed on a zero-value model.ContextLimits — see secondTransportModel's doc
+	// comment for the identical rationale on the second transport.
+	base.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 	second := secondTransportModel()
 	baseCapability := contextTestInferenceCapability()
 	counter := &loopContextCounter{capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: []content.TokenCount{40}}
