@@ -16,6 +16,7 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
 	model "github.com/looprig/inference/model"
 	stream "github.com/looprig/inference/stream"
 )
@@ -719,6 +720,149 @@ func TestContextTransportSynthesizedDefaultSet(t *testing.T) {
 	var notDeclared *ContextTransportNotDeclaredError
 	if !errors.As(err, &notDeclared) {
 		t.Fatalf("Define() cause = %T, want *ContextTransportNotDeclaredError", err)
+	}
+}
+
+// TestBoundDefinition_ContextTransportCapability proves BoundDefinition
+// exposes the declared per-transport InferenceCapability by set membership:
+// the base transport (real, whether synthesized from WithInferenceCapability
+// or caller-declared) resolves to its capability, an additional declared
+// transport resolves to its OWN distinct capability, and any transport
+// outside the declared set resolves to (zero, false).
+func TestBoundDefinition_ContextTransportCapability(t *testing.T) {
+	t.Parallel()
+	t.Run("synthesized default set", func(t *testing.T) {
+		t.Parallel()
+		counter := &policyCounter{capability: exactCounterCapability()}
+		base := testModel()
+		capability := localInferenceCapability()
+		definition, err := Define(contextDefinitionOptions(counter, capability, manualCompactionPolicy())...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bound, err := definition.Bind(context.Background(), validToolBindings(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotCap, ok := bound.ContextTransportCapability(base); !ok || gotCap != capability {
+			t.Fatalf("ContextTransportCapability(base) = %+v, %v; want %+v, true", gotCap, ok, capability)
+		}
+		other := base
+		other.Provider = "other-provider"
+		if gotCap, ok := bound.ContextTransportCapability(other); ok {
+			t.Fatalf("ContextTransportCapability(non-member) = %+v, %v; want zero, false", gotCap, ok)
+		}
+	})
+
+	t.Run("multi-member declared set", func(t *testing.T) {
+		t.Parallel()
+		base := testModel()
+		baseCapability := localInferenceCapability()
+		baseTransport := ContextTransport{Provider: base.Provider, APIFormat: base.APIFormat, BaseURL: base.BaseURL, Capability: baseCapability}
+
+		secondModel := base
+		secondModel.Provider = "second-provider"
+		secondModel.BaseURL = "https://api.second.example"
+		secondCapability := contextcount.InferenceCapability{
+			Transport: contextcount.InferenceTransportTLS, Provider: "second-provider",
+			SecurityIdentity: contextcount.SecurityIdentity{7}, Retention: contextcount.RetentionNone,
+		}
+		secondTransport := ContextTransport{Provider: secondModel.Provider, APIFormat: secondModel.APIFormat, BaseURL: secondModel.BaseURL, Capability: secondCapability}
+
+		thirdModel := base
+		thirdModel.Provider = "undeclared-provider"
+		thirdModel.BaseURL = "https://api.undeclared.example"
+
+		counter := &policyCounter{capability: exactCounterCapability()}
+		opts := append(contextDefinitionOptions(counter, baseCapability, manualCompactionPolicy()),
+			WithContextTransports(baseTransport, secondTransport))
+		definition, err := Define(opts...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bound, err := definition.Bind(context.Background(), validToolBindings(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotCap, ok := bound.ContextTransportCapability(base); !ok || gotCap != baseCapability {
+			t.Fatalf("ContextTransportCapability(base) = %+v, %v; want %+v, true", gotCap, ok, baseCapability)
+		}
+		if gotCap, ok := bound.ContextTransportCapability(secondModel); !ok || gotCap != secondCapability {
+			t.Fatalf("ContextTransportCapability(second) = %+v, %v; want %+v, true", gotCap, ok, secondCapability)
+		}
+		if gotCap, ok := bound.ContextTransportCapability(thirdModel); ok {
+			t.Fatalf("ContextTransportCapability(undeclared third) = %+v, %v; want zero, false", gotCap, ok)
+		}
+	})
+}
+
+// TestValidateContextModel_SetMembership proves Definition/BoundDefinition
+// ValidateContextModel accepts every member of a declared multi-transport
+// set (not just the literal base model) and rejects a non-member with
+// *ContextTransportNotDeclaredError. Before Task 1.4, the strict-equality-only
+// check meant a definition with 2+ declared transports rejected its own
+// legitimately declared second transport; this is the bug this task fixes.
+func TestValidateContextModel_SetMembership(t *testing.T) {
+	t.Parallel()
+	base := testModel()
+	baseCapability := localInferenceCapability()
+	baseTransport := ContextTransport{Provider: base.Provider, APIFormat: base.APIFormat, BaseURL: base.BaseURL, Capability: baseCapability}
+
+	secondModel := base
+	secondModel.Provider = "second-provider"
+	secondModel.BaseURL = "https://api.second.example"
+	secondCapability := contextcount.InferenceCapability{
+		Transport: contextcount.InferenceTransportTLS, Provider: "second-provider",
+		SecurityIdentity: contextcount.SecurityIdentity{7}, Retention: contextcount.RetentionNone,
+	}
+	secondTransport := ContextTransport{Provider: secondModel.Provider, APIFormat: secondModel.APIFormat, BaseURL: secondModel.BaseURL, Capability: secondCapability}
+
+	thirdModel := base
+	thirdModel.Provider = "undeclared-provider"
+	thirdModel.BaseURL = "https://api.undeclared.example"
+
+	counter := &policyCounter{capability: exactCounterCapability()}
+	opts := append(contextDefinitionOptions(counter, baseCapability, manualCompactionPolicy()),
+		WithContextTransports(baseTransport, secondTransport))
+	definition, err := Define(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := definition.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		model   model.Model
+		wantErr bool
+	}{
+		{name: "base member", model: base},
+		{name: "second declared member", model: secondModel},
+		{name: "undeclared third", model: thirdModel, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			definitionErr := definition.ValidateContextModel(tt.model)
+			if (definitionErr != nil) != tt.wantErr {
+				t.Fatalf("Definition.ValidateContextModel() error = %v, wantErr %v", definitionErr, tt.wantErr)
+			}
+			boundErr := bound.ValidateContextModel(tt.model)
+			if (boundErr != nil) != tt.wantErr {
+				t.Fatalf("BoundDefinition.ValidateContextModel() error = %v, wantErr %v", boundErr, tt.wantErr)
+			}
+			if tt.wantErr {
+				var target *ContextTransportNotDeclaredError
+				if !errors.As(definitionErr, &target) {
+					t.Fatalf("Definition.ValidateContextModel() error = %T, want *ContextTransportNotDeclaredError", definitionErr)
+				}
+				target = nil
+				if !errors.As(boundErr, &target) {
+					t.Fatalf("BoundDefinition.ValidateContextModel() error = %T, want *ContextTransportNotDeclaredError", boundErr)
+				}
+			}
+		})
 	}
 }
 

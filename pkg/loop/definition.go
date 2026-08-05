@@ -170,6 +170,7 @@ func Define(opts ...Option) (Definition, error) {
 	state.model = cloneModel(state.model)
 	state.tools = append([]tool.Definition(nil), state.tools...)
 	state.middlewares = append([]tool.ToolMiddleware(nil), state.middlewares...)
+	state.contextTransports = append([]ContextTransport(nil), state.contextTransports...)
 	state.delegates = dedupeDelegates(state.delegates)
 	state.modes = cloneModes(state.modes)
 	if state.output != nil {
@@ -697,6 +698,10 @@ type BoundDefinition interface {
 	ContextCounter() contextcount.ContextCounter
 	CounterCapability() (contextcount.CounterCapability, bool)
 	InferenceCapability() (contextcount.InferenceCapability, bool)
+	// ContextTransportCapability resolves the declared InferenceCapability for
+	// model's transport, or (zero, false) if that transport is not a member of
+	// this definition's declared ContextTransport set.
+	ContextTransportCapability(model.Model) (contextcount.InferenceCapability, bool)
 	ContextObservationPolicy() (ContextObservationPolicy, bool)
 	CompactionPolicy() (CompactionPolicy, bool)
 	OutputSchema() (*inference.OutputSchema, bool)
@@ -768,6 +773,9 @@ func (b *boundDefinitionState) CounterCapability() (contextcount.CounterCapabili
 }
 func (b *boundDefinitionState) InferenceCapability() (contextcount.InferenceCapability, bool) {
 	return b.definition.inferenceCapability, b.definition.contextCounter != nil
+}
+func (b *boundDefinitionState) ContextTransportCapability(m model.Model) (contextcount.InferenceCapability, bool) {
+	return lookupTransport(b.definition.contextTransports, m)
 }
 func (b *boundDefinitionState) ContextObservationPolicy() (ContextObservationPolicy, bool) {
 	return b.definition.contextObservation, b.definition.contextObservation.CountTimeout != 0
@@ -954,12 +962,10 @@ func validateDefinitionContextModel(state *definitionState, model model.Model) e
 	if state.contextCounter == nil {
 		return nil
 	}
-	// TEMPORARY (Task 1.2/1.3) strict single-transport check.
-	//
-	// TODO(task-1.4): replace this call with a real lookupTransport-based
-	// set-membership check once definitionState carries its own frozen
-	// contextTransports.
-	return validateContextTransportUnchanged(state.model, model)
+	if _, ok := lookupTransport(state.contextTransports, model); !ok {
+		return &ContextTransportNotDeclaredError{Provider: model.Provider, APIFormat: model.APIFormat, BaseURL: model.BaseURL}
+	}
+	return nil
 }
 
 // WithDisplayName sets the loop's user-facing presentation label. Purely
