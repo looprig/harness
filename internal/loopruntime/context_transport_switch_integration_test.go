@@ -69,6 +69,11 @@ func TestCrossProviderModelSwitchPreservesConversationAndCapability(t *testing.T
 	if _, ok := drainToTerminal(t, rec).(event.TurnDone); !ok {
 		t.Fatal("first (base-transport) turn did not reach TurnDone")
 	}
+	// awaitTerminalAfter (not another drainToTerminal, which always scans from index 0
+	// and would re-match this turn's already-recorded terminal) is required to find the
+	// SECOND turn's terminal below — the established multi-turn idiom documented on
+	// drainToTerminal's own doc comment.
+	afterFirstTurn := terminalIndex(rec, 0)
 
 	var sessionID, loopID = mustID(t), mustID(t)
 	for _, e := range rec.events() {
@@ -97,7 +102,7 @@ func TestCrossProviderModelSwitchPreservesConversationAndCapability(t *testing.T
 
 	// 4. Run the FIRST turn after the switch.
 	startTurn(t, l, rec, textBlocks("hello after the switch"))
-	if _, ok := drainToTerminal(t, rec).(event.TurnDone); !ok {
+	if _, ok := awaitTerminalAfter(t, rec, afterFirstTurn).(event.TurnDone); !ok {
 		t.Fatal("post-switch turn did not reach TurnDone")
 	}
 
