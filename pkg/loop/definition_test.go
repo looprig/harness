@@ -295,6 +295,80 @@ func TestPolicyRevisionDigest(t *testing.T) {
 	}
 }
 
+// TestPolicyRevisionIncludesContextTransports proves PolicyRevision hashes
+// the declared ContextTransport set: adding a second declared transport
+// changes the digest, the hashed set is order-independent (proving the sort
+// inside PolicyRevision actually runs), and the digest stays stable across
+// two definitions that both rely on the synthesized single-element default
+// (no WithContextTransports call at all).
+func TestPolicyRevisionIncludesContextTransports(t *testing.T) {
+	t.Parallel()
+	counter := &policyCounter{capability: exactCounterCapability()}
+	base := testModel()
+	baseCapability := localInferenceCapability()
+	baseTransport := ContextTransport{Provider: base.Provider, APIFormat: base.APIFormat, BaseURL: base.BaseURL, Capability: baseCapability}
+
+	secondModel := base
+	secondModel.Provider = "second-provider"
+	secondModel.BaseURL = "https://api.second.example"
+	secondCapability := contextcount.InferenceCapability{
+		Transport: contextcount.InferenceTransportTLS, Provider: "second-provider",
+		SecurityIdentity: contextcount.SecurityIdentity{7}, Retention: contextcount.RetentionNone,
+	}
+	secondTransport := ContextTransport{Provider: secondModel.Provider, APIFormat: secondModel.APIFormat, BaseURL: secondModel.BaseURL, Capability: secondCapability}
+
+	t.Run("extra declared transport changes digest", func(t *testing.T) {
+		t.Parallel()
+		withoutSecond, err := Define(contextDefinitionOptions(counter, baseCapability, manualCompactionPolicy())...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		withSecondOpts := append(contextDefinitionOptions(counter, baseCapability, manualCompactionPolicy()),
+			WithContextTransports(baseTransport, secondTransport))
+		withSecond, err := Define(withSecondOpts...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if withoutSecond.PolicyRevision() == withSecond.PolicyRevision() {
+			t.Fatal("PolicyRevision() unchanged after declaring an extra ContextTransport")
+		}
+	})
+
+	t.Run("declared set hashes order-independently", func(t *testing.T) {
+		t.Parallel()
+		forwardOpts := append(contextDefinitionOptions(counter, baseCapability, manualCompactionPolicy()),
+			WithContextTransports(baseTransport, secondTransport))
+		forward, err := Define(forwardOpts...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reverseOpts := append(contextDefinitionOptions(counter, baseCapability, manualCompactionPolicy()),
+			WithContextTransports(secondTransport, baseTransport))
+		reverse, err := Define(reverseOpts...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if forward.PolicyRevision() != reverse.PolicyRevision() {
+			t.Fatal("PolicyRevision() differs for the same ContextTransport set declared in opposite order, want equal digests")
+		}
+	})
+
+	t.Run("synthesized default set stays deterministic", func(t *testing.T) {
+		t.Parallel()
+		first, err := Define(contextDefinitionOptions(counter, baseCapability, manualCompactionPolicy())...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := Define(contextDefinitionOptions(counter, baseCapability, manualCompactionPolicy())...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first.PolicyRevision() != second.PolicyRevision() {
+			t.Fatal("PolicyRevision() differs across identical definitions relying on the synthesized default ContextTransport")
+		}
+	})
+}
+
 func TestPolicyRevisionIncludesNormalizedProducedToolNames(t *testing.T) {
 	t.Parallel()
 

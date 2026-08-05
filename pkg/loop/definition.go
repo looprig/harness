@@ -466,6 +466,7 @@ func (d Definition) PolicyRevision() string {
 		PolicyRevision      string
 		CounterCapability   *contextcount.CounterCapability
 		InferenceCapability *contextcount.InferenceCapability
+		ContextTransports   []ContextTransport
 		ContextObservation  *ContextObservationPolicy
 		Compaction          *CompactionPolicy
 		OutputPolicy        *outputPolicyIdentity `json:",omitempty"`
@@ -482,6 +483,17 @@ func (d Definition) PolicyRevision() string {
 		capability := d.state.inferenceCapability
 		projection.CounterCapability = &counter
 		projection.InferenceCapability = &capability
+		transports := append([]ContextTransport(nil), d.state.contextTransports...)
+		slices.SortFunc(transports, func(a, b ContextTransport) int {
+			if c := strings.Compare(string(a.Provider), string(b.Provider)); c != 0 {
+				return c
+			}
+			if c := strings.Compare(string(a.APIFormat), string(b.APIFormat)); c != 0 {
+				return c
+			}
+			return strings.Compare(a.BaseURL, b.BaseURL)
+		})
+		projection.ContextTransports = transports
 	}
 	if d.state.compaction.CountTimeout != 0 {
 		policy := d.state.compaction
