@@ -212,6 +212,13 @@ func TestModelRuntimeValidationBoundary(t *testing.T) {
 	}{
 		{name: "valid", runtime: sampleRuntime()},
 		{name: "empty provider", runtime: ModelRuntime{Key: model.ModelKey{Model: "model"}}, wantErr: true},
+		{name: "api format and base url populated", runtime: sampleRuntime()},
+		{name: "api format and base url left zero", runtime: func() ModelRuntime {
+			r := sampleRuntime()
+			r.APIFormat = ""
+			r.BaseURL = ""
+			return r
+		}()},
 	}
 	for _, tt := range tests {
 		tt := tt

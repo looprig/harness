@@ -8,10 +8,22 @@ import (
 // ModelRuntime is the single durable, secret-free description of the model
 // runtime selected for a loop. It deliberately excludes endpoint and catalog
 // data so journal replay and catalog repair do not depend on mutable config.
+//
+// APIFormat and BaseURL identify the declared transport a selection resolved
+// against at the moment it was accepted. A zero/absent value on either field
+// means "use the definition's declared base transport" — this is both the
+// interpretation for every pre-existing journal record written before these
+// fields existed, and the default for any caller that does not yet populate
+// them. Both fields are unconstrained by validateModelRuntime: they always
+// originate from a model.Model that already passed model.Validate() at the
+// point a live change accepted it, so re-validating them here would be
+// redundant, not additional safety.
 type ModelRuntime struct {
-	Key    model.ModelKey      `json:"key"`
-	Limits model.ContextLimits `json:"limits"`
-	Effort model.Effort        `json:"effort,omitzero"`
+	Key       model.ModelKey      `json:"key"`
+	Limits    model.ContextLimits `json:"limits"`
+	Effort    model.Effort        `json:"effort,omitzero"`
+	APIFormat model.APIFormat     `json:"api_format,omitzero"`
+	BaseURL   string              `json:"base_url,omitzero"`
 }
 
 // LoopInferenceChanged durably selects the resolved secret-free runtime for

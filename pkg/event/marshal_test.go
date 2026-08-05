@@ -360,9 +360,55 @@ func sampleMessages() content.AgenticMessages {
 
 func sampleRuntime() ModelRuntime {
 	return ModelRuntime{
-		Key:    model.ModelKey{Provider: "openai", Model: "gpt-5"},
-		Limits: model.ContextLimits{WindowTokens: 128_000, MaxOutputTokens: 16_384},
-		Effort: model.EffortHigh,
+		Key:       model.ModelKey{Provider: "openai", Model: "gpt-5"},
+		Limits:    model.ContextLimits{WindowTokens: 128_000, MaxOutputTokens: 16_384},
+		Effort:    model.EffortHigh,
+		APIFormat: model.APIFormatOpenAI,
+		BaseURL:   "https://api.example.com/v1",
+	}
+}
+
+// TestModelRuntimeAdditiveFieldsOmitWhenZero proves the wire-level backward
+// compatibility contract for the APIFormat/BaseURL fields added to
+// ModelRuntime: a zero-value ModelRuntime — the shape every pre-existing
+// journal record and every caller that hasn't adopted the new fields yet
+// produces — must not carry the new keys on the wire at all. It also proves
+// the reverse: when populated, the new fields serialize under their stable
+// snake_case names and round-trip byte-for-byte through decode.
+func TestModelRuntimeAdditiveFieldsOmitWhenZero(t *testing.T) {
+	t.Parallel()
+
+	zeroData, err := json.Marshal(ModelRuntime{})
+	if err != nil {
+		t.Fatalf("json.Marshal(zero ModelRuntime) error = %v", err)
+	}
+	zeroKeys := topLevelKeys(t, zeroData)
+	if hasKey(zeroKeys, "api_format") {
+		t.Errorf("zero ModelRuntime JSON = %s, want no api_format key", zeroData)
+	}
+	if hasKey(zeroKeys, "base_url") {
+		t.Errorf("zero ModelRuntime JSON = %s, want no base_url key", zeroData)
+	}
+
+	populated := sampleRuntime()
+	data, err := json.Marshal(populated)
+	if err != nil {
+		t.Fatalf("json.Marshal(populated ModelRuntime) error = %v", err)
+	}
+	populatedKeys := topLevelKeys(t, data)
+	if !hasKey(populatedKeys, "api_format") {
+		t.Errorf("populated ModelRuntime JSON = %s, want api_format key present", data)
+	}
+	if !hasKey(populatedKeys, "base_url") {
+		t.Errorf("populated ModelRuntime JSON = %s, want base_url key present", data)
+	}
+
+	var roundTripped ModelRuntime
+	if err := json.Unmarshal(data, &roundTripped); err != nil {
+		t.Fatalf("json.Unmarshal(ModelRuntime) error = %v", err)
+	}
+	if roundTripped != populated {
+		t.Fatalf("round trip = %#v, want %#v", roundTripped, populated)
 	}
 }
 
