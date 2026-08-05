@@ -40,6 +40,10 @@ func mustID(t *testing.T) uuid.UUID {
 // package. This test instead asserts the field exists with the correct type and
 // zero-values correctly; a real behavioral assertion belongs to the task that first
 // gives the field a reader.
+//
+// TODO(task-2.2): superseded once SetMode/ChangeInference re-resolution has a real
+// behavioral test (e.g. via a capability-recording counter double). Safe to delete
+// then — this test exercises nothing beyond "the field exists and compiles."
 func TestEffectiveConfigInferenceCapabilityField(t *testing.T) {
 	t.Parallel()
 	var cfg effectiveConfig

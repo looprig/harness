@@ -452,6 +452,11 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	// passes the definition's initial mode; NewRestored passes the restore-folded mode (and
 	// cfg already carries any restore-folded inference override). A change command later
 	// replaces these fields, and the next turn captures whatever is current here.
+	//
+	// applySetMode builds its OWN separate effectiveConfig literal (see the "next :="
+	// literal below) rather than sharing this one — a keyed struct literal doesn't
+	// force the two to stay in sync, so a future field added to effectiveConfig must
+	// be set at BOTH sites or it silently zero-values on a mode change.
 	state.effective = effectiveConfig{
 		mode:                initialMode,
 		model:               cfg.Model,
@@ -2114,6 +2119,9 @@ func runLoop(cfg loopConfig, state loopState) {
 		// resolved.Tools carries only the definition's declared registry.
 		nextTools := resolveToolSetCaps(resolved.Tools)
 		nextTools.Registry = composeRegistry(resolved.Tools.Registry, state.external)
+		// This is a SEPARATE effectiveConfig literal from newLoopWithSeed's — see the
+		// cross-reference comment there. Adding a field to effectiveConfig means setting
+		// it here too, or a mode change silently resets it to zero.
 		next := effectiveConfig{mode: modeName, model: resolved.Model, effort: resolved.Model.Sampling.Effort, system: resolved.System, tools: nextTools}
 		if err := commitContextConfigurationChange(event.LoopModeChanged{Header: changeHeader(), PreviousMode: string(state.effective.mode), Mode: string(modeName), Runtime: modelRuntime(next.model, next.effort)}); err != nil {
 			c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: err}}
