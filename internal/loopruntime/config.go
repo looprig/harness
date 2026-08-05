@@ -185,6 +185,23 @@ type runtimeConfig struct {
 	// tests make both bounded command lanes ready without timing sleeps.
 	beforeCompactionBoundary func(compactionBoundaryKind)
 
+	// afterEffectiveConfigChange is a test-only synchronization seam invoked by
+	// applySetMode/applyChangeInference on the actor goroutine immediately after
+	// committing a new state.effective (after the durable LoopModeChanged/
+	// LoopInferenceChanged event has been appended, in the same place the actor
+	// already assigns state.effective/state.runtime). It is unexported, so the
+	// composition root cannot set it; New never assigns it, so it is nil in
+	// production. effectiveConfig carries no other external observation seam (the
+	// only production query, Snapshot, exposes committed msgs/turnIndex, not the
+	// live effective config) and the actor goroutine owns loopState exclusively, so
+	// this exists only so a test can race-freely observe a field of effectiveConfig
+	// — such as inferenceCapability — that has no other reader yet. The callback
+	// runs strictly BEFORE the command's Ack send (same goroutine, sequential
+	// statements), so a test that captures the passed value before calling the
+	// change and blocks on the Ack reply observes it race-free per Go's channel
+	// happens-before guarantee.
+	afterEffectiveConfigChange func(effectiveConfig)
+
 	// reviewContext, when non-nil, turns on live-only permission-review
 	// context capture (internal/loopruntime/review_context.go) for every turn
 	// this loop runs: buildTurnConfig copies it onto each turnConfig.reviewContext

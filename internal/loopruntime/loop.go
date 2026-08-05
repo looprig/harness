@@ -232,11 +232,14 @@ type admissionFaultProbe interface {
 // ChangeLoopInference replaces only model+effort. The effort is also baked into
 // model.Sampling.Effort so the request the turn builds carries it.
 //
-// inferenceCapability is seeded once here from the resolved runtimeConfig
-// (cfg.InferenceCapability) at construction. As of this seeding, nothing yet
-// re-resolves it on a mode or inference change — that is later work, which will need
-// it to reflect the CURRENTLY selected mode/model's transport capability rather than
-// staying frozen at the loop's initial resolution.
+// inferenceCapability is seeded from the resolved runtimeConfig (cfg.InferenceCapability)
+// at construction, and re-resolved by applySetMode/applyChangeInference (via
+// BoundDefinition.ContextTransportCapability) whenever a mode or inference change moves
+// the effective model onto a different declared ContextTransport. It always reflects the
+// CURRENTLY selected mode/model's transport capability. Nothing reads it for real
+// measurement purposes yet — the request-measurement call sites (measureRequestContext)
+// still read the frozen runtimeConfig.InferenceCapability; threading this per-turn value
+// into those call sites is separate follow-up work.
 type effectiveConfig struct {
 	mode                loop.ModeName
 	model               model.Model
@@ -2119,16 +2122,35 @@ func runLoop(cfg loopConfig, state loopState) {
 		// resolved.Tools carries only the definition's declared registry.
 		nextTools := resolveToolSetCaps(resolved.Tools)
 		nextTools.Registry = composeRegistry(resolved.Tools.Registry, state.external)
+		// Re-resolve the effective capability for the NEW mode's model transport.
+		// resolved.InferenceCapability (from configForMode/resolveMode) is deliberately
+		// NOT used here: resolveMode only ever reads the definition's BASE transport
+		// capability (bound.InferenceCapability()), which is wrong for a mode whose
+		// model sits on a different declared ContextTransport. ContextTransportCapability
+		// looks up the capability declared for resolved.Model's OWN transport identity.
+		// cfg.bound is nil only on the raw-config test path, which never predeclares
+		// modes (configForMode already refused above in that case), so this guard is
+		// defensive; a missing/undeclared transport leaves the capability unchanged
+		// rather than silently zeroing it.
+		nextCapability := state.effective.inferenceCapability
+		if cfg.bound != nil {
+			if capability, ok := cfg.bound.ContextTransportCapability(resolved.Model); ok {
+				nextCapability = capability
+			}
+		}
 		// This is a SEPARATE effectiveConfig literal from newLoopWithSeed's — see the
 		// cross-reference comment there. Adding a field to effectiveConfig means setting
 		// it here too, or a mode change silently resets it to zero.
-		next := effectiveConfig{mode: modeName, model: resolved.Model, effort: resolved.Model.Sampling.Effort, system: resolved.System, tools: nextTools}
+		next := effectiveConfig{mode: modeName, model: resolved.Model, effort: resolved.Model.Sampling.Effort, system: resolved.System, tools: nextTools, inferenceCapability: nextCapability}
 		if err := commitContextConfigurationChange(event.LoopModeChanged{Header: changeHeader(), PreviousMode: string(state.effective.mode), Mode: string(modeName), Runtime: modelRuntime(next.model, next.effort)}); err != nil {
 			c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: err}}
 			return
 		}
 		state.effective = next
 		state.runtime = modelRuntime(next.model, next.effort)
+		if config.afterEffectiveConfigChange != nil {
+			config.afterEffectiveConfigChange(state.effective)
+		}
 		c.Ack <- command.LoopChangeResult{Mode: string(next.mode), Model: next.model, Effort: next.effort}
 	}
 
@@ -2217,6 +2239,17 @@ func runLoop(cfg loopConfig, state loopState) {
 				}
 			}
 		}
+		// Re-resolve the effective capability for the NEW model's transport (see the
+		// matching comment in applySetMode for why ContextTransportCapability, not
+		// resolved.InferenceCapability, is the correct lookup). An effort-only change
+		// (c.SetModel false) leaves the current capability untouched — the model, and
+		// therefore its transport, has not changed.
+		nextCapability := state.effective.inferenceCapability
+		if c.SetModel && cfg.bound != nil {
+			if capability, ok := cfg.bound.ContextTransportCapability(model); ok {
+				nextCapability = capability
+			}
+		}
 		if c.SetEffort {
 			effort = c.Effort
 			if !effort.Valid() {
@@ -2232,7 +2265,11 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		state.effective.model = model
 		state.effective.effort = effort
+		state.effective.inferenceCapability = nextCapability
 		state.runtime = modelRuntime(model, effort)
+		if config.afterEffectiveConfigChange != nil {
+			config.afterEffectiveConfigChange(state.effective)
+		}
 		c.Ack <- command.LoopChangeResult{Mode: string(state.effective.mode), Model: model, Effort: effort}
 	}
 
