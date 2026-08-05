@@ -166,6 +166,14 @@ type runtimeConfig struct {
 	// test seam so a test can inject a deterministic (or failing) factory.
 	eventFactory *event.Factory
 
+	// The four fields below (afterDrain, afterContextReplacement,
+	// beforeCompactionBoundary, afterEffectiveConfigChange) are this package's
+	// test-only observation/synchronization seams: unexported, nil in
+	// production (never assigned by New/newLoopWithSeed outside tests), always
+	// nil-checked at their call sites. Check here before adding a fifth —
+	// the right execution point (turn goroutine vs. actor goroutine, before
+	// vs. after a durable commit) may already exist.
+
 	// afterDrain is a test-only synchronization seam invoked by foldPending in the
 	// turn goroutine AFTER cfg.drainPending has moved the inbox into the actor's
 	// draining buffer but BEFORE the first TurnFoldedInto commit. It is unexported,
@@ -200,6 +208,11 @@ type runtimeConfig struct {
 	// statements), so a test that captures the passed value before calling the
 	// change and blocks on the Ack reply observes it race-free per Go's channel
 	// happens-before guarantee.
+	//
+	// TODO(task-2.3): once inferenceCapability gets a real production reader
+	// (the request-measurement call sites this task deliberately left
+	// untouched), reassess whether this seam is still needed or whether tests
+	// can observe the change through that reader instead.
 	afterEffectiveConfigChange func(effectiveConfig)
 
 	// reviewContext, when non-nil, turns on live-only permission-review
