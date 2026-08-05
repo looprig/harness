@@ -254,6 +254,17 @@ type effectiveConfig struct {
 	inferenceCapability contextcount.InferenceCapability
 }
 
+// modelRuntime is the SOLE builder of the durable event.ModelRuntime this loop emits: the
+// actor's own state.runtime mirror (construction and every SetLoopMode/ChangeLoopInference
+// commit) and the Runtime field on the LoopModeChanged/LoopInferenceChanged events those
+// commits publish. Dropping a field here silently breaks restore in production — a field
+// missing from the durable record can never be folded back on restore no matter how
+// correct the restore-fold read side is, exactly the bug fixed by e7da984a (APIFormat/
+// BaseURL were grafted at the restore-fold sites before this builder ever populated them
+// on write). See the sibling restore-fold sites this function's output ultimately feeds:
+// restored.go's NewRestoredWithRuntime and sessionruntime/loop_change.go's
+// applyModelRuntime. sessionruntime/session.go's runtimeForModel is the analogous sole
+// builder for the session-level LoopStarted.Runtime.
 func modelRuntime(model model.Model, effort model.Effort) event.ModelRuntime {
 	return event.ModelRuntime{
 		Key:       model.Key(),

@@ -7,6 +7,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
+	model "github.com/looprig/inference/model"
 )
 
 // RestoredState is the pre-built committed state a restored loop comes up with: the
@@ -148,6 +149,20 @@ func NewRestoredWithRuntime(
 		cfg.Model.Sampling = cfg.Model.Sampling.Clone()
 		cfg.Model.Sampling.Effort = seed.Runtime.Effort
 	}
+	// Hard restore-time validation: a folded runtime whose transport is no longer a
+	// member of the bound definition's declared ContextTransport set fails restore
+	// unconditionally (see RestoreTransportMismatchError's doc comment). Gated on
+	// bound.ContextCounter() != nil so a definition with no context counting configured
+	// at all (ContextTransportCapability always reports false, having nothing declared)
+	// is unaffected — exactly the modeDefinition-style fixtures the rest of this package
+	// restores against today.
+	if seed.HasRuntime && bound.ContextCounter() != nil {
+		if _, ok := bound.ContextTransportCapability(cfg.Model); !ok {
+			return nil, &RestoreTransportMismatchError{
+				Provider: cfg.Model.Provider, APIFormat: cfg.Model.APIFormat, BaseURL: cfg.Model.BaseURL,
+			}
+		}
+	}
 	if err := installRuntimeDependencies(loopCtx, &cfg, deps); err != nil {
 		return nil, err
 	}
@@ -236,3 +251,20 @@ func (e *SnapshotError) Error() string {
 }
 
 func (e *SnapshotError) Unwrap() error { return e.Cause }
+
+// RestoreTransportMismatchError reports a durably-folded model runtime whose
+// transport is no longer a member of the current bound definition's declared
+// ContextTransport set. Restore fails unconditionally on this error — there
+// is no coherent "resume anyway" answer for a resolved model whose trust
+// tier can no longer be determined, so it does not route through
+// RestoreDecider/WithAllowConfigMismatch (see the design doc's "New
+// restore-time hard validation" section).
+type RestoreTransportMismatchError struct {
+	Provider  model.ProviderName
+	APIFormat model.APIFormat
+	BaseURL   string
+}
+
+func (e *RestoreTransportMismatchError) Error() string {
+	return "loopruntime: restored model transport is not a declared ContextTransport"
+}

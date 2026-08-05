@@ -266,3 +266,92 @@ func TestNewRestoredSeedsTransportOverride(t *testing.T) {
 		})
 	}
 }
+
+// TestRestoreTransportMismatch proves NewRestoredWithRuntime hard-fails restore (returning
+// a typed *RestoreTransportMismatchError and constructing NO loop) when a seeded
+// ModelRuntime's transport is not a member of the bound definition's declared
+// ContextTransport set, and restores successfully when it IS a member — including the
+// synthesized single-member default (WithContextTransports omitted) that today's ordinary
+// single-transport definitions rely on, and the case where no ContextCounter is configured
+// at all (the check is gated off entirely, matching every pre-existing restore fixture in
+// this package).
+func TestRestoreTransportMismatch(t *testing.T) {
+	t.Parallel()
+
+	t.Run("undeclared transport fails restore, constructs no loop", func(t *testing.T) {
+		t.Parallel()
+		llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
+		bound := crossTransportDefinition(t, llm)
+		third := thirdTransportModel()
+		seed := RestoredState{HasRuntime: true, Runtime: event.ModelRuntime{
+			Key: third.Key(), APIFormat: third.APIFormat, BaseURL: third.BaseURL,
+		}}
+		rec := &recordingPublisher{}
+		l, err := NewRestored(context.Background(), mustID(t), mustID(t), Provenance{}, rec, bound, seed)
+		if l != nil {
+			t.Fatalf("NewRestored returned a non-nil loop on an undeclared transport: %+v", l)
+		}
+		var mismatch *RestoreTransportMismatchError
+		if !errors.As(err, &mismatch) {
+			t.Fatalf("NewRestored err = %v, want *RestoreTransportMismatchError", err)
+		}
+		if mismatch.Provider != third.Provider || mismatch.APIFormat != third.APIFormat || mismatch.BaseURL != third.BaseURL {
+			t.Fatalf("mismatch = %+v, want Provider/APIFormat/BaseURL %q/%q/%q",
+				mismatch, third.Provider, third.APIFormat, third.BaseURL)
+		}
+	})
+
+	t.Run("declared second-transport member restores successfully", func(t *testing.T) {
+		t.Parallel()
+		llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
+		bound := crossTransportDefinition(t, llm)
+		second := secondTransportModel()
+		seed := RestoredState{HasRuntime: true, Runtime: event.ModelRuntime{
+			Key: second.Key(), APIFormat: second.APIFormat, BaseURL: second.BaseURL,
+		}}
+		rec := &recordingPublisher{}
+		l, err := NewRestored(context.Background(), mustID(t), mustID(t), Provenance{}, rec, bound, seed)
+		if err != nil {
+			t.Fatalf("NewRestored: %v", err)
+		}
+		if l == nil {
+			t.Fatal("NewRestored returned a nil loop on a declared transport")
+		}
+	})
+
+	t.Run("synthesized single-member default restores successfully (regression)", func(t *testing.T) {
+		t.Parallel()
+		llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
+		bound := contextBoundDefinition(t, llm) // WithContextCounter, no WithContextTransports.
+		base := testModel()
+		seed := RestoredState{HasRuntime: true, Runtime: event.ModelRuntime{
+			Key: base.Key(), APIFormat: base.APIFormat, BaseURL: base.BaseURL,
+		}}
+		rec := &recordingPublisher{}
+		l, err := NewRestored(context.Background(), mustID(t), mustID(t), Provenance{}, rec, bound, seed)
+		if err != nil {
+			t.Fatalf("NewRestored: %v", err)
+		}
+		if l == nil {
+			t.Fatal("NewRestored returned a nil loop under the synthesized default transport")
+		}
+	})
+
+	t.Run("no ContextCounter configured skips the check entirely (regression)", func(t *testing.T) {
+		t.Parallel()
+		llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
+		bound := modeDefinition(t, llm) // No WithContextCounter at all.
+		third := thirdTransportModel()
+		seed := RestoredState{HasRuntime: true, Runtime: event.ModelRuntime{
+			Key: third.Key(), APIFormat: third.APIFormat, BaseURL: third.BaseURL,
+		}}
+		rec := &recordingPublisher{}
+		l, err := NewRestored(context.Background(), mustID(t), mustID(t), Provenance{}, rec, bound, seed)
+		if err != nil {
+			t.Fatalf("NewRestored: %v", err)
+		}
+		if l == nil {
+			t.Fatal("NewRestored returned a nil loop when no ContextCounter is configured")
+		}
+	})
+}

@@ -177,6 +177,53 @@ func bindCfg(d loop.Definition, sessionID, loopID uuid.UUID) loop.BoundDefinitio
 	return bound
 }
 
+// TestNewLoopPublishesTransportOnLoopStarted is a DIRECT regression test for
+// runtimeForModel's write side (session.go, fixed by e7da984a): it drives a real session
+// construction (New) with a model whose APIFormat/BaseURL differ from validModel's
+// reference default (openai/localhost:1234), and asserts the actually-PUBLISHED root
+// LoopStarted event's Runtime.APIFormat/BaseURL carry the override.
+//
+// TestRestoreSeedingAgreesWithLiveView (loop_change_test.go) already covers this fold
+// end-to-end, but it builds BOTH sides of its comparison by calling runtimeForModel
+// itself (via restoredInference{Runtime: runtimeForModel(...)}), so it structurally cannot
+// catch a regression in runtimeForModel: it would still agree with itself even if a field
+// silently dropped out of the function. This test instead observes runtimeForModel's
+// actual OUTPUT on the wire — the durably-appended event a real construction publishes —
+// independent of the function under test.
+func TestNewLoopPublishesTransportOnLoopStarted(t *testing.T) {
+	t.Parallel()
+	base := transportOverrideModel("root-transport", model.EffortNone)
+	definition := mustDefine(
+		loop.WithName("agent"), loop.WithInference(&stubLLM{}, base), loop.WithDrainTimeout(100*time.Millisecond),
+	)
+
+	rec := &recordingEventAppender{}
+	s, err := newTestSession(context.Background(), definition, WithEventAppender(rec))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	var found bool
+	for _, ev := range rec.snapshot() {
+		started, ok := ev.(event.LoopStarted)
+		if !ok || started.Cause.Coordinates != (identity.Coordinates{}) {
+			continue // not the root loop's own (zero-Cause) start
+		}
+		found = true
+		if started.Runtime.APIFormat != base.APIFormat || started.Runtime.BaseURL != base.BaseURL {
+			t.Fatalf("published LoopStarted.Runtime APIFormat/BaseURL = %q/%q, want %q/%q",
+				started.Runtime.APIFormat, started.Runtime.BaseURL, base.APIFormat, base.BaseURL)
+		}
+		if started.Runtime.Key != base.Key() {
+			t.Fatalf("published LoopStarted.Runtime.Key = %+v, want %+v", started.Runtime.Key, base.Key())
+		}
+	}
+	if !found {
+		t.Fatal("no root LoopStarted was durably appended")
+	}
+}
+
 func TestNew(t *testing.T) {
 	t.Parallel()
 	t.Run("non-zero SessionID", func(t *testing.T) {
