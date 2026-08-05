@@ -132,6 +132,10 @@ func NewRestoredWithRuntime(
 		return nil, err
 	}
 	if seed.HasRuntime {
+		// Kept in lockstep with sessionruntime/loop_change.go's applyModelRuntime — see the
+		// design doc's "Both grafting sites, kept in lockstep". That function grafts the SAME
+		// fields onto the lightweight reported Handle view; a divergent edit here would leave
+		// the actor's real running model out of sync with what Handle.Model() reports.
 		if seed.Runtime.APIFormat != "" {
 			cfg.Model.APIFormat = seed.Runtime.APIFormat
 		}

@@ -255,7 +255,13 @@ type effectiveConfig struct {
 }
 
 func modelRuntime(model model.Model, effort model.Effort) event.ModelRuntime {
-	return event.ModelRuntime{Key: model.Key(), Limits: model.Limits, Effort: effort}
+	return event.ModelRuntime{
+		Key:       model.Key(),
+		Limits:    model.Limits,
+		Effort:    effort,
+		APIFormat: model.APIFormat,
+		BaseURL:   model.BaseURL,
+	}
 }
 
 const defaultDrainTimeout = 5 * time.Second

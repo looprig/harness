@@ -229,12 +229,27 @@ func inferModelWithEffort(name string, eff model.Effort) model.Model {
 	return m
 }
 
+// transportOverrideModel is inferModelWithEffort with a transport (APIFormat/BaseURL)
+// that deliberately differs from modeCfg's base model, so a runtimeForModel(...) built
+// from it exercises the non-empty APIFormat/BaseURL override branch of both restore-fold
+// sites (loopruntime.NewRestoredWithRuntime and sessionruntime.applyModelRuntime).
+func transportOverrideModel(name string, eff model.Effort) model.Model {
+	m := inferModelWithEffort(name, eff)
+	m.APIFormat = model.APIFormatAnthropic
+	m.BaseURL = "https://example.com"
+	return m
+}
+
 // TestRestoreSeedingAgreesWithLiveView is the drift guard between the two restore-resolution
 // paths: for EVERY case — including the base mode reached via "" — the loop actor's seeded
 // effective config (observed via its first-turn request's model + system) must match what
 // internal/sessionruntime liveViewFor reports (mode + model). This locks NewRestored's
 // configForMode-based seeding and liveViewFor's exact bound.Mode resolution together, so a
-// future divergence (like the C1 base-mode remap) fails a test.
+// future divergence (like the C1 base-mode remap) fails a test. The "inference override
+// carrying a transport switch" case additionally locks NewRestoredWithRuntime's
+// APIFormat/BaseURL graft (restored.go) and applyModelRuntime's identical graft
+// (loop_change.go) in lockstep — see the design doc's "Both grafting sites, kept in
+// lockstep" — so a future edit to only one of the two sites fails this test.
 func TestRestoreSeedingAgreesWithLiveView(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -248,6 +263,10 @@ func TestRestoreSeedingAgreesWithLiveView(t *testing.T) {
 		{
 			name: "inference override on a mode",
 			ri:   restoredInference{HasMode: true, Mode: "plan", HasRuntime: true, Runtime: runtimeForModel(inferModelWithEffort("routed", testEffortHigh))},
+		},
+		{
+			name: "inference override carrying a transport switch",
+			ri:   restoredInference{HasMode: true, Mode: "plan", HasRuntime: true, Runtime: runtimeForModel(transportOverrideModel("routed-transport", testEffortHigh))},
 		},
 	}
 	for _, tt := range tests {
@@ -287,6 +306,15 @@ func TestRestoreSeedingAgreesWithLiveView(t *testing.T) {
 			if req.Model.Name != wantModel.Name || req.Model.Sampling.Effort != wantModel.Sampling.Effort {
 				t.Fatalf("seeded model/effort = %q/%q, liveViewFor = %q/%q",
 					req.Model.Name, req.Model.Sampling.Effort, wantModel.Name, wantModel.Sampling.Effort)
+			}
+			// APIFormat/BaseURL the seeded actor's REAL running model carries == liveViewFor's
+			// reported transport. This is the drift guard between the two grafting sites: Site 1
+			// (NewRestoredWithRuntime, observed here via req.Model) and Site 2 (applyModelRuntime,
+			// observed via liveViewFor's wantModel) must agree, or the live Handle view and the
+			// actor's real running model diverge after restore.
+			if req.Model.APIFormat != wantModel.APIFormat || req.Model.BaseURL != wantModel.BaseURL {
+				t.Fatalf("seeded model APIFormat/BaseURL = %q/%q, liveViewFor = %q/%q",
+					req.Model.APIFormat, req.Model.BaseURL, wantModel.APIFormat, wantModel.BaseURL)
 			}
 			// System prompt reflects liveViewFor's mode (locks mode agreement across the paths).
 			bm, ok := bound.Mode(wantMode)

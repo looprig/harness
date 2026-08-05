@@ -278,6 +278,73 @@ func TestChangeInferenceUndeclaredTransportRefusedAndCapabilityUnchanged(t *test
 	}
 }
 
+// TestSetModeEmitsTransportInDurableRuntime proves a SetLoopMode into a mode whose model
+// sits on a DIFFERENT declared ContextTransport durably records that transport on the
+// emitted LoopModeChanged.Runtime. modelRuntime (loop.go) is the SOLE site that builds
+// event.ModelRuntime for every durable emission — LoopStarted, LoopModeChanged, and
+// LoopInferenceChanged all route through it — so this is a write-side companion to the
+// restore-fold graft tests (restored_test.go, loop_change_test.go): without APIFormat/
+// BaseURL threaded through here, a restore's graft conditionals can never see a
+// non-empty value from a REAL journal record, and a live cross-provider switch would
+// silently revert to the definition's base transport on every restore.
+func TestSetModeEmitsTransportInDurableRuntime(t *testing.T) {
+	t.Parallel()
+	llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
+	bound := crossTransportDefinition(t, llm)
+	l, rec := newBoundLoopWithConfig(t, bound, nil, nil)
+
+	res := sendSetMode(t, l, "second")
+	if res.Err != nil {
+		t.Fatalf("SetLoopMode(second) err = %v", res.Err)
+	}
+
+	second := secondTransportModel()
+	var found bool
+	for _, e := range rec.events() {
+		if mc, ok := e.(event.LoopModeChanged); ok && mc.Mode == "second" {
+			found = true
+			if mc.Runtime.APIFormat != second.APIFormat || mc.Runtime.BaseURL != second.BaseURL {
+				t.Fatalf("LoopModeChanged.Runtime APIFormat/BaseURL = %q/%q, want %q/%q",
+					mc.Runtime.APIFormat, mc.Runtime.BaseURL, second.APIFormat, second.BaseURL)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no LoopModeChanged(second) published")
+	}
+}
+
+// TestChangeInferenceEmitsTransportInDurableRuntime is the ChangeLoopInference companion to
+// TestSetModeEmitsTransportInDurableRuntime above: a direct inference change to a model on a
+// different declared transport must durably record that transport on
+// LoopInferenceChanged.Runtime, not just the identity/limits/effort fields.
+func TestChangeInferenceEmitsTransportInDurableRuntime(t *testing.T) {
+	t.Parallel()
+	llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
+	bound := crossTransportDefinition(t, llm)
+	l, rec := newBoundLoopWithConfig(t, bound, nil, nil)
+
+	second := secondTransportModel()
+	res := sendChange(t, l, command.ChangeLoopInference{Model: second, SetModel: true})
+	if res.Err != nil {
+		t.Fatalf("ChangeLoopInference(second) err = %v", res.Err)
+	}
+
+	var found bool
+	for _, e := range rec.events() {
+		if ic, ok := e.(event.LoopInferenceChanged); ok && ic.Runtime.Key == second.Key() {
+			found = true
+			if ic.Runtime.APIFormat != second.APIFormat || ic.Runtime.BaseURL != second.BaseURL {
+				t.Fatalf("LoopInferenceChanged.Runtime APIFormat/BaseURL = %q/%q, want %q/%q",
+					ic.Runtime.APIFormat, ic.Runtime.BaseURL, second.APIFormat, second.BaseURL)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no LoopInferenceChanged published")
+	}
+}
+
 // TestContextMeasurementUsesEffectiveCapabilityAfterTransportSwitch proves that a LIVE
 // context measurement taken during a turn started AFTER a transport-crossing
 // ChangeLoopInference reflects state.effective.inferenceCapability (the newly re-resolved

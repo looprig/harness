@@ -128,6 +128,12 @@ func liveViewFor(bound loop.BoundDefinition, ri restoredInference) (loop.ModeNam
 	return mode, model
 }
 
+// applyModelRuntime folds a durable ModelRuntime onto a base model to compute the
+// lightweight reported Handle.Mode()/Model() view. Kept in lockstep with
+// loopruntime.NewRestoredWithRuntime (internal/loopruntime/restored.go), which grafts the
+// SAME fields onto the actor's REAL running model — see the design doc's "Both grafting
+// sites, kept in lockstep". A divergent edit here would leave the reported Handle view out
+// of sync with what the actor actually runs.
 func applyModelRuntime(model model.Model, runtime event.ModelRuntime) model.Model {
 	if runtime.APIFormat != "" {
 		model.APIFormat = runtime.APIFormat

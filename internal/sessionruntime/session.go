@@ -617,7 +617,13 @@ type loopHandle struct {
 }
 
 func runtimeForModel(model model.Model) event.ModelRuntime {
-	return event.ModelRuntime{Key: model.Key(), Limits: model.Limits, Effort: model.Sampling.Effort}
+	return event.ModelRuntime{
+		Key:       model.Key(),
+		Limits:    model.Limits,
+		Effort:    model.Sampling.Effort,
+		APIFormat: model.APIFormat,
+		BaseURL:   model.BaseURL,
+	}
 }
 
 func (h *loopHandle) ID() uuid.UUID { return h.id }
