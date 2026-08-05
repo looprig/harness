@@ -58,11 +58,10 @@ func (e *ContextTransportNotDeclaredError) Error() string {
 }
 
 // validateContextTransportMembership reports whether m's transport identity is
-// a member of transports. An empty transports set is treated as "not yet
-// populated" and is permissive (nil): until Task 1.3 wires the real declared
-// (or synthesized) set into Define, the mode-binding call site that uses this
-// helper has nothing meaningful to check against. Given a non-empty set, it
-// performs the real lookupTransport-backed membership check.
+// a member of transports. Define always populates transports (either the
+// caller-declared set, or the synthesized single-member default derived from
+// the base model) before its mode-binding loop calls this, so the empty-set
+// branch below is defensive only — no production caller passes an empty set.
 func validateContextTransportMembership(transports []ContextTransport, m model.Model) error {
 	if len(transports) == 0 {
 		return nil

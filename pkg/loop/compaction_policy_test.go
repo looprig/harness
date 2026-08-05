@@ -225,10 +225,10 @@ func TestContextTransportBinding(t *testing.T) {
 	}
 	// NOTE: this test previously also asserted that a predeclared mode on a
 	// different provider fails Define with DefinitionInvalidModeBinding. That
-	// mode-binding enforcement is intentionally relaxed for this task cycle
-	// (see validateContextTransportMembership in context_transport.go) and is
-	// restored, set-based, in Task 1.3 (which is expected to add an
-	// equivalent regression case to definition_test.go).
+	// mode-binding enforcement is now set-based and covered by
+	// TestWithContextTransports_ModeBindingAcrossDeclaredTransports and
+	// TestContextTransportSynthesizedDefaultSet in
+	// context_transport_test.go/definition_test.go.
 }
 
 func TestRequestFingerprintSensitivity(t *testing.T) {
