@@ -258,8 +258,8 @@ func TestNewCompactionExecutorRejectsTypedNilCollaborators(t *testing.T) {
 			t.Parallel()
 			executor, err := newCompactionExecutor(context.Background(), compactionExecutorConfig{
 				Compactor: tt.compactor, Counter: tt.counter,
-				CounterCapability: validCounter.capability, InferenceCapability: contextTestInferenceCapability(),
-				Settings: contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second}, MaxSummaryTokens: 10,
+				CounterCapability: validCounter.capability,
+				Settings:          contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second}, MaxSummaryTokens: 10,
 			})
 			var configErr *compactionExecutorError
 			if executor != nil || !errors.As(err, &configErr) || configErr.Field != tt.wantField {
@@ -333,7 +333,7 @@ func TestIdleManualCompactionBuildsStableBaseCandidate(t *testing.T) {
 			settings := contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second}
 			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 				Compactor: compactor, Counter: counter, CounterCapability: counter.capability,
-				InferenceCapability: contextTestInferenceCapability(), Settings: settings, MaxSummaryTokens: 10,
+				Settings: settings, MaxSummaryTokens: 10,
 			})
 			if err != nil {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
@@ -693,8 +693,7 @@ func TestIdleCompactionPreparationQueuesNewTurnBeforeMeasurement(t *testing.T) {
 			compactor := &echoExecutorCompactor{summary: validFinalizationSummary()}
 			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 				Compactor: compactor, Counter: counter, CounterCapability: capability,
-				InferenceCapability: contextTestInferenceCapability(),
-				Settings:            contextAdmissionSettings{ReservedOutput: 20, CountTimeout: 2 * time.Second}, MaxSummaryTokens: 10,
+				Settings: contextAdmissionSettings{ReservedOutput: 20, CountTimeout: 2 * time.Second}, MaxSummaryTokens: 10,
 			})
 			if err != nil {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
@@ -832,7 +831,7 @@ func newRestoredIdleCompactionActor(
 	settings := contextAdmissionSettings{ReservedOutput: 20, CountTimeout: 2 * time.Second}
 	executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 		Compactor: compactor, Counter: counter, CounterCapability: capability,
-		InferenceCapability: contextTestInferenceCapability(), Settings: settings, MaxSummaryTokens: 10,
+		Settings: settings, MaxSummaryTokens: 10,
 	})
 	if err != nil {
 		t.Fatalf("newCompactionExecutor() error = %v", err)
@@ -1018,8 +1017,7 @@ func TestCompactionExecutorCountsExactSummaryCandidateBeforeProposal(t *testing.
 			}
 			executor, err := newCompactionExecutor(context.Background(), compactionExecutorConfig{
 				Compactor: compactor, Counter: counter, CounterCapability: basicCounter.capability,
-				InferenceCapability: contextTestInferenceCapability(),
-				Settings:            contextAdmissionSettings{ReservedOutput: 20, CountTimeout: 5 * time.Millisecond}, MaxSummaryTokens: 10,
+				Settings: contextAdmissionSettings{ReservedOutput: 20, CountTimeout: 5 * time.Millisecond}, MaxSummaryTokens: 10,
 			})
 			if err != nil {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
@@ -1036,7 +1034,8 @@ func TestCompactionExecutorCountsExactSummaryCandidateBeforeProposal(t *testing.
 					Model: model, System: "system", Messages: content.AgenticMessages{replacementTestMessage("old transcript"), runtimeTail},
 				},
 				RuntimeTail: runtimeTail, RuntimeRevision: revisionDigest([]byte("runtime tail")),
-				Transcript: content.AgenticMessages{replacementTestMessage("old transcript")},
+				Transcript:          content.AgenticMessages{replacementTestMessage("old transcript")},
+				InferenceCapability: contextTestInferenceCapability(),
 			}
 			if err := executor.CoordinateCompactionCandidate(context.Background(), compactionDisposition{
 				Kind: compactionDispositionStart, Attempt: &attempt,
@@ -1133,8 +1132,8 @@ func TestLoopCompactsToolContinuationAtPostStepBoundary(t *testing.T) {
 			settings := contextAdmissionSettings{ReservedOutput: 20, CompactAt: 8_000, RearmBelow: 6_000, CountTimeout: time.Second, Automatic: true}
 			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 				Compactor: &echoExecutorCompactor{summary: validFinalizationSummary()}, Counter: counter,
-				CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
-				Settings: settings, MaxSummaryTokens: 10,
+				CounterCapability: counter.capability,
+				Settings:          settings, MaxSummaryTokens: 10,
 			})
 			if err != nil {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
@@ -1206,7 +1205,7 @@ func TestLoopManualCompactionFreezesPostStepCandidate(t *testing.T) {
 			compactor := &echoExecutorCompactor{summary: validFinalizationSummary()}
 			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 				Compactor: compactor, Counter: counter, CounterCapability: counter.capability,
-				InferenceCapability: contextTestInferenceCapability(), Settings: settings, MaxSummaryTokens: 10,
+				Settings: settings, MaxSummaryTokens: 10,
 			})
 			if err != nil {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
@@ -1334,7 +1333,7 @@ func TestLoopCompactionRejectionAdmissionAtToolContinuation(t *testing.T) {
 			}
 			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 				Compactor: compactor, Counter: counter, CounterCapability: counter.capability,
-				InferenceCapability: contextTestInferenceCapability(), Settings: executorSettings, MaxSummaryTokens: 10,
+				Settings: executorSettings, MaxSummaryTokens: 10,
 			})
 			if err != nil {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
@@ -1434,7 +1433,6 @@ func TestLoopTerminalCompactionRejectionPreservesProducedResponse(t *testing.T) 
 			}
 			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 				Compactor: compactor, Counter: counter, CounterCapability: counter.capability,
-				InferenceCapability: contextTestInferenceCapability(),
 				Settings: contextAdmissionSettings{
 					ReservedOutput: 20, SafetyMargin: tt.executorMargin, CompactAt: 8_000, RearmBelow: 6_000,
 					CountTimeout: time.Second, Automatic: true,
@@ -1513,7 +1511,7 @@ func TestLoopTerminalResponseWaitsForCompactionAndRemainsUnchanged(t *testing.T)
 			compactor := &gatedExecutorCompactor{summary: validFinalizationSummary(), started: make(chan struct{}), release: make(chan struct{})}
 			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 				Compactor: compactor, Counter: counter, CounterCapability: counter.capability,
-				InferenceCapability: contextTestInferenceCapability(), Settings: settings, MaxSummaryTokens: 10,
+				Settings: settings, MaxSummaryTokens: 10,
 			})
 			if err != nil {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
@@ -1612,7 +1610,7 @@ func TestLoopTerminalCompactionCancellationPreemptsProducedResponse(t *testing.T
 			}
 			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 				Compactor: compactor, Counter: counter, CounterCapability: counter.capability,
-				InferenceCapability: contextTestInferenceCapability(), Settings: settings, MaxSummaryTokens: 10,
+				Settings: settings, MaxSummaryTokens: 10,
 			})
 			if err != nil {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
@@ -1723,7 +1721,7 @@ func TestLoopStartedCompactionCancellationIsActorOwned(t *testing.T) {
 			}
 			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 				Compactor: compactor, Counter: counter, CounterCapability: counter.capability,
-				InferenceCapability: contextTestInferenceCapability(), Settings: settings, MaxSummaryTokens: 10,
+				Settings: settings, MaxSummaryTokens: 10,
 			})
 			if err != nil {
 				t.Fatalf("newCompactionExecutor() error = %v", err)

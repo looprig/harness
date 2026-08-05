@@ -804,7 +804,7 @@ func newCompactionHooksActor(
 	settings := contextAdmissionSettings{ReservedOutput: 20, CountTimeout: 2 * time.Second}
 	executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 		Compactor: compactor, Counter: counter, CounterCapability: capability,
-		InferenceCapability: contextTestInferenceCapability(), Settings: settings, MaxSummaryTokens: 10,
+		Settings: settings, MaxSummaryTokens: 10,
 	})
 	if err != nil {
 		t.Fatalf("newCompactionExecutor() error = %v", err)
@@ -851,7 +851,7 @@ func newActiveTurnCompactionHooksActor(
 	}
 	executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 		Compactor: compactor, Counter: counter, CounterCapability: capability,
-		InferenceCapability: contextTestInferenceCapability(), Settings: settings, MaxSummaryTokens: 10,
+		Settings: settings, MaxSummaryTokens: 10,
 	})
 	if err != nil {
 		t.Fatalf("newCompactionExecutor() error = %v", err)

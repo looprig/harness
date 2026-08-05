@@ -59,7 +59,13 @@ func (c *effectiveConfigCapture) last(t *testing.T) effectiveConfig {
 // the raw-config test path (newWithConfig) carries no bound definition at all (every
 // SetLoopMode there is refused with ChangeInvalidMode, and ChangeLoopInference never consults
 // a bound definition's declared ContextTransport set).
-func newBoundLoopWithConfig(t *testing.T, bound loop.BoundDefinition, configure func(*runtimeConfig)) (*Loop, *recordingPublisher) {
+//
+// seed is optional (nil for a freshly-constructed loop). Pass a non-nil seed to exercise a
+// path that requires a restored-like loop — e.g. startIdleCompactionPreparation (loop.go)
+// requires a non-zero ContextBasis before it will run at all
+// (basis.Revision != 0 && !basis.ThroughEventID.IsZero()), and a freshly-constructed loop's
+// basis starts at the zero value.
+func newBoundLoopWithConfig(t *testing.T, bound loop.BoundDefinition, seed *RestoredState, configure func(*runtimeConfig)) (*Loop, *recordingPublisher) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -71,33 +77,7 @@ func newBoundLoopWithConfig(t *testing.T, bound loop.BoundDefinition, configure 
 	if configure != nil {
 		configure(&cfg)
 	}
-	l, err := newLoopWithSeed(ctx, mustID(t), mustID(t), Provenance{}, rec, cfg, bound, bound.InitialMode(), nil)
-	if err != nil {
-		t.Fatalf("newLoopWithSeed: %v", err)
-	}
-	return l, rec
-}
-
-// newBoundLoopWithSeedAndConfig is newBoundLoopWithConfig plus a RestoredState seed.
-// startIdleCompactionPreparation (loop.go) requires a non-zero ContextBasis before it will
-// run at all (basis.Revision != 0 && !basis.ThroughEventID.IsZero()), and a
-// freshly-constructed (unseeded) loop's basis starts at the zero value — so exercising the
-// IDLE-compaction preparation path (as opposed to newBoundLoopWithConfig's callers, which
-// only exercise SetMode/ChangeLoopInference bookkeeping) needs a loop that is already
-// seeded with committed history and a basis, exactly like a restored loop.
-func newBoundLoopWithSeedAndConfig(t *testing.T, bound loop.BoundDefinition, seed RestoredState, configure func(*runtimeConfig)) (*Loop, *recordingPublisher) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	rec := &recordingPublisher{}
-	cfg, err := configFromBound(bound, "")
-	if err != nil {
-		t.Fatalf("configFromBound: %v", err)
-	}
-	if configure != nil {
-		configure(&cfg)
-	}
-	l, err := newLoopWithSeed(ctx, mustID(t), mustID(t), Provenance{}, rec, cfg, bound, bound.InitialMode(), &seed)
+	l, err := newLoopWithSeed(ctx, mustID(t), mustID(t), Provenance{}, rec, cfg, bound, bound.InitialMode(), seed)
 	if err != nil {
 		t.Fatalf("newLoopWithSeed: %v", err)
 	}
@@ -219,7 +199,7 @@ func TestSetModeReResolvesCapabilityAcrossTransport(t *testing.T) {
 	llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
 	bound := crossTransportDefinition(t, llm)
 	var capture effectiveConfigCapture
-	l, _ := newBoundLoopWithConfig(t, bound, func(cfg *runtimeConfig) {
+	l, _ := newBoundLoopWithConfig(t, bound, nil, func(cfg *runtimeConfig) {
 		cfg.afterEffectiveConfigChange = capture.capture
 	})
 
@@ -241,7 +221,7 @@ func TestChangeInferenceReResolvesCapabilityAcrossTransport(t *testing.T) {
 	llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
 	bound := crossTransportDefinition(t, llm)
 	var capture effectiveConfigCapture
-	l, _ := newBoundLoopWithConfig(t, bound, func(cfg *runtimeConfig) {
+	l, _ := newBoundLoopWithConfig(t, bound, nil, func(cfg *runtimeConfig) {
 		cfg.afterEffectiveConfigChange = capture.capture
 	})
 
@@ -271,7 +251,7 @@ func TestChangeInferenceUndeclaredTransportRefusedAndCapabilityUnchanged(t *test
 	llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
 	bound := crossTransportDefinition(t, llm)
 	var capture effectiveConfigCapture
-	l, _ := newBoundLoopWithConfig(t, bound, func(cfg *runtimeConfig) {
+	l, _ := newBoundLoopWithConfig(t, bound, nil, func(cfg *runtimeConfig) {
 		cfg.afterEffectiveConfigChange = capture.capture
 	})
 
@@ -321,7 +301,7 @@ func TestContextMeasurementUsesEffectiveCapabilityAfterTransportSwitch(t *testin
 	llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
 	bound := crossTransportDefinition(t, llm)
 	var counter *loopContextCounter
-	l, rec := newBoundLoopWithConfig(t, bound, func(cfg *runtimeConfig) {
+	l, rec := newBoundLoopWithConfig(t, bound, nil, func(cfg *runtimeConfig) {
 		counter = cfg.ContextCounter.(*loopContextCounter)
 	})
 
@@ -386,8 +366,8 @@ func TestContextMeasurementUsesEffectiveCapabilityAfterTransportSwitch(t *testin
 // an executed proof.
 //
 // The loop must already carry a non-zero ContextBasis for startIdleCompactionPreparation to
-// run at all, so this uses newBoundLoopWithSeedAndConfig (a restored-like seed) rather than
-// the plain newBoundLoopWithConfig the other tests in this file use. A command.Compact sent
+// run at all, so this passes a non-nil seed to newBoundLoopWithConfig (a restored-like seed)
+// rather than the nil seed the other tests in this file use. A command.Compact sent
 // while idle drives compaction admission straight into startIdleCompactionPreparation
 // (loop.go: `if state.status == loopIdle { ... startIdleCompactionPreparation(...) }`), and
 // idleCandidateCapturingSink (a compactionCandidateSink + contextCompactionAwaiter, the two
@@ -411,7 +391,7 @@ func TestIdleCompactionPreparationUsesEffectiveCapabilityAfterTransportSwitch(t 
 		Basis:     event.ContextBasis{Revision: 1, ThroughEventID: uuid.UUID{0xd0}},
 		HasBasis:  true,
 	}
-	l, _ := newBoundLoopWithSeedAndConfig(t, bound, seed, func(cfg *runtimeConfig) {
+	l, _ := newBoundLoopWithConfig(t, bound, &seed, func(cfg *runtimeConfig) {
 		cfg.compactionSink = sink
 	})
 
@@ -447,5 +427,89 @@ func TestIdleCompactionPreparationUsesEffectiveCapabilityAfterTransportSwitch(t 
 	}
 	if candidate.Measurement.RequestFingerprint == staleFingerprint {
 		t.Fatal("idle-compaction measured fingerprint matches the frozen base-transport capability; call site 1 did not read the re-resolved effective capability")
+	}
+}
+
+// TestCompactionExecutorPreparesWithPerCandidateInferenceCapability is the executor-level
+// companion to the two call-site tests above: it proves compactionExecutor.prepare() derives
+// its post-compaction measurement fingerprint from InferenceCapability carried on the
+// compactionExecutionCandidate itself, not a value frozen on compactionExecutorConfig at
+// construction time (that field is removed entirely by this task — capability is not known
+// until a candidate is dispatched, since it can change between executor construction and any
+// given compaction attempt via ChangeLoopInference/SetLoopMode).
+//
+// The proof drives CoordinateCompactionCandidate twice against the SAME executor instance,
+// varying only candidate.InferenceCapability between runs (same request, same transcript, same
+// counter capability, same settings) and shows the resulting PostCount.Fingerprint template
+// produces two DIFFERENT [32]byte digests for an identical basis — a difference that can only
+// be explained by prepare() reading candidate.InferenceCapability per call.
+func TestCompactionExecutorPreparesWithPerCandidateInferenceCapability(t *testing.T) {
+	t.Parallel()
+	compactor := &echoExecutorCompactor{summary: validFinalizationSummary()}
+	counter := &loopContextCounter{
+		capability: contextTestCapability(contextcount.CountQualityExactLocal),
+		counts:     []content.TokenCount{40},
+	}
+	settings := contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second}
+	executor, err := newCompactionExecutor(context.Background(), compactionExecutorConfig{
+		Compactor: compactor, Counter: counter, CounterCapability: counter.capability,
+		Settings: settings, MaxSummaryTokens: 10,
+	})
+	if err != nil {
+		t.Fatalf("newCompactionExecutor() error = %v", err)
+	}
+
+	requestModel := testModel()
+	requestModel.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+	basis := event.ContextBasis{Revision: 7, ThroughEventID: uuid.UUID{7}}
+	fingerprint := [32]byte{8}
+
+	runOnce := func(attemptID event.CompactAttemptID, capability contextcount.InferenceCapability) compactionPostCount {
+		t.Helper()
+		attempt := validFinalizationAttempt()
+		attempt.AttemptID = attemptID
+		attempt.Basis = basis
+		candidate := compactionExecutionCandidate{
+			Measurement: event.ContextMeasurement{
+				Basis: basis, Model: requestModel.Key(), RequestFingerprint: fingerprint,
+				InputTokens: 40, InputLimit: 80, Quality: contextcount.CountQualityExactLocal,
+			},
+			Request: inference.Request{
+				Model: requestModel, System: "system",
+				Messages: content.AgenticMessages{replacementTestMessage("old transcript")},
+			},
+			RuntimeRevision:     revisionDigest(nil),
+			Transcript:          content.AgenticMessages{replacementTestMessage("old transcript")},
+			InferenceCapability: capability,
+		}
+		if err := executor.CoordinateCompactionCandidate(context.Background(), compactionDisposition{
+			Kind: compactionDispositionStart, Attempt: &attempt,
+		}, candidate); err != nil {
+			t.Fatalf("CoordinateCompactionCandidate() error = %v", err)
+		}
+		result, err := executor.AwaitCompaction(context.Background(), attempt.AttemptID)
+		if err != nil {
+			t.Fatalf("AwaitCompaction() error = %v", err)
+		}
+		if result.Disposition != contextCompactionAwaitCommitted || result.Proposal.Success == nil {
+			t.Fatalf("result = %+v, want prepared success", result)
+		}
+		return result.Proposal.Success.PostCount
+	}
+
+	basePost := runOnce(event.CompactAttemptID(uuid.UUID{0xa1}), contextTestInferenceCapability())
+	switchedPost := runOnce(event.CompactAttemptID(uuid.UUID{0xa2}), secondTransportCapability())
+
+	compareBasis := event.ContextBasis{Revision: 9, ThroughEventID: uuid.UUID{9}}
+	baseFingerprint, err := basePost.Fingerprint.Fingerprint(compareBasis)
+	if err != nil {
+		t.Fatalf("basePost.Fingerprint.Fingerprint() error = %v", err)
+	}
+	switchedFingerprint, err := switchedPost.Fingerprint.Fingerprint(compareBasis)
+	if err != nil {
+		t.Fatalf("switchedPost.Fingerprint.Fingerprint() error = %v", err)
+	}
+	if baseFingerprint == switchedFingerprint {
+		t.Fatal("PostCount fingerprint unchanged across different candidate.InferenceCapability values; prepare() did not use the per-candidate capability")
 	}
 }

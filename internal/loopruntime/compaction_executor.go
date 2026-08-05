@@ -15,20 +15,20 @@ import (
 )
 
 type compactionExecutorConfig struct {
-	Compactor           Compactor
-	Counter             contextcount.ContextCounter
-	CounterCapability   contextcount.CounterCapability
-	InferenceCapability contextcount.InferenceCapability
-	Settings            contextAdmissionSettings
-	MaxSummaryTokens    content.TokenCount
+	Compactor         Compactor
+	Counter           contextcount.ContextCounter
+	CounterCapability contextcount.CounterCapability
+	Settings          contextAdmissionSettings
+	MaxSummaryTokens  content.TokenCount
 }
 
 type compactionExecutionCandidate struct {
-	Measurement     event.ContextMeasurement
-	Request         inference.Request
-	RuntimeTail     *content.UserMessage
-	RuntimeRevision string
-	Transcript      content.AgenticMessages
+	Measurement         event.ContextMeasurement
+	Request             inference.Request
+	RuntimeTail         *content.UserMessage
+	RuntimeRevision     string
+	Transcript          content.AgenticMessages
+	InferenceCapability contextcount.InferenceCapability
 }
 
 type compactionExecutorError struct{ Field string }
@@ -71,9 +71,6 @@ func newCompactionExecutor(ctx context.Context, config compactionExecutorConfig)
 	if err := config.CounterCapability.Validate(); err != nil {
 		return nil, &compactionExecutorError{Field: "counter_capability"}
 	}
-	if err := config.InferenceCapability.Validate(); err != nil {
-		return nil, &compactionExecutorError{Field: "inference_capability"}
-	}
 	return &compactionExecutor{ctx: ctx, config: config, runs: make(map[event.CompactAttemptID]compactionExecutionRun)}, nil
 }
 
@@ -89,8 +86,8 @@ func installCompactionExecutor(ctx context.Context, config *runtimeConfig, compa
 	}
 	executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 		Compactor: compactor, Counter: config.ContextCounter,
-		CounterCapability: config.CounterCapability, InferenceCapability: config.InferenceCapability,
-		Settings: compactionAdmissionSettings(*config.Compaction), MaxSummaryTokens: config.Compaction.MaxSummaryTokens,
+		CounterCapability: config.CounterCapability,
+		Settings:          compactionAdmissionSettings(*config.Compaction), MaxSummaryTokens: config.Compaction.MaxSummaryTokens,
 	})
 	if err != nil {
 		return err
@@ -153,6 +150,13 @@ func (e *compactionExecutor) CoordinateCompactionCandidate(
 		rejected.Proposal.hookScope = disposition.hookScope
 		result <- compactionExecutionResult{outcome: rejected}
 		return nil
+	}
+	if err := candidate.InferenceCapability.Validate(); err != nil {
+		e.mu.Lock()
+		delete(e.runs, attempt.AttemptID)
+		e.mu.Unlock()
+		cancel()
+		return &compactionExecutorError{Field: "inference_capability"}
 	}
 	candidate.Request.Messages = cloneMessages(candidate.Request.Messages)
 	candidate.RuntimeTail = cloneUserMessage(candidate.RuntimeTail)
@@ -293,7 +297,7 @@ func (e *compactionExecutor) prepare(
 		request.Messages = append(request.Messages, cloneUserMessage(candidate.RuntimeTail))
 	}
 	measurement, err := measureRequestContext(
-		ctx, e.config.Counter, e.config.CounterCapability, e.config.InferenceCapability,
+		ctx, e.config.Counter, e.config.CounterCapability, candidate.InferenceCapability,
 		e.config.Settings, attempt.Basis, request, candidate.RuntimeRevision,
 	)
 	if err != nil {
@@ -306,7 +310,7 @@ func (e *compactionExecutor) prepare(
 		)
 	}
 	template, err := contextFingerprintTemplateForRequest(
-		request, candidate.RuntimeRevision, e.config.CounterCapability, e.config.InferenceCapability,
+		request, candidate.RuntimeRevision, e.config.CounterCapability, candidate.InferenceCapability,
 	)
 	if err != nil {
 		return rejectedCompactionResult(event.CompactRejectInternal)

@@ -1128,7 +1128,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				preparation: prepared,
 				candidate: compactionExecutionCandidate{
 					Measurement: measurement, Request: request, RuntimeRevision: runtimeRevision,
-					Transcript: cloneMessages(prepared.transcript),
+					Transcript: cloneMessages(prepared.transcript), InferenceCapability: prepared.inferenceCapability,
 				},
 				err: err,
 			}
@@ -2707,7 +2707,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			executionCandidate := compactionExecutionCandidate{
 				Measurement: result.measurement, Request: result.request.request,
 				RuntimeTail: result.request.runtimeTail, RuntimeRevision: result.request.runtimeContextRevision,
-				Transcript: cloneMessages(state.msgs),
+				Transcript: cloneMessages(state.msgs), InferenceCapability: state.effective.inferenceCapability,
 			}
 			if compactions.pendingAtBoundary() {
 				pending := compactions.pendingAttempt()
