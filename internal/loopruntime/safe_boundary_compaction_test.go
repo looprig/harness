@@ -1108,6 +1108,59 @@ func TestCompactionExecutorCountsExactSummaryCandidateBeforeProposal(t *testing.
 	}
 }
 
+// TestCoordinateCompactionCandidateRejectsInvalidCapabilityAndCleansUpRun proves the
+// per-candidate InferenceCapability.Validate() check added to CoordinateCompactionCandidate
+// (mirroring the constructor-time check that used to live on compactionExecutorConfig) both
+// rejects a structurally invalid capability with the expected typed error, AND that the run
+// entry registered in e.runs just before that check is genuinely deleted on rejection rather
+// than leaked. A leaked entry would never receive a result (the compaction goroutine is never
+// started on this path), so a subsequent AwaitCompaction for the same AttemptID would block
+// until context deadline instead of reporting "attempt not found" immediately.
+func TestCoordinateCompactionCandidateRejectsInvalidCapabilityAndCleansUpRun(t *testing.T) {
+	t.Parallel()
+	compactor := &executorTestCompactor{}
+	counter := &loopContextCounter{
+		capability: contextTestCapability(contextcount.CountQualityExactLocal),
+		counts:     []content.TokenCount{40},
+	}
+	executor, err := newCompactionExecutor(context.Background(), compactionExecutorConfig{
+		Compactor: compactor, Counter: counter, CounterCapability: counter.capability,
+		Settings: contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second}, MaxSummaryTokens: 10,
+	})
+	if err != nil {
+		t.Fatalf("newCompactionExecutor() error = %v", err)
+	}
+
+	attempt := validFinalizationAttempt()
+	requestModel := testModel()
+	invalidCandidate := compactionExecutionCandidate{
+		Measurement: event.ContextMeasurement{
+			Basis: attempt.Basis, Model: requestModel.Key(), RequestFingerprint: [32]byte{1},
+			InputTokens: 40, InputLimit: 80, Quality: contextcount.CountQualityExactLocal,
+		},
+		Request: inference.Request{Model: requestModel, System: "system"},
+		// InferenceCapability is deliberately left zero-value: Transport ==
+		// InferenceTransportUnknown fails Validate(), exercising the per-candidate
+		// validation branch in CoordinateCompactionCandidate.
+	}
+
+	err = executor.CoordinateCompactionCandidate(context.Background(), compactionDisposition{
+		Kind: compactionDispositionStart, Attempt: &attempt,
+	}, invalidCandidate)
+	var configErr *compactionExecutorError
+	if !errors.As(err, &configErr) || configErr.Field != "inference_capability" {
+		t.Fatalf("CoordinateCompactionCandidate() error = %#v, want typed error field inference_capability", err)
+	}
+
+	awaitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, awaitErr := executor.AwaitCompaction(awaitCtx, attempt.AttemptID)
+	var awaitTypedErr *compactionExecutorError
+	if !errors.As(awaitErr, &awaitTypedErr) || awaitTypedErr.Field != "attempt" {
+		t.Fatalf("AwaitCompaction() after rejected candidate error = %v, want typed error field attempt (not found) — a non-\"attempt\" error, nil error, or a hang past the deadline means the run entry was leaked instead of cleaned up", awaitErr)
+	}
+}
+
 func TestLoopCompactsToolContinuationAtPostStepBoundary(t *testing.T) {
 	tests := []struct {
 		name string

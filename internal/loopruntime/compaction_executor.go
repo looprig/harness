@@ -151,6 +151,12 @@ func (e *compactionExecutor) CoordinateCompactionCandidate(
 		result <- compactionExecutionResult{outcome: rejected}
 		return nil
 	}
+	// Must run AFTER the preRejected branch above, not before: a preRejected disposition
+	// carries this same candidate but has already decided its outcome (e.g. a hook denial
+	// with its own specific CompactRejectReason) and returns before this point. Validating
+	// candidate.InferenceCapability first would let a structurally invalid candidate silently
+	// override that already-decided rejection reason with a generic "inference_capability"
+	// error instead.
 	if err := candidate.InferenceCapability.Validate(); err != nil {
 		e.mu.Lock()
 		delete(e.runs, attempt.AttemptID)

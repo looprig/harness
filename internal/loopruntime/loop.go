@@ -241,9 +241,10 @@ type admissionFaultProbe interface {
 // preparation goroutine) read a per-actor-turn snapshot of this field — captured
 // synchronously on the actor goroutine before any off-actor goroutine spawns — rather
 // than the frozen runtimeConfig.InferenceCapability, which never re-resolves across a
-// transport-crossing change. The frozen config.InferenceCapability remains the seed value
-// above and is also still read by compaction_executor.go's own frozen config, a separate
-// (deliberately out of scope here) mechanism.
+// transport-crossing change. compaction_executor.go no longer freezes its own copy either:
+// compactionExecutionCandidate.InferenceCapability is threaded per-call from this same
+// per-turn snapshot (see compactionExecutionCandidate construction in loop.go), so a
+// compaction triggered after a transport switch measures against the current transport too.
 type effectiveConfig struct {
 	mode                loop.ModeName
 	model               model.Model
