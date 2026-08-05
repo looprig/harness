@@ -17,6 +17,7 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
 	model "github.com/looprig/inference/model"
 )
 
@@ -230,12 +231,19 @@ type admissionFaultProbe interface {
 // takes effect only at the next turn boundary. SetLoopMode replaces all five fields;
 // ChangeLoopInference replaces only model+effort. The effort is also baked into
 // model.Sampling.Effort so the request the turn builds carries it.
+//
+// inferenceCapability is seeded once here from the resolved runtimeConfig
+// (cfg.InferenceCapability) at construction. As of this seeding, nothing yet
+// re-resolves it on a mode or inference change — that is later work, which will need
+// it to reflect the CURRENTLY selected mode/model's transport capability rather than
+// staying frozen at the loop's initial resolution.
 type effectiveConfig struct {
-	mode   loop.ModeName
-	model  model.Model
-	effort model.Effort
-	system string
-	tools  ToolSet
+	mode                loop.ModeName
+	model               model.Model
+	effort              model.Effort
+	system              string
+	tools               ToolSet
+	inferenceCapability contextcount.InferenceCapability
 }
 
 func modelRuntime(model model.Model, effort model.Effort) event.ModelRuntime {
@@ -445,11 +453,12 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	// cfg already carries any restore-folded inference override). A change command later
 	// replaces these fields, and the next turn captures whatever is current here.
 	state.effective = effectiveConfig{
-		mode:   initialMode,
-		model:  cfg.Model,
-		effort: cfg.Model.Sampling.Effort,
-		system: cfg.System,
-		tools:  cfg.Tools,
+		mode:                initialMode,
+		model:               cfg.Model,
+		effort:              cfg.Model.Sampling.Effort,
+		system:              cfg.System,
+		tools:               cfg.Tools,
+		inferenceCapability: cfg.InferenceCapability,
 	}
 	state.runtime = modelRuntime(cfg.Model, cfg.Model.Sampling.Effort)
 	if seed != nil {

@@ -15,6 +15,7 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
 	model "github.com/looprig/inference/model"
 )
 
@@ -26,6 +27,25 @@ func mustID(t *testing.T) uuid.UUID {
 		t.Fatalf("uuid.New: %v", err)
 	}
 	return u
+}
+
+// TestEffectiveConfigInferenceCapabilityField is a compile-level check for Task 2.1:
+// effectiveConfig gains an inferenceCapability field (seeded from the resolved
+// runtimeConfig at construction), but nothing reads it yet — SetMode/ChangeInference
+// re-resolution is later work (2.2/2.3). effectiveConfig is actor-owned state with no
+// external observation seam (the only existing query, Snapshot, exposes committed
+// msgs/turnIndex, not the live effective config), and the actor goroutine takes
+// ownership of loopState immediately at construction (newLoopWithSeed's `go
+// runLoop(lc, state)`), so there is no race-free way to peek at it from outside the
+// package. This test instead asserts the field exists with the correct type and
+// zero-values correctly; a real behavioral assertion belongs to the task that first
+// gives the field a reader.
+func TestEffectiveConfigInferenceCapabilityField(t *testing.T) {
+	t.Parallel()
+	var cfg effectiveConfig
+	if cfg.inferenceCapability != (contextcount.InferenceCapability{}) {
+		t.Fatalf("effectiveConfig{}.inferenceCapability = %+v, want zero value", cfg.inferenceCapability)
+	}
 }
 
 // noopPublisher is a no-op eventPublisher for loop tests that do not assert on
