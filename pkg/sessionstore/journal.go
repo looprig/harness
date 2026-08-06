@@ -143,15 +143,22 @@ func (s *Store) OpenJournalWithOpeningAppend(
 		idx:        journal.NewIdempotencyIndex(),
 	}
 
-	// Take ownership FIRST, immediately after the tip read with no intervening
-	// I/O — the same tight tip-then-CAS coupling every later Append already has
-	// via trackedTip (writeLocked never re-reads the tip; it CASes on whatever is
-	// already tracked in memory). Claiming the fence this early, BEFORE the
-	// idempotency-index hydration below, closes the window in which a still-live
-	// predecessor writer (a crash-path teardown append, or a parked goroutine
-	// unblocked by context cancellation — see handBackRequest) could land a write
-	// on this ledger and advance the tip out from under a tip value cached before
-	// a slow walk. The first append is the opening fence, stamping the lease
+	// Take ownership FIRST, immediately after the tip read: on the middleware-free
+	// path there is no intervening I/O at all — the same tight tip-then-CAS
+	// coupling every later Append already has via trackedTip (writeLocked never
+	// re-reads the tip; it CASes on whatever is already tracked in memory). A
+	// caller-supplied AppendMiddleware (as both of internal/sessionruntime's own
+	// callers — Lifecycle.NewSession and restoreTopologySession — install via
+	// journal.HookMiddleware whenever a hook handles OperationJournalAppend) still
+	// runs between the tip read and the CAS below and could itself do I/O — that
+	// gap is real but bounded by whatever the hook does, not by a full-ledger
+	// walk, and it existed in this exact position in the pre-fix code too.
+	// Claiming the fence this early, BEFORE the idempotency-index hydration below,
+	// closes the window in which a still-live predecessor writer (a crash-path
+	// teardown append, or a parked goroutine unblocked by context cancellation —
+	// see handBackRequest) could land a write on this ledger and advance the tip
+	// out from under a tip value cached before a slow walk. The first append is
+	// the opening fence, stamping the lease
 	// epoch and fenced on the current tip. A stale prior owner (or higher-epoch
 	// successor) that advanced the ledger causes this CAS to conflict and Open to
 	// fail closed. Only once it commits is the journal ready.
@@ -211,6 +218,18 @@ func (s *Store) OpenJournalWithOpeningAppend(
 		idx, hydrateErr := hydrateIdempotencyIndex(hydrateCtx, s.backend.Ledger, s.backend.Blobs, name)
 		hydrateCancel()
 		if hydrateErr != nil {
+			// Accepted trade-off of hydrating after the fence: the fence above has
+			// already durably committed (the tip is advanced) even though Open now
+			// fails closed and returns this journal to no caller. That leaves an
+			// orphaned fence stamped with this lease's epoch sitting in the ledger —
+			// impossible in the pre-fix ordering, where nothing could fail once the
+			// fence's writeLocked succeeded. It is not a correctness problem: the
+			// caller's failure path releases the lease as usual, and the next Open
+			// simply reads a fresh tip past this stray fence and claims its own —
+			// the same self-healing the epoch/fencing design already relies on for
+			// any crash between a fence commit and full ownership. Surfacing it here
+			// so a future reader chasing an orphaned fence in production logs has a
+			// documented, expected cause rather than a mystery.
 			return nil, hydrateErr
 		}
 		j.idx = idx
