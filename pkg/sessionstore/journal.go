@@ -79,11 +79,13 @@ type sessionJournal struct {
 	trackedTip uint64
 
 	// idx tracks every idempotency id already durable in this session's log —
-	// hydrated from the full ledger before the opening fence (see
-	// OpenJournalWithOpeningAppend and hydrateIdempotencyIndex) — so a redelivered
-	// Append/AppendIdempotent can be detected and deduplicated instead of writing a
-	// second frame. It is guarded by mu exactly like ready/trackedTip: only
-	// appendChecked reads or updates it once the journal is open.
+	// hydrated from the full ledger AFTER the opening fence has claimed ownership
+	// (see OpenJournalWithOpeningAppend and hydrateIdempotencyIndex) — so a
+	// redelivered Append/AppendIdempotent can be detected and deduplicated instead
+	// of writing a second frame. It is guarded by mu exactly like ready/trackedTip:
+	// only appendChecked reads or updates it once the journal is open, and Open
+	// itself holds mu across both the fence commit and the hydration that follows
+	// it, so no external caller can observe or mutate it before hydration finishes.
 	idx *journal.IdempotencyIndex
 }
 
@@ -130,23 +132,6 @@ func (s *Store) OpenJournalWithOpeningAppend(
 		return nil, err
 	}
 
-	// Hydrate the idempotency index from whatever is ALREADY durable, BEFORE this
-	// journal's own opening fence is appended below: hydrating first means the
-	// fence's own id can never be mistaken for a prior duplicate, and — because the
-	// journal is not ready yet and unreachable by any other caller — no concurrent
-	// Append/AppendIdempotent can race the walk. A ledger that has never been
-	// written (tip 0, the common fresh-session case) has nothing to hydrate, so the
-	// read is skipped entirely rather than performed for no reason.
-	idx := journal.NewIdempotencyIndex()
-	if tip > 0 {
-		hydrateCtx, hydrateCancel := context.WithTimeout(ctx, hydrateTimeout)
-		idx, err = hydrateIdempotencyIndex(hydrateCtx, s.backend.Ledger, s.backend.Blobs, name)
-		hydrateCancel()
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	j := &sessionJournal{
 		id:         id,
 		lease:      lease,
@@ -155,10 +140,18 @@ func (s *Store) OpenJournalWithOpeningAppend(
 		name:       name,
 		threshold:  s.opts.OffloadThreshold,
 		trackedTip: tip,
-		idx:        idx,
+		idx:        journal.NewIdempotencyIndex(),
 	}
 
-	// Take ownership: the first append is the opening fence, stamping the lease
+	// Take ownership FIRST, immediately after the tip read with no intervening
+	// I/O — the same tight tip-then-CAS coupling every later Append already has
+	// via trackedTip (writeLocked never re-reads the tip; it CASes on whatever is
+	// already tracked in memory). Claiming the fence this early, BEFORE the
+	// idempotency-index hydration below, closes the window in which a still-live
+	// predecessor writer (a crash-path teardown append, or a parked goroutine
+	// unblocked by context cancellation — see handBackRequest) could land a write
+	// on this ledger and advance the tip out from under a tip value cached before
+	// a slow walk. The first append is the opening fence, stamping the lease
 	// epoch and fenced on the current tip. A stale prior owner (or higher-epoch
 	// successor) that advanced the ledger causes this CAS to conflict and Open to
 	// fail closed. Only once it commits is the journal ready.
@@ -198,11 +191,38 @@ func (s *Store) OpenJournalWithOpeningAppend(
 	if fenceErr != nil {
 		return nil, fenceErr
 	}
+
+	// Now that ownership is claimed, hydrate the idempotency index from whatever
+	// is durable — including the fence just committed above, and anything else
+	// that lands on the ledger before this walk observes it, since a fresh
+	// full-ledger read has no dependency on the pre-fence tip snapshot. Deferring
+	// this SLOW walk until after the fence commits is what closes the race: no
+	// predecessor writer can land another append once the fence has fenced it out
+	// (its next CAS conflicts against the tip this fence already advanced), so
+	// hydration can safely take as long as it needs without widening the window
+	// the opening fence itself is exposed to. j.ready stays false and j is not
+	// yet returned to any caller, so nothing can call Append/AppendIdempotent
+	// through this instance and race the walk. A ledger that had nothing durable
+	// before this fence (tip 0, the common fresh-session case) has nothing more to
+	// hydrate beyond what the fence's own hygiene Observe below already records,
+	// so the walk is skipped entirely rather than performed for no reason.
+	if tip > 0 {
+		hydrateCtx, hydrateCancel := context.WithTimeout(ctx, hydrateTimeout)
+		idx, hydrateErr := hydrateIdempotencyIndex(hydrateCtx, s.backend.Ledger, s.backend.Blobs, name)
+		hydrateCancel()
+		if hydrateErr != nil {
+			return nil, hydrateErr
+		}
+		j.idx = idx
+	}
 	// Keep the index authoritative for the fence itself too. This is hygiene, not
 	// load-bearing: the fence always commits through the raw writeLocked path above
-	// regardless of what the index holds. A MarshalLeaseFence failure here is
-	// unreachable in practice (a LeaseFence is one uint64) and is simply not
-	// observed rather than failing a fence that has already durably committed.
+	// regardless of what the index holds. It is also not redundant with the
+	// hydration walk above, which — for a fresh session (tip 0 before this fence)
+	// — is skipped and so never observes the fence on its own. A MarshalLeaseFence
+	// failure here is unreachable in practice (a LeaseFence is one uint64) and is
+	// simply not observed rather than failing a fence that has already durably
+	// committed.
 	if body, marshalErr := journal.MarshalLeaseFence(fence.Fence()); marshalErr == nil {
 		j.idx.Observe(fence.IdempotencyID(), fenceSeq, journal.NewFingerprint(string(kindFence), body))
 	}

@@ -801,7 +801,142 @@ func TestSessionJournalOffloadedRecordHydratesIdempotencyIndex(t *testing.T) {
 	}
 }
 
+// TestOpenJournalFenceSurvivesConcurrentWriteDuringHydration is a deterministic,
+// unit-level reproduction of the TOCTOU race in OpenJournalWithOpeningAppend: the
+// opening fence's CAS write must not be fenced on a tip cached BEFORE the
+// idempotency-index hydration walk, because a still-live predecessor writer (a
+// crash-path teardown append, or a parked goroutine unblocked by context
+// cancellation) can land a durable write on the same ledger stream during that
+// walk. Rather than relying on real goroutine timing to land inside the
+// hydration window probabilistically (as the integration-level
+// TestAgentRestoreReconcilesDurableEdges/TestDelegateQueuedRequestRestores...
+// tests in internal/sessionruntime do), this test uses openRaceLedger to land the
+// concurrent write synchronously and unconditionally at hydrateIdempotencyIndex's
+// one and only Read call — the exact entry point of the walk — so the race is
+// reproduced on every run, not merely most runs.
+//
+// Before the fix: the opening fence is fenced on the pre-hydration tip, the
+// concurrent write has already advanced the real tip by the time the fence's CAS
+// lands, and OpenJournal fails closed with a spurious *journal.AppendError even
+// though nothing was actually contending for ownership.
+//
+// After the fix: OpenJournal must succeed despite the concurrent write, AND the
+// hydrated index must still have observed that write (proven by retrying it
+// through AppendIdempotent and getting Appended=false) — hydration correctness is
+// not allowed to regress along with the race fix.
+func TestOpenJournalFenceSurvivesConcurrentWriteDuringHydration(t *testing.T) {
+	t.Parallel()
+	backend := memstore.New()
+	id := newTestUUID(t)
+	name := ledgerName(id)
+
+	// Seed legitimate prior history (tip > 0) so the reopen below actually runs
+	// hydration at all — a genuinely fresh session (tip 0) skips the walk
+	// entirely and would never exercise this race.
+	st1, err := Open(backend)
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	lease1, err := st1.AcquireLease(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AcquireLease() err = %v", err)
+	}
+	if _, err := st1.OpenJournal(context.Background(), id, lease1); err != nil {
+		t.Fatalf("first OpenJournal() err = %v", err)
+	}
+	if err := lease1.Release(context.Background()); err != nil {
+		t.Fatalf("Release() err = %v", err)
+	}
+
+	// The predecessor's would-be durable write: a legitimate, decodable event
+	// envelope (not garbage bytes) so hydration's walk fails only on the
+	// invariant under test, never on an unrelated decode error.
+	racerID := newTestUUID(t)
+	racerEv := event.SessionStarted{
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: id}, EventID: racerID},
+	}
+	racerBody, err := event.MarshalEvent(racerEv)
+	if err != nil {
+		t.Fatalf("MarshalEvent() err = %v", err)
+	}
+	racerEnv, err := encodeEnvelope(envelope{V: envelopeVersion, Kind: string(kindEvent), ID: racerID.String(), Body: racerBody})
+	if err != nil {
+		t.Fatalf("encodeEnvelope() err = %v", err)
+	}
+
+	raced := &openRaceLedger{inner: backend.Ledger, name: name}
+	raced.fire = func() {
+		tip, tipErr := backend.Ledger.Tip(context.Background(), name)
+		if tipErr != nil {
+			t.Fatalf("racer Tip() err = %v", tipErr)
+		}
+		if appendErr := backend.Ledger.Append(context.Background(), name, tip, racerEnv); appendErr != nil {
+			t.Fatalf("racer Append() err = %v", appendErr)
+		}
+	}
+	comp := &storage.Composite{Ledger: raced, Leaser: backend.Leaser, KV: backend.KV, Blobs: backend.Blobs}
+
+	st2, err := Open(comp)
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	lease2, err := st2.AcquireLease(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AcquireLease() err = %v", err)
+	}
+
+	j, err := st2.OpenJournal(context.Background(), id, lease2)
+	if err != nil {
+		t.Fatalf("OpenJournal() err = %v, want success: a predecessor write landing on the ledger during hydration must not fence out this journal's own opening fence", err)
+	}
+	if j == nil {
+		t.Fatal("OpenJournal() journal = nil")
+	}
+
+	// The concurrent write must still have been captured by hydration: an
+	// identical retry of it deduplicates instead of writing a second frame.
+	idem, ok := j.(journal.IdempotentJournal)
+	if !ok {
+		t.Fatal("reopened journal does not implement journal.IdempotentJournal")
+	}
+	result, err := idem.AppendIdempotent(context.Background(), journal.NewEventRecord(racerEv))
+	if err != nil {
+		t.Fatalf("retry racer record AppendIdempotent() err = %v", err)
+	}
+	if result.Appended {
+		t.Error("retry racer record Appended = true, want false (hydration must still see the predecessor write that landed during Open)")
+	}
+}
+
 // --- test doubles ---------------------------------------------------------
+
+// openRaceLedger fires a one-time side effect the instant Read is called for its
+// bound session name — the exact entry point hydrateIdempotencyIndex uses (its
+// one and only Read call). This lets a test land a concurrent write
+// deterministically inside the hydration window on every run, rather than
+// relying on real goroutine scheduling to hit a ~650-700us race window.
+type openRaceLedger struct {
+	inner storage.Ledger
+	name  string
+	once  sync.Once
+	fire  func()
+}
+
+func (l *openRaceLedger) Append(ctx context.Context, name string, expected uint64, payload []byte) error {
+	return l.inner.Append(ctx, name, expected, payload)
+}
+func (l *openRaceLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
+	if name == l.name {
+		l.once.Do(l.fire)
+	}
+	return l.inner.Read(ctx, name, from)
+}
+func (l *openRaceLedger) Tip(ctx context.Context, name string) (uint64, error) {
+	return l.inner.Tip(ctx, name)
+}
+func (l *openRaceLedger) Delete(ctx context.Context, name string) error {
+	return l.inner.Delete(ctx, name)
+}
 
 // errVerifyRead is the leaf read failure verifyFailLedger injects so a conflict's
 // resolving Read fails, driving AppendDefinite's *storage.AppendVerifyError path.
@@ -942,4 +1077,5 @@ var (
 	_ storage.Blobs  = (*recordingBlobs)(nil)
 	_ storage.Ledger = (*blockingLedger)(nil)
 	_ storage.Ledger = (*verifyFailLedger)(nil)
+	_ storage.Ledger = (*openRaceLedger)(nil)
 )
