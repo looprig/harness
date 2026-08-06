@@ -86,7 +86,14 @@ func AssessDrift(baseline, candidate ConfigManifest) DriftAssessment {
 		add(DriftTopology, "", baseline.TopologyRev, candidate.TopologyRev, DriftInfo)
 	}
 	if baseline.ExternalCapabilityRev != candidate.ExternalCapabilityRev {
-		add(DriftExternal, "", baseline.ExternalCapabilityRev, candidate.ExternalCapabilityRev, DriftInfo)
+		// Opaque digest-only change with no strictness ordinal to compare
+		// directionally (unlike DriftConfinement/DriftPermission, which carry
+		// one): per this function's own doc, direction-unknowable changes are
+		// Warn, fail secure. A consumer's external capability set (e.g.
+		// looprig/mcp's configured servers) can change in security-relevant
+		// ways this digest cannot express tightened-vs-broadened, so treat
+		// every change as a candidate a restore should not silently adopt.
+		add(DriftExternal, "", baseline.ExternalCapabilityRev, candidate.ExternalCapabilityRev, DriftWarn)
 	}
 	assessRuntime(baseline, candidate, add)
 	assessTools(baseline, candidate, add)

@@ -26,8 +26,8 @@ func TestAssessDrift(t *testing.T) {
 			wantCategory: DriftTool, wantSeverity: DriftInfo},
 		{name: "topology change is info", mutate: func(m *ConfigManifest) { m.TopologyRev = "x" },
 			wantCategory: DriftTopology, wantSeverity: DriftInfo},
-		{name: "external catalog change is info", mutate: func(m *ConfigManifest) { m.ExternalCapabilityRev = "x" },
-			wantCategory: DriftExternal, wantSeverity: DriftInfo},
+		{name: "external catalog change is warn (unknown direction, fail secure)", mutate: func(m *ConfigManifest) { m.ExternalCapabilityRev = "x" },
+			wantCategory: DriftExternal, wantSeverity: DriftWarn},
 		{name: "confinement stricter is info", mutate: func(m *ConfigManifest) {
 			m.ConfinementRev = "x"
 			m.ConfinementStrictness = base.ConfinementStrictness + 1
