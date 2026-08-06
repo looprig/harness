@@ -420,6 +420,7 @@ func validateProcessLifecycleEvent(
 func invalidPermissionReview(name EventName, field FieldName) error {
 	return &InvalidEventError{Event: name, Field: field, Rule: RuleInvalid}
 }
+
 // Bounds for ConfigurationAdopted's durable, partly user-authored payload: a
 // hostile or buggy decision must not be able to append an unbounded record to
 // the journal, and a legacy (SchemaVersion 0) manifest projection is never
