@@ -32,6 +32,23 @@ const (
 
 var errCheckpointActivated = errors.New("sessionruntime: checkpoint canceled by session activation")
 
+// bestEffortAcquireTimeout bounds how long a best-effort checkpoint's workspace
+// permit Acquire may run while a live caller is synchronously waiting on it (see
+// runBestEffort's accepted channel). That caller is the loop actor's own
+// goroutine -- sessionIdle and the native StepDone/TurnDone boundary are both
+// invoked synchronously from the same call stack that publishes the actor's own
+// terminal events (pkg/hub's commit/derive -> CommitSessionIdle/CommitBoundary) --
+// so it must stay free to keep reading the actor's own command channel. A
+// long-running background command can hold the workspace's exclusive lifetime
+// lease well past its own turn's synchronous end, which makes Acquire block for
+// as long as that command runs. Bounding Acquire itself, rather than leaving it to
+// the full snapshot-policy timeout (60s in CodeRig's real assembly), lets a
+// stalled permit fall through to the existing "publish the trigger without a
+// checkpoint, retry on the next eligible boundary" fallback fast enough to matter
+// to a live caller. checkpointRequired/manual checkpoints never pass a non-nil
+// accepted callback into commit, so they are unaffected by this bound.
+const bestEffortAcquireTimeout = 200 * time.Millisecond
+
 type checkpointPolicy struct {
 	Trigger  checkpointTrigger
 	Priority checkpointPriority
@@ -625,7 +642,16 @@ func (c *checkpointController) runBestEffort(req checkpointRequest, triggerCommi
 		if kind == event.SnapshotTriggerKindUnknown {
 			kind = checkpointTriggerKind(req.trigger)
 		}
-		_, commitErr := c.commit(workerCtx, req.trigger, kind, commit, onAccepted)
+		// commit only needs to know onAccepted when a live caller is actually
+		// waiting on it (accepted != nil): that is precisely the signal it uses to
+		// bound its own permit Acquire (see bestEffortAcquireTimeout). A fire-and-
+		// forget walk (queued-pending drain, post-activation resume) has no such
+		// caller and keeps the full policy timeout to acquire its permit.
+		var commitAccepted func()
+		if accepted != nil {
+			commitAccepted = onAccepted
+		}
+		_, commitErr := c.commit(workerCtx, req.trigger, kind, commit, commitAccepted)
 		observe := accepted == nil || signaled
 		if accepted != nil && !signaled {
 			// Best-effort progress still requires the execution trigger to survive a
@@ -909,7 +935,18 @@ func (c *checkpointController) commit(caller context.Context, trigger event.Even
 		return "", &CheckpointError{Kind: CheckpointNotIdle}
 	}
 	durabilityAttempted = true
-	permit, err := c.cfg.Coordinator.Acquire(ctx, tool.WorkspaceOperationCheckpoint, "")
+	acquireCtx := ctx
+	if accepted != nil && c.cfg.Policy.Priority == checkpointBestEffort {
+		// A live caller (the loop actor's own goroutine) is synchronously waiting
+		// on accepted(); never let it wait anywhere near the full policy timeout
+		// for a permit that a background process may hold for a long time. This
+		// context.WithTimeout is naturally capped by ctx's own (policy) deadline
+		// when that deadline is already shorter, so it never LENGTHENS the wait.
+		var acquireCancel context.CancelFunc
+		acquireCtx, acquireCancel = context.WithTimeout(ctx, bestEffortAcquireTimeout)
+		defer acquireCancel()
+	}
+	permit, err := c.cfg.Coordinator.Acquire(acquireCtx, tool.WorkspaceOperationCheckpoint, "")
 	if err != nil {
 		return "", c.classifyError(err)
 	}

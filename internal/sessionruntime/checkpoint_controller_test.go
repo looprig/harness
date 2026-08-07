@@ -2330,6 +2330,85 @@ func TestCheckpointWorkspaceRequiresSessionIdle(t *testing.T) {
 	}
 }
 
+// TestSessionIdleBestEffortDoesNotBlockCallerOnHeldWorkspaceLease reproduces the
+// long-running-command availability bug: a best-effort checkpoint's permit
+// Acquire can be stuck behind a background process's still-held workspace
+// lifetime lease (broad-write, from AcquireLifetime -- exactly what a
+// long-running command holds for its whole run). sessionIdle's caller is the
+// loop actor's OWN goroutine (see hub.go's commit()/derive() -> CommitSessionIdle
+// -> checkpoints.sessionIdle, invoked synchronously from the same call stack that
+// PublishEvent runs on). That goroutine must stay free to read the actor's
+// Commands channel again -- a best-effort checkpoint must never make it wait
+// anywhere near the full snapshot-policy timeout just because a lease conflict
+// exists; skipping this round's checkpoint and retrying on the next eligible
+// boundary is the designed fallback (see runBestEffort's accepted-fallback
+// comment), it just needs to engage fast enough to matter to a live caller.
+func TestSessionIdleBestEffortDoesNotBlockCallerOnHeldWorkspaceLease(t *testing.T) {
+	t.Parallel()
+	ws, err := workspacestore.Open(memstore.New().Blobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "work.txt"), []byte("work"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sid := mustUUID()
+	coordinator := newWorkspaceCoordinator(nil)
+	publisher := &boundaryPublisher{order: &checkpointOrder{}, checkpointed: make(chan event.WorkspaceCheckpointed, 1)}
+	// A long, real policy timeout -- exactly like CodeRig's real 60s SnapshotPolicy
+	// assembly (internal/app/persistence.go's snapshotTimeout). Scaled down for a
+	// fast test while remaining far larger than any acceptable caller-visible wait.
+	const policyTimeout = 2 * time.Second
+	c := newCheckpointController(checkpointControllerConfig{
+		SessionID: sid,
+		Policy:    checkpointPolicy{Trigger: checkpointOnIdle, Priority: checkpointBestEffort, Timeout: policyTimeout},
+		Store:     ws, Root: root, Mode: PlacementSession, Coordinator: coordinator,
+		Publisher: publisher, Factory: event.NewFactory(uuid.New, time.Now),
+	})
+	t.Cleanup(c.shutdown)
+
+	// Simulate a background long-running command still holding its workspace
+	// lifetime lease when the session goes idle -- structurally impossible before
+	// background processes existed, now reachable any time a command outlives its
+	// own turn.
+	background, err := coordinator.AcquireLifetime(context.Background(), tool.NewWorkspaceAccess(tool.WorkspaceAccessBroadWrite, nil, nil))
+	if err != nil {
+		t.Fatalf("AcquireLifetime() error = %v", err)
+	}
+	defer background.Release()
+
+	idle := event.SessionIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: mustUUID()}}
+	idleDone := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		idleDone <- c.sessionIdle(context.Background(), idle, func() error {
+			return publisher.PublishEventChecked(context.Background(), idle)
+		})
+	}()
+
+	// Confirm the checkpoint really did queue behind the held lease -- proves this
+	// test exercises the reported conflict rather than passing vacuously.
+	awaitQueued(t, coordinator, 1)
+
+	// The actor must not be held anywhere near the full policy timeout. 500ms is a
+	// generous, implementation-independent SLA: comfortably above a healthy
+	// permit-acquire round trip, comfortably below the 2s policyTimeout the buggy
+	// code needs (it can only unblock once Acquire's own context times out).
+	const maxCallerWait = 500 * time.Millisecond
+	select {
+	case err := <-idleDone:
+		if err != nil {
+			t.Fatalf("sessionIdle returned error: %v", err)
+		}
+	case <-time.After(maxCallerWait):
+		t.Fatalf("sessionIdle blocked its caller (the loop actor's own goroutine) for more than %s while a background process held the workspace lease", maxCallerWait)
+	}
+	if elapsed := time.Since(start); elapsed >= policyTimeout {
+		t.Fatalf("sessionIdle waited %s -- the full policy timeout -- instead of giving up on the stalled permit quickly", elapsed)
+	}
+}
+
 func TestShutdownCancelsCheckpointControllerBeforeLeaseRelease(t *testing.T) {
 	t.Parallel()
 	ws, root := checkpointFixture(t, nil)
