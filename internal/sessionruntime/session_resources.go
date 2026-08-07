@@ -555,9 +555,26 @@ func (r *sessionResources) GetOrCreate(
 		path := r.resourcePath(key)
 		r.mu.Unlock()
 
-		// Factories run without a registry lock and must return; their public
-		// contract has no cancellation parameter.
-		resource, createErr := factory(path)
+		// The registry itself provisions the private, owner-only per-key
+		// resource directory before ever handing it to a factory
+		// (pkg/tool.SessionResourceRegistry's own doc comment: "The factory
+		// receives its private storage directory" -- received, not
+		// self-provisioned). Reuses the exact same secure primitive the
+		// session-level resource root one level up is created with
+		// (createPrivateSessionResourceRoot, session_resource_storage_*.go),
+		// so both roots share one 0700 security convention. A factory (or,
+		// as is the common real case, that resource's later use, e.g.
+		// tools/process.ManifestStore.Save) must never have to MkdirAll its
+		// own storage root itself, and two resources racing to create the
+		// identical directory would otherwise be redundant, error-prone work
+		// every factory would have to duplicate.
+		var resource tool.SessionResource
+		createErr := createPrivateSessionResourceRoot(path)
+		if createErr == nil {
+			// Factories run without a registry lock and must return; their
+			// public contract has no cancellation parameter.
+			resource, createErr = factory(path)
+		}
 		if createErr == nil && nilSessionResource(resource) {
 			createErr = errSessionResourceNil
 		}

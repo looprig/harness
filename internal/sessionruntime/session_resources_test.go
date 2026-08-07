@@ -142,6 +142,59 @@ func TestSessionResourcesGetOrCreateSingleFlight(t *testing.T) {
 	}
 }
 
+// TestSessionResourcesGetOrCreateProvisionsPrivateResourceDirectory proves
+// GetOrCreate creates the per-key private resource directory it hands to a
+// factory (pkg/tool.SessionResourceRegistry's own doc comment: "The factory
+// receives its private storage directory") BEFORE ever calling that
+// factory, and that the directory is owner-only (0700, matching
+// createPrivateSessionResourceRoot's -- session_resource_storage_*.go --
+// established security convention for the session-level resource root one
+// level up). Every existing GetOrCreate test's fake factory either ignores
+// path or only inspects it structurally (filepath.Dir comparisons); none
+// ever performs real file I/O against it, which is exactly why a factory
+// that DOES (e.g. github.com/looprig/tools/process's ManifestStore, the
+// first real-world caller to actually write a file there) previously failed
+// with a bare "no such file or directory" the first time it tried to
+// persist anything -- discovered via Coderig's Task 28 end-to-end
+// integration tests, the first place in this whole feature that exercises
+// a real session resource through the real registry with a factory that
+// performs real disk I/O.
+func TestSessionResourcesGetOrCreateProvisionsPrivateResourceDirectory(t *testing.T) {
+	registry := newSessionResources(t.TempDir())
+
+	var observedPath string
+	got, err := registry.GetOrCreate(context.Background(), "provisioned", func(path string) (tool.SessionResource, error) {
+		observedPath = path
+		// The real-world failure mode this test guards against: a factory
+		// (or, as here, a stand-in for one) that immediately performs real
+		// file I/O against its handed directory, exactly like
+		// tools/process.NewManifestStore's eventual Save call does.
+		if writeErr := os.WriteFile(filepath.Join(path, "probe.txt"), []byte("ok"), 0o600); writeErr != nil {
+			return nil, fmt.Errorf("factory could not write into its own handed directory %q: %w", path, writeErr)
+		}
+		return &testSessionResource{}, nil
+	})
+	if err != nil {
+		t.Fatalf("GetOrCreate() error = %v, want nil (the handed directory must already exist and be writable)", err)
+	}
+	if got == nil {
+		t.Fatal("GetOrCreate() resource = nil")
+	}
+
+	info, statErr := os.Stat(observedPath)
+	if statErr != nil {
+		t.Fatalf("os.Stat(%q) error = %v, want the directory to exist", observedPath, statErr)
+	}
+	if !info.IsDir() {
+		t.Fatalf("resource path %q is not a directory", observedPath)
+	}
+	if runtime.GOOS != "windows" {
+		if mode := info.Mode().Perm(); mode&0o077 != 0 {
+			t.Errorf("resource directory mode = %o, want owner-only (no group/other bits)", mode)
+		}
+	}
+}
+
 func TestSessionResourcesCreationFailureCanRetry(t *testing.T) {
 	registry := newSessionResources(t.TempDir())
 	wantErr := errors.New("creation failed")
