@@ -3,7 +3,6 @@ package delegationtool
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"unicode/utf8"
 
 	"github.com/looprig/harness/pkg/identity"
@@ -66,11 +65,14 @@ func executeAgentCall(ctx context.Context, controller tool.DelegateController, o
 	}
 	result, err := controller.Execute(ctx, req)
 	if err != nil {
-		var modelFacing interface{ ModelFacingError() string }
-		if errors.As(err, &modelFacing) {
-			if message := modelFacing.ModelFacingError(); message != "" {
-				return tool.TextResult("error: " + message), nil
+		if operation == tool.DelegateStart {
+			if detail, marked := tool.ModelFacingErrorDetail(err); marked {
+				return tool.TextResult(formatStartAgentFailure(detail)), nil
 			}
+			return tool.TextResult("error: agent failed"), nil
+		}
+		if detail, marked := tool.ModelFacingErrorDetail(err); marked && detail != "" {
+			return tool.TextResult("error: " + tool.BoundModelFacingErrorDetail(detail)), nil
 		}
 		return tool.TextResult("error: agent request failed"), nil
 	}

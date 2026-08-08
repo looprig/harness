@@ -3,6 +3,7 @@ package delegationtool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -106,6 +107,69 @@ func TestFailedStartAgentBoundsMalformedFailureDetail(t *testing.T) {
 	}
 	if !strings.HasPrefix(got, "error: agent failed: ") {
 		t.Fatalf("result = %q, want bounded failure detail", got)
+	}
+}
+
+type fabricatedStartModelFacingMarker struct{ detail string }
+
+func (e fabricatedStartModelFacingMarker) ModelFacingError() string { return e.detail }
+
+type fabricatedStartModelFacingAsError struct{ detail string }
+
+func (e fabricatedStartModelFacingAsError) Error() string { return "ordinary start failure" }
+
+func (e fabricatedStartModelFacingAsError) As(target any) bool {
+	modelFacing, ok := target.(*interface{ ModelFacingError() string })
+	if !ok {
+		return false
+	}
+	*modelFacing = fabricatedStartModelFacingMarker(e)
+	return true
+}
+
+type markedStartFailure struct{ detail string }
+
+func (e markedStartFailure) Error() string { return "ordinary start failure" }
+
+func (e markedStartFailure) ModelFacingError() string { return e.detail }
+
+func TestStartAgentImmediateErrorDoesNotTrustCustomAs(t *testing.T) {
+	t.Parallel()
+	controller := &fakeController{execErr: fabricatedStartModelFacingAsError{detail: "secret"}}
+	start := NewStartAgent(controller, loop.DelegationManaged, agentCatalog())
+	result, err := invokePrepared(t, start, `{"name":"map","instructions":"inspect","agent_type":"explorer"}`)
+	if err != nil {
+		t.Fatalf("InvokableRun() error = %v", err)
+	}
+	if got := textOf(t, result); got != "error: agent failed" {
+		t.Fatalf("result = %q, want generic failed result", got)
+	}
+}
+
+func TestStartAgentImmediateMarkedErrorUsesFailurePrefix(t *testing.T) {
+	t.Parallel()
+	const detail = "runtime selection is unavailable"
+	controller := &fakeController{execErr: markedStartFailure{detail: detail}}
+	start := NewStartAgent(controller, loop.DelegationManaged, agentCatalog())
+	result, err := invokePrepared(t, start, `{"name":"map","instructions":"inspect","agent_type":"explorer"}`)
+	if err != nil {
+		t.Fatalf("InvokableRun() error = %v", err)
+	}
+	if got := textOf(t, result); got != "error: agent failed: "+detail {
+		t.Fatalf("result = %q, want failure prefix and detail", got)
+	}
+}
+
+func TestStartAgentOrdinaryImmediateErrorUsesGenericFailure(t *testing.T) {
+	t.Parallel()
+	controller := &fakeController{execErr: errors.New("provider secret")}
+	start := NewStartAgent(controller, loop.DelegationManaged, agentCatalog())
+	result, err := invokePrepared(t, start, `{"name":"map","instructions":"inspect","agent_type":"explorer"}`)
+	if err != nil {
+		t.Fatalf("InvokableRun() error = %v", err)
+	}
+	if got := textOf(t, result); got != "error: agent failed" {
+		t.Fatalf("result = %q, want generic failed result", got)
 	}
 }
 

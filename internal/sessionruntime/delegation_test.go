@@ -56,6 +56,23 @@ func (e *markedDelegateFailure) Error() string { return "ordinary failure: " + e
 
 func (e *markedDelegateFailure) ModelFacingError() string { return e.detail }
 
+type fabricatedModelFacingMarker struct{ detail string }
+
+func (e fabricatedModelFacingMarker) ModelFacingError() string { return e.detail }
+
+type fabricatedModelFacingAsError struct{ detail string }
+
+func (e fabricatedModelFacingAsError) Error() string { return "ordinary failure with malicious As" }
+
+func (e fabricatedModelFacingAsError) As(target any) bool {
+	modelFacing, ok := target.(*interface{ ModelFacingError() string })
+	if !ok {
+		return false
+	}
+	*modelFacing = fabricatedModelFacingMarker(e)
+	return true
+}
+
 func newTrackingDelegateSubscription() *trackingDelegateSubscription {
 	return &trackingDelegateSubscription{events: make(chan event.Delivery)}
 }
@@ -1146,9 +1163,24 @@ func TestDelegateFailureDetailTraversesDrainWrapper(t *testing.T) {
 	}
 }
 
+func TestDelegateFailureDetailRejectsFabricatedAsAndSecretJoinSiblings(t *testing.T) {
+	t.Parallel()
+	const secret = "provider secret must stay hidden"
+	if got := delegateFailureDetail(fabricatedModelFacingAsError{detail: secret}); got != "" {
+		t.Fatalf("malicious As detail = %q, want empty", got)
+	}
+	if got := delegateFailureDetail(errors.Join(errors.New(secret), fabricatedModelFacingAsError{detail: secret})); got != "" {
+		t.Fatalf("joined malicious As detail = %q, want empty", got)
+	}
+	const safe = "retry later"
+	if got := delegateFailureDetail(errors.Join(errors.New(secret), &markedDelegateFailure{detail: safe})); got != safe {
+		t.Fatalf("joined marked detail = %q, want %q", got, safe)
+	}
+}
+
 func TestRestoredBackgroundFailureDetailUsesDurableTurnFailure(t *testing.T) {
 	t.Parallel()
-	requestID, turnID, childID, parentID := mustUUID(), mustUUID(), mustUUID(), mustUUID()
+	requestID, turnID, childID, parentID, sessionID := mustUUID(), mustUUID(), mustUUID(), mustUUID(), mustUUID()
 	const detail = "ACP error 429: retry later"
 	background := command.UserInput{
 		Header:             command.Header{CommandID: requestID, Agency: identity.AgencyMachine},
@@ -1169,8 +1201,17 @@ func TestRestoredBackgroundFailureDetailUsesDurableTurnFailure(t *testing.T) {
 			Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID},
 			Cause:       identity.Cause{CommandID: requestID},
 		}},
-		event.TurnFailed{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}}, Err: &markedDelegateFailure{detail: detail}},
+		event.TurnFailed{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: childID, TurnID: turnID}, EventID: mustUUID()}, Err: &markedDelegateFailure{detail: detail}},
 	}
+	serializedFailure, err := event.MarshalEvent(replayed[2])
+	if err != nil {
+		t.Fatalf("MarshalEvent(TurnFailed) error = %v", err)
+	}
+	restoredFailure, err := event.UnmarshalEvent(serializedFailure)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent(TurnFailed) error = %v", err)
+	}
+	replayed[2] = restoredFailure
 	manager := newDelegationManager(Topology{})
 	records := []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), childID, background)}
 	if err := seedResolvedDelegateRecords(manager, records, replayed, nil); err != nil {

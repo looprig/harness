@@ -274,13 +274,13 @@ func marshalPermissionRequested(e PermissionRequested) ([]byte, error) {
 }
 
 // turnFailedWire is TurnFailed's wire form: the Err interface has no general codec,
-// so it is projected to a stable {kind,message} pair (RestoredError) — kind from
-// ErrKind, message from Err.Error() — preserving the human-readable cause even when
-// the concrete type cannot survive.
+// so it is projected to a stable {kind,message} pair plus an additive explicit
+// model-facing classification/detail when the live error opts into that marker.
+// Legacy records containing only {kind,message} remain ordinary on restore.
 type turnFailedWire struct {
 	Header
-	TurnIndex TurnIndex      `json:"turn_index,omitzero"`
-	Err       *RestoredError `json:"err,omitempty"`
+	TurnIndex TurnIndex          `json:"turn_index,omitzero"`
+	Err       *restoredErrorWire `json:"err,omitempty"`
 }
 
 func marshalTurnFailed(e TurnFailed) ([]byte, error) {
@@ -295,11 +295,10 @@ func marshalTurnFailed(e TurnFailed) ([]byte, error) {
 	return out, nil
 }
 
-// restoreErroredWire mirrors turnFailedWire for the session-scoped restore failure:
-// Err projects to the same {kind,message} RestoredError pair.
+// restoreErroredWire mirrors turnFailedWire for the session-scoped restore failure.
 type restoreErroredWire struct {
 	Header
-	Err *RestoredError `json:"err,omitempty"`
+	Err *restoredErrorWire `json:"err,omitempty"`
 }
 
 func marshalRestoreErrored(e RestoreErrored) ([]byte, error) {
@@ -313,25 +312,63 @@ func marshalRestoreErrored(e RestoreErrored) ([]byte, error) {
 	return out, nil
 }
 
-// projectError projects a live error to its durable {kind,message} form. A nil
-// error projects to KindUnknown with an empty message (an absent cause), so the
-// restored event always carries a *RestoredError rather than a typed-nil — matching
-// the reconstructed-on-unmarshal contract the round-trip test asserts. An already-
-// restored *RestoredError (the decode form, re-marshaled by journal compaction /
-// checkpoint re-persist) copies its fields directly rather than calling Error():
-// (*RestoredError).Error() renders "<kind>: <message>", so re-projecting through it
-// would accrete a "<kind>: " prefix onto Message on every cycle. Copying makes
-// re-marshal a fixed point — Kind AND Message stable across any number of round-trips
-// (ErrKind already keeps Kind stable the same way).
-func projectError(err error) *RestoredError {
+// restoredErrorWire is the additive durable projection for an error-bearing event.
+// model_facing and model_facing_detail are omitted for ordinary errors, preserving
+// the legacy {kind,message} shape. Safety is accepted only when the explicit boolean
+// marker is true; message/kind alone never opt an error into the model-facing path.
+type restoredErrorWire struct {
+	Kind              string `json:"kind"`
+	Message           string `json:"message"`
+	ModelFacing       bool   `json:"model_facing,omitempty"`
+	ModelFacingDetail string `json:"model_facing_detail,omitempty"`
+}
+
+func (w *restoredErrorWire) errorValue() error {
+	if w == nil {
+		return nil
+	}
+	if w.ModelFacing {
+		return &RestoredModelFacingError{
+			Kind: w.Kind, Message: w.Message,
+			Detail: tool.BoundModelFacingErrorDetail(w.ModelFacingDetail),
+		}
+	}
+	return &RestoredError{Kind: w.Kind, Message: w.Message}
+}
+
+// projectError projects a live error to its durable form. A nil error projects to
+// KindUnknown with an empty message (an absent cause), so the restored event always
+// carries a concrete ordinary RestoredError. An explicitly marked safe detail is
+// copied into separate additive fields after normalization; no ordinary error text
+// or stable kind can opt into that classification.
+func projectError(err error) *restoredErrorWire {
 	if err == nil {
-		return &RestoredError{Kind: KindUnknown, Message: ""}
+		return &restoredErrorWire{Kind: KindUnknown, Message: ""}
+	}
+	var modelRestored *RestoredModelFacingError
+	if errors.As(err, &modelRestored) && modelRestored != nil {
+		wire := &restoredErrorWire{Kind: modelRestored.Kind, Message: modelRestored.Message}
+		if detail, marked := tool.ModelFacingErrorDetail(err); marked {
+			wire.ModelFacing = true
+			wire.ModelFacingDetail = tool.BoundModelFacingErrorDetail(detail)
+		}
+		return wire
 	}
 	var restored *RestoredError
 	if errors.As(err, &restored) {
-		return &RestoredError{Kind: restored.Kind, Message: restored.Message}
+		wire := &restoredErrorWire{Kind: restored.Kind, Message: restored.Message}
+		if detail, marked := tool.ModelFacingErrorDetail(err); marked {
+			wire.ModelFacing = true
+			wire.ModelFacingDetail = tool.BoundModelFacingErrorDetail(detail)
+		}
+		return wire
 	}
-	return &RestoredError{Kind: ErrKind(err), Message: err.Error()}
+	wire := &restoredErrorWire{Kind: ErrKind(err), Message: err.Error()}
+	if detail, marked := tool.ModelFacingErrorDetail(err); marked {
+		wire.ModelFacing = true
+		wire.ModelFacingDetail = tool.BoundModelFacingErrorDetail(detail)
+	}
+	return wire
 }
 
 // mergeEnvelope merges the type discriminator and schema version into a pre-encoded
@@ -854,7 +891,7 @@ func decodeTurnFailed(data []byte) (Event, error) {
 	}
 	ev := TurnFailed{Header: w.Header, TurnIndex: w.TurnIndex}
 	if w.Err != nil {
-		ev.Err = w.Err
+		ev.Err = w.Err.errorValue()
 	}
 	return ev, nil
 }
@@ -866,7 +903,7 @@ func decodeRestoreErrored(data []byte) (Event, error) {
 	}
 	ev := RestoreErrored{Header: w.Header}
 	if w.Err != nil {
-		ev.Err = w.Err
+		ev.Err = w.Err.errorValue()
 	}
 	return ev, nil
 }

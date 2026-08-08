@@ -5,8 +5,10 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -736,6 +738,115 @@ func TestMarshalEventTurnFailedErrProjection(t *testing.T) {
 			re := RestoreErrored{Header: fullHeaderSession(), Err: tt.err}
 			assertErrRoundTrip(t, re, func(ev Event) error { return ev.(RestoreErrored).Err }, tt.wantKind, tt.wantMsg)
 		})
+	}
+}
+
+type markedEventFailure struct{ detail string }
+
+func (e markedEventFailure) Error() string { return "provider failure: " + e.detail }
+
+func (e markedEventFailure) ModelFacingError() string { return e.detail }
+
+func TestMarshalEventPreservesExplicitModelFacingTurnFailureDetail(t *testing.T) {
+	t.Parallel()
+	const detail = "ACP error 429: retry later"
+
+	data, err := MarshalEvent(TurnFailed{Header: fullHeaderTurn(), TurnIndex: 5, Err: markedEventFailure{detail: detail}})
+	if err != nil {
+		t.Fatalf("MarshalEvent() error = %v", err)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatalf("json.Unmarshal(wire) error = %v", err)
+	}
+	var errWire map[string]json.RawMessage
+	if err := json.Unmarshal(wire["err"], &errWire); err != nil {
+		t.Fatalf("json.Unmarshal(err) error = %v", err)
+	}
+	if _, ok := errWire["model_facing"]; !ok {
+		t.Fatalf("wire error missing explicit model_facing classification: %s", data)
+	}
+
+	decoded, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent() error = %v", err)
+	}
+	restored := decoded.(TurnFailed).Err
+	modelFacing, ok := restored.(interface{ ModelFacingError() string })
+	if !ok {
+		t.Fatalf("restored error %T does not implement ModelFacingError", restored)
+	}
+	if got := modelFacing.ModelFacingError(); got != detail {
+		t.Fatalf("restored safe detail = %q, want %q", got, detail)
+	}
+}
+
+func TestUnmarshalEventOrdinaryAndLegacyTurnFailureErrorsRemainNonModelFacing(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"ordinary", "legacy"} {
+		t.Run(name, func(t *testing.T) {
+			var original error = errSentinel{}
+			data, err := MarshalEvent(TurnFailed{Header: fullHeaderTurn(), TurnIndex: 5, Err: original})
+			if err != nil {
+				t.Fatalf("MarshalEvent() error = %v", err)
+			}
+			if name == "legacy" {
+				var wire map[string]json.RawMessage
+				if err := json.Unmarshal(data, &wire); err != nil {
+					t.Fatalf("json.Unmarshal(wire) error = %v", err)
+				}
+				var errWire map[string]json.RawMessage
+				if err := json.Unmarshal(wire["err"], &errWire); err != nil {
+					t.Fatalf("json.Unmarshal(err) error = %v", err)
+				}
+				delete(errWire, "model_facing")
+				delete(errWire, "model_facing_detail")
+				encodedErr, err := json.Marshal(errWire)
+				if err != nil {
+					t.Fatalf("json.Marshal(err) error = %v", err)
+				}
+				wire["err"] = encodedErr
+				data, err = json.Marshal(wire)
+				if err != nil {
+					t.Fatalf("json.Marshal(wire) error = %v", err)
+				}
+			}
+			decoded, err := UnmarshalEvent(data)
+			if err != nil {
+				t.Fatalf("UnmarshalEvent() error = %v", err)
+			}
+			restored := decoded.(TurnFailed).Err
+			if _, ok := restored.(interface{ ModelFacingError() string }); ok {
+				t.Fatalf("restored %s error %T unexpectedly implements ModelFacingError", name, restored)
+			}
+		})
+	}
+}
+
+func TestMarshalEventBoundsAndNormalizesModelFacingTurnFailureDetail(t *testing.T) {
+	t.Parallel()
+	detail := strings.Repeat("界", tool.MaxModelFacingErrorBytes) + "\xff"
+	data, err := MarshalEvent(TurnFailed{Header: fullHeaderTurn(), TurnIndex: 5, Err: markedEventFailure{detail: detail}})
+	if err != nil {
+		t.Fatalf("MarshalEvent() error = %v", err)
+	}
+	decoded, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent() error = %v", err)
+	}
+	modelFacing, ok := decoded.(TurnFailed).Err.(interface{ ModelFacingError() string })
+	if !ok {
+		t.Fatalf("restored error does not implement ModelFacingError")
+	}
+	got := modelFacing.ModelFacingError()
+	if len(got) > tool.MaxModelFacingErrorBytes {
+		t.Fatalf("restored detail bytes = %d, want <= %d", len(got), tool.MaxModelFacingErrorBytes)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatal("restored detail is not valid UTF-8")
+	}
+	if strings.ContainsRune(got, utf8.RuneError) {
+		t.Fatal("restored detail contains a replacement rune from partial truncation")
 	}
 }
 

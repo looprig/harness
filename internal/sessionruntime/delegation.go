@@ -1256,23 +1256,19 @@ func boundUTF8(value string, limit int) string {
 
 // delegateFailureDetail crosses the child-to-parent boundary only for an error
 // that explicitly opts into the narrow model-facing projection. The drain wraps
-// TurnFailed.Err, so errors.As deliberately traverses that wrapper without
-// exposing arbitrary Error() text. A malformed or oversized projection is made
-// valid and bounded before it reaches a result or durable completion envelope.
+// TurnFailed.Err; the shared traversal follows only real wrapper/join links and
+// never invokes a custom errors.As implementation. A malformed or oversized
+// projection is made valid and bounded before it reaches a result or durable
+// completion envelope.
 func delegateFailureDetail(err error) (detail string) {
 	if err == nil {
 		return ""
 	}
-	var modelFacing interface{ ModelFacingError() string }
-	if !errors.As(err, &modelFacing) || modelFacing == nil {
+	detail, marked := tool.ModelFacingErrorDetail(err)
+	if !marked {
 		return ""
 	}
-	defer func() {
-		if recover() != nil {
-			detail = ""
-		}
-	}()
-	return boundUTF8(modelFacing.ModelFacingError(), maxDelegateOutputBytes)
+	return boundUTF8(detail, maxDelegateOutputBytes)
 }
 
 func runePrefixEnds(value string) []int {

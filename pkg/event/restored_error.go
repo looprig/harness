@@ -9,6 +9,9 @@ import "errors"
 // pair on marshal and reconstructs a *RestoredError on unmarshal. Kind is the stable
 // classification (see ErrKind); Message is the original Error() text, preserved
 // verbatim so no human-readable detail is lost even when the concrete type is not.
+// RestoredError deliberately does not implement ModelFacingError: ordinary and
+// legacy journal records must never become model-facing merely because their
+// message or kind happens to look safe.
 type RestoredError struct {
 	Kind    string `json:"kind"`
 	Message string `json:"message"`
@@ -16,6 +19,27 @@ type RestoredError struct {
 
 // Error renders "<kind>: <message>", mirroring how the original typed cause read.
 func (e *RestoredError) Error() string { return e.Kind + ": " + e.Message }
+
+// RestoredModelFacingError is the distinct restore form for an error that was
+// explicitly marked safe before it crossed the durable event boundary. Detail is
+// kept separate from Kind and Message so the restore path never infers safety
+// from arbitrary legacy error text.
+type RestoredModelFacingError struct {
+	Kind    string `json:"kind"`
+	Message string `json:"message"`
+	Detail  string `json:"-"`
+}
+
+func (e *RestoredModelFacingError) Error() string { return e.Kind + ": " + e.Message }
+
+// ModelFacingError returns the already-normalized, bounded detail persisted by
+// the event codec. Callers still bound it at their presentation boundary.
+func (e *RestoredModelFacingError) ModelFacingError() string {
+	if e == nil {
+		return ""
+	}
+	return e.Detail
+}
 
 // Stable kind strings ErrKind projects the event package's own TurnFailed.Err causes
 // to. They are part of the durable wire contract: never rename one (old journals
@@ -47,10 +71,11 @@ func ErrKind(err error) string {
 		return KindUnknown
 	}
 	var (
-		empty    *EmptyResponseError
-		toolLim  *ToolLimitError
-		panicErr *TurnPanicError
-		restored *RestoredError
+		empty         *EmptyResponseError
+		toolLim       *ToolLimitError
+		panicErr      *TurnPanicError
+		restored      *RestoredError
+		modelRestored *RestoredModelFacingError
 	)
 	switch {
 	case errors.As(err, &empty):
@@ -59,6 +84,8 @@ func ErrKind(err error) string {
 		return KindToolLimit
 	case errors.As(err, &panicErr):
 		return KindTurnPanic
+	case errors.As(err, &modelRestored):
+		return modelRestored.Kind
 	case errors.As(err, &restored):
 		// Idempotent: re-projecting an already-restored error preserves its Kind
 		// rather than collapsing it to "unknown" on a second round-trip.
