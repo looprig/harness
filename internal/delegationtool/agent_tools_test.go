@@ -68,6 +68,47 @@ func TestFormatForegroundBoundsEncodedEscapedResponse(t *testing.T) {
 	}
 }
 
+func TestFailedStartAgentFormatsSafeFailureDetail(t *testing.T) {
+	t.Parallel()
+	const detail = "ACP error 429: retry later"
+	controller := &fakeController{result: tool.DelegateResult{
+		ResponseStatus: tool.DelegateResponseFailed,
+		Response:       detail,
+	}}
+	start := NewStartAgent(controller, loop.DelegationManaged, agentCatalog())
+	result, err := invokePrepared(t, start, `{"name":"map","instructions":"inspect","agent_type":"explorer"}`)
+	if err != nil {
+		t.Fatalf("InvokableRun() error = %v", err)
+	}
+	if got := textOf(t, result); got != "error: agent failed: "+detail {
+		t.Fatalf("result = %q, want safe failure detail", got)
+	}
+}
+
+func TestFailedStartAgentBoundsMalformedFailureDetail(t *testing.T) {
+	t.Parallel()
+	detail := strings.Repeat("界", maxAgentResultBytes) + "\xff"
+	controller := &fakeController{result: tool.DelegateResult{
+		ResponseStatus: tool.DelegateResponseFailed,
+		Response:       detail,
+	}}
+	start := NewStartAgent(controller, loop.DelegationManaged, agentCatalog())
+	result, err := invokePrepared(t, start, `{"name":"map","instructions":"inspect","agent_type":"explorer"}`)
+	if err != nil {
+		t.Fatalf("InvokableRun() error = %v", err)
+	}
+	got := textOf(t, result)
+	if len(got) > maxAgentResultBytes {
+		t.Fatalf("result bytes = %d, want <= %d", len(got), maxAgentResultBytes)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatal("result is not valid UTF-8")
+	}
+	if !strings.HasPrefix(got, "error: agent failed: ") {
+		t.Fatalf("result = %q, want bounded failure detail", got)
+	}
+}
+
 type fakeController struct {
 	mu       sync.Mutex
 	result   tool.DelegateResult

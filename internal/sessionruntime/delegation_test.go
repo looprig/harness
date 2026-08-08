@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -48,6 +49,12 @@ type trackingDelegateSubscription struct {
 	events chan event.Delivery
 	closed atomic.Int32
 }
+
+type markedDelegateFailure struct{ detail string }
+
+func (e *markedDelegateFailure) Error() string { return "ordinary failure: " + e.detail }
+
+func (e *markedDelegateFailure) ModelFacingError() string { return e.detail }
 
 func newTrackingDelegateSubscription() *trackingDelegateSubscription {
 	return &trackingDelegateSubscription{events: make(chan event.Delivery)}
@@ -1078,6 +1085,111 @@ func TestRestoreDoesNotAdmitForegroundDelegateIntentAsBackgroundHandBack(t *test
 	}
 	if got, ok := durableResolvedRecord(manager, requestID); ok {
 		t.Fatalf("foreground delegate intent was admitted as background hand-back: %+v", got)
+	}
+}
+
+func TestDelegateFailureDetailUsesOnlyMarkedTurnFailureCause(t *testing.T) {
+	t.Parallel()
+	requestID, turnID, childID := mustUUID(), mustUUID(), mustUUID()
+	started := event.TurnStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID},
+		Cause:       identity.Cause{CommandID: requestID},
+	}}
+	tests := []struct {
+		name       string
+		err        error
+		wantDetail string
+		wantMarked bool
+		wantStatus tool.DelegateStatusValue
+	}{
+		{name: "marked", err: &markedDelegateFailure{detail: "ACP error 429: retry later"}, wantDetail: "ACP error 429: retry later", wantMarked: true, wantStatus: tool.DelegateStatusFailed},
+		{name: "ordinary", err: errors.New("provider secret must stay hidden"), wantStatus: tool.DelegateStatusFailed},
+		{name: "oversized malformed marked", err: &markedDelegateFailure{detail: strings.Repeat("界", maxDelegateOutputBytes) + "\xff"}, wantMarked: true, wantStatus: tool.DelegateStatusFailed},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			events := []event.Event{
+				started,
+				event.TurnFailed{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}}, Err: tt.err},
+			}
+			resolved, ok := foldDelegateTerminals(events)[requestID]
+			if !ok || resolved.status != tt.wantStatus {
+				t.Fatalf("resolved = %+v, %v; want failed terminal", resolved, ok)
+			}
+			if tt.wantMarked && tt.wantDetail != "" && resolved.text != tt.wantDetail {
+				t.Fatalf("resolved detail = %q, want %q", resolved.text, tt.wantDetail)
+			}
+			if !tt.wantMarked && resolved.text != "" {
+				t.Fatalf("ordinary failure detail = %q, want generic empty detail", resolved.text)
+			}
+			if tt.name == "oversized malformed marked" {
+				if len(resolved.text) > maxDelegateOutputBytes {
+					t.Fatalf("resolved detail bytes = %d, want <= %d", len(resolved.text), maxDelegateOutputBytes)
+				}
+				if !utf8.ValidString(resolved.text) {
+					t.Fatal("resolved detail is not valid UTF-8")
+				}
+			}
+		})
+	}
+}
+
+func TestDelegateFailureDetailTraversesDrainWrapper(t *testing.T) {
+	t.Parallel()
+	const detail = "ACP error 429: retry later"
+	if got := delegateFailureDetail(&drainFailedError{Cause: &markedDelegateFailure{detail: detail}}); got != detail {
+		t.Fatalf("wrapped marked detail = %q, want %q", got, detail)
+	}
+	if got := delegateFailureDetail(&drainFailedError{Cause: errors.New("provider secret must stay hidden")}); got != "" {
+		t.Fatalf("wrapped ordinary detail = %q, want generic empty detail", got)
+	}
+}
+
+func TestRestoredBackgroundFailureDetailUsesDurableTurnFailure(t *testing.T) {
+	t.Parallel()
+	requestID, turnID, childID, parentID := mustUUID(), mustUUID(), mustUUID(), mustUUID()
+	const detail = "ACP error 429: retry later"
+	background := command.UserInput{
+		Header:             command.Header{CommandID: requestID, Agency: identity.AgencyMachine},
+		NoFold:             true,
+		TargetLoopID:       childID,
+		BackgroundHandBack: true,
+	}
+	replayed := []event.Event{
+		event.LoopStarted{
+			Header: event.Header{
+				Coordinates: identity.Coordinates{LoopID: childID},
+				Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: parentID}},
+			},
+			DisplayName:      "worker",
+			InitialRequestID: requestID,
+		},
+		event.TurnStarted{Header: event.Header{
+			Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID},
+			Cause:       identity.Cause{CommandID: requestID},
+		}},
+		event.TurnFailed{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}}, Err: &markedDelegateFailure{detail: detail}},
+	}
+	manager := newDelegationManager(Topology{})
+	records := []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), childID, background)}
+	if err := seedResolvedDelegateRecords(manager, records, replayed, nil); err != nil {
+		t.Fatal(err)
+	}
+	s := &Session{loops: map[uuid.UUID]*loopHandle{}}
+	plan, err := manager.planRestoredBackgroundRequests(s, records, replayed, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) != 1 {
+		t.Fatalf("restore plan = %+v, want one failure completion", plan)
+	}
+	if plan[0].resolved.status != tool.DelegateStatusFailed || plan[0].resolved.text != detail {
+		t.Fatalf("restored result = %+v, want failed detail %q", plan[0].resolved, detail)
+	}
+	completion, ok := decodeBackgroundCompletion(backgroundCompletionBlocks(childID, plan[0].name, requestID, plan[0].resolved.status, plan[0].resolved.text))
+	if !ok || completion.ResponseStatus != tool.DelegateResponseFailed || completion.Response != detail {
+		t.Fatalf("restored completion = %+v, %v; want failed detail %q", completion, ok, detail)
 	}
 }
 

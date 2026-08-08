@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -510,7 +511,7 @@ func foldDelegateTerminals(events []event.Event) map[uuid.UUID]resolvedRequest {
 			}
 		case event.TurnFailed:
 			if k, ok := byTurn[e.Coordinates.TurnID]; ok && !k.commandID.IsZero() {
-				out[k.commandID] = resolvedRequest{childID: k.loopID, status: tool.DelegateStatusFailed}
+				out[k.commandID] = resolvedRequest{childID: k.loopID, status: tool.DelegateStatusFailed, text: delegateFailureDetail(e.Err)}
 			}
 		case event.TurnInterrupted:
 			if k, ok := byTurn[e.Coordinates.TurnID]; ok && !k.commandID.IsZero() {
@@ -689,6 +690,9 @@ func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.U
 		status := statusFromDrain(err)
 		if status == tool.DelegateStatusInterrupted && didTimeout(timeoutSeconds, waitCtx) {
 			status = tool.DelegateStatusTimedOut
+		}
+		if status == tool.DelegateStatusFailed && text == "" {
+			text = delegateFailureDetail(err)
 		}
 		tracked.markTerminal()
 		if err := s.deliverSubagentResult(s.sessionCtx, parentID, childID, backgroundCompletionBlocks(childID, name, requestID, status, text)); err != nil {
@@ -1152,6 +1156,9 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 		if status == tool.DelegateStatusInterrupted && didTimeout(req.TimeoutSeconds, waitCtx) {
 			status = tool.DelegateStatusTimedOut
 		}
+		if status == tool.DelegateStatusFailed && text == "" {
+			text = delegateFailureDetail(err)
+		}
 		tracked.markTerminal()
 		result := c.responseResult(s, childID, requestID, status, text)
 		if req.Name != "" {
@@ -1233,6 +1240,10 @@ func backgroundCompletionBlocks(agentID uuid.UUID, name string, correlationID uu
 }
 
 func boundUTF8(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	value = strings.ToValidUTF8(value, "\uFFFD")
 	if len(value) <= limit {
 		return value
 	}
@@ -1241,6 +1252,27 @@ func boundUTF8(value string, limit int) string {
 		end--
 	}
 	return value[:end]
+}
+
+// delegateFailureDetail crosses the child-to-parent boundary only for an error
+// that explicitly opts into the narrow model-facing projection. The drain wraps
+// TurnFailed.Err, so errors.As deliberately traverses that wrapper without
+// exposing arbitrary Error() text. A malformed or oversized projection is made
+// valid and bounded before it reaches a result or durable completion envelope.
+func delegateFailureDetail(err error) (detail string) {
+	if err == nil {
+		return ""
+	}
+	var modelFacing interface{ ModelFacingError() string }
+	if !errors.As(err, &modelFacing) || modelFacing == nil {
+		return ""
+	}
+	defer func() {
+		if recover() != nil {
+			detail = ""
+		}
+	}()
+	return boundUTF8(modelFacing.ModelFacingError(), maxDelegateOutputBytes)
 }
 
 func runePrefixEnds(value string) []int {

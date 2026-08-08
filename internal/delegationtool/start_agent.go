@@ -3,6 +3,8 @@ package delegationtool
 import (
 	"context"
 	"encoding/json"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
@@ -50,9 +52,33 @@ func (s *StartAgentTool) InvokableRun(ctx context.Context, _ string) (*tool.Tool
 
 func formatStartAgentResult(req tool.DelegateRequest, result tool.DelegateResult) string {
 	if req.WaitForResponse {
+		if result.ResponseStatus == tool.DelegateResponseFailed {
+			return formatStartAgentFailure(result.Response)
+		}
 		return formatForeground(result)
 	}
 	return formatBackground(result)
+}
+
+const startAgentFailurePrefix = "error: agent failed: "
+
+func formatStartAgentFailure(detail string) string {
+	detail = boundAgentOutput(strings.ToValidUTF8(detail, "\uFFFD"))
+	maxDetailBytes := maxAgentResultBytes - len(startAgentFailurePrefix)
+	if maxDetailBytes <= 0 {
+		return "error: agent failed"
+	}
+	if len(detail) > maxDetailBytes {
+		end := maxDetailBytes
+		for end > 0 && !utf8.RuneStart(detail[end]) {
+			end--
+		}
+		detail = detail[:end]
+	}
+	if detail == "" {
+		return "error: agent failed"
+	}
+	return startAgentFailurePrefix + detail
 }
 
 var _ tool.InvokableTool = (*StartAgentTool)(nil)
