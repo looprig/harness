@@ -3,6 +3,7 @@ package tool
 import (
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"unicode/utf8"
 )
@@ -31,6 +32,28 @@ type modelFacingErrorTestCycle struct{ next error }
 func (e *modelFacingErrorTestCycle) Error() string { return "cycle" }
 
 func (e *modelFacingErrorTestCycle) Unwrap() error { return e.next }
+
+type modelFacingErrorTestFanout struct{ children []error }
+
+func (e modelFacingErrorTestFanout) Error() string { return "fanout" }
+
+func (e modelFacingErrorTestFanout) Unwrap() []error { return e.children }
+
+type modelFacingErrorTestCountingMarker struct {
+	calls *atomic.Int64
+	id    int
+	safe  bool
+}
+
+func (e modelFacingErrorTestCountingMarker) Error() string { return "counted marker" }
+
+func (e modelFacingErrorTestCountingMarker) ModelFacingError() string {
+	e.calls.Add(1)
+	if e.safe {
+		return "safe fanout detail"
+	}
+	panic("marker probe")
+}
 
 func TestModelFacingErrorDetailTraversesOnlyRealChains(t *testing.T) {
 	t.Parallel()
@@ -61,6 +84,31 @@ func TestModelFacingErrorDetailTraversesOnlyRealChains(t *testing.T) {
 	cycle.next = cycle
 	if got, marked := ModelFacingErrorDetail(cycle); got != "" || marked {
 		t.Fatalf("cycle detail = %q, %v; want empty, false", got, marked)
+	}
+}
+
+func TestModelFacingErrorDetailBoundsHostileFanout(t *testing.T) {
+	t.Parallel()
+	const childCount = maxModelFacingErrorNodes * 1024
+	calls := new(atomic.Int64)
+	children := make([]error, childCount)
+	for i := range children {
+		children[i] = modelFacingErrorTestCountingMarker{calls: calls, id: i}
+	}
+	children[maxModelFacingErrorNodes-2] = modelFacingErrorTestCountingMarker{calls: calls, id: maxModelFacingErrorNodes - 2, safe: true}
+	root := modelFacingErrorTestFanout{children: children}
+
+	bounded := unwrapErrors(root, maxModelFacingErrorNodes-1)
+	if got, want := len(bounded), maxModelFacingErrorNodes-1; got != want {
+		t.Fatalf("unwrapErrors() returned %d children, want exactly the %d-child budget", got, want)
+	}
+
+	detail, marked := ModelFacingErrorDetail(root)
+	if detail != "safe fanout detail" || !marked {
+		t.Fatalf("ModelFacingErrorDetail() = %q, %v; want safe fanout detail, true", detail, marked)
+	}
+	if got, want := calls.Load(), int64(maxModelFacingErrorNodes-1); got != want {
+		t.Fatalf("ModelFacingError() calls = %d, want exactly %d allowed children", got, want)
 	}
 }
 

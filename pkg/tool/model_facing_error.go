@@ -74,7 +74,8 @@ func ModelFacingErrorDetail(err error) (detail string, marked bool) {
 		if current.depth == maxModelFacingErrorDepth {
 			continue
 		}
-		for _, child := range unwrapErrors(current.err) {
+		remaining := maxModelFacingErrorNodes - nodes - len(queue)
+		for _, child := range unwrapErrors(current.err, remaining) {
 			if child != nil {
 				queue = append(queue, modelFacingErrorNode{err: child, depth: current.depth + 1})
 			}
@@ -107,17 +108,44 @@ func callModelFacingError(marker ModelFacingError) (detail string, ok bool) {
 	return marker.ModelFacingError(), true
 }
 
-func unwrapErrors(err error) (children []error) {
+// unwrapErrors inspects and copies at most maxChildren child slots. An
+// Unwrap() []error implementation may return an arbitrary fan-out, so never
+// append its complete result to the traversal queue.
+func unwrapErrors(err error, maxChildren int) (children []error) {
+	if maxChildren <= 0 {
+		return nil
+	}
+	if maxChildren > maxModelFacingErrorNodes {
+		maxChildren = maxModelFacingErrorNodes
+	}
+	children = make([]error, 0, maxChildren)
 	defer func() {
 		if recover() != nil {
 			children = nil
 		}
 	}()
+	inspected := 0
 	if one, ok := err.(interface{ Unwrap() error }); ok {
-		children = append(children, one.Unwrap())
+		children = appendUnwrappedChild(children, one.Unwrap())
+		inspected++
 	}
-	if many, ok := err.(interface{ Unwrap() []error }); ok {
-		children = append(children, many.Unwrap()...)
+	if inspected < maxChildren {
+		if many, ok := err.(interface{ Unwrap() []error }); ok {
+			for _, child := range many.Unwrap() {
+				if inspected >= maxChildren {
+					break
+				}
+				inspected++
+				children = appendUnwrappedChild(children, child)
+			}
+		}
 	}
 	return children
+}
+
+func appendUnwrappedChild(children []error, child error) []error {
+	if child == nil {
+		return children
+	}
+	return append(children, child)
 }
