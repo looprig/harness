@@ -88,8 +88,12 @@ const (
 type SessionMeta struct {
 	// SessionID is the session this entry describes.
 	SessionID uuid.UUID `json:"session_id"`
-	// Title is a short, human-readable label derived from the first turn's user message
-	// (its first line, truncated). Empty until a first TurnStarted is seen.
+	// Title is a short, human-readable label derived from the MOST RECENT turn's user
+	// message (its first line, truncated), so a picker shows what a session is doing now
+	// rather than its stale opening line. It updates on every TurnStarted that carries
+	// derivable text, retaining the prior value when a turn's message has none (e.g. a
+	// tool-continuation with no user-authored text). Empty until a first TurnStarted with
+	// derivable text is seen.
 	Title string `json:"title,omitempty"`
 	// CreatedAt is when the session started (SessionStarted's CreatedAt).
 	CreatedAt time.Time `json:"created_at,omitzero"`
@@ -508,8 +512,9 @@ type EventReplayerOpener interface {
 //
 //   - SessionStarted: stamps SessionID, CreatedAt, ConfigFingerprint, AgentKind (from the
 //     fingerprint — passthrough), Status=active, State=idle, and counts the primary loop.
-//   - TurnStarted: State=running, sets ActiveTurnID, sets Title from the user message if
-//     not already set (first turn wins), and bumps LastActiveAt.
+//   - TurnStarted: State=running, sets ActiveTurnID, sets Title from the user message
+//     (retaining the prior Title when the new message has no derivable text), and bumps
+//     LastActiveAt.
 //   - GateOpened: State=waiting_on_gate, sets WaitingGateID.
 //   - GateResolved: clears WaitingGateID; State back to running if a turn is active, else
 //     idle.
@@ -541,8 +546,8 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 		}
 	case event.TurnStarted:
 		meta.SessionID = e.SessionID
-		if meta.Title == "" {
-			meta.Title = deriveTitle(e.Message)
+		if title := deriveTitle(e.Message); title != "" {
+			meta.Title = title
 		}
 		meta.LastActiveAt = now()
 		meta.State = StateRunning

@@ -377,7 +377,7 @@ func TestApplyEvent(t *testing.T) {
 			},
 		},
 		{
-			name:  "second TurnStarted does not overwrite Title (first wins) but bumps activity",
+			name:  "second TurnStarted updates Title to the latest message and bumps activity",
 			start: SessionMeta{SessionID: sid, Title: "first title"},
 			ev: event.TurnStarted{
 				Header:  hdr(sid),
@@ -385,11 +385,25 @@ func TestApplyEvent(t *testing.T) {
 			},
 			wantChanged: true,
 			check: func(t *testing.T, m SessionMeta) {
-				if m.Title != "first title" {
-					t.Errorf("Title = %q, want unchanged first title", m.Title)
+				if m.Title != "second message" {
+					t.Errorf("Title = %q, want updated to latest message", m.Title)
 				}
 				if !m.LastActiveAt.Equal(active) {
 					t.Errorf("LastActiveAt = %v, want bumped", m.LastActiveAt)
+				}
+			},
+		},
+		{
+			name:  "a TurnStarted with no derivable text retains the prior Title",
+			start: SessionMeta{SessionID: sid, Title: "keep this title"},
+			ev: event.TurnStarted{
+				Header:  hdr(sid),
+				Message: userMsg(""),
+			},
+			wantChanged: true,
+			check: func(t *testing.T, m SessionMeta) {
+				if m.Title != "keep this title" {
+					t.Errorf("Title = %q, want retained when the new message has no text", m.Title)
 				}
 			},
 		},
