@@ -165,7 +165,7 @@ github.com/looprig/inference/usage
 github.com/looprig/inference/wire/jsonbody
 github.com/looprig/inference/wire/sse
 # github.com/looprig/storage v0.3.0 => ../storage
-## explicit; go 1.25.0
+## explicit; go 1.25.8
 github.com/looprig/storage
 github.com/looprig/storage/memstore
 # github.com/openai/openai-go/v3 v3.50.0

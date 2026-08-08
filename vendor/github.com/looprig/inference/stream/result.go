@@ -14,6 +14,9 @@ type StreamResult struct {
 	Usage        *content.Usage
 	Model        string
 	FinishReason FinishReason
+	// Attempts is how many establishment attempts a retrying decorator made
+	// before this stream opened; 0 when the producer does not count.
+	Attempts int
 }
 
 // StreamResultProducer supplies the terminal metadata accumulated while a

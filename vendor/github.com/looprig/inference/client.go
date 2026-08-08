@@ -142,6 +142,10 @@ type Response struct {
 	Usage        *content.Usage
 	Model        string
 	FinishReason stream.FinishReason
+	// Attempts is how many attempts produced this response when served
+	// through a retrying decorator; 0 means the serving client does not
+	// count attempts, 1 means first-try success.
+	Attempts int
 }
 
 // Tool is a callable function definition exposed to the model.

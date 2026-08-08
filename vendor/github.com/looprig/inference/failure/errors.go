@@ -4,6 +4,7 @@ package failure
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/looprig/inference/model"
 )
@@ -19,6 +20,9 @@ type APIError struct {
 	Status  int
 	Message string
 	Body    []byte
+	// RetryAfter is the server-advertised wait from a Retry-After header,
+	// integer-seconds form only. Zero means absent or unparseable.
+	RetryAfter time.Duration
 }
 
 func (e *APIError) Error() string {
