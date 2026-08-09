@@ -114,6 +114,27 @@ func waitForRequestTracker(t *testing.T, manager *delegationManager, requestID u
 	t.Fatalf("request tracker present = %v, want %v", requestTrackerPresent(manager, requestID), want)
 }
 
+func waitForRequestOpening(t *testing.T, manager *delegationManager, requestID uuid.UUID, want tool.DelegateDeliveryStatus) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		manager.mu.Lock()
+		tracked := manager.requests[requestID]
+		manager.mu.Unlock()
+		if tracked != nil && tracked.openingStatus() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	manager.mu.Lock()
+	tracked := manager.requests[requestID]
+	manager.mu.Unlock()
+	if tracked == nil {
+		t.Fatalf("request tracker disappeared before opening %q", want)
+	}
+	t.Fatalf("request opening = %q, want %q", tracked.openingStatus(), want)
+}
+
 func assertNoForeignCancellationCommands(t *testing.T, fixture foreignMessageAgentFixture) {
 	t.Helper()
 	deadline := time.Now().Add(100 * time.Millisecond)
@@ -135,6 +156,26 @@ func assertNoForeignCancellationCommands(t *testing.T, fixture foreignMessageAge
 		default:
 			time.Sleep(time.Millisecond)
 		}
+	}
+}
+
+func assertNoForeignCancellationCommandsNow(t *testing.T, fixture foreignMessageAgentFixture) {
+	t.Helper()
+	for _, record := range fixture.commands.snapshot() {
+		switch record.Command().(type) {
+		case command.CancelDelegateRequest, command.CancelQueuedInput:
+			t.Fatalf("unexpected persisted cancellation: %T", record.Command())
+		}
+	}
+	select {
+	case raw := <-fixture.child.Commands:
+		switch raw.(type) {
+		case command.CancelDelegateRequest, command.CancelQueuedInput:
+			t.Fatalf("unexpected dispatched cancellation: %T", raw)
+		default:
+			t.Fatalf("unexpected child command after admission: %T", raw)
+		}
+	default:
 	}
 }
 
@@ -878,6 +919,68 @@ func TestMessageAgentForeignForegroundTimeoutLaterQueuedCleansWithoutHandback(t 
 	fixture.sub.feed(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: fixture.session.sessionID, LoopID: fixture.childID, TurnID: turnID}}, Message: aiMessage("late")})
 	waitForRequestTracker(t, fixture.controller.manager, cmd.CommandID, false)
 	assertNoParentCommand(t, fixture.parent, 100*time.Millisecond)
+}
+
+func TestMessageAgentForeignForegroundTimeoutAfterOpeningCleansCorrelation(t *testing.T) {
+	tests := []struct {
+		name     string
+		folded   bool
+		status   tool.DelegateDeliveryStatus
+		response string
+	}{
+		{name: "queued TurnStarted", status: tool.DelegateDeliveryQueued, response: "late queued"},
+		{name: "injected TurnFoldedInto", folded: true, status: tool.DelegateDeliveryInjected, response: "late injected"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newForeignMessageAgentFixture(t)
+			callerCtx, cancel := context.WithCancel(context.Background())
+			resultCh := make(chan struct {
+				result tool.DelegateResult
+				err    error
+			}, 1)
+			go func() {
+				result, err := fixture.controller.Execute(callerCtx, foreignMessageRequest(fixture.childID, true))
+				resultCh <- struct {
+					result tool.DelegateResult
+					err    error
+				}{result: result, err: err}
+			}()
+			raw := <-fixture.child.Commands
+			cmd := raw.(command.UserInput)
+			turnID := mustUUID()
+			if tt.folded {
+				if err := fixture.hook.Reserve(context.Background(), foreign.DeliveryReservation{LoopID: fixture.childID, RequestID: cmd.CommandID}); err != nil {
+					t.Fatalf("Reserve: %v", err)
+				}
+				fixture.hook.observeFold(event.TurnFoldedInto{Header: event.Header{Coordinates: identity.Coordinates{SessionID: fixture.session.sessionID, LoopID: fixture.childID, TurnID: turnID}, Cause: identity.Cause{CommandID: cmd.CommandID}}})
+				if err := fixture.hook.Resolve(context.Background(), foreign.DeliveryResolution{LoopID: fixture.childID, RequestID: cmd.CommandID, TurnID: turnID, State: foreign.DeliveryResolutionInjected}); err != nil {
+					t.Fatalf("Resolve injected: %v", err)
+				}
+			} else if err := fixture.hook.QueueFallback(context.Background(), foreignFallbackIntent(cmd.CommandID, fixture.childID)); err != nil {
+				t.Fatalf("QueueFallback: %v", err)
+			}
+			cmd.Accepted <- nil
+			fixture.sub.feed(foreignTurnEvent(fixture, cmd.CommandID, turnID, tt.folded))
+			waitForRequestOpening(t, fixture.controller.manager, cmd.CommandID, tt.status)
+			cancel()
+			call := <-resultCh
+			if call.err != nil {
+				t.Fatalf("Execute: %v", call.err)
+			}
+			if call.result.DeliveryStatus != tt.status || call.result.ResponseStatus != tool.DelegateResponseInterrupted {
+				t.Fatalf("timeout result = %+v, want %s/interrupted", call.result, tt.status)
+			}
+			fixture.sub.feed(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: fixture.session.sessionID, LoopID: fixture.childID, TurnID: turnID}}, Message: aiMessage(tt.response)})
+			waitForRequestTracker(t, fixture.controller.manager, cmd.CommandID, false)
+			assertNoForeignCancellationCommandsNow(t, fixture)
+			select {
+			case extra := <-fixture.parent.Commands:
+				t.Fatalf("foreground timeout created handback: %T", extra)
+			default:
+			}
+		})
+	}
 }
 
 func TestMessageAgentForeignResolvedUnknownIsCategoricalWithoutWatcher(t *testing.T) {

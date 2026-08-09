@@ -13,6 +13,17 @@ import (
 
 const maxDelegateOutputBytes = 256 << 10
 
+// drainCorrelationState is the phase boundary between the opening resolution
+// event and the target terminal. A caller may stop observing after the opening
+// event has been consumed; retaining this state lets a session-owned cleanup
+// drain resume phase two without scanning for a second opening.
+type drainCorrelationState struct {
+	turnID   uuid.UUID
+	loopID   uuid.UUID
+	haveTurn bool
+	lastStep string
+}
+
 // drainFailedError wraps a TurnFailed.Err terminal: the sub-loop's turn ended on
 // a non-cancellation provider/LLM error. Cause is the typed cause the loop
 // carried; callers errors.As to this type and errors.Is/As through Unwrap to the
@@ -130,17 +141,27 @@ func drainDelegateAnswerObserved(ctx context.Context, sub event.Subscription, co
 }
 
 func drainDelegateAnswerObservedWithDisposition(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func(), onOpening func(tool.DelegateDeliveryStatus)) (string, error) {
-	return drainCorrelated(ctx, sub, commandID, interrupt, false, onOpening)
+	return drainDelegateAnswerObservedWithState(ctx, sub, commandID, interrupt, onOpening, nil)
 }
 
 func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func(), stepFallback bool, onOpening func(tool.DelegateDeliveryStatus)) (string, error) {
+	return drainCorrelatedWithState(ctx, sub, commandID, interrupt, stepFallback, onOpening, nil)
+}
+
+// drainDelegateAnswerObservedWithState is the resumable managed-delegation
+// drain. A non-nil state is owned by the session coordinator and is shared by
+// the caller-facing observer and its cleanup-only continuation.
+func drainDelegateAnswerObservedWithState(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func(), onOpening func(tool.DelegateDeliveryStatus), state *drainCorrelationState) (string, error) {
+	return drainCorrelatedWithState(ctx, sub, commandID, interrupt, false, onOpening, state)
+}
+
+func drainCorrelatedWithState(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func(), stepFallback bool, onOpening func(tool.DelegateDeliveryStatus), state *drainCorrelationState) (string, error) {
+	if state == nil {
+		state = &drainCorrelationState{}
+	}
 	var (
-		turnID    uuid.UUID // captured from the opening TurnStarted (phase-1 -> phase-2 edge)
-		loopID    uuid.UUID // captured alongside turnID; phase-2 cross-checks it (fail-secure)
-		haveTurn  bool
-		lastStep  string // latest StepDone assistant text for the matched turn (fallback)
-		fired     bool   // guards the single fail-safe interrupt() on ctx.Done()
-		ctxClosed bool   // once true, await terminal/close without re-selecting ctx.Done()
+		fired     bool // guards the single fail-safe interrupt() on ctx.Done()
+		ctxClosed bool // once true, await terminal/close without re-selecting ctx.Done()
 	)
 
 	for {
@@ -152,7 +173,7 @@ func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid
 			if !ok {
 				return "", &drainLostError{Cause: sub.Err()}
 			}
-			if text, done, err := handleCorrelatedEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep, stepFallback, onOpening); done {
+			if text, done, err := handleCorrelatedEvent(d.Event, commandID, state, stepFallback, onOpening); done {
 				return text, err
 			}
 			continue
@@ -163,7 +184,7 @@ func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid
 			if !ok {
 				return "", &drainLostError{Cause: sub.Err()}
 			}
-			if text, done, err := handleCorrelatedEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep, stepFallback, onOpening); done {
+			if text, done, err := handleCorrelatedEvent(d.Event, commandID, state, stepFallback, onOpening); done {
 				return text, err
 			}
 		case <-ctx.Done():
@@ -194,21 +215,18 @@ func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid
 func handleCorrelatedEvent(
 	ev event.Event,
 	commandID uuid.UUID,
-	turnID *uuid.UUID,
-	loopID *uuid.UUID,
-	haveTurn *bool,
-	lastStep *string,
+	state *drainCorrelationState,
 	stepFallback bool,
 	onOpening func(tool.DelegateDeliveryStatus),
 ) (text string, done bool, err error) {
-	if !*haveTurn {
+	if !state.haveTurn {
 		// Phase 1: await the opening resolution event for our submit.
 		switch e := ev.(type) {
 		case event.TurnStarted:
 			if e.Cause.CommandID == commandID {
-				*turnID = e.Coordinates.TurnID
-				*loopID = e.Coordinates.LoopID
-				*haveTurn = true
+				state.turnID = e.Coordinates.TurnID
+				state.loopID = e.Coordinates.LoopID
+				state.haveTurn = true
 				if onOpening != nil {
 					onOpening(tool.DelegateDeliveryQueued)
 				}
@@ -218,9 +236,9 @@ func handleCorrelatedEvent(
 			// into the already-running turn rather than a new TurnStarted. The
 			// terminal still belongs to this exact (LoopID, TurnID) pair.
 			if e.Cause.CommandID == commandID {
-				*turnID = e.Coordinates.TurnID
-				*loopID = e.Coordinates.LoopID
-				*haveTurn = true
+				state.turnID = e.Coordinates.TurnID
+				state.loopID = e.Coordinates.LoopID
+				state.haveTurn = true
 				if onOpening != nil {
 					onOpening(tool.DelegateDeliveryInjected)
 				}
@@ -242,25 +260,25 @@ func handleCorrelatedEvent(
 	// phase-2 event from a different loop is provably ignored, not "can't happen").
 	switch e := ev.(type) {
 	case event.StepDone:
-		if e.Coordinates.TurnID == *turnID && e.Coordinates.LoopID == *loopID {
+		if e.Coordinates.TurnID == state.turnID && e.Coordinates.LoopID == state.loopID {
 			if t := stepDoneText(e.Messages); t != "" {
-				*lastStep = t
+				state.lastStep = t
 			}
 		}
 	case event.TurnDone:
-		if e.Coordinates.TurnID == *turnID && e.Coordinates.LoopID == *loopID {
+		if e.Coordinates.TurnID == state.turnID && e.Coordinates.LoopID == state.loopID {
 			final := aiText(e.Message)
 			if final == "" && stepFallback {
-				final = *lastStep
+				final = state.lastStep
 			}
 			return final, true, nil
 		}
 	case event.TurnFailed:
-		if e.Coordinates.TurnID == *turnID && e.Coordinates.LoopID == *loopID {
+		if e.Coordinates.TurnID == state.turnID && e.Coordinates.LoopID == state.loopID {
 			return "", true, &drainFailedError{Cause: e.Err}
 		}
 	case event.TurnInterrupted:
-		if e.Coordinates.TurnID == *turnID && e.Coordinates.LoopID == *loopID {
+		if e.Coordinates.TurnID == state.turnID && e.Coordinates.LoopID == state.loopID {
 			return "", true, &drainInterruptedError{}
 		}
 	}

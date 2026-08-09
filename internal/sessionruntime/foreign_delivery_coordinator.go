@@ -62,6 +62,7 @@ type foreignDeliveryCoordinator struct {
 	hook       *foreignDeliveryHook
 	tracked    *requestTracker
 	sub        event.Subscription
+	drainState *drainCorrelationState
 	background bool
 	timeout    *int
 
@@ -84,6 +85,7 @@ func newForeignDeliveryCoordinator(c *scopedController, s *Session, childID, req
 		hook:       hook,
 		tracked:    tracked,
 		sub:        sub,
+		drainState: &drainCorrelationState{},
 		background: background,
 		timeout:    timeout,
 		updates:    make(chan foreignDeliveryCoordinatorUpdate, 2),
@@ -309,7 +311,7 @@ func (c *foreignDeliveryCoordinator) drainCleanupOnly() {
 	if c.session.sessionCtx.Err() != nil {
 		return
 	}
-	_, _ = drainDelegateAnswerObservedWithDisposition(c.session.sessionCtx, c.sub, c.requestID, nil, c.tracked.markOpening)
+	_, _ = drainDelegateAnswerObservedWithState(c.session.sessionCtx, c.sub, c.requestID, nil, c.tracked.markOpening, c.drainState)
 }
 
 func (c *foreignDeliveryCoordinator) sendTargetHandBack(status tool.DelegateDeliveryStatus) {
@@ -318,7 +320,7 @@ func (c *foreignDeliveryCoordinator) sendTargetHandBack(status tool.DelegateDeli
 	}
 	waitCtx, cancel := waitContext(c.session.sessionCtx, c.timeout)
 	defer cancel()
-	text, err := drainDelegateAnswerObservedWithDisposition(waitCtx, c.sub, c.requestID, nil, c.tracked.markOpening)
+	text, err := drainDelegateAnswerObservedWithState(waitCtx, c.sub, c.requestID, nil, c.tracked.markOpening, c.drainState)
 	observerExpired := drainObserverExpired(err)
 	responseStatus := statusFromDrain(err)
 	if responseStatus == tool.DelegateStatusInterrupted && didTimeout(c.timeout, waitCtx) {
@@ -430,7 +432,7 @@ func (c *scopedController) resolveForeignForeground(ctx context.Context, s *Sess
 			return c.foreignObserverResult(s, childID, requestID, status, tool.DelegateResponseUnknown, req.Name), nil
 		}
 
-		text, err := drainDelegateAnswerObservedWithDisposition(waitCtx, sub, requestID, nil, tracked.markOpening)
+		text, err := drainDelegateAnswerObservedWithState(waitCtx, sub, requestID, nil, tracked.markOpening, coordinator.drainState)
 		responseStatus := statusFromDrain(err)
 		if responseStatus == tool.DelegateStatusInterrupted && didTimeout(req.TimeoutSeconds, waitCtx) {
 			responseStatus = tool.DelegateStatusTimedOut
