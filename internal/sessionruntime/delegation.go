@@ -228,6 +228,19 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	}
 	index := make(map[uuid.UUID]resolvedRequest)
 	deliveryUnknown := make(map[uuid.UUID]struct{})
+	opened := make(map[uuid.UUID]struct{})
+	for _, ev := range combined {
+		var requestID uuid.UUID
+		switch opening := ev.(type) {
+		case event.TurnStarted:
+			requestID = opening.Cause.CommandID
+		case event.TurnFoldedInto:
+			requestID = opening.Cause.CommandID
+		}
+		if !requestID.IsZero() {
+			opened[requestID] = struct{}{}
+		}
+	}
 	for _, ev := range combined {
 		var requestID, childID uuid.UUID
 		switch accepted := ev.(type) {
@@ -261,10 +274,14 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 			deliveryUnknown[requestID] = struct{}{}
 		case state == event.DelegateDeliverySteerAttemptReserved:
 			// A reservation without a durable fallback is repaired as unknown by
-			// the normal restore path. Direct reducer callers retain that same
-			// fail-closed result, while a fallback phase remains re-admittable.
-			if fallback, ok := phased[requestID]; !ok || fallback.DelegateDeliveryPhase != command.DelegateDeliveryPhaseFallbackQueued {
-				index[requestID] = resolvedRequest{childID: target, status: tool.DelegateStatusUnknown}
+			// the normal restore path. An authoritative opening has already crossed
+			// the actor boundary and remains correlated to its eventual terminal;
+			// only an unopened reservation retains the fail-closed result. A
+			// fallback phase remains re-admittable.
+			if _, admitted := opened[requestID]; !admitted {
+				if fallback, ok := phased[requestID]; !ok || fallback.DelegateDeliveryPhase != command.DelegateDeliveryPhaseFallbackQueued {
+					index[requestID] = resolvedRequest{childID: target, status: tool.DelegateStatusUnknown}
+				}
 			}
 		}
 	}
@@ -532,6 +549,19 @@ func persistUnresolvedDelegateDeliveryStates(ctx context.Context, j journal.Sess
 		return nil, err
 	}
 	closed := make(map[uuid.UUID]struct{}, len(terminals))
+	opened := make(map[uuid.UUID]struct{})
+	for _, ev := range combined {
+		var requestID uuid.UUID
+		switch opening := ev.(type) {
+		case event.TurnStarted:
+			requestID = opening.Cause.CommandID
+		case event.TurnFoldedInto:
+			requestID = opening.Cause.CommandID
+		}
+		if !requestID.IsZero() {
+			opened[requestID] = struct{}{}
+		}
+	}
 	for requestID := range terminals {
 		closed[requestID] = struct{}{}
 	}
@@ -549,6 +579,13 @@ func persistUnresolvedDelegateDeliveryStates(ctx context.Context, j journal.Sess
 			continue
 		}
 		if _, done := closed[requestID]; done {
+			continue
+		}
+		// TurnStarted and TurnFoldedInto are authoritative actor admission
+		// evidence. A reservation that has already crossed either boundary is
+		// still awaiting its terminal correlation, not an ambiguous provider
+		// delivery that restore may repair to unknown.
+		if _, admitted := opened[requestID]; admitted {
 			continue
 		}
 		if fallback, ok := phased[requestID]; ok && fallback.DelegateDeliveryPhase == command.DelegateDeliveryPhaseFallbackQueued {
