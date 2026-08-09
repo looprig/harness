@@ -419,6 +419,8 @@ func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.
 	}
 	deliveryStates := make(map[uuid.UUID]struct{})
 	cancellations := make(map[uuid.UUID]struct{})
+	openings := make(map[uuid.UUID]struct{})
+	closures := make(map[uuid.UUID]struct{})
 	validateTargetRoute := func(requestID, loopID uuid.UUID) error {
 		if requestID.IsZero() {
 			return nil
@@ -434,9 +436,15 @@ func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.
 			if err := validateTargetRoute(typed.Cause.CommandID, typed.LoopID); err != nil {
 				return err
 			}
+			if !typed.Cause.CommandID.IsZero() {
+				openings[typed.Cause.CommandID] = struct{}{}
+			}
 		case event.TurnFoldedInto:
 			if err := validateTargetRoute(typed.Cause.CommandID, typed.LoopID); err != nil {
 				return err
+			}
+			if !typed.Cause.CommandID.IsZero() {
+				openings[typed.Cause.CommandID] = struct{}{}
 			}
 		case event.DelegateDeliveryStateChanged:
 			if typed.RequestID.IsZero() {
@@ -455,11 +463,19 @@ func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.
 				event.DelegateDeliveryResolvedUntrackable:
 				deliveryStates[typed.RequestID] = struct{}{}
 			}
+		case event.TurnRejected:
+			if err := validateTargetRoute(typed.Cause.CommandID, typed.LoopID); err != nil {
+				return err
+			}
+			if !typed.Cause.CommandID.IsZero() {
+				closures[typed.Cause.CommandID] = struct{}{}
+			}
 		case event.InputCancelled:
 			if err := validateTargetRoute(typed.Cause.CommandID, typed.LoopID); err != nil {
 				return err
 			}
 			if !typed.Cause.CommandID.IsZero() {
+				closures[typed.Cause.CommandID] = struct{}{}
 				cancellations[typed.Cause.CommandID] = struct{}{}
 			}
 		}
@@ -470,6 +486,14 @@ func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.
 		}
 		if target, admitted := intents[requestID]; admitted && terminal.childID != target {
 			return &journal.CommandRouteMismatchError{RecordLoopID: terminal.childID, TargetLoopID: target}
+		}
+	}
+	for requestID := range closures {
+		if _, opened := openings[requestID]; opened {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "rejection or cancellation conflicts with turn opening"}
+		}
+		if _, terminal := terminals[requestID]; terminal {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "rejection or cancellation conflicts with turn terminal"}
 		}
 	}
 	for requestID := range cancellations {

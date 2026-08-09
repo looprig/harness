@@ -379,6 +379,11 @@ func TestMessageAgentRestoreRejectsContradictoryCorrelation(t *testing.T) {
 		openingLoopMismatch   = "opening loop mismatch"
 		foldedLoopMismatch    = "folded loop mismatch"
 		cancelledLoopMismatch = "cancelled loop mismatch"
+		rejectedLoopMismatch  = "rejected loop mismatch"
+		rejectedWithOpening   = "rejected with opening"
+		cancelledWithOpening  = "cancelled with opening"
+		rejectedWithTerminal  = "rejected with terminal"
+		cancelledWithTerminal = "cancelled with terminal"
 	)
 	for _, tt := range []struct {
 		name   string
@@ -429,6 +434,37 @@ func TestMessageAgentRestoreRejectsContradictoryCorrelation(t *testing.T) {
 		{name: cancelledLoopMismatch, events: func(_, wrongLoop, requestID, _, _ uuid.UUID) []event.Event {
 			return []event.Event{
 				event.InputCancelled{Header: event.Header{Coordinates: identity.Coordinates{LoopID: wrongLoop}, Cause: identity.Cause{CommandID: requestID}}, Reason: event.CancelClientRetracted},
+			}
+		}},
+		{name: rejectedLoopMismatch, events: func(_, wrongLoop, requestID, _, _ uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnRejected{Header: event.Header{Coordinates: identity.Coordinates{LoopID: wrongLoop}, Cause: identity.Cause{CommandID: requestID}}, Reason: event.RejectShuttingDown},
+			}
+		}},
+		{name: rejectedWithOpening, events: func(childID, _, requestID, turnA, _ uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnA}, Cause: identity.Cause{CommandID: requestID}}},
+				event.TurnRejected{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID}, Cause: identity.Cause{CommandID: requestID}}, Reason: event.RejectShuttingDown},
+			}
+		}},
+		{name: cancelledWithOpening, events: func(childID, _, requestID, turnA, _ uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnA}, Cause: identity.Cause{CommandID: requestID}}},
+				event.InputCancelled{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID}, Cause: identity.Cause{CommandID: requestID}}, Reason: event.CancelClientRetracted},
+			}
+		}},
+		{name: rejectedWithTerminal, events: func(childID, _, requestID, turnA, _ uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnA}, Cause: identity.Cause{CommandID: requestID}}},
+				event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnA}}, Message: aiMessage("done")},
+				event.TurnRejected{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID}, Cause: identity.Cause{CommandID: requestID}}, Reason: event.RejectShuttingDown},
+			}
+		}},
+		{name: cancelledWithTerminal, events: func(childID, _, requestID, turnA, _ uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnA}, Cause: identity.Cause{CommandID: requestID}}},
+				event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnA}}, Message: aiMessage("done")},
+				event.InputCancelled{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID}, Cause: identity.Cause{CommandID: requestID}}, Reason: event.CancelClientRetracted},
 			}
 		}},
 	} {
