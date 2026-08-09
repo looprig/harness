@@ -653,7 +653,7 @@ func decodePayload(tag string, data []byte) (Event, error) {
 	case "ActiveLoopChanged":
 		return decodePlain[ActiveLoopChanged](tag, data)
 	case "DelegateDeliveryStateChanged":
-		return decodePlain[DelegateDeliveryStateChanged](tag, data)
+		return decodeDelegateDeliveryStateChanged(data)
 	case "LoopRestoreTombstoned":
 		return decodePlain[LoopRestoreTombstoned](tag, data)
 	case "HustleStarted":
@@ -853,6 +853,44 @@ func decodeProcessLifecycleEvent(tag string, data []byte) (Event, error) {
 	default:
 		return nil, &UnknownEventTypeError{Type: tag}
 	}
+}
+
+// delegateDeliveryStateChangedWire is the deliberately closed wire shape for
+// DelegateDeliveryStateChanged. Unlike ordinary plain events, this record is a
+// durable ABI boundary: accepting an extra field could let transport-only or
+// model-visible data leak into the journal. Keep the envelope keys and Header
+// fields explicit through embedding, and reject every other key below.
+type delegateDeliveryStateChangedWire struct {
+	Type string  `json:"type"`
+	V    *uint32 `json:"v"`
+	Header
+	RequestID    uuid.UUID             `json:"request_id"`
+	TargetLoopID uuid.UUID             `json:"target_loop_id"`
+	State        DelegateDeliveryState `json:"state"`
+}
+
+func decodeDelegateDeliveryStateChanged(data []byte) (Event, error) {
+	const tag = "DelegateDeliveryStateChanged"
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+
+	var wire delegateDeliveryStateChangedWire
+	if err := decoder.Decode(&wire); err != nil {
+		return nil, &EventDecodeError{Type: tag, Cause: err}
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = errors.New("trailing JSON value")
+		}
+		return nil, &EventDecodeError{Type: tag, Cause: err}
+	}
+
+	return DelegateDeliveryStateChanged{
+		Header:       wire.Header,
+		RequestID:    wire.RequestID,
+		TargetLoopID: wire.TargetLoopID,
+		State:        wire.State,
+	}, nil
 }
 
 func decodeStepDone(data []byte) (Event, error) {

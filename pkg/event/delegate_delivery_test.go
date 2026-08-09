@@ -124,3 +124,57 @@ func TestDelegateDeliveryStateChangedRejectsUnknownState(t *testing.T) {
 		t.Fatalf("InvalidEventError = %+v, want State/invalid", invalid)
 	}
 }
+
+func TestDelegateDeliveryStateChangedDecodeRejectsUnknownFieldsAndTrailingValues(t *testing.T) {
+	t.Parallel()
+
+	in := event.DelegateDeliveryStateChanged{
+		Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: uuid.UUID{1}},
+			EventID:     uuid.UUID{4},
+		},
+		RequestID:    uuid.UUID{2},
+		TargetLoopID: uuid.UUID{3},
+		State:        event.DelegateDeliverySteerAttemptReserved,
+	}
+	valid, err := event.MarshalEvent(in)
+	if err != nil {
+		t.Fatalf("MarshalEvent() = %v", err)
+	}
+
+	unknownFields := []string{"user_input", "broker_token", "origin_session_id", "origin_loop_id", "unexpected"}
+	for _, field := range unknownFields {
+		field := field
+		t.Run("unknown "+field, func(t *testing.T) {
+			var wire map[string]json.RawMessage
+			if err := json.Unmarshal(valid, &wire); err != nil {
+				t.Fatalf("valid wire JSON: %v", err)
+			}
+			wire[field] = json.RawMessage(`"forbidden"`)
+			data, err := json.Marshal(wire)
+			if err != nil {
+				t.Fatalf("mutated wire JSON: %v", err)
+			}
+			got, err := event.UnmarshalEvent(data)
+			if got != nil {
+				t.Fatalf("UnmarshalEvent() returned %#v on unknown field %q", got, field)
+			}
+			var decodeErr *event.EventDecodeError
+			if !errors.As(err, &decodeErr) {
+				t.Fatalf("UnmarshalEvent() error = %T (%v), want *EventDecodeError", err, err)
+			}
+		})
+	}
+
+	t.Run("trailing JSON value", func(t *testing.T) {
+		data := append(append([]byte(nil), valid...), []byte(`{}`)...)
+		got, err := event.UnmarshalEvent(data)
+		if got != nil {
+			t.Fatalf("UnmarshalEvent() returned %#v on trailing value", got)
+		}
+		var decodeErr *event.EventDecodeError
+		if !errors.As(err, &decodeErr) {
+			t.Fatalf("UnmarshalEvent() error = %T (%v), want *EventDecodeError", err, err)
+		}
+	})
+}
