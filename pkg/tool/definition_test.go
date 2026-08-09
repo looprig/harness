@@ -69,7 +69,7 @@ func TestDelegateControllerUsesAgentLanguageWithoutWaitCollection(t *testing.T) 
 	}
 
 	wantResultFields := []string{
-		"AgentID", "Name", "State", "Response", "ResponseStatus",
+		"AgentID", "Name", "State", "DeliveryStatus", "Response", "ResponseStatus",
 		"CorrelationID", "PreviousState", "Agents", "Truncated",
 	}
 	resultType := reflect.TypeOf(tool.DelegateResult{})

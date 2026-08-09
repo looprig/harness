@@ -121,6 +121,20 @@ const (
 	AgentStateUnavailable AgentState = "unavailable"
 )
 
+// DelegateDeliveryStatus identifies how a message reached (or failed to
+// reach) its target. It is intentionally separate from the target response's
+// terminal status.
+type DelegateDeliveryStatus string
+
+const (
+	DelegateDeliveryAcceptedPending DelegateDeliveryStatus = "accepted_pending"
+	DelegateDeliveryInjected        DelegateDeliveryStatus = "injected"
+	DelegateDeliveryQueued          DelegateDeliveryStatus = "queued"
+	DelegateDeliveryRejected        DelegateDeliveryStatus = "rejected"
+	DelegateDeliveryUnknown         DelegateDeliveryStatus = "delivery_unknown"
+	DelegateDeliveryUntrackable     DelegateDeliveryStatus = "delivered_untrackable"
+)
+
 // DelegateResponseStatus is the terminal status of one agent response. It is
 // intentionally separate from the persistent agent's lifecycle state.
 type DelegateResponseStatus uint8
@@ -196,6 +210,7 @@ type DelegateResult struct {
 	AgentID        uuid.UUID
 	Name           string
 	State          AgentState
+	DeliveryStatus DelegateDeliveryStatus
 	Response       string
 	ResponseStatus DelegateResponseStatus
 	// CorrelationID is an internal command/response identity used by session

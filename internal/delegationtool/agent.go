@@ -80,6 +80,20 @@ func executeAgentCall(ctx context.Context, controller tool.DelegateController, o
 }
 
 func formatForeground(result tool.DelegateResult) string {
+	if result.DeliveryStatus != "" {
+		if result.DeliveryStatus == tool.DelegateDeliveryUnknown || result.DeliveryStatus == tool.DelegateDeliveryUntrackable {
+			result.ResponseStatus = tool.DelegateResponseUnknown
+			result.Response = ""
+		}
+		return marshalForegroundResult(foregroundResult{
+			AgentID:        result.AgentID.String(),
+			Name:           result.Name,
+			State:          result.State,
+			DeliveryStatus: result.DeliveryStatus,
+			ResponseStatus: wireResponseStatus(result.ResponseStatus),
+			Response:       result.Response,
+		})
+	}
 	switch result.ResponseStatus {
 	case tool.DelegateResponseCompleted:
 		return marshalForegroundResult(foregroundResult{AgentID: result.AgentID.String(), Name: result.Name, State: result.State, Response: result.Response})
@@ -106,16 +120,19 @@ func boundAgentOutput(value string) string {
 }
 
 type foregroundResult struct {
-	AgentID  string          `json:"agent_id"`
-	Name     string          `json:"name"`
-	State    tool.AgentState `json:"state"`
-	Response string          `json:"response"`
+	AgentID        string                      `json:"agent_id"`
+	Name           string                      `json:"name"`
+	State          tool.AgentState             `json:"state"`
+	DeliveryStatus tool.DelegateDeliveryStatus `json:"delivery_status,omitempty"`
+	ResponseStatus string                      `json:"response_status,omitempty"`
+	Response       string                      `json:"response,omitempty"`
 }
 
 type backgroundResult struct {
-	AgentID string          `json:"agent_id"`
-	Name    string          `json:"name"`
-	State   tool.AgentState `json:"state"`
+	AgentID        string                      `json:"agent_id"`
+	Name           string                      `json:"name"`
+	State          tool.AgentState             `json:"state"`
+	DeliveryStatus tool.DelegateDeliveryStatus `json:"delivery_status,omitempty"`
 }
 
 func marshalForegroundResult(result foregroundResult) string {
@@ -150,7 +167,22 @@ func marshalForegroundResult(result foregroundResult) string {
 }
 
 func formatBackground(result tool.DelegateResult) string {
-	return marshalResult(backgroundResult{AgentID: result.AgentID.String(), Name: result.Name, State: result.State})
+	return marshalResult(backgroundResult{AgentID: result.AgentID.String(), Name: result.Name, State: result.State, DeliveryStatus: result.DeliveryStatus})
+}
+
+func wireResponseStatus(status tool.DelegateResponseStatus) string {
+	switch status {
+	case tool.DelegateResponseCompleted:
+		return "completed"
+	case tool.DelegateResponseFailed:
+		return "failed"
+	case tool.DelegateResponseInterrupted:
+		return "interrupted"
+	case tool.DelegateResponseTimedOut:
+		return "timed_out"
+	default:
+		return ""
+	}
 }
 
 func marshalResult(value any) string {

@@ -40,6 +40,32 @@ func TestAgentToolDefinitionProducesFourInvokableTools(t *testing.T) {
 	}
 }
 
+func TestDelegateDeliveryStatusUsesExactWireValues(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		status tool.DelegateDeliveryStatus
+		want   string
+	}{
+		{name: "accepted pending", status: tool.DelegateDeliveryAcceptedPending, want: "accepted_pending"},
+		{name: "injected", status: tool.DelegateDeliveryInjected, want: "injected"},
+		{name: "queued", status: tool.DelegateDeliveryQueued, want: "queued"},
+		{name: "rejected", status: tool.DelegateDeliveryRejected, want: "rejected"},
+		{name: "delivery unknown", status: tool.DelegateDeliveryUnknown, want: "delivery_unknown"},
+		{name: "delivered untrackable", status: tool.DelegateDeliveryUntrackable, want: "delivered_untrackable"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := string(tt.status); got != tt.want {
+				t.Fatalf("delivery status = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func mustDefinitionUUID(t *testing.T) uuid.UUID {
 	t.Helper()
 	id, err := uuid.New()

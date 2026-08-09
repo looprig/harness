@@ -49,10 +49,15 @@ func (s *MessageAgentTool) InvokableRun(ctx context.Context, _ string) (*tool.To
 }
 
 func formatMessageAgentResult(req tool.DelegateRequest, result tool.DelegateResult) string {
-	if req.WaitForResponse {
-		return formatForeground(result)
+	if !req.WaitForResponse {
+		// Background admission is an immediate delivery envelope. Any response
+		// fields on the controller result belong to a later hand-back and must
+		// not leak into this tool result.
+		result.Response = ""
+		result.ResponseStatus = tool.DelegateResponseUnknown
+		return formatBackground(result)
 	}
-	return formatBackground(result)
+	return formatForeground(result)
 }
 
 var _ tool.InvokableTool = (*MessageAgentTool)(nil)

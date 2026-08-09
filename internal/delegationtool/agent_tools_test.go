@@ -45,6 +45,121 @@ func TestFormatForegroundBoundsMultibyteResponseAtRuneBoundary(t *testing.T) {
 	}
 }
 
+func TestMessageAgentFormatForegroundIncludesDeliveryStatus(t *testing.T) {
+	t.Parallel()
+
+	agentID := mustParseUUID(t, "55555555-5555-4555-8555-555555555555")
+	got := formatForeground(tool.DelegateResult{
+		AgentID:        agentID,
+		Name:           "worker",
+		State:          tool.AgentStateIdle,
+		DeliveryStatus: tool.DelegateDeliveryInjected,
+		ResponseStatus: tool.DelegateResponseCompleted,
+		Response:       "done",
+	})
+	want := `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"idle","delivery_status":"injected","response_status":"completed","response":"done"}`
+	if got != want {
+		t.Fatalf("formatForeground() = %q, want %q", got, want)
+	}
+}
+
+func TestMessageAgentDeliveryStatusFormatting(t *testing.T) {
+	t.Parallel()
+
+	agentID := mustParseUUID(t, "55555555-5555-4555-8555-555555555555")
+	tests := []struct {
+		name     string
+		delivery tool.DelegateDeliveryStatus
+		wantJSON string
+	}{
+		{name: "accepted pending", delivery: tool.DelegateDeliveryAcceptedPending, wantJSON: `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"working","delivery_status":"accepted_pending"}`},
+		{name: "injected", delivery: tool.DelegateDeliveryInjected, wantJSON: `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"working","delivery_status":"injected"}`},
+		{name: "queued", delivery: tool.DelegateDeliveryQueued, wantJSON: `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"working","delivery_status":"queued"}`},
+		{name: "rejected", delivery: tool.DelegateDeliveryRejected, wantJSON: `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"working","delivery_status":"rejected"}`},
+		{name: "delivery unknown", delivery: tool.DelegateDeliveryUnknown, wantJSON: `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"working","delivery_status":"delivery_unknown"}`},
+		{name: "delivered untrackable", delivery: tool.DelegateDeliveryUntrackable, wantJSON: `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"working","delivery_status":"delivered_untrackable"}`},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := formatMessageAgentResult(tool.DelegateRequest{}, tool.DelegateResult{
+				AgentID:        agentID,
+				Name:           "worker",
+				State:          tool.AgentStateWorking,
+				DeliveryStatus: tt.delivery,
+				ResponseStatus: tool.DelegateResponseCompleted,
+				Response:       "not returned immediately",
+			})
+			if got != tt.wantJSON {
+				t.Fatalf("formatMessageAgentResult() = %q, want %q", got, tt.wantJSON)
+			}
+		})
+	}
+}
+
+func TestMessageAgentResponseStatusFormatting(t *testing.T) {
+	t.Parallel()
+
+	agentID := mustParseUUID(t, "55555555-5555-4555-8555-555555555555")
+	tests := []struct {
+		name           string
+		responseStatus tool.DelegateResponseStatus
+		wantJSON       string
+	}{
+		{name: "completed", responseStatus: tool.DelegateResponseCompleted, wantJSON: `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"idle","delivery_status":"injected","response_status":"completed","response":"reply"}`},
+		{name: "failed", responseStatus: tool.DelegateResponseFailed, wantJSON: `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"idle","delivery_status":"injected","response_status":"failed"}`},
+		{name: "interrupted", responseStatus: tool.DelegateResponseInterrupted, wantJSON: `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"idle","delivery_status":"injected","response_status":"interrupted"}`},
+		{name: "timed out", responseStatus: tool.DelegateResponseTimedOut, wantJSON: `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"idle","delivery_status":"injected","response_status":"timed_out"}`},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			response := ""
+			if tt.responseStatus == tool.DelegateResponseCompleted {
+				response = "reply"
+			}
+			got := formatMessageAgentResult(tool.DelegateRequest{WaitForResponse: true}, tool.DelegateResult{
+				AgentID:        agentID,
+				Name:           "worker",
+				State:          tool.AgentStateIdle,
+				DeliveryStatus: tool.DelegateDeliveryInjected,
+				ResponseStatus: tt.responseStatus,
+				Response:       response,
+				CorrelationID:  mustParseUUID(t, "66666666-6666-4666-8666-666666666666"),
+			})
+			if got != tt.wantJSON {
+				t.Fatalf("formatMessageAgentResult() = %q, want %q", got, tt.wantJSON)
+			}
+		})
+	}
+}
+
+func TestMessageAgentUnknownDeliveryOmitsResponseStatus(t *testing.T) {
+	t.Parallel()
+
+	agentID := mustParseUUID(t, "55555555-5555-4555-8555-555555555555")
+	for _, delivery := range []tool.DelegateDeliveryStatus{tool.DelegateDeliveryUnknown, tool.DelegateDeliveryUntrackable} {
+		delivery := delivery
+		t.Run(string(delivery), func(t *testing.T) {
+			t.Parallel()
+			got := formatMessageAgentResult(tool.DelegateRequest{WaitForResponse: true}, tool.DelegateResult{
+				AgentID:        agentID,
+				Name:           "worker",
+				State:          tool.AgentStateWorking,
+				DeliveryStatus: delivery,
+				ResponseStatus: tool.DelegateResponseCompleted,
+				Response:       "must not be correlated",
+			})
+			want := `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"working","delivery_status":"` + string(delivery) + `"}`
+			if got != want {
+				t.Fatalf("formatMessageAgentResult() = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestFormatForegroundBoundsEncodedEscapedResponse(t *testing.T) {
 	t.Parallel()
 
