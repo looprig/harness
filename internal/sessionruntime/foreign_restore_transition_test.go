@@ -188,6 +188,20 @@ func TestRestoreTerminalDeliveryStateRequiresReservation(t *testing.T) {
 	}
 }
 
+func TestRestoreDeliveryStateRequiresSessionRoute(t *testing.T) {
+	t.Parallel()
+	sessionID, childID, requestID := mustUUID(), mustUUID(), mustUUID()
+	records := []journal.JournalRecord{
+		journal.NewCommandRecord(sessionID, childID, phasedBackgroundCommand(requestID, childID, command.DelegateDeliveryPhaseIntent)),
+	}
+	wrongSession := deliveryReservationEvent(mustUUID(), requestID, childID)
+	err := seedResolvedDelegateRecords(newDelegationManager(Topology{}), records, []event.Event{wrongSession}, nil)
+	var contradiction *delegateRestoreContradictionError
+	if !errors.As(err, &contradiction) {
+		t.Fatalf("wrong-session delivery state error = %T %v, want contradiction", err, err)
+	}
+}
+
 func TestRestoreFallbackConflictsWithTerminalDeliveryStateRegardlessOrder(t *testing.T) {
 	t.Parallel()
 	for _, terminalFirst := range []bool{false, true} {

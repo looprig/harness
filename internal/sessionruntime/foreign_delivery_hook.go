@@ -150,8 +150,10 @@ func (s *Session) recordForeignDeliveryFold(ev event.Event) {
 		hook.observeFold(typed)
 	case event.TurnStarted:
 		hook.observeRestoredStart(typed)
-	case event.InputCancelled, event.TurnRejected:
-		hook.observeRestoredTerminal(loopID, requestID)
+	case event.InputCancelled:
+		hook.observeRestoredTerminal(typed.SessionID, loopID, requestID)
+	case event.TurnRejected:
+		hook.observeRestoredTerminal(typed.SessionID, loopID, requestID)
 	}
 }
 
@@ -299,8 +301,8 @@ func (h *foreignDeliveryHook) observeRestoredStart(ev event.TurnStarted) {
 	h.mu.Unlock()
 }
 
-func (h *foreignDeliveryHook) observeRestoredTerminal(loopID, requestID uuid.UUID) {
-	if h == nil || loopID != h.loopID || requestID.IsZero() {
+func (h *foreignDeliveryHook) observeRestoredTerminal(sessionID, loopID, requestID uuid.UUID) {
+	if h == nil || sessionID != h.sessionID || loopID != h.loopID || requestID.IsZero() {
 		return
 	}
 	h.mu.Lock()

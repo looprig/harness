@@ -202,6 +202,28 @@ func TestForeignDeliveryHookInjectedResolutionRequiresAuthoritativeFold(t *testi
 	}
 }
 
+func TestForeignDeliveryHookUncheckedFoldAppendCannotAuthorizeInjectedResolution(t *testing.T) {
+	t.Parallel()
+	s, hook, _, events, intent, _ := newForeignDeliveryHookFixture(t)
+	if err := hook.CreateIntent(context.Background(), intent); err != nil {
+		t.Fatal(err)
+	}
+	if err := hook.Reserve(context.Background(), foreign.DeliveryReservation(intent)); err != nil {
+		t.Fatal(err)
+	}
+	events.mu.Lock()
+	events.err = errors.New("primary fold append failed")
+	events.mu.Unlock()
+	turnID := mustUUID()
+	_ = s.PublishEvent(context.Background(), event.TurnFoldedInto{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: s.sessionID, LoopID: intent.LoopID, TurnID: turnID},
+		Cause:       identity.Cause{CommandID: intent.RequestID},
+	}})
+	if err := hook.Resolve(context.Background(), foreign.DeliveryResolution{LoopID: intent.LoopID, RequestID: intent.RequestID, TurnID: turnID, State: foreign.DeliveryResolutionInjected}); err == nil {
+		t.Fatal("Resolve(injected) succeeded after unchecked primary append failure")
+	}
+}
+
 func TestForeignDeliveryHookIgnoresFoldFromAnotherSessionOrRoute(t *testing.T) {
 	t.Parallel()
 	s, hook, _, _, intent, _ := newForeignDeliveryHookFixture(t)
@@ -432,6 +454,30 @@ func TestForeignDeliveryHookRestoredCompletionReleasesBoundCommand(t *testing.T)
 	}
 }
 
+func TestForeignDeliveryHookRestoredTerminalRequiresSessionRoute(t *testing.T) {
+	t.Parallel()
+	s, original, _, _, intent, cmd := newForeignDeliveryHookFixture(t)
+	hook := newForeignDeliveryHook(s, original.loopID)
+	cmd.DelegateDeliveryPhase = command.DelegateDeliveryPhaseIntent
+	if err := hook.observeRestoredCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	hook.observeRestoredTerminal(mustUUID(), intent.LoopID, intent.RequestID)
+	hook.mu.Lock()
+	retained := len(hook.commands)
+	hook.mu.Unlock()
+	if retained != 1 {
+		t.Fatalf("wrong-session restored terminal retained %d commands, want 1", retained)
+	}
+	hook.observeRestoredTerminal(s.sessionID, intent.LoopID, intent.RequestID)
+	hook.mu.Lock()
+	retained = len(hook.commands)
+	hook.mu.Unlock()
+	if retained != 0 {
+		t.Fatalf("matching restored terminal retained %d commands", retained)
+	}
+}
+
 func TestForeignDeliveryHookAbandonsIntentAfterBackendDispatchFailure(t *testing.T) {
 	t.Parallel()
 	s, hook, _, _, baseIntent, _ := newForeignDeliveryHookFixture(t)
@@ -453,6 +499,38 @@ func TestForeignDeliveryHookAbandonsIntentAfterBackendDispatchFailure(t *testing
 	hook.mu.Unlock()
 	if commandsRetained != 0 || foldsRetained != 0 || phases != 0 || tombstones > foreignDeliveryTombstoneLimit {
 		t.Fatalf("dispatch failures retained hook state commands=%d folds=%d phases=%d tombstones=%d", commandsRetained, foldsRetained, phases, tombstones)
+	}
+}
+
+func TestRestoredForeignDeliveryAbandonsFailedDispatches(t *testing.T) {
+	t.Parallel()
+	loopID := mustUUID()
+	backend := &channelBackend{Commands: make(chan command.Command), Done: make(chan struct{})}
+	close(backend.Done)
+	s := &Session{
+		sessionID:  mustUUID(),
+		sessionCtx: context.Background(),
+		loops:      map[uuid.UUID]*loopHandle{loopID: {id: loopID, backend: backend}},
+		delegateSubscribe: func(event.EventFilter) (event.Subscription, error) {
+			return newTrackingDelegateSubscription(), nil
+		},
+	}
+	hook := newForeignDeliveryHook(s, loopID)
+	m := newDelegationManager(Topology{})
+	for attempt := 0; attempt < foreignDeliveryTombstoneLimit*2; attempt++ {
+		requestID := mustUUID()
+		cmd := command.UserInput{
+			Header:                command.Header{CommandID: requestID, Agency: identity.AgencyMachine},
+			TargetLoopID:          loopID,
+			DelegateDeliveryPhase: command.DelegateDeliveryPhaseIntent,
+		}
+		m.readmitRestoredBackgroundRequest(s, restoredBackgroundPlan{requestID: requestID, childID: loopID, reAdmit: &cmd})
+	}
+	hook.mu.Lock()
+	commandsRetained, foldsRetained, phases, tombstones := len(hook.commands), len(hook.folds), len(hook.phases), len(hook.tombstones)
+	hook.mu.Unlock()
+	if commandsRetained != 0 || foldsRetained != 0 || phases != 0 || tombstones > foreignDeliveryTombstoneLimit {
+		t.Fatalf("restored dispatch failures retained hook state commands=%d folds=%d phases=%d tombstones=%d", commandsRetained, foldsRetained, phases, tombstones)
 	}
 }
 

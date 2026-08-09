@@ -863,7 +863,6 @@ func (s *Session) PublishEvent(ctx context.Context, ev event.Event) error {
 	if err := s.hub.PublishEvent(ctx, ev); err != nil {
 		return err
 	}
-	s.recordForeignDeliveryFold(ev)
 	s.recordLoopMechanicalState(ev)
 	s.clearReviewTurnState(ev)
 	return nil

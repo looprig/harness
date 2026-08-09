@@ -206,10 +206,14 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	combined := make([]event.Event, 0, len(replayed)+len(closures))
 	combined = append(combined, replayed...)
 	combined = append(combined, closures...)
-	if err := validateDelegateRestoreCorrelations(combined, targets); err != nil {
+	sessionID, err := phasedDelegateSessionID(records)
+	if err != nil {
 		return err
 	}
-	deliveryStates, err := collectDelegateDeliveryStates(combined, targets)
+	if err := validateDelegateRestoreCorrelations(combined, targets, sessionID); err != nil {
+		return err
+	}
+	deliveryStates, err := collectDelegateDeliveryStates(combined, targets, sessionID)
 	if err != nil {
 		return err
 	}
@@ -407,7 +411,26 @@ func delegateDeliveryStateTerminal(state event.DelegateDeliveryState) bool {
 // preserving reservation as an intermediate state. Repeated identical events are
 // idempotent; a terminal state cannot regress to reservation or change terminal
 // kind without a fail-closed restore error.
-func collectDelegateDeliveryStates(events []event.Event, targets map[uuid.UUID]uuid.UUID) (map[uuid.UUID]event.DelegateDeliveryState, error) {
+func phasedDelegateSessionID(records []journal.JournalRecord) (uuid.UUID, error) {
+	for _, record := range records {
+		commandRecord, ok := record.(journal.CommandRecord)
+		if !ok || commandRecord.SessionID().IsZero() {
+			continue
+		}
+		input, ok := commandRecord.Command().(command.UserInput)
+		if !ok || input.DelegateDeliveryPhase == "" || !input.DelegateDeliveryPhase.Valid() {
+			continue
+		}
+		// A restore stream can contain records from multiple loops and
+		// sessions. The session identity is only authoritative when checked
+		// against the delivery state for its own request; callers must not
+		// reject the whole stream because unrelated records differ.
+		return commandRecord.SessionID(), nil
+	}
+	return uuid.UUID{}, nil
+}
+
+func collectDelegateDeliveryStates(events []event.Event, targets map[uuid.UUID]uuid.UUID, sessionID uuid.UUID) (map[uuid.UUID]event.DelegateDeliveryState, error) {
 	states := make(map[uuid.UUID]event.DelegateDeliveryState)
 	for _, ev := range events {
 		state, ok := ev.(event.DelegateDeliveryStateChanged)
@@ -417,6 +440,9 @@ func collectDelegateDeliveryStates(events []event.Event, targets map[uuid.UUID]u
 		target, admitted := targets[state.RequestID]
 		if !admitted {
 			continue
+		}
+		if !sessionID.IsZero() && state.SessionID != sessionID {
+			return nil, &delegateRestoreContradictionError{requestID: state.RequestID, reason: "delivery state session mismatch"}
 		}
 		if state.TargetLoopID != target {
 			return nil, &journal.CommandRouteMismatchError{RecordLoopID: state.TargetLoopID, TargetLoopID: target}
@@ -466,10 +492,10 @@ func persistUnresolvedDelegateDeliveryStates(ctx context.Context, j journal.Sess
 	combined := make([]event.Event, 0, len(replayed)+len(closures))
 	combined = append(combined, replayed...)
 	combined = append(combined, closures...)
-	if err := validateDelegateRestoreCorrelations(combined, targets); err != nil {
+	if err := validateDelegateRestoreCorrelations(combined, targets, sessionID); err != nil {
 		return nil, err
 	}
-	deliveryStates, err := collectDelegateDeliveryStates(combined, targets)
+	deliveryStates, err := collectDelegateDeliveryStates(combined, targets, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -539,12 +565,12 @@ func persistUnresolvedDelegateDeliveryStates(ctx context.Context, j journal.Sess
 // restore repair can append a new delivery-state event. In particular, a repair
 // must never be written first and only then discover that the same request also
 // has an authoritative turn terminal or cancellation.
-func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.UUID]uuid.UUID) error {
+func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.UUID]uuid.UUID, sessionID uuid.UUID) error {
 	terminals, err := foldDelegateTerminalsChecked(events)
 	if err != nil {
 		return err
 	}
-	deliveryStates, err := collectDelegateDeliveryStates(events, intents)
+	deliveryStates, err := collectDelegateDeliveryStates(events, intents, sessionID)
 	if err != nil {
 		return err
 	}
@@ -669,6 +695,16 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 	if err != nil {
 		return nil, err
 	}
+	restoreSessionID, err := phasedDelegateSessionID(records)
+	if err != nil {
+		return nil, err
+	}
+	if !s.sessionID.IsZero() {
+		if !restoreSessionID.IsZero() && restoreSessionID != s.sessionID {
+			return nil, &delegateRestoreContradictionError{reason: "delegate command session mismatch"}
+		}
+		restoreSessionID = s.sessionID
+	}
 	phased, err := phasedDelegateCommands(records)
 	if err != nil {
 		return nil, err
@@ -680,10 +716,10 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 	combined := make([]event.Event, 0, len(replayed)+len(closures))
 	combined = append(combined, replayed...)
 	combined = append(combined, closures...)
-	if err := validateDelegateRestoreCorrelations(combined, targets); err != nil {
+	if err := validateDelegateRestoreCorrelations(combined, targets, restoreSessionID); err != nil {
 		return nil, err
 	}
-	deliveryStates, err := collectDelegateDeliveryStates(combined, targets)
+	deliveryStates, err := collectDelegateDeliveryStates(combined, targets, restoreSessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -992,7 +1028,9 @@ func (m *delegationManager) readmitRestoredBackgroundRequest(s *Session, entry r
 	}
 	cmd := *entry.reAdmit
 	cmd.Accepted = make(chan error, 1)
-	if hook := s.foreignDeliveryHookFor(entry.childID); hook != nil {
+	hook := s.foreignDeliveryHookFor(entry.childID)
+	hookBound := false
+	if hook != nil {
 		if err := hook.observeRestoredCommand(cmd); err != nil {
 			_ = sub.Close()
 			m.removeRequest(entry.requestID, tracked)
@@ -1001,9 +1039,17 @@ func (m *delegationManager) readmitRestoredBackgroundRequest(s *Session, entry r
 			}
 			return
 		}
+		hookBound = true
 	}
+	dispatched := false
+	defer func() {
+		if hookBound && !dispatched {
+			hook.abandon(entry.requestID)
+		}
+	}()
 	select {
 	case backend.CommandSink() <- cmd:
+		dispatched = true
 		// Drain immediately. The actor's acceptance ack is intentionally not
 		// awaited here: the durable command is valid, and the drain observes
 		// the authoritative opening/rejection event without blocking RestoreDone.
