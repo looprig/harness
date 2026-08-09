@@ -294,6 +294,8 @@ type Session struct {
 	foreignBuildServices         foreign.ServicesBuilder
 	foreignBuildRestoredServices foreign.ServicesRestoredBuilder
 	foreignRegistry              *foreign.BuilderRegistry
+	foreignDeliveryMu            sync.RWMutex
+	foreignDeliveryHooks         map[uuid.UUID]*foreignDeliveryHook
 	runtimeCatalog               loop.RuntimeCatalog
 	hasRuntimeCatalog            bool
 	runtimeCatalogProvider       RuntimeCatalogProvider
@@ -861,6 +863,7 @@ func (s *Session) PublishEvent(ctx context.Context, ev event.Event) error {
 	if err := s.hub.PublishEvent(ctx, ev); err != nil {
 		return err
 	}
+	s.recordForeignDeliveryFold(ev)
 	s.recordLoopMechanicalState(ev)
 	s.clearReviewTurnState(ev)
 	return nil
@@ -874,9 +877,30 @@ func (s *Session) PublishEventChecked(ctx context.Context, ev event.Event) error
 	if err := s.hub.PublishEventChecked(ctx, ev); err != nil {
 		return err
 	}
+	s.recordForeignDeliveryFold(ev)
 	s.recordLoopMechanicalState(ev)
 	s.clearReviewTurnState(ev)
 	return nil
+}
+
+// foreignServicesFor creates the one services snapshot for an exact foreign
+// loop construction. The broker descriptor remains empty until the broker
+// composition work lands; delivery authority is nevertheless live and scoped
+// to this session+loop pair. A fresh hook is created for every construction,
+// including restored loops, so no capability is shared across loops/sessions.
+func (s *Session) foreignServicesFor(loopID uuid.UUID) foreign.Services {
+	hook := newForeignDeliveryHook(s, loopID)
+	return foreign.NewServices(foreign.BrokerDescriptor{}, hook)
+}
+
+func (s *Session) foreignDeliveryHookFor(loopID uuid.UUID) *foreignDeliveryHook {
+	if s == nil {
+		return nil
+	}
+	s.foreignDeliveryMu.RLock()
+	hook := s.foreignDeliveryHooks[loopID]
+	s.foreignDeliveryMu.RUnlock()
+	return hook
 }
 
 // CommitBoundary is the native loop-actor boundary seam. Without a configured
@@ -1502,10 +1526,10 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 				return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing, Cause: lookupErr}
 			}
 			b, foreignSID, err = builder(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
-				func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.Services{})
+				func() (uuid.UUID, error) { return s.newID() }, s.factory, s.foreignServicesFor(loopID))
 		} else if s.foreignBuildServices != nil {
 			b, foreignSID, err = s.foreignBuildServices(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
-				func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.Services{})
+				func() (uuid.UUID, error) { return s.newID() }, s.factory, s.foreignServicesFor(loopID))
 		} else if s.foreignBuild != nil {
 			// The legacy function-pair seam remains a valid composition path for
 			// adapter definitions. A profile-aware dispatcher supplied through
@@ -1533,7 +1557,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		bound = selectedBound
 		if s.foreignBuildServices != nil {
 			b, foreignSID, err = s.foreignBuildServices(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
-				func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.Services{})
+				func() (uuid.UUID, error) { return s.newID() }, s.factory, s.foreignServicesFor(loopID))
 		} else {
 			b, foreignSID, err = s.foreignBuild(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
 				func() (uuid.UUID, error) { return s.newID() }, s.factory)

@@ -52,8 +52,9 @@ func (d BrokerDescriptor) clone() BrokerDescriptor {
 }
 
 // DeliveryIntent identifies one durable delivery request. It deliberately
-// carries only loop/request identity; session controllers and message payloads
-// do not cross the foreign-loop boundary.
+// carries only loop/request identity; the session binds the exact command
+// payload privately before actor admission, so session controllers, journals,
+// and message payloads do not cross the foreign-loop boundary.
 type DeliveryIntent struct {
 	LoopID    uuid.UUID
 	RequestID uuid.UUID
@@ -62,7 +63,9 @@ type DeliveryIntent struct {
 // DeliveryReservation identifies one reserved foreign delivery attempt.
 type DeliveryReservation = DeliveryIntent
 
-// DeliveryFallback identifies the one normal-queue fallback for a request.
+// DeliveryFallback identifies the one normal-queue fallback for a request. The
+// hook implementation reuses the command already bound to RequestID and writes
+// its fallback phase before returning; callers never supply a second payload.
 type DeliveryFallback = DeliveryIntent
 
 // DeliveryResolutionState is the provider-neutral terminal classification for
@@ -89,7 +92,9 @@ type DeliveryResolution struct {
 // DeliveryHook is the narrow durability capability supplied to one foreign
 // loop actor. Implementations must scope every operation to the loop and
 // request identifiers supplied in its value; they must not expose a Session,
-// controller, or other cross-loop authority.
+// controller, journal, command sink, or other cross-loop authority. A
+// successful QueueFallback return means its exact command payload is already
+// durably recorded and may now be admitted through the normal actor path.
 type DeliveryHook interface {
 	CreateIntent(context.Context, DeliveryIntent) error
 	Reserve(context.Context, DeliveryReservation) error

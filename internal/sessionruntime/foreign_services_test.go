@@ -13,7 +13,7 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 )
 
-func TestForeignServicesBuilderReceivesZeroSnapshotUntilPerLoopBinding(t *testing.T) {
+func TestForeignServicesBuilderReceivesFreshPerLoopDeliveryHook(t *testing.T) {
 	t.Parallel()
 
 	backend := newFakeBackend()
@@ -38,8 +38,8 @@ func TestForeignServicesBuilderReceivesZeroSnapshotUntilPerLoopBinding(t *testin
 		t.Fatalf("newSession: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-	if got.Broker.Endpoint() != "" || got.Broker.Capability() != nil || got.Delivery != nil {
-		t.Fatalf("services = %#v, want zero Services before per-loop binding", got)
+	if got.Broker.Endpoint() != "" || got.Broker.Capability() != nil || got.Delivery == nil {
+		t.Fatalf("services = %#v, want empty broker plus a per-loop delivery hook", got)
 	}
 }
 
@@ -63,7 +63,7 @@ func TestLegacyForeignBuilderPathRemainsUsableWithZeroServices(t *testing.T) {
 	}
 }
 
-func TestServicesRestoredBuilderReceivesZeroSnapshotUntilPerLoopBinding(t *testing.T) {
+func TestServicesRestoredBuilderReceivesFreshPerLoopDeliveryHook(t *testing.T) {
 	t.Parallel()
 
 	folded := foldLoop([]event.Event{
@@ -100,8 +100,8 @@ func TestServicesRestoredBuilderReceivesZeroSnapshotUntilPerLoopBinding(t *testi
 		t.Fatalf("buildRestoredSession: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-	if got.Broker.Endpoint() != "" || got.Broker.Capability() != nil || got.Delivery != nil {
-		t.Fatalf("restored services = %#v, want zero Services before per-loop binding", got)
+	if got.Broker.Endpoint() != "" || got.Broker.Capability() != nil || got.Delivery == nil {
+		t.Fatalf("restored services = %#v, want empty broker plus a per-loop delivery hook", got)
 	}
 }
 
