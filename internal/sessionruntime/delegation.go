@@ -62,9 +62,10 @@ type delegationManager struct {
 	runtimeCatalog         loop.RuntimeCatalog
 	hasRuntimeCatalog      bool
 	runtimeCatalogProvider RuntimeCatalogProvider
-	// foreignDeliveryResponsiveness bounds only the caller-facing observer. It
-	// never adjudicates the hook or cancels the target; the session-owned
-	// coordinator continues on the durable hook signal after this bound.
+	// foreignDeliveryResponsiveness is private coordinator bookkeeping. It never
+	// adjudicates the hook or cancels the target, and never synthesizes a
+	// model-visible delivery result; the session-owned coordinator continues on
+	// the durable hook signal after this bound.
 	foreignDeliveryResponsiveness time.Duration
 	foreignDeliveryTimerFactory   func(time.Duration) foreignDeliveryObserverTimer
 }

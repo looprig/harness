@@ -91,6 +91,8 @@ func (p *orderedTurnPublisher) PublishEventChecked(ctx context.Context, value ev
 	switch value.(type) {
 	case event.TurnStarted:
 		p.appendOrder("turn.started")
+	case event.TurnRejected:
+		p.appendOrder("turn.rejected")
 	case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
 		p.appendOrder("turn.terminal")
 	}

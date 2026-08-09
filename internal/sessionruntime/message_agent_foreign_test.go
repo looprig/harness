@@ -423,6 +423,56 @@ func TestMessageAgentForeignQueuedForegroundOwnsSubscriptionBeforeObserverBound(
 	timer.fire()
 }
 
+// TestMessageAgentForeignForegroundWaitsPastObserverBoundForConcreteDelivery
+// proves that the private responsiveness observer cannot replace the actor's
+// eventual delivery phase in a foreground result. A delayed actor ack remains
+// eligible to resolve as queued even after the observer timer fires.
+func TestMessageAgentForeignForegroundWaitsPastObserverBoundForConcreteDelivery(t *testing.T) {
+	fixture := newForeignMessageAgentFixture(t)
+	timer := newManualForeignDeliveryTimer()
+	fixture.controller.manager.foreignDeliveryTimerFactory = func(time.Duration) foreignDeliveryObserverTimer { return timer }
+	one := 1
+	resultCh := make(chan struct {
+		result tool.DelegateResult
+		err    error
+	}, 1)
+	go func() {
+		req := foreignMessageRequest(fixture.childID, true)
+		req.TimeoutSeconds = &one
+		result, err := fixture.controller.Execute(context.Background(), req)
+		resultCh <- struct {
+			result tool.DelegateResult
+			err    error
+		}{result: result, err: err}
+	}()
+	raw := <-fixture.child.Commands
+	cmd := raw.(command.UserInput)
+	cmd.Accepted <- nil
+	timer.fire()
+	select {
+	case call := <-resultCh:
+		t.Fatalf("observer bound returned early = %+v/%v, want actor delivery phase", call.result, call.err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := fixture.hook.QueueFallback(context.Background(), foreignFallbackIntent(cmd.CommandID, fixture.childID)); err != nil {
+		t.Fatalf("QueueFallback: %v", err)
+	}
+	turnID := mustUUID()
+	fixture.sub.feed(foreignTurnEvent(fixture, cmd.CommandID, turnID, false))
+	fixture.sub.feed(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: fixture.session.sessionID, LoopID: fixture.childID, TurnID: turnID}}, Message: aiMessage("delayed answer")})
+	select {
+	case call := <-resultCh:
+		if call.err != nil {
+			t.Fatalf("Execute: %v", call.err)
+		}
+		if call.result.DeliveryStatus != tool.DelegateDeliveryQueued || call.result.ResponseStatus != tool.DelegateResponseCompleted || call.result.Response != "delayed answer" {
+			t.Fatalf("result = %+v, want queued/completed/delayed answer", call.result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Execute did not resolve after delayed concrete delivery")
+	}
+}
+
 func TestMessageAgentForeignInjectedWaitReportsInjectedDeliveryAndResponse(t *testing.T) {
 	fixture := newForeignMessageAgentFixture(t)
 	resultCh := make(chan struct {
@@ -496,7 +546,7 @@ func TestMessageAgentForeignIdleAdmissionReportsQueuedDelivery(t *testing.T) {
 	}
 }
 
-func TestMessageAgentForeignObserverBoundReturnsPendingWithoutUnknown(t *testing.T) {
+func TestMessageAgentForeignBackgroundWaitsPastObserverBoundForConcreteDelivery(t *testing.T) {
 	fixture := newForeignMessageAgentFixture(t)
 	timer := newManualForeignDeliveryTimer()
 	fixture.controller.manager.foreignDeliveryTimerFactory = func(time.Duration) foreignDeliveryObserverTimer { return timer }
@@ -515,12 +565,10 @@ func TestMessageAgentForeignObserverBoundReturnsPendingWithoutUnknown(t *testing
 	cmd := raw.(command.UserInput)
 	cmd.Accepted <- nil
 	timer.fire()
-	call := <-resultCh
-	if call.err != nil {
-		t.Fatalf("Execute: %v", call.err)
-	}
-	if call.result.DeliveryStatus != tool.DelegateDeliveryAcceptedPending || call.result.ResponseStatus != tool.DelegateResponseUnknown || call.result.CorrelationID != cmd.CommandID {
-		t.Fatalf("observer-bound result = %+v, want accepted_pending/unknown correlation=%v", call.result, cmd.CommandID)
+	select {
+	case call := <-resultCh:
+		t.Fatalf("observer bound returned early = %+v/%v, want actor delivery phase", call.result, call.err)
+	case <-time.After(20 * time.Millisecond):
 	}
 	if got := fixture.hook.deliveryStatus(cmd.CommandID); got != "" {
 		t.Fatalf("observer bound changed hook status to %q, want no concrete phase", got)
@@ -531,6 +579,13 @@ func TestMessageAgentForeignObserverBoundReturnsPendingWithoutUnknown(t *testing
 	turnID := mustUUID()
 	fixture.sub.feed(foreignTurnEvent(fixture, cmd.CommandID, turnID, false))
 	fixture.sub.feed(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: fixture.session.sessionID, LoopID: fixture.childID, TurnID: turnID}}, Message: aiMessage("bound answer")})
+	call := <-resultCh
+	if call.err != nil {
+		t.Fatalf("Execute: %v", call.err)
+	}
+	if call.result.DeliveryStatus != tool.DelegateDeliveryQueued || call.result.ResponseStatus != tool.DelegateResponseUnknown || call.result.CorrelationID != cmd.CommandID {
+		t.Fatalf("result = %+v, want queued/unknown correlation=%v", call.result, cmd.CommandID)
+	}
 	rawParent := <-fixture.parent.Commands
 	completion, ok := decodeBackgroundCompletion(rawParent.(command.SubagentResult).Blocks)
 	if !ok || completion.DeliveryStatus != tool.DelegateDeliveryQueued || completion.ResponseStatus != tool.DelegateResponseCompleted {
@@ -627,9 +682,10 @@ func TestMessageAgentForeignObserverBoundLaterCategoricalHandbackOnce(t *testing
 			cmd := raw.(command.UserInput)
 			cmd.Accepted <- nil
 			timer.fire()
-			call := <-resultCh
-			if call.err != nil || call.result.DeliveryStatus != tool.DelegateDeliveryAcceptedPending || call.result.CorrelationID != cmd.CommandID {
-				t.Fatalf("pending result = %+v/%v, want accepted_pending correlation=%v", call.result, call.err, cmd.CommandID)
+			select {
+			case call := <-resultCh:
+				t.Fatalf("observer bound returned early = %+v/%v, want actor delivery phase", call.result, call.err)
+			case <-time.After(20 * time.Millisecond):
 			}
 			if err := fixture.hook.Reserve(context.Background(), foreign.DeliveryReservation{LoopID: fixture.childID, RequestID: cmd.CommandID}); err != nil {
 				t.Fatalf("Reserve: %v", err)
@@ -637,16 +693,20 @@ func TestMessageAgentForeignObserverBoundLaterCategoricalHandbackOnce(t *testing
 			if err := fixture.hook.Resolve(context.Background(), foreign.DeliveryResolution{LoopID: fixture.childID, RequestID: cmd.CommandID, State: state}); err != nil {
 				t.Fatalf("Resolve %s: %v", state, err)
 			}
+			call := <-resultCh
+			want := tool.DelegateDeliveryUnknown
+			if state == foreign.DeliveryResolutionUntrackable {
+				want = tool.DelegateDeliveryUntrackable
+			}
+			if call.err != nil || call.result.DeliveryStatus != want || call.result.CorrelationID != cmd.CommandID {
+				t.Fatalf("result = %+v/%v, want %s correlation=%v", call.result, call.err, want, cmd.CommandID)
+			}
 			rawParent := <-fixture.parent.Commands
 			handBack, ok := rawParent.(command.SubagentResult)
 			if !ok {
 				t.Fatalf("categorical handback = %T, want command.SubagentResult", rawParent)
 			}
 			completion, ok := decodeBackgroundCompletion(handBack.Blocks)
-			want := tool.DelegateDeliveryUnknown
-			if state == foreign.DeliveryResolutionUntrackable {
-				want = tool.DelegateDeliveryUntrackable
-			}
 			if !ok || completion.DeliveryStatus != want || completion.ResponseStatus != tool.DelegateResponseUnknown {
 				t.Fatalf("categorical completion = %+v/%v, want %s/unknown", completion, ok, want)
 			}

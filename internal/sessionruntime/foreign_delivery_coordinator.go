@@ -10,9 +10,11 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 )
 
-// foreignDeliveryResponsivenessBound is an observer-only bound. Reaching it
-// reports accepted-pending to the caller; it is deliberately not a hook
-// transition and does not interrupt the target actor.
+// foreignDeliveryResponsivenessBound is a private observer-only bound used for
+// coordinator bookkeeping. Reaching it never reports a model-visible delivery
+// result, changes the hook, or interrupts the target actor; callers continue
+// waiting for the actor's concrete delivery phase unless an explicit response
+// observer deadline/cancellation ends their wait.
 const foreignDeliveryResponsivenessBound = 250 * time.Millisecond
 
 type foreignDeliveryObserverTimer interface {
@@ -159,13 +161,15 @@ func (c *foreignDeliveryCoordinator) run() {
 	handBackSent := false
 	detached := c.background
 
-	markPending := func() {
+	markPending := func(notify bool) {
 		if pendingSeen {
 			return
 		}
 		pendingSeen = true
 		c.tracked.markDelivery(tool.DelegateDeliveryAcceptedPending)
-		c.notify(tool.DelegateDeliveryAcceptedPending)
+		if notify {
+			c.notify(tool.DelegateDeliveryAcceptedPending)
+		}
 	}
 
 	for {
@@ -217,11 +221,19 @@ func (c *foreignDeliveryCoordinator) run() {
 		case <-changed:
 			continue
 		case <-observerChan(observer):
-			markPending()
+			// The responsiveness bound is private coordinator bookkeeping. It
+			// must not synthesize a model-visible delivery result; the actor's
+			// authoritative phase is the only concrete foreground/background
+			// admission result.
+			markPending(false)
 			observer = nil
 		case <-responseDone:
 			if errors.Is(responseCtx.Err(), context.DeadlineExceeded) {
-				markPending()
+				// An explicit response observer deadline is allowed to return
+				// accepted-pending while the coordinator retains ownership. A
+				// foreground caller observes its own wait context instead, so only
+				// background admission needs this notification.
+				markPending(c.background)
 				if c.background && !handBackSent {
 					c.sendTimedOutHandBack()
 					handBackSent = true

@@ -1689,9 +1689,12 @@ func runLoop(cfg loopConfig, state loopState) {
 	// event.TurnRejected to the session fan-in (header-stamped by stampLoopHeader,
 	// Cause.CommandID == InputID), so any issuer recognises its answer via
 	// ReplyTo() == its command id. The published TurnRejected is the whole answer:
-	// every submit observes its outcome on the session fan-in.
-	rejectSubmit := func(qi queuedInput, reason event.RejectReason) {
-		publish(event.TurnRejected{
+	// every submit observes its outcome on the session fan-in. Because a managed
+	// delegate intent is already durable before admission, this uses the checked
+	// publication path: returning a queue-full acknowledgement without its durable
+	// rejection would make restore replay an intent the caller was told was refused.
+	rejectSubmit := func(qi queuedInput, reason event.RejectReason) error {
+		stamped, err := stamp(event.TurnRejected{
 			Header: event.Header{
 				Cause: identity.Cause{
 					CommandID:   qi.inputID,
@@ -1700,6 +1703,10 @@ func runLoop(cfg loopConfig, state loopState) {
 			},
 			Reason: reason,
 		})
+		if err != nil {
+			return err
+		}
+		return cfg.events.PublishEventChecked(ctx, stamped)
 	}
 
 	// decideSubmit resolves a UserInput/SubagentResult against the actor's OWN live
@@ -1722,7 +1729,9 @@ func runLoop(cfg loopConfig, state loopState) {
 				if bypassReject {
 					returnEntry(qi, event.CancelTurnFailed, uuid.UUID{})
 				} else {
-					rejectSubmit(qi, event.RejectInternal)
+					if err := rejectSubmit(qi, event.RejectInternal); err != nil {
+						slog.Error("loop rejection publication failed", "error", err)
+					}
 				}
 				return
 			}
@@ -1740,9 +1749,13 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		switch {
 		case state.status == loopShuttingDown && !bypassReject:
-			rejectSubmit(qi, event.RejectShuttingDown)
+			if err := rejectSubmit(qi, event.RejectShuttingDown); err != nil {
+				slog.Error("loop rejection publication failed", "error", err)
+			}
 		case len(state.inbox) >= loop.ManagedInputQueueCapacity && !bypassReject:
-			rejectSubmit(qi, event.RejectQueueFull)
+			if err := rejectSubmit(qi, event.RejectQueueFull); err != nil {
+				slog.Error("loop rejection publication failed", "error", err)
+			}
 		case state.status == loopRunning || state.status == loopWaitingAdmission || compactions.blocksInput() || (state.status == loopShuttingDown && bypassReject):
 			// Busy (or a never-rejected SubagentResult while shutting down): accept into
 			// the inbox (ordered) and publish InputQueued (Ephemeral). The submit resolves
@@ -1780,7 +1793,10 @@ func runLoop(cfg loopConfig, state loopState) {
 			}
 		}
 		reject := func(reason event.RejectReason, cause error) {
-			rejectSubmit(qi, reason)
+			if err := rejectSubmit(qi, reason); err != nil {
+				c.Accepted <- err
+				return
+			}
 			c.Accepted <- &loop.InputRejectedError{Reason: reason, Cause: cause}
 		}
 		switch {
@@ -1883,7 +1899,9 @@ func runLoop(cfg loopConfig, state loopState) {
 			next, _ := popFront()
 			if _, err := startTurn(next); err != nil {
 				if next.rejectOnStartFailure {
-					rejectSubmit(next, event.RejectInternal)
+					if publishErr := rejectSubmit(next, event.RejectInternal); publishErr != nil {
+						slog.Error("loop rejection publication failed", "error", publishErr)
+					}
 				} else {
 					returnEntry(next, event.CancelTurnFailed, uuid.UUID{})
 				}
@@ -3042,7 +3060,9 @@ func runLoop(cfg loopConfig, state loopState) {
 				result.release()
 				state.status = loopIdle
 				if next.rejectOnStartFailure {
-					rejectSubmit(next, event.RejectInternal)
+					if publishErr := rejectSubmit(next, event.RejectInternal); publishErr != nil {
+						slog.Error("loop rejection publication failed", "error", publishErr)
+					}
 				} else {
 					returnEntry(next, event.CancelTurnFailed, uuid.UUID{})
 				}
@@ -3053,7 +3073,9 @@ func runLoop(cfg loopConfig, state loopState) {
 			if _, err := startTurnWithIDAndAdmission(turnID, next, result.release, result.start); err != nil {
 				state.status = loopIdle
 				if next.rejectOnStartFailure {
-					rejectSubmit(next, event.RejectInternal)
+					if publishErr := rejectSubmit(next, event.RejectInternal); publishErr != nil {
+						slog.Error("loop rejection publication failed", "error", publishErr)
+					}
 				} else {
 					returnEntry(next, event.CancelTurnFailed, uuid.UUID{})
 				}

@@ -347,6 +347,41 @@ func TestInboxFullRejected(t *testing.T) {
 	}
 }
 
+// TestManagedQueueFullPublicationFailureDoesNotAcknowledgeRejection proves that
+// a durable TurnRejected append failure is not converted into a successful
+// queue-full admission refusal. The delegate intent is already durable at this
+// point, so reporting a rejection without its enduring event would make restore
+// replay the request after the caller was told it was refused.
+func TestManagedQueueFullPublicationFailureDoesNotAcknowledgeRejection(t *testing.T) {
+	t.Parallel()
+	l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
+	startTurn(t, l, rec, nil) // occupy the loop
+	for i := 0; i < loop.ManagedInputQueueCapacity; i++ {
+		if _, ok := submitUserInput(t, l, rec, mustID(t)).(event.InputQueued); !ok {
+			t.Fatalf("submit %d: want event.InputQueued", i)
+		}
+	}
+
+	sentinel := errors.New("queue-full rejection append failed")
+	rec.setCheckedError(sentinel)
+	id := mustID(t)
+	accepted := make(chan error, 1)
+	l.Commands <- command.UserInput{
+		Header:       command.Header{CommandID: id},
+		NoFold:       true,
+		TargetLoopID: mustID(t),
+		Accepted:     accepted,
+	}
+	if err := <-accepted; !errors.Is(err, sentinel) {
+		t.Fatalf("acceptance error = %T %v, want checked publication failure", err, err)
+	}
+	for _, ev := range rec.events() {
+		if rejected, ok := ev.(event.TurnRejected); ok && rejected.Cause.CommandID == id {
+			t.Fatalf("queue-full rejection was reported despite publication failure: %+v", rejected)
+		}
+	}
+}
+
 // TestShuttingDownRejected: a submit after the loop is shutting down is rejected with
 // event.TurnRejected{RejectShuttingDown}.
 func TestShuttingDownRejected(t *testing.T) {
