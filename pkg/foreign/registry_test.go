@@ -267,6 +267,65 @@ func TestBuilderRegistryServicesRegistrationAndLookup(t *testing.T) {
 	}
 }
 
+func TestBuilderRegistryServicesRegistrationSupportsLegacyLookup(t *testing.T) {
+	t.Parallel()
+
+	var liveGot, restoredGot foreign.Services
+	servicesLive := foreign.ServicesBuilder(func(
+		_ context.Context,
+		_ uuid.UUID,
+		_ uuid.UUID,
+		_ loop.Provenance,
+		_ foreign.EventPublisher,
+		_ loop.BoundDefinition,
+		_ func() (uuid.UUID, error),
+		_ *event.Factory,
+		services foreign.Services,
+	) (loop.Backend, string, error) {
+		liveGot = services
+		return nil, "legacy-adapted-live", nil
+	})
+	servicesRestored := foreign.ServicesRestoredBuilder(func(
+		_ context.Context,
+		_ uuid.UUID,
+		_ uuid.UUID,
+		_ loop.Provenance,
+		_ foreign.EventPublisher,
+		_ loop.BoundDefinition,
+		_ func() (uuid.UUID, error),
+		_ *event.Factory,
+		_ foreign.RestoredForeign,
+		services foreign.Services,
+	) (loop.Backend, error) {
+		restoredGot = services
+		return nil, nil
+	})
+
+	var registry foreign.BuilderRegistry
+	if err := registry.RegisterServices("services", servicesLive, servicesRestored); err != nil {
+		t.Fatalf("RegisterServices: %v", err)
+	}
+	live, restored, err := registry.Builder("services")
+	if err != nil {
+		t.Fatalf("legacy Builder lookup: %v", err)
+	}
+	if live == nil || restored == nil {
+		t.Fatal("legacy Builder lookup returned a nil cross-shape adapter")
+	}
+	if _, sid, err := live(context.Background(), uuid.UUID{}, uuid.UUID{}, loop.Provenance{}, nil, nil, nil, nil); err != nil || sid != "legacy-adapted-live" {
+		t.Fatalf("legacy-adapted live = sid %q, err %v; want legacy-adapted-live", sid, err)
+	}
+	if _, err := restored(context.Background(), uuid.UUID{}, uuid.UUID{}, loop.Provenance{}, nil, nil, nil, nil, foreign.RestoredForeign{}); err != nil {
+		t.Fatalf("legacy-adapted restored: %v", err)
+	}
+	if liveGot.Broker.Endpoint() != "" || liveGot.Broker.Capability() != nil || liveGot.Delivery != nil {
+		t.Fatalf("legacy-adapted live services = %#v, want zero Services", liveGot)
+	}
+	if restoredGot.Broker.Endpoint() != "" || restoredGot.Broker.Capability() != nil || restoredGot.Delivery != nil {
+		t.Fatalf("legacy-adapted restored services = %#v, want zero Services", restoredGot)
+	}
+}
+
 func TestBuilderRegistryLegacyServicesAdapterIgnoresNonzeroSnapshot(t *testing.T) {
 	t.Parallel()
 
@@ -316,5 +375,19 @@ func TestBuilderRegistryLegacyServicesAdapterIgnoresNonzeroSnapshot(t *testing.T
 	}
 	if liveCalls != 1 || restoredCalls != 1 {
 		t.Fatalf("legacy calls = (%d, %d), want (1, 1)", liveCalls, restoredCalls)
+	}
+}
+
+func TestBuilderRegistryServicesLookupUnknownProfile(t *testing.T) {
+	t.Parallel()
+
+	var registry foreign.BuilderRegistry
+	gotLive, gotRestored, err := registry.ServicesBuilder("unknown-services-profile")
+	if gotLive != nil || gotRestored != nil {
+		t.Fatalf("ServicesBuilder unknown returned builders (%v, %v)", gotLive, gotRestored)
+	}
+	var unknown *foreign.UnknownProfileError
+	if !errors.As(err, &unknown) {
+		t.Fatalf("ServicesBuilder unknown error = %v, want *UnknownProfileError", err)
 	}
 }

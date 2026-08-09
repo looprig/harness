@@ -49,6 +49,7 @@ var (
 	errDuplicateBuilderProfile = errors.New("foreign: builder profile already registered")
 	errNilBuilder              = errors.New("foreign: builder callbacks required")
 	errNilServicesBuilder      = errors.New("foreign: services builder callbacks required")
+	errBuilderRegistryShape    = errors.New("foreign: builder registry entry has an invalid shape")
 )
 
 // UnknownProfileError reports a profile that is not registered. Its message is
@@ -129,8 +130,10 @@ func (r *BuilderRegistry) RegisterServices(profile loop.RuntimeProfileName, buil
 	return nil
 }
 
-// Builder returns the live and restored builders registered for profile. An
-// unknown profile returns a bounded *UnknownProfileError and no builders.
+// Builder returns legacy-shaped live and restored builders registered for
+// profile. Services registrations are adapted with zero Services so legacy
+// callers remain source-compatible without gaining authority. An unknown
+// profile returns a bounded *UnknownProfileError and no builders.
 func (r *BuilderRegistry) Builder(profile loop.RuntimeProfileName) (Builder, RestoredBuilder, error) {
 	if r == nil {
 		return nil, nil, &UnknownProfileError{}
@@ -142,7 +145,14 @@ func (r *BuilderRegistry) Builder(profile loop.RuntimeProfileName) (Builder, Res
 	if !exists {
 		return nil, nil, &UnknownProfileError{}
 	}
-	return pair.build, pair.restored, nil
+	switch {
+	case pair.build != nil && pair.restored != nil && pair.servicesBuild == nil && pair.servicesRestore == nil:
+		return pair.build, pair.restored, nil
+	case pair.build == nil && pair.restored == nil && pair.servicesBuild != nil && pair.servicesRestore != nil:
+		return adaptServicesBuilder(pair.servicesBuild), adaptServicesRestoredBuilder(pair.servicesRestore), nil
+	default:
+		return nil, nil, errBuilderRegistryShape
+	}
 }
 
 // ServicesBuilder returns the services-aware live/restored builders for
@@ -159,8 +169,12 @@ func (r *BuilderRegistry) ServicesBuilder(profile loop.RuntimeProfileName) (Serv
 	if !exists {
 		return nil, nil, &UnknownProfileError{}
 	}
-	if pair.servicesBuild != nil && pair.servicesRestore != nil {
+	switch {
+	case pair.servicesBuild != nil && pair.servicesRestore != nil && pair.build == nil && pair.restored == nil:
 		return pair.servicesBuild, pair.servicesRestore, nil
+	case pair.servicesBuild == nil && pair.servicesRestore == nil && pair.build != nil && pair.restored != nil:
+		return adaptBuilder(pair.build), adaptRestoredBuilder(pair.restored), nil
+	default:
+		return nil, nil, errBuilderRegistryShape
 	}
-	return adaptBuilder(pair.build), adaptRestoredBuilder(pair.restored), nil
 }

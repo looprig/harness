@@ -166,3 +166,30 @@ func adaptRestoredBuilder(builder RestoredBuilder) ServicesRestoredBuilder {
 		return builder(loopCtx, sessionID, loopID, parent, pub, cfg, idGen, fac, seed)
 	}
 }
+
+// adaptServicesBuilder gives a services-aware builder the legacy shape. The
+// legacy caller has no authority to supply services, so the adapter always
+// invokes it with the zero value rather than forwarding a shared capability.
+func adaptServicesBuilder(builder ServicesBuilder) Builder {
+	if builder == nil {
+		return nil
+	}
+	return func(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance,
+		pub EventPublisher, cfg loop.BoundDefinition, idGen func() (uuid.UUID, error),
+		fac *event.Factory) (loop.Backend, string, error) {
+		return builder(loopCtx, sessionID, loopID, parent, pub, cfg, idGen, fac, Services{})
+	}
+}
+
+// adaptServicesRestoredBuilder gives a services-aware restored builder the
+// legacy shape, also withholding all services authority from the old caller.
+func adaptServicesRestoredBuilder(builder ServicesRestoredBuilder) RestoredBuilder {
+	if builder == nil {
+		return nil
+	}
+	return func(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance,
+		pub EventPublisher, cfg loop.BoundDefinition, idGen func() (uuid.UUID, error),
+		fac *event.Factory, seed RestoredForeign) (loop.Backend, error) {
+		return builder(loopCtx, sessionID, loopID, parent, pub, cfg, idGen, fac, seed, Services{})
+	}
+}
