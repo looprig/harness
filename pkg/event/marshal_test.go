@@ -491,6 +491,7 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"WorkspaceCheckpointed empty ref", WorkspaceCheckpointed{Header: checkpointHeader(), Consistency: SnapshotQuiescent, Trigger: SnapshotTriggerManual}},
 		{"WorkspaceRestored", WorkspaceRestored{Header: fullHeaderSession(), Ref: "v1:sha256:restored"}},
 		{"ActiveLoopChanged", ActiveLoopChanged{Header: fullHeaderSession(), PreviousLoopID: seededUUID(0x20), ActiveLoopID: seededUUID(0x21)}},
+		{"DelegateDeliveryStateChanged", DelegateDeliveryStateChanged{Header: fullHeaderSession(), RequestID: seededUUID(0x22), TargetLoopID: seededUUID(0x23), State: DelegateDeliverySteerAttemptReserved}},
 		// RestoreErrored.Err handled in the dedicated err-projection test below.
 		{"LoopIdle", LoopIdle{Header: fullHeaderLoop()}},
 		{"LoopStarted", LoopStarted{Header: fullHeaderLoop(), Runtime: sampleRuntime()}},
@@ -984,7 +985,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 46
+const wantEnduringTypes = 47
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -999,7 +1000,7 @@ func unionInstances() []Event {
 		PermissionReviewStarted{}, PermissionReviewCompleted{},
 		ProcessStarted{}, ProcessBackgrounded{}, ProcessCompleted{}, ProcessStopRequested{}, ProcessLost{},
 		ConfigurationAdopted{},
-		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{}, WorkspaceRestored{}, ActiveLoopChanged{},
+		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{}, WorkspaceRestored{}, ActiveLoopChanged{}, DelegateDeliveryStateChanged{},
 		LoopIdle{}, LoopStarted{}, DelegateRequestAccepted{}, LoopInferenceChanged{}, LoopModeChanged{},
 		LoopExternalToolsetChanged{}, ForeignSessionBound{},
 		CompactionStarted{}, CompactionCommitted{}, CompactionRejected{}, CompactWaiterResolved{}, CompactWaiterRejected{},

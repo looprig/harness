@@ -343,6 +343,7 @@ func TestClassifyExhaustive(t *testing.T) {
 		{"WorkspaceCheckpointed", WorkspaceCheckpointed{}},
 		{"WorkspaceRestored", WorkspaceRestored{}},
 		{"ActiveLoopChanged", ActiveLoopChanged{}},
+		{"DelegateDeliveryStateChanged", DelegateDeliveryStateChanged{}},
 		{"LoopRestoreTombstoned", LoopRestoreTombstoned{}},
 		{"LoopIdle", LoopIdle{}},
 		{"LoopStarted", LoopStarted{}},

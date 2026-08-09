@@ -32,6 +32,7 @@ func TestValidateCommandValid(t *testing.T) {
 		{"UserInput", command.UserInput{Header: hdr}},
 		{"UserInput foreground delegate default marker", command.UserInput{Header: command.Header{CommandID: cmdID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: target}},
 		{"UserInput background delegate marker", command.UserInput{Header: command.Header{CommandID: cmdID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: target, BackgroundHandBack: true}},
+		{"UserInput foldable durable delegate intent", command.UserInput{Header: command.Header{CommandID: cmdID, Agency: identity.AgencyMachine}, TargetLoopID: target, DelegateDeliveryPhase: command.DelegateDeliveryPhaseIntent}},
 		{"SubagentResult", command.SubagentResult{Header: hdr, Coordinates: identity.Coordinates{LoopID: loop}}},
 		{"CancelQueuedInput", command.CancelQueuedInput{Header: hdr, Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop}, TargetCommandID: target}},
 		{"CancelDelegateRequest", command.CancelDelegateRequest{Header: hdr, Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop}, TargetCommandID: target}},
@@ -60,6 +61,20 @@ func TestValidateCommandValid(t *testing.T) {
 				t.Errorf("ValidateCommand(%s) = %v, want nil", tt.name, err)
 			}
 		})
+	}
+}
+
+func TestValidateCommandAcceptsFoldableBackgroundHandBackWithDurablePhase(t *testing.T) {
+	t.Parallel()
+
+	cmd := command.UserInput{
+		Header:                command.Header{CommandID: newID(t), Agency: identity.AgencyMachine},
+		TargetLoopID:          newID(t),
+		BackgroundHandBack:    true,
+		DelegateDeliveryPhase: command.DelegateDeliveryPhaseIntent,
+	}
+	if err := command.ValidateCommand(cmd); err != nil {
+		t.Fatalf("ValidateCommand() = %v, want nil", err)
 	}
 }
 
@@ -100,10 +115,17 @@ func TestValidateCommandInvalid(t *testing.T) {
 			wantRule:  command.RuleRequired,
 		},
 		{
-			name:      "background hand-back marker requires machine NoFold delegate input",
-			cmd:       command.UserInput{Header: hdr, BackgroundHandBack: true},
+			name:      "background hand-back marker requires durable target even when foldable",
+			cmd:       command.UserInput{Header: command.Header{CommandID: cmdID, Agency: identity.AgencyMachine}, BackgroundHandBack: true},
 			wantCmd:   command.CommandUserInput,
-			wantField: command.FieldBackgroundHandBack,
+			wantField: command.FieldTargetLoopID,
+			wantRule:  command.RuleRequired,
+		},
+		{
+			name:      "unknown delegate delivery phase",
+			cmd:       command.UserInput{Header: command.Header{CommandID: cmdID, Agency: identity.AgencyMachine}, TargetLoopID: target, DelegateDeliveryPhase: command.DelegateDeliveryPhase("future")},
+			wantCmd:   command.CommandUserInput,
+			wantField: command.FieldDelegateDeliveryPhase,
 			wantRule:  command.RuleInvalid,
 		},
 		{

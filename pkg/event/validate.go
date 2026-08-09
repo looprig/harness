@@ -49,7 +49,9 @@ const (
 	FieldTrigger            FieldName = "Trigger"
 	FieldCause              FieldName = "Cause"
 	FieldCommandID          FieldName = "CommandID"
+	FieldRequestID          FieldName = "RequestID"
 	FieldActiveLoopID       FieldName = "ActiveLoopID"
+	FieldTargetLoopID       FieldName = "TargetLoopID"
 	FieldCategory           FieldName = "Category"
 	FieldModel              FieldName = "Model"
 	FieldModelKey           FieldName = "ModelKey"
@@ -195,6 +197,16 @@ func validateEventBody(ev Event) error {
 	case DelegateRequestAccepted:
 		if e.Cause.CommandID.IsZero() {
 			return &InvalidEventError{Event: "DelegateRequestAccepted", Field: FieldCommandID, Rule: RuleRequired}
+		}
+	case DelegateDeliveryStateChanged:
+		if e.RequestID.IsZero() {
+			return &InvalidEventError{Event: "DelegateDeliveryStateChanged", Field: FieldRequestID, Rule: RuleRequired}
+		}
+		if e.TargetLoopID.IsZero() {
+			return &InvalidEventError{Event: "DelegateDeliveryStateChanged", Field: FieldTargetLoopID, Rule: RuleRequired}
+		}
+		if !e.State.Valid() {
+			return &InvalidEventError{Event: "DelegateDeliveryStateChanged", Field: FieldState, Rule: RuleInvalid}
 		}
 	case LoopInferenceChanged:
 		return validateModelRuntime("LoopInferenceChanged", e.Runtime)
@@ -948,6 +960,8 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "WorkspaceRestored", sessionProfile(), true
 	case ActiveLoopChanged:
 		return "ActiveLoopChanged", sessionProfile(), true
+	case DelegateDeliveryStateChanged:
+		return "DelegateDeliveryStateChanged", sessionProfile(), true
 	case LoopRestoreTombstoned:
 		return "LoopRestoreTombstoned", loopProfile(), true
 	case IntegrationStatus:

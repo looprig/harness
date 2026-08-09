@@ -93,6 +93,8 @@ func TestMarshalCommandRoundTrip(t *testing.T) {
 	}{
 		{"UserInput delegate route", UserInput{Header: fullHeader(), Blocks: sampleBlocks("hello"), NoFold: true, TargetLoopID: seededUUID(0x44)}},
 		{"UserInput background hand-back marker", UserInput{Header: fullMachineHeader(), Blocks: sampleBlocks("hello"), NoFold: true, TargetLoopID: seededUUID(0x44), BackgroundHandBack: true}},
+		{"UserInput foldable durable delegate intent", UserInput{Header: fullMachineHeader(), Blocks: sampleBlocks("hello"), TargetLoopID: seededUUID(0x44), DelegateDeliveryPhase: DelegateDeliveryPhaseIntent}},
+		{"UserInput durable fallback queued phase", UserInput{Header: fullMachineHeader(), Blocks: sampleBlocks("hello"), TargetLoopID: seededUUID(0x44), DelegateDeliveryPhase: DelegateDeliveryPhaseFallbackQueued}},
 		{"UserInput nil blocks", UserInput{Header: fullHeader()}},
 		{"SubagentResult", SubagentResult{
 			Header:      fullHeader(),
@@ -176,6 +178,35 @@ func TestMarshalUserInputBackgroundHandBackOmitsFalseAndRoundTripsTrue(t *testin
 	}
 	if !reflect.DeepEqual(got, background) {
 		t.Fatalf("background round-trip mismatch:\n got = %#v\nwant = %#v", got, background)
+	}
+}
+
+func TestMarshalUserInputDelegateDeliveryPhaseRoundTripsWithFoldableHandBack(t *testing.T) {
+	t.Parallel()
+
+	input := UserInput{
+		Header:                fullMachineHeader(),
+		Blocks:                sampleBlocks("hello"),
+		TargetLoopID:          seededUUID(0x44),
+		BackgroundHandBack:    true,
+		DelegateDeliveryPhase: DelegateDeliveryPhaseFallbackQueued,
+	}
+	data, err := MarshalCommand(input)
+	if err != nil {
+		t.Fatalf("MarshalCommand() = %v", err)
+	}
+	if !strings.Contains(string(data), `"delegate_delivery_phase":"fallback_queued"`) {
+		t.Fatalf("wire missing durable phase marker: %s", data)
+	}
+	if !strings.Contains(string(data), `"background_hand_back":true`) {
+		t.Fatalf("wire missing background hand-back marker: %s", data)
+	}
+	got, err := UnmarshalCommand(data)
+	if err != nil {
+		t.Fatalf("UnmarshalCommand() = %v\nwire: %s", err, data)
+	}
+	if !reflect.DeepEqual(got, input) {
+		t.Fatalf("round-trip mismatch:\n got = %#v\nwant = %#v", got, input)
 	}
 }
 

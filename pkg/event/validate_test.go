@@ -58,6 +58,7 @@ func TestValidateEventValid(t *testing.T) {
 		{"WorkspaceCheckpointed quiescent manual", event.WorkspaceCheckpointed{Header: sessionH, Ref: "v1:sha256:aabb", Consistency: event.SnapshotQuiescent, Trigger: event.SnapshotTriggerManual}},
 		{"WorkspaceRestored", event.WorkspaceRestored{Header: sessionH, Ref: "v1:sha256:aabb"}},
 		{"ActiveLoopChanged", event.ActiveLoopChanged{Header: sessionH, PreviousLoopID: loop, ActiveLoopID: vID(t)}},
+		{"DelegateDeliveryStateChanged", event.DelegateDeliveryStateChanged{Header: sessionH, RequestID: vID(t), TargetLoopID: loop, State: event.DelegateDeliverySteerAttemptReserved}},
 		{"LoopIdle", event.LoopIdle{Header: loopH}},
 		{"LoopInferenceChanged", event.LoopInferenceChanged{Header: loopH, Runtime: runtime}},
 		{"LoopModeChanged", event.LoopModeChanged{Header: loopH, Runtime: runtime}},

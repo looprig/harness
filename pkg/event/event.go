@@ -523,23 +523,24 @@ type LoopAgentSessionBound struct {
 	ACPSessionID string `json:"acp_session_id"`
 }
 
-func (SessionStarted) isEvent()          {}
-func (SessionActive) isEvent()           {}
-func (SessionIdle) isEvent()             {}
-func (SessionStopped) isEvent()          {}
-func (HustleStarted) isEvent()           {}
-func (HustleCompleted) isEvent()         {}
-func (HustleFailed) isEvent()            {}
-func (RestoreStarted) isEvent()          {}
-func (RestoreDone) isEvent()             {}
-func (RestoreErrored) isEvent()          {}
-func (ConfigurationAdopted) isEvent()    {}
-func (WorkspaceCheckpointed) isEvent()   {}
-func (WorkspaceRestored) isEvent()       {}
-func (ActiveLoopChanged) isEvent()       {}
-func (LoopRestoreTombstoned) isEvent()   {}
-func (LoopIdle) isEvent()                {}
-func (LoopStarted) isEvent()             {}
-func (DelegateRequestAccepted) isEvent() {}
-func (ForeignSessionBound) isEvent()     {}
-func (LoopAgentSessionBound) isEvent()   {}
+func (SessionStarted) isEvent()               {}
+func (SessionActive) isEvent()                {}
+func (SessionIdle) isEvent()                  {}
+func (SessionStopped) isEvent()               {}
+func (HustleStarted) isEvent()                {}
+func (HustleCompleted) isEvent()              {}
+func (HustleFailed) isEvent()                 {}
+func (RestoreStarted) isEvent()               {}
+func (RestoreDone) isEvent()                  {}
+func (RestoreErrored) isEvent()               {}
+func (ConfigurationAdopted) isEvent()         {}
+func (WorkspaceCheckpointed) isEvent()        {}
+func (WorkspaceRestored) isEvent()            {}
+func (ActiveLoopChanged) isEvent()            {}
+func (LoopRestoreTombstoned) isEvent()        {}
+func (LoopIdle) isEvent()                     {}
+func (LoopStarted) isEvent()                  {}
+func (DelegateRequestAccepted) isEvent()      {}
+func (DelegateDeliveryStateChanged) isEvent() {}
+func (ForeignSessionBound) isEvent()          {}
+func (LoopAgentSessionBound) isEvent()        {}

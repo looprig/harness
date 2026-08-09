@@ -6,6 +6,29 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 )
 
+// DelegateDeliveryPhase is the durable phase marker on a machine delegate
+// UserInput. The command record remains the source of truth for the request
+// payload and request id; this marker lets restore distinguish an accepted
+// intent from the one fallback admission that was already journaled. The zero
+// value is intentionally unset for ordinary interactive input and legacy
+// records.
+type DelegateDeliveryPhase string
+
+const (
+	// DelegateDeliveryPhaseIntent means the exact command record was accepted
+	// durably but has not yet been admitted to the actor path.
+	DelegateDeliveryPhaseIntent DelegateDeliveryPhase = "intent"
+	// DelegateDeliveryPhaseFallbackQueued means the exact command record was
+	// durably admitted once as the normal fallback; restore may re-admit that
+	// same command id if no opening/cancellation event exists.
+	DelegateDeliveryPhaseFallbackQueued DelegateDeliveryPhase = "fallback_queued"
+)
+
+// Valid reports whether p is one of the non-zero durable delegate phases.
+func (p DelegateDeliveryPhase) Valid() bool {
+	return p == DelegateDeliveryPhaseIntent || p == DelegateDeliveryPhaseFallbackQueued
+}
+
 // UserInput is interactive input. The loop decides its outcome; the caller never
 // assumes a turn was created. Submit commands DO NOT carry a context (no Ctx
 // field): a queued input can start much later, fold, be cancelled, or be returned,
@@ -32,8 +55,14 @@ type UserInput struct {
 	TargetLoopID uuid.UUID `json:"target_loop_id,omitzero"`
 	// BackgroundHandBack durably marks the narrow managed-delegation request shape that
 	// requires automatic background parent hand-back after the child terminal commits.
-	// Foreground delegate requests and ordinary user input leave it false.
+	// It may be foldable: the durable target identity, not NoFold, authorizes this
+	// machine-originated hand-back. Foreground delegate requests and ordinary user input
+	// leave it false.
 	BackgroundHandBack bool `json:"background_hand_back,omitzero"`
+	// DelegateDeliveryPhase is the durable phase marker for machine MessageAgent
+	// delivery. Intent and fallback_queued are journaled together with this exact
+	// command record, so the actor payload and fallback phase cannot diverge.
+	DelegateDeliveryPhase DelegateDeliveryPhase `json:"delegate_delivery_phase,omitzero"`
 	// Accepted is the transient durable-acceptance ack used only by managed delegate
 	// sends. It is never serialized; prepared starts use LoopStarted.InitialRequestID.
 	Accepted chan error `json:"-"`

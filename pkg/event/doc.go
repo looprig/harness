@@ -33,6 +33,7 @@ var (
 	_ Event = WorkspaceCheckpointed{}
 	_ Event = WorkspaceRestored{}
 	_ Event = ActiveLoopChanged{}
+	_ Event = DelegateDeliveryStateChanged{}
 	_ Event = IntegrationStatus{}
 
 	// Loop-scoped events.
