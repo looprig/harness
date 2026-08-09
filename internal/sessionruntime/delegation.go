@@ -62,6 +62,11 @@ type delegationManager struct {
 	runtimeCatalog         loop.RuntimeCatalog
 	hasRuntimeCatalog      bool
 	runtimeCatalogProvider RuntimeCatalogProvider
+	// foreignDeliveryResponsiveness bounds only the caller-facing observer. It
+	// never adjudicates the hook or cancels the target; the session-owned
+	// coordinator continues on the durable hook signal after this bound.
+	foreignDeliveryResponsiveness time.Duration
+	foreignDeliveryTimerFactory   func(time.Duration) foreignDeliveryObserverTimer
 }
 
 type delegateAdmission struct {
@@ -154,9 +159,10 @@ func newDelegationManager(topology Topology, catalogs ...loop.RuntimeCatalog) *d
 		byName[def.Name()] = def
 	}
 	manager := &delegationManager{
-		byName:   byName,
-		requests: make(map[uuid.UUID]*requestTracker),
-		resolved: make(map[uuid.UUID]resolvedRequest),
+		byName:                        byName,
+		requests:                      make(map[uuid.UUID]*requestTracker),
+		resolved:                      make(map[uuid.UUID]resolvedRequest),
+		foreignDeliveryResponsiveness: foreignDeliveryResponsivenessBound,
 	}
 	if len(catalogs) > 0 {
 		manager.runtimeCatalog = catalogs[0]
@@ -1418,7 +1424,7 @@ func (p *requestTracker) markDelivery(status tool.DelegateDeliveryStatus) {
 		return
 	}
 	p.mu.Lock()
-	if p.delivery == "" {
+	if p.delivery == "" || p.delivery == tool.DelegateDeliveryAcceptedPending {
 		p.delivery = status
 	}
 	p.mu.Unlock()
@@ -2027,6 +2033,12 @@ func (c *scopedController) categoricalForeignResult(s *Session, childID, request
 func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, childID, requestID uuid.UUID, sub event.Subscription, tracked *requestTracker, req tool.DelegateRequest) (tool.DelegateResult, error) {
 	foreignHook := s.foreignDeliveryHookFor(childID)
 	foreignMessage := req.Operation == tool.DelegateSend && foreignHook != nil
+	if foreignMessage {
+		if req.WaitForResponse {
+			return c.resolveForeignForeground(ctx, s, childID, requestID, tracked, sub, req, foreignHook)
+		}
+		return c.resolveForeignBackground(s, childID, requestID, tracked, sub, req, foreignHook)
+	}
 	if req.WaitForResponse {
 		waitCtx, cancel := waitContext(ctx, req.TimeoutSeconds)
 		defer cancel()

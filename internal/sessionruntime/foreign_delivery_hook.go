@@ -316,6 +316,19 @@ func (h *foreignDeliveryHook) deliveryStatus(requestID uuid.UUID) tool.DelegateD
 	return foreignDeliveryStatusForPhase(h.phaseLocked(requestID))
 }
 
+// deliveryWaitState returns the current concrete disposition together with the
+// generation channel that is replaced whenever the hook reaches a terminal
+// phase. The pair is sampled under one lock so an observer cannot miss a
+// transition between reading the status and subscribing to the notification.
+func (h *foreignDeliveryHook) deliveryWaitState(requestID uuid.UUID) (tool.DelegateDeliveryStatus, <-chan struct{}) {
+	if h == nil || requestID.IsZero() {
+		return "", nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return foreignDeliveryStatusForPhase(h.phaseLocked(requestID)), h.changed
+}
+
 func foreignDeliveryStatusForPhase(phase foreignDeliveryPhase) tool.DelegateDeliveryStatus {
 	switch phase {
 	case foreignDeliveryFallback:
