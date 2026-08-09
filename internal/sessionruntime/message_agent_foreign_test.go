@@ -80,6 +80,63 @@ func foreignMessageRequest(childID uuid.UUID, wait bool) tool.DelegateRequest {
 	return tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: childID, Message: "steer", WaitForResponse: wait}
 }
 
+func requestTrackerPresent(manager *delegationManager, requestID uuid.UUID) bool {
+	if manager == nil {
+		return false
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	_, ok := manager.requests[requestID]
+	return ok
+}
+
+func waitForRequestTracker(t *testing.T, manager *delegationManager, requestID uuid.UUID, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if requestTrackerPresent(manager, requestID) == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("request tracker present = %v, want %v", requestTrackerPresent(manager, requestID), want)
+}
+
+func assertNoForeignCancellationCommands(t *testing.T, fixture foreignMessageAgentFixture) {
+	t.Helper()
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for _, record := range fixture.commands.snapshot() {
+			switch record.Command().(type) {
+			case command.CancelDelegateRequest, command.CancelQueuedInput:
+				t.Fatalf("observer timeout persisted %T", record.Command())
+			}
+		}
+		select {
+		case raw := <-fixture.child.Commands:
+			switch raw.(type) {
+			case command.CancelDelegateRequest, command.CancelQueuedInput:
+				t.Fatalf("observer timeout dispatched %T", raw)
+			default:
+				t.Fatalf("unexpected child command after admission: %T", raw)
+			}
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func assertNoParentCommand(t *testing.T, parent *channelBackend, timeout time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case raw := <-parent.Commands:
+		t.Fatalf("unexpected second parent command: %T", raw)
+	case <-timer.C:
+	}
+}
+
 func foreignTurnEvent(fixture foreignMessageAgentFixture, cmdID, turnID uuid.UUID, folded bool) event.Event {
 	header := event.Header{Coordinates: identity.Coordinates{SessionID: fixture.session.sessionID, LoopID: fixture.childID, TurnID: turnID}, Cause: identity.Cause{CommandID: cmdID}}
 	if folded {
@@ -292,7 +349,7 @@ func TestMessageAgentForeignUntrackableBackgroundHandbackIsCategoricalAndUnwatch
 	}
 }
 
-func TestMessageAgentForeignQueuedBackgroundUsesTrackableTerminalWatcher(t *testing.T) {
+func TestMessageAgentForeignQueuedBackgroundTimeoutRetainsTrackerUntilTerminal(t *testing.T) {
 	fixture := newForeignMessageAgentFixture(t)
 	resultCh := make(chan struct {
 		result tool.DelegateResult
@@ -315,13 +372,14 @@ func TestMessageAgentForeignQueuedBackgroundUsesTrackableTerminalWatcher(t *test
 	}
 	cmd.Accepted <- nil
 	call := <-resultCh
-	if call.err != nil || call.result.DeliveryStatus != tool.DelegateDeliveryQueued {
-		t.Fatalf("immediate result = %+v/%v, want queued", call.result, call.err)
+	if call.err != nil {
+		t.Fatalf("Execute: %v", call.err)
 	}
-	select {
-	case got := <-fixture.parent.Commands:
-		t.Fatalf("trackable background handback arrived before terminal: %T", got)
-	default:
+	if call.result.AgentID != fixture.childID || call.result.State != tool.AgentStateWorking ||
+		call.result.DeliveryStatus != tool.DelegateDeliveryQueued ||
+		call.result.ResponseStatus != tool.DelegateResponseUnknown ||
+		call.result.Response != "" || call.result.CorrelationID != cmd.CommandID {
+		t.Fatalf("immediate result = %+v, want working/queued/unknown correlation=%v", call.result, cmd.CommandID)
 	}
 	var handBack command.SubagentResult
 	select {
@@ -332,20 +390,23 @@ func TestMessageAgentForeignQueuedBackgroundUsesTrackableTerminalWatcher(t *test
 			t.Fatalf("queued background handback = %T, want command.SubagentResult", rawParent)
 		}
 		completion, ok := decodeBackgroundCompletion(handBack.Blocks)
-		if !ok || completion.DeliveryStatus != tool.DelegateDeliveryQueued || completion.ResponseStatus != tool.DelegateResponseTimedOut {
-			t.Fatalf("queued background completion = %+v/%v, want queued/timed_out", completion, ok)
+		if !ok || completion.AgentID != fixture.childID.String() || completion.State != tool.AgentStateWorking ||
+			completion.DeliveryStatus != tool.DelegateDeliveryQueued ||
+			completion.ResponseStatus != tool.DelegateResponseTimedOut ||
+			completion.Response != "" || completion.CorrelationID != cmd.CommandID.String() {
+			t.Fatalf("queued background completion = %+v/%v, want working/queued/timed_out empty response correlation=%v", completion, ok, cmd.CommandID)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("trackable queued timeout handback did not arrive")
 	}
+	waitForRequestTracker(t, fixture.controller.manager, cmd.CommandID, true)
+	assertNoForeignCancellationCommands(t, fixture)
 	turnID := mustUUID()
 	fixture.sub.feed(foreignTurnEvent(fixture, cmd.CommandID, turnID, false))
 	fixture.sub.feed(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: fixture.session.sessionID, LoopID: fixture.childID, TurnID: turnID}}, Message: aiMessage("queued background")})
-	select {
-	case extra := <-fixture.parent.Commands:
-		t.Fatalf("trackable terminal created duplicate handback: %T", extra)
-	case <-time.After(20 * time.Millisecond):
-	}
+	waitForRequestTracker(t, fixture.controller.manager, cmd.CommandID, false)
+	assertNoParentCommand(t, fixture.parent, 100*time.Millisecond)
+	assertNoForeignCancellationCommands(t, fixture)
 }
 
 func TestMessageAgentForeignRestoreReadmissionUsesNormalPathWithoutSteering(t *testing.T) {
