@@ -64,6 +64,17 @@ func foreignDeliveryPublicationErrorFrom(_ error) error {
 	return &foreignDeliveryPublicationError{}
 }
 
+// foreignDeliveryWaiter retains one request's terminal phase while the
+// session-owned coordinator is handed off from actor admission. The handoff
+// reference is created with the durable intent and released after the
+// coordinator samples and owns the request.
+type foreignDeliveryWaiter struct {
+	changed chan struct{}
+	phase   foreignDeliveryPhase
+	refs    int
+	claimed bool
+}
+
 // foreignDeliveryHook is the private session-owned implementation of the
 // public foreign.DeliveryHook. Its only authority is the exact loop selected
 // when it is constructed. Command payloads are registered by the session before
@@ -84,6 +95,7 @@ type foreignDeliveryHook struct {
 	phases         map[uuid.UUID]foreignDeliveryPhase
 	restored       map[uuid.UUID]bool
 	folds          map[uuid.UUID]uuid.UUID
+	waiters        map[uuid.UUID]*foreignDeliveryWaiter
 	tombstones     map[uuid.UUID]foreignDeliveryPhase
 	tombstoneOrder []uuid.UUID
 	// changed is closed and replaced whenever a delivery reaches an externally
@@ -102,6 +114,7 @@ func newForeignDeliveryHook(session *Session, loopID uuid.UUID) *foreignDelivery
 		phases:     make(map[uuid.UUID]foreignDeliveryPhase),
 		restored:   make(map[uuid.UUID]bool),
 		folds:      make(map[uuid.UUID]uuid.UUID),
+		waiters:    make(map[uuid.UUID]*foreignDeliveryWaiter),
 		tombstones: make(map[uuid.UUID]foreignDeliveryPhase),
 		changed:    make(chan struct{}),
 		loopID:     loopID,
@@ -274,6 +287,9 @@ func (h *foreignDeliveryHook) observeRestoredCommand(cmd command.UserInput) erro
 }
 
 func (h *foreignDeliveryHook) phaseLocked(requestID uuid.UUID) foreignDeliveryPhase {
+	if waiter, ok := h.waiters[requestID]; ok && waiter.phase != foreignDeliveryAbsent {
+		return waiter.phase
+	}
 	if phase, ok := h.phases[requestID]; ok {
 		return phase
 	}
@@ -288,6 +304,17 @@ func (h *foreignDeliveryHook) finishLocked(requestID uuid.UUID, phase foreignDel
 	delete(h.folds, requestID)
 	delete(h.phases, requestID)
 	delete(h.restored, requestID)
+	if waiter, ok := h.waiters[requestID]; ok {
+		if waiter.phase == foreignDeliveryAbsent {
+			waiter.phase = phase
+			if waiter.changed != nil {
+				close(waiter.changed)
+			}
+		}
+		if waiter.refs == 0 {
+			delete(h.waiters, requestID)
+		}
+	}
 	if _, exists := h.tombstones[requestID]; !exists {
 		h.tombstoneOrder = append(h.tombstoneOrder, requestID)
 	}
@@ -300,6 +327,70 @@ func (h *foreignDeliveryHook) finishLocked(requestID uuid.UUID, phase foreignDel
 	if h.changed != nil {
 		close(h.changed)
 		h.changed = make(chan struct{})
+	}
+}
+
+// registerDeliveryWaiter installs the admission handoff reference for one
+// live request. Session admission calls this after CreateIntent and before the
+// command enters the actor, so a terminal phase cannot be evicted while
+// coordinator construction is delayed. Keeping this separate from CreateIntent
+// avoids retaining waiter state for restore-only or direct hook transitions.
+func (h *foreignDeliveryHook) registerDeliveryWaiter(requestID uuid.UUID) bool {
+	if h == nil || requestID.IsZero() {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.phaseLocked(requestID) == foreignDeliveryAbsent {
+		return false
+	}
+	if _, exists := h.waiters[requestID]; exists {
+		return false
+	}
+	h.waiters[requestID] = &foreignDeliveryWaiter{changed: make(chan struct{}), refs: 1}
+	return true
+}
+
+// claimDeliveryWaiter transfers the admission handoff reference to the one
+// session-owned coordinator for this request. The handoff reference is held
+// until coordinator cleanup acknowledges the terminal result.
+func (h *foreignDeliveryHook) claimDeliveryWaiter(requestID uuid.UUID) bool {
+	if h == nil || requestID.IsZero() {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	waiter, ok := h.waiters[requestID]
+	if !ok {
+		return false
+	}
+	if waiter.claimed {
+		return false
+	}
+	waiter.claimed = true
+	return true
+}
+
+// releaseDeliveryWaiter releases the coordinator's reference. A nonterminal
+// request remains retained as live state until the actor supplies a terminal
+// phase; terminal requests release all local waiter state on the final ack.
+func (h *foreignDeliveryHook) releaseDeliveryWaiter(requestID uuid.UUID) {
+	if h == nil || requestID.IsZero() {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.releaseDeliveryWaiterLocked(requestID)
+}
+
+func (h *foreignDeliveryHook) releaseDeliveryWaiterLocked(requestID uuid.UUID) {
+	waiter, ok := h.waiters[requestID]
+	if !ok || waiter.refs == 0 {
+		return
+	}
+	waiter.refs--
+	if waiter.refs == 0 && waiter.phase != foreignDeliveryAbsent {
+		delete(h.waiters, requestID)
 	}
 }
 
@@ -326,7 +417,11 @@ func (h *foreignDeliveryHook) deliveryWaitState(requestID uuid.UUID) (tool.Deleg
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return foreignDeliveryStatusForPhase(h.phaseLocked(requestID)), h.changed
+	changed := h.changed
+	if waiter, ok := h.waiters[requestID]; ok && waiter.changed != nil {
+		changed = waiter.changed
+	}
+	return foreignDeliveryStatusForPhase(h.phaseLocked(requestID)), changed
 }
 
 func foreignDeliveryStatusForPhase(phase foreignDeliveryPhase) tool.DelegateDeliveryStatus {
@@ -355,6 +450,9 @@ func (h *foreignDeliveryHook) waitDeliveryStatus(ctx context.Context, requestID 
 		h.mu.Lock()
 		status := foreignDeliveryStatusForPhase(h.phaseLocked(requestID))
 		changed := h.changed
+		if waiter, ok := h.waiters[requestID]; ok && waiter.changed != nil {
+			changed = waiter.changed
+		}
 		h.mu.Unlock()
 		if status != "" {
 			return status
@@ -386,6 +484,7 @@ func (h *foreignDeliveryHook) abandon(requestID uuid.UUID) {
 		return
 	}
 	h.finishLocked(requestID, foreignDeliveryAbandoned)
+	h.releaseDeliveryWaiterLocked(requestID)
 }
 
 func (h *foreignDeliveryHook) observeFold(ev event.TurnFoldedInto) {

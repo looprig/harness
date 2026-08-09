@@ -2699,6 +2699,9 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 			removeRequest(id, registered)
 		}
 	}()
+	if deliveryHook != nil && !deliveryHook.registerDeliveryWaiter(id) {
+		return uuid.UUID{}, nil, &SessionError{Kind: SessionDelegateAdmissionCommitFailed}
+	}
 	select {
 	case backend.CommandSink() <- cmd:
 		var canceled bool

@@ -92,6 +92,9 @@ func newForeignDeliveryCoordinator(c *scopedController, s *Session, childID, req
 		actions:    make(chan foreignDeliveryCoordinatorAction, 1),
 		done:       make(chan struct{}),
 	}
+	if hook != nil {
+		hook.claimDeliveryWaiter(requestID)
+	}
 	go coordinator.run()
 	return coordinator
 }
@@ -273,6 +276,9 @@ func (c *foreignDeliveryCoordinator) trackable(status tool.DelegateDeliveryStatu
 func (c *foreignDeliveryCoordinator) cleanup() {
 	if c == nil {
 		return
+	}
+	if c.hook != nil {
+		c.hook.releaseDeliveryWaiter(c.requestID)
 	}
 	if c.tracked != nil {
 		c.tracked.markTerminal()

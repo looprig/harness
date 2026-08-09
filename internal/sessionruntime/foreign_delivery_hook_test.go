@@ -420,11 +420,11 @@ func TestForeignDeliveryHookTerminalStateCardinalityBounded(t *testing.T) {
 		}
 	}
 	hook.mu.Lock()
-	phases, tombstones := len(hook.phases), len(hook.tombstones)
+	phases, tombstones, waiters := len(hook.phases), len(hook.tombstones), len(hook.waiters)
 	commandsRetained, foldsRetained := len(hook.commands), len(hook.folds)
 	hook.mu.Unlock()
-	if phases > foreignDeliveryTombstoneLimit || tombstones > foreignDeliveryTombstoneLimit || commandsRetained != 0 || foldsRetained != 0 {
-		t.Fatalf("hook state cardinality phases=%d tombstones=%d commands=%d folds=%d, want bounded payload-free state", phases, tombstones, commandsRetained, foldsRetained)
+	if phases > foreignDeliveryTombstoneLimit || tombstones > foreignDeliveryTombstoneLimit || waiters > foreignDeliveryTombstoneLimit || commandsRetained != 0 || foldsRetained != 0 {
+		t.Fatalf("hook state cardinality phases=%d tombstones=%d waiters=%d commands=%d folds=%d, want bounded payload-free state", phases, tombstones, waiters, commandsRetained, foldsRetained)
 	}
 	for _, requestID := range []uuid.UUID{evictedID, retainedID} {
 		err := hook.Resolve(context.Background(), foreign.DeliveryResolution{LoopID: hook.loopID, RequestID: requestID, State: foreign.DeliveryResolutionUnknown})

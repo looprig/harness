@@ -198,6 +198,159 @@ func foreignTurnEvent(fixture foreignMessageAgentFixture, cmdID, turnID uuid.UUI
 	return event.TurnStarted{Header: header}
 }
 
+func churnForeignDeliveryTombstones(hook *foreignDeliveryHook, count int) {
+	hook.mu.Lock()
+	defer hook.mu.Unlock()
+	for i := 0; i < count; i++ {
+		hook.finishLocked(mustUUID(), foreignDeliveryUnknown)
+	}
+}
+
+func assertNoForeignDeliveryWaiter(t *testing.T, hook *foreignDeliveryHook, requestID uuid.UUID) {
+	t.Helper()
+	hook.mu.Lock()
+	_, retained := hook.waiters[requestID]
+	hook.mu.Unlock()
+	if retained {
+		t.Fatalf("delivery waiter for %v remained after coordinator cleanup", requestID)
+	}
+}
+
+func TestMessageAgentForeignBackgroundUnknownSurvivesTombstoneChurn(t *testing.T) {
+	fixture := newForeignMessageAgentFixture(t)
+	resultCh := make(chan struct {
+		result tool.DelegateResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := fixture.controller.Execute(context.Background(), foreignMessageRequest(fixture.childID, false))
+		resultCh <- struct {
+			result tool.DelegateResult
+			err    error
+		}{result: result, err: err}
+	}()
+	raw := <-fixture.child.Commands
+	cmd := raw.(command.UserInput)
+	if err := fixture.hook.Reserve(context.Background(), foreign.DeliveryReservation{LoopID: fixture.childID, RequestID: cmd.CommandID}); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if err := fixture.hook.Resolve(context.Background(), foreign.DeliveryResolution{LoopID: fixture.childID, RequestID: cmd.CommandID, State: foreign.DeliveryResolutionUnknown}); err != nil {
+		t.Fatalf("Resolve unknown: %v", err)
+	}
+	churnForeignDeliveryTombstones(fixture.hook, foreignDeliveryTombstoneLimit+1)
+	cmd.Accepted <- nil
+	select {
+	case call := <-resultCh:
+		if call.err != nil || call.result.DeliveryStatus != tool.DelegateDeliveryUnknown {
+			t.Fatalf("result = %+v/%v, want unknown delivery", call.result, call.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("background Execute did not observe retained unknown delivery")
+	}
+	rawParent := <-fixture.parent.Commands
+	handBack, ok := rawParent.(command.SubagentResult)
+	if !ok {
+		t.Fatalf("unknown handback = %T, want command.SubagentResult", rawParent)
+	}
+	completion, ok := decodeBackgroundCompletion(handBack.Blocks)
+	if !ok || completion.DeliveryStatus != tool.DelegateDeliveryUnknown || completion.ResponseStatus != tool.DelegateResponseUnknown || completion.CorrelationID != cmd.CommandID.String() {
+		t.Fatalf("unknown completion = %+v/%v, want one exact categorical handback", completion, ok)
+	}
+	waitForRequestTracker(t, fixture.controller.manager, cmd.CommandID, false)
+	assertNoForeignDeliveryWaiter(t, fixture.hook, cmd.CommandID)
+	assertNoParentCommand(t, fixture.parent, 100*time.Millisecond)
+}
+
+func TestMessageAgentForeignBackgroundUntrackableSurvivesTombstoneChurn(t *testing.T) {
+	fixture := newForeignMessageAgentFixture(t)
+	resultCh := make(chan struct {
+		result tool.DelegateResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := fixture.controller.Execute(context.Background(), foreignMessageRequest(fixture.childID, false))
+		resultCh <- struct {
+			result tool.DelegateResult
+			err    error
+		}{result: result, err: err}
+	}()
+	raw := <-fixture.child.Commands
+	cmd := raw.(command.UserInput)
+	if err := fixture.hook.Reserve(context.Background(), foreign.DeliveryReservation{LoopID: fixture.childID, RequestID: cmd.CommandID}); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if err := fixture.hook.Resolve(context.Background(), foreign.DeliveryResolution{LoopID: fixture.childID, RequestID: cmd.CommandID, State: foreign.DeliveryResolutionUntrackable}); err != nil {
+		t.Fatalf("Resolve untrackable: %v", err)
+	}
+	churnForeignDeliveryTombstones(fixture.hook, foreignDeliveryTombstoneLimit+1)
+	cmd.Accepted <- nil
+	select {
+	case call := <-resultCh:
+		if call.err != nil || call.result.DeliveryStatus != tool.DelegateDeliveryUntrackable {
+			t.Fatalf("result = %+v/%v, want untrackable delivery", call.result, call.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("background Execute did not observe retained untrackable delivery")
+	}
+	rawParent := <-fixture.parent.Commands
+	handBack, ok := rawParent.(command.SubagentResult)
+	if !ok {
+		t.Fatalf("untrackable handback = %T, want command.SubagentResult", rawParent)
+	}
+	completion, ok := decodeBackgroundCompletion(handBack.Blocks)
+	if !ok || completion.DeliveryStatus != tool.DelegateDeliveryUntrackable || completion.ResponseStatus != tool.DelegateResponseUnknown || completion.CorrelationID != cmd.CommandID.String() {
+		t.Fatalf("untrackable completion = %+v/%v, want one exact categorical handback", completion, ok)
+	}
+	waitForRequestTracker(t, fixture.controller.manager, cmd.CommandID, false)
+	assertNoForeignDeliveryWaiter(t, fixture.hook, cmd.CommandID)
+	assertNoParentCommand(t, fixture.parent, 100*time.Millisecond)
+}
+
+func TestMessageAgentForeignBackgroundQueuedSurvivesTombstoneChurn(t *testing.T) {
+	fixture := newForeignMessageAgentFixture(t)
+	resultCh := make(chan struct {
+		result tool.DelegateResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := fixture.controller.Execute(context.Background(), foreignMessageRequest(fixture.childID, false))
+		resultCh <- struct {
+			result tool.DelegateResult
+			err    error
+		}{result: result, err: err}
+	}()
+	raw := <-fixture.child.Commands
+	cmd := raw.(command.UserInput)
+	if err := fixture.hook.QueueFallback(context.Background(), foreignFallbackIntent(cmd.CommandID, fixture.childID)); err != nil {
+		t.Fatalf("QueueFallback: %v", err)
+	}
+	churnForeignDeliveryTombstones(fixture.hook, foreignDeliveryTombstoneLimit+1)
+	turnID := mustUUID()
+	fixture.sub.feed(foreignTurnEvent(fixture, cmd.CommandID, turnID, false))
+	fixture.sub.feed(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: fixture.session.sessionID, LoopID: fixture.childID, TurnID: turnID}}, Message: aiMessage("queued after churn")})
+	cmd.Accepted <- nil
+	select {
+	case call := <-resultCh:
+		if call.err != nil || call.result.DeliveryStatus != tool.DelegateDeliveryQueued {
+			t.Fatalf("result = %+v/%v, want queued delivery", call.result, call.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("background Execute did not observe retained queued delivery")
+	}
+	rawParent := <-fixture.parent.Commands
+	handBack, ok := rawParent.(command.SubagentResult)
+	if !ok {
+		t.Fatalf("queued handback = %T, want command.SubagentResult", rawParent)
+	}
+	completion, ok := decodeBackgroundCompletion(handBack.Blocks)
+	if !ok || completion.DeliveryStatus != tool.DelegateDeliveryQueued || completion.ResponseStatus != tool.DelegateResponseCompleted || completion.Response != "queued after churn" || completion.CorrelationID != cmd.CommandID.String() {
+		t.Fatalf("queued completion = %+v/%v, want one exact completed handback", completion, ok)
+	}
+	waitForRequestTracker(t, fixture.controller.manager, cmd.CommandID, false)
+	assertNoForeignDeliveryWaiter(t, fixture.hook, cmd.CommandID)
+	assertNoParentCommand(t, fixture.parent, 100*time.Millisecond)
+}
+
 func TestMessageAgentForeignQueuedWaitReportsQueuedDeliveryAndResponse(t *testing.T) {
 	fixture := newForeignMessageAgentFixture(t)
 	resultCh := make(chan struct {
