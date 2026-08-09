@@ -15,6 +15,7 @@ const (
 	ShutdownCleanupLoopSend         ShutdownCleanupPhase = "loop_send"
 	ShutdownCleanupLoopDrain        ShutdownCleanupPhase = "loop_drain"
 	ShutdownCleanupCheckpointDrain  ShutdownCleanupPhase = "checkpoint_drain"
+	ShutdownCleanupCollabBroker     ShutdownCleanupPhase = "collab_broker"
 	ShutdownCleanupSessionResources ShutdownCleanupPhase = "session_resources"
 	ShutdownCleanupHubStop          ShutdownCleanupPhase = "hub_stop"
 )
@@ -38,6 +39,7 @@ type shutdownCleanupTimeouts struct {
 	loopSend         time.Duration
 	loopDrain        time.Duration
 	checkpoint       time.Duration
+	collabBroker     time.Duration
 	sessionResources time.Duration
 	hub              time.Duration
 }
@@ -55,7 +57,7 @@ func (s *Session) resolveShutdownTimeouts(snapshot []loopSnapshot) shutdownClean
 	}
 	derived := shutdownCleanupTimeouts{
 		hustle: hustleTimeout, loopSend: loopTimeout, loopDrain: loopTimeout,
-		checkpoint: checkpointTimeout, sessionResources: base, hub: base,
+		checkpoint: checkpointTimeout, collabBroker: base, sessionResources: base, hub: base,
 	}
 	return derived.withOverrides(s.shutdownTimeouts)
 }
@@ -66,6 +68,7 @@ func (t shutdownCleanupTimeouts) withOverrides(overrides shutdownCleanupTimeouts
 		loopSend:         timeoutOverride(t.loopSend, overrides.loopSend),
 		loopDrain:        timeoutOverride(t.loopDrain, overrides.loopDrain),
 		checkpoint:       timeoutOverride(t.checkpoint, overrides.checkpoint),
+		collabBroker:     timeoutOverride(t.collabBroker, overrides.collabBroker),
 		sessionResources: timeoutOverride(t.sessionResources, overrides.sessionResources),
 		hub:              timeoutOverride(t.hub, overrides.hub),
 	}

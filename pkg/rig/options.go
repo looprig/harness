@@ -423,11 +423,11 @@ func WithForeignBuilders(builder foreign.Builder, restored foreign.RestoredBuild
 	}
 }
 
-// WithForeignServicesBuilders installs the additive foreign-engine seam. The
-// session currently passes the zero Services value; later lifecycle work binds
-// fresh per-loop services internally, without making a fixed capability part
-// of rig configuration. The legacy WithForeignBuilders option remains
-// supported and is used when this option is absent.
+// WithForeignServicesBuilders opts a rig into the additive foreign-engine
+// seam. Each live/restored foreign origin receives a fresh loop-scoped broker
+// descriptor and delivery hook at session construction; no capability is part
+// of the immutable rig configuration. The legacy WithForeignBuilders option
+// remains supported and receives zero services.
 func WithForeignServicesBuilders(builder foreign.ServicesBuilder, restored foreign.ServicesRestoredBuilder) Option {
 	return func(state *definitionState) error {
 		if builder == nil || restored == nil {

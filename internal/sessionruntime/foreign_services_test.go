@@ -32,8 +32,14 @@ func TestForeignServicesBuilderFailureUnregistersDeliveryHook(t *testing.T) {
 	})
 	cfg := engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineForeignClaude, "x")
 	for attempt := 0; attempt < 8; attempt++ {
-		_, err := newSession(context.Background(), cfg, uuid.New, time.Now,
+		session, err := newSession(context.Background(), cfg, uuid.New, time.Now,
 			WithFingerprintProvider(testFingerprintProvider), WithForeignServicesBuilders(build, restored))
+		if collabPlatformSupported() && errors.Is(err, errCollabBrokerProtocol) && len(sessions) == 0 {
+			t.Skipf("Unix socket unavailable in this runner: %v", err)
+		}
+		if session != nil {
+			_ = session.Shutdown(context.Background())
+		}
 		if err == nil {
 			t.Fatal("newSession unexpectedly succeeded")
 		}
@@ -93,12 +99,15 @@ func TestForeignServicesBuilderReceivesFreshPerLoopDeliveryHook(t *testing.T) {
 	s, err := newSession(context.Background(), c, uuid.New, time.Now,
 		WithFingerprintProvider(testFingerprintProvider),
 		WithForeignServicesBuilders(build, restored))
+	if collabPlatformSupported() && errors.Is(err, errCollabBrokerProtocol) {
+		t.Skipf("Unix socket unavailable in this runner: %v", err)
+	}
 	if err != nil {
 		t.Fatalf("newSession: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-	if got.Broker.Endpoint() != "" || got.Broker.Capability() != nil || got.Delivery == nil {
-		t.Fatalf("services = %#v, want empty broker plus a per-loop delivery hook", got)
+	if got.Broker.Endpoint() == "" || len(got.Broker.Capability()) != collabCapabilityBytes || got.Delivery == nil {
+		t.Fatalf("services = %#v, want per-loop broker plus delivery hook", got)
 	}
 }
 
@@ -151,16 +160,19 @@ func TestServicesRestoredBuilderReceivesFreshPerLoopDeliveryHook(t *testing.T) {
 	c := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineForeignClaude, "x"), sessionID, rootLoopID)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	s, err := buildRestoredSession(ctx, cancel, c, tool.Bindings{SessionID: sessionID, LoopID: rootLoopID}, sessionID, rootLoopID,
+	s, err := buildRestoredSession(ctx, cancel, c, tool.Bindings{SessionID: sessionID, LoopID: rootLoopID, Delegate: &recordingDelegateController{}}, sessionID, rootLoopID,
 		fixedForeignSID, 0, folded, restoredInference{}, nil, nil, fakeSessionJournal{},
 		event.NewFactory(uuid.New, time.Now), uuid.New, time.Now,
 		WithForeignServicesBuilders(build, restored))
+	if collabPlatformSupported() && errors.Is(err, errCollabBrokerProtocol) {
+		t.Skipf("Unix socket unavailable in this runner: %v", err)
+	}
 	if err != nil {
 		t.Fatalf("buildRestoredSession: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-	if got.Broker.Endpoint() != "" || got.Broker.Capability() != nil || got.Delivery == nil {
-		t.Fatalf("restored services = %#v, want empty broker plus a per-loop delivery hook", got)
+	if got.Broker.Endpoint() == "" || len(got.Broker.Capability()) != collabCapabilityBytes || got.Delivery == nil {
+		t.Fatalf("restored services = %#v, want per-loop broker plus delivery hook", got)
 	}
 }
 

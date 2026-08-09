@@ -1338,7 +1338,9 @@ func delegateExtraTools(def loop.Definition, manager *delegationManager) []tool.
 
 // controllerFor builds the parent-scoped controller injected into one loop's atomic
 // agent-tool bundle. The allowed delegate set and delegation style are derived from the PARENT
-// definition (least privilege). It tolerates a nil manager receiver so a struct-literal
+// definition (least privilege). The collaboration broker resolves this exact
+// controller from the originating loop; its bearer capability never widens the
+// direct-child set. It tolerates a nil manager receiver so a struct-literal
 // session with no delegation manager can still bind loops that carry no agent tools.
 func (m *delegationManager) controllerFor(parentLoopID uuid.UUID, parent loop.Definition) tool.DelegateController {
 	allowed := make(map[identity.AgentName]struct{})

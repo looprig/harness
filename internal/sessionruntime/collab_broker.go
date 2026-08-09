@@ -111,7 +111,7 @@ func (s *Session) closeCollabBrokerWithTimeout(root context.Context, timeout tim
 	defer cancel()
 	if err := s.closeCollabBroker(ctx); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			return cleanupTimeoutError(ShutdownCleanupSessionResources, timeout, err)
+			return cleanupTimeoutError(ShutdownCleanupCollabBroker, timeout, err)
 		}
 		return err
 	}
@@ -411,7 +411,7 @@ func (b *collabBroker) handle(conn net.Conn) {
 
 	_ = conn.SetReadDeadline(time.Now().Add(collabAdmissionTimeout))
 	peerUID, peerOK := collabPeerUID(conn)
-	if peerOK && peerUID != uint32(os.Getuid()) {
+	if peerOK && peerUID != collabUID() {
 		return
 	}
 	token, err := readCollabHandshake(conn)

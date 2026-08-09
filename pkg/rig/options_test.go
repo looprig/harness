@@ -50,6 +50,12 @@ func TestWithForeignServicesBuildersCompilesAndRejectsDuplicate(t *testing.T) {
 	if got := len(state.lifecycleOptions); got != 1 {
 		t.Fatalf("lifecycle options = %d, want 1", got)
 	}
+	if !state.seen[keyForeignServicesBuilder] {
+		t.Fatalf("services builder option did not record %q", keyForeignServicesBuilder)
+	}
+	if state.seen[keyForeignBuilder] {
+		t.Fatalf("services builder option unexpectedly recorded legacy %q", keyForeignBuilder)
+	}
 	err := option(state)
 	var definitionErr *DefinitionError
 	if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionDuplicateOption || definitionErr.Name != "foreign_services_builders" {

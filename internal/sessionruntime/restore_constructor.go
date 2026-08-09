@@ -92,6 +92,10 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 				cancel()
 				return builderErr
 			}
+			if err := s.startCollabBroker(); err != nil {
+				cancel()
+				return &RestoreError{Kind: RestoreLoopFailed, Cause: err}
+			}
 			services, hook := s.foreignServicesForTrackedWithController(started.LoopID, bindings.Delegate)
 			constructionHook = hook
 			backend, err = servicesBuilder(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, seed, services)
@@ -135,7 +139,8 @@ func (s *Session) restoredBuilder(bound loop.BoundDefinition) (foreign.RestoredB
 
 func (s *Session) usesServicesRestoredBuilder(bound loop.BoundDefinition) bool {
 	return s.foreignBuildRestoredServices != nil ||
-		(s.foreignRegistry != nil && bound.Engine() == loop.EngineAdapter && bound.RuntimeProfile() != "")
+		(s.foreignRegistry != nil && bound.Engine() == loop.EngineAdapter && bound.RuntimeProfile() != "" &&
+			s.foreignRegistry.HasServicesBuilder(bound.RuntimeProfile()))
 }
 
 func (s *Session) servicesRestoredBuilder(bound loop.BoundDefinition) (foreign.ServicesRestoredBuilder, error) {
@@ -1237,6 +1242,11 @@ func buildRestoredSession(
 			Admission:    s.checkpointAdmission.enterCheckpoint,
 			ObserveError: s.observeBestEffortCheckpointError,
 		})
+	}
+	if s.collabBrokerRequired(cfg) {
+		if err := s.startCollabBroker(); err != nil {
+			return abort(&RestoreError{Kind: RestoreLoopFailed, Cause: err})
+		}
 	}
 
 	// Seed the root loop under its ORIGINAL id (identity stable), coming up idle with

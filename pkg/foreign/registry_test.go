@@ -391,3 +391,35 @@ func TestBuilderRegistryServicesLookupUnknownProfile(t *testing.T) {
 		t.Fatalf("ServicesBuilder unknown error = %v, want *UnknownProfileError", err)
 	}
 }
+
+func TestBuilderRegistryHasServicesBuilderDistinguishesRegistrationShape(t *testing.T) {
+	t.Parallel()
+	var legacy, services foreign.BuilderRegistry
+	if err := legacy.Register("legacy", registryBuilder("live"), registryRestoredBuilder(nil)); err != nil {
+		t.Fatalf("legacy Register: %v", err)
+	}
+	servicesLive := foreign.ServicesBuilder(func(
+		context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreign.EventPublisher,
+		loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory, foreign.Services,
+	) (loop.Backend, string, error) {
+		return nil, "", nil
+	})
+	servicesRestored := foreign.ServicesRestoredBuilder(func(
+		context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreign.EventPublisher,
+		loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory, foreign.RestoredForeign, foreign.Services,
+	) (loop.Backend, error) {
+		return nil, nil
+	})
+	if err := services.RegisterServices("services", servicesLive, servicesRestored); err != nil {
+		t.Fatalf("services Register: %v", err)
+	}
+	if legacy.HasServicesBuilder("legacy") {
+		t.Fatal("legacy registration reported services-aware")
+	}
+	if !services.HasServicesBuilder("services") {
+		t.Fatal("services registration did not report services-aware")
+	}
+	if services.HasServicesBuilder("unknown") {
+		t.Fatal("unknown registration reported services-aware")
+	}
+}

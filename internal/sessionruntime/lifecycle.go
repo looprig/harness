@@ -520,8 +520,10 @@ func WithLifecycleForeignBuilders(b foreign.Builder, rb foreign.RestoredBuilder)
 }
 
 // WithLifecycleForeignServicesBuilders captures the additive foreign builder
-// seams for every live/restored session. Runtime currently supplies zero
-// Services; later lifecycle work binds fresh per-loop services internally.
+// seams for every live/restored session. Session construction starts one
+// private broker only when a foreign loop uses this opt-in seam, then mints a
+// fresh descriptor for each origin loop. Native and legacy builders remain
+// zero-services paths.
 func WithLifecycleForeignServicesBuilders(b foreign.ServicesBuilder, rb foreign.ServicesRestoredBuilder) LifecycleOption {
 	return func(r *Lifecycle) {
 		if b != nil && rb != nil {

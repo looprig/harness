@@ -237,8 +237,8 @@ func WithForeignBuilders(b foreign.Builder, rb foreign.RestoredBuilder) Option {
 
 // WithForeignServicesBuilders wires the additive foreign-engine seam. Runtime
 // supplies a fresh Services snapshot for the exact session+loop construction:
-// Broker is intentionally empty until broker composition lands, while Delivery
-// is a loop-scoped hook. Legacy builders remain on the zero-services adapter.
+// the broker descriptor is minted for that origin loop and Delivery remains a
+// loop-scoped hook. Legacy builders remain on the zero-services adapter.
 func WithForeignServicesBuilders(b foreign.ServicesBuilder, rb foreign.ServicesRestoredBuilder) Option {
 	return func(s *Session) {
 		s.foreignBuildServices = b

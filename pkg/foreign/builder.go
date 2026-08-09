@@ -178,3 +178,18 @@ func (r *BuilderRegistry) ServicesBuilder(profile loop.RuntimeProfileName) (Serv
 		return nil, nil, errBuilderRegistryShape
 	}
 }
+
+// HasServicesBuilder reports whether profile was registered through the
+// additive services-aware shape. Legacy registrations are intentionally false
+// even though ServicesBuilder can return a compatibility adapter for them;
+// callers that manage capabilities must not mint authority for a legacy
+// builder that cannot receive it.
+func (r *BuilderRegistry) HasServicesBuilder(profile loop.RuntimeProfileName) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	pair, exists := r.builders[profile]
+	r.mu.RUnlock()
+	return exists && pair.servicesBuild != nil && pair.servicesRestore != nil && pair.build == nil && pair.restored == nil
+}

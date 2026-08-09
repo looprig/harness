@@ -11,3 +11,5 @@ func listenCollabEndpoint(string) (net.Listener, error) {
 }
 
 func collabPeerUID(net.Conn) (uint32, bool) { return 0, false }
+
+func collabUID() uint32 { return 0 }
