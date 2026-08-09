@@ -202,6 +202,55 @@ func TestRestoreDeliveryStateRequiresSessionRoute(t *testing.T) {
 	}
 }
 
+func TestRestoreLifecycleEvidenceRequiresSessionRoute(t *testing.T) {
+	t.Parallel()
+	sessionID, wrongSession, childID, requestID, turnID := mustUUID(), mustUUID(), mustUUID(), mustUUID(), mustUUID()
+	records := []journal.JournalRecord{
+		journal.NewCommandRecord(sessionID, childID, phasedBackgroundCommand(requestID, childID, command.DelegateDeliveryPhaseIntent)),
+	}
+	coord := func(sid uuid.UUID) identity.Coordinates {
+		return identity.Coordinates{SessionID: sid, LoopID: childID, TurnID: turnID}
+	}
+	started := event.TurnStarted{Header: event.Header{Coordinates: coord(sessionID), Cause: identity.Cause{CommandID: requestID}}}
+	for _, tc := range []struct {
+		name   string
+		events func() []event.Event
+	}{
+		{name: "opening", events: func() []event.Event {
+			return []event.Event{event.TurnStarted{Header: event.Header{Coordinates: coord(wrongSession), Cause: identity.Cause{CommandID: requestID}}}}
+		}},
+		{name: "fold", events: func() []event.Event {
+			return []event.Event{started, event.TurnFoldedInto{Header: event.Header{Coordinates: coord(wrongSession), Cause: identity.Cause{CommandID: requestID}}}}
+		}},
+		{name: "rejected", events: func() []event.Event {
+			return []event.Event{event.TurnRejected{Header: event.Header{Coordinates: identity.Coordinates{SessionID: wrongSession, LoopID: childID}, Cause: identity.Cause{CommandID: requestID}}, Reason: event.RejectQueueFull}}
+		}},
+		{name: "cancelled", events: func() []event.Event {
+			return []event.Event{event.InputCancelled{Header: event.Header{Coordinates: identity.Coordinates{SessionID: wrongSession, LoopID: childID}, Cause: identity.Cause{CommandID: requestID}}, Reason: event.CancelClientRetracted}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := seedResolvedDelegateRecords(newDelegationManager(Topology{}), records, tc.events(), nil); err == nil {
+				t.Fatalf("wrong-session %s evidence was accepted", tc.name)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name     string
+		terminal event.Event
+	}{
+		{name: "done", terminal: event.TurnDone{Header: event.Header{Coordinates: coord(wrongSession)}}},
+		{name: "failed", terminal: event.TurnFailed{Header: event.Header{Coordinates: coord(wrongSession)}, Err: errors.New("failed")}},
+		{name: "interrupted", terminal: event.TurnInterrupted{Header: event.Header{Coordinates: coord(wrongSession)}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := seedResolvedDelegateRecords(newDelegationManager(Topology{}), records, []event.Event{started, tc.terminal}, nil); err == nil {
+				t.Fatalf("wrong-session %s terminal was accepted", tc.name)
+			}
+		})
+	}
+}
+
 func TestRestoreFallbackConflictsWithTerminalDeliveryStateRegardlessOrder(t *testing.T) {
 	t.Parallel()
 	for _, terminalFirst := range []bool{false, true} {

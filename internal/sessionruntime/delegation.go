@@ -262,7 +262,7 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 			}
 		}
 	}
-	terminals, err := foldDelegateTerminalsChecked(combined)
+	terminals, err := foldDelegateTerminalsChecked(combined, sessionID)
 	if err != nil {
 		return err
 	}
@@ -506,7 +506,7 @@ func persistUnresolvedDelegateDeliveryStates(ctx context.Context, j journal.Sess
 	if err := validateDelegateDeliveryPhases(phased, deliveryStates); err != nil {
 		return nil, err
 	}
-	terminals, err := foldDelegateTerminalsChecked(combined)
+	terminals, err := foldDelegateTerminalsChecked(combined, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -566,7 +566,7 @@ func persistUnresolvedDelegateDeliveryStates(ctx context.Context, j journal.Sess
 // must never be written first and only then discover that the same request also
 // has an authoritative turn terminal or cancellation.
 func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.UUID]uuid.UUID, sessionID uuid.UUID) error {
-	terminals, err := foldDelegateTerminalsChecked(events)
+	terminals, err := foldDelegateTerminalsChecked(events, sessionID)
 	if err != nil {
 		return err
 	}
@@ -586,6 +586,12 @@ func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.
 		}
 		return nil
 	}
+	validateEventSession := func(actual, requestID uuid.UUID) error {
+		if sessionID.IsZero() || actual.IsZero() || actual == sessionID {
+			return nil
+		}
+		return &delegateRestoreContradictionError{requestID: requestID, reason: "delegate evidence session mismatch"}
+	}
 	for _, ev := range events {
 		switch typed := ev.(type) {
 		case event.TurnStarted:
@@ -603,6 +609,9 @@ func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.
 				openings[typed.Cause.CommandID] = struct{}{}
 			}
 		case event.TurnRejected:
+			if err := validateEventSession(typed.SessionID, typed.Cause.CommandID); err != nil {
+				return err
+			}
 			if err := validateTargetRoute(typed.Cause.CommandID, typed.LoopID); err != nil {
 				return err
 			}
@@ -610,6 +619,9 @@ func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.
 				closures[typed.Cause.CommandID] = struct{}{}
 			}
 		case event.InputCancelled:
+			if err := validateEventSession(typed.SessionID, typed.Cause.CommandID); err != nil {
+				return err
+			}
 			if err := validateTargetRoute(typed.Cause.CommandID, typed.LoopID); err != nil {
 				return err
 			}
@@ -895,7 +907,7 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 			requestIDs = append(requestIDs, requestID)
 		}
 	}
-	terminals, err := foldDelegateTerminalsChecked(combined)
+	terminals, err := foldDelegateTerminalsChecked(combined, restoreSessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -1099,7 +1111,11 @@ func foldDelegateTerminals(events []event.Event) map[uuid.UUID]resolvedRequest {
 // a request mapped to multiple turns, a turn id routed to multiple loops, and
 // incompatible terminal events. InputQueued is deliberately ignored; it is an
 // ephemeral admission hint and does not prove that a request reached a turn.
-func foldDelegateTerminalsChecked(events []event.Event) (map[uuid.UUID]resolvedRequest, error) {
+func foldDelegateTerminalsChecked(events []event.Event, expectedSessionIDs ...uuid.UUID) (map[uuid.UUID]resolvedRequest, error) {
+	var expectedSessionID uuid.UUID
+	if len(expectedSessionIDs) > 0 {
+		expectedSessionID = expectedSessionIDs[0]
+	}
 	type turnKey struct {
 		loopID uuid.UUID
 		turnID uuid.UUID
@@ -1118,6 +1134,12 @@ func foldDelegateTerminalsChecked(events []event.Event) (map[uuid.UUID]resolvedR
 	terminalOwners := make(map[uuid.UUID]uuid.UUID)
 	lifecycle := make(map[turnKey]turnLifecycle)
 	terminals := make(map[turnKey]terminalObservation)
+	validateSession := func(actual, requestID uuid.UUID) error {
+		if expectedSessionID.IsZero() || actual.IsZero() || actual == expectedSessionID {
+			return nil
+		}
+		return &delegateRestoreContradictionError{requestID: requestID, reason: "delegate evidence session mismatch"}
+	}
 	validateRoute := func(key turnKey) error {
 		if priorLoop, exists := turnOwners[key.turnID]; exists && priorLoop != key.loopID {
 			return &journal.CommandRouteMismatchError{RecordLoopID: key.loopID, TargetLoopID: priorLoop}
@@ -1200,26 +1222,41 @@ func foldDelegateTerminalsChecked(events []event.Event) (map[uuid.UUID]resolvedR
 	for _, ev := range events {
 		switch e := ev.(type) {
 		case event.TurnStarted:
+			if err := validateSession(e.SessionID, e.Cause.CommandID); err != nil {
+				return nil, err
+			}
 			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
 			if err := addStarted(key, e.Cause.CommandID); err != nil {
 				return nil, err
 			}
 		case event.TurnFoldedInto:
+			if err := validateSession(e.SessionID, e.Cause.CommandID); err != nil {
+				return nil, err
+			}
 			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
 			if err := addFolded(key, e.Cause.CommandID); err != nil {
 				return nil, err
 			}
 		case event.TurnDone:
+			if err := validateSession(e.SessionID, uuid.UUID{}); err != nil {
+				return nil, err
+			}
 			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
 			if err := observeTerminal(key, terminalObservation{kind: "done", text: aiText(e.Message)}); err != nil {
 				return nil, err
 			}
 		case event.TurnFailed:
+			if err := validateSession(e.SessionID, uuid.UUID{}); err != nil {
+				return nil, err
+			}
 			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
 			if err := observeTerminal(key, terminalObservation{kind: "failed", text: delegateFailureDetail(e.Err)}); err != nil {
 				return nil, err
 			}
 		case event.TurnInterrupted:
+			if err := validateSession(e.SessionID, uuid.UUID{}); err != nil {
+				return nil, err
+			}
 			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
 			if err := observeTerminal(key, terminalObservation{kind: "interrupted"}); err != nil {
 				return nil, err
