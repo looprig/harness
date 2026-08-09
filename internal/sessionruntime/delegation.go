@@ -175,7 +175,7 @@ func (m *delegationManager) catalogFor(parent loop.Definition) (loop.RuntimeCata
 }
 
 // seedResolvedDelegateRecords reconstructs durable delegate correlation from required
-// machine NoFold intents, then overlays exact started-turn terminals and crash closures.
+// machine delegate intents, then overlays exact started-turn terminals and crash closures.
 func seedResolvedDelegateRecords(m *delegationManager, records []journal.JournalRecord, replayed, closures []event.Event, tombstonedSet ...map[uuid.UUID]struct{}) error {
 	tombstoned := map[uuid.UUID]struct{}{}
 	if len(tombstonedSet) > 0 && tombstonedSet[0] != nil {
@@ -210,6 +210,33 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 			return &journal.CommandRouteMismatchError{RecordLoopID: childID, TargetLoopID: target}
 		}
 		index[requestID] = resolvedRequest{childID: target, status: tool.DelegateStatusInterrupted}
+	}
+	// Foreign/native delivery state is session-owned durable evidence. A reservation
+	// means the adapter may have accepted the message but the host has no
+	// authoritative turn to correlate, so restore records an unknown terminal and
+	// must never steer the same request again. Validate the duplicated target before
+	// touching the index: a contradictory route is corruption, not a new delivery.
+	for _, ev := range combined {
+		state, ok := ev.(event.DelegateDeliveryStateChanged)
+		if !ok || state.RequestID.IsZero() {
+			continue
+		}
+		target, admitted := intents[state.RequestID]
+		if !admitted {
+			// State for a request whose intent is not in this journal cannot be
+			// safely routed or replayed. It is intentionally ignored rather than
+			// inventing an intent from an event-only record.
+			continue
+		}
+		if state.TargetLoopID != target {
+			return &journal.CommandRouteMismatchError{RecordLoopID: state.TargetLoopID, TargetLoopID: target}
+		}
+		switch state.State {
+		case event.DelegateDeliverySteerAttemptReserved,
+			event.DelegateDeliveryResolvedUnknown,
+			event.DelegateDeliveryResolvedUntrackable:
+			index[state.RequestID] = resolvedRequest{childID: target, status: tool.DelegateStatusUnknown}
+		}
 	}
 	for requestID, terminal := range foldDelegateTerminals(combined) {
 		if _, admitted := index[requestID]; admitted {
@@ -249,9 +276,10 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 
 // backgroundDelegateIntents returns the durable request-to-child map for the one
 // managed request shape whose completion must cross the child-to-parent boundary
-// after a process restart. The marker is intentionally narrower than "machine
-// NoFold": foreground responses and ordinary machine input must never be replayed
-// as parent hand-backs.
+// after a process restart. Both the legacy non-folding marker and the phased
+// foldable marker are admitted. The marker is intentionally narrower than
+// "machine NoFold": foreground responses and ordinary machine input must never be
+// replayed as parent hand-backs.
 func backgroundDelegateIntents(records []journal.JournalRecord) (map[uuid.UUID]uuid.UUID, error) {
 	intents := make(map[uuid.UUID]uuid.UUID)
 	for _, record := range records {
@@ -263,8 +291,14 @@ func backgroundDelegateIntents(records []journal.JournalRecord) (map[uuid.UUID]u
 			return nil, err
 		}
 		input, ok := commandRecord.Command().(command.UserInput)
-		if !ok || !input.BackgroundHandBack || !input.NoFold || input.Agency != identity.AgencyMachine || input.TargetLoopID.IsZero() || input.CommandID.IsZero() {
+		if !ok || !input.BackgroundHandBack || input.Agency != identity.AgencyMachine || input.TargetLoopID.IsZero() || input.CommandID.IsZero() {
 			continue
+		}
+		if !input.NoFold && !input.DelegateDeliveryPhase.Valid() {
+			continue
+		}
+		if prior, exists := intents[input.CommandID]; exists && prior != input.TargetLoopID {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: input.TargetLoopID, TargetLoopID: prior}
 		}
 		intents[input.CommandID] = input.TargetLoopID
 	}
@@ -288,6 +322,33 @@ type restoredBackgroundPlan struct {
 	name      string
 	resolved  resolvedRequest
 	handBack  *command.SubagentResult
+	// reAdmit is set for a foldable phased command whose durable journal has
+	// no opening/cancellation/terminal evidence. Restore sends this exact
+	// command id back through the child actor; it never steers a request with
+	// an ambiguous delivery state.
+	reAdmit *command.UserInput
+}
+
+// phasedBackgroundCommands returns the exact foldable command payloads that may
+// be re-admitted after restore. Legacy NoFold hand-backs remain terminal-correlation
+// records only; replaying those would change the historical admission contract.
+func phasedBackgroundCommands(records []journal.JournalRecord) (map[uuid.UUID]command.UserInput, error) {
+	commands := make(map[uuid.UUID]command.UserInput)
+	for _, record := range records {
+		commandRecord, ok := record.(journal.CommandRecord)
+		if !ok {
+			continue
+		}
+		if err := journal.ValidateCommandRecordRoute(commandRecord); err != nil {
+			return nil, err
+		}
+		input, ok := commandRecord.Command().(command.UserInput)
+		if !ok || !input.BackgroundHandBack || !input.DelegateDeliveryPhase.Valid() || input.CommandID.IsZero() || input.TargetLoopID.IsZero() {
+			continue
+		}
+		commands[input.CommandID] = input
+	}
+	return commands, nil
 }
 
 // planRestoredBackgroundRequests reconstructs the durable child-terminal to
@@ -298,6 +359,10 @@ type restoredBackgroundPlan struct {
 // replayed because the restored actor does not reconstruct its ephemeral inbox.
 func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records []journal.JournalRecord, replayed, closures []event.Event) ([]restoredBackgroundPlan, error) {
 	intents, err := backgroundDelegateIntents(records)
+	if err != nil {
+		return nil, err
+	}
+	phased, err := phasedBackgroundCommands(records)
 	if err != nil {
 		return nil, err
 	}
@@ -387,8 +452,32 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 	}
 
 	processed := make(map[uuid.UUID]struct{})
+	// requestOpened is intentionally separate from processed parent hand-back
+	// commands. A TurnStarted/TurnFoldedInto proves a child request crossed the
+	// actor boundary; InputQueued does not and is therefore omitted.
+	requestOpened := make(map[uuid.UUID]struct{})
+	requestTerminal := make(map[uuid.UUID]struct{})
+	requestDeliveryState := make(map[uuid.UUID]struct{})
 	for _, ev := range append(append([]event.Event(nil), replayed...), closures...) {
 		commandID := ev.EventHeader().Cause.CommandID
+		switch typed := ev.(type) {
+		case event.TurnStarted:
+			if !typed.Cause.CommandID.IsZero() {
+				requestOpened[typed.Cause.CommandID] = struct{}{}
+			}
+		case event.TurnFoldedInto:
+			if !typed.Cause.CommandID.IsZero() {
+				requestOpened[typed.Cause.CommandID] = struct{}{}
+			}
+		case event.InputCancelled, event.TurnRejected:
+			if !commandID.IsZero() {
+				requestTerminal[commandID] = struct{}{}
+			}
+		case event.DelegateDeliveryStateChanged:
+			if !typed.RequestID.IsZero() {
+				requestDeliveryState[typed.RequestID] = struct{}{}
+			}
+		}
 		// The completion envelope is also durable in the parent turn input.
 		// This correlation survives even when the audit-only SubagentResult
 		// command append failed, so a processed completion cannot be replayed
@@ -425,11 +514,25 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 		}
 	}
 
-	requestIDs := make([]uuid.UUID, 0, len(intents))
+	requestIDSet := make(map[uuid.UUID]struct{}, len(intents))
 	for requestID := range intents {
+		requestIDSet[requestID] = struct{}{}
+	}
+	for requestID := range phased {
+		requestIDSet[requestID] = struct{}{}
+	}
+	requestIDs := make([]uuid.UUID, 0, len(requestIDSet))
+	for requestID := range requestIDSet {
 		if _, resolved := m.getResolved(requestID); resolved {
 			requestIDs = append(requestIDs, requestID)
+			continue
 		}
+		if _, isPhased := phased[requestID]; isPhased {
+			requestIDs = append(requestIDs, requestID)
+		}
+	}
+	for requestID := range foldDelegateTerminals(append(append([]event.Event(nil), replayed...), closures...)) {
+		requestTerminal[requestID] = struct{}{}
 	}
 	sort.Slice(requestIDs, func(i, j int) bool { return requestIDs[i].String() < requestIDs[j].String() })
 
@@ -438,11 +541,38 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 		if _, done := processed[requestID]; done {
 			continue
 		}
+		childID := intents[requestID]
+		if childID.IsZero() {
+			if phasedCommand, ok := phased[requestID]; ok {
+				childID = phasedCommand.TargetLoopID
+			}
+		}
+		if phasedCommand, isPhased := phased[requestID]; isPhased {
+			// An opening event is already authoritative. An explicit terminal,
+			// cancellation, or delivery-state event is also final evidence; in
+			// particular, an unresolved reservation is never steered again.
+			_, opened := requestOpened[requestID]
+			_, terminal := requestTerminal[requestID]
+			_, deliveryState := requestDeliveryState[requestID]
+			if !opened && !terminal && !deliveryState {
+				info, known := children[childID]
+				if known && !info.parent.IsZero() {
+					copy := phasedCommand
+					plan = append(plan, restoredBackgroundPlan{
+						requestID: requestID,
+						childID:   childID,
+						parentID:  info.parent,
+						name:      info.name,
+						reAdmit:   &copy,
+					})
+				}
+				continue
+			}
+		}
 		resolved, ok := m.getResolved(requestID)
 		if !ok {
 			continue
 		}
-		childID := intents[requestID]
 		if resolved.childID != childID {
 			return nil, &journal.CommandRouteMismatchError{RecordLoopID: resolved.childID, TargetLoopID: childID}
 		}
@@ -474,6 +604,10 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 // dispatch and released by the normal parent event path.
 func (m *delegationManager) reconcileRestoredBackgroundRequests(s *Session, plan []restoredBackgroundPlan) {
 	for _, entry := range plan {
+		if entry.reAdmit != nil {
+			m.readmitRestoredBackgroundRequest(s, entry)
+			continue
+		}
 		s.expectTurn(s.sessionCtx, entry.childID)
 		var err error
 		if entry.handBack != nil {
@@ -489,34 +623,108 @@ func (m *delegationManager) reconcileRestoredBackgroundRequests(s *Session, plan
 	}
 }
 
-// foldDelegateTerminals correlates every turn's opening request id (TurnStarted's
-// Cause.CommandID) to its terminal (TurnDone answer / TurnFailed / TurnInterrupted). A
-// turn with a zero Cause.CommandID (no correlating submit) is skipped. It mirrors the live
-// delegate drain exactly: only TurnDone.Message is an answer; StepDone is progress.
+// readmitRestoredBackgroundRequest sends the exact durable phased command back
+// through the child actor when no event proves that the prior admission crossed
+// an opening/terminal boundary. The transient Accepted channel is recreated only
+// for this in-memory dispatch; it is never written to the journal. The subscription
+// is installed before dispatch so TurnStarted, TurnFoldedInto, or InputCancelled
+// cannot race past the session-owned hand-back drain.
+func (m *delegationManager) readmitRestoredBackgroundRequest(s *Session, entry restoredBackgroundPlan) {
+	if s == nil || entry.reAdmit == nil {
+		return
+	}
+	sub, err := s.subscribeLoop(entry.childID)
+	if err != nil {
+		return
+	}
+	backend, ok := s.loopFor(entry.childID)
+	if !ok || backend == nil {
+		_ = sub.Close()
+		return
+	}
+	tracked := m.registerRequest(entry.requestID, entry.childID)
+	if s.hub != nil {
+		s.expectTurn(s.sessionCtx, entry.childID)
+	}
+	cmd := *entry.reAdmit
+	cmd.Accepted = make(chan error, 1)
+	select {
+	case backend.CommandSink() <- cmd:
+		// Drain immediately. The actor's acceptance ack is intentionally not
+		// awaited here: the durable command is valid, and the drain observes
+		// the authoritative opening/rejection event without blocking RestoreDone.
+		m.handBackRequest(s, entry.parentID, entry.childID, entry.name, tracked, entry.requestID, sub, nil, true)
+	case <-backend.DoneChan():
+		_ = sub.Close()
+		m.removeRequest(entry.requestID, tracked)
+		if s.hub != nil {
+			s.cancelExpectTurn(context.Background(), entry.childID)
+		}
+	case <-s.sessionCtx.Done():
+		_ = sub.Close()
+		m.removeRequest(entry.requestID, tracked)
+		if s.hub != nil {
+			s.cancelExpectTurn(context.Background(), entry.childID)
+		}
+	}
+}
+
+// foldDelegateTerminals correlates every turn's opening and folded request ids to
+// its terminal (TurnDone answer / TurnFailed / TurnInterrupted). A turn may carry
+// several MessageAgent requests: one TurnStarted command followed by one or more
+// TurnFoldedInto commands. Every request folded into the same exact
+// (LoopID, TurnID) receives the one terminal. InputQueued is deliberately ignored;
+// it is an ephemeral admission hint and does not prove that a request reached a
+// turn. It mirrors the live delegate drain exactly: only TurnDone.Message is an
+// answer; StepDone is progress.
 func foldDelegateTerminals(events []event.Event) map[uuid.UUID]resolvedRequest {
 	type turnKey struct {
-		loopID    uuid.UUID
-		commandID uuid.UUID
+		loopID uuid.UUID
+		turnID uuid.UUID
 	}
-	byTurn := make(map[uuid.UUID]turnKey)
+	byTurn := make(map[turnKey]map[uuid.UUID]struct{})
 	out := make(map[uuid.UUID]resolvedRequest)
+	addRequest := func(key turnKey, requestID uuid.UUID) {
+		if requestID.IsZero() {
+			return
+		}
+		requests := byTurn[key]
+		if requests == nil {
+			requests = make(map[uuid.UUID]struct{})
+			byTurn[key] = requests
+		}
+		requests[requestID] = struct{}{}
+	}
+	forEachRequest := func(key turnKey, fn func(uuid.UUID)) {
+		for requestID := range byTurn[key] {
+			fn(requestID)
+		}
+	}
 	for _, ev := range events {
 		switch e := ev.(type) {
 		case event.TurnStarted:
-			byTurn[e.Coordinates.TurnID] = turnKey{loopID: e.Coordinates.LoopID, commandID: e.Cause.CommandID}
+			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
+			addRequest(key, e.Cause.CommandID)
+		case event.TurnFoldedInto:
+			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
+			addRequest(key, e.Cause.CommandID)
 		case event.TurnDone:
-			if k, ok := byTurn[e.Coordinates.TurnID]; ok && !k.commandID.IsZero() {
-				text := aiText(e.Message)
-				out[k.commandID] = resolvedRequest{childID: k.loopID, status: tool.DelegateStatusCompleted, text: text}
-			}
+			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
+			text := aiText(e.Message)
+			forEachRequest(key, func(requestID uuid.UUID) {
+				out[requestID] = resolvedRequest{childID: e.Coordinates.LoopID, status: tool.DelegateStatusCompleted, text: text}
+			})
 		case event.TurnFailed:
-			if k, ok := byTurn[e.Coordinates.TurnID]; ok && !k.commandID.IsZero() {
-				out[k.commandID] = resolvedRequest{childID: k.loopID, status: tool.DelegateStatusFailed, text: delegateFailureDetail(e.Err)}
-			}
+			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
+			text := delegateFailureDetail(e.Err)
+			forEachRequest(key, func(requestID uuid.UUID) {
+				out[requestID] = resolvedRequest{childID: e.Coordinates.LoopID, status: tool.DelegateStatusFailed, text: text}
+			})
 		case event.TurnInterrupted:
-			if k, ok := byTurn[e.Coordinates.TurnID]; ok && !k.commandID.IsZero() {
-				out[k.commandID] = resolvedRequest{childID: k.loopID, status: tool.DelegateStatusInterrupted}
-			}
+			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
+			forEachRequest(key, func(requestID uuid.UUID) {
+				out[requestID] = resolvedRequest{childID: e.Coordinates.LoopID, status: tool.DelegateStatusInterrupted}
+			})
 		}
 	}
 	return out
@@ -678,15 +886,19 @@ func (m *delegationManager) removeRequest(requestID uuid.UUID, tracked *requestT
 // handBackRequest starts the session-owned drain for one background response. The drain
 // runs on the session lifetime, not the parent tool-call context. Its only terminal
 // delivery is a machine-originated SubagentResult to the direct parent.
-func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.UUID, name string, tracked *requestTracker, requestID uuid.UUID, sub event.Subscription, timeoutSeconds *int) {
+func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.UUID, name string, tracked *requestTracker, requestID uuid.UUID, sub event.Subscription, timeoutSeconds *int, suppressInterrupt bool) {
 	go func() {
 		defer func() { _ = sub.Close() }()
 		defer m.removeRequest(requestID, tracked)
 		waitCtx, cancel := waitContext(s.sessionCtx, timeoutSeconds)
 		defer cancel()
-		text, err := drainDelegateAnswerObserved(waitCtx, sub, requestID, func() {
-			_, _ = s.cancelDelegateRequest(childID, requestID)
-		}, tracked.markActive)
+		var interrupt func()
+		if !suppressInterrupt {
+			interrupt = func() {
+				_, _ = s.cancelDelegateRequest(childID, requestID)
+			}
+		}
+		text, err := drainDelegateAnswerObserved(waitCtx, sub, requestID, interrupt, tracked.markActive)
 		status := statusFromDrain(err)
 		if status == tool.DelegateStatusInterrupted && didTimeout(timeoutSeconds, waitCtx) {
 			status = tool.DelegateStatusTimedOut
@@ -1149,9 +1361,14 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 		defer c.manager.removeRequest(requestID, tracked)
 		waitCtx, cancel := waitContext(ctx, req.TimeoutSeconds)
 		defer cancel()
-		text, err := drainDelegateAnswerObserved(waitCtx, sub, requestID, func() {
-			_, _ = s.cancelDelegateRequest(childID, requestID)
-		}, tracked.markActive)
+		var interrupt func()
+		nativeMessage := req.Operation == tool.DelegateSend && s.nativeDelegateLoop(childID)
+		if !nativeMessage {
+			interrupt = func() {
+				_, _ = s.cancelDelegateRequest(childID, requestID)
+			}
+		}
+		text, err := drainDelegateAnswerObserved(waitCtx, sub, requestID, interrupt, tracked.markActive)
 		status := statusFromDrain(err)
 		if status == tool.DelegateStatusInterrupted && didTimeout(req.TimeoutSeconds, waitCtx) {
 			status = tool.DelegateStatusTimedOut
@@ -1170,10 +1387,13 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 	if name == "" {
 		name = c.agentSnapshot(s, childID).Name
 	}
-	c.manager.handBackRequest(s, c.parentLoopID, childID, name, tracked, requestID, sub, req.TimeoutSeconds)
+	c.manager.handBackRequest(s, c.parentLoopID, childID, name, tracked, requestID, sub, req.TimeoutSeconds, req.Operation == tool.DelegateSend && s.nativeDelegateLoop(childID))
 	result := c.agentResult(s, childID)
 	result.CorrelationID = requestID
 	result.State = tool.AgentStateWorking
+	if req.Operation == tool.DelegateSend && s.nativeDelegateLoop(childID) {
+		result.DeliveryStatus = tool.DelegateDeliveryAcceptedPending
+	}
 	if req.Name != "" {
 		result.Name = req.Name
 	}
@@ -1561,9 +1781,19 @@ func runtimeEffortString(value inferencemodel.Effort) string {
 	return string(value)
 }
 
-// sendDelegate enqueues a distinct NON-FOLDING follow-up turn on an existing owned
-// child. It subscribes BEFORE the enqueue so the correlated turn's opening event is
-// never missed.
+// nativeDelegateLoop reports whether the target uses the in-process native loop.
+// Native MessageAgent sends use the ordinary fold semantics; the legacy
+// non-folding command remains available for foreign or headless seams without a
+// bound native definition.
+func (s *Session) nativeDelegateLoop(loopID uuid.UUID) bool {
+	s.loopsMu.RLock()
+	h := s.loops[loopID]
+	s.loopsMu.RUnlock()
+	return h != nil && h.bound != nil && h.bound.Engine() == loop.EngineNative
+}
+
+// sendDelegate enqueues a follow-up turn on an existing owned child. It subscribes
+// BEFORE the enqueue so the correlated opening event is never missed.
 func (s *Session) sendDelegate(ctx context.Context, childID uuid.UUID, message string, background bool, registerRequest func(requestID, childID uuid.UUID) *requestTracker, removeRequest func(uuid.UUID, *requestTracker)) (requestID uuid.UUID, sub event.Subscription, tracked *requestTracker, err error) {
 	sub, err = s.subscribeLoop(childID)
 	if err != nil {
@@ -1599,12 +1829,11 @@ func (s *Session) subscribeLoop(loopID uuid.UUID) (event.Subscription, error) {
 	})
 }
 
-// enqueueDelegateTurn is the internal NON-FOLDING delegate enqueue: a distinct
-// machine-originated turn whose minted command id correlates the child's turn. It submits
-// with NoFold=true, so even a send to a child that is mid-tool-turn NEVER folds into the
-// running turn (the loop actor's drainInbox skips non-folding entries); it queues behind
-// the running turn and starts its OWN distinct turn when that finishes. The public
-// Session.SubmitToLoop keeps its interactive queue/fold semantics (NoFold=false).
+// enqueueDelegateTurn is the internal machine-originated delegate enqueue. Native
+// MessageAgent requests deliberately use NoFold=false so a busy child can fold the
+// request into its current turn; the durable phase marker distinguishes that
+// recovery path. Unknown/foreign-bound seams retain the historical non-folding
+// command.
 func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blocks []content.Block, background bool, registerRequest func(requestID, childID uuid.UUID) *requestTracker, removeRequest func(uuid.UUID, *requestTracker)) (requestID uuid.UUID, tracked *requestTracker, err error) {
 	if err := s.faultIfFaulted(); err != nil {
 		return uuid.UUID{}, nil, err
@@ -1621,13 +1850,17 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 		return uuid.UUID{}, nil, err
 	}
 	accepted := make(chan error, 1)
+	native := s.nativeDelegateLoop(loopID)
 	cmd := command.UserInput{
 		Header:             command.Header{CommandID: id, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()},
 		Blocks:             blocks,
-		NoFold:             true,
+		NoFold:             !native,
 		TargetLoopID:       loopID,
 		BackgroundHandBack: background,
 		Accepted:           accepted,
+	}
+	if native && background {
+		cmd.DelegateDeliveryPhase = command.DelegateDeliveryPhaseIntent
 	}
 	if err := s.appendDelegateCommand(ctx, loopID, cmd); err != nil {
 		return uuid.UUID{}, nil, err
@@ -1642,12 +1875,21 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 	}()
 	select {
 	case backend.CommandSink() <- cmd:
-		canceled, err := awaitDelegateAcceptance(ctx, accepted, backend.DoneChan())
+		var canceled bool
+		if native {
+			canceled, err = awaitNativeDelegateAcceptance(ctx, accepted, backend.DoneChan())
+		} else {
+			canceled, err = awaitDelegateAcceptance(ctx, accepted, backend.DoneChan())
+		}
 		if err != nil {
 			return uuid.UUID{}, nil, err
 		}
 		admitted = true
 		if canceled {
+			// awaitDelegateAcceptance reports cancellation only when the caller
+			// won the race before the durable acceptance receive. An accepted
+			// native request therefore never reaches this branch for a post-ack
+			// timeout/cancel, while a true pre-ack cancel still retracts queued work.
 			_, _ = s.cancelDelegateRequest(loopID, id)
 		}
 		return id, tracked, nil
@@ -1682,6 +1924,44 @@ func awaitDelegateAcceptance(ctx context.Context, accepted <-chan error, backend
 					return canceled, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: acceptErr}
 				}
 				return canceled || ctx.Err() != nil, nil
+			default:
+				return canceled, &SessionError{Kind: SessionLoopExited}
+			}
+		}
+	}
+}
+
+// awaitNativeDelegateAcceptance keeps the native foldable admission boundary
+// distinct from the legacy helper above. If caller cancellation and the ack are
+// ready together, an already-buffered ack wins; cancellation observed before the
+// ack remains eligible for the queued retraction branch in enqueueDelegateTurn.
+func awaitNativeDelegateAcceptance(ctx context.Context, accepted <-chan error, backendDone <-chan struct{}) (canceled bool, err error) {
+	ctxDone := ctx.Done()
+	for {
+		select {
+		case acceptErr := <-accepted:
+			if acceptErr != nil {
+				return canceled, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: acceptErr}
+			}
+			return canceled, nil
+		case <-ctxDone:
+			select {
+			case acceptErr := <-accepted:
+				if acceptErr != nil {
+					return false, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: acceptErr}
+				}
+				return false, nil
+			default:
+			}
+			canceled = true
+			ctxDone = nil
+		case <-backendDone:
+			select {
+			case acceptErr := <-accepted:
+				if acceptErr != nil {
+					return canceled, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: acceptErr}
+				}
+				return canceled, nil
 			default:
 				return canceled, &SessionError{Kind: SessionLoopExited}
 			}

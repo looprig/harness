@@ -82,11 +82,13 @@ func (e *drainLostError) Unwrap() error { return e.Cause }
 // StepDone assistant text. Managed delegation uses drainDelegateAnswer below, where
 // StepDone is progress only and the correlated TurnDone.Message is the exact answer.
 //
-// ctx is the calling turn's context and interrupt is the loop-targeted Interrupt
-// bound to the sub-loop. Submits carry no ctx, so cancelling ctx cannot reach the
-// sub-loop's turn — only an explicit Interrupt can. On ctx.Done() the helper
-// therefore calls interrupt() EXACTLY ONCE (fail-safe) and keeps draining to the
-// sub-loop's TurnInterrupted terminal so the loop does not orphan on ctx-cancel.
+// ctx is the calling turn's context and interrupt is the optional loop-targeted
+// Interrupt bound to the sub-loop. Submits carry no ctx, so cancelling ctx cannot
+// reach the sub-loop's turn — only an explicit Interrupt can on the legacy path.
+// Native managed delegation passes nil: its accepted foldable request must not be
+// retracted or interrupted by caller cancellation. On ctx.Done() the helper calls
+// a non-nil interrupt EXACTLY ONCE (fail-safe) and otherwise returns the typed
+// interrupted result without emitting a control command.
 // This fail-safe relies on the sub-loop honouring the interrupt by producing a
 // terminal (or the subscription closing); a pathologically wedged provider that
 // ignores its turn ctx after the interrupt is a known, pre-existing liveness corner.
@@ -153,13 +155,17 @@ func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid
 				// bound into an unbounded terminal drain when a provider ignores cancel.
 				// The session-owned interrupt path is fire-and-forget; the caller closes
 				// its subscription immediately after this typed terminal is returned.
-				go interrupt()
+				if interrupt != nil {
+					go interrupt()
+				}
 				return "", &drainInterruptedError{}
 			}
 			ctxClosed = true
 			if !fired {
 				fired = true
-				interrupt()
+				if interrupt != nil {
+					interrupt()
+				}
 			}
 		}
 	}
@@ -179,6 +185,18 @@ func handleCorrelatedEvent(
 		// Phase 1: await the opening resolution event for our submit.
 		switch e := ev.(type) {
 		case event.TurnStarted:
+			if e.Cause.CommandID == commandID {
+				*turnID = e.Coordinates.TurnID
+				*loopID = e.Coordinates.LoopID
+				*haveTurn = true
+				if onTurnStarted != nil {
+					onTurnStarted()
+				}
+			}
+		case event.TurnFoldedInto:
+			// A native busy-child MessageAgent request is resolved by a fold
+			// into the already-running turn rather than a new TurnStarted. The
+			// terminal still belongs to this exact (LoopID, TurnID) pair.
 			if e.Cause.CommandID == commandID {
 				*turnID = e.Coordinates.TurnID
 				*loopID = e.Coordinates.LoopID
