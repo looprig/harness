@@ -85,6 +85,9 @@ func ValidateCommand(cmd Command) error {
 				return &CommandValidationError{Command: CommandUserInput, Field: FieldTargetLoopID, Rule: RuleRequired}
 			}
 		}
+		if c.BackgroundHandBack && !c.NoFold && c.DelegateDeliveryPhase == "" {
+			return &CommandValidationError{Command: CommandUserInput, Field: FieldBackgroundHandBack, Rule: RuleInvalid}
+		}
 		return nil
 	case SubagentResult:
 		return validateSubagentResult(c)

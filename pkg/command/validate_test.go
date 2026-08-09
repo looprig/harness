@@ -78,6 +78,66 @@ func TestValidateCommandAcceptsFoldableBackgroundHandBackWithDurablePhase(t *tes
 	}
 }
 
+func TestValidateCommandBackgroundHandBackRequiresNoFoldOrDurablePhase(t *testing.T) {
+	t.Parallel()
+
+	cmdID := newID(t)
+	target := newID(t)
+	tests := []struct {
+		name string
+		cmd  command.UserInput
+	}{
+		{
+			name: "legacy no-fold hand-back",
+			cmd: command.UserInput{
+				Header:             command.Header{CommandID: cmdID, Agency: identity.AgencyMachine},
+				NoFold:             true,
+				TargetLoopID:       target,
+				BackgroundHandBack: true,
+			},
+		},
+		{
+			name: "foldable intent hand-back",
+			cmd: command.UserInput{
+				Header:                command.Header{CommandID: cmdID, Agency: identity.AgencyMachine},
+				TargetLoopID:          target,
+				BackgroundHandBack:    true,
+				DelegateDeliveryPhase: command.DelegateDeliveryPhaseIntent,
+			},
+		},
+		{
+			name: "foldable fallback hand-back",
+			cmd: command.UserInput{
+				Header:                command.Header{CommandID: cmdID, Agency: identity.AgencyMachine},
+				TargetLoopID:          target,
+				BackgroundHandBack:    true,
+				DelegateDeliveryPhase: command.DelegateDeliveryPhaseFallbackQueued,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := command.ValidateCommand(tt.cmd); err != nil {
+				t.Fatalf("ValidateCommand() = %v, want nil", err)
+			}
+		})
+	}
+
+	phaseLess := command.UserInput{
+		Header:             command.Header{CommandID: cmdID, Agency: identity.AgencyMachine},
+		TargetLoopID:       target,
+		BackgroundHandBack: true,
+	}
+	err := command.ValidateCommand(phaseLess)
+	var invalid *command.CommandValidationError
+	if !errors.As(err, &invalid) {
+		t.Fatalf("ValidateCommand() error = %T (%v), want *CommandValidationError", err, err)
+	}
+	if invalid.Field != command.FieldBackgroundHandBack || invalid.Rule != command.RuleInvalid {
+		t.Fatalf("CommandValidationError = %+v, want BackgroundHandBack/invalid", invalid)
+	}
+}
+
 // TestValidateCommandInvalid asserts each forbidden/missing case returns a typed
 // *CommandValidationError naming the offending field + rule. Covers: zero CommandID;
 // SubagentResult missing parent LoopID; CancelQueuedInput missing SessionID, LoopID,

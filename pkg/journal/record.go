@@ -82,14 +82,15 @@ func NewCommandRecord(sessionID, loopID uuid.UUID, cmd command.Command) CommandR
 }
 
 // ValidateCommandRecordRoute validates the command's own identity contract, then
-// cross-checks the duplicated live dispatch route for machine NoFold delegate input.
-// A zero record LoopID is accepted only because storage replay cannot reconstruct it.
+// cross-checks the duplicated live dispatch route for machine NoFold or phased
+// delegate input. A zero record LoopID is accepted only because storage replay
+// cannot reconstruct it.
 func ValidateCommandRecordRoute(record CommandRecord) error {
 	if err := command.ValidateCommand(record.cmd); err != nil {
 		return err
 	}
 	input, ok := record.cmd.(command.UserInput)
-	if !ok || !input.NoFold || input.Agency != identity.AgencyMachine {
+	if !ok || input.Agency != identity.AgencyMachine || (!input.NoFold && input.DelegateDeliveryPhase == "") {
 		return nil
 	}
 	if record.loopID.IsZero() || record.loopID == input.TargetLoopID {

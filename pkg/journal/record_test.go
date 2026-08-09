@@ -121,6 +121,41 @@ func TestValidateCommandRecordRoute(t *testing.T) {
 	}
 }
 
+func TestValidateCommandRecordRouteChecksFoldableDelegatePhases(t *testing.T) {
+	t.Parallel()
+	target, other := fixedUUID(0x65), fixedUUID(0x66)
+	for _, phase := range []command.DelegateDeliveryPhase{
+		command.DelegateDeliveryPhaseIntent,
+		command.DelegateDeliveryPhaseFallbackQueued,
+	} {
+		phase := phase
+		t.Run(string(phase)+" matching", func(t *testing.T) {
+			t.Parallel()
+			cmd := command.UserInput{
+				Header:                command.Header{CommandID: fixedUUID(0x67), Agency: identity.AgencyMachine},
+				TargetLoopID:          target,
+				DelegateDeliveryPhase: phase,
+			}
+			if err := ValidateCommandRecordRoute(NewCommandRecord(fixedUUID(0x68), target, cmd)); err != nil {
+				t.Fatalf("ValidateCommandRecordRoute() = %v, want nil", err)
+			}
+		})
+		t.Run(string(phase)+" mismatching", func(t *testing.T) {
+			t.Parallel()
+			cmd := command.UserInput{
+				Header:                command.Header{CommandID: fixedUUID(0x69), Agency: identity.AgencyMachine},
+				TargetLoopID:          target,
+				DelegateDeliveryPhase: phase,
+			}
+			err := ValidateCommandRecordRoute(NewCommandRecord(fixedUUID(0x6a), other, cmd))
+			var mismatch *CommandRouteMismatchError
+			if !errors.As(err, &mismatch) || mismatch.RecordLoopID != other || mismatch.TargetLoopID != target {
+				t.Fatalf("error = %T %+v, want typed route mismatch", err, err)
+			}
+		})
+	}
+}
+
 // TestJournalRecordSumIsSealed asserts each record variant satisfies the sealed
 // JournalRecord marker (so a serializer's switch over the sum stays exhaustive) and
 // exposes a non-empty idempotency id.

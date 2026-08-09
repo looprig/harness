@@ -22,12 +22,6 @@ const (
 	// that delivered outside the host-owned turn contract. No synthetic turn or
 	// automatic fallback may follow it.
 	DelegateDeliveryResolvedUntrackable DelegateDeliveryState = "resolved_untrackable"
-
-	// State-prefixed aliases keep the event vocabulary discoverable alongside
-	// the type name while the shorter names remain the canonical identifiers.
-	DelegateDeliveryStateSteerAttemptReserved = DelegateDeliverySteerAttemptReserved
-	DelegateDeliveryStateResolvedUnknown      = DelegateDeliveryResolvedUnknown
-	DelegateDeliveryStateResolvedUntrackable  = DelegateDeliveryResolvedUntrackable
 )
 
 // Valid reports whether s is one of the closed durable delivery states.
