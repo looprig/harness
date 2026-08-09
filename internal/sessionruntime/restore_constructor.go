@@ -605,6 +605,11 @@ func restoreTopologySession(
 			tombstoned[plan.started.LoopID] = struct{}{}
 		}
 	}
+	deliveryRepairs, err := persistUnresolvedDelegateDeliveryStates(ctx, j, factory, sessionID, allRecords, all, crashClosures)
+	if err != nil {
+		return abortAccepted(s, &RestoreError{Kind: RestoreAppendFailed, Cause: err})
+	}
+	all = append(all, deliveryRepairs...)
 	if err := seedResolvedDelegateRecords(manager, allRecords, all, crashClosures, tombstoned); err != nil {
 		return abortAccepted(s, &RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}

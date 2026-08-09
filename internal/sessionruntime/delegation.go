@@ -138,6 +138,15 @@ type resolvedRequest struct {
 	text    string
 }
 
+type delegateRestoreContradictionError struct {
+	requestID uuid.UUID
+	reason    string
+}
+
+func (e *delegateRestoreContradictionError) Error() string {
+	return "delegate restore contradiction for " + e.requestID.String() + ": " + e.reason
+}
+
 func newDelegationManager(topology Topology, catalogs ...loop.RuntimeCatalog) *delegationManager {
 	byName := make(map[identity.AgentName]loop.Definition, len(topology.Definitions))
 	for _, def := range topology.Definitions {
@@ -189,6 +198,8 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	combined = append(combined, replayed...)
 	combined = append(combined, closures...)
 	index := make(map[uuid.UUID]resolvedRequest)
+	deliveryUnknown := make(map[uuid.UUID]struct{})
+	deliveryStates := make(map[uuid.UUID]struct{})
 	for _, ev := range combined {
 		var requestID, childID uuid.UUID
 		switch accepted := ev.(type) {
@@ -235,10 +246,25 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 		case event.DelegateDeliverySteerAttemptReserved,
 			event.DelegateDeliveryResolvedUnknown,
 			event.DelegateDeliveryResolvedUntrackable:
+			deliveryStates[state.RequestID] = struct{}{}
 			index[state.RequestID] = resolvedRequest{childID: target, status: tool.DelegateStatusUnknown}
+			deliveryUnknown[state.RequestID] = struct{}{}
 		}
 	}
-	for requestID, terminal := range foldDelegateTerminals(combined) {
+	terminals, err := foldDelegateTerminalsChecked(combined)
+	if err != nil {
+		return err
+	}
+	for requestID, terminal := range terminals {
+		if _, hasDeliveryState := deliveryStates[requestID]; hasDeliveryState {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "delivery state conflicts with turn terminal"}
+		}
+		if _, unknown := deliveryUnknown[requestID]; unknown {
+			continue
+		}
+		if target, admitted := intents[requestID]; admitted && terminal.childID != target {
+			return &journal.CommandRouteMismatchError{RecordLoopID: terminal.childID, TargetLoopID: target}
+		}
 		if _, admitted := index[requestID]; admitted {
 			index[requestID] = terminal
 		}
@@ -258,6 +284,12 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 		}
 		admitted, ok := index[cancelled.Cause.CommandID]
 		if !ok {
+			continue
+		}
+		if _, hasDeliveryState := deliveryStates[cancelled.Cause.CommandID]; hasDeliveryState {
+			return &delegateRestoreContradictionError{requestID: cancelled.Cause.CommandID, reason: "delivery state conflicts with cancellation"}
+		}
+		if _, unknown := deliveryUnknown[cancelled.Cause.CommandID]; unknown {
 			continue
 		}
 		if cancelled.LoopID != admitted.childID {
@@ -303,6 +335,126 @@ func backgroundDelegateIntents(records []journal.JournalRecord) (map[uuid.UUID]u
 		intents[input.CommandID] = input.TargetLoopID
 	}
 	return intents, nil
+}
+
+// persistUnresolvedDelegateDeliveryStates closes a durable foreign/native delivery
+// reservation before RestoreDone. A reservation is deliberately converted to
+// resolved_unknown once: the adapter may have accepted the request, so restore
+// must not steer it again or synthesize a parent completion. Existing unknown or
+// untrackable states are already terminal and are not appended again.
+func persistUnresolvedDelegateDeliveryStates(ctx context.Context, j journal.SessionJournal, factory *event.Factory, sessionID uuid.UUID, records []journal.JournalRecord, replayed, closures []event.Event) ([]event.Event, error) {
+	intents, err := backgroundDelegateIntents(records)
+	if err != nil {
+		return nil, err
+	}
+	combined := make([]event.Event, 0, len(replayed)+len(closures))
+	combined = append(combined, replayed...)
+	combined = append(combined, closures...)
+	if err := validateDelegateRestoreCorrelations(combined, intents); err != nil {
+		return nil, err
+	}
+	states := make(map[uuid.UUID]event.DelegateDeliveryStateChanged)
+	for _, ev := range combined {
+		state, ok := ev.(event.DelegateDeliveryStateChanged)
+		if !ok || state.RequestID.IsZero() {
+			continue
+		}
+		target, admitted := intents[state.RequestID]
+		if !admitted {
+			continue
+		}
+		if state.TargetLoopID != target {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: state.TargetLoopID, TargetLoopID: target}
+		}
+		switch state.State {
+		case event.DelegateDeliverySteerAttemptReserved,
+			event.DelegateDeliveryResolvedUnknown,
+			event.DelegateDeliveryResolvedUntrackable:
+			states[state.RequestID] = state
+		}
+	}
+	requestIDs := make([]uuid.UUID, 0, len(states))
+	for requestID, state := range states {
+		if state.State == event.DelegateDeliverySteerAttemptReserved {
+			requestIDs = append(requestIDs, requestID)
+		}
+	}
+	sort.Slice(requestIDs, func(i, j int) bool { return requestIDs[i].String() < requestIDs[j].String() })
+	repairs := make([]event.Event, 0, len(requestIDs))
+	for _, requestID := range requestIDs {
+		state := states[requestID]
+		repair := event.DelegateDeliveryStateChanged{
+			Header:       event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
+			RequestID:    requestID,
+			TargetLoopID: state.TargetLoopID,
+			State:        event.DelegateDeliveryResolvedUnknown,
+		}
+		header, err := factory.Stamp(repair.EventHeader())
+		if err != nil {
+			return nil, &RestoreError{Kind: RestoreIDGenerationFailed, Cause: err}
+		}
+		repair.Header = header
+		if err := event.ValidateEvent(repair); err != nil {
+			return nil, err
+		}
+		if _, err := j.Append(ctx, journal.NewEventRecord(repair)); err != nil {
+			return nil, err
+		}
+		repairs = append(repairs, repair)
+	}
+	return repairs, nil
+}
+
+// validateDelegateRestoreCorrelations performs the fail-closed checks before a
+// restore repair can append a new delivery-state event. In particular, a repair
+// must never be written first and only then discover that the same request also
+// has an authoritative turn terminal or cancellation.
+func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.UUID]uuid.UUID) error {
+	terminals, err := foldDelegateTerminalsChecked(events)
+	if err != nil {
+		return err
+	}
+	deliveryStates := make(map[uuid.UUID]struct{})
+	cancellations := make(map[uuid.UUID]struct{})
+	for _, ev := range events {
+		switch typed := ev.(type) {
+		case event.DelegateDeliveryStateChanged:
+			if typed.RequestID.IsZero() {
+				continue
+			}
+			target, admitted := intents[typed.RequestID]
+			if !admitted {
+				continue
+			}
+			if typed.TargetLoopID != target {
+				return &journal.CommandRouteMismatchError{RecordLoopID: typed.TargetLoopID, TargetLoopID: target}
+			}
+			switch typed.State {
+			case event.DelegateDeliverySteerAttemptReserved,
+				event.DelegateDeliveryResolvedUnknown,
+				event.DelegateDeliveryResolvedUntrackable:
+				deliveryStates[typed.RequestID] = struct{}{}
+			}
+		case event.InputCancelled:
+			if !typed.Cause.CommandID.IsZero() {
+				cancellations[typed.Cause.CommandID] = struct{}{}
+			}
+		}
+	}
+	for requestID, terminal := range terminals {
+		if _, hasDeliveryState := deliveryStates[requestID]; hasDeliveryState {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "delivery state conflicts with turn terminal"}
+		}
+		if target, admitted := intents[requestID]; admitted && terminal.childID != target {
+			return &journal.CommandRouteMismatchError{RecordLoopID: terminal.childID, TargetLoopID: target}
+		}
+	}
+	for requestID := range cancellations {
+		if _, hasDeliveryState := deliveryStates[requestID]; hasDeliveryState {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "delivery state conflicts with cancellation"}
+		}
+	}
+	return nil
 }
 
 func (m *delegationManager) getResolved(requestID uuid.UUID) (resolvedRequest, bool) {
@@ -531,7 +683,11 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 			requestIDs = append(requestIDs, requestID)
 		}
 	}
-	for requestID := range foldDelegateTerminals(append(append([]event.Event(nil), replayed...), closures...)) {
+	terminals, err := foldDelegateTerminalsChecked(append(append([]event.Event(nil), replayed...), closures...))
+	if err != nil {
+		return nil, err
+	}
+	for requestID := range terminals {
 		requestTerminal[requestID] = struct{}{}
 	}
 	sort.Slice(requestIDs, func(i, j int) bool { return requestIDs[i].String() < requestIDs[j].String() })
@@ -548,6 +704,12 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 			}
 		}
 		if phasedCommand, isPhased := phased[requestID]; isPhased {
+			if _, deliveryState := requestDeliveryState[requestID]; deliveryState {
+				// A foreign/native adapter state is terminal for automatic delivery
+				// recovery. Even resolved_unknown/untrackable must not mint a parent
+				// hand-back or steer the request again.
+				continue
+			}
 			// An opening event is already authoritative. An explicit terminal,
 			// cancellation, or delivery-state event is also final evidence; in
 			// particular, an unresolved reservation is never steered again.
@@ -669,65 +831,125 @@ func (m *delegationManager) readmitRestoredBackgroundRequest(s *Session, entry r
 	}
 }
 
-// foldDelegateTerminals correlates every turn's opening and folded request ids to
-// its terminal (TurnDone answer / TurnFailed / TurnInterrupted). A turn may carry
-// several MessageAgent requests: one TurnStarted command followed by one or more
-// TurnFoldedInto commands. Every request folded into the same exact
-// (LoopID, TurnID) receives the one terminal. InputQueued is deliberately ignored;
-// it is an ephemeral admission hint and does not prove that a request reached a
-// turn. It mirrors the live delegate drain exactly: only TurnDone.Message is an
-// answer; StepDone is progress.
+// foldDelegateTerminals preserves the historical map-only helper for focused live
+// correlation tests. Restore uses foldDelegateTerminalsChecked so contradictory
+// durable histories fail closed instead of silently taking the last write.
 func foldDelegateTerminals(events []event.Event) map[uuid.UUID]resolvedRequest {
+	terminals, _ := foldDelegateTerminalsChecked(events)
+	return terminals
+}
+
+// foldDelegateTerminalsChecked correlates every turn's opening and folded request
+// ids to its terminal (TurnDone answer / TurnFailed / TurnInterrupted). It rejects
+// a request mapped to multiple turns, a turn id routed to multiple loops, and
+// incompatible terminal events. InputQueued is deliberately ignored; it is an
+// ephemeral admission hint and does not prove that a request reached a turn.
+func foldDelegateTerminalsChecked(events []event.Event) (map[uuid.UUID]resolvedRequest, error) {
 	type turnKey struct {
 		loopID uuid.UUID
 		turnID uuid.UUID
 	}
+	type terminalObservation struct {
+		kind string
+		text string
+	}
 	byTurn := make(map[turnKey]map[uuid.UUID]struct{})
-	out := make(map[uuid.UUID]resolvedRequest)
-	addRequest := func(key turnKey, requestID uuid.UUID) {
-		if requestID.IsZero() {
-			return
+	requestTurns := make(map[uuid.UUID]turnKey)
+	turnOwners := make(map[uuid.UUID]uuid.UUID)
+	terminalOwners := make(map[uuid.UUID]uuid.UUID)
+	terminals := make(map[turnKey]terminalObservation)
+	addOpening := func(key turnKey, requestID uuid.UUID) error {
+		if priorLoop, exists := turnOwners[key.turnID]; exists && priorLoop != key.loopID {
+			return &journal.CommandRouteMismatchError{RecordLoopID: key.loopID, TargetLoopID: priorLoop}
+		}
+		if priorLoop, exists := terminalOwners[key.turnID]; exists && priorLoop != key.loopID {
+			return &journal.CommandRouteMismatchError{RecordLoopID: key.loopID, TargetLoopID: priorLoop}
+		}
+		turnOwners[key.turnID] = key.loopID
+		if !requestID.IsZero() {
+			if prior, exists := requestTurns[requestID]; exists && prior != key {
+				return &delegateRestoreContradictionError{requestID: requestID, reason: "request belongs to multiple turns"}
+			}
+			requestTurns[requestID] = key
 		}
 		requests := byTurn[key]
 		if requests == nil {
 			requests = make(map[uuid.UUID]struct{})
 			byTurn[key] = requests
 		}
-		requests[requestID] = struct{}{}
-	}
-	forEachRequest := func(key turnKey, fn func(uuid.UUID)) {
-		for requestID := range byTurn[key] {
-			fn(requestID)
+		if !requestID.IsZero() {
+			requests[requestID] = struct{}{}
 		}
+		return nil
+	}
+	observeTerminal := func(key turnKey, observation terminalObservation) error {
+		if priorLoop, exists := turnOwners[key.turnID]; exists && priorLoop != key.loopID {
+			return &journal.CommandRouteMismatchError{RecordLoopID: key.loopID, TargetLoopID: priorLoop}
+		}
+		if priorLoop, exists := terminalOwners[key.turnID]; exists && priorLoop != key.loopID {
+			return &journal.CommandRouteMismatchError{RecordLoopID: key.loopID, TargetLoopID: priorLoop}
+		}
+		terminalOwners[key.turnID] = key.loopID
+		if prior, exists := terminals[key]; exists && prior != observation {
+			for requestID := range byTurn[key] {
+				return &delegateRestoreContradictionError{requestID: requestID, reason: "turn has incompatible terminal events"}
+			}
+			return &delegateRestoreContradictionError{reason: "turn has incompatible terminal events"}
+		}
+		terminals[key] = observation
+		return nil
 	}
 	for _, ev := range events {
 		switch e := ev.(type) {
 		case event.TurnStarted:
 			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
-			addRequest(key, e.Cause.CommandID)
+			if err := addOpening(key, e.Cause.CommandID); err != nil {
+				return nil, err
+			}
 		case event.TurnFoldedInto:
 			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
-			addRequest(key, e.Cause.CommandID)
+			if err := addOpening(key, e.Cause.CommandID); err != nil {
+				return nil, err
+			}
 		case event.TurnDone:
 			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
-			text := aiText(e.Message)
-			forEachRequest(key, func(requestID uuid.UUID) {
-				out[requestID] = resolvedRequest{childID: e.Coordinates.LoopID, status: tool.DelegateStatusCompleted, text: text}
-			})
+			if err := observeTerminal(key, terminalObservation{kind: "done", text: aiText(e.Message)}); err != nil {
+				return nil, err
+			}
 		case event.TurnFailed:
 			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
-			text := delegateFailureDetail(e.Err)
-			forEachRequest(key, func(requestID uuid.UUID) {
-				out[requestID] = resolvedRequest{childID: e.Coordinates.LoopID, status: tool.DelegateStatusFailed, text: text}
-			})
+			if err := observeTerminal(key, terminalObservation{kind: "failed", text: delegateFailureDetail(e.Err)}); err != nil {
+				return nil, err
+			}
 		case event.TurnInterrupted:
 			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
-			forEachRequest(key, func(requestID uuid.UUID) {
-				out[requestID] = resolvedRequest{childID: e.Coordinates.LoopID, status: tool.DelegateStatusInterrupted}
-			})
+			if err := observeTerminal(key, terminalObservation{kind: "interrupted"}); err != nil {
+				return nil, err
+			}
 		}
 	}
-	return out
+	out := make(map[uuid.UUID]resolvedRequest)
+	for key, requests := range byTurn {
+		terminal, ok := terminals[key]
+		if !ok {
+			continue
+		}
+		for requestID := range requests {
+			resolved := resolvedRequest{childID: key.loopID}
+			switch terminal.kind {
+			case "done":
+				resolved.status = tool.DelegateStatusCompleted
+				resolved.text = terminal.text
+			case "failed":
+				resolved.status = tool.DelegateStatusFailed
+				resolved.text = terminal.text
+			case "interrupted":
+				resolved.status = tool.DelegateStatusInterrupted
+			}
+			out[requestID] = resolved
+		}
+	}
+	return out, nil
 }
 
 // attach binds the live session so scoped controllers can spawn and address children.
@@ -808,6 +1030,7 @@ type requestTracker struct {
 
 	mu        sync.Mutex
 	lifecycle requestLifecycle
+	opening   tool.DelegateDeliveryStatus
 }
 
 type requestLifecycle uint8
@@ -824,6 +1047,26 @@ func (p *requestTracker) markActive() {
 		p.lifecycle = requestActive
 	}
 	p.mu.Unlock()
+}
+
+func (p *requestTracker) markOpening(status tool.DelegateDeliveryStatus) {
+	if status != tool.DelegateDeliveryQueued && status != tool.DelegateDeliveryInjected {
+		return
+	}
+	p.mu.Lock()
+	if p.opening == "" {
+		p.opening = status
+	}
+	if p.lifecycle == requestQueued {
+		p.lifecycle = requestActive
+	}
+	p.mu.Unlock()
+}
+
+func (p *requestTracker) openingStatus() tool.DelegateDeliveryStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.opening
 }
 
 func (p *requestTracker) markTerminal() {
@@ -898,7 +1141,7 @@ func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.U
 				_, _ = s.cancelDelegateRequest(childID, requestID)
 			}
 		}
-		text, err := drainDelegateAnswerObserved(waitCtx, sub, requestID, interrupt, tracked.markActive)
+		text, err := drainDelegateAnswerObservedWithDisposition(waitCtx, sub, requestID, interrupt, tracked.markOpening)
 		status := statusFromDrain(err)
 		if status == tool.DelegateStatusInterrupted && didTimeout(timeoutSeconds, waitCtx) {
 			status = tool.DelegateStatusTimedOut
@@ -907,7 +1150,13 @@ func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.U
 			text = delegateFailureDetail(err)
 		}
 		tracked.markTerminal()
-		if err := s.deliverSubagentResult(s.sessionCtx, parentID, childID, backgroundCompletionBlocks(childID, name, requestID, status, text)); err != nil {
+		var blocks []content.Block
+		if suppressInterrupt {
+			blocks = backgroundCompletionBlocks(childID, name, requestID, status, text, tracked.openingStatus())
+		} else {
+			blocks = backgroundCompletionBlocks(childID, name, requestID, status, text)
+		}
+		if err := s.deliverSubagentResult(s.sessionCtx, parentID, childID, blocks); err != nil {
 			// No parent event can release the hand-back token when dispatch itself is
 			// impossible (session shutdown, parent exit, or command-id failure).
 			s.cancelExpectTurn(context.Background(), childID)
@@ -1368,7 +1617,13 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 				_, _ = s.cancelDelegateRequest(childID, requestID)
 			}
 		}
-		text, err := drainDelegateAnswerObserved(waitCtx, sub, requestID, interrupt, tracked.markActive)
+		var text string
+		var err error
+		if nativeMessage {
+			text, err = drainDelegateAnswerObservedWithDisposition(waitCtx, sub, requestID, interrupt, tracked.markOpening)
+		} else {
+			text, err = drainDelegateAnswerObserved(waitCtx, sub, requestID, interrupt, tracked.markActive)
+		}
 		status := statusFromDrain(err)
 		if status == tool.DelegateStatusInterrupted && didTimeout(req.TimeoutSeconds, waitCtx) {
 			status = tool.DelegateStatusTimedOut
@@ -1378,6 +1633,9 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 		}
 		tracked.markTerminal()
 		result := c.responseResult(s, childID, requestID, status, text)
+		if nativeMessage {
+			result.DeliveryStatus = tracked.openingStatus()
+		}
 		if req.Name != "" {
 			result.Name = req.Name
 		}
@@ -1404,6 +1662,7 @@ type backgroundCompletionEnvelope struct {
 	AgentID        string                      `json:"agent_id"`
 	Name           string                      `json:"name"`
 	State          tool.AgentState             `json:"state"`
+	DeliveryStatus tool.DelegateDeliveryStatus `json:"delivery_status,omitempty"`
 	ResponseStatus tool.DelegateResponseStatus `json:"response_status"`
 	CorrelationID  string                      `json:"correlation_id"`
 	Response       string                      `json:"response"`
@@ -1428,9 +1687,13 @@ func decodeBackgroundCompletion(blocks []content.Block) (backgroundCompletionEnv
 // delivered to a parent. Correlation stays internal to durable orchestration: agent
 // tools never expose or accept it, while the persisted SubagentResult blocks retain it
 // for restore-time idempotence.
-func backgroundCompletionBlocks(agentID uuid.UUID, name string, correlationID uuid.UUID, status tool.DelegateStatusValue, response string) []content.Block {
+func backgroundCompletionBlocks(agentID uuid.UUID, name string, correlationID uuid.UUID, status tool.DelegateStatusValue, response string, deliveryStatus ...tool.DelegateDeliveryStatus) []content.Block {
+	var disposition tool.DelegateDeliveryStatus
+	if len(deliveryStatus) > 0 {
+		disposition = deliveryStatus[0]
+	}
 	envelope := backgroundCompletionEnvelope{
-		AgentID: agentID.String(), Name: boundUTF8(name, 4096), State: tool.AgentStateIdle,
+		AgentID: agentID.String(), Name: boundUTF8(name, 4096), State: tool.AgentStateIdle, DeliveryStatus: disposition,
 		ResponseStatus: responseStatus(status), CorrelationID: correlationID.String(),
 	}
 	response = boundUTF8(response, maxDelegateOutputBytes)
@@ -1801,7 +2064,7 @@ func (s *Session) sendDelegate(ctx context.Context, childID uuid.UUID, message s
 	}
 	wakeOwned := background
 	if background {
-		s.expectTurn(ctx, childID)
+		s.expectTurn(s.sessionCtx, childID)
 		defer func() {
 			if wakeOwned {
 				s.cancelExpectTurn(context.Background(), childID)
@@ -1859,11 +2122,18 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 		BackgroundHandBack: background,
 		Accepted:           accepted,
 	}
-	if native && background {
+	if native {
 		cmd.DelegateDeliveryPhase = command.DelegateDeliveryPhaseIntent
 	}
 	if err := s.appendDelegateCommand(ctx, loopID, cmd); err != nil {
 		return uuid.UUID{}, nil, err
+	}
+	deliveryCtx := ctx
+	if native {
+		// Once the intent record is durable, native MessageAgent delivery belongs to
+		// the session, not the caller's observation context. The caller may stop
+		// waiting, but it cannot retract a command whose delivery is in flight.
+		deliveryCtx = s.sessionCtx
 	}
 	tracked = registerRequest(id, loopID)
 	registered := tracked
@@ -1877,9 +2147,9 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 	case backend.CommandSink() <- cmd:
 		var canceled bool
 		if native {
-			canceled, err = awaitNativeDelegateAcceptance(ctx, accepted, backend.DoneChan())
+			canceled, err = awaitNativeDelegateAcceptance(deliveryCtx, accepted, backend.DoneChan())
 		} else {
-			canceled, err = awaitDelegateAcceptance(ctx, accepted, backend.DoneChan())
+			canceled, err = awaitDelegateAcceptance(deliveryCtx, accepted, backend.DoneChan())
 		}
 		if err != nil {
 			return uuid.UUID{}, nil, err
@@ -1893,8 +2163,8 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 			_, _ = s.cancelDelegateRequest(loopID, id)
 		}
 		return id, tracked, nil
-	case <-ctx.Done():
-		return uuid.UUID{}, nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	case <-deliveryCtx.Done():
+		return uuid.UUID{}, nil, &SessionError{Kind: SessionContextDone, Cause: deliveryCtx.Err()}
 	case <-backend.DoneChan():
 		return uuid.UUID{}, nil, &SessionError{Kind: SessionLoopExited}
 	}

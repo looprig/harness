@@ -168,6 +168,16 @@ func TestMessageAgentNativeBusyNonWaitingReturnsAcceptedPendingAndDurableHandbac
 	if !ok || completion.CorrelationID != cmd.CommandID.String() || completion.Response != "native answer" {
 		t.Fatalf("durable hand-back envelope = %+v, %v; want request=%v answer=native answer", completion, ok, cmd.CommandID)
 	}
+	var delivery struct {
+		DeliveryStatus string `json:"delivery_status"`
+	}
+	block, ok := handBack.Blocks[0].(*content.TextBlock)
+	if !ok || json.Unmarshal([]byte(block.Text), &delivery) != nil {
+		t.Fatalf("durable hand-back delivery envelope = %#v, want JSON", handBack.Blocks)
+	}
+	if delivery.DeliveryStatus != string(tool.DelegateDeliveryQueued) {
+		t.Fatalf("TurnStarted background delivery_status = %q, want %q", delivery.DeliveryStatus, tool.DelegateDeliveryQueued)
+	}
 	var got struct {
 		DeliveryStatus string `json:"delivery_status"`
 	}
@@ -176,6 +186,228 @@ func TestMessageAgentNativeBusyNonWaitingReturnsAcceptedPendingAndDurableHandbac
 	}
 	if got.DeliveryStatus != string(tool.DelegateDeliveryAcceptedPending) {
 		t.Fatalf("MessageAgent non-waiting delivery_status = %q, want %q", got.DeliveryStatus, tool.DelegateDeliveryAcceptedPending)
+	}
+}
+
+func TestMessageAgentNativeForegroundIntentIsDurableAndPhased(t *testing.T) {
+	fixture := newNativeMessageAgentFixture(t)
+	messageAgent := delegationtool.NewMessageAgent(fixture.controller, loop.DelegationManaged, nil)
+	args := `{"agent_id":"` + fixture.childID.String() + `","message":"foreground","wait_for_response":true}`
+	request, artifact, err := messageAgent.PrepareCall(context.Background(), mustUUID(), args)
+	if err != nil {
+		t.Fatalf("MessageAgent PrepareCall: %v", err)
+	}
+	resultCh := make(chan struct {
+		result *tool.ToolResult
+		err    error
+	}, 1)
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{Request: request, Artifact: artifact})
+	go func() {
+		result, runErr := messageAgent.InvokableRun(ctx, args)
+		resultCh <- struct {
+			result *tool.ToolResult
+			err    error
+		}{result: result, err: runErr}
+	}()
+
+	cmd, ok := (<-fixture.child.Commands).(command.UserInput)
+	if !ok {
+		t.Fatalf("native foreground MessageAgent command = %T, want command.UserInput", cmd)
+	}
+	initial := fixture.appender.snapshot()
+	if len(initial) != 1 {
+		t.Fatalf("foreground durable intent records = %d, want 1 before acceptance", len(initial))
+	}
+	intent, ok := initial[0].Command().(command.UserInput)
+	if !ok {
+		t.Fatalf("foreground durable intent = %T, want command.UserInput", initial[0].Command())
+	}
+	if intent.CommandID != cmd.CommandID {
+		t.Fatalf("foreground durable intent id = %v, want dispatched id %v", intent.CommandID, cmd.CommandID)
+	}
+	if intent.DelegateDeliveryPhase != command.DelegateDeliveryPhaseIntent {
+		t.Fatalf("foreground native delivery phase = %q, want %q", intent.DelegateDeliveryPhase, command.DelegateDeliveryPhaseIntent)
+	}
+
+	cmd.Accepted <- nil
+	turnID := mustUUID()
+	fixture.sub.feed(event.TurnStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{LoopID: fixture.childID, TurnID: turnID},
+		Cause:       identity.Cause{CommandID: cmd.CommandID},
+	}})
+	fixture.sub.feed(event.TurnDone{Header: event.Header{
+		Coordinates: identity.Coordinates{LoopID: fixture.childID, TurnID: turnID},
+	}, Message: aiMessage("foreground answer")})
+	call := <-resultCh
+	if call.err != nil {
+		t.Fatalf("MessageAgent foreground InvokableRun: %v", call.err)
+	}
+	var got struct {
+		DeliveryStatus string `json:"delivery_status"`
+	}
+	if err := json.Unmarshal([]byte(messageAgentText(t, call.result)), &got); err != nil {
+		t.Fatalf("foreground MessageAgent result JSON: %v", err)
+	}
+	if got.DeliveryStatus != string(tool.DelegateDeliveryQueued) {
+		t.Fatalf("foreground TurnStarted delivery_status = %q, want %q", got.DeliveryStatus, tool.DelegateDeliveryQueued)
+	}
+}
+
+func TestMessageAgentNativeForegroundFoldedReportsInjectedDisposition(t *testing.T) {
+	fixture := newNativeMessageAgentFixture(t)
+	messageAgent := delegationtool.NewMessageAgent(fixture.controller, loop.DelegationManaged, nil)
+	args := `{"agent_id":"` + fixture.childID.String() + `","message":"folded foreground","wait_for_response":true}`
+	request, artifact, err := messageAgent.PrepareCall(context.Background(), mustUUID(), args)
+	if err != nil {
+		t.Fatalf("MessageAgent PrepareCall: %v", err)
+	}
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{Request: request, Artifact: artifact})
+	resultCh := make(chan struct {
+		result *tool.ToolResult
+		err    error
+	}, 1)
+	go func() {
+		result, runErr := messageAgent.InvokableRun(ctx, args)
+		resultCh <- struct {
+			result *tool.ToolResult
+			err    error
+		}{result: result, err: runErr}
+	}()
+
+	cmd, ok := (<-fixture.child.Commands).(command.UserInput)
+	if !ok {
+		t.Fatalf("native folded foreground command = %T, want command.UserInput", cmd)
+	}
+	cmd.Accepted <- nil
+	turnID := mustUUID()
+	fixture.sub.feed(event.TurnFoldedInto{Header: event.Header{
+		Coordinates: identity.Coordinates{LoopID: fixture.childID, TurnID: turnID},
+		Cause:       identity.Cause{CommandID: cmd.CommandID},
+	}})
+	fixture.sub.feed(event.TurnDone{Header: event.Header{
+		Coordinates: identity.Coordinates{LoopID: fixture.childID, TurnID: turnID},
+	}, Message: aiMessage("folded foreground answer")})
+	call := <-resultCh
+	if call.err != nil {
+		t.Fatalf("MessageAgent folded foreground InvokableRun: %v", call.err)
+	}
+	var got struct {
+		DeliveryStatus string `json:"delivery_status"`
+	}
+	if err := json.Unmarshal([]byte(messageAgentText(t, call.result)), &got); err != nil {
+		t.Fatalf("folded foreground MessageAgent result JSON: %v", err)
+	}
+	if got.DeliveryStatus != string(tool.DelegateDeliveryInjected) {
+		t.Fatalf("foreground TurnFoldedInto delivery_status = %q, want %q", got.DeliveryStatus, tool.DelegateDeliveryInjected)
+	}
+}
+
+func TestMessageAgentNativeForegroundTimeoutRetainsQueuedDisposition(t *testing.T) {
+	fixture := newNativeMessageAgentFixture(t)
+	messageAgent := delegationtool.NewMessageAgent(fixture.controller, loop.DelegationManaged, nil)
+	args := `{"agent_id":"` + fixture.childID.String() + `","message":"timeout foreground","wait_for_response":true,"timeout_seconds":1}`
+	request, artifact, err := messageAgent.PrepareCall(context.Background(), mustUUID(), args)
+	if err != nil {
+		t.Fatalf("MessageAgent PrepareCall: %v", err)
+	}
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{Request: request, Artifact: artifact})
+	resultCh := make(chan struct {
+		result *tool.ToolResult
+		err    error
+	}, 1)
+	go func() {
+		result, runErr := messageAgent.InvokableRun(ctx, args)
+		resultCh <- struct {
+			result *tool.ToolResult
+			err    error
+		}{result: result, err: runErr}
+	}()
+
+	cmd, ok := (<-fixture.child.Commands).(command.UserInput)
+	if !ok {
+		t.Fatalf("native timeout foreground command = %T, want command.UserInput", cmd)
+	}
+	cmd.Accepted <- nil
+	turnID := mustUUID()
+	fixture.sub.feed(event.TurnStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{LoopID: fixture.childID, TurnID: turnID},
+		Cause:       identity.Cause{CommandID: cmd.CommandID},
+	}})
+	select {
+	case call := <-resultCh:
+		if call.err != nil {
+			t.Fatalf("MessageAgent timeout foreground InvokableRun: %v", call.err)
+		}
+		var got struct {
+			DeliveryStatus string `json:"delivery_status"`
+			ResponseStatus string `json:"response_status"`
+		}
+		if err := json.Unmarshal([]byte(messageAgentText(t, call.result)), &got); err != nil {
+			t.Fatalf("timeout foreground MessageAgent result JSON: %v", err)
+		}
+		if got.DeliveryStatus != string(tool.DelegateDeliveryQueued) || got.ResponseStatus != "timed_out" {
+			t.Fatalf("timeout foreground result = %+v, want queued/timed_out", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout foreground MessageAgent did not return")
+	}
+}
+
+func TestMessageAgentNativeBackgroundFoldedHandbackRetainsInjectedDisposition(t *testing.T) {
+	fixture := newNativeMessageAgentFixture(t)
+	messageAgent := delegationtool.NewMessageAgent(fixture.controller, loop.DelegationManaged, nil)
+	args := `{"agent_id":"` + fixture.childID.String() + `","message":"folded background","wait_for_response":false}`
+	request, artifact, err := messageAgent.PrepareCall(context.Background(), mustUUID(), args)
+	if err != nil {
+		t.Fatalf("MessageAgent PrepareCall: %v", err)
+	}
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{Request: request, Artifact: artifact})
+	resultCh := make(chan struct {
+		result *tool.ToolResult
+		err    error
+	}, 1)
+	go func() {
+		result, runErr := messageAgent.InvokableRun(ctx, args)
+		resultCh <- struct {
+			result *tool.ToolResult
+			err    error
+		}{result: result, err: runErr}
+	}()
+
+	cmd, ok := (<-fixture.child.Commands).(command.UserInput)
+	if !ok {
+		t.Fatalf("native folded background command = %T, want command.UserInput", cmd)
+	}
+	cmd.Accepted <- nil
+	call := <-resultCh
+	if call.err != nil {
+		t.Fatalf("MessageAgent folded background InvokableRun: %v", call.err)
+	}
+	turnID := mustUUID()
+	fixture.sub.feed(event.TurnFoldedInto{Header: event.Header{
+		Coordinates: identity.Coordinates{LoopID: fixture.childID, TurnID: turnID},
+		Cause:       identity.Cause{CommandID: cmd.CommandID},
+	}})
+	fixture.sub.feed(event.TurnDone{Header: event.Header{
+		Coordinates: identity.Coordinates{LoopID: fixture.childID, TurnID: turnID},
+	}, Message: aiMessage("folded background answer")})
+
+	deadline := time.Now().Add(time.Second)
+	var records []journal.CommandRecord
+	for len(records) < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+		records = fixture.appender.snapshot()
+	}
+	if len(records) < 2 {
+		t.Fatalf("folded background records = %d, want intent plus hand-back", len(records))
+	}
+	handBack, ok := records[1].Command().(command.SubagentResult)
+	if !ok {
+		t.Fatalf("folded background hand-back = %T, want command.SubagentResult", records[1].Command())
+	}
+	completion, ok := decodeBackgroundCompletion(handBack.Blocks)
+	if !ok || completion.Response != "folded background answer" || completion.DeliveryStatus != tool.DelegateDeliveryInjected {
+		t.Fatalf("folded background completion = %+v, %v; want injected answer", completion, ok)
 	}
 }
 
@@ -224,6 +456,98 @@ func TestMessageAgentCallerCancellationAfterAcceptanceEmitsNoRetraction(t *testi
 		}
 		if _, retract := record.Command().(command.CancelQueuedInput); retract {
 			t.Fatal("caller cancellation after acceptance persisted CancelQueuedInput")
+		}
+	}
+}
+
+func TestMessageAgentCallerCancellationAfterIntentBeforeDispatchStillDelivers(t *testing.T) {
+	fixture := newNativeMessageAgentFixture(t)
+	fixture.child.Commands = make(chan command.Command)
+	messageAgent := delegationtool.NewMessageAgent(fixture.controller, loop.DelegationManaged, nil)
+	args := `{"agent_id":"` + fixture.childID.String() + `","message":"cancel before send","wait_for_response":true}`
+	request, artifact, err := messageAgent.PrepareCall(context.Background(), mustUUID(), args)
+	if err != nil {
+		t.Fatalf("MessageAgent PrepareCall: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	prepared := loop.WithPreparedCall(ctx, tool.PreparedCall{Request: request, Artifact: artifact})
+	resultCh := make(chan error, 1)
+	go func() {
+		_, runErr := messageAgent.InvokableRun(prepared, args)
+		resultCh <- runErr
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for len(fixture.appender.snapshot()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(fixture.appender.snapshot()) != 1 {
+		t.Fatal("durable intent was not appended before cancellation")
+	}
+	cancel()
+	select {
+	case raw := <-fixture.child.Commands:
+		cmd, ok := raw.(command.UserInput)
+		if !ok {
+			t.Fatalf("delivered command = %T, want command.UserInput", raw)
+		}
+		cmd.Accepted <- nil
+	case <-time.After(time.Second):
+		t.Fatal("caller cancellation after intent prevented eventual delivery")
+	}
+	select {
+	case <-resultCh:
+	case <-time.After(time.Second):
+		t.Fatal("MessageAgent did not finish after eventual delivery")
+	}
+	for _, record := range fixture.appender.snapshot() {
+		switch record.Command().(type) {
+		case command.CancelDelegateRequest, command.CancelQueuedInput:
+			t.Fatalf("caller cancellation emitted control command %T", record.Command())
+		}
+	}
+}
+
+func TestMessageAgentCallerCancellationAfterDispatchBeforeAcceptanceDoesNotRetract(t *testing.T) {
+	fixture := newNativeMessageAgentFixture(t)
+	messageAgent := delegationtool.NewMessageAgent(fixture.controller, loop.DelegationManaged, nil)
+	args := `{"agent_id":"` + fixture.childID.String() + `","message":"cancel before ack","wait_for_response":true}`
+	request, artifact, err := messageAgent.PrepareCall(context.Background(), mustUUID(), args)
+	if err != nil {
+		t.Fatalf("MessageAgent PrepareCall: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	prepared := loop.WithPreparedCall(ctx, tool.PreparedCall{Request: request, Artifact: artifact})
+	resultCh := make(chan error, 1)
+	go func() {
+		_, runErr := messageAgent.InvokableRun(prepared, args)
+		resultCh <- runErr
+	}()
+
+	raw := <-fixture.child.Commands
+	cmd, ok := raw.(command.UserInput)
+	if !ok {
+		t.Fatalf("delivered command = %T, want command.UserInput", raw)
+	}
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+	cmd.Accepted <- nil
+	select {
+	case <-resultCh:
+	case <-time.After(time.Second):
+		t.Fatal("MessageAgent did not finish after post-dispatch cancellation")
+	}
+	select {
+	case extra := <-fixture.child.Commands:
+		if extra != nil {
+			t.Fatalf("post-dispatch cancellation emitted %T (%+v)", extra, extra)
+		}
+	case <-time.After(100 * time.Millisecond):
+	}
+	for _, record := range fixture.appender.snapshot() {
+		switch record.Command().(type) {
+		case command.CancelDelegateRequest, command.CancelQueuedInput:
+			t.Fatalf("post-dispatch cancellation persisted control command %T", record.Command())
 		}
 	}
 }

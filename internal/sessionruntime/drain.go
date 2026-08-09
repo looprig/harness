@@ -7,6 +7,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 const maxDelegateOutputBytes = 256 << 10
@@ -110,10 +111,18 @@ func drainDelegateAnswer(ctx context.Context, sub event.Subscription, commandID 
 // drainDelegateAnswerObserved reports when the correlated request leaves the child queue
 // and opens a turn. Managed foreground and background drains use the same lifecycle edge.
 func drainDelegateAnswerObserved(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt, onTurnStarted func()) (string, error) {
-	return drainCorrelated(ctx, sub, commandID, interrupt, false, onTurnStarted)
+	var onOpening func(tool.DelegateDeliveryStatus)
+	if onTurnStarted != nil {
+		onOpening = func(tool.DelegateDeliveryStatus) { onTurnStarted() }
+	}
+	return drainDelegateAnswerObservedWithDisposition(ctx, sub, commandID, interrupt, onOpening)
 }
 
-func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func(), stepFallback bool, onTurnStarted func()) (string, error) {
+func drainDelegateAnswerObservedWithDisposition(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func(), onOpening func(tool.DelegateDeliveryStatus)) (string, error) {
+	return drainCorrelated(ctx, sub, commandID, interrupt, false, onOpening)
+}
+
+func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func(), stepFallback bool, onOpening func(tool.DelegateDeliveryStatus)) (string, error) {
 	var (
 		turnID    uuid.UUID // captured from the opening TurnStarted (phase-1 -> phase-2 edge)
 		loopID    uuid.UUID // captured alongside turnID; phase-2 cross-checks it (fail-secure)
@@ -132,7 +141,7 @@ func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid
 			if !ok {
 				return "", &drainLostError{Cause: sub.Err()}
 			}
-			if text, done, err := handleCorrelatedEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep, stepFallback, onTurnStarted); done {
+			if text, done, err := handleCorrelatedEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep, stepFallback, onOpening); done {
 				return text, err
 			}
 			continue
@@ -143,7 +152,7 @@ func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid
 			if !ok {
 				return "", &drainLostError{Cause: sub.Err()}
 			}
-			if text, done, err := handleCorrelatedEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep, stepFallback, onTurnStarted); done {
+			if text, done, err := handleCorrelatedEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep, stepFallback, onOpening); done {
 				return text, err
 			}
 		case <-ctx.Done():
@@ -179,7 +188,7 @@ func handleCorrelatedEvent(
 	haveTurn *bool,
 	lastStep *string,
 	stepFallback bool,
-	onTurnStarted func(),
+	onOpening func(tool.DelegateDeliveryStatus),
 ) (text string, done bool, err error) {
 	if !*haveTurn {
 		// Phase 1: await the opening resolution event for our submit.
@@ -189,8 +198,8 @@ func handleCorrelatedEvent(
 				*turnID = e.Coordinates.TurnID
 				*loopID = e.Coordinates.LoopID
 				*haveTurn = true
-				if onTurnStarted != nil {
-					onTurnStarted()
+				if onOpening != nil {
+					onOpening(tool.DelegateDeliveryQueued)
 				}
 			}
 		case event.TurnFoldedInto:
@@ -201,8 +210,8 @@ func handleCorrelatedEvent(
 				*turnID = e.Coordinates.TurnID
 				*loopID = e.Coordinates.LoopID
 				*haveTurn = true
-				if onTurnStarted != nil {
-					onTurnStarted()
+				if onOpening != nil {
+					onOpening(tool.DelegateDeliveryInjected)
 				}
 			}
 		case event.TurnRejected:

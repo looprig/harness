@@ -1,16 +1,35 @@
 package sessionruntime
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 
+	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
 )
+
+// restoreBlockedBackend keeps the real actor's DoneChan while diverting the
+// session routing path into a buffered sink the actor never reads. This leaves
+// the durable native intent and reservation unresolved without manufacturing a
+// TurnStarted/TurnInterrupted pair during the crash barrier.
+type restoreBlockedBackend struct {
+	commands chan command.Command
+	done     <-chan struct{}
+}
+
+func (b *restoreBlockedBackend) CommandSink() chan<- command.Command { return b.commands }
+func (b *restoreBlockedBackend) DoneChan() <-chan struct{}           { return b.done }
+func (b *restoreBlockedBackend) Snapshot(context.Context) (content.AgenticMessages, event.TurnIndex, error) {
+	return nil, 0, nil
+}
 
 func phasedBackgroundCommand(requestID, childID uuid.UUID, phase command.DelegateDeliveryPhase) command.UserInput {
 	return command.UserInput{
@@ -174,13 +193,237 @@ func TestMessageAgentRestoreReservationNeverReadmits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planRestoredBackgroundRequests: %v", err)
 	}
-	if len(plan) != 1 {
-		t.Fatalf("unknown delivery plan = %+v, want one durable unknown hand-back", plan)
+	if len(plan) != 0 {
+		t.Fatalf("unknown delivery plan = %+v, want no delivery action or terminal hand-back", plan)
 	}
-	if plan[0].reAdmit != nil {
-		t.Fatalf("unknown delivery was scheduled for steer: %+v", plan[0].reAdmit)
+}
+
+func TestMessageAgentRestorePersistsUnknownReservationIdempotentlyWithoutHandback(t *testing.T) {
+	parentLLM := newControlledAgentLLM()
+	childLLM := newControlledAgentLLM()
+	lifecycle, session, _ := newAgentRestoreLifecycle(t, newRestoreStore(t), parentLLM, childLLM, nil)
+	controller := session.delegation.controllerFor(session.ActiveLoopID(), backgroundNode("parent", parentLLM, "child"))
+	startCh := make(chan struct {
+		result tool.DelegateResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := controller.Execute(delegateCtx(t), tool.DelegateRequest{
+			Operation: tool.DelegateStart, AgentType: "child", Message: "start", WaitForResponse: true,
+		})
+		startCh <- struct {
+			result tool.DelegateResult
+			err    error
+		}{result: result, err: err}
+	}()
+	<-childLLM.started
+	childLLM.release <- struct{}{}
+	started := <-startCh
+	if started.err != nil {
+		t.Fatalf("initial child start: %v", started.err)
 	}
-	if plan[0].resolved.childID != childID || plan[0].resolved.status != tool.DelegateStatusUnknown {
-		t.Fatalf("unknown delivery plan resolution = %+v, want child=%v status=%v", plan[0].resolved, childID, tool.DelegateStatusUnknown)
+	session.loopsMu.Lock()
+	childHandle := session.loops[started.result.AgentID]
+	if childHandle == nil || childHandle.backend == nil {
+		session.loopsMu.Unlock()
+		t.Fatalf("initial child %v has no backend", started.result.AgentID)
+	}
+	blockedBackend := &restoreBlockedBackend{
+		commands: make(chan command.Command, 1),
+		done:     childHandle.backend.DoneChan(),
+	}
+	childHandle.backend = blockedBackend
+	session.loopsMu.Unlock()
+	sendCh := make(chan struct {
+		result tool.DelegateResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := controller.Execute(delegateCtx(t), tool.DelegateRequest{
+			Operation: tool.DelegateSend, AgentID: started.result.AgentID, Message: "ambiguous", WaitForResponse: false,
+		})
+		sendCh <- struct {
+			result tool.DelegateResult
+			err    error
+		}{result: result, err: err}
+	}()
+	dispatched, ok := (<-blockedBackend.commands).(command.UserInput)
+	if !ok {
+		t.Fatalf("native background command = %T, want command.UserInput", dispatched)
+	}
+	dispatched.Accepted <- nil
+	sentResult := <-sendCh
+	sent, err := sentResult.result, sentResult.err
+	if err != nil {
+		t.Fatalf("native background send: %v", err)
+	}
+	reservation := event.DelegateDeliveryStateChanged{
+		Header:    event.Header{Coordinates: identity.Coordinates{SessionID: session.SessionID()}, EventID: mustUUID()},
+		RequestID: sent.CorrelationID, TargetLoopID: sent.AgentID, State: event.DelegateDeliverySteerAttemptReserved,
+	}
+	if err := session.PublishEvent(context.Background(), reservation); err != nil {
+		t.Fatalf("publish reservation: %v", err)
+	}
+	sessionID := session.SessionID()
+	crashAgentRestoreSession(t, session)
+	waitForMessageAgentRecordsStable(t, lifecycle.store, sessionID)
+	baselineRecords := messageAgentRestoreRecords(t, lifecycle.store, sessionID)
+	baselineHandbacks := countMessageAgentHandbacks(baselineRecords, sent.CorrelationID)
+
+	restored, err := lifecycle.RestoreSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("first RestoreSession: %v", err)
+	}
+	recordsAfterFirst := messageAgentRestoreRecords(t, lifecycle.store, sessionID)
+	assertMessageAgentUnknownRepair(t, recordsAfterFirst, sent.CorrelationID)
+	if countMessageAgentHandbacks(recordsAfterFirst, sent.CorrelationID) != baselineHandbacks {
+		t.Fatalf("first restore changed SubagentResult count from %d to %d for unresolved delivery", baselineHandbacks, countMessageAgentHandbacks(recordsAfterFirst, sent.CorrelationID))
+	}
+	if err := restored.Shutdown(context.Background()); err != nil {
+		t.Fatalf("first restored Shutdown: %v", err)
+	}
+
+	second, err := lifecycle.RestoreSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("second RestoreSession: %v", err)
+	}
+	recordsAfterSecond := messageAgentRestoreRecords(t, lifecycle.store, sessionID)
+	assertMessageAgentUnknownRepair(t, recordsAfterSecond, sent.CorrelationID)
+	if countMessageAgentHandbacks(recordsAfterSecond, sent.CorrelationID) != baselineHandbacks {
+		t.Fatalf("second restore changed SubagentResult count from %d to %d for unresolved delivery", baselineHandbacks, countMessageAgentHandbacks(recordsAfterSecond, sent.CorrelationID))
+	}
+	if err := second.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second restored Shutdown: %v", err)
+	}
+}
+
+func messageAgentRestoreRecords(t *testing.T, store *sessionstore.Store, sessionID uuid.UUID) []journal.JournalRecord {
+	t.Helper()
+	replayer, err := store.OpenInternalRecordReplayer(sessionID, sessionstore.ReplayRequest{FromSeq: 0})
+	if err != nil {
+		t.Fatalf("OpenInternalRecordReplayer: %v", err)
+	}
+	records, err := drainRecordReplay(context.Background(), replayer, journal.ReplayRequest{Follow: false})
+	if err != nil {
+		t.Fatalf("drainRecordReplay: %v", err)
+	}
+	return records
+}
+
+func waitForMessageAgentRecordsStable(t *testing.T, store *sessionstore.Store, sessionID uuid.UUID) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	previous := -1
+	stable := 0
+	for time.Now().Before(deadline) {
+		length := len(messageAgentRestoreRecords(t, store, sessionID))
+		if length == previous {
+			stable++
+			if stable >= 5 {
+				return
+			}
+		} else {
+			previous = length
+			stable = 0
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("journal did not stabilize before restore")
+}
+
+func assertMessageAgentUnknownRepair(t *testing.T, records []journal.JournalRecord, requestID uuid.UUID) {
+	t.Helper()
+	unknown := 0
+	for _, record := range records {
+		eventRecord, ok := record.(journal.EventRecord)
+		if !ok {
+			continue
+		}
+		state, ok := eventRecord.Event().(event.DelegateDeliveryStateChanged)
+		if ok && state.RequestID == requestID && state.State == event.DelegateDeliveryResolvedUnknown {
+			unknown++
+		}
+	}
+	if unknown != 1 {
+		t.Fatalf("resolved_unknown repairs = %d, want one durable idempotent repair", unknown)
+	}
+}
+
+func countMessageAgentHandbacks(records []journal.JournalRecord, requestID uuid.UUID) int {
+	count := 0
+	for _, record := range records {
+		commandRecord, ok := record.(journal.CommandRecord)
+		if !ok {
+			continue
+		}
+		handBack, ok := commandRecord.Command().(command.SubagentResult)
+		if !ok {
+			continue
+		}
+		envelope, ok := decodeBackgroundCompletion(handBack.Blocks)
+		if ok && envelope.CorrelationID == requestID.String() {
+			count++
+		}
+	}
+	return count
+}
+
+func TestMessageAgentRestoreRejectsContradictoryCorrelation(t *testing.T) {
+	t.Parallel()
+	const (
+		terminalLoopMismatch = "terminal loop mismatch"
+		requestMappedTwice   = "request mapped to multiple turns"
+		incompatibleTerminal = "incompatible terminals"
+		stateTerminal        = "delivery state plus terminal"
+		stateCancellation    = "delivery state plus cancellation"
+	)
+	for _, tt := range []struct {
+		name   string
+		events func(childID, wrongLoop, requestID, turnA, turnB uuid.UUID) []event.Event
+	}{
+		{name: terminalLoopMismatch, events: func(childID, wrongLoop, requestID, turnA, _ uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnA}, Cause: identity.Cause{CommandID: requestID}}},
+				event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: wrongLoop, TurnID: turnA}}, Message: aiMessage("wrong loop")},
+			}
+		}},
+		{name: requestMappedTwice, events: func(childID, _, requestID, turnA, turnB uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnA}, Cause: identity.Cause{CommandID: requestID}}},
+				event.TurnFoldedInto{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnB}, Cause: identity.Cause{CommandID: requestID}}},
+			}
+		}},
+		{name: incompatibleTerminal, events: func(childID, _, requestID, turnA, _ uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnA}, Cause: identity.Cause{CommandID: requestID}}},
+				event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnA}}, Message: aiMessage("done")},
+				event.TurnFailed{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnA}}, Err: errors.New("failed")},
+			}
+		}},
+		{name: stateTerminal, events: func(childID, _, requestID, turnA, _ uuid.UUID) []event.Event {
+			return []event.Event{
+				event.DelegateDeliveryStateChanged{Header: event.Header{Coordinates: identity.Coordinates{SessionID: mustUUID()}, EventID: mustUUID()}, RequestID: requestID, TargetLoopID: childID, State: event.DelegateDeliveryResolvedUnknown},
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnA}, Cause: identity.Cause{CommandID: requestID}}},
+				event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnA}}, Message: aiMessage("done")},
+			}
+		}},
+		{name: stateCancellation, events: func(childID, _, requestID, _, _ uuid.UUID) []event.Event {
+			return []event.Event{
+				event.DelegateDeliveryStateChanged{Header: event.Header{Coordinates: identity.Coordinates{SessionID: mustUUID()}, EventID: mustUUID()}, RequestID: requestID, TargetLoopID: childID, State: event.DelegateDeliveryResolvedUntrackable},
+				event.InputCancelled{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID}, Cause: identity.Cause{CommandID: requestID}}, Reason: event.CancelClientRetracted},
+			}
+		}},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			childID, wrongLoop, requestID, turnA, turnB := mustUUID(), mustUUID(), mustUUID(), mustUUID(), mustUUID()
+			records := []journal.JournalRecord{
+				journal.NewCommandRecord(mustUUID(), childID, phasedBackgroundCommand(requestID, childID, command.DelegateDeliveryPhaseIntent)),
+			}
+			err := seedResolvedDelegateRecords(newDelegationManager(Topology{}), records, tt.events(childID, wrongLoop, requestID, turnA, turnB), nil)
+			if err == nil {
+				t.Fatalf("contradiction %q was accepted", tt.name)
+			}
+		})
 	}
 }
