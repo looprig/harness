@@ -71,6 +71,11 @@ type foreignDeliveryCoordinator struct {
 	updates chan foreignDeliveryCoordinatorUpdate
 	actions chan foreignDeliveryCoordinatorAction
 	done    chan struct{}
+	// pendingSeen and pendingNotified are owned by the coordinator goroutine.
+	// The private responsiveness observation must not consume the one-shot
+	// notification needed when an explicit response deadline later fires.
+	pendingSeen     bool
+	pendingNotified bool
 }
 
 func newForeignDeliveryCoordinator(c *scopedController, s *Session, childID, requestID uuid.UUID,
@@ -140,6 +145,21 @@ func (c *foreignDeliveryCoordinator) notify(status tool.DelegateDeliveryStatus) 
 	}
 }
 
+func (c *foreignDeliveryCoordinator) markPending(notify bool) {
+	if c == nil {
+		return
+	}
+	if !c.pendingSeen {
+		c.pendingSeen = true
+		c.tracked.markDelivery(tool.DelegateDeliveryAcceptedPending)
+	}
+	if !notify || c.pendingNotified {
+		return
+	}
+	c.pendingNotified = true
+	c.notify(tool.DelegateDeliveryAcceptedPending)
+}
+
 func (c *foreignDeliveryCoordinator) run() {
 	defer close(c.done)
 	defer close(c.updates)
@@ -157,20 +177,8 @@ func (c *foreignDeliveryCoordinator) run() {
 	responseDone := responseCtx.Done()
 
 	concreteSeen := false
-	pendingSeen := false
 	handBackSent := false
 	detached := c.background
-
-	markPending := func(notify bool) {
-		if pendingSeen {
-			return
-		}
-		pendingSeen = true
-		c.tracked.markDelivery(tool.DelegateDeliveryAcceptedPending)
-		if notify {
-			c.notify(tool.DelegateDeliveryAcceptedPending)
-		}
-	}
 
 	for {
 		status, changed := c.hook.deliveryWaitState(c.requestID)
@@ -225,7 +233,7 @@ func (c *foreignDeliveryCoordinator) run() {
 			// must not synthesize a model-visible delivery result; the actor's
 			// authoritative phase is the only concrete foreground/background
 			// admission result.
-			markPending(false)
+			c.markPending(false)
 			observer = nil
 		case <-responseDone:
 			if errors.Is(responseCtx.Err(), context.DeadlineExceeded) {
@@ -233,7 +241,7 @@ func (c *foreignDeliveryCoordinator) run() {
 				// accepted-pending while the coordinator retains ownership. A
 				// foreground caller observes its own wait context instead, so only
 				// background admission needs this notification.
-				markPending(c.background)
+				c.markPending(c.background)
 				if c.background && !handBackSent {
 					c.sendTimedOutHandBack()
 					handBackSent = true
