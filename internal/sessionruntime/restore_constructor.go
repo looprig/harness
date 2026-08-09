@@ -50,6 +50,13 @@ func RestoreTopology(ctx context.Context, topology Topology, sessionID uuid.UUID
 
 func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Provenance, bound loop.BoundDefinition, bindings tool.Bindings, folded foldResult, ri restoredInference, notifications []tool.ProcessCompletionNotification, foreignSID string) error {
 	loopCtx, cancel := context.WithCancel(s.sessionCtx)
+	var constructionHook *foreignDeliveryHook
+	loopCommitted := false
+	defer func() {
+		if !loopCommitted && constructionHook != nil {
+			s.unregisterForeignDeliveryHook(constructionHook)
+		}
+	}()
 	var backend loop.Backend
 	var err error
 	switch bound.Engine() {
@@ -84,7 +91,9 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 				cancel()
 				return builderErr
 			}
-			backend, err = servicesBuilder(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, seed, s.foreignServicesFor(started.LoopID))
+			services, hook := s.foreignServicesForTracked(started.LoopID)
+			constructionHook = hook
+			backend, err = servicesBuilder(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, seed, services)
 		} else {
 			restoredBuilder, builderErr := s.restoredBuilder(bound)
 			if builderErr != nil {
@@ -102,6 +111,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 	s.loopsMu.Lock()
 	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, bindings: bindings, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle, agentName: started.DisplayName, agentMode: loop.ModeName(started.InitialMode), selectedHarness: restoredSelectedHarness(started.AgentRuntime)}
 	s.loopsMu.Unlock()
+	loopCommitted = true
 	return nil
 }
 
@@ -1163,6 +1173,13 @@ func buildRestoredSession(
 		gateAppender:        nopGateAppender{},
 		checkpointAdmission: newCheckpointAdmissionGate(),
 	}
+	var constructionHook *foreignDeliveryHook
+	loopCommitted := false
+	defer func() {
+		if !loopCommitted && constructionHook != nil {
+			s.unregisterForeignDeliveryHook(constructionHook)
+		}
+	}()
 	// Apply the same opts the probe read (WithCommandAppender may replace the durable
 	// journal adapter for a direct/test caller; WithAllowConfigMismatch is a no-op here —
 	// already consumed; WithLimits sets the spawn caps the restored session enforces
@@ -1263,8 +1280,10 @@ func buildRestoredSession(
 				cancel()
 				return abort(builderErr)
 			}
+			services, hook := s.foreignServicesForTracked(rootLoopID)
+			constructionHook = hook
 			l, err = servicesBuilder(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
-				func() (uuid.UUID, error) { return newID() }, factory, seed, s.foreignServicesFor(rootLoopID))
+				func() (uuid.UUID, error) { return newID() }, factory, seed, services)
 		} else {
 			restoredBuilder, builderErr := s.restoredBuilder(cfg)
 			if builderErr != nil {
@@ -1290,6 +1309,7 @@ func buildRestoredSession(
 	// declares a requirement, and would hand the rest a separate observation set.
 	s.loops[rootLoopID] = &loopHandle{id: rootLoopID, owner: s, bound: cfg, bindings: bindings, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle, selectedHarness: restoredSelectedHarness(ri.AgentRuntime)}
 	s.activeLoopID = rootLoopID
+	loopCommitted = true
 	return s, nil
 }
 

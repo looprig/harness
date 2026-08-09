@@ -30,6 +30,7 @@ const (
 	foreignDeliveryUnknown
 	foreignDeliveryUntrackable
 	foreignDeliveryRestoredDone
+	foreignDeliveryAbandoned
 )
 
 // Tombstones preserve fail-closed duplicate handling without retaining every
@@ -110,6 +111,17 @@ func (s *Session) registerForeignDeliveryHook(hook *foreignDeliveryHook) {
 	s.foreignDeliveryMu.Unlock()
 }
 
+func (s *Session) unregisterForeignDeliveryHook(hook *foreignDeliveryHook) {
+	if s == nil || hook == nil {
+		return
+	}
+	s.foreignDeliveryMu.Lock()
+	if current := s.foreignDeliveryHooks[hook.loopID]; current == hook {
+		delete(s.foreignDeliveryHooks, hook.loopID)
+	}
+	s.foreignDeliveryMu.Unlock()
+}
+
 func (s *Session) recordForeignDeliveryFold(ev event.Event) {
 	var loopID, requestID uuid.UUID
 	switch typed := ev.(type) {
@@ -175,7 +187,7 @@ func (h *foreignDeliveryHook) bindCommand(cmd command.UserInput) error {
 	// Do not let a late restore bind or callback recreate an unbounded command
 	// entry for a request whose phase is no longer admitting delivery.
 	switch h.phaseLocked(cmd.CommandID) {
-	case foreignDeliveryFallback, foreignDeliveryInjected, foreignDeliveryUnknown, foreignDeliveryUntrackable, foreignDeliveryRestoredDone:
+	case foreignDeliveryFallback, foreignDeliveryInjected, foreignDeliveryUnknown, foreignDeliveryUntrackable, foreignDeliveryRestoredDone, foreignDeliveryAbandoned:
 		return errForeignDeliveryInvalidTransition
 	}
 	if prior, exists := h.commands[cmd.CommandID]; exists {
@@ -233,6 +245,24 @@ func (h *foreignDeliveryHook) finishLocked(requestID uuid.UUID, phase foreignDel
 		h.tombstoneOrder = h.tombstoneOrder[1:]
 		delete(h.tombstones, oldest)
 	}
+}
+
+// abandon drops only process-local admission state after a durable intent could
+// not be handed to the backend. The intent remains in the journal for restore,
+// where the normal unresolved-intent repair closes it durably as unknown.
+func (h *foreignDeliveryHook) abandon(requestID uuid.UUID) {
+	if h == nil || requestID.IsZero() {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	phase := h.phaseLocked(requestID)
+	if phase == foreignDeliveryAbsent {
+		delete(h.commands, requestID)
+		delete(h.folds, requestID)
+		return
+	}
+	h.finishLocked(requestID, foreignDeliveryAbandoned)
 }
 
 func (h *foreignDeliveryHook) observeFold(ev event.TurnFoldedInto) {

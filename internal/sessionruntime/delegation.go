@@ -213,6 +213,9 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	if err != nil {
 		return err
 	}
+	if err := validateDelegateDeliveryPhases(phased, deliveryStates); err != nil {
+		return err
+	}
 	index := make(map[uuid.UUID]resolvedRequest)
 	deliveryUnknown := make(map[uuid.UUID]struct{})
 	for _, ev := range combined {
@@ -438,6 +441,18 @@ func collectDelegateDeliveryStates(events []event.Event, targets map[uuid.UUID]u
 	return states, nil
 }
 
+func validateDelegateDeliveryPhases(phased map[uuid.UUID]command.UserInput, states map[uuid.UUID]event.DelegateDeliveryState) error {
+	for requestID, state := range states {
+		if !delegateDeliveryStateTerminal(state) {
+			continue
+		}
+		if cmd, ok := phased[requestID]; ok && cmd.DelegateDeliveryPhase == command.DelegateDeliveryPhaseFallbackQueued {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "fallback command conflicts with terminal delivery state"}
+		}
+	}
+	return nil
+}
+
 // persistUnresolvedDelegateDeliveryStates closes only an intent-only durable
 // foreign/native delivery reservation before RestoreDone. A fallback command or
 // an authoritative turn/cancellation already decides the request and remains
@@ -460,6 +475,9 @@ func persistUnresolvedDelegateDeliveryStates(ctx context.Context, j journal.Sess
 	}
 	phased, err := phasedDelegateCommands(records)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateDelegateDeliveryPhases(phased, deliveryStates); err != nil {
 		return nil, err
 	}
 	terminals, err := foldDelegateTerminalsChecked(combined)
@@ -667,6 +685,9 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 	}
 	deliveryStates, err := collectDelegateDeliveryStates(combined, targets)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateDelegateDeliveryPhases(phased, deliveryStates); err != nil {
 		return nil, err
 	}
 
@@ -2398,6 +2419,7 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 	accepted := make(chan error, 1)
 	native := s.nativeDelegateLoop(loopID)
 	deliveryHook := s.foreignDeliveryHookFor(loopID)
+	deliveryIntentPublished := false
 	cmd := command.UserInput{
 		Header:             command.Header{CommandID: id, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()},
 		Blocks:             blocks,
@@ -2416,6 +2438,7 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 		if err := deliveryHook.CreateIntent(ctx, foreign.DeliveryIntent{LoopID: loopID, RequestID: id}); err != nil {
 			return uuid.UUID{}, nil, err
 		}
+		deliveryIntentPublished = true
 	} else if err := s.appendDelegateCommand(ctx, loopID, cmd); err != nil {
 		return uuid.UUID{}, nil, err
 	}
@@ -2431,6 +2454,9 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 	admitted := false
 	defer func() {
 		if !admitted {
+			if deliveryIntentPublished {
+				deliveryHook.abandon(id)
+			}
 			removeRequest(id, registered)
 		}
 	}()

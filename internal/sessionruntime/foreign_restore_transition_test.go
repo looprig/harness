@@ -11,7 +11,9 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/storage/memstore"
 )
 
 type deliveryRepairJournal struct {
@@ -183,5 +185,88 @@ func TestRestoreTerminalDeliveryStateRequiresReservation(t *testing.T) {
 				t.Fatalf("terminal without reservation error = %T %v, want contradiction", err, err)
 			}
 		})
+	}
+}
+
+func TestRestoreFallbackConflictsWithTerminalDeliveryStateRegardlessOrder(t *testing.T) {
+	t.Parallel()
+	for _, terminalFirst := range []bool{false, true} {
+		terminalFirst := terminalFirst
+		t.Run(map[bool]string{false: "reservation_then_terminal", true: "terminal_then_reservation"}[terminalFirst], func(t *testing.T) {
+			t.Parallel()
+			sessionID, childID, requestID := mustUUID(), mustUUID(), mustUUID()
+			intent := phasedBackgroundCommand(requestID, childID, command.DelegateDeliveryPhaseIntent)
+			fallback := intent
+			fallback.DelegateDeliveryPhase = command.DelegateDeliveryPhaseFallbackQueued
+			records := []journal.JournalRecord{
+				journal.NewCommandRecord(sessionID, childID, intent),
+				journal.NewCommandRecord(sessionID, childID, fallback),
+			}
+			reservation := deliveryReservationEvent(sessionID, requestID, childID)
+			terminal := deliveryResolutionEvent(sessionID, requestID, childID, event.DelegateDeliveryResolvedUnknown)
+			events := []event.Event{reservation, terminal}
+			if terminalFirst {
+				events = []event.Event{terminal, reservation}
+			}
+			err := seedResolvedDelegateRecords(newDelegationManager(Topology{}), records, events, nil)
+			var contradiction *delegateRestoreContradictionError
+			if !errors.As(err, &contradiction) {
+				t.Fatalf("fallback terminal corruption error = %T %v, want contradiction", err, err)
+			}
+		})
+	}
+}
+
+func TestRealJournalRejectsFallbackTerminalCorruption(t *testing.T) {
+	t.Parallel()
+	sessionID, childID, requestID := mustUUID(), mustUUID(), mustUUID()
+	store, err := sessionstore.Open(memstore.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.AcquireLease(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lease.Release(context.Background()) })
+	durable, err := store.OpenJournal(context.Background(), sessionID, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := phasedBackgroundCommand(requestID, childID, command.DelegateDeliveryPhaseIntent)
+	fallback := intent
+	fallback.DelegateDeliveryPhase = command.DelegateDeliveryPhaseFallbackQueued
+	for _, record := range []journal.JournalRecord{
+		journal.NewCommandRecord(sessionID, childID, intent),
+		journal.NewCommandRecord(sessionID, childID, fallback),
+		journal.NewEventRecord(deliveryReservationEvent(sessionID, requestID, childID)),
+		journal.NewEventRecord(deliveryResolutionEvent(sessionID, requestID, childID, event.DelegateDeliveryResolvedUnknown)),
+	} {
+		if _, err := durable.Append(context.Background(), record); err != nil {
+			t.Fatalf("append corrupt record: %v", err)
+		}
+	}
+	replayer, err := store.OpenInternalRecordReplayer(sessionID, sessionstore.ReplayRequest{FromSeq: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := drainRecordReplay(context.Background(), replayer, journal.ReplayRequest{Follow: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var records []journal.JournalRecord
+	var events []event.Event
+	for _, record := range all {
+		switch typed := record.(type) {
+		case journal.CommandRecord:
+			records = append(records, typed)
+		case journal.EventRecord:
+			events = append(events, typed.Event())
+		}
+	}
+	err = seedResolvedDelegateRecords(newDelegationManager(Topology{}), records, events, nil)
+	var contradiction *delegateRestoreContradictionError
+	if !errors.As(err, &contradiction) {
+		t.Fatalf("real journal corruption error = %T %v, want contradiction", err, err)
 	}
 }

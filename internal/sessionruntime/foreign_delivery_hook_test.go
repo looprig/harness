@@ -366,8 +366,15 @@ func TestForeignDeliveryHookTerminalStateCardinalityBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	const requests = foreignDeliveryTombstoneLimit*4 + 17
+	var evictedID, retainedID uuid.UUID
 	for i := 0; i < requests; i++ {
 		requestID := mustUUID()
+		if i == 0 {
+			evictedID = requestID
+		}
+		if i == requests-1 {
+			retainedID = requestID
+		}
 		cmd := command.UserInput{
 			Header:       command.Header{CommandID: requestID, Agency: identity.AgencyMachine},
 			TargetLoopID: hook.loopID,
@@ -397,6 +404,12 @@ func TestForeignDeliveryHookTerminalStateCardinalityBounded(t *testing.T) {
 	if phases > foreignDeliveryTombstoneLimit || tombstones > foreignDeliveryTombstoneLimit || commandsRetained != 0 || foldsRetained != 0 {
 		t.Fatalf("hook state cardinality phases=%d tombstones=%d commands=%d folds=%d, want bounded payload-free state", phases, tombstones, commandsRetained, foldsRetained)
 	}
+	for _, requestID := range []uuid.UUID{evictedID, retainedID} {
+		err := hook.Resolve(context.Background(), foreign.DeliveryResolution{LoopID: hook.loopID, RequestID: requestID, State: foreign.DeliveryResolutionUnknown})
+		if !errors.Is(err, errForeignDeliveryInvalidTransition) {
+			t.Fatalf("late callback for %v returned %v, want fixed invalid-transition error", requestID, err)
+		}
+	}
 }
 
 func TestForeignDeliveryHookRestoredCompletionReleasesBoundCommand(t *testing.T) {
@@ -416,6 +429,30 @@ func TestForeignDeliveryHookRestoredCompletionReleasesBoundCommand(t *testing.T)
 	hook.mu.Unlock()
 	if commandsRetained != 0 || foldsRetained != 0 {
 		t.Fatalf("restored completion retained payload state commands=%d folds=%d", commandsRetained, foldsRetained)
+	}
+}
+
+func TestForeignDeliveryHookAbandonsIntentAfterBackendDispatchFailure(t *testing.T) {
+	t.Parallel()
+	s, hook, _, _, baseIntent, _ := newForeignDeliveryHookFixture(t)
+	hook.abandon(baseIntent.RequestID)
+	loopID := hook.loopID
+	backend := &channelBackend{Commands: make(chan command.Command), Done: make(chan struct{})}
+	close(backend.Done)
+	s.loops[loopID] = &loopHandle{id: loopID, backend: backend}
+	for attempt := 0; attempt < foreignDeliveryTombstoneLimit*2; attempt++ {
+		_, _, err := s.enqueueDelegateTurn(context.Background(), loopID, delegateBlocks("dispatch failure"), false,
+			func(_, childID uuid.UUID) *requestTracker { return &requestTracker{childID: childID} },
+			func(uuid.UUID, *requestTracker) {})
+		if err == nil {
+			t.Fatal("enqueueDelegateTurn unexpectedly succeeded")
+		}
+	}
+	hook.mu.Lock()
+	commandsRetained, foldsRetained, phases, tombstones := len(hook.commands), len(hook.folds), len(hook.phases), len(hook.tombstones)
+	hook.mu.Unlock()
+	if commandsRetained != 0 || foldsRetained != 0 || phases != 0 || tombstones > foreignDeliveryTombstoneLimit {
+		t.Fatalf("dispatch failures retained hook state commands=%d folds=%d phases=%d tombstones=%d", commandsRetained, foldsRetained, phases, tombstones)
 	}
 }
 

@@ -2,6 +2,7 @@ package sessionruntime
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -12,6 +13,64 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
+
+func TestForeignServicesBuilderFailureUnregistersDeliveryHook(t *testing.T) {
+	t.Parallel()
+	var sessions []*Session
+	build := foreign.ServicesBuilder(func(_ context.Context, _, _ uuid.UUID, _ loop.Provenance,
+		publisher foreign.EventPublisher, _ loop.BoundDefinition, _ func() (uuid.UUID, error), _ *event.Factory,
+		_ foreign.Services) (loop.Backend, string, error) {
+		if session, ok := publisher.(*Session); ok {
+			sessions = append(sessions, session)
+		}
+		return nil, "", errors.New("builder failed")
+	})
+	restored := foreign.ServicesRestoredBuilder(func(_ context.Context, _, _ uuid.UUID, _ loop.Provenance,
+		_ foreign.EventPublisher, _ loop.BoundDefinition, _ func() (uuid.UUID, error), _ *event.Factory,
+		_ foreign.RestoredForeign, _ foreign.Services) (loop.Backend, error) {
+		return nil, nil
+	})
+	cfg := engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineForeignClaude, "x")
+	for attempt := 0; attempt < 8; attempt++ {
+		_, err := newSession(context.Background(), cfg, uuid.New, time.Now,
+			WithFingerprintProvider(testFingerprintProvider), WithForeignServicesBuilders(build, restored))
+		if err == nil {
+			t.Fatal("newSession unexpectedly succeeded")
+		}
+	}
+	if len(sessions) != 8 {
+		t.Fatalf("builder captured %d sessions, want 8", len(sessions))
+	}
+	for i, session := range sessions {
+		session.foreignDeliveryMu.RLock()
+		retained := len(session.foreignDeliveryHooks)
+		session.foreignDeliveryMu.RUnlock()
+		if retained != 0 {
+			t.Fatalf("failed construction %d retained %d foreign delivery hooks", i, retained)
+		}
+	}
+}
+
+func TestForeignDeliveryHookUnregisterIsIdentitySafe(t *testing.T) {
+	t.Parallel()
+	loopID := mustUUID()
+	session := &Session{sessionID: mustUUID()}
+	other := &Session{sessionID: mustUUID()}
+	first := newForeignDeliveryHook(session, loopID)
+	second := newForeignDeliveryHook(session, loopID)
+	session.unregisterForeignDeliveryHook(first)
+	if got := session.foreignDeliveryHookFor(loopID); got != second {
+		t.Fatalf("unregister old hook removed replacement: got %p want %p", got, second)
+	}
+	other.unregisterForeignDeliveryHook(second)
+	if got := session.foreignDeliveryHookFor(loopID); got != second {
+		t.Fatalf("unregister from another session changed hook: got %p want %p", got, second)
+	}
+	session.unregisterForeignDeliveryHook(second)
+	if got := session.foreignDeliveryHookFor(loopID); got != nil {
+		t.Fatalf("unregister current hook retained %p", got)
+	}
+}
 
 func TestForeignServicesBuilderReceivesFreshPerLoopDeliveryHook(t *testing.T) {
 	t.Parallel()
