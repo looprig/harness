@@ -428,7 +428,7 @@ func TestMessageAgentRestoreReservationNeverReadmits(t *testing.T) {
 	}
 }
 
-func TestMessageAgentRestorePersistsUnknownReservationIdempotentlyWithoutHandback(t *testing.T) {
+func TestMessageAgentRestorePersistsUnknownReservationIdempotentlyWithCategoricalHandback(t *testing.T) {
 	parentLLM := newControlledAgentLLM()
 	childLLM := newControlledAgentLLM()
 	lifecycle, session, _ := newAgentRestoreLifecycle(t, newRestoreStore(t), parentLLM, childLLM, nil)
@@ -494,6 +494,13 @@ func TestMessageAgentRestorePersistsUnknownReservationIdempotentlyWithoutHandbac
 	if err := session.PublishEvent(context.Background(), reservation); err != nil {
 		t.Fatalf("publish reservation: %v", err)
 	}
+	// Remove the live parent route before the crash barrier. Any cancellation of
+	// the observer-owned drain must therefore fail before minting a durable
+	// SubagentResult, leaving restore to exercise the no-handback crash point.
+	parentLoopID := session.ActiveLoopID()
+	session.loopsMu.Lock()
+	delete(session.loops, parentLoopID)
+	session.loopsMu.Unlock()
 	sessionID := session.SessionID()
 	crashAgentRestoreSession(t, session)
 	waitForMessageAgentRecordsStable(t, lifecycle.store, sessionID)
@@ -506,9 +513,10 @@ func TestMessageAgentRestorePersistsUnknownReservationIdempotentlyWithoutHandbac
 	}
 	recordsAfterFirst := messageAgentRestoreRecords(t, lifecycle.store, sessionID)
 	assertMessageAgentUnknownRepair(t, recordsAfterFirst, sent.CorrelationID)
-	if countMessageAgentHandbacks(recordsAfterFirst, sent.CorrelationID) != baselineHandbacks {
-		t.Fatalf("first restore changed SubagentResult count from %d to %d for unresolved delivery", baselineHandbacks, countMessageAgentHandbacks(recordsAfterFirst, sent.CorrelationID))
+	if countMessageAgentHandbacks(recordsAfterFirst, sent.CorrelationID) != baselineHandbacks+1 {
+		t.Fatalf("first restore changed SubagentResult count from %d to %d for unresolved delivery; want one categorical handback", baselineHandbacks, countMessageAgentHandbacks(recordsAfterFirst, sent.CorrelationID))
 	}
+	assertMessageAgentCategoricalHandback(t, recordsAfterFirst, sent.CorrelationID, tool.DelegateDeliveryUnknown)
 	if err := restored.Shutdown(context.Background()); err != nil {
 		t.Fatalf("first restored Shutdown: %v", err)
 	}
@@ -519,9 +527,10 @@ func TestMessageAgentRestorePersistsUnknownReservationIdempotentlyWithoutHandbac
 	}
 	recordsAfterSecond := messageAgentRestoreRecords(t, lifecycle.store, sessionID)
 	assertMessageAgentUnknownRepair(t, recordsAfterSecond, sent.CorrelationID)
-	if countMessageAgentHandbacks(recordsAfterSecond, sent.CorrelationID) != baselineHandbacks {
-		t.Fatalf("second restore changed SubagentResult count from %d to %d for unresolved delivery", baselineHandbacks, countMessageAgentHandbacks(recordsAfterSecond, sent.CorrelationID))
+	if countMessageAgentHandbacks(recordsAfterSecond, sent.CorrelationID) != baselineHandbacks+1 {
+		t.Fatalf("second restore changed SubagentResult count from %d to %d for unresolved delivery; want idempotent one categorical handback", baselineHandbacks, countMessageAgentHandbacks(recordsAfterSecond, sent.CorrelationID))
 	}
+	assertMessageAgentCategoricalHandback(t, recordsAfterSecond, sent.CorrelationID, tool.DelegateDeliveryUnknown)
 	if err := second.Shutdown(context.Background()); err != nil {
 		t.Fatalf("second restored Shutdown: %v", err)
 	}
@@ -596,6 +605,32 @@ func countMessageAgentHandbacks(records []journal.JournalRecord, requestID uuid.
 		}
 	}
 	return count
+}
+
+func assertMessageAgentCategoricalHandback(t *testing.T, records []journal.JournalRecord, requestID uuid.UUID, want tool.DelegateDeliveryStatus) {
+	t.Helper()
+	var matches []backgroundCompletionEnvelope
+	for _, record := range records {
+		commandRecord, ok := record.(journal.CommandRecord)
+		if !ok {
+			continue
+		}
+		handBack, ok := commandRecord.Command().(command.SubagentResult)
+		if !ok {
+			continue
+		}
+		envelope, ok := decodeBackgroundCompletion(handBack.Blocks)
+		if ok && envelope.CorrelationID == requestID.String() {
+			matches = append(matches, envelope)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("categorical handbacks for %v = %d, want one", requestID, len(matches))
+	}
+	got := matches[0]
+	if got.State != tool.AgentStateWorking || got.DeliveryStatus != want || got.ResponseStatus != tool.DelegateResponseUnknown || got.Response != "" {
+		t.Fatalf("categorical handback = %+v, want working/%q/unknown/empty", got, want)
+	}
 }
 
 func TestMessageAgentRestoreRejectsContradictoryCorrelation(t *testing.T) {

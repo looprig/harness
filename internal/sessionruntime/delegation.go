@@ -413,6 +413,21 @@ func delegateDeliveryStateTerminal(state event.DelegateDeliveryState) bool {
 	return state == event.DelegateDeliveryResolvedUnknown || state == event.DelegateDeliveryResolvedUntrackable
 }
 
+// restoredDelegateDeliveryStatus translates an actor-owned terminal delivery
+// adjudication into the categorical status carried by the parent hand-back.
+// These states are terminal for child admission, but they still require one
+// parent-visible result when restore finds no durable result already processed.
+func restoredDelegateDeliveryStatus(state event.DelegateDeliveryState) (tool.DelegateDeliveryStatus, bool) {
+	switch state {
+	case event.DelegateDeliveryResolvedUnknown:
+		return tool.DelegateDeliveryUnknown, true
+	case event.DelegateDeliveryResolvedUntrackable:
+		return tool.DelegateDeliveryUntrackable, true
+	default:
+		return "", false
+	}
+}
+
 // collectDelegateDeliveryStates folds the durable delivery-state events while
 // preserving reservation as an intermediate state. Repeated identical events are
 // idempotent; a terminal state cannot regress to reservation or change terminal
@@ -678,6 +693,10 @@ type restoredBackgroundPlan struct {
 	name      string
 	resolved  resolvedRequest
 	handBack  *command.SubagentResult
+	// deliveryStatus is set for an actor-owned unknown/untrackable delivery
+	// decision. It is a categorical parent hand-back, never a child re-admission
+	// or target-turn watcher.
+	deliveryStatus tool.DelegateDeliveryStatus
 	// reAdmit is set for a foldable phased command whose durable journal has
 	// no opening/cancellation/terminal evidence. Restore sends this exact
 	// command id back through the child actor; it never steers a request with
@@ -933,13 +952,19 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 				childID = phasedCommand.TargetLoopID
 			}
 		}
-		if phasedCommand, isPhased := phased[requestID]; isPhased {
-			if state, deliveryState := deliveryStates[requestID]; deliveryState && delegateDeliveryStateTerminal(state) {
-				// A foreign/native adapter state is terminal for automatic delivery
-				// recovery. Even resolved_unknown/untrackable must not mint a parent
-				// hand-back or steer the request again.
-				continue
+		deliveryStatus := tool.DelegateDeliveryStatus("")
+		if state, deliveryState := deliveryStates[requestID]; deliveryState {
+			if status, terminal := restoredDelegateDeliveryStatus(state); terminal {
+				if _, background := intents[requestID]; !background {
+					// A terminal delivery state on a foreground phased request is
+					// authoritative for child admission, but it is not a parent
+					// hand-back contract. Leave it closed without inventing one.
+					continue
+				}
+				deliveryStatus = status
 			}
+		}
+		if phasedCommand, isPhased := phased[requestID]; isPhased && deliveryStatus == "" {
 			// An opening event is already authoritative. An explicit terminal or
 			// cancellation is also final evidence; an intent-only reservation is
 			// repaired to unknown, while a fallback reservation remains replayable.
@@ -980,7 +1005,7 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 			// private resolution index for diagnostics, but do not invent a parent.
 			continue
 		}
-		entry := restoredBackgroundPlan{requestID: requestID, childID: childID, parentID: info.parent, name: info.name, resolved: resolved}
+		entry := restoredBackgroundPlan{requestID: requestID, childID: childID, parentID: info.parent, name: info.name, resolved: resolved, deliveryStatus: deliveryStatus}
 		if handBack, exists := handBacks[requestID]; exists {
 			if _, done := processed[handBack.commandID]; !done {
 				copy := handBack.command
@@ -1011,7 +1036,11 @@ func (m *delegationManager) reconcileRestoredBackgroundRequests(s *Session, plan
 		if entry.handBack != nil {
 			err = s.replaySubagentResult(s.sessionCtx, *entry.handBack)
 		} else {
-			err = s.deliverSubagentResult(s.sessionCtx, entry.parentID, entry.childID, backgroundCompletionBlocks(entry.childID, entry.name, entry.requestID, entry.resolved.status, entry.resolved.text))
+			blocks := backgroundCompletionBlocks(entry.childID, entry.name, entry.requestID, entry.resolved.status, entry.resolved.text)
+			if entry.deliveryStatus != "" {
+				blocks = backgroundCompletionBlocksWithState(entry.childID, entry.name, entry.requestID, entry.resolved.status, entry.resolved.text, entry.deliveryStatus, true)
+			}
+			err = s.deliverSubagentResult(s.sessionCtx, entry.parentID, entry.childID, blocks)
 		}
 		if err != nil {
 			// No parent event can release the restored wake token when transport

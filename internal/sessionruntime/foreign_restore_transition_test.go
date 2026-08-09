@@ -6,11 +6,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/storage/memstore"
@@ -183,6 +186,298 @@ func TestRestoreTerminalDeliveryStateRequiresReservation(t *testing.T) {
 			var contradiction *delegateRestoreContradictionError
 			if !errors.As(err, &contradiction) {
 				t.Fatalf("terminal without reservation error = %T %v, want contradiction", err, err)
+			}
+		})
+	}
+}
+
+func TestRestoreTerminalDeliveryPlansCategoricalHandbackAtEveryCrashPoint(t *testing.T) {
+	t.Parallel()
+	states := []struct {
+		name        string
+		eventState  event.DelegateDeliveryState
+		disposition tool.DelegateDeliveryStatus
+	}{
+		{name: "unknown", eventState: event.DelegateDeliveryResolvedUnknown, disposition: tool.DelegateDeliveryUnknown},
+		{name: "untrackable", eventState: event.DelegateDeliveryResolvedUntrackable, disposition: tool.DelegateDeliveryUntrackable},
+	}
+	crashPoints := []struct {
+		name      string
+		processed string
+	}{
+		{name: "no handback"},
+		{name: "durable handback"},
+		{name: "processed turn started", processed: "started"},
+		{name: "processed turn folded", processed: "folded"},
+	}
+	for _, state := range states {
+		state := state
+		t.Run(state.name, func(t *testing.T) {
+			t.Parallel()
+			for _, crashPoint := range crashPoints {
+				crashPoint := crashPoint
+				t.Run(crashPoint.name, func(t *testing.T) {
+					t.Parallel()
+					sessionID, parentID, childID, requestID := mustUUID(), mustUUID(), mustUUID(), mustUUID()
+					handBackID := mustUUID()
+					records := []journal.JournalRecord{
+						journal.NewCommandRecord(sessionID, childID, phasedBackgroundCommand(requestID, childID, command.DelegateDeliveryPhaseIntent)),
+					}
+					replayed := []event.Event{
+						event.LoopStarted{
+							Header: event.Header{
+								Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: childID},
+								EventID:     mustUUID(),
+								Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: parentID}},
+							},
+							DisplayName: "worker",
+						},
+						deliveryReservationEvent(sessionID, requestID, childID),
+						deliveryResolutionEvent(sessionID, requestID, childID, state.eventState),
+					}
+					if crashPoint.processed != "" || crashPoint.name == "durable handback" {
+						handBack := command.SubagentResult{
+							Coordinates: identity.Coordinates{LoopID: parentID},
+							Header: command.Header{
+								CommandID: handBackID,
+								Cause:     identity.Cause{Coordinates: identity.Coordinates{LoopID: childID}},
+							},
+							Blocks: backgroundCompletionBlocksWithState(childID, "worker", requestID, tool.DelegateStatusUnknown, "", state.disposition, true),
+						}
+						records = append(records, journal.NewCommandRecord(sessionID, parentID, handBack))
+					}
+					if crashPoint.processed != "" {
+						message := &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: handBackBlocks(childID, "worker", requestID, state.disposition)}}
+						header := event.Header{
+							Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: parentID, TurnID: mustUUID()},
+							EventID:     mustUUID(),
+							Cause:       identity.Cause{CommandID: handBackID, Coordinates: identity.Coordinates{LoopID: childID}},
+						}
+						if crashPoint.processed == "started" {
+							replayed = append(replayed, event.TurnStarted{Header: header, Message: message})
+						} else {
+							openingHeader := header
+							openingHeader.EventID = mustUUID()
+							replayed = append(replayed, event.TurnStarted{Header: openingHeader})
+							replayed = append(replayed, event.TurnFoldedInto{Header: header, Message: message})
+						}
+					}
+
+					manager := newDelegationManager(Topology{})
+					if err := seedResolvedDelegateRecords(manager, records, replayed, nil); err != nil {
+						t.Fatalf("seedResolvedDelegateRecords: %v", err)
+					}
+					plan, err := manager.planRestoredBackgroundRequests(&Session{loops: map[uuid.UUID]*loopHandle{}}, records, replayed, nil)
+					if err != nil {
+						t.Fatalf("planRestoredBackgroundRequests: %v", err)
+					}
+					if crashPoint.processed != "" {
+						if len(plan) != 0 {
+							t.Fatalf("processed %s restore plan = %+v, want no handback", crashPoint.processed, plan)
+						}
+						return
+					}
+					if len(plan) != 1 {
+						t.Fatalf("%s restore plan = %+v, want one categorical handback", crashPoint.name, plan)
+					}
+					entry := plan[0]
+					if entry.reAdmit != nil || entry.deliveryStatus != state.disposition {
+						t.Fatalf("%s restore entry = %+v, want categorical %q without re-admission", crashPoint.name, entry, state.disposition)
+					}
+					if crashPoint.name == "no handback" {
+						if entry.handBack != nil {
+							t.Fatalf("no-handback restore entry = %+v, want a minted handback", entry)
+						}
+					} else if entry.handBack == nil || entry.handBack.CommandID != handBackID {
+						t.Fatalf("durable handback restore entry = %+v, want command %v replay", entry.handBack, handBackID)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestRestoreTerminalDeliveryDoesNotHandBackForegroundPhase(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name  string
+		state event.DelegateDeliveryState
+	}{
+		{name: "unknown", state: event.DelegateDeliveryResolvedUnknown},
+		{name: "untrackable", state: event.DelegateDeliveryResolvedUntrackable},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			sessionID, parentID, childID, requestID := mustUUID(), mustUUID(), mustUUID(), mustUUID()
+			foreground := phasedBackgroundCommand(requestID, childID, command.DelegateDeliveryPhaseIntent)
+			foreground.BackgroundHandBack = false
+			records := []journal.JournalRecord{journal.NewCommandRecord(sessionID, childID, foreground)}
+			replayed := []event.Event{
+				event.LoopStarted{
+					Header: event.Header{
+						Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: childID},
+						EventID:     mustUUID(),
+						Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: parentID}},
+					},
+					DisplayName: "worker",
+				},
+				deliveryReservationEvent(sessionID, requestID, childID),
+				deliveryResolutionEvent(sessionID, requestID, childID, test.state),
+			}
+			manager := newDelegationManager(Topology{})
+			if err := seedResolvedDelegateRecords(manager, records, replayed, nil); err != nil {
+				t.Fatalf("seedResolvedDelegateRecords: %v", err)
+			}
+			plan, err := manager.planRestoredBackgroundRequests(&Session{loops: map[uuid.UUID]*loopHandle{}}, records, replayed, nil)
+			if err != nil {
+				t.Fatalf("planRestoredBackgroundRequests: %v", err)
+			}
+			if len(plan) != 0 {
+				t.Fatalf("foreground %s restore plan = %+v, want no parent hand-back", test.name, plan)
+			}
+		})
+	}
+}
+
+func handBackBlocks(childID uuid.UUID, name string, requestID uuid.UUID, disposition tool.DelegateDeliveryStatus) []content.Block {
+	return backgroundCompletionBlocksWithState(childID, name, requestID, tool.DelegateStatusUnknown, "", disposition, true)
+}
+
+func TestRestoreTerminalDeliveryReconcilesExactlyOneCategoricalHandback(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name        string
+		eventState  event.DelegateDeliveryState
+		disposition tool.DelegateDeliveryStatus
+	}{
+		{name: "unknown", eventState: event.DelegateDeliveryResolvedUnknown, disposition: tool.DelegateDeliveryUnknown},
+		{name: "untrackable", eventState: event.DelegateDeliveryResolvedUntrackable, disposition: tool.DelegateDeliveryUntrackable},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			sessionID, parentID, childID, requestID := mustUUID(), mustUUID(), mustUUID(), mustUUID()
+			records := []journal.JournalRecord{
+				journal.NewCommandRecord(sessionID, childID, phasedBackgroundCommand(requestID, childID, command.DelegateDeliveryPhaseIntent)),
+			}
+			replayed := []event.Event{
+				event.LoopStarted{
+					Header: event.Header{
+						Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: childID},
+						EventID:     mustUUID(),
+						Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: parentID}},
+					},
+					DisplayName: "worker",
+				},
+				deliveryReservationEvent(sessionID, requestID, childID),
+				deliveryResolutionEvent(sessionID, requestID, childID, test.eventState),
+			}
+			manager := newDelegationManager(Topology{})
+			if err := seedResolvedDelegateRecords(manager, records, replayed, nil); err != nil {
+				t.Fatalf("seedResolvedDelegateRecords: %v", err)
+			}
+			plan, err := manager.planRestoredBackgroundRequests(&Session{loops: map[uuid.UUID]*loopHandle{}}, records, replayed, nil)
+			if err != nil || len(plan) != 1 {
+				t.Fatalf("restore plan = %+v, err=%v; want one categorical entry", plan, err)
+			}
+			parentBackend := &channelBackend{Commands: make(chan command.Command, 1), Done: make(chan struct{})}
+			childBackend := &channelBackend{Commands: make(chan command.Command, 1), Done: make(chan struct{})}
+			s := &Session{
+				sessionCtx: context.Background(), sessionID: sessionID, hub: hub.New(sessionID),
+				newID: uuid.New, now: time.Now,
+				loops: map[uuid.UUID]*loopHandle{
+					parentID: {id: parentID, backend: parentBackend},
+					childID:  {id: childID, backend: childBackend, parent: loop.Provenance{LoopID: parentID}},
+				},
+			}
+			manager.reconcileRestoredBackgroundRequests(s, plan)
+			select {
+			case raw := <-parentBackend.Commands:
+				result, ok := raw.(command.SubagentResult)
+				if !ok {
+					t.Fatalf("restored command = %T, want SubagentResult", raw)
+				}
+				completion, ok := decodeBackgroundCompletion(result.Blocks)
+				if !ok || completion.CorrelationID != requestID.String() || completion.State != tool.AgentStateWorking || completion.DeliveryStatus != test.disposition || completion.ResponseStatus != tool.DelegateResponseUnknown || completion.Response != "" {
+					t.Fatalf("restored categorical completion = %+v, %v; want %q working/unknown empty", completion, ok, test.disposition)
+				}
+			default:
+				t.Fatal("restore did not emit categorical handback")
+			}
+			select {
+			case childCommand := <-childBackend.Commands:
+				t.Fatalf("restore sent child command %T, want no re-admission", childCommand)
+			default:
+			}
+		})
+	}
+}
+
+func TestRestoreTerminalDeliveryReplaysUnprocessedHandbackCommand(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name        string
+		eventState  event.DelegateDeliveryState
+		disposition tool.DelegateDeliveryStatus
+	}{
+		{name: "unknown", eventState: event.DelegateDeliveryResolvedUnknown, disposition: tool.DelegateDeliveryUnknown},
+		{name: "untrackable", eventState: event.DelegateDeliveryResolvedUntrackable, disposition: tool.DelegateDeliveryUntrackable},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			sessionID, parentID, childID, requestID, handBackID := mustUUID(), mustUUID(), mustUUID(), mustUUID(), mustUUID()
+			records := []journal.JournalRecord{
+				journal.NewCommandRecord(sessionID, childID, phasedBackgroundCommand(requestID, childID, command.DelegateDeliveryPhaseIntent)),
+			}
+			handBack := command.SubagentResult{
+				Coordinates: identity.Coordinates{LoopID: parentID},
+				Header: command.Header{
+					CommandID: handBackID,
+					Cause:     identity.Cause{Coordinates: identity.Coordinates{LoopID: childID}},
+				},
+				Blocks: handBackBlocks(childID, "worker", requestID, test.disposition),
+			}
+			records = append(records, journal.NewCommandRecord(sessionID, parentID, handBack))
+			replayed := []event.Event{
+				event.LoopStarted{
+					Header: event.Header{
+						Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: childID},
+						EventID:     mustUUID(),
+						Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: parentID}},
+					},
+					DisplayName: "worker",
+				},
+				deliveryReservationEvent(sessionID, requestID, childID),
+				deliveryResolutionEvent(sessionID, requestID, childID, test.eventState),
+			}
+			manager := newDelegationManager(Topology{})
+			if err := seedResolvedDelegateRecords(manager, records, replayed, nil); err != nil {
+				t.Fatalf("seedResolvedDelegateRecords: %v", err)
+			}
+			plan, err := manager.planRestoredBackgroundRequests(&Session{loops: map[uuid.UUID]*loopHandle{}}, records, replayed, nil)
+			if err != nil || len(plan) != 1 || plan[0].handBack == nil || plan[0].handBack.CommandID != handBackID {
+				t.Fatalf("restore replay plan = %+v, err=%v; want exact handback %v", plan, err, handBackID)
+			}
+			parentBackend := &channelBackend{Commands: make(chan command.Command, 1), Done: make(chan struct{})}
+			childBackend := &channelBackend{Commands: make(chan command.Command, 1), Done: make(chan struct{})}
+			s := &Session{
+				sessionCtx: context.Background(), sessionID: sessionID, hub: hub.New(sessionID),
+				newID: uuid.New, now: time.Now,
+				loops: map[uuid.UUID]*loopHandle{
+					parentID: {id: parentID, backend: parentBackend},
+					childID:  {id: childID, backend: childBackend, parent: loop.Provenance{LoopID: parentID}},
+				},
+			}
+			manager.reconcileRestoredBackgroundRequests(s, plan)
+			select {
+			case raw := <-parentBackend.Commands:
+				got, ok := raw.(command.SubagentResult)
+				if !ok || got.CommandID != handBackID {
+					t.Fatalf("replayed command = %T/%v, want SubagentResult/%v", raw, got.CommandID, handBackID)
+				}
+			case <-childBackend.Commands:
+				t.Fatal("restore re-admitted child for terminal delivery")
+			default:
+				t.Fatal("restore did not replay durable handback")
 			}
 		})
 	}
