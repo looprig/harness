@@ -296,6 +296,7 @@ type Session struct {
 	foreignRegistry              *foreign.BuilderRegistry
 	foreignDeliveryMu            sync.RWMutex
 	foreignDeliveryHooks         map[uuid.UUID]*foreignDeliveryHook
+	foreignDeliveryWatcherOnce   sync.Once
 	// collabBroker is created lazily when a services-aware foreign loop is
 	// constructed. Native and legacy foreign loops never receive a broker
 	// descriptor. The broker owns the endpoint; raw capabilities remain only in

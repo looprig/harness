@@ -122,17 +122,6 @@ func newForeignDeliveryHook(session *Session, loopID uuid.UUID) *foreignDelivery
 	if session != nil {
 		hook.sessionID = session.sessionID
 		session.registerForeignDeliveryHook(hook)
-		if session.sessionCtx != nil {
-			if done := session.sessionCtx.Done(); done != nil {
-				// Delivery payload is process-local. A session cancellation is
-				// ownership abandonment, not provider evidence, so close the local
-				// handoff without publishing a phase or parent result.
-				go func() {
-					<-done
-					hook.abandonAll()
-				}()
-			}
-		}
 	}
 	return hook
 }
@@ -177,6 +166,27 @@ func (s *Session) registerForeignDeliveryHook(hook *foreignDeliveryHook) {
 	}
 	s.foreignDeliveryHooks[hook.loopID] = hook
 	s.foreignDeliveryMu.Unlock()
+	s.ensureForeignDeliveryWatcher()
+}
+
+// ensureForeignDeliveryWatcher starts one session-owned cancellation watcher.
+// The watcher captures the Session rather than an individual hook, so failed
+// loop construction can unregister a hook without leaving a goroutine holding
+// that hook alive until session shutdown.
+func (s *Session) ensureForeignDeliveryWatcher() {
+	if s == nil || s.sessionCtx == nil {
+		return
+	}
+	s.foreignDeliveryWatcherOnce.Do(func() {
+		done := s.sessionCtx.Done()
+		if done == nil {
+			return
+		}
+		go func() {
+			<-done
+			s.abandonForeignDeliveryHooks()
+		}()
+	})
 }
 
 func (s *Session) unregisterForeignDeliveryHook(hook *foreignDeliveryHook) {
@@ -191,10 +201,10 @@ func (s *Session) unregisterForeignDeliveryHook(hook *foreignDeliveryHook) {
 }
 
 // abandonForeignDeliveryHooks synchronously clears process-local delivery
-// payloads after the session context has been cancelled. The hook-level watcher
-// handles direct context cancellation; Shutdown also calls this method so its
-// return establishes a deterministic cleanup boundary for callers inspecting
-// session-owned state.
+// payloads after the session context has been cancelled. The session-owned
+// watcher handles direct context cancellation; Shutdown also calls this method
+// so its return establishes a deterministic cleanup boundary for callers
+// inspecting session-owned state.
 func (s *Session) abandonForeignDeliveryHooks() {
 	if s == nil {
 		return

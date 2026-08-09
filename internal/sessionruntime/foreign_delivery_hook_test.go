@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +26,16 @@ type foreignDeliveryCommandAppender struct {
 	mu      sync.Mutex
 	records []journal.CommandRecord
 	err     error
+}
+
+type countingForeignDeliveryContext struct {
+	context.Context
+	doneCalls atomic.Int32
+}
+
+func (c *countingForeignDeliveryContext) Done() <-chan struct{} {
+	c.doneCalls.Add(1)
+	return c.Context.Done()
 }
 
 func (a *foreignDeliveryCommandAppender) AppendCommand(_ context.Context, record journal.CommandRecord) error {
@@ -97,6 +108,58 @@ func newForeignDeliveryHookFixture(t *testing.T) (*Session, *foreignDeliveryHook
 	hook.bindCommand(cmd)
 	t.Cleanup(cancel)
 	return s, hook, commands, events, foreign.DeliveryIntent{LoopID: loopID, RequestID: requestID}, cmd
+}
+
+func TestForeignDeliveryWatcherIsSessionOwnedAcrossUnregister(t *testing.T) {
+	t.Parallel()
+	base, cancel := context.WithCancel(context.Background())
+	ctx := &countingForeignDeliveryContext{Context: base}
+	s := &Session{sessionID: mustUUID(), sessionCtx: ctx, newID: uuid.New, now: time.Now, factory: event.NewFactory(uuid.New, time.Now)}
+	const attempts = 8
+	removed := make([]*foreignDeliveryHook, 0, attempts-1)
+	var registered *foreignDeliveryHook
+	for i := 0; i < attempts; i++ {
+		loopID, requestID := mustUUID(), mustUUID()
+		hook := newForeignDeliveryHook(s, loopID)
+		if err := hook.bindCommand(command.UserInput{
+			Header:       command.Header{CommandID: requestID, Agency: identity.AgencyMachine},
+			Blocks:       []content.Block{&content.TextBlock{Text: "unregistered"}},
+			TargetLoopID: loopID,
+		}); err != nil {
+			t.Fatalf("bindCommand attempt %d: %v", i, err)
+		}
+		if i == attempts-1 {
+			registered = hook
+			continue
+		}
+		s.unregisterForeignDeliveryHook(hook)
+		removed = append(removed, hook)
+	}
+	if got := ctx.doneCalls.Load(); got != 1 {
+		t.Fatalf("session context Done subscriptions = %d, want one watcher for %d hook registrations", got, attempts)
+	}
+	if got := len(s.foreignDeliveryHooks); got != 1 {
+		t.Fatalf("registered foreign hooks = %d, want one", got)
+	}
+
+	cancel()
+	// Keep this boundary deterministic for the registered hook. The session-owned
+	// watcher is asynchronous, while the direct sweep is the same operation used
+	// by Shutdown and must not reach hooks already removed from the registry.
+	s.abandonForeignDeliveryHooks()
+	hookState := func(hook *foreignDeliveryHook) int {
+		hook.mu.Lock()
+		defer hook.mu.Unlock()
+		return len(hook.commands)
+	}
+	if got := hookState(registered); got != 0 {
+		t.Fatalf("registered hook retained %d command payloads after cancellation, want zero", got)
+	}
+	for i, hook := range removed {
+		if got := hookState(hook); got != 1 {
+			t.Fatalf("unregistered hook %d retained %d command payloads after cancellation, want one untouched payload", i, got)
+		}
+	}
 }
 
 func TestForeignDeliveryHookCreatesIntentBeforeReservation(t *testing.T) {
