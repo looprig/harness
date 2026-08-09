@@ -423,19 +423,18 @@ func WithForeignBuilders(builder foreign.Builder, restored foreign.RestoredBuild
 	}
 }
 
-// WithForeignServicesBuilders installs the additive foreign-engine seam that
-// receives one immutable services snapshot for each live and restored loop.
-// The legacy WithForeignBuilders option remains supported and is used when
-// this option is absent. The optional services argument is a compatibility
-// value for callers that have not yet attached a per-loop broker; omitted
-// services are the zero snapshot.
-func WithForeignServicesBuilders(builder foreign.ServicesBuilder, restored foreign.ServicesRestoredBuilder, configured ...foreign.Services) Option {
+// WithForeignServicesBuilders installs the additive foreign-engine seam. The
+// session currently passes the zero Services value; later lifecycle work binds
+// fresh per-loop services internally, without making a fixed capability part
+// of rig configuration. The legacy WithForeignBuilders option remains
+// supported and is used when this option is absent.
+func WithForeignServicesBuilders(builder foreign.ServicesBuilder, restored foreign.ServicesRestoredBuilder) Option {
 	return func(state *definitionState) error {
 		if builder == nil || restored == nil {
 			return &DefinitionError{Kind: DefinitionInvalidForeignBuilders}
 		}
 		return singletonCompile(keyForeignServicesBuilder,
-			sessionruntime.WithLifecycleForeignServicesBuilders(builder, restored, configured...))(state)
+			sessionruntime.WithLifecycleForeignServicesBuilders(builder, restored))(state)
 	}
 }
 

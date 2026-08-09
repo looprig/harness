@@ -2,6 +2,8 @@ package foreign
 
 import (
 	"context"
+	"fmt"
+	"io"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
@@ -18,6 +20,18 @@ import (
 type BrokerDescriptor struct {
 	endpoint   string
 	capability []byte
+}
+
+const (
+	redactedBrokerDescriptor = "<broker-descriptor-redacted>"
+	redactedForeignServices  = "<foreign-services-redacted>"
+)
+
+// Format deliberately ignores the requested verb, flags, width, and
+// precision. The descriptor may carry a bearer capability and an endpoint
+// path, so every formatting form receives the same fixed bounded redaction.
+func (d BrokerDescriptor) Format(state fmt.State, verb rune) {
+	_, _ = io.WriteString(state, redactedBrokerDescriptor)
 }
 
 // NewBrokerDescriptor takes an endpoint and capability snapshot. The input
@@ -90,6 +104,19 @@ type Services struct {
 	Broker   BrokerDescriptor
 	Delivery DeliveryHook
 }
+
+// Format keeps the descriptor and delivery authority out of diagnostics even
+// when Services is formatted as a struct with %#v or %+v. Formatting options
+// are intentionally ignored for the same fixed bounded output contract as
+// BrokerDescriptor.Format.
+func (s Services) Format(state fmt.State, verb rune) {
+	_, _ = io.WriteString(state, redactedForeignServices)
+}
+
+var (
+	_ fmt.Formatter = BrokerDescriptor{}
+	_ fmt.Formatter = Services{}
+)
 
 // NewServices takes an independent snapshot of broker descriptor bytes while
 // retaining the narrow delivery interface value.

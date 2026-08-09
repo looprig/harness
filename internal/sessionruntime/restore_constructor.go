@@ -84,7 +84,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 				cancel()
 				return builderErr
 			}
-			backend, err = servicesBuilder(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, seed, s.foreignServices.Clone())
+			backend, err = servicesBuilder(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, seed, foreign.Services{})
 		} else {
 			restoredBuilder, builderErr := s.restoredBuilder(bound)
 			if builderErr != nil {
@@ -1264,7 +1264,7 @@ func buildRestoredSession(
 				return abort(builderErr)
 			}
 			l, err = servicesBuilder(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
-				func() (uuid.UUID, error) { return newID() }, factory, seed, s.foreignServices.Clone())
+				func() (uuid.UUID, error) { return newID() }, factory, seed, foreign.Services{})
 		} else {
 			restoredBuilder, builderErr := s.restoredBuilder(cfg)
 			if builderErr != nil {

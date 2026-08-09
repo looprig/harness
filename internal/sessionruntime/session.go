@@ -293,7 +293,6 @@ type Session struct {
 	foreignBuildRestored         foreign.RestoredBuilder
 	foreignBuildServices         foreign.ServicesBuilder
 	foreignBuildRestoredServices foreign.ServicesRestoredBuilder
-	foreignServices              foreign.Services
 	foreignRegistry              *foreign.BuilderRegistry
 	runtimeCatalog               loop.RuntimeCatalog
 	hasRuntimeCatalog            bool
@@ -1503,10 +1502,10 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 				return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing, Cause: lookupErr}
 			}
 			b, foreignSID, err = builder(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
-				func() (uuid.UUID, error) { return s.newID() }, s.factory, s.foreignServices.Clone())
+				func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.Services{})
 		} else if s.foreignBuildServices != nil {
 			b, foreignSID, err = s.foreignBuildServices(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
-				func() (uuid.UUID, error) { return s.newID() }, s.factory, s.foreignServices.Clone())
+				func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.Services{})
 		} else if s.foreignBuild != nil {
 			// The legacy function-pair seam remains a valid composition path for
 			// adapter definitions. A profile-aware dispatcher supplied through
@@ -1534,7 +1533,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		bound = selectedBound
 		if s.foreignBuildServices != nil {
 			b, foreignSID, err = s.foreignBuildServices(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
-				func() (uuid.UUID, error) { return s.newID() }, s.factory, s.foreignServices.Clone())
+				func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.Services{})
 		} else {
 			b, foreignSID, err = s.foreignBuild(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
 				func() (uuid.UUID, error) { return s.newID() }, s.factory)

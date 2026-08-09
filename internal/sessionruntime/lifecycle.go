@@ -520,12 +520,12 @@ func WithLifecycleForeignBuilders(b foreign.Builder, rb foreign.RestoredBuilder)
 }
 
 // WithLifecycleForeignServicesBuilders captures the additive foreign builder
-// seams and their immutable services snapshot for every live/restored session.
-// A missing services value is the zero compatibility snapshot.
-func WithLifecycleForeignServicesBuilders(b foreign.ServicesBuilder, rb foreign.ServicesRestoredBuilder, configured ...foreign.Services) LifecycleOption {
+// seams for every live/restored session. Runtime currently supplies zero
+// Services; later lifecycle work binds fresh per-loop services internally.
+func WithLifecycleForeignServicesBuilders(b foreign.ServicesBuilder, rb foreign.ServicesRestoredBuilder) LifecycleOption {
 	return func(r *Lifecycle) {
 		if b != nil && rb != nil {
-			r.baseOpts = append(r.baseOpts, WithForeignServicesBuilders(b, rb, configured...))
+			r.baseOpts = append(r.baseOpts, WithForeignServicesBuilders(b, rb))
 		}
 	}
 }

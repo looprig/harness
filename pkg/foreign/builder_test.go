@@ -3,6 +3,8 @@ package foreign_test
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/looprig/core/content"
@@ -103,6 +105,27 @@ func TestServicesBuilderContractsAndDescriptorDefensiveCopy(t *testing.T) {
 		!bytes.Equal(cloned.Broker.Capability(), services.Broker.Capability()) ||
 		cloned.Delivery == nil {
 		t.Fatalf("services clone = %#v, want equivalent independent services", cloned)
+	}
+}
+
+func TestBrokerDescriptorAndServicesFormattingRedactsAllSecrets(t *testing.T) {
+	poisonEndpoint := "poison-endpoint"
+	poisonCapability := "poison-capability"
+	descriptor := foreign.NewBrokerDescriptor(poisonEndpoint, []byte(poisonCapability))
+	services := foreign.NewServices(descriptor, contractDeliveryHook{})
+	formats := []string{
+		"%v", "%+v", "%#v", "%s", "%q", "%d", "%#x", "%10.4v", "%-#20q",
+	}
+	for _, format := range formats {
+		for _, value := range []any{descriptor, services} {
+			got := fmt.Sprintf(format, value)
+			if strings.Contains(got, poisonEndpoint) || strings.Contains(got, poisonCapability) {
+				t.Fatalf("format %q leaked broker secret: %q", format, got)
+			}
+			if len(got) > 128 {
+				t.Fatalf("format %q was not bounded: %d bytes", format, len(got))
+			}
+		}
 	}
 }
 

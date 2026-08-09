@@ -13,12 +13,10 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 )
 
-func TestForeignServicesBuilderReceivesConfiguredSnapshot(t *testing.T) {
+func TestForeignServicesBuilderReceivesZeroSnapshotUntilPerLoopBinding(t *testing.T) {
 	t.Parallel()
 
 	backend := newFakeBackend()
-	capability := []byte("live-capability")
-	services := foreign.NewServices(foreign.NewBrokerDescriptor("broker://live", capability), nil)
 	var got foreign.Services
 	build := foreign.ServicesBuilder(func(_ context.Context, _, _ uuid.UUID, _ loop.Provenance,
 		_ foreign.EventPublisher, _ loop.BoundDefinition, _ func() (uuid.UUID, error), _ *event.Factory,
@@ -35,16 +33,13 @@ func TestForeignServicesBuilderReceivesConfiguredSnapshot(t *testing.T) {
 	c := engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineForeignClaude, "x")
 	s, err := newSession(context.Background(), c, uuid.New, time.Now,
 		WithFingerprintProvider(testFingerprintProvider),
-		WithForeignServicesBuilders(build, restored, services))
+		WithForeignServicesBuilders(build, restored))
 	if err != nil {
 		t.Fatalf("newSession: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-	if got.Broker.Endpoint() != "broker://live" {
-		t.Fatalf("services endpoint = %q, want broker://live", got.Broker.Endpoint())
-	}
-	if string(got.Broker.Capability()) != string(capability) {
-		t.Fatalf("services capability = %q, want %q", got.Broker.Capability(), capability)
+	if got.Broker.Endpoint() != "" || got.Broker.Capability() != nil || got.Delivery != nil {
+		t.Fatalf("services = %#v, want zero Services before per-loop binding", got)
 	}
 }
 
@@ -68,7 +63,7 @@ func TestLegacyForeignBuilderPathRemainsUsableWithZeroServices(t *testing.T) {
 	}
 }
 
-func TestServicesRestoredBuilderReceivesConfiguredSnapshot(t *testing.T) {
+func TestServicesRestoredBuilderReceivesZeroSnapshotUntilPerLoopBinding(t *testing.T) {
 	t.Parallel()
 
 	folded := foldLoop([]event.Event{
@@ -79,7 +74,6 @@ func TestServicesRestoredBuilderReceivesConfiguredSnapshot(t *testing.T) {
 	backend := newFakeBackend()
 	backend.msgs = folded.Msgs
 	backend.turnIndex = folded.TurnIndex
-	services := foreign.NewServices(foreign.NewBrokerDescriptor("broker://restore", []byte("restore-capability")), nil)
 	var got foreign.Services
 	build := foreign.ServicesBuilder(func(_ context.Context, _, _ uuid.UUID, _ loop.Provenance,
 		_ foreign.EventPublisher, _ loop.BoundDefinition, _ func() (uuid.UUID, error), _ *event.Factory,
@@ -101,12 +95,45 @@ func TestServicesRestoredBuilderReceivesConfiguredSnapshot(t *testing.T) {
 	s, err := buildRestoredSession(ctx, cancel, c, tool.Bindings{SessionID: sessionID, LoopID: rootLoopID}, sessionID, rootLoopID,
 		fixedForeignSID, 0, folded, restoredInference{}, nil, nil, fakeSessionJournal{},
 		event.NewFactory(uuid.New, time.Now), uuid.New, time.Now,
-		WithForeignServicesBuilders(build, restored, services))
+		WithForeignServicesBuilders(build, restored))
 	if err != nil {
 		t.Fatalf("buildRestoredSession: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-	if got.Broker.Endpoint() != "broker://restore" {
-		t.Fatalf("restored services endpoint = %q, want broker://restore", got.Broker.Endpoint())
+	if got.Broker.Endpoint() != "" || got.Broker.Capability() != nil || got.Delivery != nil {
+		t.Fatalf("restored services = %#v, want zero Services before per-loop binding", got)
+	}
+}
+
+func TestLifecycleForeignServicesBuildersCarryNoFixedServices(t *testing.T) {
+	var got foreign.Services
+	build := foreign.ServicesBuilder(func(_ context.Context, _, _ uuid.UUID, _ loop.Provenance,
+		_ foreign.EventPublisher, _ loop.BoundDefinition, _ func() (uuid.UUID, error), _ *event.Factory,
+		received foreign.Services) (loop.Backend, string, error) {
+		got = received
+		return nil, "", nil
+	})
+	restored := foreign.ServicesRestoredBuilder(func(_ context.Context, _, _ uuid.UUID, _ loop.Provenance,
+		_ foreign.EventPublisher, _ loop.BoundDefinition, _ func() (uuid.UUID, error), _ *event.Factory,
+		_ foreign.RestoredForeign, received foreign.Services) (loop.Backend, error) {
+		got = received
+		return nil, nil
+	})
+
+	lifecycle := &Lifecycle{}
+	WithLifecycleForeignServicesBuilders(build, restored)(lifecycle)
+	if len(lifecycle.baseOpts) != 1 {
+		t.Fatalf("lifecycle base options = %d, want one services option", len(lifecycle.baseOpts))
+	}
+	session := &Session{}
+	lifecycle.baseOpts[0](session)
+	if session.foreignBuildServices == nil || session.foreignBuildRestoredServices == nil {
+		t.Fatal("lifecycle did not forward both services builders")
+	}
+	if _, _, err := session.foreignBuildServices(context.Background(), uuid.UUID{}, uuid.UUID{}, loop.Provenance{}, nil, nil, nil, nil, foreign.Services{}); err != nil {
+		t.Fatalf("forwarded services builder: %v", err)
+	}
+	if got.Broker.Endpoint() != "" || got.Broker.Capability() != nil || got.Delivery != nil {
+		t.Fatalf("forwarded services = %#v, want zero Services", got)
 	}
 }

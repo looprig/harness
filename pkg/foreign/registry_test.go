@@ -212,3 +212,109 @@ func TestRestoredForeignZeroValueRemainsBackwardCompatible(t *testing.T) {
 		})
 	}
 }
+
+func TestBuilderRegistryServicesRegistrationAndLookup(t *testing.T) {
+	t.Parallel()
+
+	var liveGot, restoredGot foreign.Services
+	servicesLive := foreign.ServicesBuilder(func(
+		_ context.Context,
+		_ uuid.UUID,
+		_ uuid.UUID,
+		_ loop.Provenance,
+		_ foreign.EventPublisher,
+		_ loop.BoundDefinition,
+		_ func() (uuid.UUID, error),
+		_ *event.Factory,
+		services foreign.Services,
+	) (loop.Backend, string, error) {
+		liveGot = services
+		return nil, "services-live", nil
+	})
+	servicesRestored := foreign.ServicesRestoredBuilder(func(
+		_ context.Context,
+		_ uuid.UUID,
+		_ uuid.UUID,
+		_ loop.Provenance,
+		_ foreign.EventPublisher,
+		_ loop.BoundDefinition,
+		_ func() (uuid.UUID, error),
+		_ *event.Factory,
+		_ foreign.RestoredForeign,
+		services foreign.Services,
+	) (loop.Backend, error) {
+		restoredGot = services
+		return nil, nil
+	})
+
+	var registry foreign.BuilderRegistry
+	if err := registry.RegisterServices("services", servicesLive, servicesRestored); err != nil {
+		t.Fatalf("RegisterServices: %v", err)
+	}
+	live, restored, err := registry.ServicesBuilder("services")
+	if err != nil {
+		t.Fatalf("ServicesBuilder: %v", err)
+	}
+	want := foreign.NewServices(foreign.NewBrokerDescriptor("endpoint", []byte("capability")), nil)
+	if _, sid, err := live(context.Background(), uuid.UUID{}, uuid.UUID{}, loop.Provenance{}, nil, nil, nil, nil, want); err != nil || sid != "services-live" {
+		t.Fatalf("services live = sid %q, err %v; want services-live", sid, err)
+	}
+	if _, err := restored(context.Background(), uuid.UUID{}, uuid.UUID{}, loop.Provenance{}, nil, nil, nil, nil, foreign.RestoredForeign{}, want); err != nil {
+		t.Fatalf("services restored: %v", err)
+	}
+	if liveGot.Broker.Endpoint() != "endpoint" || restoredGot.Broker.Endpoint() != "endpoint" {
+		t.Fatalf("registry services snapshots = (%q, %q), want endpoint", liveGot.Broker.Endpoint(), restoredGot.Broker.Endpoint())
+	}
+}
+
+func TestBuilderRegistryLegacyServicesAdapterIgnoresNonzeroSnapshot(t *testing.T) {
+	t.Parallel()
+
+	var liveCalls, restoredCalls int
+	legacyLive := foreign.Builder(func(
+		_ context.Context,
+		_ uuid.UUID,
+		_ uuid.UUID,
+		_ loop.Provenance,
+		_ foreign.EventPublisher,
+		_ loop.BoundDefinition,
+		_ func() (uuid.UUID, error),
+		_ *event.Factory,
+	) (loop.Backend, string, error) {
+		liveCalls++
+		return nil, "legacy-live", nil
+	})
+	legacyRestored := foreign.RestoredBuilder(func(
+		_ context.Context,
+		_ uuid.UUID,
+		_ uuid.UUID,
+		_ loop.Provenance,
+		_ foreign.EventPublisher,
+		_ loop.BoundDefinition,
+		_ func() (uuid.UUID, error),
+		_ *event.Factory,
+		_ foreign.RestoredForeign,
+	) (loop.Backend, error) {
+		restoredCalls++
+		return nil, nil
+	})
+
+	var registry foreign.BuilderRegistry
+	if err := registry.Register("legacy", legacyLive, legacyRestored); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	live, restored, err := registry.ServicesBuilder("legacy")
+	if err != nil {
+		t.Fatalf("ServicesBuilder legacy: %v", err)
+	}
+	nonzero := foreign.NewServices(foreign.NewBrokerDescriptor("must-not-cross", []byte("must-not-cross")), nil)
+	if _, _, err := live(context.Background(), uuid.UUID{}, uuid.UUID{}, loop.Provenance{}, nil, nil, nil, nil, nonzero); err != nil {
+		t.Fatalf("adapted legacy live: %v", err)
+	}
+	if _, err := restored(context.Background(), uuid.UUID{}, uuid.UUID{}, loop.Provenance{}, nil, nil, nil, nil, foreign.RestoredForeign{}, nonzero); err != nil {
+		t.Fatalf("adapted legacy restored: %v", err)
+	}
+	if liveCalls != 1 || restoredCalls != 1 {
+		t.Fatalf("legacy calls = (%d, %d), want (1, 1)", liveCalls, restoredCalls)
+	}
+}
