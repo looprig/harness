@@ -42,7 +42,7 @@ require (
 	github.com/invopop/jsonschema v0.14.0 // indirect
 	github.com/looprig/core v0.5.0
 	github.com/looprig/eval v0.1.0
-	github.com/looprig/inference v0.7.0
+	github.com/looprig/inference v0.8.0
 	github.com/looprig/storage v0.3.0
 	github.com/openai/openai-go/v3 v3.50.0 // indirect
 	github.com/securego/gosec/v2 v2.28.0 // indirect
