@@ -84,4 +84,3 @@ Expected: all commands pass; only the intended broker/design files are dirty.
 git add internal/sessionruntime/collab_broker.go internal/sessionruntime/collab_broker_test.go docs/plans/2026-08-09-collab-broker-shutdown-implementation.md
 git commit -m "fix(session): bound collaboration broker watcher shutdown"
 ```
-

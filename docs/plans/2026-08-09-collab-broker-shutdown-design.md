@@ -53,4 +53,3 @@ caller receives a bounded close result; it will also create repeated canceled
 broker sessions and assert every lifecycle channel closes and no endpoint
 remains. The test cleanup releases the intentionally held controller only
 after those assertions so the test itself leaves no goroutine behind.
-
