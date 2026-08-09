@@ -470,7 +470,7 @@ func TestMessageAgentForeignObserverCancellationDoesNotRetractAcceptedDelivery(t
 	}
 }
 
-func TestMessageAgentForeignInternalAdmissionTimeoutBecomesUnknownWithoutWatcher(t *testing.T) {
+func TestMessageAgentForeignSessionCancellationKeepsAdmissionPending(t *testing.T) {
 	fixture := newForeignMessageAgentFixture(t)
 	resultCh := make(chan struct {
 		result tool.DelegateResult
@@ -485,6 +485,122 @@ func TestMessageAgentForeignInternalAdmissionTimeoutBecomesUnknownWithoutWatcher
 	}()
 	raw := <-fixture.child.Commands
 	cmd := raw.(command.UserInput)
+	cmd.Accepted <- nil
+	// Session cancellation ends the observer before the foreign actor emits a
+	// terminal delivery phase. It is not evidence of provider Unknown, so the
+	// public result must remain accepted-pending and must not issue a cancel.
+	fixture.session.sessionCancel()
+	select {
+	case call := <-resultCh:
+		if call.err != nil {
+			t.Fatalf("Execute: %v", call.err)
+		}
+		if call.result.DeliveryStatus != tool.DelegateDeliveryAcceptedPending || call.result.ResponseStatus != tool.DelegateResponseUnknown || call.result.CorrelationID != cmd.CommandID {
+			t.Fatalf("result = %+v, want accepted_pending/unknown correlation=%v", call.result, cmd.CommandID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session cancellation did not resolve admission observer")
+	}
+	for _, record := range fixture.commands.snapshot() {
+		if _, ok := record.Command().(command.CancelDelegateRequest); ok {
+			t.Fatalf("session cancellation retracted accepted delivery: %T", record.Command())
+		}
+	}
+}
+
+func TestMessageAgentForeignForegroundSessionCancellationKeepsAdmissionPending(t *testing.T) {
+	fixture := newForeignMessageAgentFixture(t)
+	resultCh := make(chan struct {
+		result tool.DelegateResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := fixture.controller.Execute(context.Background(), foreignMessageRequest(fixture.childID, true))
+		resultCh <- struct {
+			result tool.DelegateResult
+			err    error
+		}{result: result, err: err}
+	}()
+	raw := <-fixture.child.Commands
+	cmd := raw.(command.UserInput)
+	cmd.Accepted <- nil
+	fixture.session.sessionCancel()
+	select {
+	case call := <-resultCh:
+		if call.err != nil {
+			t.Fatalf("Execute: %v", call.err)
+		}
+		if call.result.DeliveryStatus != tool.DelegateDeliveryAcceptedPending || call.result.ResponseStatus != tool.DelegateResponseUnknown || call.result.CorrelationID != cmd.CommandID {
+			t.Fatalf("result = %+v, want accepted_pending/unknown correlation=%v", call.result, cmd.CommandID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("foreground session cancellation did not resolve admission observer")
+	}
+	for _, record := range fixture.commands.snapshot() {
+		if _, ok := record.Command().(command.CancelDelegateRequest); ok {
+			t.Fatalf("session cancellation retracted accepted delivery: %T", record.Command())
+		}
+	}
+}
+
+func TestMessageAgentForeignCallerTimeoutBeforeDecisionKeepsAdmissionPending(t *testing.T) {
+	fixture := newForeignMessageAgentFixture(t)
+	callerCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resultCh := make(chan struct {
+		result tool.DelegateResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := fixture.controller.Execute(callerCtx, foreignMessageRequest(fixture.childID, true))
+		resultCh <- struct {
+			result tool.DelegateResult
+			err    error
+		}{result: result, err: err}
+	}()
+	raw := <-fixture.child.Commands
+	cmd := raw.(command.UserInput)
+	cmd.Accepted <- nil
+	cancel()
+	select {
+	case call := <-resultCh:
+		if call.err != nil {
+			t.Fatalf("Execute: %v", call.err)
+		}
+		if call.result.DeliveryStatus != tool.DelegateDeliveryAcceptedPending || call.result.ResponseStatus != tool.DelegateResponseInterrupted || call.result.CorrelationID != cmd.CommandID {
+			t.Fatalf("result = %+v, want accepted_pending/interrupted correlation=%v", call.result, cmd.CommandID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("caller timeout did not resolve admission observer")
+	}
+	for _, record := range fixture.commands.snapshot() {
+		if _, ok := record.Command().(command.CancelDelegateRequest); ok {
+			t.Fatalf("caller timeout retracted accepted delivery: %T", record.Command())
+		}
+	}
+}
+
+func TestMessageAgentForeignResolvedUnknownIsCategoricalWithoutWatcher(t *testing.T) {
+	fixture := newForeignMessageAgentFixture(t)
+	resultCh := make(chan struct {
+		result tool.DelegateResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := fixture.controller.Execute(context.Background(), foreignMessageRequest(fixture.childID, false))
+		resultCh <- struct {
+			result tool.DelegateResult
+			err    error
+		}{result: result, err: err}
+	}()
+	raw := <-fixture.child.Commands
+	cmd := raw.(command.UserInput)
+	if err := fixture.hook.Reserve(context.Background(), foreign.DeliveryReservation{LoopID: fixture.childID, RequestID: cmd.CommandID}); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if err := fixture.hook.Resolve(context.Background(), foreign.DeliveryResolution{LoopID: fixture.childID, RequestID: cmd.CommandID, State: foreign.DeliveryResolutionUnknown}); err != nil {
+		t.Fatalf("Resolve unknown: %v", err)
+	}
 	cmd.Accepted <- nil
 	select {
 	case call := <-resultCh:

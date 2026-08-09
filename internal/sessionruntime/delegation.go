@@ -1995,12 +1995,6 @@ func (c *scopedController) status(s *Session, req tool.DelegateRequest) (tool.De
 	return tool.DelegateResult{Agents: agents, Truncated: truncated}, nil
 }
 
-// foreignDeliveryAdmissionTimeout is the session-side safety clock for waiting
-// on a typed actor delivery result. It is intentionally independent from the
-// model-controlled response timeout: a broken adapter can never hold a
-// non-waiting MessageAgent call or terminal adjudication forever.
-const foreignDeliveryAdmissionTimeout = 250 * time.Millisecond
-
 func waitForeignDeliveryStatus(s *Session, hook *foreignDeliveryHook, requestID uuid.UUID) tool.DelegateDeliveryStatus {
 	if s == nil || hook == nil {
 		return ""
@@ -2009,16 +2003,11 @@ func waitForeignDeliveryStatus(s *Session, hook *foreignDeliveryHook, requestID 
 	if base == nil {
 		base = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(base, foreignDeliveryAdmissionTimeout)
-	defer cancel()
-	status := hook.waitDeliveryStatus(ctx, requestID)
-	if status == "" {
-		// An actor that does not produce a terminal typed delivery result within
-		// the internal clock is ambiguous by definition. It must never be
-		// retried or handed to a target-terminal watcher.
-		return tool.DelegateDeliveryUnknown
-	}
-	return status
+	// The actor owns the bounded delivery adjudication deadline. Until it emits
+	// a concrete terminal phase, this observer must retain accepted-pending
+	// state; a session shutdown merely ends observation and is not provider
+	// evidence of Unknown.
+	return hook.waitDeliveryStatus(base, requestID)
 }
 
 func (c *scopedController) categoricalForeignResult(s *Session, childID, requestID uuid.UUID, status tool.DelegateDeliveryStatus, name string) tool.DelegateResult {
@@ -2050,6 +2039,17 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 			go func() { deliveryCh <- waitForeignDeliveryStatus(s, foreignHook, requestID) }()
 			select {
 			case deliveryStatus = <-deliveryCh:
+				if deliveryStatus == "" && s.sessionCtx != nil && s.sessionCtx.Err() != nil {
+					// Session shutdown ended observation before the actor emitted a
+					// terminal phase. Preserve the accepted request as pending; the
+					// observer boundary is not provider Unknown evidence.
+					deliveryStatus = tool.DelegateDeliveryAcceptedPending
+					tracked.markDelivery(deliveryStatus)
+					tracked.markTerminal()
+					_ = sub.Close()
+					c.manager.removeRequest(requestID, tracked)
+					return c.categoricalForeignResult(s, childID, requestID, deliveryStatus, req.Name), nil
+				}
 			case <-waitCtx.Done():
 				deliveryStatus = tracked.deliveryStatus()
 				if deliveryStatus == "" {
