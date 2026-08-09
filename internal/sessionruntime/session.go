@@ -289,14 +289,17 @@ type Session struct {
 	// RestoreForeignBuilderMissing). The session depends only on these narrow function
 	// seams, never on the foreignloop concrete loop (Dependency Inversion): loopruntime.New
 	// itself only ever builds native, and the foreign backend is injected here.
-	foreignBuild           foreign.Builder
-	foreignBuildRestored   foreign.RestoredBuilder
-	foreignRegistry        *foreign.BuilderRegistry
-	runtimeCatalog         loop.RuntimeCatalog
-	hasRuntimeCatalog      bool
-	runtimeCatalogProvider RuntimeCatalogProvider
-	delegateSubscribe      func(event.EventFilter) (event.Subscription, error)
-	delegateEnqueue        func(context.Context, loop.Backend, command.UserInput) error
+	foreignBuild                 foreign.Builder
+	foreignBuildRestored         foreign.RestoredBuilder
+	foreignBuildServices         foreign.ServicesBuilder
+	foreignBuildRestoredServices foreign.ServicesRestoredBuilder
+	foreignServices              foreign.Services
+	foreignRegistry              *foreign.BuilderRegistry
+	runtimeCatalog               loop.RuntimeCatalog
+	hasRuntimeCatalog            bool
+	runtimeCatalogProvider       RuntimeCatalogProvider
+	delegateSubscribe            func(event.EventFilter) (event.Subscription, error)
+	delegateEnqueue              func(context.Context, loop.Backend, command.UserInput) error
 
 	// ws is the workspace snapshot store CheckpointWorkspace archives the session's
 	// working tree into, and wsRoot is the directory it archives. Both are wired
@@ -1493,14 +1496,17 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		}
 		bound = selectedBound
 		if s.foreignRegistry != nil {
-			builder, _, lookupErr := s.foreignRegistry.Builder(bound.RuntimeProfile())
+			builder, _, lookupErr := s.foreignRegistry.ServicesBuilder(bound.RuntimeProfile())
 			if lookupErr != nil {
 				release()
 				cancel()
 				return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing, Cause: lookupErr}
 			}
 			b, foreignSID, err = builder(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
-				func() (uuid.UUID, error) { return s.newID() }, s.factory)
+				func() (uuid.UUID, error) { return s.newID() }, s.factory, s.foreignServices.Clone())
+		} else if s.foreignBuildServices != nil {
+			b, foreignSID, err = s.foreignBuildServices(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
+				func() (uuid.UUID, error) { return s.newID() }, s.factory, s.foreignServices.Clone())
 		} else if s.foreignBuild != nil {
 			// The legacy function-pair seam remains a valid composition path for
 			// adapter definitions. A profile-aware dispatcher supplied through
@@ -1514,7 +1520,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing}
 		}
 	default:
-		if s.foreignBuild == nil {
+		if s.foreignBuildServices == nil && s.foreignBuild == nil {
 			release()
 			cancel()
 			return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing}
@@ -1526,8 +1532,13 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			return uuid.UUID{}, selectErr
 		}
 		bound = selectedBound
-		b, foreignSID, err = s.foreignBuild(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
-			func() (uuid.UUID, error) { return s.newID() }, s.factory)
+		if s.foreignBuildServices != nil {
+			b, foreignSID, err = s.foreignBuildServices(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
+				func() (uuid.UUID, error) { return s.newID() }, s.factory, s.foreignServices.Clone())
+		} else {
+			b, foreignSID, err = s.foreignBuild(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
+				func() (uuid.UUID, error) { return s.newID() }, s.factory)
+		}
 	}
 	if err != nil {
 		release()

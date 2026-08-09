@@ -235,6 +235,20 @@ func WithForeignBuilders(b foreign.Builder, rb foreign.RestoredBuilder) Option {
 	}
 }
 
+// WithForeignServicesBuilders wires the additive foreign-engine seam that
+// receives one immutable Services snapshot per construction. The optional
+// services argument keeps the seam useful before the session-owned broker is
+// attached; omitted services are the zero compatibility value.
+func WithForeignServicesBuilders(b foreign.ServicesBuilder, rb foreign.ServicesRestoredBuilder, configured ...foreign.Services) Option {
+	return func(s *Session) {
+		s.foreignBuildServices = b
+		s.foreignBuildRestoredServices = rb
+		if len(configured) > 0 {
+			s.foreignServices = configured[0].Clone()
+		}
+	}
+}
+
 // WithForeignBuilderRegistry injects profile-keyed foreign construction while
 // retaining the legacy function-pair seam for EngineForeignClaude/Codex.
 func WithForeignBuilderRegistry(registry *foreign.BuilderRegistry) Option {

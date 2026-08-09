@@ -35,3 +35,17 @@ type RestoredBuilder func(
 	fac *event.Factory,
 	seed RestoredForeign,
 ) (loop.Backend, error)
+
+// ServicesRestoredBuilder is the additive restored-loop construction seam. It
+// mirrors RestoredBuilder and receives the immutable Services snapshot last.
+type ServicesRestoredBuilder func(
+	loopCtx context.Context,
+	sessionID, loopID uuid.UUID,
+	parent loop.Provenance,
+	pub EventPublisher,
+	cfg loop.BoundDefinition,
+	idGen func() (uuid.UUID, error),
+	fac *event.Factory,
+	seed RestoredForeign,
+	services Services,
+) (loop.Backend, error)

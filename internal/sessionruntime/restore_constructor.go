@@ -77,12 +77,22 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 			cancel()
 			return &RestoreError{Kind: RestoreForeignSIDMissing}
 		}
-		restoredBuilder, builderErr := s.restoredBuilder(bound)
-		if builderErr != nil {
-			cancel()
-			return builderErr
+		seed := foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: agentSessionID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs}
+		if s.usesServicesRestoredBuilder(bound) {
+			servicesBuilder, builderErr := s.servicesRestoredBuilder(bound)
+			if builderErr != nil {
+				cancel()
+				return builderErr
+			}
+			backend, err = servicesBuilder(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, seed, s.foreignServices.Clone())
+		} else {
+			restoredBuilder, builderErr := s.restoredBuilder(bound)
+			if builderErr != nil {
+				cancel()
+				return builderErr
+			}
+			backend, err = restoredBuilder(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, seed)
 		}
-		backend, err = restoredBuilder(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: agentSessionID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
 	}
 	if err != nil {
 		cancel()
@@ -107,6 +117,25 @@ func (s *Session) restoredBuilder(bound loop.BoundDefinition) (foreign.RestoredB
 		return nil, &RestoreError{Kind: RestoreForeignBuilderMissing}
 	}
 	return s.foreignBuildRestored, nil
+}
+
+func (s *Session) usesServicesRestoredBuilder(bound loop.BoundDefinition) bool {
+	return s.foreignBuildRestoredServices != nil ||
+		(s.foreignRegistry != nil && bound.Engine() == loop.EngineAdapter && bound.RuntimeProfile() != "")
+}
+
+func (s *Session) servicesRestoredBuilder(bound loop.BoundDefinition) (foreign.ServicesRestoredBuilder, error) {
+	if s.foreignRegistry != nil && bound.Engine() == loop.EngineAdapter && bound.RuntimeProfile() != "" {
+		_, restored, err := s.foreignRegistry.ServicesBuilder(bound.RuntimeProfile())
+		if err != nil {
+			return nil, &RestoreError{Kind: RestoreForeignBuilderMissing, Cause: err}
+		}
+		return restored, nil
+	}
+	if s.foreignBuildRestoredServices == nil {
+		return nil, &RestoreError{Kind: RestoreForeignBuilderMissing}
+	}
+	return s.foreignBuildRestoredServices, nil
 }
 
 func restoreTopologySession(
@@ -1225,16 +1254,26 @@ func buildRestoredSession(
 			restoreErr := &RestoreError{Kind: RestoreForeignSIDMissing}
 			return abort(restoreErr)
 		}
-		restoredBuilder, builderErr := s.restoredBuilder(cfg)
-		if builderErr != nil {
-			cancel()
-			return abort(builderErr)
-		}
 		// Legacy journals expose one foreign SID. Phase 6 dedicated journal wiring may
 		// replace the agent-side value with a separately journaled AgentSessionID.
-		l, err = restoredBuilder(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
-			func() (uuid.UUID, error) { return newID() }, factory,
-			foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: agentSessionID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
+		seed := foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: agentSessionID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs}
+		if s.usesServicesRestoredBuilder(cfg) {
+			servicesBuilder, builderErr := s.servicesRestoredBuilder(cfg)
+			if builderErr != nil {
+				cancel()
+				return abort(builderErr)
+			}
+			l, err = servicesBuilder(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
+				func() (uuid.UUID, error) { return newID() }, factory, seed, s.foreignServices.Clone())
+		} else {
+			restoredBuilder, builderErr := s.restoredBuilder(cfg)
+			if builderErr != nil {
+				cancel()
+				return abort(builderErr)
+			}
+			l, err = restoredBuilder(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
+				func() (uuid.UUID, error) { return newID() }, factory, seed)
+		}
 	}
 	if err != nil {
 		cancel()

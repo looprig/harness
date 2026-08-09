@@ -30,11 +30,25 @@ type Builder func(
 	fac *event.Factory,
 ) (loop.Backend, string, error)
 
+// ServicesBuilder is the additive foreign-loop construction seam. Services
+// is passed last so existing builder argument order remains source-compatible.
+type ServicesBuilder func(
+	loopCtx context.Context,
+	sessionID, loopID uuid.UUID,
+	parent loop.Provenance,
+	pub EventPublisher,
+	cfg loop.BoundDefinition,
+	idGen func() (uuid.UUID, error),
+	fac *event.Factory,
+	services Services,
+) (loop.Backend, string, error)
+
 var (
 	errBuilderRegistryNil      = errors.New("foreign: builder registry unavailable")
 	errEmptyBuilderProfile     = errors.New("foreign: builder profile required")
 	errDuplicateBuilderProfile = errors.New("foreign: builder profile already registered")
 	errNilBuilder              = errors.New("foreign: builder callbacks required")
+	errNilServicesBuilder      = errors.New("foreign: services builder callbacks required")
 )
 
 // UnknownProfileError reports a profile that is not registered. Its message is
@@ -47,8 +61,10 @@ func (*UnknownProfileError) Error() string {
 }
 
 type builderPair struct {
-	build    Builder
-	restored RestoredBuilder
+	build           Builder
+	restored        RestoredBuilder
+	servicesBuild   ServicesBuilder
+	servicesRestore ServicesRestoredBuilder
 }
 
 // BuilderRegistry routes foreign-loop construction by the stable runtime
@@ -87,6 +103,32 @@ func (r *BuilderRegistry) Register(profile loop.RuntimeProfileName, builder Buil
 	return nil
 }
 
+// RegisterServices binds a services-aware live/restored builder pair to a
+// profile. A profile has one registration shape; use Register for legacy
+// builders and RegisterServices for the additive services shape.
+func (r *BuilderRegistry) RegisterServices(profile loop.RuntimeProfileName, builder ServicesBuilder, restored ServicesRestoredBuilder) error {
+	if r == nil {
+		return errBuilderRegistryNil
+	}
+	if profile == "" {
+		return errEmptyBuilderProfile
+	}
+	if builder == nil || restored == nil {
+		return errNilServicesBuilder
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.builders == nil {
+		r.builders = make(map[loop.RuntimeProfileName]builderPair)
+	}
+	if _, exists := r.builders[profile]; exists {
+		return errDuplicateBuilderProfile
+	}
+	r.builders[profile] = builderPair{servicesBuild: builder, servicesRestore: restored}
+	return nil
+}
+
 // Builder returns the live and restored builders registered for profile. An
 // unknown profile returns a bounded *UnknownProfileError and no builders.
 func (r *BuilderRegistry) Builder(profile loop.RuntimeProfileName) (Builder, RestoredBuilder, error) {
@@ -101,4 +143,24 @@ func (r *BuilderRegistry) Builder(profile loop.RuntimeProfileName) (Builder, Res
 		return nil, nil, &UnknownProfileError{}
 	}
 	return pair.build, pair.restored, nil
+}
+
+// ServicesBuilder returns the services-aware live/restored builders for
+// profile. Legacy registrations are adapted with a zero Services value so
+// callers can use one dispatch path without changing legacy behavior.
+func (r *BuilderRegistry) ServicesBuilder(profile loop.RuntimeProfileName) (ServicesBuilder, ServicesRestoredBuilder, error) {
+	if r == nil {
+		return nil, nil, &UnknownProfileError{}
+	}
+
+	r.mu.RLock()
+	pair, exists := r.builders[profile]
+	r.mu.RUnlock()
+	if !exists {
+		return nil, nil, &UnknownProfileError{}
+	}
+	if pair.servicesBuild != nil && pair.servicesRestore != nil {
+		return pair.servicesBuild, pair.servicesRestore, nil
+	}
+	return adaptBuilder(pair.build), adaptRestoredBuilder(pair.restored), nil
 }

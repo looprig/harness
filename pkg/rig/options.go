@@ -28,6 +28,7 @@ const (
 	keyDelegationLimits                singletonKey = "delegation_limits"
 	keyConfigFingerprint               singletonKey = "config_fingerprint"
 	keyForeignBuilder                  singletonKey = "foreign_builders"
+	keyForeignServicesBuilder          singletonKey = "foreign_services_builders"
 	keyRuntimeCatalog                  singletonKey = "runtime_catalog"
 	keyGateCaps                        singletonKey = "gate_caps"
 	keyAllowConfigMismatch             singletonKey = "allow_config_mismatch"
@@ -419,6 +420,22 @@ func WithForeignBuilders(builder foreign.Builder, restored foreign.RestoredBuild
 			return &DefinitionError{Kind: DefinitionInvalidForeignBuilders}
 		}
 		return singletonCompile(keyForeignBuilder, sessionruntime.WithLifecycleForeignBuilders(builder, restored))(state)
+	}
+}
+
+// WithForeignServicesBuilders installs the additive foreign-engine seam that
+// receives one immutable services snapshot for each live and restored loop.
+// The legacy WithForeignBuilders option remains supported and is used when
+// this option is absent. The optional services argument is a compatibility
+// value for callers that have not yet attached a per-loop broker; omitted
+// services are the zero snapshot.
+func WithForeignServicesBuilders(builder foreign.ServicesBuilder, restored foreign.ServicesRestoredBuilder, configured ...foreign.Services) Option {
+	return func(state *definitionState) error {
+		if builder == nil || restored == nil {
+			return &DefinitionError{Kind: DefinitionInvalidForeignBuilders}
+		}
+		return singletonCompile(keyForeignServicesBuilder,
+			sessionruntime.WithLifecycleForeignServicesBuilders(builder, restored, configured...))(state)
 	}
 }
 
