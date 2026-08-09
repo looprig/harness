@@ -278,7 +278,10 @@ func (c *foreignDeliveryCoordinator) cleanup() {
 		return
 	}
 	if c.hook != nil {
-		c.hook.releaseDeliveryWaiter(c.requestID)
+		// Session cancellation is ownership abandonment, not delivery evidence.
+		// Clear any still-live process-local command/phase payload before releasing
+		// the coordinator's waiter reference; the durable intent remains for restore.
+		c.hook.abandon(c.requestID)
 	}
 	if c.tracked != nil {
 		c.tracked.markTerminal()

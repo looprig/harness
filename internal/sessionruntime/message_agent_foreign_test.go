@@ -1001,6 +1001,70 @@ func TestMessageAgentForeignForegroundSessionCancellationKeepsAdmissionPending(t
 	}
 }
 
+func TestMessageAgentForeignSessionCancellationClearsUndecidedHookPayload(t *testing.T) {
+	fixture := newForeignMessageAgentFixture(t)
+	resultCh := make(chan struct {
+		result tool.DelegateResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := fixture.controller.Execute(context.Background(), foreignMessageRequest(fixture.childID, false))
+		resultCh <- struct {
+			result tool.DelegateResult
+			err    error
+		}{result: result, err: err}
+	}()
+	raw := <-fixture.child.Commands
+	cmd, ok := raw.(command.UserInput)
+	if !ok {
+		t.Fatalf("foreign command = %T, want command.UserInput", raw)
+	}
+	// Acceptance is durable command handoff only. Deliberately leave the hook at
+	// intent with no reservation, fallback, fold, or terminal delivery evidence.
+	cmd.Accepted <- nil
+	fixture.session.sessionCancel()
+	select {
+	case call := <-resultCh:
+		if call.err != nil {
+			t.Fatalf("Execute: %v", call.err)
+		}
+		if call.result.DeliveryStatus != tool.DelegateDeliveryAcceptedPending || call.result.ResponseStatus != tool.DelegateResponseUnknown || call.result.CorrelationID != cmd.CommandID {
+			t.Fatalf("cancelled result = %+v, want accepted_pending/unknown correlation=%v", call.result, cmd.CommandID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session cancellation did not finish coordinator")
+	}
+	waitForRequestTracker(t, fixture.controller.manager, cmd.CommandID, false)
+
+	fixture.hook.mu.Lock()
+	commands, phases, folds, restored, waiters := len(fixture.hook.commands), len(fixture.hook.phases), len(fixture.hook.folds), len(fixture.hook.restored), len(fixture.hook.waiters)
+	fixture.hook.mu.Unlock()
+	if commands != 0 || phases != 0 || folds != 0 || restored != 0 || waiters != 0 {
+		t.Fatalf("cancelled undecided hook state commands=%d phases=%d folds=%d restored=%d waiters=%d, want all zero", commands, phases, folds, restored, waiters)
+	}
+	fixture.controller.manager.mu.Lock()
+	trackers := len(fixture.controller.manager.requests)
+	fixture.controller.manager.mu.Unlock()
+	if trackers != 0 {
+		t.Fatalf("cancelled request trackers = %d, want zero", trackers)
+	}
+	if records := fixture.commands.snapshot(); len(records) != 1 {
+		t.Fatalf("cancelled durable command records = %d, want one intent", len(records))
+	} else if intent, ok := records[0].Command().(command.UserInput); !ok || intent.CommandID != cmd.CommandID || intent.DelegateDeliveryPhase != command.DelegateDeliveryPhaseIntent {
+		t.Fatalf("cancelled durable command = %#v, want original intent %v", records[0].Command(), cmd.CommandID)
+	}
+	select {
+	case raw := <-fixture.child.Commands:
+		switch raw.(type) {
+		case command.CancelDelegateRequest, command.CancelQueuedInput:
+			t.Fatalf("session cancellation dispatched target cancel %T", raw)
+		default:
+			t.Fatalf("unexpected child command after accepted cancellation: %T", raw)
+		}
+	default:
+	}
+}
+
 func TestMessageAgentForeignCallerTimeoutBeforeDecisionKeepsAdmissionPending(t *testing.T) {
 	fixture := newForeignMessageAgentFixture(t)
 	callerCtx, cancel := context.WithCancel(context.Background())

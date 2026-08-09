@@ -2771,6 +2771,7 @@ func (s *Session) shutdown() error {
 	if s.sessionCancel != nil {
 		s.sessionCancel()
 	}
+	s.abandonForeignDeliveryHooks()
 	return combineShutdownErrors(failures...)
 }
 

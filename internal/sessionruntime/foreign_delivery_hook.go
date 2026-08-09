@@ -122,6 +122,17 @@ func newForeignDeliveryHook(session *Session, loopID uuid.UUID) *foreignDelivery
 	if session != nil {
 		hook.sessionID = session.sessionID
 		session.registerForeignDeliveryHook(hook)
+		if session.sessionCtx != nil {
+			if done := session.sessionCtx.Done(); done != nil {
+				// Delivery payload is process-local. A session cancellation is
+				// ownership abandonment, not provider evidence, so close the local
+				// handoff without publishing a phase or parent result.
+				go func() {
+					<-done
+					hook.abandonAll()
+				}()
+			}
+		}
 	}
 	return hook
 }
@@ -177,6 +188,26 @@ func (s *Session) unregisterForeignDeliveryHook(hook *foreignDeliveryHook) {
 		delete(s.foreignDeliveryHooks, hook.loopID)
 	}
 	s.foreignDeliveryMu.Unlock()
+}
+
+// abandonForeignDeliveryHooks synchronously clears process-local delivery
+// payloads after the session context has been cancelled. The hook-level watcher
+// handles direct context cancellation; Shutdown also calls this method so its
+// return establishes a deterministic cleanup boundary for callers inspecting
+// session-owned state.
+func (s *Session) abandonForeignDeliveryHooks() {
+	if s == nil {
+		return
+	}
+	s.foreignDeliveryMu.RLock()
+	hooks := make([]*foreignDeliveryHook, 0, len(s.foreignDeliveryHooks))
+	for _, hook := range s.foreignDeliveryHooks {
+		hooks = append(hooks, hook)
+	}
+	s.foreignDeliveryMu.RUnlock()
+	for _, hook := range hooks {
+		hook.abandonAll()
+	}
 }
 
 func (s *Session) recordForeignDeliveryFold(ev event.Event) {
@@ -477,10 +508,65 @@ func (h *foreignDeliveryHook) abandon(requestID uuid.UUID) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.abandonLocked(requestID)
+}
+
+// abandonAll releases every process-local delivery payload owned by this hook.
+// It is invoked by the session context cancellation watcher to cover the gap
+// before a coordinator claims its waiter as well as coordinators that exit on
+// session shutdown. Durable intent/fallback records remain untouched; restore
+// remains the authority for any later delivery decision.
+func (h *foreignDeliveryHook) abandonAll() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ids := make(map[uuid.UUID]struct{}, len(h.commands)+len(h.phases)+len(h.folds)+len(h.restored)+len(h.waiters))
+	for requestID := range h.commands {
+		ids[requestID] = struct{}{}
+	}
+	for requestID := range h.phases {
+		ids[requestID] = struct{}{}
+	}
+	for requestID := range h.folds {
+		ids[requestID] = struct{}{}
+	}
+	for requestID := range h.restored {
+		ids[requestID] = struct{}{}
+	}
+	for requestID := range h.waiters {
+		ids[requestID] = struct{}{}
+	}
+	for requestID := range ids {
+		h.abandonLocked(requestID)
+	}
+}
+
+func (h *foreignDeliveryHook) abandonLocked(requestID uuid.UUID) {
+	if requestID.IsZero() {
+		return
+	}
+	_, hasCommand := h.commands[requestID]
+	_, hasPhase := h.phases[requestID]
+	_, hasFold := h.folds[requestID]
+	_, hasRestored := h.restored[requestID]
+	waiter, hasWaiter := h.waiters[requestID]
+	// A completed request may retain only a waiter reference while its
+	// coordinator is unwinding. Its terminal signal was already closed by
+	// finishLocked; release that reference without rewriting the tombstone.
+	if !hasCommand && !hasPhase && !hasFold && !hasRestored && (!hasWaiter || waiter.phase != foreignDeliveryAbsent) {
+		if hasWaiter {
+			h.releaseDeliveryWaiterLocked(requestID)
+		}
+		return
+	}
 	phase := h.phaseLocked(requestID)
 	if phase == foreignDeliveryAbsent {
-		delete(h.commands, requestID)
-		delete(h.folds, requestID)
+		// A command can be bound in the tiny pre-intent window. Treat it as
+		// abandoned local payload, while retaining no public delivery evidence.
+		h.finishLocked(requestID, foreignDeliveryAbandoned)
+		h.releaseDeliveryWaiterLocked(requestID)
 		return
 	}
 	h.finishLocked(requestID, foreignDeliveryAbandoned)

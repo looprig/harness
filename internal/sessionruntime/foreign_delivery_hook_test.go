@@ -553,6 +553,88 @@ func TestForeignDeliveryHookAbandonsIntentAfterBackendDispatchFailure(t *testing
 	}
 }
 
+func TestForeignDeliveryHookSessionCancellationAbandonsUnclaimedWaiter(t *testing.T) {
+	t.Parallel()
+	s, hook, commands, _, intent, _ := newForeignDeliveryHookFixture(t)
+	if err := hook.CreateIntent(context.Background(), intent); err != nil {
+		t.Fatalf("CreateIntent: %v", err)
+	}
+	if !hook.registerDeliveryWaiter(intent.RequestID) {
+		t.Fatal("registerDeliveryWaiter returned false")
+	}
+	hook.mu.Lock()
+	waiter := hook.waiters[intent.RequestID]
+	if waiter == nil || waiter.changed == nil {
+		hook.mu.Unlock()
+		t.Fatal("registered waiter has no change signal")
+	}
+	changed := waiter.changed
+	hook.mu.Unlock()
+
+	// This is the handoff gap: the durable intent and waiter exist, but no
+	// coordinator has claimed the waiter yet. Session cancellation must abandon
+	// only process-local payload and leave the durable intent available to restore.
+	s.sessionCancel()
+	select {
+	case <-changed:
+	case <-time.After(time.Second):
+		t.Fatal("session cancellation did not close unclaimed waiter signal")
+	}
+	hook.mu.Lock()
+	commandsRetained, phases, folds, restored, waiters := len(hook.commands), len(hook.phases), len(hook.folds), len(hook.restored), len(hook.waiters)
+	hook.mu.Unlock()
+	if commandsRetained != 0 || phases != 0 || folds != 0 || restored != 0 || waiters != 0 {
+		t.Fatalf("cancelled unclaimed hook state commands=%d phases=%d folds=%d restored=%d waiters=%d, want all zero", commandsRetained, phases, folds, restored, waiters)
+	}
+	if got := len(commands.snapshot()); got != 1 {
+		t.Fatalf("cancelled unclaimed durable commands = %d, want one intent", got)
+	}
+}
+
+func TestForeignDeliveryHookShutdownSynchronouslyAbandonsPayload(t *testing.T) {
+	t.Parallel()
+	sessionID, loopID, requestID := mustUUID(), mustUUID(), mustUUID()
+	commands := &foreignDeliveryCommandAppender{}
+	events := &foreignDeliveryEventAppender{}
+	s := &Session{
+		sessionID:   sessionID,
+		sessionCtx:  context.Background(),
+		hub:         hub.New(sessionID, hub.WithAppender(events)),
+		newID:       uuid.New,
+		now:         time.Now,
+		factory:     event.NewFactory(uuid.New, time.Now),
+		cmdAppender: commands,
+		loops:       map[uuid.UUID]*loopHandle{},
+	}
+	hook := newForeignDeliveryHook(s, loopID)
+	intent := foreign.DeliveryIntent{LoopID: loopID, RequestID: requestID}
+	cmd := command.UserInput{
+		Header:       command.Header{CommandID: requestID, Agency: identity.AgencyMachine},
+		TargetLoopID: loopID,
+	}
+	if err := hook.bindCommand(cmd); err != nil {
+		t.Fatalf("bindCommand: %v", err)
+	}
+	if err := hook.CreateIntent(context.Background(), intent); err != nil {
+		t.Fatalf("CreateIntent: %v", err)
+	}
+	if !hook.registerDeliveryWaiter(requestID) {
+		t.Fatal("registerDeliveryWaiter returned false")
+	}
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	hook.mu.Lock()
+	commandsRetained, phases, folds, restored, waiters := len(hook.commands), len(hook.phases), len(hook.folds), len(hook.restored), len(hook.waiters)
+	hook.mu.Unlock()
+	if commandsRetained != 0 || phases != 0 || folds != 0 || restored != 0 || waiters != 0 {
+		t.Fatalf("shutdown hook state commands=%d phases=%d folds=%d restored=%d waiters=%d, want all zero", commandsRetained, phases, folds, restored, waiters)
+	}
+	if got := len(commands.snapshot()); got != 1 {
+		t.Fatalf("shutdown durable commands = %d, want one intent", got)
+	}
+}
+
 func TestRestoredForeignDeliveryAbandonsFailedDispatches(t *testing.T) {
 	t.Parallel()
 	loopID := mustUUID()
