@@ -155,6 +155,12 @@ func TestForeignDeliveryHookFallbackPersistsExactCommandOnce(t *testing.T) {
 	if len(events.snapshot()) != 1 {
 		t.Fatalf("fallback emitted %d events, want reservation only", len(events.snapshot()))
 	}
+	hook.mu.Lock()
+	commandsRetained, foldsRetained := len(hook.commands), len(hook.folds)
+	hook.mu.Unlock()
+	if commandsRetained != 0 || foldsRetained != 0 {
+		t.Fatalf("fallback retained payload state commands=%d folds=%d, want both zero", commandsRetained, foldsRetained)
+	}
 }
 
 func TestForeignDeliveryHookInjectedResolutionRequiresAuthoritativeFold(t *testing.T) {
@@ -339,6 +345,57 @@ func TestForeignDeliveryHookFallbackPublicationFailureDoesNotCommitTransition(t 
 	if got := len(commands.snapshot()); got != 2 {
 		t.Fatalf("command records = %d, want intent plus one committed fallback", got)
 	}
+}
+
+func TestForeignDeliveryHookCleansPayloadAfterTerminalResolution(t *testing.T) {
+	t.Parallel()
+	t.Run("unknown", func(t *testing.T) {
+		t.Parallel()
+		s, hook, _, _, intent, _ := newForeignDeliveryHookFixture(t)
+		if err := hook.CreateIntent(context.Background(), intent); err != nil {
+			t.Fatal(err)
+		}
+		if err := hook.Reserve(context.Background(), foreign.DeliveryReservation(intent)); err != nil {
+			t.Fatal(err)
+		}
+		if err := hook.Resolve(context.Background(), foreign.DeliveryResolution{LoopID: intent.LoopID, RequestID: intent.RequestID, State: foreign.DeliveryResolutionUnknown}); err != nil {
+			t.Fatal(err)
+		}
+		hook.observeFold(event.TurnFoldedInto{Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: s.sessionID, LoopID: intent.LoopID, TurnID: mustUUID()},
+			Cause:       identity.Cause{CommandID: intent.RequestID},
+		}})
+		hook.mu.Lock()
+		commandsRetained, foldsRetained := len(hook.commands), len(hook.folds)
+		hook.mu.Unlock()
+		if commandsRetained != 0 || foldsRetained != 0 {
+			t.Fatalf("unknown resolution retained payload state commands=%d folds=%d, want both zero", commandsRetained, foldsRetained)
+		}
+	})
+	t.Run("injected", func(t *testing.T) {
+		s, hook, _, _, intent, _ := newForeignDeliveryHookFixture(t)
+		if err := hook.CreateIntent(context.Background(), intent); err != nil {
+			t.Fatal(err)
+		}
+		if err := hook.Reserve(context.Background(), foreign.DeliveryReservation(intent)); err != nil {
+			t.Fatal(err)
+		}
+		fold := event.TurnFoldedInto{Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: s.sessionID, LoopID: intent.LoopID, TurnID: mustUUID()},
+			Cause:       identity.Cause{CommandID: intent.RequestID},
+		}}
+		hook.observeFold(fold)
+		if err := hook.Resolve(context.Background(), foreign.DeliveryResolution{LoopID: intent.LoopID, RequestID: intent.RequestID, TurnID: fold.TurnID, State: foreign.DeliveryResolutionInjected}); err != nil {
+			t.Fatal(err)
+		}
+		hook.observeFold(fold)
+		hook.mu.Lock()
+		commandsRetained, foldsRetained := len(hook.commands), len(hook.folds)
+		hook.mu.Unlock()
+		if commandsRetained != 0 || foldsRetained != 0 {
+			t.Fatalf("injected resolution retained payload state commands=%d folds=%d, want both zero", commandsRetained, foldsRetained)
+		}
+	})
 }
 
 func TestForeignDeliveryHookUsesRealJournalCommandAppender(t *testing.T) {

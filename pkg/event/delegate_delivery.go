@@ -11,8 +11,9 @@ type DelegateDeliveryState string
 
 const (
 	// DelegateDeliverySteerAttemptReserved is appended before a foreign adapter
-	// may admit the steering request to its writer. An unresolved reservation is
-	// restored as DelegateDeliveryResolvedUnknown and is never retried.
+	// may admit the steering request to its writer. It is an intermediate state:
+	// restore may correlate a later turn terminal or replay a durable fallback;
+	// only an intent-only reservation is repaired as resolved_unknown.
 	DelegateDeliverySteerAttemptReserved DelegateDeliveryState = "steer_attempt_reserved"
 	// DelegateDeliveryResolvedUnknown records an ambiguous delivery result. It
 	// is terminal for automatic delivery recovery: the request may have reached

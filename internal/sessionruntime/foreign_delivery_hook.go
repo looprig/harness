@@ -149,6 +149,13 @@ func (h *foreignDeliveryHook) bindCommand(cmd command.UserInput) error {
 	bound.Accepted = cmd.Accepted
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// A terminal/fallback callback has already consumed the durable payload.
+	// Do not let a late restore bind or callback recreate an unbounded command
+	// entry for a request whose phase is no longer admitting delivery.
+	switch h.phases[cmd.CommandID] {
+	case foreignDeliveryFallback, foreignDeliveryInjected, foreignDeliveryUnknown, foreignDeliveryUntrackable:
+		return errForeignDeliveryInvalidTransition
+	}
 	if prior, exists := h.commands[cmd.CommandID]; exists {
 		// Accepted is a process-local admission channel recreated for every
 		// restore dispatch. It is deliberately outside the durable command
@@ -172,6 +179,10 @@ func (h *foreignDeliveryHook) observeFold(ev event.TurnFoldedInto) {
 		return
 	}
 	h.mu.Lock()
+	if h.phases[ev.Cause.CommandID] != foreignDeliveryReserved {
+		h.mu.Unlock()
+		return
+	}
 	if _, exists := h.folds[ev.Cause.CommandID]; !exists {
 		h.folds[ev.Cause.CommandID] = ev.TurnID
 	}
@@ -280,8 +291,9 @@ func (h *foreignDeliveryHook) QueueFallback(ctx context.Context, fallback foreig
 	if _, err := h.session.appendCommandResultChecked(ctx, record); err != nil {
 		return foreignDeliveryPublicationErrorFrom(err)
 	}
-	h.commands[fallback.RequestID] = cmd
 	h.phases[fallback.RequestID] = foreignDeliveryFallback
+	delete(h.commands, fallback.RequestID)
+	delete(h.folds, fallback.RequestID)
 	return nil
 }
 
@@ -303,18 +315,24 @@ func (h *foreignDeliveryHook) Resolve(ctx context.Context, resolution foreign.De
 			return errForeignDeliveryInvalidTransition
 		}
 		h.phases[resolution.RequestID] = foreignDeliveryInjected
+		delete(h.commands, resolution.RequestID)
+		delete(h.folds, resolution.RequestID)
 		return nil
 	case foreign.DeliveryResolutionUnknown:
 		if err := h.publishStateChecked(ctx, resolution.RequestID, event.DelegateDeliveryResolvedUnknown); err != nil {
 			return err
 		}
 		h.phases[resolution.RequestID] = foreignDeliveryUnknown
+		delete(h.commands, resolution.RequestID)
+		delete(h.folds, resolution.RequestID)
 		return nil
 	case foreign.DeliveryResolutionUntrackable:
 		if err := h.publishStateChecked(ctx, resolution.RequestID, event.DelegateDeliveryResolvedUntrackable); err != nil {
 			return err
 		}
 		h.phases[resolution.RequestID] = foreignDeliveryUntrackable
+		delete(h.commands, resolution.RequestID)
+		delete(h.folds, resolution.RequestID)
 		return nil
 	default:
 		return errForeignDeliveryInvalidTransition

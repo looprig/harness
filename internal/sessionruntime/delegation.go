@@ -199,15 +199,22 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	if err != nil {
 		return err
 	}
+	phased, err := phasedDelegateCommands(records)
+	if err != nil {
+		return err
+	}
 	combined := make([]event.Event, 0, len(replayed)+len(closures))
 	combined = append(combined, replayed...)
 	combined = append(combined, closures...)
 	if err := validateDelegateRestoreCorrelations(combined, targets); err != nil {
 		return err
 	}
+	deliveryStates, err := collectDelegateDeliveryStates(combined, targets)
+	if err != nil {
+		return err
+	}
 	index := make(map[uuid.UUID]resolvedRequest)
 	deliveryUnknown := make(map[uuid.UUID]struct{})
-	deliveryStates := make(map[uuid.UUID]struct{})
 	for _, ev := range combined {
 		var requestID, childID uuid.UUID
 		switch accepted := ev.(type) {
@@ -230,33 +237,22 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 		}
 		index[requestID] = resolvedRequest{childID: target, status: tool.DelegateStatusInterrupted}
 	}
-	// Foreign/native delivery state is session-owned durable evidence. A reservation
-	// means the adapter may have accepted the message but the host has no
-	// authoritative turn to correlate, so restore records an unknown terminal and
-	// must never steer the same request again. Validate the duplicated target before
-	// touching the index: a contradictory route is corruption, not a new delivery.
-	for _, ev := range combined {
-		state, ok := ev.(event.DelegateDeliveryStateChanged)
-		if !ok || state.RequestID.IsZero() {
-			continue
-		}
-		target, admitted := targets[state.RequestID]
-		if !admitted {
-			// State for a request whose intent is not in this journal cannot be
-			// safely routed or replayed. It is intentionally ignored rather than
-			// inventing an intent from an event-only record.
-			continue
-		}
-		if state.TargetLoopID != target {
-			return &journal.CommandRouteMismatchError{RecordLoopID: state.TargetLoopID, TargetLoopID: target}
-		}
-		switch state.State {
-		case event.DelegateDeliverySteerAttemptReserved,
-			event.DelegateDeliveryResolvedUnknown,
-			event.DelegateDeliveryResolvedUntrackable:
-			deliveryStates[state.RequestID] = struct{}{}
-			index[state.RequestID] = resolvedRequest{childID: target, status: tool.DelegateStatusUnknown}
-			deliveryUnknown[state.RequestID] = struct{}{}
+	// Only terminal delivery adjudications suppress recovery. A reservation is
+	// intermediate: a fold/turn terminal may supersede it, while a durable fallback
+	// command may still be re-admitted after a crash.
+	for requestID, state := range deliveryStates {
+		target := targets[requestID]
+		switch {
+		case delegateDeliveryStateTerminal(state):
+			index[requestID] = resolvedRequest{childID: target, status: tool.DelegateStatusUnknown}
+			deliveryUnknown[requestID] = struct{}{}
+		case state == event.DelegateDeliverySteerAttemptReserved:
+			// A reservation without a durable fallback is repaired as unknown by
+			// the normal restore path. Direct reducer callers retain that same
+			// fail-closed result, while a fallback phase remains re-admittable.
+			if fallback, ok := phased[requestID]; !ok || fallback.DelegateDeliveryPhase != command.DelegateDeliveryPhaseFallbackQueued {
+				index[requestID] = resolvedRequest{childID: target, status: tool.DelegateStatusUnknown}
+			}
 		}
 	}
 	terminals, err := foldDelegateTerminalsChecked(combined)
@@ -264,7 +260,7 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 		return err
 	}
 	for requestID, terminal := range terminals {
-		if _, hasDeliveryState := deliveryStates[requestID]; hasDeliveryState {
+		if state, hasDeliveryState := deliveryStates[requestID]; hasDeliveryState && delegateDeliveryStateTerminal(state) {
 			return &delegateRestoreContradictionError{requestID: requestID, reason: "delivery state conflicts with turn terminal"}
 		}
 		if _, unknown := deliveryUnknown[requestID]; unknown {
@@ -294,7 +290,7 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 		if !ok {
 			continue
 		}
-		if _, hasDeliveryState := deliveryStates[cancelled.Cause.CommandID]; hasDeliveryState {
+		if state, hasDeliveryState := deliveryStates[cancelled.Cause.CommandID]; hasDeliveryState && delegateDeliveryStateTerminal(state) {
 			return &delegateRestoreContradictionError{requestID: cancelled.Cause.CommandID, reason: "delivery state conflicts with cancellation"}
 		}
 		if _, unknown := deliveryUnknown[cancelled.Cause.CommandID]; unknown {
@@ -396,24 +392,21 @@ func phasedDelegateTargets(records []journal.JournalRecord) (map[uuid.UUID]uuid.
 	return targets, nil
 }
 
-// persistUnresolvedDelegateDeliveryStates closes a durable foreign/native delivery
-// reservation before RestoreDone. A reservation is deliberately converted to
-// resolved_unknown once: the adapter may have accepted the request, so restore
-// must not steer it again or synthesize a parent completion. Existing unknown or
-// untrackable states are already terminal and are not appended again.
-func persistUnresolvedDelegateDeliveryStates(ctx context.Context, j journal.SessionJournal, factory *event.Factory, sessionID uuid.UUID, records []journal.JournalRecord, replayed, closures []event.Event) ([]event.Event, error) {
-	targets, err := phasedDelegateTargets(records)
-	if err != nil {
-		return nil, err
-	}
-	combined := make([]event.Event, 0, len(replayed)+len(closures))
-	combined = append(combined, replayed...)
-	combined = append(combined, closures...)
-	if err := validateDelegateRestoreCorrelations(combined, targets); err != nil {
-		return nil, err
-	}
-	states := make(map[uuid.UUID]event.DelegateDeliveryStateChanged)
-	for _, ev := range combined {
+// delegateDeliveryStateTerminal distinguishes the reservation gate from the
+// terminal adjudications. A reservation only proves that steering admission was
+// attempted; a later turn fold/terminal or fallback command can still decide the
+// request's fate during restore.
+func delegateDeliveryStateTerminal(state event.DelegateDeliveryState) bool {
+	return state == event.DelegateDeliveryResolvedUnknown || state == event.DelegateDeliveryResolvedUntrackable
+}
+
+// collectDelegateDeliveryStates folds the durable delivery-state events while
+// preserving reservation as an intermediate state. Repeated identical events are
+// idempotent; a terminal state cannot regress to reservation or change terminal
+// kind without a fail-closed restore error.
+func collectDelegateDeliveryStates(events []event.Event, targets map[uuid.UUID]uuid.UUID) (map[uuid.UUID]event.DelegateDeliveryState, error) {
+	states := make(map[uuid.UUID]event.DelegateDeliveryState)
+	for _, ev := range events {
 		state, ok := ev.(event.DelegateDeliveryStateChanged)
 		if !ok || state.RequestID.IsZero() {
 			continue
@@ -425,27 +418,84 @@ func persistUnresolvedDelegateDeliveryStates(ctx context.Context, j journal.Sess
 		if state.TargetLoopID != target {
 			return nil, &journal.CommandRouteMismatchError{RecordLoopID: state.TargetLoopID, TargetLoopID: target}
 		}
-		switch state.State {
-		case event.DelegateDeliverySteerAttemptReserved,
-			event.DelegateDeliveryResolvedUnknown,
-			event.DelegateDeliveryResolvedUntrackable:
-			states[state.RequestID] = state
+		if !state.State.Valid() {
+			return nil, &delegateRestoreContradictionError{requestID: state.RequestID, reason: "invalid delivery state"}
+		}
+		prior, exists := states[state.RequestID]
+		if !exists || prior == state.State {
+			states[state.RequestID] = state.State
+			continue
+		}
+		if prior == event.DelegateDeliverySteerAttemptReserved && delegateDeliveryStateTerminal(state.State) {
+			states[state.RequestID] = state.State
+			continue
+		}
+		return nil, &delegateRestoreContradictionError{requestID: state.RequestID, reason: "delivery state regressed or changed terminal kind"}
+	}
+	return states, nil
+}
+
+// persistUnresolvedDelegateDeliveryStates closes only an intent-only durable
+// foreign/native delivery reservation before RestoreDone. A fallback command or
+// an authoritative turn/cancellation already decides the request and remains
+// recoverable from that evidence. Existing unknown or untrackable states are
+// terminal and are not appended again.
+func persistUnresolvedDelegateDeliveryStates(ctx context.Context, j journal.SessionJournal, factory *event.Factory, sessionID uuid.UUID, records []journal.JournalRecord, replayed, closures []event.Event) ([]event.Event, error) {
+	targets, err := phasedDelegateTargets(records)
+	if err != nil {
+		return nil, err
+	}
+	combined := make([]event.Event, 0, len(replayed)+len(closures))
+	combined = append(combined, replayed...)
+	combined = append(combined, closures...)
+	if err := validateDelegateRestoreCorrelations(combined, targets); err != nil {
+		return nil, err
+	}
+	deliveryStates, err := collectDelegateDeliveryStates(combined, targets)
+	if err != nil {
+		return nil, err
+	}
+	phased, err := phasedDelegateCommands(records)
+	if err != nil {
+		return nil, err
+	}
+	terminals, err := foldDelegateTerminalsChecked(combined)
+	if err != nil {
+		return nil, err
+	}
+	closed := make(map[uuid.UUID]struct{}, len(terminals))
+	for requestID := range terminals {
+		closed[requestID] = struct{}{}
+	}
+	for _, ev := range combined {
+		switch terminal := ev.(type) {
+		case event.TurnRejected, event.InputCancelled:
+			if requestID := terminal.EventHeader().Cause.CommandID; !requestID.IsZero() {
+				closed[requestID] = struct{}{}
+			}
 		}
 	}
-	requestIDs := make([]uuid.UUID, 0, len(states))
-	for requestID, state := range states {
-		if state.State == event.DelegateDeliverySteerAttemptReserved {
-			requestIDs = append(requestIDs, requestID)
+	requestIDs := make([]uuid.UUID, 0, len(deliveryStates))
+	for requestID, state := range deliveryStates {
+		if state != event.DelegateDeliverySteerAttemptReserved {
+			continue
 		}
+		if _, done := closed[requestID]; done {
+			continue
+		}
+		if fallback, ok := phased[requestID]; ok && fallback.DelegateDeliveryPhase == command.DelegateDeliveryPhaseFallbackQueued {
+			continue
+		}
+		requestIDs = append(requestIDs, requestID)
 	}
 	sort.Slice(requestIDs, func(i, j int) bool { return requestIDs[i].String() < requestIDs[j].String() })
 	repairs := make([]event.Event, 0, len(requestIDs))
 	for _, requestID := range requestIDs {
-		state := states[requestID]
+		targetLoopID := targets[requestID]
 		repair := event.DelegateDeliveryStateChanged{
 			Header:       event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
 			RequestID:    requestID,
-			TargetLoopID: state.TargetLoopID,
+			TargetLoopID: targetLoopID,
 			State:        event.DelegateDeliveryResolvedUnknown,
 		}
 		header, err := factory.Stamp(repair.EventHeader())
@@ -473,7 +523,10 @@ func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.
 	if err != nil {
 		return err
 	}
-	deliveryStates := make(map[uuid.UUID]struct{})
+	deliveryStates, err := collectDelegateDeliveryStates(events, intents)
+	if err != nil {
+		return err
+	}
 	cancellations := make(map[uuid.UUID]struct{})
 	openings := make(map[uuid.UUID]struct{})
 	closures := make(map[uuid.UUID]struct{})
@@ -502,23 +555,6 @@ func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.
 			if !typed.Cause.CommandID.IsZero() {
 				openings[typed.Cause.CommandID] = struct{}{}
 			}
-		case event.DelegateDeliveryStateChanged:
-			if typed.RequestID.IsZero() {
-				continue
-			}
-			target, admitted := intents[typed.RequestID]
-			if !admitted {
-				continue
-			}
-			if typed.TargetLoopID != target {
-				return &journal.CommandRouteMismatchError{RecordLoopID: typed.TargetLoopID, TargetLoopID: target}
-			}
-			switch typed.State {
-			case event.DelegateDeliverySteerAttemptReserved,
-				event.DelegateDeliveryResolvedUnknown,
-				event.DelegateDeliveryResolvedUntrackable:
-				deliveryStates[typed.RequestID] = struct{}{}
-			}
 		case event.TurnRejected:
 			if err := validateTargetRoute(typed.Cause.CommandID, typed.LoopID); err != nil {
 				return err
@@ -537,7 +573,7 @@ func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.
 		}
 	}
 	for requestID, terminal := range terminals {
-		if _, hasDeliveryState := deliveryStates[requestID]; hasDeliveryState {
+		if state, hasDeliveryState := deliveryStates[requestID]; hasDeliveryState && delegateDeliveryStateTerminal(state) {
 			return &delegateRestoreContradictionError{requestID: requestID, reason: "delivery state conflicts with turn terminal"}
 		}
 		if target, admitted := intents[requestID]; admitted && terminal.childID != target {
@@ -553,7 +589,7 @@ func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.
 		}
 	}
 	for requestID := range cancellations {
-		if _, hasDeliveryState := deliveryStates[requestID]; hasDeliveryState {
+		if state, hasDeliveryState := deliveryStates[requestID]; hasDeliveryState && delegateDeliveryStateTerminal(state) {
 			return &delegateRestoreContradictionError{requestID: requestID, reason: "delivery state conflicts with cancellation"}
 		}
 	}
@@ -624,6 +660,10 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 	combined = append(combined, replayed...)
 	combined = append(combined, closures...)
 	if err := validateDelegateRestoreCorrelations(combined, targets); err != nil {
+		return nil, err
+	}
+	deliveryStates, err := collectDelegateDeliveryStates(combined, targets)
+	if err != nil {
 		return nil, err
 	}
 
@@ -726,7 +766,6 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 	// actor boundary; InputQueued does not and is therefore omitted.
 	requestOpened := make(map[uuid.UUID]struct{})
 	requestTerminal := make(map[uuid.UUID]struct{})
-	requestDeliveryState := make(map[uuid.UUID]struct{})
 	for _, ev := range combined {
 		commandID := ev.EventHeader().Cause.CommandID
 		switch typed := ev.(type) {
@@ -741,10 +780,6 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 		case event.InputCancelled, event.TurnRejected:
 			if !commandID.IsZero() {
 				requestTerminal[commandID] = struct{}{}
-			}
-		case event.DelegateDeliveryStateChanged:
-			if !typed.RequestID.IsZero() {
-				requestDeliveryState[typed.RequestID] = struct{}{}
 			}
 		}
 		// The completion envelope is also durable in the parent turn input.
@@ -821,19 +856,25 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 			}
 		}
 		if phasedCommand, isPhased := phased[requestID]; isPhased {
-			if _, deliveryState := requestDeliveryState[requestID]; deliveryState {
+			if state, deliveryState := deliveryStates[requestID]; deliveryState && delegateDeliveryStateTerminal(state) {
 				// A foreign/native adapter state is terminal for automatic delivery
 				// recovery. Even resolved_unknown/untrackable must not mint a parent
 				// hand-back or steer the request again.
 				continue
 			}
-			// An opening event is already authoritative. An explicit terminal,
-			// cancellation, or delivery-state event is also final evidence; in
-			// particular, an unresolved reservation is never steered again.
+			// An opening event is already authoritative. An explicit terminal or
+			// cancellation is also final evidence; an intent-only reservation is
+			// repaired to unknown, while a fallback reservation remains replayable.
 			_, opened := requestOpened[requestID]
 			_, terminal := requestTerminal[requestID]
-			_, deliveryState := requestDeliveryState[requestID]
-			if !opened && !terminal && !deliveryState {
+			state, deliveryState := deliveryStates[requestID]
+			if deliveryState && state == event.DelegateDeliverySteerAttemptReserved && phasedCommand.DelegateDeliveryPhase != command.DelegateDeliveryPhaseFallbackQueued && !opened && !terminal {
+				// An intent-only reservation is repaired to unknown by the normal
+				// restore path and is never re-admitted. A durable fallback is the
+				// one reservation successor that remains eligible for replay.
+				continue
+			}
+			if !opened && !terminal && (!deliveryState || !delegateDeliveryStateTerminal(state)) {
 				info, known := children[childID]
 				if known && (!phasedCommand.BackgroundHandBack || !info.parent.IsZero()) {
 					copy := phasedCommand
