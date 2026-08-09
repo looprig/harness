@@ -81,22 +81,25 @@ func executeAgentCall(ctx context.Context, controller tool.DelegateController, o
 
 func formatForeground(result tool.DelegateResult) string {
 	if result.DeliveryStatus != "" {
+		responseStatus := wireResponseStatus(result.ResponseStatus)
+		var response *string
 		if result.DeliveryStatus == tool.DelegateDeliveryUnknown || result.DeliveryStatus == tool.DelegateDeliveryUntrackable {
-			result.ResponseStatus = tool.DelegateResponseUnknown
-			result.Response = ""
+			responseStatus = ""
+		} else if result.ResponseStatus == tool.DelegateResponseCompleted || (responseStatus != "" && result.Response != "") {
+			response = &result.Response
 		}
 		return marshalForegroundResult(foregroundResult{
 			AgentID:        result.AgentID.String(),
 			Name:           result.Name,
 			State:          result.State,
 			DeliveryStatus: result.DeliveryStatus,
-			ResponseStatus: wireResponseStatus(result.ResponseStatus),
-			Response:       result.Response,
+			ResponseStatus: responseStatus,
+			Response:       response,
 		})
 	}
 	switch result.ResponseStatus {
 	case tool.DelegateResponseCompleted:
-		return marshalForegroundResult(foregroundResult{AgentID: result.AgentID.String(), Name: result.Name, State: result.State, Response: result.Response})
+		return marshalForegroundResult(foregroundResult{AgentID: result.AgentID.String(), Name: result.Name, State: result.State, Response: &result.Response})
 	case tool.DelegateResponseFailed:
 		return "error: agent failed"
 	case tool.DelegateResponseInterrupted:
@@ -125,7 +128,7 @@ type foregroundResult struct {
 	State          tool.AgentState             `json:"state"`
 	DeliveryStatus tool.DelegateDeliveryStatus `json:"delivery_status,omitempty"`
 	ResponseStatus string                      `json:"response_status,omitempty"`
-	Response       string                      `json:"response,omitempty"`
+	Response       *string                     `json:"response,omitempty"`
 }
 
 type backgroundResult struct {
@@ -136,7 +139,11 @@ type backgroundResult struct {
 }
 
 func marshalForegroundResult(result foregroundResult) string {
-	response := boundAgentOutput(result.Response)
+	includeResponse := result.Response != nil
+	response := ""
+	if includeResponse {
+		response = boundAgentOutput(*result.Response)
+	}
 	prefixEnds := make([]int, 1, len(response)+1)
 	for end := 0; end < len(response); {
 		_, size := utf8.DecodeRuneInString(response[end:])
@@ -148,7 +155,10 @@ func marshalForegroundResult(result foregroundResult) string {
 	low, high := 0, len(prefixEnds)
 	for low < high {
 		mid := low + (high-low)/2
-		result.Response = response[:prefixEnds[mid]]
+		if includeResponse {
+			candidate := response[:prefixEnds[mid]]
+			result.Response = &candidate
+		}
 		encoded, err := json.Marshal(result)
 		if err != nil {
 			return "error: agent result unavailable"

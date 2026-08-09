@@ -34,13 +34,16 @@ func TestFormatForegroundBoundsMultibyteResponseAtRuneBoundary(t *testing.T) {
 	if err := json.Unmarshal([]byte(result), &decoded); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v", err)
 	}
-	if !utf8.ValidString(decoded.Response) {
+	if decoded.Response == nil {
+		t.Fatal("decoded response is nil")
+	}
+	if !utf8.ValidString(*decoded.Response) {
 		t.Fatal("decoded response is not valid UTF-8")
 	}
-	if strings.ContainsRune(decoded.Response, utf8.RuneError) {
+	if strings.ContainsRune(*decoded.Response, utf8.RuneError) {
 		t.Fatal("decoded response contains a replacement rune from partial truncation")
 	}
-	if decoded.Response == "" || strings.Trim(decoded.Response, "界") != "" {
+	if *decoded.Response == "" || strings.Trim(*decoded.Response, "界") != "" {
 		t.Fatal("decoded response did not preserve a complete-rune prefix")
 	}
 }
@@ -58,6 +61,39 @@ func TestMessageAgentFormatForegroundIncludesDeliveryStatus(t *testing.T) {
 		Response:       "done",
 	})
 	want := `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"idle","delivery_status":"injected","response_status":"completed","response":"done"}`
+	if got != want {
+		t.Fatalf("formatForeground() = %q, want %q", got, want)
+	}
+}
+
+func TestFormatForegroundPreservesEmptyLegacyCompletedResponse(t *testing.T) {
+	t.Parallel()
+
+	agentID := mustParseUUID(t, "55555555-5555-4555-8555-555555555555")
+	got := formatForeground(tool.DelegateResult{
+		AgentID:        agentID,
+		Name:           "worker",
+		State:          tool.AgentStateIdle,
+		ResponseStatus: tool.DelegateResponseCompleted,
+	})
+	want := `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"idle","response":""}`
+	if got != want {
+		t.Fatalf("formatForeground() = %q, want %q", got, want)
+	}
+}
+
+func TestFormatForegroundPreservesEmptyDeliveryAwareCompletedResponse(t *testing.T) {
+	t.Parallel()
+
+	agentID := mustParseUUID(t, "55555555-5555-4555-8555-555555555555")
+	got := formatForeground(tool.DelegateResult{
+		AgentID:        agentID,
+		Name:           "worker",
+		State:          tool.AgentStateIdle,
+		DeliveryStatus: tool.DelegateDeliveryInjected,
+		ResponseStatus: tool.DelegateResponseCompleted,
+	})
+	want := `{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"idle","delivery_status":"injected","response_status":"completed","response":""}`
 	if got != want {
 		t.Fatalf("formatForeground() = %q, want %q", got, want)
 	}
@@ -179,7 +215,7 @@ func TestFormatForegroundBoundsEncodedEscapedResponse(t *testing.T) {
 	if err := json.Unmarshal([]byte(result), &decoded); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v", err)
 	}
-	if decoded.Response == "" || strings.Trim(decoded.Response, "\x01") != "" {
+	if decoded.Response == nil || *decoded.Response == "" || strings.Trim(*decoded.Response, "\x01") != "" {
 		t.Fatal("decoded response did not preserve the escaped response prefix")
 	}
 }
