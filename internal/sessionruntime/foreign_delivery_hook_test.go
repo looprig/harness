@@ -454,6 +454,57 @@ func TestForeignDeliveryHookRestoredCompletionReleasesBoundCommand(t *testing.T)
 	}
 }
 
+func TestForeignDeliveryHookRestoredIntentContinuesNormalTransitions(t *testing.T) {
+	t.Parallel()
+	s, original, commands, _, intent, cmd := newForeignDeliveryHookFixture(t)
+	hook := newForeignDeliveryHook(s, original.loopID)
+	cmd.DelegateDeliveryPhase = command.DelegateDeliveryPhaseIntent
+	if err := hook.observeRestoredCommand(cmd); err != nil {
+		t.Fatalf("observeRestoredCommand: %v", err)
+	}
+	if err := hook.observeRestoredCommand(cmd); err != nil {
+		t.Fatalf("repeated observeRestoredCommand: %v", err)
+	}
+	if err := hook.CreateIntent(context.Background(), intent); err != nil {
+		t.Fatalf("idempotent CreateIntent: %v", err)
+	}
+	if got := len(commands.snapshot()); got != 0 {
+		t.Fatalf("restored idempotent CreateIntent appended %d records", got)
+	}
+	if err := hook.Reserve(context.Background(), foreign.DeliveryReservation(intent)); err != nil {
+		t.Fatalf("Reserve after restore: %v", err)
+	}
+	turnID := mustUUID()
+	if err := s.PublishEventChecked(context.Background(), event.TurnFoldedInto{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: s.sessionID, LoopID: intent.LoopID, TurnID: turnID},
+		Cause:       identity.Cause{CommandID: intent.RequestID},
+	}}); err != nil {
+		t.Fatalf("PublishEventChecked: %v", err)
+	}
+	if err := hook.Resolve(context.Background(), foreign.DeliveryResolution{LoopID: intent.LoopID, RequestID: intent.RequestID, TurnID: turnID, State: foreign.DeliveryResolutionInjected}); err != nil {
+		t.Fatalf("Resolve after restore: %v", err)
+	}
+}
+
+func TestForeignDeliveryHookRestoredIntentQueuesFallback(t *testing.T) {
+	t.Parallel()
+	s, original, commands, _, intent, cmd := newForeignDeliveryHookFixture(t)
+	hook := newForeignDeliveryHook(s, original.loopID)
+	cmd.DelegateDeliveryPhase = command.DelegateDeliveryPhaseIntent
+	if err := hook.observeRestoredCommand(cmd); err != nil {
+		t.Fatalf("observeRestoredCommand: %v", err)
+	}
+	if err := hook.Reserve(context.Background(), foreign.DeliveryReservation(intent)); err != nil {
+		t.Fatalf("Reserve after restore: %v", err)
+	}
+	if err := hook.QueueFallback(context.Background(), foreign.DeliveryFallback(intent)); err != nil {
+		t.Fatalf("QueueFallback after restore: %v", err)
+	}
+	if got := len(commands.snapshot()); got != 1 {
+		t.Fatalf("restored fallback records = %d, want 1", got)
+	}
+}
+
 func TestForeignDeliveryHookRestoredTerminalRequiresSessionRoute(t *testing.T) {
 	t.Parallel()
 	s, original, _, _, intent, cmd := newForeignDeliveryHookFixture(t)

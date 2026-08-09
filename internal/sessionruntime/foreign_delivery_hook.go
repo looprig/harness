@@ -76,6 +76,7 @@ type foreignDeliveryHook struct {
 	mu             sync.Mutex
 	commands       map[uuid.UUID]command.UserInput
 	phases         map[uuid.UUID]foreignDeliveryPhase
+	restored       map[uuid.UUID]bool
 	folds          map[uuid.UUID]uuid.UUID
 	tombstones     map[uuid.UUID]foreignDeliveryPhase
 	tombstoneOrder []uuid.UUID
@@ -88,6 +89,7 @@ func newForeignDeliveryHook(session *Session, loopID uuid.UUID) *foreignDelivery
 		session:    session,
 		commands:   make(map[uuid.UUID]command.UserInput),
 		phases:     make(map[uuid.UUID]foreignDeliveryPhase),
+		restored:   make(map[uuid.UUID]bool),
 		folds:      make(map[uuid.UUID]uuid.UUID),
 		tombstones: make(map[uuid.UUID]foreignDeliveryPhase),
 		loopID:     loopID,
@@ -217,10 +219,15 @@ func (h *foreignDeliveryHook) observeRestoredCommand(cmd command.UserInput) erro
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.phaseLocked(cmd.CommandID) != foreignDeliveryAbsent {
+	phase := h.phaseLocked(cmd.CommandID)
+	if phase != foreignDeliveryAbsent && !h.restored[cmd.CommandID] {
 		return errForeignDeliveryInvalidTransition
 	}
-	h.phases[cmd.CommandID] = foreignDeliveryRestored
+	// Restore ownership is orthogonal to the durable delivery phase. A rebound
+	// actor continues through intent/reservation/fallback, while the marker
+	// allows authoritative lifecycle evidence to release local payload state.
+	h.phases[cmd.CommandID] = foreignDeliveryIntent
+	h.restored[cmd.CommandID] = true
 	return nil
 }
 
@@ -238,6 +245,7 @@ func (h *foreignDeliveryHook) finishLocked(requestID uuid.UUID, phase foreignDel
 	delete(h.commands, requestID)
 	delete(h.folds, requestID)
 	delete(h.phases, requestID)
+	delete(h.restored, requestID)
 	if _, exists := h.tombstones[requestID]; !exists {
 		h.tombstoneOrder = append(h.tombstoneOrder, requestID)
 	}
@@ -275,7 +283,7 @@ func (h *foreignDeliveryHook) observeFold(ev event.TurnFoldedInto) {
 	}
 	h.mu.Lock()
 	phase := h.phaseLocked(ev.Cause.CommandID)
-	if phase == foreignDeliveryRestored {
+	if h.restored[ev.Cause.CommandID] && phase != foreignDeliveryReserved {
 		h.finishLocked(ev.Cause.CommandID, foreignDeliveryRestoredDone)
 		h.mu.Unlock()
 		return
@@ -295,7 +303,7 @@ func (h *foreignDeliveryHook) observeRestoredStart(ev event.TurnStarted) {
 		return
 	}
 	h.mu.Lock()
-	if h.phaseLocked(ev.Cause.CommandID) == foreignDeliveryRestored {
+	if h.restored[ev.Cause.CommandID] {
 		h.finishLocked(ev.Cause.CommandID, foreignDeliveryRestoredDone)
 	}
 	h.mu.Unlock()
@@ -306,7 +314,7 @@ func (h *foreignDeliveryHook) observeRestoredTerminal(sessionID, loopID, request
 		return
 	}
 	h.mu.Lock()
-	if h.phaseLocked(requestID) == foreignDeliveryRestored {
+	if h.restored[requestID] {
 		h.finishLocked(requestID, foreignDeliveryRestoredDone)
 	}
 	h.mu.Unlock()
@@ -349,6 +357,9 @@ func (h *foreignDeliveryHook) CreateIntent(ctx context.Context, intent foreign.D
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.phases[intent.RequestID] == foreignDeliveryIntent && h.restored[intent.RequestID] {
+		return nil
+	}
 	if h.phaseLocked(intent.RequestID) != foreignDeliveryAbsent {
 		return errForeignDeliveryInvalidTransition
 	}
