@@ -2083,8 +2083,8 @@ func TestAgentForegroundTimeoutPreservesPersistentAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("timed MessageAgent: %v", err)
 	}
-	if result.ResponseStatus != tool.DelegateResponseTimedOut || result.State != tool.AgentStateIdle || result.Response != "" {
-		t.Fatalf("timeout result = %+v, want timed-out empty response/idle", result)
+	if result.ResponseStatus != tool.DelegateResponseTimedOut || result.State != tool.AgentStateWorking || result.DeliveryStatus != tool.DelegateDeliveryAcceptedPending || result.Response != "" {
+		t.Fatalf("timeout result = %+v, want timed-out empty response/working/accepted_pending", result)
 	}
 	status, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: started.AgentID})
 	if err != nil {

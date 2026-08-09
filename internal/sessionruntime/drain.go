@@ -2,6 +2,7 @@ package sessionruntime
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/looprig/core/content"
@@ -32,9 +33,19 @@ func (e *drainFailedError) Unwrap() error { return e.Cause }
 // TurnInterrupted terminal — the caller went away (ctx cancel) and the helper's
 // fail-safe interrupt stopped the loop, or a distributed Interrupt reached it.
 // There is no partial result.
-type drainInterruptedError struct{}
+type drainInterruptedError struct {
+	// observer reports that the caller's observation context expired before a
+	// correlated target terminal was observed. A target TurnInterrupted uses the
+	// zero value and therefore still represents an idle terminal agent.
+	observer bool
+}
 
 func (e *drainInterruptedError) Error() string { return "drain: turn interrupted" }
+
+func drainObserverExpired(err error) bool {
+	var interrupted *drainInterruptedError
+	return errors.As(err, &interrupted) && interrupted.observer
+}
 
 // drainCancelledError reports that an admitted queued delegate request left the
 // child inbox before it ever opened a turn.
@@ -167,7 +178,7 @@ func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid
 				if interrupt != nil {
 					go interrupt()
 				}
-				return "", &drainInterruptedError{}
+				return "", &drainInterruptedError{observer: true}
 			}
 			ctxClosed = true
 			if !fired {

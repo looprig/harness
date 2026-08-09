@@ -371,11 +371,14 @@ func countMessageAgentHandbacks(records []journal.JournalRecord, requestID uuid.
 func TestMessageAgentRestoreRejectsContradictoryCorrelation(t *testing.T) {
 	t.Parallel()
 	const (
-		terminalLoopMismatch = "terminal loop mismatch"
-		requestMappedTwice   = "request mapped to multiple turns"
-		incompatibleTerminal = "incompatible terminals"
-		stateTerminal        = "delivery state plus terminal"
-		stateCancellation    = "delivery state plus cancellation"
+		terminalLoopMismatch  = "terminal loop mismatch"
+		requestMappedTwice    = "request mapped to multiple turns"
+		incompatibleTerminal  = "incompatible terminals"
+		stateTerminal         = "delivery state plus terminal"
+		stateCancellation     = "delivery state plus cancellation"
+		openingLoopMismatch   = "opening loop mismatch"
+		foldedLoopMismatch    = "folded loop mismatch"
+		cancelledLoopMismatch = "cancelled loop mismatch"
 	)
 	for _, tt := range []struct {
 		name   string
@@ -411,6 +414,21 @@ func TestMessageAgentRestoreRejectsContradictoryCorrelation(t *testing.T) {
 			return []event.Event{
 				event.DelegateDeliveryStateChanged{Header: event.Header{Coordinates: identity.Coordinates{SessionID: mustUUID()}, EventID: mustUUID()}, RequestID: requestID, TargetLoopID: childID, State: event.DelegateDeliveryResolvedUntrackable},
 				event.InputCancelled{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID}, Cause: identity.Cause{CommandID: requestID}}, Reason: event.CancelClientRetracted},
+			}
+		}},
+		{name: openingLoopMismatch, events: func(_, wrongLoop, requestID, turnA, _ uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: wrongLoop, TurnID: turnA}, Cause: identity.Cause{CommandID: requestID}}},
+			}
+		}},
+		{name: foldedLoopMismatch, events: func(_, wrongLoop, requestID, turnA, _ uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnFoldedInto{Header: event.Header{Coordinates: identity.Coordinates{LoopID: wrongLoop, TurnID: turnA}, Cause: identity.Cause{CommandID: requestID}}},
+			}
+		}},
+		{name: cancelledLoopMismatch, events: func(_, wrongLoop, requestID, _, _ uuid.UUID) []event.Event {
+			return []event.Event{
+				event.InputCancelled{Header: event.Header{Coordinates: identity.Coordinates{LoopID: wrongLoop}, Cause: identity.Cause{CommandID: requestID}}, Reason: event.CancelClientRetracted},
 			}
 		}},
 	} {

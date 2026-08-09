@@ -197,6 +197,9 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	combined := make([]event.Event, 0, len(replayed)+len(closures))
 	combined = append(combined, replayed...)
 	combined = append(combined, closures...)
+	if err := validateDelegateRestoreCorrelations(combined, intents); err != nil {
+		return err
+	}
 	index := make(map[uuid.UUID]resolvedRequest)
 	deliveryUnknown := make(map[uuid.UUID]struct{})
 	deliveryStates := make(map[uuid.UUID]struct{})
@@ -416,8 +419,25 @@ func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.
 	}
 	deliveryStates := make(map[uuid.UUID]struct{})
 	cancellations := make(map[uuid.UUID]struct{})
+	validateTargetRoute := func(requestID, loopID uuid.UUID) error {
+		if requestID.IsZero() {
+			return nil
+		}
+		if target, admitted := intents[requestID]; admitted && loopID != target {
+			return &journal.CommandRouteMismatchError{RecordLoopID: loopID, TargetLoopID: target}
+		}
+		return nil
+	}
 	for _, ev := range events {
 		switch typed := ev.(type) {
+		case event.TurnStarted:
+			if err := validateTargetRoute(typed.Cause.CommandID, typed.LoopID); err != nil {
+				return err
+			}
+		case event.TurnFoldedInto:
+			if err := validateTargetRoute(typed.Cause.CommandID, typed.LoopID); err != nil {
+				return err
+			}
 		case event.DelegateDeliveryStateChanged:
 			if typed.RequestID.IsZero() {
 				continue
@@ -436,6 +456,9 @@ func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.
 				deliveryStates[typed.RequestID] = struct{}{}
 			}
 		case event.InputCancelled:
+			if err := validateTargetRoute(typed.Cause.CommandID, typed.LoopID); err != nil {
+				return err
+			}
 			if !typed.Cause.CommandID.IsZero() {
 				cancellations[typed.Cause.CommandID] = struct{}{}
 			}
@@ -516,6 +539,12 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 	}
 	phased, err := phasedBackgroundCommands(records)
 	if err != nil {
+		return nil, err
+	}
+	combined := make([]event.Event, 0, len(replayed)+len(closures))
+	combined = append(combined, replayed...)
+	combined = append(combined, closures...)
+	if err := validateDelegateRestoreCorrelations(combined, intents); err != nil {
 		return nil, err
 	}
 
@@ -610,7 +639,7 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 	requestOpened := make(map[uuid.UUID]struct{})
 	requestTerminal := make(map[uuid.UUID]struct{})
 	requestDeliveryState := make(map[uuid.UUID]struct{})
-	for _, ev := range append(append([]event.Event(nil), replayed...), closures...) {
+	for _, ev := range combined {
 		commandID := ev.EventHeader().Cause.CommandID
 		switch typed := ev.(type) {
 		case event.TurnStarted:
@@ -683,7 +712,7 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 			requestIDs = append(requestIDs, requestID)
 		}
 	}
-	terminals, err := foldDelegateTerminalsChecked(append(append([]event.Event(nil), replayed...), closures...))
+	terminals, err := foldDelegateTerminalsChecked(combined)
 	if err != nil {
 		return nil, err
 	}
@@ -1142,6 +1171,7 @@ func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.U
 			}
 		}
 		text, err := drainDelegateAnswerObservedWithDisposition(waitCtx, sub, requestID, interrupt, tracked.markOpening)
+		observerExpired := drainObserverExpired(err)
 		status := statusFromDrain(err)
 		if status == tool.DelegateStatusInterrupted && didTimeout(timeoutSeconds, waitCtx) {
 			status = tool.DelegateStatusTimedOut
@@ -1152,7 +1182,11 @@ func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.U
 		tracked.markTerminal()
 		var blocks []content.Block
 		if suppressInterrupt {
-			blocks = backgroundCompletionBlocks(childID, name, requestID, status, text, tracked.openingStatus())
+			deliveryStatus := tracked.openingStatus()
+			if deliveryStatus == "" && observerExpired {
+				deliveryStatus = tool.DelegateDeliveryAcceptedPending
+			}
+			blocks = backgroundCompletionBlocksWithState(childID, name, requestID, status, text, deliveryStatus, observerExpired)
 		} else {
 			blocks = backgroundCompletionBlocks(childID, name, requestID, status, text)
 		}
@@ -1631,10 +1665,18 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 		if status == tool.DelegateStatusFailed && text == "" {
 			text = delegateFailureDetail(err)
 		}
+		observerExpired := drainObserverExpired(err)
 		tracked.markTerminal()
 		result := c.responseResult(s, childID, requestID, status, text)
+		if observerExpired {
+			result.State = tool.AgentStateWorking
+		}
 		if nativeMessage {
-			result.DeliveryStatus = tracked.openingStatus()
+			deliveryStatus := tracked.openingStatus()
+			if deliveryStatus == "" && observerExpired {
+				deliveryStatus = tool.DelegateDeliveryAcceptedPending
+			}
+			result.DeliveryStatus = deliveryStatus
 		}
 		if req.Name != "" {
 			result.Name = req.Name
@@ -1692,8 +1734,16 @@ func backgroundCompletionBlocks(agentID uuid.UUID, name string, correlationID uu
 	if len(deliveryStatus) > 0 {
 		disposition = deliveryStatus[0]
 	}
+	return backgroundCompletionBlocksWithState(agentID, name, correlationID, status, response, disposition, false)
+}
+
+func backgroundCompletionBlocksWithState(agentID uuid.UUID, name string, correlationID uuid.UUID, status tool.DelegateStatusValue, response string, disposition tool.DelegateDeliveryStatus, working bool) []content.Block {
+	state := tool.AgentStateIdle
+	if working {
+		state = tool.AgentStateWorking
+	}
 	envelope := backgroundCompletionEnvelope{
-		AgentID: agentID.String(), Name: boundUTF8(name, 4096), State: tool.AgentStateIdle, DeliveryStatus: disposition,
+		AgentID: agentID.String(), Name: boundUTF8(name, 4096), State: state, DeliveryStatus: disposition,
 		ResponseStatus: responseStatus(status), CorrelationID: correlationID.String(),
 	}
 	response = boundUTF8(response, maxDelegateOutputBytes)
