@@ -303,12 +303,17 @@ func TestCollabBrokerResultGoldenJSONOmitsInternalIdentity(t *testing.T) {
 func TestCollabBrokerAuthenticatesEachCapabilityToItsController(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	var peerChecks int
 	b := &collabBroker{
 		ctx:         ctx,
 		principals:  make(map[[32]byte]*collabPrincipal),
 		byLoop:      make(map[uuid.UUID]*collabPrincipal),
 		connections: make(map[net.Conn]*collabPrincipal),
 		globalCalls: make(chan struct{}, collabMaxConcurrent),
+		peerUID: func(net.Conn) (uint32, bool) {
+			peerChecks++
+			return collabUID(), true
+		},
 	}
 	controller := &recordingDelegateController{}
 	token := bytes.Repeat([]byte{0x44}, collabCapabilityBytes)
@@ -359,6 +364,167 @@ func TestCollabBrokerAuthenticatesEachCapabilityToItsController(t *testing.T) {
 	if called != 1 {
 		t.Fatalf("controller calls = %d, want 1", called)
 	}
+	if peerChecks != 1 {
+		t.Fatalf("peer credential checks = %d, want 1", peerChecks)
+	}
+}
+
+func TestCollabBrokerDeadlineSetupFailureIsBoundedAndFixed(t *testing.T) {
+	const secret = "deadline-failure-secret-token"
+	conn := &deadlineFailureConn{admissionProbeConn: admissionProbeConn{secret: secret}}
+	b := newCollabAdmissionTestBroker(func(net.Conn) (uint32, bool) {
+		return collabUID(), true
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- b.handle(conn) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errCollabBrokerProtocol) {
+			t.Fatalf("handle() error = %v, want fixed protocol error", err)
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("handle() error leaked secret: %v", err)
+		}
+		if conn.readCalls != 0 {
+			t.Fatalf("handler read %d bytes before rejecting deadline setup", conn.readCalls)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handler did not terminate after deadline setup failure")
+	}
+}
+
+func TestCollabBrokerRejectsPeerCredentialFailureAndWrongUIDBeforeTokenAuth(t *testing.T) {
+	const secret = "peer-admission-secret-token"
+	tests := []struct {
+		name string
+		peer func(net.Conn) (uint32, bool)
+	}{
+		{
+			name: "credential syscall failure",
+			peer: func(net.Conn) (uint32, bool) { return 0, false },
+		},
+		{
+			name: "wrong uid",
+			peer: func(net.Conn) (uint32, bool) { return collabUID() + 1, true },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conn := &admissionProbeConn{secret: secret}
+			b := newCollabAdmissionTestBroker(tt.peer)
+
+			done := make(chan error, 1)
+			go func() { done <- b.handle(conn) }()
+			select {
+			case err := <-done:
+				if !errors.Is(err, errCollabBrokerAuthentication) {
+					t.Fatalf("handle() error = %v, want fixed authentication error", err)
+				}
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("handle() error leaked secret: %v", err)
+				}
+				if conn.readCalls != 0 {
+					t.Fatalf("handler read token before peer rejection: %d reads", conn.readCalls)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("handler did not terminate after peer rejection")
+			}
+		})
+	}
+}
+
+func TestCollabBrokerCloseReturnsAtDeadlineForNonCooperativeController(t *testing.T) {
+	if !collabPlatformSupported() {
+		t.Skip("collaboration broker requires Unix-domain sockets")
+	}
+	s := &Session{sessionID: mustUUID(), sessionCtx: context.Background()}
+	b, err := newCollabBroker(s)
+	if err != nil {
+		t.Skipf("Unix socket unavailable in this runner: %v", err)
+	}
+	controller := newNonCooperativeDelegateController()
+	t.Cleanup(func() {
+		controller.release()
+		_ = b.Close(context.Background())
+	})
+	descriptor, err := b.Mint(mustUUID(), controller)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	conn, err := net.Dial("unix", descriptor.Endpoint())
+	if err != nil {
+		t.Fatalf("dial broker: %v", err)
+	}
+	defer conn.Close()
+	if err := writeCollabFrame(conn, descriptor.Capability(), collabCapabilityBytes); err != nil {
+		t.Fatalf("write capability: %v", err)
+	}
+	request := []byte(`{"agent_id":"55555555-5555-4555-8555-555555555555","message":"noncooperative","wait_for_response":false}`)
+	if err := writeCollabFrame(conn, request, collabMaxArgumentBytes); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	select {
+	case <-controller.entered:
+	case <-time.After(time.Second):
+		t.Fatal("controller did not receive admitted call")
+	}
+
+	const releaseDelay = 500 * time.Millisecond
+	time.AfterFunc(releaseDelay, controller.release)
+	closeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err = b.Close(closeCtx)
+	elapsed := time.Since(started)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close() error = %v, want context deadline", err)
+	}
+	if elapsed >= releaseDelay/2 {
+		t.Fatalf("Close() waited for non-cooperative controller: %v", elapsed)
+	}
+	if _, statErr := os.Stat(descriptor.Endpoint()); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("broker endpoint stat = %v, want removed before handler release", statErr)
+	}
+
+	controller.release()
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Second)
+	defer cleanupCancel()
+	if err := b.Close(cleanupCtx); err != nil {
+		t.Fatalf("Close() after controller release: %v", err)
+	}
+}
+
+func newCollabAdmissionTestBroker(peerUID func(net.Conn) (uint32, bool)) *collabBroker {
+	return &collabBroker{
+		ctx:         context.Background(),
+		principals:  make(map[[32]byte]*collabPrincipal),
+		byLoop:      make(map[uuid.UUID]*collabPrincipal),
+		connections: make(map[net.Conn]*collabPrincipal),
+		globalCalls: make(chan struct{}, collabMaxConcurrent),
+		peerUID:     peerUID,
+	}
+}
+
+func FuzzDecodeCollabRequest(f *testing.F) {
+	seeds := [][]byte{
+		[]byte(`{"agent_id":"55555555-5555-4555-8555-555555555555","message":"hello"}`),
+		[]byte(`{"agent_id":null,"message":"hello"}`),
+		[]byte(`not-json`),
+		[]byte{0xff, 0xfe, 0xfd},
+	}
+	for _, seed := range seeds {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		request, err := decodeCollabRequest(raw)
+		if err != nil {
+			return
+		}
+		if request.agentID.IsZero() || strings.TrimSpace(request.message) == "" {
+			t.Fatalf("successful decode produced invalid request: %#v", request)
+		}
+	})
 }
 
 type blockingDelegateController struct{}
@@ -366,6 +532,26 @@ type blockingDelegateController struct{}
 func (*blockingDelegateController) Execute(ctx context.Context, _ tool.DelegateRequest) (tool.DelegateResult, error) {
 	<-ctx.Done()
 	return tool.DelegateResult{}, ctx.Err()
+}
+
+type nonCooperativeDelegateController struct {
+	entered   chan struct{}
+	releaseCh chan struct{}
+	once      sync.Once
+}
+
+func newNonCooperativeDelegateController() *nonCooperativeDelegateController {
+	return &nonCooperativeDelegateController{entered: make(chan struct{}), releaseCh: make(chan struct{})}
+}
+
+func (c *nonCooperativeDelegateController) Execute(context.Context, tool.DelegateRequest) (tool.DelegateResult, error) {
+	close(c.entered)
+	<-c.releaseCh
+	return tool.DelegateResult{AgentID: mustUUID(), Name: "worker", State: tool.AgentStateIdle}, nil
+}
+
+func (c *nonCooperativeDelegateController) release() {
+	c.once.Do(func() { close(c.releaseCh) })
 }
 
 type testConn struct{}
@@ -383,6 +569,25 @@ type testAddr string
 
 func (a testAddr) Network() string { return "test" }
 func (a testAddr) String() string  { return string(a) }
+
+type admissionProbeConn struct {
+	testConn
+	secret    string
+	readCalls int
+}
+
+func (c *admissionProbeConn) Read([]byte) (int, error) {
+	c.readCalls++
+	return 0, errors.New(c.secret)
+}
+
+type deadlineFailureConn struct {
+	admissionProbeConn
+}
+
+func (c *deadlineFailureConn) SetReadDeadline(time.Time) error {
+	return errors.New(c.secret)
+}
 
 type shortWriter struct{ buf []byte }
 

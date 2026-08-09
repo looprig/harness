@@ -8,6 +8,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func collabPeerUIDSupported() bool { return true }
+
 func collabPeerUID(conn net.Conn) (uint32, bool) {
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {

@@ -133,7 +133,10 @@ type collabBroker struct {
 	connectionSlots chan struct{}
 	globalCalls     chan struct{}
 	acceptDone      chan struct{}
-	handlers        sync.WaitGroup
+	handlersDone    chan struct{}
+	handlerCount    int
+	readDeadline    func(net.Conn, time.Time) error
+	peerUID         func(net.Conn) (uint32, bool)
 	closeOnce       sync.Once
 }
 
@@ -253,6 +256,8 @@ func newCollabBrokerAt(session *Session, root, socketName string) (*collabBroker
 		ctx = session.sessionCtx
 	}
 	brokerCtx, cancel := context.WithCancel(ctx)
+	handlersDone := make(chan struct{})
+	close(handlersDone)
 	b := &collabBroker{
 		endpoint:        endpoint,
 		dir:             root,
@@ -265,6 +270,7 @@ func newCollabBrokerAt(session *Session, root, socketName string) (*collabBroker
 		connectionSlots: make(chan struct{}, collabMaxConcurrent*2),
 		globalCalls:     make(chan struct{}, collabMaxConcurrent),
 		acceptDone:      make(chan struct{}),
+		handlersDone:    handlersDone,
 	}
 	go b.acceptLoop()
 	go func() {
@@ -375,10 +381,13 @@ func (b *collabBroker) acceptLoop() {
 				continue
 			}
 		}
-		b.handlers.Add(1)
+		if b.handlerCount == 0 {
+			b.handlersDone = make(chan struct{})
+		}
+		b.handlerCount++
 		b.mu.Unlock()
 		go func() {
-			defer b.handlers.Done()
+			defer b.finishHandler()
 			if b.connectionSlots != nil {
 				defer func() { <-b.connectionSlots }()
 			}
@@ -387,15 +396,26 @@ func (b *collabBroker) acceptLoop() {
 	}
 }
 
-func (b *collabBroker) handle(conn net.Conn) {
-	if conn == nil {
-		return
+func (b *collabBroker) finishHandler() {
+	b.mu.Lock()
+	if b.handlerCount > 0 {
+		b.handlerCount--
+		if b.handlerCount == 0 && b.handlersDone != nil {
+			close(b.handlersDone)
+		}
+	}
+	b.mu.Unlock()
+}
+
+func (b *collabBroker) handle(conn net.Conn) error {
+	if b == nil || conn == nil {
+		return errCollabBrokerProtocol
 	}
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
 		_ = conn.Close()
-		return
+		return errCollabBrokerClosed
 	}
 	if b.connections == nil {
 		b.connections = make(map[net.Conn]*collabPrincipal)
@@ -409,19 +429,24 @@ func (b *collabBroker) handle(conn net.Conn) {
 		_ = conn.Close()
 	}()
 
-	_ = conn.SetReadDeadline(time.Now().Add(collabAdmissionTimeout))
-	peerUID, peerOK := collabPeerUID(conn)
+	if err := b.setAdmissionReadDeadline(conn, time.Now().Add(collabAdmissionTimeout)); err != nil {
+		return errCollabBrokerProtocol
+	}
+	peerUID, peerOK := b.peerCredentials(conn)
 	if peerOK && peerUID != collabUID() {
-		return
+		return errCollabBrokerAuthentication
+	}
+	if b.peerCredentialsRequired() && !peerOK {
+		return errCollabBrokerAuthentication
 	}
 	token, err := readCollabHandshake(conn)
 	if err != nil {
-		return
+		return err
 	}
 	digest := sha256.Sum256(token)
 	p := b.lookupDigest(digest)
 	if p == nil {
-		return
+		return errCollabBrokerAuthentication
 	}
 	p.attachConnection(conn)
 	defer p.detachConnection(conn)
@@ -430,21 +455,26 @@ func (b *collabBroker) handle(conn net.Conn) {
 	b.mu.Unlock()
 	payload, err := readCollabFrame(conn, collabMaxArgumentBytes)
 	if err != nil {
-		return
+		return err
 	}
 	req, err := decodeCollabRequest(payload)
 	if err != nil {
-		return
+		return err
 	}
 	callCtx, release, ok := b.beginCall(p, conn)
 	if !ok {
-		return
+		return errCollabBrokerLimit
 	}
 	defer release()
 	// The admission deadline ends after the request frame. MessageAgent's
 	// response timeout is owned by the scoped controller and is intentionally
 	// independent from this broker's I/O budget.
-	_ = conn.SetReadDeadline(time.Time{})
+	if err := b.setAdmissionReadDeadline(conn, time.Time{}); err != nil {
+		return errCollabBrokerProtocol
+	}
+	if b.isClosed() {
+		return errCollabBrokerClosed
+	}
 	result, err := p.controller.Execute(callCtx, tool.DelegateRequest{
 		Operation:       tool.DelegateSend,
 		AgentID:         req.agentID,
@@ -453,16 +483,56 @@ func (b *collabBroker) handle(conn net.Conn) {
 		TimeoutSeconds:  req.timeoutSeconds,
 	})
 	if err != nil {
-		return
+		return errCollabBrokerProtocol
+	}
+	if b.isClosed() {
+		return errCollabBrokerClosed
 	}
 	encoded, err := encodeCollabResult(result)
 	if err != nil {
-		return
+		return errCollabBrokerProtocol
 	}
 	if err := conn.SetWriteDeadline(time.Now().Add(collabIOTimeout)); err != nil {
-		return
+		return errCollabBrokerProtocol
 	}
-	_ = writeCollabFrame(conn, encoded, collabMaxFrameBytes)
+	if b.isClosed() {
+		return errCollabBrokerClosed
+	}
+	if err := writeCollabFrame(conn, encoded, collabMaxFrameBytes); err != nil {
+		return errCollabBrokerProtocol
+	}
+	return nil
+}
+
+func (b *collabBroker) setAdmissionReadDeadline(conn net.Conn, deadline time.Time) error {
+	if b != nil && b.readDeadline != nil {
+		return b.readDeadline(conn, deadline)
+	}
+	return conn.SetReadDeadline(deadline)
+}
+
+func (b *collabBroker) peerCredentials(conn net.Conn) (uint32, bool) {
+	if b != nil && b.peerUID != nil {
+		return b.peerUID(conn)
+	}
+	if !collabPeerUIDSupported() {
+		return 0, false
+	}
+	return collabPeerUID(conn)
+}
+
+func (b *collabBroker) peerCredentialsRequired() bool {
+	return b == nil || b.peerUID != nil || collabPeerUIDSupported()
+}
+
+func (b *collabBroker) isClosed() bool {
+	if b == nil {
+		return true
+	}
+	b.mu.RLock()
+	closed := b.closed
+	b.mu.RUnlock()
+	return closed
 }
 
 type decodedCollabRequest struct {
@@ -687,8 +757,10 @@ func (p *collabPrincipal) revoke() {
 }
 
 // Close revokes every origin, closes the endpoint, and waits for all admitted
-// calls to release. It never waits while holding broker locks, which keeps
-// shutdown/revocation race-safe with connection handlers.
+// calls to release while the caller's context remains live. It never waits
+// while holding broker locks, which keeps shutdown/revocation race-safe with
+// connection handlers. A non-cooperative controller can outlive a timed
+// Close; the authority and endpoint are still removed before that deadline.
 func (b *collabBroker) Close(ctx context.Context) error {
 	if b == nil {
 		return nil
@@ -718,28 +790,28 @@ func (b *collabBroker) Close(ctx context.Context) error {
 		for _, conn := range connections {
 			_ = conn.Close()
 		}
-		go func() {
-			<-b.acceptDone
-			b.handlers.Wait()
-			_ = os.Remove(b.endpoint)
-			_ = os.Remove(b.dir)
-		}()
+		_ = os.Remove(b.endpoint)
+		_ = os.Remove(b.dir)
 	})
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// closeOnce's cleanup goroutine has no externally visible completion channel;
-	// the handler wait is bounded here and the endpoint is removed by that owner.
 	if b.acceptDone == nil {
-		_ = os.Remove(b.endpoint)
-		_ = os.Remove(b.dir)
 		return nil
 	}
 	select {
 	case <-b.acceptDone:
-		b.handlers.Wait()
-		_ = os.Remove(b.endpoint)
-		_ = os.Remove(b.dir)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	b.mu.RLock()
+	handlersDone := b.handlersDone
+	b.mu.RUnlock()
+	if handlersDone == nil {
+		return nil
+	}
+	select {
+	case <-handlersDone:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

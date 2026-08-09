@@ -1,8 +1,10 @@
-//go:build aix || dragonfly || freebsd || hurd || illumos || netbsd || openbsd || solaris
+//go:build aix || android || dragonfly || freebsd || hurd || illumos || ios || netbsd || openbsd || solaris
 
 package sessionruntime
 
 import "net"
+
+func collabPeerUIDSupported() bool { return false }
 
 // Some Unix variants expose peer credentials through platform-specific APIs;
 // when this narrow build does not expose one, the broker still enforces the

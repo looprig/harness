@@ -4,6 +4,8 @@ package sessionruntime
 
 import "net"
 
+func collabPeerUIDSupported() bool { return false }
+
 func collabPlatformSupported() bool { return false }
 
 func listenCollabEndpoint(string) (net.Listener, error) {
