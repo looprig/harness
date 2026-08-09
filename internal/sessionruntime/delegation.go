@@ -422,6 +422,9 @@ func collectDelegateDeliveryStates(events []event.Event, targets map[uuid.UUID]u
 			return nil, &delegateRestoreContradictionError{requestID: state.RequestID, reason: "invalid delivery state"}
 		}
 		prior, exists := states[state.RequestID]
+		if !exists && delegateDeliveryStateTerminal(state.State) {
+			return nil, &delegateRestoreContradictionError{requestID: state.RequestID, reason: "terminal delivery state lacks reservation predecessor"}
+		}
 		if !exists || prior == state.State {
 			states[state.RequestID] = state.State
 			continue
@@ -969,7 +972,7 @@ func (m *delegationManager) readmitRestoredBackgroundRequest(s *Session, entry r
 	cmd := *entry.reAdmit
 	cmd.Accepted = make(chan error, 1)
 	if hook := s.foreignDeliveryHookFor(entry.childID); hook != nil {
-		if err := hook.bindCommand(cmd); err != nil {
+		if err := hook.observeRestoredCommand(cmd); err != nil {
 			_ = sub.Close()
 			m.removeRequest(entry.requestID, tracked)
 			if s.hub != nil && cmd.BackgroundHandBack {

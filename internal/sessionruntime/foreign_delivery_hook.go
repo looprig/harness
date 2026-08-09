@@ -24,11 +24,18 @@ const (
 	foreignDeliveryAbsent foreignDeliveryPhase = iota
 	foreignDeliveryIntent
 	foreignDeliveryReserved
+	foreignDeliveryRestored
 	foreignDeliveryFallback
 	foreignDeliveryInjected
 	foreignDeliveryUnknown
 	foreignDeliveryUntrackable
+	foreignDeliveryRestoredDone
 )
+
+// Tombstones preserve fail-closed duplicate handling without retaining every
+// completed request for the lifetime of a session. Eviction only changes a
+// duplicate into the same invalid-transition result produced for an unknown ID.
+const foreignDeliveryTombstoneLimit = 256
 
 var (
 	errForeignDeliveryInvalidCoordinate  = errors.New("foreign delivery: invalid coordinate")
@@ -37,12 +44,10 @@ var (
 	errForeignDeliveryPublicationFailed  = errors.New("foreign delivery: durable publication failed")
 )
 
-// foreignDeliveryPublicationError preserves errors.Is/errors.As for the
-// session's typed append failure while keeping the public diagnostic fixed and
+// foreignDeliveryPublicationError keeps the public diagnostic fixed and
 // bounded. Journal and adapter errors are not safe to expose: they may contain
 // storage paths, bearer material, or provider response text.
 type foreignDeliveryPublicationError struct {
-	cause error
 }
 
 func (e *foreignDeliveryPublicationError) Error() string {
@@ -50,17 +55,11 @@ func (e *foreignDeliveryPublicationError) Error() string {
 }
 
 func (e *foreignDeliveryPublicationError) Unwrap() []error {
-	if e == nil || e.cause == nil {
-		return []error{errForeignDeliveryPublicationFailed}
-	}
-	return []error{errForeignDeliveryPublicationFailed, e.cause}
+	return []error{errForeignDeliveryPublicationFailed}
 }
 
-func foreignDeliveryPublicationErrorFrom(cause error) error {
-	if cause == nil {
-		return errForeignDeliveryPublicationFailed
-	}
-	return &foreignDeliveryPublicationError{cause: cause}
+func foreignDeliveryPublicationErrorFrom(_ error) error {
+	return &foreignDeliveryPublicationError{}
 }
 
 // foreignDeliveryHook is the private session-owned implementation of the
@@ -73,21 +72,24 @@ type foreignDeliveryHook struct {
 	sessionID uuid.UUID
 	loopID    uuid.UUID
 
-	mu       sync.Mutex
-	commands map[uuid.UUID]command.UserInput
-	phases   map[uuid.UUID]foreignDeliveryPhase
-	folds    map[uuid.UUID]uuid.UUID
+	mu             sync.Mutex
+	commands       map[uuid.UUID]command.UserInput
+	phases         map[uuid.UUID]foreignDeliveryPhase
+	folds          map[uuid.UUID]uuid.UUID
+	tombstones     map[uuid.UUID]foreignDeliveryPhase
+	tombstoneOrder []uuid.UUID
 }
 
 var _ foreign.DeliveryHook = (*foreignDeliveryHook)(nil)
 
 func newForeignDeliveryHook(session *Session, loopID uuid.UUID) *foreignDeliveryHook {
 	hook := &foreignDeliveryHook{
-		session:  session,
-		commands: make(map[uuid.UUID]command.UserInput),
-		phases:   make(map[uuid.UUID]foreignDeliveryPhase),
-		folds:    make(map[uuid.UUID]uuid.UUID),
-		loopID:   loopID,
+		session:    session,
+		commands:   make(map[uuid.UUID]command.UserInput),
+		phases:     make(map[uuid.UUID]foreignDeliveryPhase),
+		folds:      make(map[uuid.UUID]uuid.UUID),
+		tombstones: make(map[uuid.UUID]foreignDeliveryPhase),
+		loopID:     loopID,
 	}
 	if session != nil {
 		hook.sessionID = session.sessionID
@@ -109,15 +111,35 @@ func (s *Session) registerForeignDeliveryHook(hook *foreignDeliveryHook) {
 }
 
 func (s *Session) recordForeignDeliveryFold(ev event.Event) {
-	fold, ok := ev.(event.TurnFoldedInto)
-	if !ok || fold.LoopID.IsZero() {
+	var loopID, requestID uuid.UUID
+	switch typed := ev.(type) {
+	case event.TurnFoldedInto:
+		loopID, requestID = typed.LoopID, typed.Cause.CommandID
+	case event.TurnStarted:
+		loopID, requestID = typed.LoopID, typed.Cause.CommandID
+	case event.InputCancelled:
+		loopID, requestID = typed.LoopID, typed.Cause.CommandID
+	case event.TurnRejected:
+		loopID, requestID = typed.LoopID, typed.Cause.CommandID
+	default:
+		return
+	}
+	if loopID.IsZero() || requestID.IsZero() {
 		return
 	}
 	s.foreignDeliveryMu.RLock()
-	hook := s.foreignDeliveryHooks[fold.LoopID]
+	hook := s.foreignDeliveryHooks[loopID]
 	s.foreignDeliveryMu.RUnlock()
-	if hook != nil {
-		hook.observeFold(fold)
+	if hook == nil {
+		return
+	}
+	switch typed := ev.(type) {
+	case event.TurnFoldedInto:
+		hook.observeFold(typed)
+	case event.TurnStarted:
+		hook.observeRestoredStart(typed)
+	case event.InputCancelled, event.TurnRejected:
+		hook.observeRestoredTerminal(loopID, requestID)
 	}
 }
 
@@ -152,8 +174,8 @@ func (h *foreignDeliveryHook) bindCommand(cmd command.UserInput) error {
 	// A terminal/fallback callback has already consumed the durable payload.
 	// Do not let a late restore bind or callback recreate an unbounded command
 	// entry for a request whose phase is no longer admitting delivery.
-	switch h.phases[cmd.CommandID] {
-	case foreignDeliveryFallback, foreignDeliveryInjected, foreignDeliveryUnknown, foreignDeliveryUntrackable:
+	switch h.phaseLocked(cmd.CommandID) {
+	case foreignDeliveryFallback, foreignDeliveryInjected, foreignDeliveryUnknown, foreignDeliveryUntrackable, foreignDeliveryRestoredDone:
 		return errForeignDeliveryInvalidTransition
 	}
 	if prior, exists := h.commands[cmd.CommandID]; exists {
@@ -172,6 +194,47 @@ func (h *foreignDeliveryHook) bindCommand(cmd command.UserInput) error {
 	return nil
 }
 
+// observeRestoredCommand binds a command being replayed by Restore and marks it
+// separately from the live intent/reservation protocol. Its payload is released
+// at the first authoritative actor boundary (TurnStarted/TurnFoldedInto).
+func (h *foreignDeliveryHook) observeRestoredCommand(cmd command.UserInput) error {
+	if err := h.bindCommand(cmd); err != nil {
+		return err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.phaseLocked(cmd.CommandID) != foreignDeliveryAbsent {
+		return errForeignDeliveryInvalidTransition
+	}
+	h.phases[cmd.CommandID] = foreignDeliveryRestored
+	return nil
+}
+
+func (h *foreignDeliveryHook) phaseLocked(requestID uuid.UUID) foreignDeliveryPhase {
+	if phase, ok := h.phases[requestID]; ok {
+		return phase
+	}
+	if phase, ok := h.tombstones[requestID]; ok {
+		return phase
+	}
+	return foreignDeliveryAbsent
+}
+
+func (h *foreignDeliveryHook) finishLocked(requestID uuid.UUID, phase foreignDeliveryPhase) {
+	delete(h.commands, requestID)
+	delete(h.folds, requestID)
+	delete(h.phases, requestID)
+	if _, exists := h.tombstones[requestID]; !exists {
+		h.tombstoneOrder = append(h.tombstoneOrder, requestID)
+	}
+	h.tombstones[requestID] = phase
+	for len(h.tombstoneOrder) > foreignDeliveryTombstoneLimit {
+		oldest := h.tombstoneOrder[0]
+		h.tombstoneOrder = h.tombstoneOrder[1:]
+		delete(h.tombstones, oldest)
+	}
+}
+
 func (h *foreignDeliveryHook) observeFold(ev event.TurnFoldedInto) {
 	if h == nil || ev.SessionID != h.sessionID || ev.LoopID != h.loopID ||
 		(!ev.Cause.LoopID.IsZero() && ev.Cause.LoopID != h.loopID) ||
@@ -179,12 +242,40 @@ func (h *foreignDeliveryHook) observeFold(ev event.TurnFoldedInto) {
 		return
 	}
 	h.mu.Lock()
-	if h.phases[ev.Cause.CommandID] != foreignDeliveryReserved {
+	phase := h.phaseLocked(ev.Cause.CommandID)
+	if phase == foreignDeliveryRestored {
+		h.finishLocked(ev.Cause.CommandID, foreignDeliveryRestoredDone)
+		h.mu.Unlock()
+		return
+	}
+	if phase != foreignDeliveryReserved {
 		h.mu.Unlock()
 		return
 	}
 	if _, exists := h.folds[ev.Cause.CommandID]; !exists {
 		h.folds[ev.Cause.CommandID] = ev.TurnID
+	}
+	h.mu.Unlock()
+}
+
+func (h *foreignDeliveryHook) observeRestoredStart(ev event.TurnStarted) {
+	if h == nil || ev.SessionID != h.sessionID || ev.LoopID != h.loopID || ev.Cause.CommandID.IsZero() {
+		return
+	}
+	h.mu.Lock()
+	if h.phaseLocked(ev.Cause.CommandID) == foreignDeliveryRestored {
+		h.finishLocked(ev.Cause.CommandID, foreignDeliveryRestoredDone)
+	}
+	h.mu.Unlock()
+}
+
+func (h *foreignDeliveryHook) observeRestoredTerminal(loopID, requestID uuid.UUID) {
+	if h == nil || loopID != h.loopID || requestID.IsZero() {
+		return
+	}
+	h.mu.Lock()
+	if h.phaseLocked(requestID) == foreignDeliveryRestored {
+		h.finishLocked(requestID, foreignDeliveryRestoredDone)
 	}
 	h.mu.Unlock()
 }
@@ -226,7 +317,7 @@ func (h *foreignDeliveryHook) CreateIntent(ctx context.Context, intent foreign.D
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.phases[intent.RequestID] != foreignDeliveryAbsent {
+	if h.phaseLocked(intent.RequestID) != foreignDeliveryAbsent {
 		return errForeignDeliveryInvalidTransition
 	}
 	cmd, ok := h.commands[intent.RequestID]
@@ -239,6 +330,8 @@ func (h *foreignDeliveryHook) CreateIntent(ctx context.Context, intent foreign.D
 		return err
 	}
 	if _, err := h.session.appendCommandResultChecked(ctx, record); err != nil {
+		delete(h.commands, intent.RequestID)
+		delete(h.folds, intent.RequestID)
 		return foreignDeliveryPublicationErrorFrom(err)
 	}
 	h.commands[intent.RequestID] = cmd
@@ -291,9 +384,7 @@ func (h *foreignDeliveryHook) QueueFallback(ctx context.Context, fallback foreig
 	if _, err := h.session.appendCommandResultChecked(ctx, record); err != nil {
 		return foreignDeliveryPublicationErrorFrom(err)
 	}
-	h.phases[fallback.RequestID] = foreignDeliveryFallback
-	delete(h.commands, fallback.RequestID)
-	delete(h.folds, fallback.RequestID)
+	h.finishLocked(fallback.RequestID, foreignDeliveryFallback)
 	return nil
 }
 
@@ -306,7 +397,7 @@ func (h *foreignDeliveryHook) Resolve(ctx context.Context, resolution foreign.De
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.phases[resolution.RequestID] != foreignDeliveryReserved {
+	if h.phaseLocked(resolution.RequestID) != foreignDeliveryReserved {
 		return errForeignDeliveryInvalidTransition
 	}
 	switch resolution.State {
@@ -314,25 +405,19 @@ func (h *foreignDeliveryHook) Resolve(ctx context.Context, resolution foreign.De
 		if turnID, ok := h.folds[resolution.RequestID]; !ok || turnID != resolution.TurnID {
 			return errForeignDeliveryInvalidTransition
 		}
-		h.phases[resolution.RequestID] = foreignDeliveryInjected
-		delete(h.commands, resolution.RequestID)
-		delete(h.folds, resolution.RequestID)
+		h.finishLocked(resolution.RequestID, foreignDeliveryInjected)
 		return nil
 	case foreign.DeliveryResolutionUnknown:
 		if err := h.publishStateChecked(ctx, resolution.RequestID, event.DelegateDeliveryResolvedUnknown); err != nil {
 			return err
 		}
-		h.phases[resolution.RequestID] = foreignDeliveryUnknown
-		delete(h.commands, resolution.RequestID)
-		delete(h.folds, resolution.RequestID)
+		h.finishLocked(resolution.RequestID, foreignDeliveryUnknown)
 		return nil
 	case foreign.DeliveryResolutionUntrackable:
 		if err := h.publishStateChecked(ctx, resolution.RequestID, event.DelegateDeliveryResolvedUntrackable); err != nil {
 			return err
 		}
-		h.phases[resolution.RequestID] = foreignDeliveryUntrackable
-		delete(h.commands, resolution.RequestID)
-		delete(h.folds, resolution.RequestID)
+		h.finishLocked(resolution.RequestID, foreignDeliveryUntrackable)
 		return nil
 	default:
 		return errForeignDeliveryInvalidTransition

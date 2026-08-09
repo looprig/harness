@@ -306,7 +306,8 @@ func TestForeignDeliveryHookPublicationErrorsAreBoundedAndRedacted(t *testing.T)
 	t.Parallel()
 	_, hook, commands, _, intent, _ := newForeignDeliveryHookFixture(t)
 	commands.mu.Lock()
-	commands.err = errors.New("bearer-secret-must-not-escape")
+	secretErr := errors.New("bearer-secret-must-not-escape")
+	commands.err = secretErr
 	commands.mu.Unlock()
 
 	err := hook.CreateIntent(context.Background(), intent)
@@ -316,8 +317,105 @@ func TestForeignDeliveryHookPublicationErrorsAreBoundedAndRedacted(t *testing.T)
 	if strings.Contains(err.Error(), "bearer-secret-must-not-escape") {
 		t.Fatalf("publication error leaked underlying secret: %q", err)
 	}
+	if errors.Is(err, secretErr) {
+		t.Fatal("publication error exposed underlying secret through errors.Is")
+	}
 	if len(err.Error()) > 128 {
 		t.Fatalf("publication error length = %d, want bounded <= 128: %q", len(err.Error()), err)
+	}
+}
+
+func TestForeignDeliveryHookFailedIntentPublicationReleasesBoundCommand(t *testing.T) {
+	t.Parallel()
+	_, hook, commands, _, intent, _ := newForeignDeliveryHookFixture(t)
+	commands.mu.Lock()
+	commands.err = errors.New("append failed")
+	commands.mu.Unlock()
+	for attempt := 0; attempt < 32; attempt++ {
+		if err := hook.CreateIntent(context.Background(), intent); err == nil {
+			t.Fatal("CreateIntent succeeded despite publication failure")
+		}
+		hook.mu.Lock()
+		retained := len(hook.commands)
+		hook.mu.Unlock()
+		if retained != 0 {
+			t.Fatalf("failed CreateIntent attempt %d retained %d command payloads", attempt, retained)
+		}
+		if err := hook.bindCommand(command.UserInput{
+			Header:       command.Header{CommandID: intent.RequestID, Agency: identity.AgencyMachine},
+			TargetLoopID: intent.LoopID,
+		}); err != nil {
+			t.Fatalf("rebind attempt %d: %v", attempt, err)
+		}
+	}
+}
+
+func TestForeignDeliveryHookTerminalStateCardinalityBounded(t *testing.T) {
+	t.Parallel()
+	_, hook, commands, _, baseIntent, _ := newForeignDeliveryHookFixture(t)
+	commands.mu.Lock()
+	commands.err = nil
+	commands.mu.Unlock()
+	if err := hook.CreateIntent(context.Background(), baseIntent); err != nil {
+		t.Fatal(err)
+	}
+	if err := hook.Reserve(context.Background(), foreign.DeliveryReservation(baseIntent)); err != nil {
+		t.Fatal(err)
+	}
+	if err := hook.Resolve(context.Background(), foreign.DeliveryResolution{LoopID: baseIntent.LoopID, RequestID: baseIntent.RequestID, State: foreign.DeliveryResolutionUnknown}); err != nil {
+		t.Fatal(err)
+	}
+	const requests = foreignDeliveryTombstoneLimit*4 + 17
+	for i := 0; i < requests; i++ {
+		requestID := mustUUID()
+		cmd := command.UserInput{
+			Header:       command.Header{CommandID: requestID, Agency: identity.AgencyMachine},
+			TargetLoopID: hook.loopID,
+		}
+		if err := hook.bindCommand(cmd); err != nil {
+			t.Fatalf("bind %d: %v", i, err)
+		}
+		intent := foreign.DeliveryIntent{LoopID: hook.loopID, RequestID: requestID}
+		if err := hook.CreateIntent(context.Background(), intent); err != nil {
+			t.Fatalf("CreateIntent %d: %v", i, err)
+		}
+		if err := hook.Reserve(context.Background(), foreign.DeliveryReservation(intent)); err != nil {
+			t.Fatalf("Reserve %d: %v", i, err)
+		}
+		if i%2 == 0 {
+			if err := hook.Resolve(context.Background(), foreign.DeliveryResolution{LoopID: hook.loopID, RequestID: requestID, State: foreign.DeliveryResolutionUnknown}); err != nil {
+				t.Fatalf("Resolve %d: %v", i, err)
+			}
+		} else if err := hook.QueueFallback(context.Background(), foreign.DeliveryFallback(intent)); err != nil {
+			t.Fatalf("QueueFallback %d: %v", i, err)
+		}
+	}
+	hook.mu.Lock()
+	phases, tombstones := len(hook.phases), len(hook.tombstones)
+	commandsRetained, foldsRetained := len(hook.commands), len(hook.folds)
+	hook.mu.Unlock()
+	if phases > foreignDeliveryTombstoneLimit || tombstones > foreignDeliveryTombstoneLimit || commandsRetained != 0 || foldsRetained != 0 {
+		t.Fatalf("hook state cardinality phases=%d tombstones=%d commands=%d folds=%d, want bounded payload-free state", phases, tombstones, commandsRetained, foldsRetained)
+	}
+}
+
+func TestForeignDeliveryHookRestoredCompletionReleasesBoundCommand(t *testing.T) {
+	t.Parallel()
+	s, original, _, _, intent, cmd := newForeignDeliveryHookFixture(t)
+	hook := newForeignDeliveryHook(s, original.loopID)
+	cmd.DelegateDeliveryPhase = command.DelegateDeliveryPhaseIntent
+	if err := hook.observeRestoredCommand(cmd); err != nil {
+		t.Fatalf("observeRestoredCommand: %v", err)
+	}
+	hook.observeFold(event.TurnFoldedInto{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: hook.sessionID, LoopID: intent.LoopID, TurnID: mustUUID()},
+		Cause:       identity.Cause{CommandID: intent.RequestID},
+	}})
+	hook.mu.Lock()
+	commandsRetained, foldsRetained := len(hook.commands), len(hook.folds)
+	hook.mu.Unlock()
+	if commandsRetained != 0 || foldsRetained != 0 {
+		t.Fatalf("restored completion retained payload state commands=%d folds=%d", commandsRetained, foldsRetained)
 	}
 }
 

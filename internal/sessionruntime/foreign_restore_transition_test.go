@@ -162,3 +162,26 @@ func TestRestoreResolvedUnknownThenFoldFailsClosed(t *testing.T) {
 		t.Fatalf("unknown+fold restore error = %T %v, want contradiction", err, err)
 	}
 }
+
+func TestRestoreTerminalDeliveryStateRequiresReservation(t *testing.T) {
+	t.Parallel()
+	for _, state := range []event.DelegateDeliveryState{
+		event.DelegateDeliveryResolvedUnknown,
+		event.DelegateDeliveryResolvedUntrackable,
+	} {
+		state := state
+		t.Run(string(state), func(t *testing.T) {
+			t.Parallel()
+			sessionID, childID, requestID := mustUUID(), mustUUID(), mustUUID()
+			records := []journal.JournalRecord{
+				journal.NewCommandRecord(sessionID, childID, phasedBackgroundCommand(requestID, childID, command.DelegateDeliveryPhaseIntent)),
+			}
+			events := []event.Event{deliveryResolutionEvent(sessionID, requestID, childID, state)}
+			err := seedResolvedDelegateRecords(newDelegationManager(Topology{}), records, events, nil)
+			var contradiction *delegateRestoreContradictionError
+			if !errors.As(err, &contradiction) {
+				t.Fatalf("terminal without reservation error = %T %v, want contradiction", err, err)
+			}
+		})
+	}
+}
