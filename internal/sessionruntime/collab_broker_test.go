@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -492,6 +493,111 @@ func TestCollabBrokerCloseReturnsAtDeadlineForNonCooperativeController(t *testin
 	defer cleanupCancel()
 	if err := b.Close(cleanupCtx); err != nil {
 		t.Fatalf("Close() after controller release: %v", err)
+	}
+}
+
+func TestCollabBrokerWatcherDoesNotOutliveNonCooperativeHandler(t *testing.T) {
+	if !collabPlatformSupported() {
+		t.Skip("collaboration broker requires Unix-domain sockets")
+	}
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	s := &Session{sessionID: mustUUID(), sessionCtx: sessionCtx}
+	b, err := newCollabBroker(s)
+	if err != nil {
+		t.Skipf("Unix socket unavailable in this runner: %v", err)
+	}
+	controller := newNonCooperativeDelegateController()
+	var conn net.Conn
+	t.Cleanup(func() {
+		// Keep the controller permanently blocked through every lifecycle
+		// assertion above. Release it only after broker-owned goroutines have
+		// been proven bounded so cleanup can reap the intentionally retained
+		// external handler.
+		controller.release()
+		sessionCancel()
+		if conn != nil {
+			_ = conn.Close()
+		}
+		_ = b.Close(context.Background())
+	})
+	descriptor, err := b.Mint(mustUUID(), controller)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	conn, err = net.Dial("unix", descriptor.Endpoint())
+	if err != nil {
+		t.Fatalf("dial broker: %v", err)
+	}
+	if err := writeCollabFrame(conn, descriptor.Capability(), collabCapabilityBytes); err != nil {
+		t.Fatalf("write capability: %v", err)
+	}
+	request := []byte(`{"agent_id":"55555555-5555-4555-8555-555555555555","message":"never-release","wait_for_response":false}`)
+	if err := writeCollabFrame(conn, request, collabMaxArgumentBytes); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	select {
+	case <-controller.entered:
+	case <-time.After(time.Second):
+		t.Fatal("controller did not receive admitted call")
+	}
+
+	// Exercise the owning session cancellation path before the explicit caller
+	// join. The watcher must stop itself without waiting for this controller.
+	sessionCancel()
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer closeCancel()
+	if err := b.Close(closeCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close() error = %v, want context deadline", err)
+	}
+	if b.HasRawCapability(descriptor.Capability()) {
+		t.Fatal("capability remained authenticated after bounded close")
+	}
+	if _, statErr := os.Stat(descriptor.Endpoint()); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("broker endpoint stat = %v, want removed before handler release", statErr)
+	}
+	select {
+	case <-b.acceptDone:
+	case <-time.After(time.Second):
+		t.Fatal("broker accept goroutine did not finish")
+	}
+	select {
+	case <-b.watchDone:
+	case <-time.After(time.Second):
+		t.Fatal("broker lifecycle watcher remained blocked on noncooperative handler")
+	}
+}
+
+func TestCollabBrokerCanceledSessionsHaveBoundedLifecycle(t *testing.T) {
+	if !collabPlatformSupported() {
+		t.Skip("collaboration broker requires Unix-domain sockets")
+	}
+	const sessions = 16
+	for i := 0; i < sessions; i++ {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			sessionCtx, sessionCancel := context.WithCancel(context.Background())
+			s := &Session{sessionID: mustUUID(), sessionCtx: sessionCtx}
+			b, err := newCollabBroker(s)
+			if err != nil {
+				t.Skipf("Unix socket unavailable in this runner: %v", err)
+			}
+			t.Cleanup(sessionCancel)
+			t.Cleanup(func() { _ = b.Close(context.Background()) })
+			endpoint := b.Endpoint()
+			sessionCancel()
+			select {
+			case <-b.watchDone:
+			case <-time.After(time.Second):
+				t.Fatal("broker watcher did not finish after session cancellation")
+			}
+			select {
+			case <-b.acceptDone:
+			case <-time.After(time.Second):
+				t.Fatal("broker accept goroutine did not finish after session cancellation")
+			}
+			if _, statErr := os.Stat(endpoint); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("broker endpoint stat = %v, want removed after cancellation", statErr)
+			}
+		})
 	}
 }
 

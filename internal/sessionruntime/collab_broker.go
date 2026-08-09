@@ -134,6 +134,7 @@ type collabBroker struct {
 	globalCalls     chan struct{}
 	acceptDone      chan struct{}
 	handlersDone    chan struct{}
+	watchDone       chan struct{}
 	handlerCount    int
 	readDeadline    func(net.Conn, time.Time) error
 	peerUID         func(net.Conn) (uint32, bool)
@@ -271,13 +272,29 @@ func newCollabBrokerAt(session *Session, root, socketName string) (*collabBroker
 		globalCalls:     make(chan struct{}, collabMaxConcurrent),
 		acceptDone:      make(chan struct{}),
 		handlersDone:    handlersDone,
+		watchDone:       make(chan struct{}),
 	}
 	go b.acceptLoop()
-	go func() {
-		<-brokerCtx.Done()
-		_ = b.Close(context.Background())
-	}()
+	go b.watchContext(brokerCtx)
 	return b, nil
+}
+
+// watchContext observes the broker's owning session context. Cancellation
+// revokes authority and stops admission immediately, but it deliberately does
+// not join handlers: an external controller may ignore cancellation forever,
+// and no broker-owned lifecycle goroutine may wait on it.
+func (b *collabBroker) watchContext(ctx context.Context) {
+	if b == nil {
+		return
+	}
+	if b.watchDone != nil {
+		defer close(b.watchDone)
+	}
+	if ctx == nil {
+		return
+	}
+	<-ctx.Done()
+	b.stop()
 }
 
 func (b *collabBroker) Endpoint() string {
@@ -756,14 +773,12 @@ func (p *collabPrincipal) revoke() {
 	}
 }
 
-// Close revokes every origin, closes the endpoint, and waits for all admitted
-// calls to release while the caller's context remains live. It never waits
-// while holding broker locks, which keeps shutdown/revocation race-safe with
-// connection handlers. A non-cooperative controller can outlive a timed
-// Close; the authority and endpoint are still removed before that deadline.
-func (b *collabBroker) Close(ctx context.Context) error {
+// stop revokes every origin and closes the endpoint without waiting for
+// handlers. It is the only closeOnce owner, so a context watcher and an
+// explicit Close can race without double-closing lifecycle channels.
+func (b *collabBroker) stop() {
 	if b == nil {
-		return nil
+		return
 	}
 	b.closeOnce.Do(func() {
 		b.mu.Lock()
@@ -793,6 +808,17 @@ func (b *collabBroker) Close(ctx context.Context) error {
 		_ = os.Remove(b.endpoint)
 		_ = os.Remove(b.dir)
 	})
+}
+
+// Close performs the nonblocking stop phase, then waits for broker-owned
+// admission/handler goroutines while the caller's context remains live. A
+// non-cooperative controller can outlive a timed Close; the authority and
+// endpoint are still removed before that deadline.
+func (b *collabBroker) Close(ctx context.Context) error {
+	if b == nil {
+		return nil
+	}
+	b.stop()
 	if ctx == nil {
 		ctx = context.Background()
 	}
