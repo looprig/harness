@@ -87,6 +87,16 @@ type sessionJournal struct {
 	// itself holds mu across both the fence commit and the hydration that follows
 	// it, so no external caller can observe or mutate it before hydration finishes.
 	idx *journal.IdempotencyIndex
+	// deliveryTransitions indexes the logical request state for phased delegate
+	// commands. It is guarded by mu together with idx and is updated only after
+	// the corresponding physical frame commits.
+	deliveryTransitions map[uuid.UUID]deliveryTransition
+}
+
+type deliveryTransition struct {
+	fingerprint journal.Fingerprint
+	intentSeq   uint64
+	fallbackSeq uint64
 }
 
 // Compile-time proofs that *sessionJournal honors both the plain journal.SessionJournal
@@ -133,14 +143,15 @@ func (s *Store) OpenJournalWithOpeningAppend(
 	}
 
 	j := &sessionJournal{
-		id:         id,
-		lease:      lease,
-		ledger:     s.backend.Ledger,
-		blobs:      s.backend.Blobs,
-		name:       name,
-		threshold:  s.opts.OffloadThreshold,
-		trackedTip: tip,
-		idx:        journal.NewIdempotencyIndex(),
+		id:                  id,
+		lease:               lease,
+		ledger:              s.backend.Ledger,
+		blobs:               s.backend.Blobs,
+		name:                name,
+		threshold:           s.opts.OffloadThreshold,
+		trackedTip:          tip,
+		idx:                 journal.NewIdempotencyIndex(),
+		deliveryTransitions: make(map[uuid.UUID]deliveryTransition),
 	}
 
 	// Take ownership FIRST, immediately after the tip read: on the middleware-free
@@ -215,7 +226,7 @@ func (s *Store) OpenJournalWithOpeningAppend(
 	// so the walk is skipped entirely rather than performed for no reason.
 	if tip > 0 {
 		hydrateCtx, hydrateCancel := context.WithTimeout(ctx, hydrateTimeout)
-		idx, hydrateErr := hydrateIdempotencyIndex(hydrateCtx, s.backend.Ledger, s.backend.Blobs, name)
+		idx, transitions, hydrateErr := hydrateJournalIndexes(hydrateCtx, s.backend.Ledger, s.backend.Blobs, name)
 		hydrateCancel()
 		if hydrateErr != nil {
 			// Accepted trade-off of hydrating after the fence: the fence above has
@@ -233,6 +244,7 @@ func (s *Store) OpenJournalWithOpeningAppend(
 			return nil, hydrateErr
 		}
 		j.idx = idx
+		j.deliveryTransitions = transitions
 	}
 	// Keep the index authoritative for the fence itself too. This is hygiene, not
 	// load-bearing: the fence always commits through the raw writeLocked path above
@@ -258,23 +270,88 @@ func (s *Store) OpenJournalWithOpeningAppend(
 // COMPLETE view of history the index cannot be trusted to catch a real duplicate, so
 // OpenJournal must not proceed on a partial hydration.
 func hydrateIdempotencyIndex(ctx context.Context, ledger storage.Ledger, blobs storage.Blobs, name string) (*journal.IdempotencyIndex, error) {
+	idx, _, err := hydrateJournalIndexes(ctx, ledger, blobs, name)
+	return idx, err
+}
+
+func hydrateJournalIndexes(ctx context.Context, ledger storage.Ledger, blobs storage.Blobs, name string) (*journal.IdempotencyIndex, map[uuid.UUID]deliveryTransition, error) {
 	idx := journal.NewIdempotencyIndex()
+	transitions := make(map[uuid.UUID]deliveryTransition)
 	cur, err := ledger.Read(ctx, name, 1)
 	if err != nil {
-		return nil, &ReplayReadError{Name: name, Cause: err}
+		return nil, nil, &ReplayReadError{Name: name, Cause: err}
 	}
 	base := &baseCursor{name: name, blobs: blobs, cur: cur}
 	defer func() { _ = base.close() }()
 	for {
 		r, nextErr := base.next(ctx)
 		if errors.Is(nextErr, io.EOF) {
-			return idx, nil
+			return idx, transitions, nil
 		}
 		if nextErr != nil {
-			return nil, nextErr
+			return nil, nil, nextErr
 		}
 		idx.Observe(r.id, r.seq, journal.NewFingerprint(string(r.kind), r.body))
+		if err := observeHydratedDeliveryTransition(transitions, r); err != nil {
+			return nil, nil, err
+		}
 	}
+}
+
+// observeHydratedDeliveryTransition rebuilds the logical request index from
+// one durable command frame. A fallback is accepted only after its intent has
+// appeared earlier in ledger order with the same phase-normalized payload.
+func observeHydratedDeliveryTransition(transitions map[uuid.UUID]deliveryTransition, r resolved) error {
+	if r.kind != kindCommand {
+		return nil
+	}
+	decoded, err := command.UnmarshalCommand(r.body)
+	if err != nil {
+		return &ReplayDecodeError{Seq: r.seq, Cause: err}
+	}
+	input, ok := decoded.(command.UserInput)
+	if !ok || !input.DelegateDeliveryPhase.Valid() {
+		return nil
+	}
+	record := journal.NewCommandRecord(uuid.UUID{}, uuid.UUID{}, input)
+	if record.IdempotencyID() != r.id {
+		return &journal.DeliveryTransitionError{
+			CommandID: input.CommandID,
+			Phase:     input.DelegateDeliveryPhase,
+			Reason:    "physical id does not match command phase",
+		}
+	}
+	fingerprint, err := record.NormalizedDeliveryFingerprint()
+	if err != nil {
+		return err
+	}
+	logicalID := input.CommandID
+	prior, exists := transitions[logicalID]
+	switch input.DelegateDeliveryPhase {
+	case command.DelegateDeliveryPhaseIntent:
+		if exists {
+			if prior.fingerprint != fingerprint {
+				return &journal.DeliveryTransitionError{CommandID: logicalID, Phase: input.DelegateDeliveryPhase, Reason: "intent payload changed"}
+			}
+			if prior.intentSeq != 0 {
+				return &journal.DeliveryTransitionError{CommandID: logicalID, Phase: input.DelegateDeliveryPhase, Reason: "duplicate intent frame"}
+			}
+		}
+		transitions[logicalID] = deliveryTransition{fingerprint: fingerprint, intentSeq: r.seq}
+	case command.DelegateDeliveryPhaseFallbackQueued:
+		if !exists || prior.intentSeq == 0 {
+			return &journal.DeliveryTransitionError{CommandID: logicalID, Phase: input.DelegateDeliveryPhase, Reason: "fallback precedes intent"}
+		}
+		if prior.fingerprint != fingerprint {
+			return &journal.DeliveryTransitionError{CommandID: logicalID, Phase: input.DelegateDeliveryPhase, Reason: "fallback payload differs from intent"}
+		}
+		if prior.fallbackSeq != 0 {
+			return &journal.DeliveryTransitionError{CommandID: logicalID, Phase: input.DelegateDeliveryPhase, Reason: "duplicate fallback frame"}
+		}
+		prior.fallbackSeq = r.seq
+		transitions[logicalID] = prior
+	}
+	return nil
 }
 
 // Append serializes rec behind mu, refuses if the journal is not ready or its lease
@@ -324,6 +401,15 @@ func (b *sessionJournal) appendChecked(ctx context.Context, rec journal.JournalR
 	if !b.leaseHeld() {
 		return journal.AppendResult{}, &journal.JournalLeaseLostError{SessionID: b.id, Epoch: b.lease.Epoch()}
 	}
+	var commandRecord journal.CommandRecord
+	var hasPhasedCommand bool
+	if candidate, ok := rec.(journal.CommandRecord); ok && candidate.DeliveryPhase() != "" {
+		if err := journal.ValidateCommandRecordRoute(candidate); err != nil {
+			return journal.AppendResult{}, err
+		}
+		commandRecord = candidate
+		hasPhasedCommand = true
+	}
 
 	k, body, err := b.encodeRecordBody(rec)
 	if err != nil {
@@ -337,12 +423,66 @@ func (b *sessionJournal) appendChecked(ctx context.Context, rec journal.JournalR
 		return journal.AppendResult{Sequence: seq, Appended: false}, nil
 	}
 
+	var transitionRecord *journal.CommandRecord
+	var pendingTransition deliveryTransition
+	if hasPhasedCommand && commandRecord.DeliveryPhase().Valid() {
+		pending, err := b.prepareDeliveryTransition(commandRecord)
+		if err != nil {
+			return journal.AppendResult{}, err
+		}
+		transitionRecord = &commandRecord
+		pendingTransition = pending
+	}
+
 	seq, err := b.writeLocked(ctx, rec)
 	if err != nil {
 		return journal.AppendResult{}, err
 	}
 	b.idx.Observe(id, seq, fp)
+	if transitionRecord != nil {
+		if b.deliveryTransitions == nil {
+			b.deliveryTransitions = make(map[uuid.UUID]deliveryTransition)
+		}
+		if transitionRecord.DeliveryPhase() == command.DelegateDeliveryPhaseIntent {
+			pendingTransition.intentSeq = seq
+		} else {
+			pendingTransition.fallbackSeq = seq
+		}
+		b.deliveryTransitions[transitionRecord.LogicalCommandID()] = pendingTransition
+	}
 	return journal.AppendResult{Sequence: seq, Appended: true}, nil
+}
+
+func (b *sessionJournal) prepareDeliveryTransition(record journal.CommandRecord) (deliveryTransition, error) {
+	fingerprint, err := record.NormalizedDeliveryFingerprint()
+	if err != nil {
+		return deliveryTransition{}, err
+	}
+	logicalID := record.LogicalCommandID()
+	prior, exists := b.deliveryTransitions[logicalID]
+	switch record.DeliveryPhase() {
+	case command.DelegateDeliveryPhaseIntent:
+		if exists {
+			if prior.fingerprint != fingerprint {
+				return deliveryTransition{}, &journal.DeliveryTransitionError{CommandID: logicalID, Phase: record.DeliveryPhase(), Reason: "intent payload changed"}
+			}
+			return deliveryTransition{}, &journal.DeliveryTransitionError{CommandID: logicalID, Phase: record.DeliveryPhase(), Reason: "intent already durable"}
+		}
+		return deliveryTransition{fingerprint: fingerprint}, nil
+	case command.DelegateDeliveryPhaseFallbackQueued:
+		if !exists || prior.intentSeq == 0 {
+			return deliveryTransition{}, &journal.DeliveryTransitionError{CommandID: logicalID, Phase: record.DeliveryPhase(), Reason: "fallback precedes intent"}
+		}
+		if prior.fingerprint != fingerprint {
+			return deliveryTransition{}, &journal.DeliveryTransitionError{CommandID: logicalID, Phase: record.DeliveryPhase(), Reason: "fallback payload differs from intent"}
+		}
+		if prior.fallbackSeq != 0 {
+			return deliveryTransition{}, &journal.DeliveryTransitionError{CommandID: logicalID, Phase: record.DeliveryPhase(), Reason: "fallback already durable"}
+		}
+		return prior, nil
+	default:
+		return deliveryTransition{}, &journal.DeliveryTransitionError{CommandID: logicalID, Phase: record.DeliveryPhase(), Reason: "unsupported delivery phase"}
+	}
 }
 
 // leaseHeld reports whether the ownership lease is still held: both its validity

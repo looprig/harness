@@ -16,7 +16,9 @@ import (
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/storage/memstore"
 )
 
 type foreignDeliveryCommandAppender struct {
@@ -125,6 +127,7 @@ func TestForeignDeliveryHookCreatesIntentBeforeReservation(t *testing.T) {
 func TestForeignDeliveryHookFallbackPersistsExactCommandOnce(t *testing.T) {
 	t.Parallel()
 	_, hook, commands, events, intent, cmd := newForeignDeliveryHookFixture(t)
+	cmd.Blocks[0].(*content.TextBlock).Text = "mutated-after-bind"
 	if err := hook.CreateIntent(context.Background(), intent); err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +148,8 @@ func TestForeignDeliveryHookFallbackPersistsExactCommandOnce(t *testing.T) {
 	if !ok {
 		t.Fatalf("fallback command = %T, want command.UserInput", got[1].Command())
 	}
-	if fallback.CommandID != cmd.CommandID || fallback.TargetLoopID != cmd.TargetLoopID || fallback.DelegateDeliveryPhase != command.DelegateDeliveryPhaseFallbackQueued || len(fallback.Blocks) != len(cmd.Blocks) {
+	fallbackText, _ := fallback.Blocks[0].(*content.TextBlock)
+	if fallback.CommandID != cmd.CommandID || fallback.TargetLoopID != cmd.TargetLoopID || fallback.DelegateDeliveryPhase != command.DelegateDeliveryPhaseFallbackQueued || len(fallback.Blocks) != len(cmd.Blocks) || fallbackText == nil || fallbackText.Text != "steer" {
 		t.Fatalf("fallback command = %#v, want exact command id/route/payload with fallback phase", fallback)
 	}
 	if len(events.snapshot()) != 1 {
@@ -309,6 +313,189 @@ func TestForeignDeliveryHookPublicationErrorsAreBoundedAndRedacted(t *testing.T)
 	if len(err.Error()) > 128 {
 		t.Fatalf("publication error length = %d, want bounded <= 128: %q", len(err.Error()), err)
 	}
+}
+
+func TestForeignDeliveryHookFallbackPublicationFailureDoesNotCommitTransition(t *testing.T) {
+	t.Parallel()
+	_, hook, commands, _, intent, _ := newForeignDeliveryHookFixture(t)
+	if err := hook.CreateIntent(context.Background(), intent); err != nil {
+		t.Fatal(err)
+	}
+	if err := hook.Reserve(context.Background(), foreign.DeliveryReservation(intent)); err != nil {
+		t.Fatal(err)
+	}
+	commands.mu.Lock()
+	commands.err = errors.New("fallback append failed")
+	commands.mu.Unlock()
+	if err := hook.QueueFallback(context.Background(), foreign.DeliveryFallback(intent)); err == nil {
+		t.Fatal("QueueFallback succeeded despite checked publication failure")
+	}
+	commands.mu.Lock()
+	commands.err = nil
+	commands.mu.Unlock()
+	if err := hook.QueueFallback(context.Background(), foreign.DeliveryFallback(intent)); err != nil {
+		t.Fatalf("QueueFallback retry: %v", err)
+	}
+	if got := len(commands.snapshot()); got != 2 {
+		t.Fatalf("command records = %d, want intent plus one committed fallback", got)
+	}
+}
+
+func TestForeignDeliveryHookUsesRealJournalCommandAppender(t *testing.T) {
+	t.Parallel()
+	store, err := sessionstore.Open(memstore.New())
+	if err != nil {
+		t.Fatalf("sessionstore.Open: %v", err)
+	}
+	sessionID, loopID, requestID := mustUUID(), mustUUID(), mustUUID()
+	lease, err := store.AcquireLease(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("AcquireLease: %v", err)
+	}
+	durable, err := store.OpenJournal(context.Background(), sessionID, lease)
+	if err != nil {
+		t.Fatalf("OpenJournal: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Session{
+		sessionID:     sessionID,
+		sessionCtx:    ctx,
+		sessionCancel: cancel,
+		hub:           hub.New(sessionID, hub.WithAppender(journal.NewJournalEventAppender(durable))),
+		factory:       event.NewFactory(uuid.New, time.Now),
+		cmdAppender:   journal.NewJournalCommandAppender(durable),
+		loops:         map[uuid.UUID]*loopHandle{loopID: {id: loopID}},
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = lease.Release(context.Background())
+	})
+	hook := newForeignDeliveryHook(s, loopID)
+	cmd := command.UserInput{
+		Header:       command.Header{CommandID: requestID, Agency: identity.AgencyMachine},
+		Blocks:       []content.Block{&content.TextBlock{Text: "real journal"}},
+		NoFold:       true,
+		TargetLoopID: loopID,
+	}
+	if err := hook.bindCommand(cmd); err != nil {
+		t.Fatalf("bindCommand: %v", err)
+	}
+	intent := foreign.DeliveryIntent{LoopID: loopID, RequestID: requestID}
+	if err := hook.CreateIntent(context.Background(), intent); err != nil {
+		t.Fatalf("CreateIntent: %v", err)
+	}
+	if err := hook.Reserve(context.Background(), foreign.DeliveryReservation(intent)); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if err := hook.QueueFallback(context.Background(), foreign.DeliveryFallback(intent)); err != nil {
+		t.Fatalf("QueueFallback: %v", err)
+	}
+}
+
+func TestForeignServiceDelegateBindsBeforeActorCreateIntent(t *testing.T) {
+	t.Parallel()
+	loopID := mustUUID()
+	backend := &channelBackend{Commands: make(chan command.Command), Done: make(chan struct{})}
+	commands := &foreignDeliveryCommandAppender{}
+	s := &Session{
+		sessionID:   mustUUID(),
+		sessionCtx:  context.Background(),
+		newID:       uuid.New,
+		cmdAppender: commands,
+		loops:       map[uuid.UUID]*loopHandle{loopID: {id: loopID, backend: backend}},
+	}
+	newForeignDeliveryHook(s, loopID)
+	actorErr := make(chan error, 1)
+	go func() {
+		input, ok := (<-backend.Commands).(command.UserInput)
+		if !ok {
+			actorErr <- errors.New("actor received non-user input")
+			return
+		}
+		if input.DelegateDeliveryPhase != command.DelegateDeliveryPhaseIntent {
+			input.Accepted <- errors.New("intent phase missing before actor admission")
+			actorErr <- errors.New("intent phase missing before actor admission")
+			return
+		}
+		input.Accepted <- nil
+		actorErr <- nil
+	}()
+
+	requestID, _, err := s.enqueueDelegateTurn(context.Background(), loopID, delegateBlocks("foreign"), false,
+		func(_, childID uuid.UUID) *requestTracker { return &requestTracker{childID: childID} },
+		func(uuid.UUID, *requestTracker) {})
+	if err != nil {
+		t.Fatalf("enqueueDelegateTurn: %v", err)
+	}
+	if err := <-actorErr; err != nil {
+		t.Fatal(err)
+	}
+	got := commands.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("durable command records = %d, want one hook-owned intent", len(got))
+	}
+	persisted, ok := got[0].Command().(command.UserInput)
+	if !ok || persisted.CommandID != requestID || persisted.DelegateDeliveryPhase != command.DelegateDeliveryPhaseIntent {
+		t.Fatalf("persisted command = %#v, want bound intent %v", got[0].Command(), requestID)
+	}
+}
+
+func TestRestoredDelegateBindsForeignCommandBeforeAdmission(t *testing.T) {
+	t.Parallel()
+	loopID, requestID := mustUUID(), mustUUID()
+	backend := &channelBackend{Commands: make(chan command.Command), Done: make(chan struct{})}
+	sub := newTrackingDelegateSubscription()
+	commands := &foreignDeliveryCommandAppender{}
+	s := &Session{
+		sessionID:   mustUUID(),
+		sessionCtx:  context.Background(),
+		cmdAppender: commands,
+		loops:       map[uuid.UUID]*loopHandle{loopID: {id: loopID, backend: backend}},
+		delegateSubscribe: func(event.EventFilter) (event.Subscription, error) {
+			return sub, nil
+		},
+	}
+	hook := newForeignDeliveryHook(s, loopID)
+	m := newDelegationManager(Topology{})
+	cmd := command.UserInput{
+		Header:                command.Header{CommandID: requestID, Agency: identity.AgencyMachine},
+		Blocks:                []content.Block{&content.TextBlock{Text: "restored foreign"}},
+		NoFold:                true,
+		TargetLoopID:          loopID,
+		DelegateDeliveryPhase: command.DelegateDeliveryPhaseIntent,
+	}
+	entry := restoredBackgroundPlan{requestID: requestID, childID: loopID, reAdmit: &cmd}
+	received := make(chan command.UserInput, 1)
+	go func() {
+		got, ok := (<-backend.Commands).(command.UserInput)
+		if ok {
+			received <- got
+		}
+	}()
+	m.readmitRestoredBackgroundRequest(s, entry)
+	select {
+	case got := <-received:
+		if got.CommandID != requestID || got.DelegateDeliveryPhase != command.DelegateDeliveryPhaseIntent {
+			t.Fatalf("restored command = %#v, want exact intent %v", got, requestID)
+		}
+		hook.mu.Lock()
+		bound, ok := hook.commands[requestID]
+		hook.mu.Unlock()
+		if !ok || bound.CommandID != requestID || bound.DelegateDeliveryPhase != command.DelegateDeliveryPhaseIntent {
+			t.Fatalf("restored command was not bound before admission: %#v, %v", bound, ok)
+		}
+		rebound := cmd
+		rebound.Accepted = make(chan error, 1)
+		if err := hook.bindCommand(rebound); err != nil {
+			t.Fatalf("rebind with recreated Accepted channel: %v", err)
+		}
+		if got := len(commands.snapshot()); got != 0 {
+			t.Fatalf("restore re-admission appended %d journal commands, want none", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("restored command was not admitted")
+	}
+	t.Cleanup(func() { close(sub.events) })
 }
 
 func TestForeignDeliveryHookRestoreReservationRepairsUnknown(t *testing.T) {

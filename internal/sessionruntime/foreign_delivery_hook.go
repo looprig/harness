@@ -131,12 +131,37 @@ func (h *foreignDeliveryHook) bindCommand(cmd command.UserInput) error {
 	if err := command.ValidateCommand(cmd); err != nil {
 		return err
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if prior, exists := h.commands[cmd.CommandID]; exists && !reflect.DeepEqual(prior, cmd) {
+	// Snapshot the durable command representation so later actor-side mutation
+	// of a shared Blocks slice cannot alter the fallback payload. Accepted is
+	// restored below because it is process-local and intentionally not durable.
+	body, err := command.MarshalCommand(cmd)
+	if err != nil {
+		return err
+	}
+	decoded, err := command.UnmarshalCommand(body)
+	if err != nil {
+		return err
+	}
+	bound, ok := decoded.(command.UserInput)
+	if !ok {
 		return errForeignDeliveryInvalidTransition
 	}
-	h.commands[cmd.CommandID] = cmd
+	bound.Accepted = cmd.Accepted
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if prior, exists := h.commands[cmd.CommandID]; exists {
+		// Accepted is a process-local admission channel recreated for every
+		// restore dispatch. It is deliberately outside the durable command
+		// identity, just like the journal fingerprint, so a rebound command can
+		// be idempotent across restore attempts without weakening payload checks.
+		prior.Accepted = nil
+		candidate := bound
+		candidate.Accepted = nil
+		if !reflect.DeepEqual(prior, candidate) {
+			return errForeignDeliveryInvalidTransition
+		}
+	}
+	h.commands[cmd.CommandID] = bound
 	return nil
 }
 

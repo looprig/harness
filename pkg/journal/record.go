@@ -22,6 +22,20 @@ func (e *CommandRouteMismatchError) Error() string {
 	return fmt.Sprintf("journal: delegate command route mismatch: record loop %s != target loop %s", e.RecordLoopID, e.TargetLoopID)
 }
 
+// DeliveryTransitionError reports a phased delegate command that violates the
+// logical intent-to-fallback ordering or otherwise cannot participate in the
+// transition index. It carries only bounded identity/category data; payloads
+// are deliberately excluded.
+type DeliveryTransitionError struct {
+	CommandID uuid.UUID
+	Phase     command.DelegateDeliveryPhase
+	Reason    string
+}
+
+func (e *DeliveryTransitionError) Error() string {
+	return fmt.Sprintf("journal: invalid delegate delivery transition for command %s phase %q: %s", e.CommandID, e.Phase, e.Reason)
+}
+
 // JournalRecord is the sealed sum a session's serialized writer persists: an
 // Enduring event, a command (the intent log), or an internal LeaseFence. It is a
 // marker plus the one backend-neutral fact the writer needs to persist without
@@ -37,8 +51,8 @@ func (e *CommandRouteMismatchError) Error() string {
 type JournalRecord interface {
 	isJournalRecord()
 	// IdempotencyID is the stable per-record id a backend uses as its de-dup key so
-	// a redelivered append de-duplicates: an event's EventID, a command's CommandID,
-	// or a fence's epoch.
+	// a redelivered append de-duplicates: an event's EventID, a command's physical
+	// CommandRecordID, or a fence's epoch.
 	IdempotencyID() string
 }
 
@@ -66,12 +80,71 @@ func (r EventRecord) IdempotencyID() string { return r.ev.EventHeader().EventID.
 // event, a command does not uniformly carry its routing coordinates (Interrupt and
 // Shutdown carry only a Header; the session dispatches them by other means), so the
 // writer supplies the target sessionID/loopID at construction. Its id is the
-// command's CommandID. The serializer encodes the wrapped command via
+// command's physical CommandRecordID. The serializer encodes the wrapped command via
 // command.MarshalCommand.
 type CommandRecord struct {
 	sessionID uuid.UUID
 	loopID    uuid.UUID
 	cmd       command.Command
+}
+
+// CommandRecordID is the physical idempotency identity of one command record.
+// Delivery fallback records retain the logical command UUID while using their
+// phase as a typed suffix, so the intent and fallback frames can both be
+// durable without weakening the journal's ordinary idempotency collision rule.
+type CommandRecordID struct {
+	CommandID uuid.UUID
+	Phase     command.DelegateDeliveryPhase
+}
+
+// String returns the canonical physical id. Ordinary and intent commands use
+// the logical UUID unchanged; only fallback_queued has a distinct physical id.
+func (id CommandRecordID) String() string {
+	if id.Phase == command.DelegateDeliveryPhaseFallbackQueued {
+		return id.CommandID.String() + "/" + string(id.Phase)
+	}
+	return id.CommandID.String()
+}
+
+// LogicalCommandID returns the command UUID independent of its durable phase.
+func (r CommandRecord) LogicalCommandID() uuid.UUID { return r.cmd.CommandHeader().CommandID }
+
+// DeliveryPhase returns the durable delegate-delivery phase carried by a
+// UserInput, or the zero phase for every other command kind.
+func (r CommandRecord) DeliveryPhase() command.DelegateDeliveryPhase {
+	input, ok := r.cmd.(command.UserInput)
+	if !ok {
+		return ""
+	}
+	return input.DelegateDeliveryPhase
+}
+
+// PhysicalID returns the typed idempotency identity used by the journal
+// envelope and backend message id. Keeping phase selection here prevents
+// callers from constructing unsafe ad-hoc string ids.
+func (r CommandRecord) PhysicalID() CommandRecordID {
+	return CommandRecordID{CommandID: r.LogicalCommandID(), Phase: r.DeliveryPhase()}
+}
+
+// NormalizedDeliveryFingerprint fingerprints the exact UserInput payload with
+// only DelegateDeliveryPhase cleared. Accepted is json:"-" and therefore does
+// not enter the fingerprint; blocks, route, agency, hand-back, timestamps, and
+// all other durable fields remain part of it.
+func (r CommandRecord) NormalizedDeliveryFingerprint() (Fingerprint, error) {
+	input, ok := r.cmd.(command.UserInput)
+	if !ok || !input.DelegateDeliveryPhase.Valid() {
+		return Fingerprint{}, &DeliveryTransitionError{
+			CommandID: r.LogicalCommandID(),
+			Phase:     r.DeliveryPhase(),
+			Reason:    "command is not a phased user input",
+		}
+	}
+	input.DelegateDeliveryPhase = ""
+	body, err := command.MarshalCommand(input)
+	if err != nil {
+		return Fingerprint{}, err
+	}
+	return NewFingerprint("command", body), nil
 }
 
 // NewCommandRecord wraps cmd as the intent-log record targeting loop loopID in
@@ -112,8 +185,8 @@ func (r CommandRecord) LoopID() uuid.UUID { return r.loopID }
 
 func (CommandRecord) isJournalRecord() {}
 
-// IdempotencyID is the command's CommandID rendered canonically.
-func (r CommandRecord) IdempotencyID() string { return r.cmd.CommandHeader().CommandID.String() }
+// IdempotencyID is the command's physical id rendered canonically.
+func (r CommandRecord) IdempotencyID() string { return r.PhysicalID().String() }
 
 // LeaseFence is an internal journal record marking a lease-handover boundary: a
 // monotonically increasing Epoch fenced into the stream when ownership of a

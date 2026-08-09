@@ -16,6 +16,7 @@ import (
 	"github.com/looprig/harness/internal/delegationtool"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
@@ -926,6 +927,16 @@ func (m *delegationManager) readmitRestoredBackgroundRequest(s *Session, entry r
 	}
 	cmd := *entry.reAdmit
 	cmd.Accepted = make(chan error, 1)
+	if hook := s.foreignDeliveryHookFor(entry.childID); hook != nil {
+		if err := hook.bindCommand(cmd); err != nil {
+			_ = sub.Close()
+			m.removeRequest(entry.requestID, tracked)
+			if s.hub != nil && cmd.BackgroundHandBack {
+				s.cancelExpectTurn(context.Background(), entry.childID)
+			}
+			return
+		}
+	}
 	select {
 	case backend.CommandSink() <- cmd:
 		// Drain immediately. The actor's acceptance ack is intentionally not
@@ -2342,6 +2353,7 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 	}
 	accepted := make(chan error, 1)
 	native := s.nativeDelegateLoop(loopID)
+	deliveryHook := s.foreignDeliveryHookFor(loopID)
 	cmd := command.UserInput{
 		Header:             command.Header{CommandID: id, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()},
 		Blocks:             blocks,
@@ -2350,14 +2362,21 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 		BackgroundHandBack: background,
 		Accepted:           accepted,
 	}
-	if native {
+	if native || deliveryHook != nil {
 		cmd.DelegateDeliveryPhase = command.DelegateDeliveryPhaseIntent
 	}
-	if err := s.appendDelegateCommand(ctx, loopID, cmd); err != nil {
+	if deliveryHook != nil {
+		if err := deliveryHook.bindCommand(cmd); err != nil {
+			return uuid.UUID{}, nil, err
+		}
+		if err := deliveryHook.CreateIntent(ctx, foreign.DeliveryIntent{LoopID: loopID, RequestID: id}); err != nil {
+			return uuid.UUID{}, nil, err
+		}
+	} else if err := s.appendDelegateCommand(ctx, loopID, cmd); err != nil {
 		return uuid.UUID{}, nil, err
 	}
 	deliveryCtx := ctx
-	if native {
+	if native || deliveryHook != nil {
 		// Once the intent record is durable, native MessageAgent delivery belongs to
 		// the session, not the caller's observation context. The caller may stop
 		// waiting, but it cannot retract a command whose delivery is in flight.
