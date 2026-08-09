@@ -163,6 +163,21 @@ func TestMessageAgentRestoreRejectsOutOfOrderTurnLifecycle(t *testing.T) {
 				event.TurnFoldedInto{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}, Cause: identity.Cause{CommandID: mustUUID()}}},
 			}
 		}},
+		{name: "duplicate done terminal", events: func(childID, requestID, turnID uuid.UUID) []event.Event {
+			started := event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}, Cause: identity.Cause{CommandID: requestID}}}
+			done := event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}}, Message: aiMessage("done")}
+			return []event.Event{started, done, done}
+		}},
+		{name: "duplicate failed terminal", events: func(childID, requestID, turnID uuid.UUID) []event.Event {
+			started := event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}, Cause: identity.Cause{CommandID: requestID}}}
+			failed := event.TurnFailed{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}}, Err: errors.New("failed")}
+			return []event.Event{started, failed, failed}
+		}},
+		{name: "duplicate interrupted terminal", events: func(childID, requestID, turnID uuid.UUID) []event.Event {
+			started := event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}, Cause: identity.Cause{CommandID: requestID}}}
+			interrupted := event.TurnInterrupted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}}}
+			return []event.Event{started, interrupted, interrupted}
+		}},
 	} {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
@@ -355,6 +370,14 @@ func TestMessageAgentRestoreReadmitsForegroundIntentAfterCrashWithoutHandback(t 
 	case <-time.After(5 * time.Second):
 		t.Fatal("restored foreground command was not re-admitted")
 	}
+	restoredController := restored.delegation.controllerFor(restored.ActiveLoopID(), backgroundNode("parent", parentLLM, "child"))
+	pending, err := restoredController.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: dispatched.TargetLoopID})
+	if err != nil {
+		t.Fatalf("restored foreground pending status: %v", err)
+	}
+	if len(pending.Agents) != 1 || pending.Agents[0].State != tool.AgentStateWorking {
+		t.Fatalf("restored foreground pending status = %+v, want working", pending.Agents)
+	}
 	if got := countMessageAgentHandbacks(messageAgentRestoreRecords(t, lifecycle.store, sessionID), dispatched.CommandID); got != 0 {
 		t.Fatalf("restored foreground hand-backs = %d, want none", got)
 	}
@@ -363,6 +386,13 @@ func TestMessageAgentRestoreReadmitsForegroundIntentAfterCrashWithoutHandback(t 
 	defer cancel()
 	if err := restored.WaitIdle(waitCtx); err != nil {
 		t.Fatalf("restored foreground WaitIdle: %v", err)
+	}
+	terminal, err := restoredController.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: dispatched.TargetLoopID})
+	if err != nil {
+		t.Fatalf("restored foreground terminal status: %v", err)
+	}
+	if len(terminal.Agents) != 1 || terminal.Agents[0].State != tool.AgentStateIdle {
+		t.Fatalf("restored foreground terminal status = %+v, want idle", terminal.Agents)
 	}
 }
 

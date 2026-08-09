@@ -1059,15 +1059,19 @@ func foldDelegateTerminalsChecked(events []event.Event) (map[uuid.UUID]resolvedR
 		if !state.started {
 			return &delegateRestoreContradictionError{reason: "turn terminal appears before TurnStarted opening"}
 		}
+		if state.terminal {
+			reason := "turn has duplicate terminal events"
+			if prior, exists := terminals[key]; exists && prior != observation {
+				reason = "turn has incompatible terminal events"
+			}
+			for requestID := range byTurn[key] {
+				return &delegateRestoreContradictionError{requestID: requestID, reason: reason}
+			}
+			return &delegateRestoreContradictionError{reason: reason}
+		}
 		state.terminal = true
 		lifecycle[key] = state
 		terminalOwners[key.turnID] = key.loopID
-		if prior, exists := terminals[key]; exists && prior != observation {
-			for requestID := range byTurn[key] {
-				return &delegateRestoreContradictionError{requestID: requestID, reason: "turn has incompatible terminal events"}
-			}
-			return &delegateRestoreContradictionError{reason: "turn has incompatible terminal events"}
-		}
 		terminals[key] = observation
 		return nil
 	}

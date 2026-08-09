@@ -1972,11 +1972,33 @@ func TestDelegateQueuedRequestRestoresInterruptedWithoutReplay(t *testing.T) {
 	if !waitTurnStartedRequest(t, obs, a.CorrelationID) {
 		t.Fatal("turn A never started")
 	}
-	b, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, AgentID: a.AgentID, Message: "B", WaitForResponse: false})
-	if err != nil {
-		t.Fatal(err)
+	// This regression intentionally constructs the legacy non-folding command.
+	// The interrupted-without-replay contract must not depend on whether a native
+	// phased request's crash-time InputCancelled happens to commit before restore.
+	b := command.UserInput{
+		Header:             command.Header{CommandID: mustUUID(), Agency: identity.AgencyMachine},
+		Blocks:             delegateBlocks("B"),
+		NoFold:             true,
+		TargetLoopID:       a.AgentID,
+		BackgroundHandBack: true,
+		Accepted:           make(chan error, 1),
 	}
-	if !waitInputQueuedRequest(t, obs, b.CorrelationID) {
+	if err := s.appendDelegateCommand(context.Background(), a.AgentID, b); err != nil {
+		t.Fatalf("append legacy delegate intent: %v", err)
+	}
+	backend, ok := s.loopFor(a.AgentID)
+	if !ok || backend == nil {
+		t.Fatalf("child backend unavailable for legacy request %v", a.AgentID)
+	}
+	select {
+	case backend.CommandSink() <- b:
+	case <-backend.DoneChan():
+		t.Fatal("child exited before legacy request dispatch")
+	}
+	if err := <-b.Accepted; err != nil {
+		t.Fatalf("legacy request acceptance: %v", err)
+	}
+	if !waitInputQueuedRequest(t, obs, b.CommandID) {
 		t.Fatal("request B never durably queued")
 	}
 	sid := s.SessionID()
@@ -1999,7 +2021,7 @@ func TestDelegateQueuedRequestRestoresInterruptedWithoutReplay(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = restored.Shutdown(context.Background()) })
 	restoredCtrl := restored.delegation.controllerFor(restored.ActiveLoopID(), parent)
-	resolved, ok := durableResolvedRecord(restored.delegation, b.CorrelationID)
+	resolved, ok := durableResolvedRecord(restored.delegation, b.CommandID)
 	if !ok || resolved.childID != a.AgentID || resolved.status != tool.DelegateStatusInterrupted {
 		t.Fatalf("restored private queued correlation = %+v, %v; want interrupted child %v", resolved, ok, a.AgentID)
 	}
