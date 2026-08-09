@@ -73,6 +73,11 @@ type foreignDeliveryHook struct {
 	sessionID uuid.UUID
 	loopID    uuid.UUID
 
+	brokerMu  sync.RWMutex
+	broker    foreign.BrokerDescriptor
+	brokerSet bool
+	brokerErr error
+
 	mu             sync.Mutex
 	commands       map[uuid.UUID]command.UserInput
 	phases         map[uuid.UUID]foreignDeliveryPhase
@@ -99,6 +104,36 @@ func newForeignDeliveryHook(session *Session, loopID uuid.UUID) *foreignDelivery
 		session.registerForeignDeliveryHook(hook)
 	}
 	return hook
+}
+
+func (h *foreignDeliveryHook) setBrokerDescriptor(descriptor foreign.BrokerDescriptor) {
+	if h == nil {
+		return
+	}
+	h.brokerMu.Lock()
+	h.broker = descriptor
+	h.brokerSet = true
+	h.brokerErr = nil
+	h.brokerMu.Unlock()
+}
+
+func (h *foreignDeliveryHook) setBrokerError(err error) {
+	if h == nil || err == nil {
+		return
+	}
+	h.brokerMu.Lock()
+	h.brokerErr = err
+	h.brokerMu.Unlock()
+}
+
+func (h *foreignDeliveryHook) brokerError() error {
+	if h == nil {
+		return nil
+	}
+	h.brokerMu.RLock()
+	err := h.brokerErr
+	h.brokerMu.RUnlock()
+	return err
 }
 
 func (s *Session) registerForeignDeliveryHook(hook *foreignDeliveryHook) {

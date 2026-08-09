@@ -54,6 +54,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 	loopCommitted := false
 	defer func() {
 		if !loopCommitted && constructionHook != nil {
+			s.revokeCollabLoop(constructionHook.loopID)
 			s.unregisterForeignDeliveryHook(constructionHook)
 		}
 	}()
@@ -91,9 +92,12 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 				cancel()
 				return builderErr
 			}
-			services, hook := s.foreignServicesForTracked(started.LoopID)
+			services, hook := s.foreignServicesForTrackedWithController(started.LoopID, bindings.Delegate)
 			constructionHook = hook
 			backend, err = servicesBuilder(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, seed, services)
+			if err == nil && constructionHook != nil {
+				err = constructionHook.brokerError()
+			}
 		} else {
 			restoredBuilder, builderErr := s.restoredBuilder(bound)
 			if builderErr != nil {
@@ -1177,6 +1181,7 @@ func buildRestoredSession(
 	loopCommitted := false
 	defer func() {
 		if !loopCommitted && constructionHook != nil {
+			s.revokeCollabLoop(constructionHook.loopID)
 			s.unregisterForeignDeliveryHook(constructionHook)
 		}
 	}()
@@ -1280,10 +1285,13 @@ func buildRestoredSession(
 				cancel()
 				return abort(builderErr)
 			}
-			services, hook := s.foreignServicesForTracked(rootLoopID)
+			services, hook := s.foreignServicesForTrackedWithController(rootLoopID, bindings.Delegate)
 			constructionHook = hook
 			l, err = servicesBuilder(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
 				func() (uuid.UUID, error) { return newID() }, factory, seed, services)
+			if err == nil && constructionHook != nil {
+				err = constructionHook.brokerError()
+			}
 		} else {
 			restoredBuilder, builderErr := s.restoredBuilder(cfg)
 			if builderErr != nil {
