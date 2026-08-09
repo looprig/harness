@@ -1368,6 +1368,7 @@ type requestTracker struct {
 	mu        sync.Mutex
 	lifecycle requestLifecycle
 	opening   tool.DelegateDeliveryStatus
+	delivery  tool.DelegateDeliveryStatus
 }
 
 type requestLifecycle uint8
@@ -1394,6 +1395,9 @@ func (p *requestTracker) markOpening(status tool.DelegateDeliveryStatus) {
 	if p.opening == "" {
 		p.opening = status
 	}
+	if p.delivery == "" {
+		p.delivery = status
+	}
 	if p.lifecycle == requestQueued {
 		p.lifecycle = requestActive
 	}
@@ -1403,7 +1407,30 @@ func (p *requestTracker) markOpening(status tool.DelegateDeliveryStatus) {
 func (p *requestTracker) openingStatus() tool.DelegateDeliveryStatus {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.opening == "" {
+		return p.delivery
+	}
 	return p.opening
+}
+
+func (p *requestTracker) markDelivery(status tool.DelegateDeliveryStatus) {
+	if p == nil || status == "" {
+		return
+	}
+	p.mu.Lock()
+	if p.delivery == "" {
+		p.delivery = status
+	}
+	p.mu.Unlock()
+}
+
+func (p *requestTracker) deliveryStatus() tool.DelegateDeliveryStatus {
+	if p == nil {
+		return ""
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.delivery
 }
 
 func (p *requestTracker) markTerminal() {
@@ -1968,22 +1995,88 @@ func (c *scopedController) status(s *Session, req tool.DelegateRequest) (tool.De
 	return tool.DelegateResult{Agents: agents, Truncated: truncated}, nil
 }
 
+// foreignDeliveryAdmissionTimeout is the session-side safety clock for waiting
+// on a typed actor delivery result. It is intentionally independent from the
+// model-controlled response timeout: a broken adapter can never hold a
+// non-waiting MessageAgent call or terminal adjudication forever.
+const foreignDeliveryAdmissionTimeout = 250 * time.Millisecond
+
+func waitForeignDeliveryStatus(s *Session, hook *foreignDeliveryHook, requestID uuid.UUID) tool.DelegateDeliveryStatus {
+	if s == nil || hook == nil {
+		return ""
+	}
+	base := s.sessionCtx
+	if base == nil {
+		base = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(base, foreignDeliveryAdmissionTimeout)
+	defer cancel()
+	status := hook.waitDeliveryStatus(ctx, requestID)
+	if status == "" {
+		// An actor that does not produce a terminal typed delivery result within
+		// the internal clock is ambiguous by definition. It must never be
+		// retried or handed to a target-terminal watcher.
+		return tool.DelegateDeliveryUnknown
+	}
+	return status
+}
+
+func (c *scopedController) categoricalForeignResult(s *Session, childID, requestID uuid.UUID, status tool.DelegateDeliveryStatus, name string) tool.DelegateResult {
+	result := c.agentResult(s, childID)
+	result.CorrelationID = requestID
+	result.State = tool.AgentStateWorking
+	result.DeliveryStatus = status
+	result.ResponseStatus = tool.DelegateResponseUnknown
+	if name != "" {
+		result.Name = name
+	}
+	return result
+}
+
 // resolveOrQueue receives the tracker installed during admission, then either returns
 // the foreground response or starts the automatic durable parent hand-back.
 func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, childID, requestID uuid.UUID, sub event.Subscription, tracked *requestTracker, req tool.DelegateRequest) (tool.DelegateResult, error) {
+	foreignHook := s.foreignDeliveryHookFor(childID)
+	foreignMessage := req.Operation == tool.DelegateSend && foreignHook != nil
 	if req.WaitForResponse {
 		waitCtx, cancel := waitContext(ctx, req.TimeoutSeconds)
 		defer cancel()
+		var deliveryStatus tool.DelegateDeliveryStatus
+		if foreignMessage {
+			// Delivery adjudication is session-owned. If the caller's response
+			// observer expires first, the actor continues and the result retains
+			// an accepted-pending disposition rather than retracting the request.
+			deliveryCh := make(chan tool.DelegateDeliveryStatus, 1)
+			go func() { deliveryCh <- waitForeignDeliveryStatus(s, foreignHook, requestID) }()
+			select {
+			case deliveryStatus = <-deliveryCh:
+			case <-waitCtx.Done():
+				deliveryStatus = tracked.deliveryStatus()
+				if deliveryStatus == "" {
+					deliveryStatus = foreignHook.deliveryStatus(requestID)
+				}
+				if deliveryStatus == "" {
+					deliveryStatus = tool.DelegateDeliveryAcceptedPending
+				}
+			}
+			tracked.markDelivery(deliveryStatus)
+			if deliveryStatus == tool.DelegateDeliveryUnknown || deliveryStatus == tool.DelegateDeliveryUntrackable {
+				tracked.markTerminal()
+				_ = sub.Close()
+				c.manager.removeRequest(requestID, tracked)
+				return c.categoricalForeignResult(s, childID, requestID, deliveryStatus, req.Name), nil
+			}
+		}
 		var interrupt func()
 		nativeMessage := req.Operation == tool.DelegateSend && s.nativeDelegateLoop(childID)
-		if !nativeMessage {
+		if !nativeMessage && !foreignMessage {
 			interrupt = func() {
 				_, _ = s.cancelDelegateRequest(childID, requestID)
 			}
 		}
 		var text string
 		var err error
-		if nativeMessage {
+		if nativeMessage || foreignMessage {
 			text, err = drainDelegateAnswerObservedWithDisposition(waitCtx, sub, requestID, interrupt, tracked.markOpening)
 		} else {
 			text, err = drainDelegateAnswerObserved(waitCtx, sub, requestID, interrupt, tracked.markActive)
@@ -2007,12 +2100,12 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 		if observerExpired {
 			result.State = tool.AgentStateWorking
 		}
-		if nativeMessage {
-			deliveryStatus := tracked.openingStatus()
-			if deliveryStatus == "" && observerExpired {
-				deliveryStatus = tool.DelegateDeliveryAcceptedPending
+		if nativeMessage || foreignMessage {
+			openingStatus := tracked.openingStatus()
+			if openingStatus == "" && observerExpired {
+				openingStatus = tool.DelegateDeliveryAcceptedPending
 			}
-			result.DeliveryStatus = deliveryStatus
+			result.DeliveryStatus = openingStatus
 		}
 		if req.Name != "" {
 			result.Name = req.Name
@@ -2023,12 +2116,32 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 	if name == "" {
 		name = c.agentSnapshot(s, childID).Name
 	}
-	c.manager.handBackRequest(s, c.parentLoopID, childID, name, tracked, requestID, sub, req.TimeoutSeconds, req.Operation == tool.DelegateSend && s.nativeDelegateLoop(childID))
+	deliveryStatus := tool.DelegateDeliveryStatus("")
+	if foreignMessage {
+		deliveryStatus = waitForeignDeliveryStatus(s, foreignHook, requestID)
+		if deliveryStatus == "" {
+			deliveryStatus = tool.DelegateDeliveryAcceptedPending
+		}
+		tracked.markDelivery(deliveryStatus)
+	} else if req.Operation == tool.DelegateSend && s.nativeDelegateLoop(childID) {
+		deliveryStatus = tool.DelegateDeliveryAcceptedPending
+	}
+	if foreignMessage && (deliveryStatus == tool.DelegateDeliveryUnknown || deliveryStatus == tool.DelegateDeliveryUntrackable) {
+		if err := s.deliverSubagentResult(s.sessionCtx, c.parentLoopID, childID,
+			backgroundCompletionBlocksWithState(childID, name, requestID, tool.DelegateStatusUnknown, "", deliveryStatus, true)); err != nil {
+			s.cancelExpectTurn(context.Background(), childID)
+		}
+		tracked.markTerminal()
+		_ = sub.Close()
+		c.manager.removeRequest(requestID, tracked)
+		return c.categoricalForeignResult(s, childID, requestID, deliveryStatus, name), nil
+	}
+	c.manager.handBackRequest(s, c.parentLoopID, childID, name, tracked, requestID, sub, req.TimeoutSeconds, req.Operation == tool.DelegateSend && (s.nativeDelegateLoop(childID) || foreignMessage))
 	result := c.agentResult(s, childID)
 	result.CorrelationID = requestID
 	result.State = tool.AgentStateWorking
-	if req.Operation == tool.DelegateSend && s.nativeDelegateLoop(childID) {
-		result.DeliveryStatus = tool.DelegateDeliveryAcceptedPending
+	if deliveryStatus != "" {
+		result.DeliveryStatus = deliveryStatus
 	}
 	if req.Name != "" {
 		result.Name = req.Name
@@ -2041,7 +2154,7 @@ type backgroundCompletionEnvelope struct {
 	Name           string                      `json:"name"`
 	State          tool.AgentState             `json:"state"`
 	DeliveryStatus tool.DelegateDeliveryStatus `json:"delivery_status,omitempty"`
-	ResponseStatus tool.DelegateResponseStatus `json:"response_status"`
+	ResponseStatus tool.DelegateResponseStatus `json:"response_status,omitempty"`
 	CorrelationID  string                      `json:"correlation_id"`
 	Response       string                      `json:"response"`
 }

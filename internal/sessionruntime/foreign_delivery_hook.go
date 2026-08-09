@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // foreignDeliveryPhase is the in-memory state machine for one foreign delivery
@@ -85,6 +86,11 @@ type foreignDeliveryHook struct {
 	folds          map[uuid.UUID]uuid.UUID
 	tombstones     map[uuid.UUID]foreignDeliveryPhase
 	tombstoneOrder []uuid.UUID
+	// changed is closed and replaced whenever a delivery reaches an externally
+	// observable terminal phase. Session orchestration waits on this channel
+	// instead of polling the actor or sleeping, so the internal admission clock
+	// remains deterministic under tests and bounded in production.
+	changed chan struct{}
 }
 
 var _ foreign.DeliveryHook = (*foreignDeliveryHook)(nil)
@@ -97,6 +103,7 @@ func newForeignDeliveryHook(session *Session, loopID uuid.UUID) *foreignDelivery
 		restored:   make(map[uuid.UUID]bool),
 		folds:      make(map[uuid.UUID]uuid.UUID),
 		tombstones: make(map[uuid.UUID]foreignDeliveryPhase),
+		changed:    make(chan struct{}),
 		loopID:     loopID,
 	}
 	if session != nil {
@@ -186,7 +193,7 @@ func (s *Session) recordForeignDeliveryFold(ev event.Event) {
 	case event.TurnFoldedInto:
 		hook.observeFold(typed)
 	case event.TurnStarted:
-		hook.observeRestoredStart(typed)
+		hook.observeStart(typed)
 	case event.InputCancelled:
 		hook.observeRestoredTerminal(typed.SessionID, loopID, requestID)
 	case event.TurnRejected:
@@ -290,6 +297,64 @@ func (h *foreignDeliveryHook) finishLocked(requestID uuid.UUID, phase foreignDel
 		h.tombstoneOrder = h.tombstoneOrder[1:]
 		delete(h.tombstones, oldest)
 	}
+	if h.changed != nil {
+		close(h.changed)
+		h.changed = make(chan struct{})
+	}
+}
+
+// deliveryStatus returns the public disposition once the actor has committed a
+// terminal delivery transition. Intermediate intent/reservation phases are
+// deliberately reported as pending so callers cannot mistake an actor receipt
+// for provider delivery.
+func (h *foreignDeliveryHook) deliveryStatus(requestID uuid.UUID) tool.DelegateDeliveryStatus {
+	if h == nil || requestID.IsZero() {
+		return ""
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return foreignDeliveryStatusForPhase(h.phaseLocked(requestID))
+}
+
+func foreignDeliveryStatusForPhase(phase foreignDeliveryPhase) tool.DelegateDeliveryStatus {
+	switch phase {
+	case foreignDeliveryFallback:
+		return tool.DelegateDeliveryQueued
+	case foreignDeliveryInjected:
+		return tool.DelegateDeliveryInjected
+	case foreignDeliveryUnknown:
+		return tool.DelegateDeliveryUnknown
+	case foreignDeliveryUntrackable:
+		return tool.DelegateDeliveryUntrackable
+	default:
+		return ""
+	}
+}
+
+// waitDeliveryStatus waits for the actor's durable delivery transition. The
+// caller owns the admission deadline; this method only provides an event-driven
+// wait and never re-admits or retracts the request.
+func (h *foreignDeliveryHook) waitDeliveryStatus(ctx context.Context, requestID uuid.UUID) tool.DelegateDeliveryStatus {
+	if h == nil {
+		return ""
+	}
+	for {
+		h.mu.Lock()
+		status := foreignDeliveryStatusForPhase(h.phaseLocked(requestID))
+		changed := h.changed
+		h.mu.Unlock()
+		if status != "" {
+			return status
+		}
+		if changed == nil {
+			return ""
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ""
+		}
+	}
 }
 
 // abandon drops only process-local admission state after a durable intent could
@@ -333,13 +398,19 @@ func (h *foreignDeliveryHook) observeFold(ev event.TurnFoldedInto) {
 	h.mu.Unlock()
 }
 
-func (h *foreignDeliveryHook) observeRestoredStart(ev event.TurnStarted) {
+func (h *foreignDeliveryHook) observeStart(ev event.TurnStarted) {
 	if h == nil || ev.SessionID != h.sessionID || ev.LoopID != h.loopID || ev.Cause.CommandID.IsZero() {
 		return
 	}
 	h.mu.Lock()
 	if h.restored[ev.Cause.CommandID] {
 		h.finishLocked(ev.Cause.CommandID, foreignDeliveryRestoredDone)
+	} else if h.phaseLocked(ev.Cause.CommandID) == foreignDeliveryIntent {
+		// An idle foreign actor admits the intent directly through its normal
+		// TurnStarted path; no steering machine is present to call QueueFallback.
+		// The opening event is authoritative queued delivery for this live request.
+		// Restore remains distinct above and never steers or rewrites the command.
+		h.finishLocked(ev.Cause.CommandID, foreignDeliveryFallback)
 	}
 	h.mu.Unlock()
 }
