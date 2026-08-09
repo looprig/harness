@@ -92,6 +92,33 @@ func messageAgentText(t *testing.T, result *tool.ToolResult) string {
 	return block.Text
 }
 
+func nativeListAgentState(t *testing.T, fixture nativeMessageAgentFixture) tool.AgentState {
+	t.Helper()
+	listAgents := delegationtool.NewListAgents(fixture.controller, loop.DelegationManaged, nil)
+	args := `{"agent_id":"` + fixture.childID.String() + `"}`
+	request, artifact, err := listAgents.PrepareCall(context.Background(), mustUUID(), args)
+	if err != nil {
+		t.Fatalf("ListAgents PrepareCall: %v", err)
+	}
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{Request: request, Artifact: artifact})
+	result, err := listAgents.InvokableRun(ctx, args)
+	if err != nil {
+		t.Fatalf("ListAgents: %v", err)
+	}
+	var listed struct {
+		Agents []struct {
+			State tool.AgentState `json:"state"`
+		} `json:"agents"`
+	}
+	if err := json.Unmarshal([]byte(messageAgentText(t, result)), &listed); err != nil {
+		t.Fatalf("ListAgents result JSON: %v", err)
+	}
+	if len(listed.Agents) != 1 {
+		t.Fatalf("ListAgents agents = %+v, want one child", listed.Agents)
+	}
+	return listed.Agents[0].State
+}
+
 func TestMessageAgentNativeBusyNonWaitingReturnsAcceptedPendingAndDurableHandback(t *testing.T) {
 	fixture := newNativeMessageAgentFixture(t)
 	messageAgent := delegationtool.NewMessageAgent(fixture.controller, loop.DelegationManaged, nil)
@@ -567,6 +594,116 @@ func TestMessageAgentNativeBackgroundTimeoutBeforeOpeningPreservesPendingObserva
 	case <-time.After(time.Second):
 		t.Fatal("background timeout-before-opening hand-back did not arrive")
 	}
+}
+
+func TestMessageAgentForegroundObserverExpiryKeepsListAgentsWorkingUntilTerminal(t *testing.T) {
+	fixture := newNativeMessageAgentFixture(t)
+	fixture.session.loopsMu.Lock()
+	fixture.session.loops[fixture.childID].setMechanicalState(tool.DelegateStatusIdle)
+	fixture.session.loopsMu.Unlock()
+	messageAgent := delegationtool.NewMessageAgent(fixture.controller, loop.DelegationManaged, nil)
+	args := `{"agent_id":"` + fixture.childID.String() + `","message":"foreground status","wait_for_response":true,"timeout_seconds":0}`
+	request, artifact, err := messageAgent.PrepareCall(context.Background(), mustUUID(), args)
+	if err != nil {
+		t.Fatalf("MessageAgent PrepareCall: %v", err)
+	}
+	resultCh := make(chan error, 1)
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{Request: request, Artifact: artifact})
+	go func() {
+		_, runErr := messageAgent.InvokableRun(ctx, args)
+		resultCh <- runErr
+	}()
+	cmd, ok := (<-fixture.child.Commands).(command.UserInput)
+	if !ok {
+		t.Fatalf("foreground status command = %T, want command.UserInput", cmd)
+	}
+	cmd.Accepted <- nil
+	select {
+	case runErr := <-resultCh:
+		if runErr != nil {
+			t.Fatalf("foreground status MessageAgent: %v", runErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("foreground status MessageAgent did not return")
+	}
+	status, err := fixture.controller.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: fixture.childID})
+	if err != nil {
+		t.Fatalf("foreground status: %v", err)
+	}
+	if len(status.Agents) != 1 || status.Agents[0].State != tool.AgentStateWorking {
+		t.Fatalf("foreground status after observer expiry = %+v, want working", status.Agents)
+	}
+	if state := nativeListAgentState(t, fixture); state != tool.AgentStateWorking {
+		t.Fatalf("ListAgents after foreground observer expiry = %s, want working", state)
+	}
+	turnID := mustUUID()
+	fixture.sub.feed(event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: fixture.childID, TurnID: turnID}, Cause: identity.Cause{CommandID: cmd.CommandID}}})
+	fixture.sub.feed(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: fixture.childID, TurnID: turnID}}, Message: aiMessage("done")})
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		status, err = fixture.controller.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: fixture.childID})
+		if err == nil && len(status.Agents) == 1 && status.Agents[0].State == tool.AgentStateIdle {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("foreground status after terminal = %+v, want idle", status.Agents)
+}
+
+func TestMessageAgentBackgroundObserverExpiryKeepsListAgentsWorkingUntilTerminal(t *testing.T) {
+	fixture := newNativeMessageAgentFixture(t)
+	fixture.session.loopsMu.Lock()
+	fixture.session.loops[fixture.childID].setMechanicalState(tool.DelegateStatusIdle)
+	fixture.session.loopsMu.Unlock()
+	messageAgent := delegationtool.NewMessageAgent(fixture.controller, loop.DelegationManaged, nil)
+	args := `{"agent_id":"` + fixture.childID.String() + `","message":"background status","wait_for_response":false,"timeout_seconds":0}`
+	request, artifact, err := messageAgent.PrepareCall(context.Background(), mustUUID(), args)
+	if err != nil {
+		t.Fatalf("MessageAgent PrepareCall: %v", err)
+	}
+	resultCh := make(chan error, 1)
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{Request: request, Artifact: artifact})
+	go func() {
+		_, runErr := messageAgent.InvokableRun(ctx, args)
+		resultCh <- runErr
+	}()
+	cmd, ok := (<-fixture.child.Commands).(command.UserInput)
+	if !ok {
+		t.Fatalf("background status command = %T, want command.UserInput", cmd)
+	}
+	cmd.Accepted <- nil
+	select {
+	case runErr := <-resultCh:
+		if runErr != nil {
+			t.Fatalf("background status MessageAgent: %v", runErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("background status MessageAgent did not return")
+	}
+	select {
+	case <-fixture.parent.Commands:
+	case <-time.After(time.Second):
+		t.Fatal("background status timeout hand-back did not arrive")
+	}
+	status, err := fixture.controller.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: fixture.childID})
+	if err != nil {
+		t.Fatalf("background status: %v", err)
+	}
+	if len(status.Agents) != 1 || status.Agents[0].State != tool.AgentStateWorking {
+		t.Fatalf("background status after observer expiry = %+v, want working", status.Agents)
+	}
+	turnID := mustUUID()
+	fixture.sub.feed(event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: fixture.childID, TurnID: turnID}, Cause: identity.Cause{CommandID: cmd.CommandID}}})
+	fixture.sub.feed(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: fixture.childID, TurnID: turnID}}, Message: aiMessage("done")})
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		status, err = fixture.controller.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: fixture.childID})
+		if err == nil && len(status.Agents) == 1 && status.Agents[0].State == tool.AgentStateIdle {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("background status after terminal = %+v, want idle", status.Agents)
 }
 
 func TestMessageAgentCallerCancellationAfterAcceptanceEmitsNoRetraction(t *testing.T) {

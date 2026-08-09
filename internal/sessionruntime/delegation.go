@@ -194,10 +194,14 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	if err != nil {
 		return err
 	}
+	targets, err := phasedDelegateTargets(records)
+	if err != nil {
+		return err
+	}
 	combined := make([]event.Event, 0, len(replayed)+len(closures))
 	combined = append(combined, replayed...)
 	combined = append(combined, closures...)
-	if err := validateDelegateRestoreCorrelations(combined, intents); err != nil {
+	if err := validateDelegateRestoreCorrelations(combined, targets); err != nil {
 		return err
 	}
 	index := make(map[uuid.UUID]resolvedRequest)
@@ -235,7 +239,7 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 		if !ok || state.RequestID.IsZero() {
 			continue
 		}
-		target, admitted := intents[state.RequestID]
+		target, admitted := targets[state.RequestID]
 		if !admitted {
 			// State for a request whose intent is not in this journal cannot be
 			// safely routed or replayed. It is intentionally ignored rather than
@@ -265,7 +269,7 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 		if _, unknown := deliveryUnknown[requestID]; unknown {
 			continue
 		}
-		if target, admitted := intents[requestID]; admitted && terminal.childID != target {
+		if target, admitted := targets[requestID]; admitted && terminal.childID != target {
 			return &journal.CommandRouteMismatchError{RecordLoopID: terminal.childID, TargetLoopID: target}
 		}
 		if _, admitted := index[requestID]; admitted {
@@ -340,20 +344,71 @@ func backgroundDelegateIntents(records []journal.JournalRecord) (map[uuid.UUID]u
 	return intents, nil
 }
 
+// phasedDelegateCommands returns every foldable native command, regardless of
+// whether its caller requested a background parent hand-back. Foreground phased
+// commands are restored as session-owned work; only background commands cross the
+// parent boundary after recovery.
+func phasedDelegateCommands(records []journal.JournalRecord) (map[uuid.UUID]command.UserInput, error) {
+	commands := make(map[uuid.UUID]command.UserInput)
+	for _, record := range records {
+		commandRecord, ok := record.(journal.CommandRecord)
+		if !ok {
+			continue
+		}
+		if err := journal.ValidateCommandRecordRoute(commandRecord); err != nil {
+			return nil, err
+		}
+		input, ok := commandRecord.Command().(command.UserInput)
+		if !ok || input.Agency != identity.AgencyMachine || input.DelegateDeliveryPhase == "" || !input.DelegateDeliveryPhase.Valid() || input.CommandID.IsZero() || input.TargetLoopID.IsZero() {
+			continue
+		}
+		if prior, exists := commands[input.CommandID]; exists && prior.TargetLoopID != input.TargetLoopID {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: input.TargetLoopID, TargetLoopID: prior.TargetLoopID}
+		}
+		commands[input.CommandID] = input
+	}
+	return commands, nil
+}
+
+// phasedDelegateTargets is the route index used by restore correlation checks.
+// It includes foreground phased commands as well as background intents, while
+// legacy NoFold commands remain in the background-only index above.
+func phasedDelegateTargets(records []journal.JournalRecord) (map[uuid.UUID]uuid.UUID, error) {
+	intents, err := backgroundDelegateIntents(records)
+	if err != nil {
+		return nil, err
+	}
+	commands, err := phasedDelegateCommands(records)
+	if err != nil {
+		return nil, err
+	}
+	targets := make(map[uuid.UUID]uuid.UUID, len(intents)+len(commands))
+	for requestID, target := range intents {
+		targets[requestID] = target
+	}
+	for requestID, input := range commands {
+		if prior, exists := targets[requestID]; exists && prior != input.TargetLoopID {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: input.TargetLoopID, TargetLoopID: prior}
+		}
+		targets[requestID] = input.TargetLoopID
+	}
+	return targets, nil
+}
+
 // persistUnresolvedDelegateDeliveryStates closes a durable foreign/native delivery
 // reservation before RestoreDone. A reservation is deliberately converted to
 // resolved_unknown once: the adapter may have accepted the request, so restore
 // must not steer it again or synthesize a parent completion. Existing unknown or
 // untrackable states are already terminal and are not appended again.
 func persistUnresolvedDelegateDeliveryStates(ctx context.Context, j journal.SessionJournal, factory *event.Factory, sessionID uuid.UUID, records []journal.JournalRecord, replayed, closures []event.Event) ([]event.Event, error) {
-	intents, err := backgroundDelegateIntents(records)
+	targets, err := phasedDelegateTargets(records)
 	if err != nil {
 		return nil, err
 	}
 	combined := make([]event.Event, 0, len(replayed)+len(closures))
 	combined = append(combined, replayed...)
 	combined = append(combined, closures...)
-	if err := validateDelegateRestoreCorrelations(combined, intents); err != nil {
+	if err := validateDelegateRestoreCorrelations(combined, targets); err != nil {
 		return nil, err
 	}
 	states := make(map[uuid.UUID]event.DelegateDeliveryStateChanged)
@@ -362,7 +417,7 @@ func persistUnresolvedDelegateDeliveryStates(ctx context.Context, j journal.Sess
 		if !ok || state.RequestID.IsZero() {
 			continue
 		}
-		target, admitted := intents[state.RequestID]
+		target, admitted := targets[state.RequestID]
 		if !admitted {
 			continue
 		}
@@ -532,20 +587,15 @@ type restoredBackgroundPlan struct {
 // be re-admitted after restore. Legacy NoFold hand-backs remain terminal-correlation
 // records only; replaying those would change the historical admission contract.
 func phasedBackgroundCommands(records []journal.JournalRecord) (map[uuid.UUID]command.UserInput, error) {
+	all, err := phasedDelegateCommands(records)
+	if err != nil {
+		return nil, err
+	}
 	commands := make(map[uuid.UUID]command.UserInput)
-	for _, record := range records {
-		commandRecord, ok := record.(journal.CommandRecord)
-		if !ok {
-			continue
+	for requestID, input := range all {
+		if input.BackgroundHandBack {
+			commands[requestID] = input
 		}
-		if err := journal.ValidateCommandRecordRoute(commandRecord); err != nil {
-			return nil, err
-		}
-		input, ok := commandRecord.Command().(command.UserInput)
-		if !ok || !input.BackgroundHandBack || !input.DelegateDeliveryPhase.Valid() || input.CommandID.IsZero() || input.TargetLoopID.IsZero() {
-			continue
-		}
-		commands[input.CommandID] = input
 	}
 	return commands, nil
 }
@@ -561,14 +611,18 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 	if err != nil {
 		return nil, err
 	}
-	phased, err := phasedBackgroundCommands(records)
+	phased, err := phasedDelegateCommands(records)
+	if err != nil {
+		return nil, err
+	}
+	targets, err := phasedDelegateTargets(records)
 	if err != nil {
 		return nil, err
 	}
 	combined := make([]event.Event, 0, len(replayed)+len(closures))
 	combined = append(combined, replayed...)
 	combined = append(combined, closures...)
-	if err := validateDelegateRestoreCorrelations(combined, intents); err != nil {
+	if err := validateDelegateRestoreCorrelations(combined, targets); err != nil {
 		return nil, err
 	}
 
@@ -592,7 +646,7 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 	// the live registry as a fallback for legacy LoopStarted records that predate the
 	// durable display-name field.
 	s.loopsMu.RLock()
-	for childID := range intents {
+	for _, childID := range targets {
 		if _, ok := children[childID]; ok {
 			continue
 		}
@@ -641,7 +695,7 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 		if childID.IsZero() || parentID.IsZero() {
 			return nil, &journal.CommandRouteMismatchError{RecordLoopID: parentID, TargetLoopID: childID}
 		}
-		if target, admitted := intents[requestID]; admitted && target != childID {
+		if target, admitted := targets[requestID]; admitted && target != childID {
 			return nil, &journal.CommandRouteMismatchError{RecordLoopID: childID, TargetLoopID: target}
 		}
 		if info, known := children[childID]; known && !info.parent.IsZero() && info.parent != parentID {
@@ -654,6 +708,15 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 			}
 		}
 		handBacks[requestID] = handBackRecord{commandID: handBack.CommandID, command: handBack, childID: childID, parentID: parentID}
+	}
+	handBackParents := make(map[uuid.UUID]map[uuid.UUID]struct{}, len(handBacks))
+	for _, handBack := range handBacks {
+		parents := handBackParents[handBack.commandID]
+		if parents == nil {
+			parents = make(map[uuid.UUID]struct{})
+			handBackParents[handBack.commandID] = parents
+		}
+		parents[handBack.parentID] = struct{}{}
 	}
 
 	processed := make(map[uuid.UUID]struct{})
@@ -712,8 +775,8 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 		if !isProcessed {
 			continue
 		}
-		for _, handBack := range handBacks {
-			if handBack.commandID == commandID && ev.EventHeader().LoopID == handBack.parentID {
+		if parents, indexed := handBackParents[commandID]; indexed {
+			if _, matched := parents[ev.EventHeader().LoopID]; matched {
 				processed[commandID] = struct{}{}
 			}
 		}
@@ -750,7 +813,7 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 		if _, done := processed[requestID]; done {
 			continue
 		}
-		childID := intents[requestID]
+		childID := targets[requestID]
 		if childID.IsZero() {
 			if phasedCommand, ok := phased[requestID]; ok {
 				childID = phasedCommand.TargetLoopID
@@ -771,7 +834,7 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 			_, deliveryState := requestDeliveryState[requestID]
 			if !opened && !terminal && !deliveryState {
 				info, known := children[childID]
-				if known && !info.parent.IsZero() {
+				if known && (!phasedCommand.BackgroundHandBack || !info.parent.IsZero()) {
 					copy := phasedCommand
 					plan = append(plan, restoredBackgroundPlan{
 						requestID: requestID,
@@ -858,7 +921,7 @@ func (m *delegationManager) readmitRestoredBackgroundRequest(s *Session, entry r
 		return
 	}
 	tracked := m.registerRequest(entry.requestID, entry.childID)
-	if s.hub != nil {
+	if s.hub != nil && entry.reAdmit.BackgroundHandBack {
 		s.expectTurn(s.sessionCtx, entry.childID)
 	}
 	cmd := *entry.reAdmit
@@ -868,20 +931,37 @@ func (m *delegationManager) readmitRestoredBackgroundRequest(s *Session, entry r
 		// Drain immediately. The actor's acceptance ack is intentionally not
 		// awaited here: the durable command is valid, and the drain observes
 		// the authoritative opening/rejection event without blocking RestoreDone.
-		m.handBackRequest(s, entry.parentID, entry.childID, entry.name, tracked, entry.requestID, sub, nil, true)
+		if cmd.BackgroundHandBack {
+			m.handBackRequest(s, entry.parentID, entry.childID, entry.name, tracked, entry.requestID, sub, nil, true)
+		} else {
+			m.observeRestoredForegroundRequest(s, tracked, entry.requestID, sub)
+		}
 	case <-backend.DoneChan():
 		_ = sub.Close()
 		m.removeRequest(entry.requestID, tracked)
-		if s.hub != nil {
+		if s.hub != nil && entry.reAdmit.BackgroundHandBack {
 			s.cancelExpectTurn(context.Background(), entry.childID)
 		}
 	case <-s.sessionCtx.Done():
 		_ = sub.Close()
 		m.removeRequest(entry.requestID, tracked)
-		if s.hub != nil {
+		if s.hub != nil && entry.reAdmit.BackgroundHandBack {
 			s.cancelExpectTurn(context.Background(), entry.childID)
 		}
 	}
+}
+
+// observeRestoredForegroundRequest keeps only the session-owned lifecycle tracker
+// for a foreground phased command. A caller that was waiting before the crash is
+// gone, so restore must never manufacture a parent SubagentResult; the tracker is
+// removed when the child opens/terminates the request or the session shuts down.
+func (m *delegationManager) observeRestoredForegroundRequest(s *Session, tracked *requestTracker, requestID uuid.UUID, sub event.Subscription) {
+	go func() {
+		defer func() { _ = sub.Close() }()
+		defer m.removeRequest(requestID, tracked)
+		_, _ = drainDelegateAnswerObservedWithDisposition(s.sessionCtx, sub, requestID, nil, tracked.markOpening)
+		tracked.markTerminal()
+	}()
 }
 
 // foldDelegateTerminals preserves the historical map-only helper for focused live
@@ -906,12 +986,17 @@ func foldDelegateTerminalsChecked(events []event.Event) (map[uuid.UUID]resolvedR
 		kind string
 		text string
 	}
+	type turnLifecycle struct {
+		started  bool
+		terminal bool
+	}
 	byTurn := make(map[turnKey]map[uuid.UUID]struct{})
 	requestTurns := make(map[uuid.UUID]turnKey)
 	turnOwners := make(map[uuid.UUID]uuid.UUID)
 	terminalOwners := make(map[uuid.UUID]uuid.UUID)
+	lifecycle := make(map[turnKey]turnLifecycle)
 	terminals := make(map[turnKey]terminalObservation)
-	addOpening := func(key turnKey, requestID uuid.UUID) error {
+	validateRoute := func(key turnKey) error {
 		if priorLoop, exists := turnOwners[key.turnID]; exists && priorLoop != key.loopID {
 			return &journal.CommandRouteMismatchError{RecordLoopID: key.loopID, TargetLoopID: priorLoop}
 		}
@@ -919,6 +1004,9 @@ func foldDelegateTerminalsChecked(events []event.Event) (map[uuid.UUID]resolvedR
 			return &journal.CommandRouteMismatchError{RecordLoopID: key.loopID, TargetLoopID: priorLoop}
 		}
 		turnOwners[key.turnID] = key.loopID
+		return nil
+	}
+	addRequest := func(key turnKey, requestID uuid.UUID) error {
 		if !requestID.IsZero() {
 			if prior, exists := requestTurns[requestID]; exists && prior != key {
 				return &delegateRestoreContradictionError{requestID: requestID, reason: "request belongs to multiple turns"}
@@ -935,13 +1023,44 @@ func foldDelegateTerminalsChecked(events []event.Event) (map[uuid.UUID]resolvedR
 		}
 		return nil
 	}
+	addStarted := func(key turnKey, requestID uuid.UUID) error {
+		if err := validateRoute(key); err != nil {
+			return err
+		}
+		state := lifecycle[key]
+		if state.terminal {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "turn opening appears after terminal"}
+		}
+		if state.started {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "turn has multiple TurnStarted openings"}
+		}
+		state.started = true
+		lifecycle[key] = state
+		return addRequest(key, requestID)
+	}
+	addFolded := func(key turnKey, requestID uuid.UUID) error {
+		if err := validateRoute(key); err != nil {
+			return err
+		}
+		state := lifecycle[key]
+		if !state.started {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "turn fold appears before TurnStarted opening"}
+		}
+		if state.terminal {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "turn fold appears after terminal"}
+		}
+		return addRequest(key, requestID)
+	}
 	observeTerminal := func(key turnKey, observation terminalObservation) error {
-		if priorLoop, exists := turnOwners[key.turnID]; exists && priorLoop != key.loopID {
-			return &journal.CommandRouteMismatchError{RecordLoopID: key.loopID, TargetLoopID: priorLoop}
+		if err := validateRoute(key); err != nil {
+			return err
 		}
-		if priorLoop, exists := terminalOwners[key.turnID]; exists && priorLoop != key.loopID {
-			return &journal.CommandRouteMismatchError{RecordLoopID: key.loopID, TargetLoopID: priorLoop}
+		state := lifecycle[key]
+		if !state.started {
+			return &delegateRestoreContradictionError{reason: "turn terminal appears before TurnStarted opening"}
 		}
+		state.terminal = true
+		lifecycle[key] = state
 		terminalOwners[key.turnID] = key.loopID
 		if prior, exists := terminals[key]; exists && prior != observation {
 			for requestID := range byTurn[key] {
@@ -956,12 +1075,12 @@ func foldDelegateTerminalsChecked(events []event.Event) (map[uuid.UUID]resolvedR
 		switch e := ev.(type) {
 		case event.TurnStarted:
 			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
-			if err := addOpening(key, e.Cause.CommandID); err != nil {
+			if err := addStarted(key, e.Cause.CommandID); err != nil {
 				return nil, err
 			}
 		case event.TurnFoldedInto:
 			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
-			if err := addOpening(key, e.Cause.CommandID); err != nil {
+			if err := addFolded(key, e.Cause.CommandID); err != nil {
 				return nil, err
 			}
 		case event.TurnDone:
@@ -1184,8 +1303,6 @@ func (m *delegationManager) removeRequest(requestID uuid.UUID, tracked *requestT
 // delivery is a machine-originated SubagentResult to the direct parent.
 func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.UUID, name string, tracked *requestTracker, requestID uuid.UUID, sub event.Subscription, timeoutSeconds *int, suppressInterrupt bool) {
 	go func() {
-		defer func() { _ = sub.Close() }()
-		defer m.removeRequest(requestID, tracked)
 		waitCtx, cancel := waitContext(s.sessionCtx, timeoutSeconds)
 		defer cancel()
 		var interrupt func()
@@ -1203,7 +1320,6 @@ func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.U
 		if status == tool.DelegateStatusFailed && text == "" {
 			text = delegateFailureDetail(err)
 		}
-		tracked.markTerminal()
 		var blocks []content.Block
 		if suppressInterrupt {
 			deliveryStatus := tracked.openingStatus()
@@ -1219,6 +1335,16 @@ func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.U
 			// impossible (session shutdown, parent exit, or command-id failure).
 			s.cancelExpectTurn(context.Background(), childID)
 		}
+		if suppressInterrupt && observerExpired {
+			// The parent observer has expired, but the accepted native request is
+			// still live. Keep the session-owned tracker and subscription until an
+			// opening/terminal event resolves it so status cannot regress to idle.
+			m.observeRestoredForegroundRequest(s, tracked, requestID, sub)
+			return
+		}
+		tracked.markTerminal()
+		_ = sub.Close()
+		m.removeRequest(requestID, tracked)
 	}()
 }
 
@@ -1234,6 +1360,23 @@ func (m *delegationManager) pendingCount(childID uuid.UUID) int {
 		}
 	}
 	return count
+}
+
+// hasNonterminalRequest exposes only the session-owned mechanical fact needed by
+// status snapshots. A retained native request keeps its child working after a
+// caller's observer expires, until the authoritative child event resolves it.
+func (m *delegationManager) hasNonterminalRequest(childID uuid.UUID) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, request := range m.requests {
+		if request.childID == childID && !request.terminal() {
+			return true
+		}
+	}
+	return false
 }
 
 // scopedController is the parent-scoped tool.DelegateController for one live parent
@@ -1664,8 +1807,6 @@ func (c *scopedController) status(s *Session, req tool.DelegateRequest) (tool.De
 // the foreground response or starts the automatic durable parent hand-back.
 func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, childID, requestID uuid.UUID, sub event.Subscription, tracked *requestTracker, req tool.DelegateRequest) (tool.DelegateResult, error) {
 	if req.WaitForResponse {
-		defer func() { _ = sub.Close() }()
-		defer c.manager.removeRequest(requestID, tracked)
 		waitCtx, cancel := waitContext(ctx, req.TimeoutSeconds)
 		defer cancel()
 		var interrupt func()
@@ -1690,7 +1831,13 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 			text = delegateFailureDetail(err)
 		}
 		observerExpired := drainObserverExpired(err)
-		tracked.markTerminal()
+		if observerExpired && nativeMessage {
+			c.manager.observeRestoredForegroundRequest(s, tracked, requestID, sub)
+		} else {
+			tracked.markTerminal()
+			_ = sub.Close()
+			c.manager.removeRequest(requestID, tracked)
+		}
 		result := c.responseResult(s, childID, requestID, status, text)
 		if observerExpired {
 			result.State = tool.AgentStateWorking
@@ -2030,6 +2177,9 @@ func (c *scopedController) childStatus(s *Session, childID uuid.UUID) tool.Deleg
 	case <-handle.backend.DoneChan():
 		return tool.DelegateStatusFailed
 	default:
+	}
+	if c.manager.hasNonterminalRequest(childID) {
+		return tool.DelegateStatusRunning
 	}
 	return handle.mechanicalState()
 }

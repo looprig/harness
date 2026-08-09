@@ -126,6 +126,57 @@ func TestMessageAgentRestoreFoldsAllRequestsIntoOneExactTerminal(t *testing.T) {
 	}
 }
 
+func TestMessageAgentRestoreRejectsOutOfOrderTurnLifecycle(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name   string
+		events func(childID, requestID, turnID uuid.UUID) []event.Event
+	}{
+		{name: "terminal before opening", events: func(childID, requestID, turnID uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}}, Message: aiMessage("done")},
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}, Cause: identity.Cause{CommandID: requestID}}},
+			}
+		}},
+		{name: "duplicate turn started", events: func(childID, requestID, turnID uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}, Cause: identity.Cause{CommandID: requestID}}},
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}, Cause: identity.Cause{CommandID: requestID}}},
+			}
+		}},
+		{name: "fold before start", events: func(childID, requestID, turnID uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnFoldedInto{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}, Cause: identity.Cause{CommandID: requestID}}},
+			}
+		}},
+		{name: "opening after terminal", events: func(childID, requestID, turnID uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}, Cause: identity.Cause{CommandID: requestID}}},
+				event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}}, Message: aiMessage("done")},
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}, Cause: identity.Cause{CommandID: mustUUID()}}},
+			}
+		}},
+		{name: "fold after terminal", events: func(childID, requestID, turnID uuid.UUID) []event.Event {
+			return []event.Event{
+				event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}, Cause: identity.Cause{CommandID: requestID}}},
+				event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}}, Message: aiMessage("done")},
+				event.TurnFoldedInto{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}, Cause: identity.Cause{CommandID: mustUUID()}}},
+			}
+		}},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			childID, requestID, turnID := mustUUID(), mustUUID(), mustUUID()
+			records := []journal.JournalRecord{
+				journal.NewCommandRecord(mustUUID(), childID, phasedBackgroundCommand(requestID, childID, command.DelegateDeliveryPhaseIntent)),
+			}
+			if err := seedResolvedDelegateRecords(newDelegationManager(Topology{}), records, tt.events(childID, requestID, turnID), nil); err == nil {
+				t.Fatalf("out-of-order lifecycle %q was accepted", tt.name)
+			}
+		})
+	}
+}
+
 func TestMessageAgentRestoreReadmitsUnopenedPhasedCommands(t *testing.T) {
 	t.Parallel()
 	sessionID, parentID, childID := mustUUID(), mustUUID(), mustUUID()
@@ -163,6 +214,155 @@ func TestMessageAgentRestoreReadmitsUnopenedPhasedCommands(t *testing.T) {
 	}
 	if !seen[intentID] || !seen[fallbackID] {
 		t.Fatalf("restore re-admission ids = %v, want intent=%v fallback=%v", seen, intentID, fallbackID)
+	}
+}
+
+func TestMessageAgentRestoreReadmitsForegroundPhasedCommandWithoutHandback(t *testing.T) {
+	t.Parallel()
+	sessionID, parentID, childID := mustUUID(), mustUUID(), mustUUID()
+	for _, phase := range []command.DelegateDeliveryPhase{
+		command.DelegateDeliveryPhaseIntent,
+		command.DelegateDeliveryPhaseFallbackQueued,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			requestID := mustUUID()
+			foreground := phasedBackgroundCommand(requestID, childID, phase)
+			foreground.BackgroundHandBack = false
+			records := []journal.JournalRecord{
+				journal.NewCommandRecord(sessionID, childID, foreground),
+			}
+			replayed := []event.Event{
+				event.LoopStarted{Header: event.Header{
+					Coordinates: identity.Coordinates{LoopID: childID},
+					Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: parentID}},
+				}, DisplayName: "worker"},
+			}
+			manager := newDelegationManager(Topology{})
+			if err := seedResolvedDelegateRecords(manager, records, replayed, nil); err != nil {
+				t.Fatalf("seedResolvedDelegateRecords: %v", err)
+			}
+			plan, err := manager.planRestoredBackgroundRequests(&Session{loops: map[uuid.UUID]*loopHandle{}}, records, replayed, nil)
+			if err != nil {
+				t.Fatalf("planRestoredBackgroundRequests: %v", err)
+			}
+			if len(plan) != 1 || plan[0].reAdmit == nil {
+				t.Fatalf("foreground restore plan = %+v, want one re-admission", plan)
+			}
+			if plan[0].reAdmit.CommandID != requestID || plan[0].reAdmit.BackgroundHandBack {
+				t.Fatalf("foreground restore command = %+v, want same id without hand-back", *plan[0].reAdmit)
+			}
+			if plan[0].handBack != nil {
+				t.Fatalf("foreground restore synthesized hand-back = %+v, want none", plan[0].handBack)
+			}
+		})
+	}
+}
+
+func TestMessageAgentRestoreReadmitsForegroundIntentAfterCrashWithoutHandback(t *testing.T) {
+	parentLLM := newControlledAgentLLM()
+	childLLM := newControlledAgentLLM()
+	lifecycle, session, _ := newAgentRestoreLifecycle(t, newRestoreStore(t), parentLLM, childLLM, nil)
+	controller := session.delegation.controllerFor(session.ActiveLoopID(), backgroundNode("parent", parentLLM, "child"))
+	started, err := controller.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, AgentType: "child", Message: "start", WaitForResponse: true,
+	})
+	if err != nil {
+		t.Fatalf("initial child start: %v", err)
+	}
+	select {
+	case message := <-childLLM.started:
+		if message != "start" {
+			t.Fatalf("initial child message = %q, want start", message)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial child did not start")
+	}
+	childLLM.release <- struct{}{}
+
+	session.loopsMu.Lock()
+	childHandle := session.loops[started.AgentID]
+	if childHandle == nil || childHandle.backend == nil {
+		session.loopsMu.Unlock()
+		t.Fatalf("initial child %v has no backend", started.AgentID)
+	}
+	blockedBackend := &restoreBlockedBackend{commands: make(chan command.Command, 1), done: childHandle.backend.DoneChan()}
+	childHandle.backend = blockedBackend
+	session.loopsMu.Unlock()
+
+	zero := 0
+	sendCh := make(chan error, 1)
+	go func() {
+		_, sendErr := controller.Execute(delegateCtx(t), tool.DelegateRequest{
+			Operation: tool.DelegateSend, AgentID: started.AgentID, Message: "foreground after restore", WaitForResponse: true, TimeoutSeconds: &zero,
+		})
+		sendCh <- sendErr
+	}()
+	var dispatched command.UserInput
+	for {
+		raw := <-blockedBackend.commands
+		switch typed := raw.(type) {
+		case command.UserInput:
+			dispatched = typed
+		case command.CancelDelegateRequest, command.CancelQueuedInput:
+			// A pre-existing child cleanup command is unrelated to the new
+			// durable foreground intent; keep draining the diverted route.
+			continue
+		default:
+			t.Fatalf("foreground crash command = %T, want command.UserInput", raw)
+		}
+		break
+	}
+	dispatched.Accepted <- nil
+	select {
+	case sendErr := <-sendCh:
+		if sendErr != nil {
+			t.Fatalf("foreground send before crash: %v", sendErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("foreground send before crash did not observe timeout")
+	}
+	beforeCrash := messageAgentRestoreRecords(t, lifecycle.store, session.SessionID())
+	foundIntent := false
+	for _, record := range beforeCrash {
+		commandRecord, ok := record.(journal.CommandRecord)
+		if !ok {
+			continue
+		}
+		input, ok := commandRecord.Command().(command.UserInput)
+		if ok && input.CommandID == dispatched.CommandID {
+			foundIntent = true
+			if input.BackgroundHandBack || input.NoFold || input.DelegateDeliveryPhase != command.DelegateDeliveryPhaseIntent {
+				t.Fatalf("foreground durable command = %+v, want phased foldable intent without hand-back", input)
+			}
+		}
+	}
+	if !foundIntent {
+		t.Fatalf("foreground durable intent %v missing before crash", dispatched.CommandID)
+	}
+
+	sessionID := session.SessionID()
+	crashAgentRestoreSession(t, session)
+	restored, err := lifecycle.RestoreSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("RestoreSession: %v", err)
+	}
+	defer restored.Shutdown(context.Background())
+	select {
+	case message := <-childLLM.started:
+		if message != "foreground after restore" {
+			t.Fatalf("restored foreground message = %q, want exact re-admission", message)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("restored foreground command was not re-admitted")
+	}
+	if got := countMessageAgentHandbacks(messageAgentRestoreRecords(t, lifecycle.store, sessionID), dispatched.CommandID); got != 0 {
+		t.Fatalf("restored foreground hand-backs = %d, want none", got)
+	}
+	childLLM.release <- struct{}{}
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := restored.WaitIdle(waitCtx); err != nil {
+		t.Fatalf("restored foreground WaitIdle: %v", err)
 	}
 }
 
