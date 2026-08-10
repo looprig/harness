@@ -30,7 +30,7 @@ func (s LoopScope) Matches(loopID uuid.UUID) bool {
 }
 
 // ShouldDeliver reports whether ev passes filter for one subscriber. Session-scoped
-// events (SessionStarted/SessionActive/SessionIdle/SessionStopped) always deliver,
+// events (including the durable WorkflowActivity timeline) always deliver,
 // bypassing LoopScope. Loop-scoped events are matched by the class-appropriate
 // LoopScope against the producing loop's Header.LoopID. It is evaluated at fan-out,
 // before the bounded send, so a filtered-out firehose never enters the egress

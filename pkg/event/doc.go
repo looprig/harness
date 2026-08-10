@@ -35,6 +35,7 @@ var (
 	_ Event = ActiveLoopChanged{}
 	_ Event = DelegateDeliveryStateChanged{}
 	_ Event = IntegrationStatus{}
+	_ Event = WorkflowActivity{}
 
 	// Loop-scoped events.
 	_ Event = ProcessStarted{}

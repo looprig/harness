@@ -985,7 +985,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 47
+const wantEnduringTypes = 48
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -999,7 +999,7 @@ func unionInstances() []Event {
 		HustleFailed{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference},
 		PermissionReviewStarted{}, PermissionReviewCompleted{},
 		ProcessStarted{}, ProcessBackgrounded{}, ProcessCompleted{}, ProcessStopRequested{}, ProcessLost{},
-		ConfigurationAdopted{},
+		ConfigurationAdopted{}, WorkflowActivity{},
 		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{}, WorkspaceRestored{}, ActiveLoopChanged{}, DelegateDeliveryStateChanged{},
 		LoopIdle{}, LoopStarted{}, DelegateRequestAccepted{}, LoopInferenceChanged{}, LoopModeChanged{},
 		LoopExternalToolsetChanged{}, ForeignSessionBound{},
