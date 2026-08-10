@@ -196,7 +196,7 @@ func newCollabBrokerAt(session *Session, root, socketName string) (*collabBroker
 	createdRoot := false
 	if root == "" {
 		var err error
-		root, err = os.MkdirTemp("", "coderig-collab-session-")
+		root, err = os.MkdirTemp("", "carbon-collab-session-")
 		if err != nil {
 			return nil, errCollabBrokerProtocol
 		}
