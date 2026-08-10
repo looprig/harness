@@ -60,8 +60,11 @@ func newCheckedWorkflowActivityPublisher(
 // PublishWorkflowActivity maps the neutral resource DTO to the one sealed
 // WorkflowActivity event, preserves its deterministic EventID, validates its
 // complete identity/body, and sends it through the ordinary durable Hub path.
-// The publisher never accepts a generic event.Event, so a resource cannot use
-// this trusted seam to bypass the event union or publish another event type.
+// OccurredAt is also the stable creation envelope for this source activity: it
+// lets a retry after a process restart reproduce the exact durable payload while
+// retaining the event's separate source-occurrence field. The publisher never
+// accepts a generic event.Event, so a resource cannot use this trusted seam to
+// bypass the event union or publish another event type.
 func (p *checkedWorkflowActivityPublisher) PublishWorkflowActivity(
 	ctx context.Context,
 	metadata tool.WorkflowActivityMetadata,
@@ -73,6 +76,7 @@ func (p *checkedWorkflowActivityPublisher) PublishWorkflowActivity(
 		Header: event.Header{
 			Coordinates: identity.Coordinates{SessionID: metadata.SessionID},
 			EventID:     metadata.EventID,
+			CreatedAt:   metadata.OccurredAt,
 		},
 		RunID:             metadata.RunID,
 		WorkflowName:      metadata.WorkflowName,

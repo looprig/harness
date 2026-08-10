@@ -3,10 +3,12 @@ package sessionruntime
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 	contextcount "github.com/looprig/inference/contextcount"
 	model "github.com/looprig/inference/model"
 )
@@ -86,6 +88,27 @@ func TestFoldLoopCarriesContextBasisWithoutMeasurement(t *testing.T) {
 				t.Fatalf("restored basis=%+v has=%v, want %+v true", seed.Basis, seed.HasBasis, wantBasis)
 			}
 		})
+	}
+}
+
+func TestFoldLoopIgnoresWorkflowActivityForModelContext(t *testing.T) {
+	t.Parallel()
+
+	activity := event.WorkflowActivity{
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: uuid.UUID{20}}, EventID: uuid.UUID{21}},
+		RunID:  uuid.UUID{22}, WorkflowName: "source_document_extract", WorkflowVersion: "v1",
+		Kind: event.WorkflowActivityRunCompleted, Status: event.WorkflowRunStatusCompleted,
+		Message: "bounded workflow diagnostic", OccurredAt: time.Date(2026, time.August, 9, 17, 0, 0, 0, time.UTC),
+	}
+	if err := event.ValidateEvent(activity); err != nil {
+		t.Fatalf("WorkflowActivity validation = %v", err)
+	}
+	folded := foldLoop([]event.Event{activity})
+	if folded.Err != nil {
+		t.Fatalf("foldLoop() error = %v", folded.Err)
+	}
+	if len(folded.Msgs) != 0 || folded.HasContext || folded.HasBasis || folded.OpenTurn {
+		t.Fatalf("folded workflow activity into model state: msgs=%d context=%v basis=%v openTurn=%v", len(folded.Msgs), folded.HasContext, folded.HasBasis, folded.OpenTurn)
 	}
 }
 

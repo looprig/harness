@@ -44,8 +44,8 @@ type WorkflowActivityPublisher interface {
 
 // WorkflowActivityMetadata is the transport-neutral, bounded input to the
 // trusted workflow publication seam. EventID is a stable source activity ID and
-// must be preserved across retries; the session runtime supplies the Harness
-// CreatedAt envelope timestamp when it stamps the sealed event.
+// must be preserved across retries; the session runtime uses the validated
+// OccurredAt as the stable creation envelope when it stamps the sealed event.
 type WorkflowActivityMetadata struct {
 	EventID           uuid.UUID `json:"event_id,omitzero"`
 	SessionID         uuid.UUID `json:"session_id,omitzero"`

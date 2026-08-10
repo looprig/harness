@@ -174,6 +174,26 @@ func TestFactoryStampWorkflowActivityPreservesDeterministicID(t *testing.T) {
 	}
 }
 
+func TestFactoryStampWorkflowActivityPreservesExplicitCreatedAt(t *testing.T) {
+	t.Parallel()
+
+	createdAt := time.Date(2026, time.August, 9, 12, 30, 0, 0, time.UTC)
+	factory := event.NewFactory(
+		func() (uuid.UUID, error) { return uuid.UUID{56}, nil },
+		func() time.Time { return createdAt.Add(time.Hour) },
+	)
+	input := validWorkflowActivity()
+	input.EventID = uuid.UUID{}
+	input.CreatedAt = createdAt
+	activity, err := factory.StampWorkflowActivity(input, uuid.UUID{55})
+	if err != nil {
+		t.Fatalf("StampWorkflowActivity() = %v", err)
+	}
+	if !activity.CreatedAt.Equal(createdAt) {
+		t.Fatalf("CreatedAt = %v, want explicit %v", activity.CreatedAt, createdAt)
+	}
+}
+
 func TestFactoryStampWorkflowActivityRejectsZeroID(t *testing.T) {
 	t.Parallel()
 
