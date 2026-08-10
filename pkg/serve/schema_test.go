@@ -161,6 +161,7 @@ func TestFixturesMatchSchemaShape(t *testing.T) {
 		sse     bool // read the data: payload rather than the whole file
 	}{
 		{fixture: "capabilities.json", schema: "capabilities.schema.json"},
+		{fixture: "capabilities_read_only.json", schema: "capabilities.schema.json"},
 		{fixture: "create_idle.json", schema: "create_response.schema.json"},
 		{fixture: "create_with_command.json", schema: "create_response.schema.json"},
 		{fixture: "session_list.json", schema: "session_list.schema.json"},

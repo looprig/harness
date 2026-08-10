@@ -123,6 +123,7 @@ func TestFixtures(t *testing.T) {
 		produce func(t *testing.T) []byte
 	}{
 		{name: "capabilities", file: "capabilities.json", produce: produceCapabilities},
+		{name: "capabilities read-only", file: "capabilities_read_only.json", produce: produceCapabilitiesReadOnly},
 		{name: "create idle", file: "create_idle.json", produce: produceCreateIdle},
 		{name: "create with command", file: "create_with_command.json", produce: produceCreateWithCommand},
 		{name: "session list", file: "session_list.json", produce: produceSessionList},
@@ -178,6 +179,14 @@ func produceCapabilities(t *testing.T) []byte {
 	srv := newServer[*fakeSession, fakeSessionOption](nil, nil, newConfig())
 	rec := httptest.NewRecorder()
 	srv.handleCapabilities(rec, httptest.NewRequest(http.MethodGet, "/v1/capabilities", http.NoBody))
+	return rec.Body.Bytes()
+}
+
+func produceCapabilitiesReadOnly(t *testing.T) []byte {
+	t.Helper()
+	rs := &readServer{reader: stubReader{}, features: readOnlyFeatures}
+	rec := httptest.NewRecorder()
+	rs.handleCapabilities(rec, httptest.NewRequest(http.MethodGet, "/v1/capabilities", http.NoBody))
 	return rec.Body.Bytes()
 }
 
