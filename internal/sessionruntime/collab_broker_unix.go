@@ -13,4 +13,10 @@ func listenCollabEndpoint(endpoint string) (net.Listener, error) {
 	return net.Listen("unix", endpoint)
 }
 
-func collabUID() uint32 { return uint32(os.Getuid()) }
+func collabUID() uint32 {
+	uid, ok := collabUint32FromNonNegativeInt(os.Getuid())
+	if !ok {
+		return 0
+	}
+	return uid
+}

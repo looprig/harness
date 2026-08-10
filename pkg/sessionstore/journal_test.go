@@ -811,7 +811,7 @@ func TestSessionJournalOffloadedRecordHydratesIdempotencyIndex(t *testing.T) {
 // hydration window probabilistically (as the integration-level
 // TestAgentRestoreReconcilesDurableEdges/TestDelegateQueuedRequestRestores...
 // tests in internal/sessionruntime do), this test uses openRaceLedger to land the
-// concurrent write synchronously and unconditionally at hydrateIdempotencyIndex's
+// concurrent write synchronously and unconditionally at hydrateJournalIndexes'
 // one and only Read call — the exact entry point of the walk — so the race is
 // reproduced on every run, not merely most runs.
 //
@@ -911,7 +911,7 @@ func TestOpenJournalFenceSurvivesConcurrentWriteDuringHydration(t *testing.T) {
 // --- test doubles ---------------------------------------------------------
 
 // openRaceLedger fires a one-time side effect the instant Read is called for its
-// bound session name — the exact entry point hydrateIdempotencyIndex uses (its
+// bound session name — the exact entry point hydrateJournalIndexes uses (its
 // one and only Read call). This lets a test land a concurrent write
 // deterministically inside the hydration window on every run, rather than
 // relying on real goroutine scheduling to hit a ~650-700us race window.

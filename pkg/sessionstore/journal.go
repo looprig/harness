@@ -80,7 +80,7 @@ type sessionJournal struct {
 
 	// idx tracks every idempotency id already durable in this session's log —
 	// hydrated from the full ledger AFTER the opening fence has claimed ownership
-	// (see OpenJournalWithOpeningAppend and hydrateIdempotencyIndex) — so a
+	// (see OpenJournalWithOpeningAppend and hydrateJournalIndexes) — so a
 	// redelivered Append/AppendIdempotent can be detected and deduplicated instead
 	// of writing a second frame. It is guarded by mu exactly like ready/trackedTip:
 	// only appendChecked reads or updates it once the journal is open, and Open
@@ -259,19 +259,6 @@ func (s *Store) OpenJournalWithOpeningAppend(
 	}
 	j.ready = true
 	return j, nil
-}
-
-// hydrateIdempotencyIndex walks name's full durable ledger, from its first record,
-// and returns an IdempotencyIndex recording every record's persisted idempotency id,
-// the ledger sequence it occupies, and a Fingerprint of its persisted (kind, body) —
-// resolving an offloaded record transparently exactly as ordinary replay does (blob
-// fetch, sha256 verification, and outer/inner id agreement; see baseCursor.next /
-// resolveBlob in replay.go). Any read/decode/integrity failure fails closed: without a
-// COMPLETE view of history the index cannot be trusted to catch a real duplicate, so
-// OpenJournal must not proceed on a partial hydration.
-func hydrateIdempotencyIndex(ctx context.Context, ledger storage.Ledger, blobs storage.Blobs, name string) (*journal.IdempotencyIndex, error) {
-	idx, _, err := hydrateJournalIndexes(ctx, ledger, blobs, name)
-	return idx, err
 }
 
 func hydrateJournalIndexes(ctx context.Context, ledger storage.Ledger, blobs storage.Blobs, name string) (*journal.IdempotencyIndex, map[uuid.UUID]deliveryTransition, error) {

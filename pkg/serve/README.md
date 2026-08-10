@@ -26,6 +26,16 @@ in at the composition root and reach `serve` exclusively through
   the config from `Options`, installs the middleware (auth, body cap,
   request id, recovery, idempotency), wraps a `ServeMux`, and returns
   an `http.Handler`. The route table is fixed and disjoint (see below).
+- **`ReadHandler`** — builds the stateless, **read-only** session HTTP
+  surface: capabilities plus `/v1/sessions` (list), `/v1/sessions/{sid}/status`,
+  and `/v1/sessions/{sid}/journal` — nothing else. It exists for a process
+  that serves durable history but hosts no agent, so it has no `Rig` to
+  hand to `Handler` — a browse-only BFF or a read-plane pod. It shares
+  `Handler`'s middleware chain (`Options` apply the same way) and the
+  identical read handlers, so there is exactly one implementation of each
+  read route. Its `/v1/capabilities` document advertises `journal` only:
+  a read-only server must not claim `live_sse`/`ephemeral_sse`/
+  `gate_response` planes it cannot serve.
 - **`Server`** — builds a hardened `*http.Server` bound to an address,
   refusing — **fail secure** — to bind a public address without
   authentication installed (`PublicBindWithoutAuthError`). It does

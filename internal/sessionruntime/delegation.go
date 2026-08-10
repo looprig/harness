@@ -742,23 +742,6 @@ type restoredBackgroundPlan struct {
 	reAdmit *command.UserInput
 }
 
-// phasedBackgroundCommands returns the exact foldable command payloads that may
-// be re-admitted after restore. Legacy NoFold hand-backs remain terminal-correlation
-// records only; replaying those would change the historical admission contract.
-func phasedBackgroundCommands(records []journal.JournalRecord) (map[uuid.UUID]command.UserInput, error) {
-	all, err := phasedDelegateCommands(records)
-	if err != nil {
-		return nil, err
-	}
-	commands := make(map[uuid.UUID]command.UserInput)
-	for requestID, input := range all {
-		if input.BackgroundHandBack {
-			commands[requestID] = input
-		}
-	}
-	return commands, nil
-}
-
 // planRestoredBackgroundRequests reconstructs the durable child-terminal to
 // parent-input correlation before RestoreDone. The plan deliberately treats
 // TurnStarted/TurnFoldedInto as processed completion evidence. InputQueued is

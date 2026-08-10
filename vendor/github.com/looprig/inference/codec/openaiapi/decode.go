@@ -19,7 +19,7 @@ func DecodeResponse(body []byte) (*inference.Response, error) {
 	}
 
 	if len(wire.Choices) == 0 {
-		return nil, &failure.APIError{Status: 0, Message: "response contains no choices", Body: body}
+		return nil, failure.NewAPIError(0, "", "", 0)
 	}
 
 	msg := wire.Choices[0].Message
@@ -73,11 +73,11 @@ func normalizePromptUsage(wire chatUsage) (content.TokenCount, content.TokenCoun
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	cacheRead, err := wire.PromptTokensDetails.CachedTokens.TokenCount(usagenorm.FieldCacheReadTokens)
+	cacheRead, err := wire.PromptTokensDetails.CachedTokens.OptionalTokenCount(usagenorm.FieldCacheReadTokens)
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	cacheCreation, err := wire.PromptTokensDetails.CacheWriteTokens.TokenCount(usagenorm.FieldCacheCreationTokens)
+	cacheCreation, err := wire.PromptTokensDetails.CacheWriteTokens.OptionalTokenCount(usagenorm.FieldCacheCreationTokens)
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -93,7 +93,7 @@ func normalizeCompletionUsage(wire chatUsage) (content.TokenCount, content.Token
 	if err != nil {
 		return 0, 0, err
 	}
-	reasoning, err := wire.CompletionTokensDetails.ReasoningTokens.TokenCount(usagenorm.FieldReasoningTokens)
+	reasoning, err := wire.CompletionTokensDetails.ReasoningTokens.OptionalTokenCount(usagenorm.FieldReasoningTokens)
 	return output, reasoning, err
 }
 

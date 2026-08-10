@@ -892,24 +892,6 @@ func (s *Session) PublishEventChecked(ctx context.Context, ev event.Event) error
 	return nil
 }
 
-// foreignServicesFor creates the one services snapshot for an exact foreign
-// loop construction. A fresh hook is created for every construction, including
-// restored loops, so no delivery authority is shared across loops/sessions.
-func (s *Session) foreignServicesFor(loopID uuid.UUID) foreign.Services {
-	services, _ := s.foreignServicesForTracked(loopID)
-	return services
-}
-
-func (s *Session) foreignServicesForTracked(loopID uuid.UUID) (foreign.Services, *foreignDeliveryHook) {
-	var controller tool.DelegateController
-	s.loopsMu.RLock()
-	if handle := s.loops[loopID]; handle != nil {
-		controller = handle.bindings.Delegate
-	}
-	s.loopsMu.RUnlock()
-	return s.foreignServicesForTrackedWithController(loopID, controller)
-}
-
 func (s *Session) foreignServicesForTrackedWithController(loopID uuid.UUID, controller tool.DelegateController) (foreign.Services, *foreignDeliveryHook) {
 	hook := s.foreignDeliveryHookFor(loopID)
 	if hook == nil {

@@ -12,16 +12,18 @@ import (
 // the concrete live-session type S (constrained to LiveSession) so the real type
 // threads through NewSession/RestoreSession without serve importing it — the composition
 // root instantiates server with its concrete session and option types while serve keeps
-// both as generic parameters.
+// both as generic parameters. The stateless read plane (list/status/journal/capabilities)
+// is embedded via *readServer rather than duplicated here, so it can also be served on
+// its own by a process with no rig.
 //
 // This holder carries no request state — one server instance serves every request
 // (the mux is built by Handler in mux.go; per-request state lives on the stack of each
-// handler invocation). Its fields are the shared per-pod dependencies: the session
-// rig, the read-plane Reader, the live-session registry, the config, and the
+// handler invocation). Its fields are the shared per-pod dependencies: the embedded
+// read plane, the session rig, the live-session registry, the config, and the
 // idempotency store.
 type server[S LiveSession, O any] struct {
+	*readServer
 	rig      Rig[S, O]
-	reader   Reader
 	registry *registry
 	cfg      *config
 	// idem is the per-pod Idempotency-Key store for POST /v1/sessions. It is built
@@ -40,11 +42,11 @@ type server[S LiveSession, O any] struct {
 // routes that never touch it (the read handlers require it).
 func newServer[S LiveSession, O any](rig Rig[S, O], reader Reader, cfg *config) *server[S, O] {
 	return &server[S, O]{
-		rig:      rig,
-		reader:   reader,
-		registry: newRegistry(),
-		cfg:      cfg,
-		idem:     newIdempotencyStore(defaultIdempotencyTTL),
+		readServer: &readServer{reader: reader, features: fullFeatures},
+		rig:        rig,
+		registry:   newRegistry(),
+		cfg:        cfg,
+		idem:       newIdempotencyStore(defaultIdempotencyTTL),
 	}
 }
 

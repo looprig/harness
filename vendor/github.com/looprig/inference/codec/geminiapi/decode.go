@@ -22,7 +22,7 @@ func DecodeResponse(body []byte) (*inference.Response, error) {
 	}
 
 	if len(wire.Candidates) == 0 {
-		return nil, &failure.APIError{Status: 0, Message: "response contains no candidates", Body: body}
+		return nil, failure.NewAPIError(0, "", "", 0)
 	}
 
 	blocks := buildBlocks(wire.Candidates[0].Content.Parts)
