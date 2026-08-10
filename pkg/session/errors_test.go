@@ -17,7 +17,7 @@ func TestConfigMismatchErrorNamesChangedFingerprintFields(t *testing.T) {
 		},
 		Live: event.ConfigFingerprint{
 			TopologyRev:     "new-topology",
-			AgentKind:       "carbon:operator",
+			AgentKind:       "carbon:carbon",
 			ModelID:         "model-a",
 			SystemPromptRev: "new-prompt",
 			WorkspaceRoot:   "exclusive:/work/carbon",
@@ -26,7 +26,7 @@ func TestConfigMismatchErrorNamesChangedFingerprintFields(t *testing.T) {
 
 	for _, want := range []string{
 		"topology",
-		`agent kind ("swe:operator" -> "carbon:operator")`,
+		`agent kind ("swe:operator" -> "carbon:carbon")`,
 		"system prompt",
 		`workspace root ("/work/swe" -> "exclusive:/work/carbon")`,
 	} {
