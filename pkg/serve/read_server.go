@@ -15,3 +15,8 @@ type readServer struct {
 	reader   Reader
 	features []string
 }
+
+// readOnlyFeatures is the capability set a ReadHandler advertises: the journal plane
+// and nothing else. A read-only server has no live session and no control routes, so
+// claiming live_sse/ephemeral_sse/gate_response would be a lie a client acts on.
+var readOnlyFeatures = []string{featureJournal}
