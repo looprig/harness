@@ -11,7 +11,7 @@ const (
 	RuntimeSourceNative  RuntimeSourceName = "native"
 )
 
-// RuntimeSelectionKind identifies whether CodeRig selected a concrete model
+// RuntimeSelectionKind identifies whether the product composition root selected
 // or delegated model selection to the child harness.
 type RuntimeSelectionKind string
 

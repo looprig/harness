@@ -6,7 +6,7 @@
 
 ## Goal
 
-Let a consumer (CodeRig's TUI `/model` command) switch a running loop's live
+Let a consumer (Carbon's TUI `/model` command) switch a running loop's live
 model between operator-configured candidates that may sit on **different**
 providers, wire dialects, or endpoints (e.g. a local LM Studio model and a
 remote Chutes-hosted model) — not just different model names on one fixed
@@ -14,10 +14,10 @@ backend. Today `pkg/loop` hard-rejects any such switch. This document designs
 the harness-side mechanism that lifts that restriction while preserving the
 security invariant the restriction was protecting.
 
-This is a harness-only design. The CodeRig-side model-router composition
+This is a harness-only design. The Carbon-side model-router composition
 (building the `ContextTransport` set from `~/.looprig/models.json`, wiring its
 existing per-request `{Provider, APIFormat, BaseURL, Name}` client router) is
-out of scope and left to separate follow-up work in the `coderig` repo.
+out of scope and left to separate follow-up work in the `carbon` repo.
 
 ## Problem Statement
 
@@ -44,10 +44,10 @@ in `vendor/github.com/looprig/inference/contextcount/contracts.go`:
   (`contracts.go:273-278`) returns `true` — meaning "always compatible,
   regardless of `inf`" — whenever the counter is
   `Transport=Local, Retention=None, Provider="", SecurityIdentity=={}`.
-  CodeRig's counter is exactly this shape (a provider-agnostic heuristic
+  Carbon's counter is exactly this shape (a provider-agnostic heuristic
   estimator: `CountQualityHeuristicEstimate`, no provider-specific tokenizer).
   So a real transport switch never invalidates counter compatibility for
-  CodeRig's counter — `CompatibleCounter` would pass against *any* declared
+  Carbon's counter — `CompatibleCounter` would pass against *any* declared
   transport's `InferenceCapability` without change.
 - What actually gets frozen and compared 1:1 against the bound model is
   `InferenceCapability` — `Provider`, `Transport` (Local / TLS / AttestedTLS /
@@ -224,7 +224,7 @@ checks (`contextcount.CompatibleCounter`, line 220):
    `contextcount.CompatibleCounter(member.Capability, capability)` must pass
    (`DefinitionIncompatibleContextCounter`, reusing the existing kind — it *is*
    the same check, just run once per declared transport instead of once for
-   the sole transport). For CodeRig's provider-neutral counter this is a
+   the sole transport). For Carbon's provider-neutral counter this is a
    structural no-op per transport (see "Why The Binding Exists" above) but the
    check stays generic for a future non-neutral counter.
 4. Replace the mode-binding loop at line 237
@@ -557,7 +557,7 @@ re-litigated:
 1. **No confirmation/consent prompt required for a local → remote switch.**
    Harness stays mechanism-only and neutral here: `ChangeModel` performs no
    UI-level confirmation of any kind for any transport pair. Any consent UX
-   is a CodeRig TUI decision, not a harness concern.
+   is a Carbon TUI decision, not a harness concern.
 2. **Compaction summaries are preserved, never force-reset, across a
    transport-crossing switch.** See the dedicated section above.
 3. **Effort is never part of transport/capability identity.** `contextTransportKey`
@@ -599,10 +599,10 @@ type never crosses the durable-event boundary.
 
 ## Out of Scope
 
-- The CodeRig-side `~/.looprig/models.json` → `ContextTransport` set
+- The Carbon-side `~/.looprig/models.json` → `ContextTransport` set
   composition, and wiring the existing `RuntimeClient` per-request model
   router in place of a single fixed `PrimerClient`. Separate follow-up in the
-  `coderig` repo.
+  `carbon` repo.
 - Any TUI-level consent/confirmation UX for a transport-crossing switch
   (settled: none required at the harness layer).
 - Unifying the two independent `ModelRuntime`-fold implementations

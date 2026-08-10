@@ -22,9 +22,9 @@ The foreign-loop module extraction was specified independently in
 
 - Implement stable ACP wire protocol version 1 over stdio first.
 - Keep Harness protocol-neutral and free of ACP dependencies.
-- Let CodeRig expose its sessions over ACP through a product-owned composition
+- Let Carbon expose its sessions over ACP through a product-owned composition
   adapter.
-- Let CodeRig drive a foreign ACP agent through the same foreignloops backend used
+- Let Carbon drive a foreign ACP agent through the same foreignloops backend used
   by the Claude and Codex drivers.
 - Preserve Harness event identity, correlation, durability, permissions, workspace
   confinement, and lifecycle semantics at the bridge.
@@ -41,7 +41,7 @@ The foreign-loop module extraction was specified independently in
 - Making draft remote transport or additional-directory proposals part of the
   stable first release.
 - Making ACP session IDs authorization tokens.
-- Automatically exposing every Harness or CodeRig control over ACP.
+- Automatically exposing every Harness or Carbon control over ACP.
 - Rewriting the Claude and Codex foreign drivers around ACP in the first release.
 - Bridging interactive foreign-agent permission prompts into Harness gates in the
   first release (see "Client-side permissions" below; a fail-closed posture
@@ -67,7 +67,7 @@ github.com/looprig/acp  │
 - `foreignloops` owns the optional foreign backend and its process drivers. Its
   future `driver/acp` package depends on `acp/client` and emits
   `foreignloops/driver.Event` values.
-- CodeRig is the composition root for workspace, policy, persistence, TUI, auth,
+- Carbon is the composition root for workspace, policy, persistence, TUI, auth,
   filesystem, terminal, and optional external-capability wiring.
 
 Harness never imports either optional module (dependency-guard tests in
@@ -195,16 +195,16 @@ consumes them:
 
 These are consumer-owned interfaces in the acp module, not Harness types; Harness
 supplies the concrete material behind them (`sessionstore` catalog and replayers,
-`session.Compact`, `loop.ModeCatalog`, `loop.Controller`), and CodeRig adapts.
+`session.Compact`, `loop.ModeCatalog`, `loop.Controller`), and Carbon adapts.
 
-CodeRig implements the host adapter. It validates and canonicalizes `cwd`, chooses
+Carbon implements the host adapter. It validates and canonicalizes `cwd`, chooses
 or constructs the appropriate fixed-workspace rig, and supplies persistence and
 policy capabilities. ACP never fabricates arbitrary Harness `rig.SessionOption`
 values.
 
 ## Session identity and authorization
 
-When CodeRig creates the underlying session, its Harness UUID is used as the ACP
+When Carbon creates the underlying session, its Harness UUID is used as the ACP
 session ID string. Load, resume, close, and list parse and validate that identifier
 before crossing the host boundary. The facade does not maintain a second durable
 identity map.
@@ -281,7 +281,7 @@ reconstructs user and assistant messages, completed tool calls, and session
 metadata from durable events instead of pretending the live token stream can be
 replayed.
 
-CodeRig supplies a narrow event replayer backed by the session store — in current
+Carbon supplies a narrow event replayer backed by the session store — in current
 code, `sessionstore.Store.OpenEventReplayer`, which is public-only by
 construction: it filters every event whose `Visibility()` is not `Public`, so the
 adapter inherits exactly the visibility filter used for live delivery. The
@@ -400,9 +400,9 @@ Configuration is supplied through optional product interfaces:
 - Harness `loop.ModeCatalog` (`Modes() []ModeName`) and `loop.Controller`
   (`SetMode`, `Change` with `loop.ChangeModel` / `loop.ChangeEffort`) for mode,
   model, and effort application.
-- CodeRig model and effort catalogs/controllers (Harness deliberately has no
+- Carbon model and effort catalogs/controllers (Harness deliberately has no
   model/effort catalog; the catalog is product-owned).
-- CodeRig security access choices, when the host explicitly exposes them.
+- Carbon security access choices, when the host explicitly exposes them.
 
 The facade validates config IDs and values against the latest catalog before
 applying a change, and config writes are idempotent: setting an option to its
@@ -416,11 +416,11 @@ model, effort, or access choices.
 ACP setup contains MCP server descriptors, but Harness MCP support remains a
 separate feature — MCP lives in the sibling `github.com/looprig/mcp` module,
 which imports Harness (never the reverse). The ACP agent accepts or advertises
-MCP setup only when CodeRig supplies a reviewed MCP composition capability.
+MCP setup only when Carbon supplies a reviewed MCP composition capability.
 Otherwise it rejects or omits the feature according to ACP rather than silently
 ignoring requested servers.
 
-When external MCP capabilities are composed, CodeRig computes the external
+When external MCP capabilities are composed, Carbon computes the external
 capability revision included in the Harness configuration fingerprint
 (`event.ConfigFingerprint.ExternalCapabilityRev`; the canonical producer is
 `mcpharness.Manager.ConfigDigest`). Restoring a session under a changed external
@@ -587,11 +587,11 @@ A foreign ACP agent may call back into its client for filesystem, terminal, and
 permission operations. These capabilities are injected into `acp/client`; the
 protocol client does not implement them directly.
 
-CodeRig supplies adapters backed by its existing workspace, tools, confinement,
+Carbon supplies adapters backed by its existing workspace, tools, confinement,
 and gate policy:
 
 ```text
-CodeRig workspace/tools/confinement
+Carbon workspace/tools/confinement
           │
           ▼
 safe FS, terminal, and permission adapters
@@ -607,7 +607,7 @@ on ambiguity. Terminal handlers use bounded contexts and supervised process-grou
 teardown, and bundle the follow-up operations (`output`, `wait_for_exit`, `kill`,
 `release`) into one handle pre-bound to the terminal id so callers never re-thread
 ids. Permission handlers preserve Harness gate identity and never grant more
-authority than CodeRig's configured security limit.
+authority than Carbon's configured security limit.
 
 ## Slash commands and compaction
 
@@ -743,7 +743,7 @@ govulncheck, module verification, vendor, and secure checks as Harness.
 1. **Protocol and stdio:** pinned artifact + generator, v1 types, validation,
    JSON-RPC, stdio, limits, fuzzing, conformance fixtures, and the mock peer.
 2. **Agent core:** initialization, new session, prompt/update correlation,
-   cancellation, permission gates, and close through an injected CodeRig host.
+   cancellation, permission gates, and close through an injected Carbon host.
 3. **Durable sessions:** load replay, resume, list, metadata updates, and optional
    delete when a real deletion capability exists.
 4. **Runtime controls:** config options, legacy mode compatibility, safe commands,
@@ -773,10 +773,10 @@ govulncheck, module verification, vendor, and secure checks as Harness.
   failure.
 - Client-side permission handling fails closed under `PostureDefault` and never
   auto-selects an always-allow option.
-- CodeRig, not the protocol packages, owns filesystem, terminal, auth, workspace,
+- Carbon, not the protocol packages, owns filesystem, terminal, auth, workspace,
   MCP, and security authority.
 - Stable stdio behavior passes schema, fuzz, race, security, process, and external
   interoperability tests, including the scriptable mock-peer conformance suite.
 - Draft remote and additional-directory behavior is not presented as stable ACP.
-- Existing CodeRig/TUI session browsing, runtime controls, replay, gates, and
+- Existing Carbon/TUI session browsing, runtime controls, replay, gates, and
   external-capability drift rules are reused rather than duplicated.

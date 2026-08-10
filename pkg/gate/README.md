@@ -325,7 +325,7 @@ operational tuning knobs, not behavioral identity, so they are deliberately
 excluded from the rig fingerprint — two rigs that agree on classifiers and
 policy but differ only in these thresholds compare equal.
 
-CodeRig's `internal/app/permission_review.go` is a complete real example:
+Carbon's `internal/app/permission_review.go` is a complete real example:
 it offers a Codex-compatible default policy and a strictly tighter
 alternative (`PermissionReviewStrictPolicy`), never the reverse.
 

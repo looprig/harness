@@ -733,7 +733,7 @@ func validateNativeAliasOwnership(entries []RuntimeCatalogEntry) error {
 }
 
 // looprigNativeGatewayAliasPair is the one intentional cross-harness alias
-// overlap: CodeRig's in-process native runtime and a gateway-backed ACP row
+// overlap: the product's in-process native runtime and a gateway-backed ACP row
 // may expose the same configured model alias. The selected harness is an
 // explicit part of the runtime tuple, so the two rows remain unambiguous.
 func looprigNativeGatewayAliasPair(left, right runtimeAliasOwner) bool {

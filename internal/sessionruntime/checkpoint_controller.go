@@ -42,9 +42,10 @@ var errCheckpointActivated = errors.New("sessionruntime: checkpoint canceled by 
 // long-running background command can hold the workspace's exclusive lifetime
 // lease well past its own turn's synchronous end, which makes Acquire block for
 // as long as that command runs. Bounding Acquire itself, rather than leaving it to
-// the full snapshot-policy timeout (60s in CodeRig's real assembly), lets a
-// stalled permit fall through to the existing "publish the trigger without a
-// checkpoint, retry on the next eligible boundary" fallback fast enough to matter
+// the full snapshot-policy timeout in the product composition root's real
+// assembly (60s), lets a stalled permit fall through to the existing
+// "publish the trigger without a checkpoint, retry on the next eligible boundary"
+// fallback fast enough to matter
 // to a live caller. checkpointRequired/manual checkpoints never pass a non-nil
 // accepted callback into commit, so they are unaffected by this bound.
 const bestEffortAcquireTimeout = 200 * time.Millisecond

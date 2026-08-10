@@ -203,7 +203,8 @@ func WithPermissionReviewEvidence(access gate.EvidenceAccessEvaluator, containme
 // Containment/AllowedKinds collaborators WithPermissionReviewEvidence
 // installs — a consumer-owned concept Harness structurally cannot and
 // should not originate (this module has no first-class "effective access
-// posture" notion; CodeRig binds its own AccessProfile name here). It is
+// posture" notion; the product composition root binds its own AccessProfile
+// name here). It is
 // NOT like a workspace root, which Harness genuinely owns and auto-derives.
 // A plain string, not a provider func: a consumer's ceiling is fixed for the
 // session's lifetime by design (YAGNI — see the design consult this option

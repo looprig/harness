@@ -5,7 +5,7 @@
 **Status:** Approved
 
 **Scope:** Harness, a new `github.com/looprig/classifiers` module, and
-consumer composition such as CodeRig.
+consumer composition such as Carbon.
 
 **Reference implementation:** Codex Guardian in
 `codeagents/codex/codex-rs/core/src/guardian`.

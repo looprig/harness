@@ -330,7 +330,7 @@ Model and effort freedom applies to every explicit child runtime:
 - a harness-managed ACP profile may omit model identity only when the product
   genuinely cannot enumerate or set it.
 
-CodeRig compiles all configured `uses: ["delegate"]` models into the eligible
+Carbon compiles all configured `uses: ["delegate"]` models into the eligible
 ordinary-native and adapter-backed runtime branches permitted for each agent
 type. ACP being absent disables only ACP branches; it must not remove
 `model`/`effort` selection from ordinary children.
@@ -377,7 +377,7 @@ Rules:
 Because making descriptions required changes validation of external
 configuration, the product model-file schema increments to version 2 rather
 than silently changing the meaning of version 1. A version-1-to-version-2
-migration adds a description to each delegate-eligible model. CodeRig
+migration adds a description to each delegate-eligible model. Carbon
 continues to fail closed on unknown versions and never rewrites the file
 itself.
 

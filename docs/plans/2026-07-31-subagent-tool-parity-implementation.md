@@ -826,10 +826,10 @@ This is a boundary test/documentation task, not a new MCP server or tool bridge.
 A later optional adapter may export selected Harness tools only through the same
 prepared/gated/audited invocation boundary.
 
-### Task 11: Compose the gateway, catalog, and ACP Loops in CodeRig/product
+### Task 11: Compose the gateway, catalog, and ACP Loops in Carbon/product
 
 **Consumer files:** discover the active product composition root with `rg`
-before editing. CodeRig is the intended consumer, but do not assume stale paths
+before editing. Carbon is the intended consumer, but do not assume stale paths
 or its current local replace targets.
 
 **Step 1: Build one immutable source configuration**
@@ -847,7 +847,7 @@ From product config, construct:
   profiles.
 
 Register the `acp/loop` live and restore builders through Harness's existing
-backend-builder option. CodeRig must not import or register the direct Claude
+backend-builder option. Carbon must not import or register the direct Claude
 or Codex CLI Loop integrations for this path.
 
 Do not create the gateway catalog and Subagent catalog from independent lists.

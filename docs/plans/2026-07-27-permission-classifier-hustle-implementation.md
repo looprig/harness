@@ -4,7 +4,7 @@
 
 **Goal:** Add consumer-selectable, Codex-Guardian-parity permission auto-review using basis-bound command-safety classifiers, capability-constrained read-only evidence tools, and human/classifier gate races.
 
-**Architecture:** Harness gains the neutral review domain, an optional bounded tool loop for structured Hustles, and the session-owned gate integration. A new `github.com/looprig/classifiers` module supplies the command-safety prompt, policy, codecs, evidence pack, and evaluation corpus; CodeRig explicitly composes it. Classifier output is evidence only: Harness revalidates the exact live basis and can submit only `ApprovalApprove`, while every other outcome leaves the ordinary human gate open.
+**Architecture:** Harness gains the neutral review domain, an optional bounded tool loop for structured Hustles, and the session-owned gate integration. A new `github.com/looprig/classifiers` module supplies the command-safety prompt, policy, codecs, evidence pack, and evaluation corpus; Carbon explicitly composes it. Classifier output is evidence only: Harness revalidates the exact live basis and can submit only `ApprovalApprove`, while every other outcome leaves the ordinary human gate open.
 
 **Tech Stack:** Go 1.26, existing `github.com/looprig/{core,harness,inference,tools}` modules, standard library JSON/crypto/filesystem/process packages, existing vendored dependencies, Go race detector, fuzz tests, and fake provider-neutral inference clients.
 
@@ -75,7 +75,7 @@ only in the explicit vendoring task.
 | --- | --- | --- |
 | Harness | `/Users/ipotter/code/looprig/harness-permission-classifier` | `feat/permission-classifier` |
 | Classifiers | `/Users/ipotter/code/looprig/classifiers` | new repository, `feat/command-safety` |
-| CodeRig | adjacent isolated worktree created before Phase 6 | `feat/permission-classifier` |
+| Carbon | adjacent isolated worktree created before Phase 6 | `feat/permission-classifier` |
 | Integration tests | adjacent isolated worktree created before Phase 7 | `feat/permission-classifier` |
 
 The Harness design commit is `ac99e57`.
@@ -1718,7 +1718,7 @@ itself. Nothing connected the two — a consumer could fully configure
 `rig.WithPermissionClassifiers` + a review policy, get a correct fingerprint,
 and still get zero automatic review at runtime, because the real classifier
 set and policy value never reached a live `Session`. This would have blocked
-Phase 6's CodeRig integration (Task 23/24) from functioning at all, so it was
+Phase 6's Carbon integration (Task 23/24) from functioning at all, so it was
 closed as a deviation before Phase 6 began, discussed and approved with the
 user (including a second-opinion design consult on the fingerprint-exclusion
 call below).
@@ -1777,7 +1777,7 @@ what need that working.
 ## Addendum — Evidence-tool security wiring (pre-Phase-6)
 
 The previous addendum's own "what remains deferred" note named this exact
-gap, and Task 23's CodeRig worktree work confirmed it as a hard blocker:
+gap, and Task 23's Carbon worktree work confirmed it as a hard blocker:
 `internal/sessionruntime` never populated
 `hustleruntime.RuntimeConfig.Evidence` at all, so **any** session registering
 a permission classifier whose `hustle.Definition` needs evidence tools (which
@@ -1827,7 +1827,7 @@ the wrong ceiling.
 - `internal/hustleruntime`/`pkg/gate`: `EvidenceAccessEvaluator`,
   `EvidenceContainmentVerifier`, and `EvidenceContainmentPolicy` moved from
   `internal/hustleruntime` (unreachable from outside the `harness` module) to
-  the public `pkg/gate`, so an out-of-module consumer (CodeRig, Task 24) can
+  the public `pkg/gate`, so an out-of-module consumer (Carbon, Task 24) can
   actually name and implement the verifier contract in its own package.
 - `pkg/tool`: new optional capability interface `EvidenceKindDeclarer`
   (`EvidenceRequirementKinds() []string`), mirroring the existing
@@ -1871,7 +1871,7 @@ the wrong ceiling.
   violated the same "do not silently proceed with a permissive default"
   requirement the containment verifier is already held to.
 
-**What remains deferred:** CodeRig's actual `gate.EvidenceContainmentVerifier`
+**What remains deferred:** Carbon's actual `gate.EvidenceContainmentVerifier`
 implementation — the real, security-relevant resolve-symlinks/reject-ambiguous-
 scope/enforce-ceiling logic — is Task 24's job, not this addendum's. This
 addendum wires the seam and proves it reaches a live session
@@ -1897,7 +1897,7 @@ call: every "end-to-end" proof built across Phases 4-6 had bypassed this via
 private-method test seams (`cfg.reviewContext = &reviewContextConfiguration{
 ...}` set directly on a hand-built `turnConfig`) or downstream-convergence
 proofs (`s.StartPermissionReview(ctx, validReviewRequest(...))` called
-directly with a hand-built request). Task 24's CodeRig worktree work
+directly with a hand-built request). Task 24's Carbon worktree work
 confirmed this as the last remaining hard blocker before a real end-to-end
 corpus run could exist at all. Closed as a third deviation before Phase 6,
 discussed and design-consulted with the user (a Fable second opinion) exactly
@@ -1972,7 +1972,7 @@ existing computed "effective access posture as a string" anywhere in
 Harness. `pkg/gate`'s own `ReviewBasis.SecurityCeiling`/`hustle.Request.
 SecurityCeiling` doc comments are explicit that the ceiling is captured
 **from** `ReviewContext.SecurityCeiling` at review time, never computed by
-Harness itself, and CodeRig's Task 24 work binds its own containment
+Harness itself, and Carbon's Task 24 work binds its own containment
 verifier's ceiling to its own `AccessProfile` string ad hoc, at the
 CONSUMER layer — confirming Harness has no first-class formalized
 representation to source from honestly. Task 13's own test fixtures (e.g.
@@ -1985,7 +1985,7 @@ inventing a new security classification scheme: it never claims a wider
 access posture than actually configured (a classifier or containment
 verifier treating an unrecognized ceiling as maximally conservative is
 correct), but it is a **known simplification** flagged here for the Phase
-6/7 boundary review to replace with a real Harness-level (or CodeRig-supplied)
+6/7 boundary review to replace with a real Harness-level (or Carbon-supplied)
 value. Confidence: high that this is honest and non-misleading; low
 confidence that the exact sentinel string is the RIGHT long-term shape —
 that is a design question for Phase 6/7, not this addendum.
@@ -2115,7 +2115,7 @@ across five isolated runs or two subsequent full-suite runs; treated as a
 pre-existing environmental flake, not a regression from this work.
 
 **What remains deferred:** a real, per-consumer `gate.ReviewContextPolicy`
-and a real Harness- or CodeRig-level `SecurityCeiling` representation are
+and a real Harness- or Carbon-level `SecurityCeiling` representation are
 both Phase 6/7 work, flagged above as known simplifications rather than
 silently fabricated values. Everything else this addendum set out to prove —
 that a registered classifier's `StartPermissionReview` receives a REAL,
@@ -2129,8 +2129,8 @@ structurally plausible.
 ## Addendum — Phase 6 specification-compliance review fixes
 
 A dedicated Phase 6 specification-compliance review of the whole feature
-(all three addenda above, plus the CodeRig consumer wiring) raised three
-findings. All three are fixed here, in this repository only; CodeRig's own
+(all three addenda above, plus the Carbon consumer wiring) raised three
+findings. All three are fixed here, in this repository only; Carbon's own
 follow-up is called out per finding where it applies.
 
 **Finding 1 [Important] — audit events silently failed to publish.**
@@ -2170,7 +2170,7 @@ all-`DriftInfo` assessment with no operator signal. Concretely: a session
 opened with classifiers disabled, the consumer's code redeployed with
 classifiers enabled, the session restored — and it silently started
 auto-reviewing gates the original session-open would have kept 100%
-human-only. CodeRig's own `TestPermissionReviewConfigFingerprintChanges`
+human-only. Carbon's own `TestPermissionReviewConfigFingerprintChanges`
 (`internal/app/permission_review_test.go`) explicitly proved and accepted
 this exact behavior as intentional; it documents, in its own comment, that
 it was verified against `pkg/event/drift.go` as it stood before this fix.
@@ -2226,11 +2226,11 @@ proves the other three transitions still auto-accept.
 `TestFrozenManifestWithPermissionReviewSetsConfigured` proves the rig-level
 wiring itself (not just the manifest/drift layer in isolation).
 
-**CodeRig follow-up (a separate task, not this one):**
+**Carbon follow-up (a separate task, not this one):**
 `TestPermissionReviewConfigFingerprintChanges` will need updating once
-CodeRig's `go.mod` picks up a Harness version containing this fix — its
+Carbon's `go.mod` picks up a Harness version containing this fix — its
 disabled -> enabled restore cases currently assert acceptance and will now
-observe a rejection (`RestoreRejectedError`) unless CodeRig also wires an
+observe a rejection (`RestoreRejectedError`) unless Carbon also wires an
 explicit accept (`WithAllowConfigMismatch` or an equivalent
 `RestoreDecider`). Its same-configuration disabled -> disabled control case
 is unaffected. No other Harness-facing surface changed: `ConfigFingerprint`
@@ -2247,20 +2247,20 @@ across the full module (`pkg/event`, `pkg/session`, `pkg/rig`,
 
 ---
 
-# Phase 6 — Consumer composition in CodeRig
+# Phase 6 — Consumer composition in Carbon
 
-## Task 23: Create isolated CodeRig worktree and add explicit classifier config
+## Task 23: Create isolated Carbon worktree and add explicit classifier config
 
 **Files:**
 
-- Create adjacent CodeRig worktree and feature branch.
+- Create adjacent Carbon worktree and feature branch.
 - Modify exact config files discovered by `rg "roleGate|AccessProfile|rig.Define"`.
 - Create focused config tests next to the owning package.
-- Update CodeRig dependency and vendor metadata.
+- Update Carbon dependency and vendor metadata.
 
 **Step 1: Verify clean baseline**
 
-Run CodeRig's documented vendored race suite before edits.
+Run Carbon's documented vendored race suite before edits.
 
 **Step 2: Write failing config tests**
 
@@ -2287,7 +2287,7 @@ policy logic.
 
 Commit module changes and vendor changes together.
 
-## Task 24: Add CodeRig end-to-end permission review tests
+## Task 24: Add Carbon end-to-end permission review tests
 
 **Files:**
 
@@ -2314,7 +2314,7 @@ Cover:
 The file uses `//go:build integration`. Run:
 
 ```bash
-GOCACHE=/private/tmp/looprig-coderig-go-cache GOFLAGS=-mod=vendor \
+GOCACHE=/private/tmp/looprig-carbon-go-cache GOFLAGS=-mod=vendor \
   go test -tags integration -race ./internal/app \
   -run '^TestPermissionReview'
 ```
@@ -2324,7 +2324,7 @@ GOCACHE=/private/tmp/looprig-coderig-go-cache GOFLAGS=-mod=vendor \
 **Step 4: Run GREEN and commit**
 
 Run the focused integration command, full integration-tagged application
-package, default unit suite, and CodeRig race suite. Confirm the integration
+package, default unit suite, and Carbon race suite. Confirm the integration
 test actually executes by checking the named test in verbose output.
 
 ## Phase 6 review gate
@@ -2352,7 +2352,7 @@ Run existing integration-tagged tests with documented vendored/modfile flags.
 
 **Step 2: Write failing real composition tests**
 
-Import Harness, classifiers, CodeRig-facing seams where allowed, tools,
+Import Harness, classifiers, Carbon-facing seams where allowed, tools,
 sandbox, and stores only in the integration module. Cover safe allow, human
 fallback, race, restore, and no leaked review content.
 
@@ -2418,7 +2418,7 @@ with `-count=50` for claim/cancel cases.
 - Modify: Harness `docs/ECOSYSTEM.md`
 - Modify: Harness `docs/TODO.md`
 - Modify: classifiers `README.md`, `CONTRIBUTING.md`, evaluation docs
-- Modify: CodeRig configuration/user docs
+- Modify: Carbon configuration/user docs
 - Modify vendor trees and module release guards in every consumer.
 
 **Step 1: Write/extend documentation tests first**
@@ -2463,7 +2463,7 @@ GOCACHE=/private/tmp/looprig-harness-go-cache make vuln
 ```
 
 Run equivalent test/lint/vulnerability/vendor commands in classifiers,
-CodeRig, tools if changed, and integration tests.
+Carbon, tools if changed, and integration tests.
 
 **Step 2: Run corpus acceptance**
 
@@ -2519,11 +2519,11 @@ This addendum is Harness-side structural mechanism only — new types, a new
 interface, a new recheck point, a new rig option — mirroring the
 already-proven `EvidenceAccessEvaluator`/`EvidenceContainmentVerifier`/
 `EvidenceContainmentPolicy` seam (Addendum 2) rather than inventing a new
-shape. Harness owns the public interface; a consumer (CodeRig, via a
+shape. Harness owns the public interface; a consumer (Carbon, via a
 sandbox-aware implementation) supplies the real verifier; Harness's own code
 never implements target-resolution logic itself, the same reasoning
 `pkg/gate/evidence.go`'s doc comments already give for containment. Real
-evidence tools recording observations, and CodeRig's real verifier
+evidence tools recording observations, and Carbon's real verifier
 implementation, are explicitly out of scope — separate follow-up dispatches,
 described below.
 
@@ -2759,12 +2759,12 @@ job):**
   slice (multiple targets per review are already supported, not just
   exactly-one), and the capability is purely additive (a tool that never
   implements it is unaffected).
-- **CodeRig:** the real `gate.EvidenceObservationVerifier` implementation —
+- **Carbon:** the real `gate.EvidenceObservationVerifier` implementation —
   sandbox-aware canonical-identity resolution and token re-derivation,
   mirroring how `EvidenceContainmentVerifier`'s own real implementation
   independently re-resolves every prepared evidence target. It plugs in via
   `rig.WithPermissionReviewObservations(verifier)`, called the same place
-  `WithPermissionReviewEvidence` already is in CodeRig's own composition
+  `WithPermissionReviewEvidence` already is in Carbon's own composition
   root. This dispatch's stub test verifiers
   (`stubPermissionReviewObservationVerifier` in `pkg/rig`,
   `observationVerifierStub` in `internal/sessionruntime`) prove the seam is
@@ -2808,11 +2808,11 @@ just not a same-metadata content edit).
 
 Commit `5f44b31`. Separately, commit `e510cef` added `lint`/`vuln`/`secure`
 Makefile targets to this module (it declared the `gosec`/`staticcheck`/
-`govulncheck` tool deps but had no target running them, unlike Harness/CodeRig —
+`govulncheck` tool deps but had no target running them, unlike Harness/Carbon —
 a real, durable CI gap the Task 28 final spec review flagged as Important
 finding #2, now closed).
 
-### Follow-up 2 — CodeRig: the real EvidenceObservationVerifier
+### Follow-up 2 — Carbon: the real EvidenceObservationVerifier
 
 `internal/app/permission_review_observation.go`'s `permissionReviewEvidenceObservation`
 independently REIMPLEMENTS classifiers' token formula from scratch (never
@@ -2827,9 +2827,9 @@ helper) — one source of truth for containment and observation, consistency by
 construction rather than by convention. Commit `80c61eb`.
 
 **A genuine cross-repo bug was found and fixed while building this, not just
-new code.** CodeRig's own end-to-end symlink-swap acceptance test
+new code.** Carbon's own end-to-end symlink-swap acceptance test
 (`TestPermissionReviewObservationSymlinkSwapBlocksAutoApprovalEndToEnd`)
-initially failed against Harness's `0bfd8262`/`ca55bdf8` — not a CodeRig bug.
+initially failed against Harness's `0bfd8262`/`ca55bdf8` — not a Carbon bug.
 Harness's `internal/hustleruntime.executeWithEvidence` derives its per-evidence-
 call context via `newEvidenceAttemptContext`, which deliberately strips every
 ambient context value from its caller — a real, intentional isolation boundary,
@@ -2861,7 +2861,7 @@ near side of that boundary can pass while the real, full-stack path is
 silently broken. Prefer an end-to-end test that cannot shortcut the boundary
 whenever a fix's whole point is closing a gap between two components.
 
-### Deferred, not fixed here — CodeRig's SecurityCeiling is session-wide, not role-scoped
+### Deferred, not fixed here — Carbon's SecurityCeiling is session-wide, not role-scoped
 
 The Task 28 final spec-compliance review separately flagged (Important finding
 #4, independent of the TOCTOU gap this addendum closes) that
@@ -2900,6 +2900,6 @@ Update this table only from fresh command output:
 | Codex scenarios equal or stricter | `TestCorpusHasNoUndocumentedLooserResult` (`internal/corpus`, classifiers). Read directly: enforces the parity comparison is one of the two closed values (equal/stricter — the type has no "looser" value), every "stricter" case documents why, and at least one case is genuinely stricter. Re-run fresh 2026-07-30: `--- PASS: TestCorpusHasNoUndocumentedLooserResult (0.01s)`. Category completeness corroborated by `TestCorpusCoversEveryDesignCategory` and siblings in the same file, also re-run fresh and PASS (see corpus acceptance section above). |
 | Harness full race suite | `GOCACHE=/private/tmp/looprig-harness-go-cache make test` runs `go test -race ./...` (confirmed by reading the Makefile: `test: go test -race ./...`, no separate race target needed). Full suite PASS across all packages, `make lint` and `make vuln` also PASS (gosec: 217 files/54900 lines scanned, 0 issues; govulncheck: no vulnerabilities). No main package exists in this module (no buildable binary to trimpath-build). |
 | Classifiers full race suite | Module test target runs under `GOCACHE=/private/tmp/looprig-classifiers-go-cache GOFLAGS=-mod=vendor`, race included per Makefile convention. Full suite PASS; lint/vuln/vendor-check PASS. Targeted re-runs performed directly in this session (corpus + evaluation tests, see above) all PASS with `-count=1` (uncached). |
-| CodeRig full race suite | `make test` and `make test-integration` (both `go test -race ./...` / `-tags integration -race ./...` per Makefile) PASS. `make secure` (lint+vuln) PASS cleanly — this target was fixed in the immediately-prior task and shows no regression. `CGO_ENABLED=0 go build -trimpath` of `cmd/coderig` succeeds. |
+| Carbon full race suite | `make test` and `make test-integration` (both `go test -race ./...` / `-tags integration -race ./...` per Makefile) PASS. `make secure` (lint+vuln) PASS cleanly — this target was fixed in the immediately-prior task and shows no regression. `CGO_ENABLED=0 go build -trimpath` of `cmd/carbon` succeeds. |
 | Cross-module integration suite | `GOWORK=off make check` (fmt-check, vet, `TestCrossModuleOwnership` dependency-boundary, `TestDevelopmentModuleSources` local-source-check, root-layout, full test suite) run directly in this session, PASS. Followed by an uncached, verbose, fresh re-run (`-race -count=1 -v ./...`, `-tags integration`): every test PASS, one expected `SKIP` (`TestSandboxBroadNetworkGrantCarriesDNS`, opt-in live-network only). `make live-network` intentionally not run — it requires real external network access and is opt-in per the module's own Makefile comment. |
-| Lint/vulnerability/vendor/release guards | Harness: `make lint`/`make vuln` PASS (gosec 217 files/54900 lines/0 issues; govulncheck 0 vulnerabilities). Classifiers: `make fmt-check`/`make vendor-check` PASS; `go vet`/`go tool staticcheck`/`go tool gosec`/`go mod verify`/`go tool govulncheck` run manually (this module has no `lint`/`vuln`/`secure` Makefile target despite declaring the same tool deps as Harness/CodeRig — a real tooling-surface inconsistency, not a defect, flagged as a pre-merge follow-up) all PASS. CodeRig: `make secure` (lint+vuln) PASS cleanly, no regression from the Task 27 dependency fix. Release guards re-run fresh 2026-07-30, both PASS: `TestReleaseModfileGuardRejectsLocalReplacements`/`TestReleaseModfileGuardRejectsAbsentModfile` (`internal/buildtest`, classifiers) and `TestReleaseModfileGuard` (`github.com/looprig/tests`, tests-permission-classifier) — both reject local/relative/absolute/file-URL/unversioned replacements and an absent modfile, and accept a clean simulated release modfile. |
+| Lint/vulnerability/vendor/release guards | Harness: `make lint`/`make vuln` PASS (gosec 217 files/54900 lines/0 issues; govulncheck 0 vulnerabilities). Classifiers: `make fmt-check`/`make vendor-check` PASS; `go vet`/`go tool staticcheck`/`go tool gosec`/`go mod verify`/`go tool govulncheck` run manually (this module has no `lint`/`vuln`/`secure` Makefile target despite declaring the same tool deps as Harness/Carbon — a real tooling-surface inconsistency, not a defect, flagged as a pre-merge follow-up) all PASS. Carbon: `make secure` (lint+vuln) PASS cleanly, no regression from the Task 27 dependency fix. Release guards re-run fresh 2026-07-30, both PASS: `TestReleaseModfileGuardRejectsLocalReplacements`/`TestReleaseModfileGuardRejectsAbsentModfile` (`internal/buildtest`, classifiers) and `TestReleaseModfileGuard` (`github.com/looprig/tests`, tests-permission-classifier) — both reject local/relative/absolute/file-URL/unversioned replacements and an absent modfile, and accept a clean simulated release modfile. |

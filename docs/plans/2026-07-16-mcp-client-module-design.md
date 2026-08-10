@@ -26,7 +26,7 @@ catalog adoption, and durable configuration identity.
 - The TUI does not own MCP configuration, connections, discovery, or auth.
 - `mcp/pkg/harness` is the optional adapter from MCP capabilities to Harness
   tools, gates, events, and configuration identity.
-- Applications such as CodeRig compose MCP definitions, Harness, and the TUI or
+- Applications such as Carbon compose MCP definitions, Harness, and the TUI or
   another presentation client.
 - One owner may have multiple independently named MCP bindings.
 - Every binding is either Session-scoped or Loop-scoped.
@@ -65,7 +65,7 @@ This design avoids the overloaded term "MCP host."
 ## Module topology
 
 ```text
-                          application / CodeRig
+                          application / Carbon
                            /                 \
                           v                   v
                github.com/looprig/mcp      github.com/looprig/harness

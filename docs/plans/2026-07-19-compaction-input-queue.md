@@ -78,14 +78,14 @@ Run: `go test -race ./internal/loopruntime ./internal/sessionruntime -count=1`
 
 Expected: PASS.
 
-### Task 4: Verify the CodeRig integration and full Harness module
+### Task 4: Verify the Carbon integration and full Harness module
 
 **Files:**
-- Modify: `../coderig/internal/app/compaction_acceptance_test.go` only if existing acceptance coverage cannot express the subagent target invariant
+- Modify: `../carbon/internal/app/compaction_acceptance_test.go` only if existing acceptance coverage cannot express the subagent target invariant
 
-**Step 1: Run CodeRig compaction acceptance tests**
+**Step 1: Run Carbon compaction acceptance tests**
 
-Run from `../coderig`: `go test -race ./internal/app -run Compaction -count=1`
+Run from `../carbon`: `go test -race ./internal/app -run Compaction -count=1`
 
 Expected: PASS using the local Harness replacement.
 
