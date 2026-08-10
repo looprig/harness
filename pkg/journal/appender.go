@@ -113,26 +113,36 @@ func NewJournalEventAppenderChecked(journal SessionJournal, opts ...AppenderOpti
 // would be redundant. A journal that does not implement the optional interface
 // behaves exactly as before (every successful Append notifies the catalog).
 func (a *JournalEventAppender) AppendEvent(ctx context.Context, ev event.Event) (uint64, error) {
+	seq, _, err := a.AppendEventResult(ctx, ev)
+	return seq, err
+}
+
+// AppendEventResult is the result-preserving event append seam used by the Hub
+// trusted publication path. Appended is true only when this call created a new
+// durable frame; an identical idempotent retry returns the original sequence and
+// Appended=false. The legacy AppendEvent method above deliberately discards only
+// this boolean so existing callers retain their API and error behavior.
+func (a *JournalEventAppender) AppendEventResult(ctx context.Context, ev event.Event) (uint64, bool, error) {
 	rec := NewEventRecord(ev)
 	if idem, ok := a.journal.(IdempotentJournal); ok {
 		result, err := idem.AppendIdempotent(ctx, rec)
 		if err != nil {
-			return 0, err
+			return 0, false, err
 		}
 		if !result.Appended {
-			return result.Sequence, nil
+			return result.Sequence, false, nil
 		}
 		_ = a.catalog.UpdateOnEvent(ctx, ev, result.Sequence)
-		return result.Sequence, nil
+		return result.Sequence, true, nil
 	}
 	seq, err := a.journal.Append(ctx, rec)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	// Best-effort, post-success: UpdateOnEvent never returns a non-nil error by
 	// contract, so the catalog can never fail the append. The return is ignored.
 	_ = a.catalog.UpdateOnEvent(ctx, ev, seq)
-	return seq, nil
+	return seq, true, nil
 }
 
 // JournalCommandAppender adapts a SessionJournal to the narrow "append one command"

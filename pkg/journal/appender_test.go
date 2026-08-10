@@ -426,6 +426,40 @@ func TestJournalAppenderDoesNotRepublishDuplicate(t *testing.T) {
 	}
 }
 
+func TestJournalEventAppenderAppendEventResultPreservesDedupOutcome(t *testing.T) {
+	t.Parallel()
+
+	sid := fixedUUID(0xB1)
+	ev := event.SessionStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid},
+		EventID:     fixedUUID(0xB2),
+	}}
+	app := NewJournalEventAppender(newIdempotentRecordingJournal())
+
+	seq, appended, err := app.AppendEventResult(context.Background(), ev)
+	if err != nil {
+		t.Fatalf("first AppendEventResult() error = %v", err)
+	}
+	if seq != 1 || !appended {
+		t.Fatalf("first AppendEventResult() = seq:%d appended:%t, want 1/true", seq, appended)
+	}
+	duplicateSeq, duplicateAppended, err := app.AppendEventResult(context.Background(), ev)
+	if err != nil {
+		t.Fatalf("duplicate AppendEventResult() error = %v", err)
+	}
+	if duplicateSeq != seq || duplicateAppended {
+		t.Fatalf("duplicate AppendEventResult() = seq:%d appended:%t, want %d/false", duplicateSeq, duplicateAppended, seq)
+	}
+
+	legacySeq, err := app.AppendEvent(context.Background(), ev)
+	if err != nil {
+		t.Fatalf("legacy AppendEvent() error = %v", err)
+	}
+	if legacySeq != seq {
+		t.Fatalf("legacy AppendEvent() seq = %d, want original %d", legacySeq, seq)
+	}
+}
+
 // TestJournalEventAppenderNilJournal proves the constructor's nil guard: a nil
 // SessionJournal is a programming error caught at construction (fail loud) rather than
 // a nil-deref at the first append.

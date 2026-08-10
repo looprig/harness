@@ -60,6 +60,28 @@ func contextTestRequest() inference.Request {
 	}
 }
 
+func TestWorkflowActivityCannotEnterModelConversation(t *testing.T) {
+	t.Parallel()
+
+	// content.Conversation and content.Block are sealed by unexported methods;
+	// these are the exact types accepted by inference.Request.Messages and by
+	// the turn context builder. WorkflowActivity is a durable event only, so its
+	// bounded diagnostic Message cannot be mistaken for model conversation text.
+	activity := event.WorkflowActivity{}
+	if _, ok := any(activity).(content.Conversation); ok {
+		t.Fatal("WorkflowActivity unexpectedly implements content.Conversation")
+	}
+	if _, ok := any(&activity).(content.Conversation); ok {
+		t.Fatal("*WorkflowActivity unexpectedly implements content.Conversation")
+	}
+	if _, ok := any(activity).(content.Block); ok {
+		t.Fatal("WorkflowActivity unexpectedly implements content.Block")
+	}
+	if _, ok := any(&activity).(content.Block); ok {
+		t.Fatal("*WorkflowActivity unexpectedly implements content.Block")
+	}
+}
+
 func TestMeasureRequestContextCountsCompleteCandidate(t *testing.T) {
 	t.Parallel()
 	request := contextTestRequest()

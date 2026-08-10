@@ -268,6 +268,18 @@ func (s *Session) stopHub(root context.Context, timeout time.Duration) error {
 	}
 	ctx, cancel := cleanupContext(root, timeout)
 	defer cancel()
+	if s.resources != nil && s.resources.processServiceBridge != nil {
+		if err := s.resources.processServiceBridge.closeWorkflowActivityPublisher(ctx); err != nil {
+			// Still attempt the Hub transition with the same bounded context. The
+			// caller needs the normal teardown attempt even when a retained resource
+			// is ignoring its publication context and blocks the bridge drain.
+			if ctx.Err() != nil {
+				s.hub.StopSession(ctx)
+				return cleanupTimeoutError(ShutdownCleanupHubStop, timeout, ctx.Err())
+			}
+			return err
+		}
+	}
 	s.hub.StopSession(ctx)
 	if err := ctx.Err(); err != nil {
 		return cleanupTimeoutError(ShutdownCleanupHubStop, timeout, err)
