@@ -1,0 +1,5 @@
+{
+  "protocol": "looprig.serve",
+  "version": 1,
+  "features": ["journal"]
+}

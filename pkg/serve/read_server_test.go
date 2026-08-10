@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
 	"github.com/looprig/core/uuid"
@@ -140,5 +141,40 @@ func TestReadHandlerRespectsOptions(t *testing.T) {
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+// TestReadOnlyCapabilitiesMatchesFixture pins the read-only discovery document to a
+// golden fixture the client repo copies verbatim. A wire change here breaks this test
+// AND the client's ajv conformance suite — the shared-fixture drift mechanism.
+func TestReadOnlyCapabilitiesMatchesFixture(t *testing.T) {
+	t.Parallel()
+
+	want, err := os.ReadFile("testdata/fixtures/capabilities_read_only.json")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	rs := &readServer{reader: stubReader{}, features: readOnlyFeatures}
+	rs.handleCapabilities(rec, httptest.NewRequest(http.MethodGet, "/v1/capabilities", http.NoBody))
+
+	var got, wantDoc capabilities
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if err := json.Unmarshal(want, &wantDoc); err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	if got.Protocol != wantDoc.Protocol || got.Version != wantDoc.Version {
+		t.Fatalf("protocol/version = %q/%d, want %q/%d", got.Protocol, got.Version, wantDoc.Protocol, wantDoc.Version)
+	}
+	if len(got.Features) != len(wantDoc.Features) {
+		t.Fatalf("features = %v, want %v", got.Features, wantDoc.Features)
+	}
+	for i := range got.Features {
+		if got.Features[i] != wantDoc.Features[i] {
+			t.Fatalf("features = %v, want %v", got.Features, wantDoc.Features)
+		}
 	}
 }
