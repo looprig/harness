@@ -412,18 +412,6 @@ func (h *foreignDeliveryHook) claimDeliveryWaiter(requestID uuid.UUID) bool {
 	return true
 }
 
-// releaseDeliveryWaiter releases the coordinator's reference. A nonterminal
-// request remains retained as live state until the actor supplies a terminal
-// phase; terminal requests release all local waiter state on the final ack.
-func (h *foreignDeliveryHook) releaseDeliveryWaiter(requestID uuid.UUID) {
-	if h == nil || requestID.IsZero() {
-		return
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.releaseDeliveryWaiterLocked(requestID)
-}
-
 func (h *foreignDeliveryHook) releaseDeliveryWaiterLocked(requestID uuid.UUID) {
 	waiter, ok := h.waiters[requestID]
 	if !ok || waiter.refs == 0 {

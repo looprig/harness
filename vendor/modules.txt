@@ -135,19 +135,19 @@ github.com/gorilla/websocket
 # github.com/invopop/jsonschema v0.14.0
 ## explicit; go 1.24
 github.com/invopop/jsonschema
-# github.com/looprig/core v0.5.0 => ../core
+# github.com/looprig/core v0.5.0
 ## explicit; go 1.25.8
 github.com/looprig/core/content
 github.com/looprig/core/content/streamaccumulator
 github.com/looprig/core/uuid
-# github.com/looprig/eval v0.1.0 => ../eval
+# github.com/looprig/eval v0.1.0
 ## explicit; go 1.26.4
 github.com/looprig/eval
 github.com/looprig/eval/evaltest
 github.com/looprig/eval/exact
 github.com/looprig/eval/judge
 github.com/looprig/eval/rubric
-# github.com/looprig/inference v0.7.0 => ../inference
+# github.com/looprig/inference v0.9.0
 ## explicit; go 1.26.4
 github.com/looprig/inference
 github.com/looprig/inference/codec
@@ -164,7 +164,7 @@ github.com/looprig/inference/stream
 github.com/looprig/inference/usage
 github.com/looprig/inference/wire/jsonbody
 github.com/looprig/inference/wire/sse
-# github.com/looprig/storage v0.3.0 => ../storage
+# github.com/looprig/storage v0.3.1
 ## explicit; go 1.25.8
 github.com/looprig/storage
 github.com/looprig/storage/memstore
@@ -706,7 +706,3 @@ honnef.co/go/tools/stylecheck/st1021
 honnef.co/go/tools/stylecheck/st1022
 honnef.co/go/tools/stylecheck/st1023
 honnef.co/go/tools/unused
-# github.com/looprig/core => ../core
-# github.com/looprig/storage => ../storage
-# github.com/looprig/inference => ../inference
-# github.com/looprig/eval => ../eval

@@ -64,6 +64,16 @@ func (c Count) TokenCount(field Field) (content.TokenCount, error) {
 	return content.TokenCount(value), nil
 }
 
+// OptionalTokenCount returns zero when an optional usage-detail field is absent
+// or explicitly null. Every present non-null value retains TokenCount's strict
+// numeric validation.
+func (c Count) OptionalTokenCount(field Field) (content.TokenCount, error) {
+	if !c.present || bytes.Equal(bytes.TrimSpace(c.raw), []byte("null")) {
+		return 0, nil
+	}
+	return c.TokenCount(field)
+}
+
 func isNumber(raw []byte) bool {
 	return len(raw) > 0 && (raw[0] == '-' || raw[0] >= '0' && raw[0] <= '9')
 }

@@ -25,11 +25,7 @@ func DecodeResponse(body []byte) (*inference.Response, error) {
 	}
 
 	if wire.Status == statusFailed {
-		msg := "openairesponses: response failed"
-		if wire.Error != nil && wire.Error.Message != "" {
-			msg = wire.Error.Message
-		}
-		return nil, &failure.APIError{Status: 0, Message: msg, Body: body}
+		return nil, failure.NewAPIError(0, "", "", 0)
 	}
 
 	blocks, err := decodeOutputBlocks(wire.Output)

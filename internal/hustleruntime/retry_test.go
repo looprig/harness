@@ -27,14 +27,14 @@ func TestRetryClassificationIsClosed(t *testing.T) {
 		want retryFailureClass
 	}{
 		{name: "network", err: &failure.NetworkError{Err: &net.DNSError{IsTemporary: true}}, want: retryFailureTransientInference},
-		{name: "request timeout", err: &failure.APIError{Status: 408, Message: "secret"}, want: retryFailureTransientInference},
-		{name: "rate limit", err: &failure.APIError{Status: 429, Message: "secret"}, want: retryFailureTransientInference},
-		{name: "server error", err: &failure.APIError{Status: 503, Message: "secret"}, want: retryFailureTransientInference},
+		{name: "request timeout", err: failure.NewAPIError(408, "", "", 0), want: retryFailureTransientInference},
+		{name: "rate limit", err: failure.NewAPIError(429, "", "", 0), want: retryFailureTransientInference},
+		{name: "server error", err: failure.NewAPIError(503, "", "", 0), want: retryFailureTransientInference},
 		{name: "recoverable terminal parse", err: toolResponseError(ToolResponseFailureInvalidTerminal), want: retryFailureRecoverableTerminal},
 		{name: "canceled", err: context.Canceled},
 		{name: "deadline", err: context.DeadlineExceeded},
-		{name: "client API", err: &failure.APIError{Status: 400, Message: "secret"}},
-		{name: "unknown API status", err: &failure.APIError{Status: 700, Message: "secret"}},
+		{name: "client API", err: failure.NewAPIError(400, "", "", 0)},
+		{name: "unknown API status", err: failure.NewAPIError(700, "", "", 0)},
 		{name: "unknown error", err: errors.New("transient timeout please retry")},
 		{name: "unknown tool", err: toolResponseError(ToolResponseFailureUnknownTool)},
 		{name: "malformed evidence arguments", err: toolResponseError(ToolResponseFailureMalformedArguments)},
@@ -62,7 +62,7 @@ func TestRetryClassificationIsClosed(t *testing.T) {
 func TestShouldRetryRequiresExplicitPolicyFirstAttemptAndLiveBudget(t *testing.T) {
 	t.Parallel()
 
-	transient := &failure.APIError{Status: 503, Message: "secret"}
+	transient := failure.NewAPIError(503, "", "", 0)
 	transientRun := &RunError{Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference, Cause: transient}
 	if shouldRetry(hustle.RetryPolicyNone, 0, nil, transientRun, false) {
 		t.Fatal("disabled policy retried")
@@ -361,7 +361,7 @@ func TestClassifiedRetryRestartsFromImmutableInputAndFreshEvidenceCatalog(t *tes
 			return oneEvidenceCallResponse("first-evidence"), nil
 		case 2:
 			return &inference.Response{Usage: &content.Usage{InputTokens: 5, OutputTokens: 1}},
-				&failure.APIError{Status: 503, Message: "provider secret"}
+				failure.NewAPIError(503, "", "", 0)
 		case 3:
 			if len(request.Messages) != 1 {
 				t.Fatalf("retry messages = %d, want pristine single input", len(request.Messages))

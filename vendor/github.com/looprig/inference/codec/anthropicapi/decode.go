@@ -21,11 +21,7 @@ func DecodeResponse(body []byte) (*inference.Response, error) {
 	}
 
 	if wire.Type == responseTypeError {
-		msg := "anthropicapi: error response"
-		if wire.Error != nil && wire.Error.Message != "" {
-			msg = wire.Error.Message
-		}
-		return nil, &failure.APIError{Status: 0, Message: msg, Body: body}
+		return nil, failure.NewAPIError(0, "", "", 0)
 	}
 
 	usage, err := normalizeUsage(wire.Usage)
