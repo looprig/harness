@@ -2356,7 +2356,7 @@ func TestSessionIdleBestEffortDoesNotBlockCallerOnHeldWorkspaceLease(t *testing.
 	sid := mustUUID()
 	coordinator := newWorkspaceCoordinator(nil)
 	publisher := &boundaryPublisher{order: &checkpointOrder{}, checkpointed: make(chan event.WorkspaceCheckpointed, 1)}
-	// A long, real policy timeout -- exactly like CodeRig's real 60s SnapshotPolicy
+	// A long, real policy timeout -- exactly like Carbon's real 60s SnapshotPolicy
 	// assembly (internal/app/persistence.go's snapshotTimeout). Scaled down for a
 	// fast test while remaining far larger than any acceptable caller-visible wait.
 	const policyTimeout = 2 * time.Second

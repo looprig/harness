@@ -385,7 +385,7 @@ func TestPermissionReviewFingerprintDomainsIndependentlyChangeIdentity(t *testin
 func TestFrozenManifestWithPermissionReviewSetsConfigured(t *testing.T) {
 	t.Parallel()
 	definition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
-	fields := ConfigFingerprintFields{AgentKind: "coderig:operator"}
+	fields := ConfigFingerprintFields{AgentKind: "carbon:operator"}
 
 	disabled := frozenManifestWithPermissionReview(
 		fields, []loop.Definition{definition}, []string{"agent"}, "agent", nil, HustleLimits{}, nil,
@@ -426,7 +426,7 @@ func TestFrozenManifestWithPermissionReviewSetsConfigured(t *testing.T) {
 func TestFrozenManifestWithPermissionReviewPolicyRevChangesWithPolicyOnly(t *testing.T) {
 	t.Parallel()
 	definition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
-	fields := ConfigFingerprintFields{AgentKind: "coderig:operator"}
+	fields := ConfigFingerprintFields{AgentKind: "carbon:operator"}
 	classifier := defineRigPermissionClassifier(t, "alpha", rigEvidencePolicy("status"))
 	set := rigPermissionClassifierSet(t, classifier)
 

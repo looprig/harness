@@ -155,7 +155,7 @@ func TestSessionResourcesGetOrCreateSingleFlight(t *testing.T) {
 // that DOES (e.g. github.com/looprig/tools/process's ManifestStore, the
 // first real-world caller to actually write a file there) previously failed
 // with a bare "no such file or directory" the first time it tried to
-// persist anything -- discovered via Coderig's Task 28 end-to-end
+// persist anything -- discovered via Carbon's Task 28 end-to-end
 // integration tests, the first place in this whole feature that exercises
 // a real session resource through the real registry with a factory that
 // performs real disk I/O.

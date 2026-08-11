@@ -9,7 +9,7 @@ import (
 func testManifest() ConfigManifest {
 	return ConfigManifest{
 		SchemaVersion:   ManifestSchemaVersion,
-		AgentKind:       "coderig:operator",
+		AgentKind:       "carbon:operator",
 		TopologyRev:     "aaaa",
 		ModelID:         "claude-fable-5",
 		SystemPromptRev: "bbbb",
