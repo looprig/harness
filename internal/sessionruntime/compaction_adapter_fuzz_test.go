@@ -2,6 +2,8 @@ package sessionruntime
 
 import (
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/looprig/core/content"
@@ -47,6 +49,43 @@ func FuzzCompactionJSON(f *testing.F) {
 		value, decodeErr := unmarshalCompactionInput(raw)
 		if decodeErr == nil && value.Validate() != nil {
 			t.Fatal("accepted input is not a valid typed compaction input")
+		}
+	})
+}
+
+func FuzzMarshalCompactionInputWithin(f *testing.F) {
+	input := compactionInputWithToolBodies(strings.Repeat("x", 300), strings.Repeat("y", 300))
+	raw, err := marshalCompactionInput(input)
+	if err != nil {
+		f.Fatal(err)
+	}
+	resultOnly, err := marshalCompactionInput(compactionInputWithToolBodies(
+		compactionOldToolResultStub, compactionOldToolResultStub,
+	))
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(len(raw))
+	f.Add(len(raw) - 1)
+	f.Add(0)
+	f.Add(len(resultOnly))
+	f.Fuzz(func(t *testing.T, limit int) {
+		if limit < 0 {
+			return
+		}
+		value, marshalErr := marshalCompactionInputWithin(input, limit)
+		if marshalErr == nil {
+			if len(value) > limit {
+				t.Fatalf("fitted input length = %d, limit = %d", len(value), limit)
+			}
+			if _, decodeErr := unmarshalCompactionInput(value); decodeErr != nil {
+				t.Fatalf("fitted input is not decodable: %v", decodeErr)
+			}
+			return
+		}
+		var tooLarge *CompactionInputTooLargeError
+		if !errors.As(marshalErr, &tooLarge) {
+			t.Fatalf("marshalCompactionInputWithin() error = %T %v, want typed size rejection", marshalErr, marshalErr)
 		}
 	})
 }
