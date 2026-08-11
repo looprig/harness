@@ -196,8 +196,18 @@ func TestEvaluatorAppliesAccessDenyBeforeStoredRules(t *testing.T) {
 	if len(result.Denied) != 1 || result.Denied[0].Kind != "network" {
 		t.Fatalf("Denied = %#v, want network", result.Denied)
 	}
+	if result.denial != DenialStructural {
+		t.Fatalf("denial = %q, want %q", result.denial, DenialStructural)
+	}
 	if len(matcher.calls) != 0 {
 		t.Fatalf("matcher calls = %#v, want none after access deny", matcher.calls)
+	}
+	resolution, err := evaluator.Resolve(context.Background(), result, ApprovalApprove)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if resolution.Approved || resolution.Denial != DenialStructural || resolution.DenialDescription != "connect to github.com:443" {
+		t.Fatalf("Resolve() = %#v, want structural network denial", resolution)
 	}
 }
 
@@ -239,9 +249,19 @@ func TestEvaluatorChecksEveryStoredDenyBeforeAnyAllow(t *testing.T) {
 	if len(result.Denied) != 1 || result.Denied[0].Kind != "network" {
 		t.Fatalf("Denied = %#v, want network", result.Denied)
 	}
+	if result.denial != DenialRefused {
+		t.Fatalf("denial = %q, want %q", result.denial, DenialRefused)
+	}
 	wantCalls := []string{"deny:command.execute", "deny:network"}
 	if !reflect.DeepEqual(matcher.calls, wantCalls) {
 		t.Fatalf("matcher calls = %#v, want %#v", matcher.calls, wantCalls)
+	}
+	resolution, err := evaluator.Resolve(context.Background(), result, ApprovalApprove)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if resolution.Approved || resolution.Denial != DenialRefused || resolution.DenialDescription != "connect to github.com:443" {
+		t.Fatalf("Resolve() = %#v, want refused network denial", resolution)
 	}
 }
 
@@ -323,6 +343,9 @@ func TestResolveApproveWritesNothingAndMintsExactGrants(t *testing.T) {
 	}
 	if !reflect.DeepEqual(resolution.Grants, []string{"secret-command-token", "secret-network-token"}) {
 		t.Fatalf("grants = %#v", resolution.Grants)
+	}
+	if resolution.Denial != DenialUnspecified || resolution.DenialDescription != "" {
+		t.Fatalf("approved resolution denial fields = %q, %q, want empty", resolution.Denial, resolution.DenialDescription)
 	}
 	if len(issuer.calls) != 2 {
 		t.Fatalf("issuer calls = %#v, want two", issuer.calls)
@@ -448,16 +471,52 @@ func TestResolveDeniedEvaluationRejectsApprovalAndMintsNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var evalErr *EvaluationError
-	if _, err := evaluator.Resolve(context.Background(), evaluation, ApprovalApprove); !errors.As(err, &evalErr) || evalErr.Kind != EvaluationDenied {
-		t.Fatalf("Resolve(Approve) on denied evaluation error = %v, want denied", err)
+	resolution, err := evaluator.Resolve(context.Background(), evaluation, ApprovalApprove)
+	if err != nil {
+		t.Fatalf("Resolve(Approve) on denied evaluation error = %v", err)
 	}
-	resolution, err := evaluator.Resolve(context.Background(), evaluation, ApprovalDeny)
+	if resolution.Approved || resolution.Denial != DenialStructural || resolution.DenialDescription != "connect to github.com:443" {
+		t.Fatalf("Resolve(Approve) = %#v, want structural network denial", resolution)
+	}
+	resolution, err = evaluator.Resolve(context.Background(), evaluation, ApprovalDeny)
 	if err != nil || resolution.Approved {
 		t.Fatalf("Resolve(Deny) = %#v, %v, want unapproved without error", resolution, err)
 	}
 	if len(issuer.calls) != 0 {
 		t.Fatalf("issuer calls = %#v, want none", issuer.calls)
+	}
+}
+
+func TestResolveDenyWithoutUnmetRequirementDoesNotPanic(t *testing.T) {
+	evaluator, err := newEvaluatorForTest(nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluation, err := evaluator.Evaluate(context.Background(), tool.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolution, err := evaluator.Resolve(context.Background(), evaluation, ApprovalDeny)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if resolution.Approved || resolution.Denial != DenialRefused || resolution.DenialDescription != "" {
+		t.Fatalf("Resolve() = %#v, want category-only refusal", resolution)
+	}
+}
+
+func TestResolveCallerConstructedDeniedEvaluationFallsBackToUnspecified(t *testing.T) {
+	evaluator, err := newEvaluatorForTest(nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluation := Evaluation{Denied: []tool.Requirement{{Description: "blocked requirement"}}}
+	resolution, err := evaluator.Resolve(context.Background(), evaluation, ApprovalApprove)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if resolution.Approved || resolution.Denial != DenialUnspecified || resolution.DenialDescription != "blocked requirement" {
+		t.Fatalf("Resolve() = %#v, want unspecified denial with prepared description", resolution)
 	}
 }
 

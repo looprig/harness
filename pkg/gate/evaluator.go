@@ -43,14 +43,28 @@ type Evaluation struct {
 	request           tool.Request
 	grantRequirements []tool.Requirement
 	candidates        []tool.RuleCandidate
+	denial            DenialReason
 }
 
-// Resolution is the live result of applying an approval action. Grants are
-// deliberately excluded from JSON: minted tokens may only travel through the
-// prepared execution path, never a prompt, display, journal, or audit payload.
+// DenialReason classifies why an unapproved resolution was not approved. It
+// names gate decision stages only, never who denied or which rule matched.
+type DenialReason string
+
+const (
+	DenialUnspecified DenialReason = ""
+	DenialStructural  DenialReason = "structural"
+	DenialRefused     DenialReason = "refused"
+)
+
+// Resolution is the live result of applying an approval action. Grants and
+// denial routing metadata are deliberately excluded from JSON: they may only
+// travel through the live authorization path, never a prompt, display,
+// journal, or audit payload.
 type Resolution struct {
-	Approved bool     `json:"approved"`
-	Grants   []string `json:"-"`
+	Approved          bool         `json:"approved"`
+	Grants            []string     `json:"-"`
+	Denial            DenialReason `json:"-"`
+	DenialDescription string       `json:"-"`
 }
 
 // ApprovalPrompt is the single combined user-facing approval for one prepared
@@ -90,7 +104,9 @@ type Evaluator struct {
 type EvaluationErrorKind string
 
 const (
-	EvaluationRuleMatchFailed         EvaluationErrorKind = "rule_match_failed"
+	EvaluationRuleMatchFailed EvaluationErrorKind = "rule_match_failed"
+	// EvaluationDenied is retained for source compatibility.
+	// Deprecated: configured, stored, and approval denials return an unapproved Resolution.
 	EvaluationDenied                  EvaluationErrorKind = "denied"
 	EvaluationActionInvalid           EvaluationErrorKind = "action_invalid"
 	EvaluationApproverMissing         EvaluationErrorKind = "approver_missing"
@@ -181,7 +197,7 @@ func (e *Evaluator) Authorize(ctx context.Context, request tool.Request) (Resolu
 		return Resolution{}, err
 	}
 	if len(evaluation.Denied) != 0 {
-		return Resolution{}, nil
+		return deniedResolution(evaluation.denial, evaluation.Denied), nil
 	}
 	if len(evaluation.Unmet) == 0 {
 		return e.Resolve(ctx, evaluation, ApprovalApprove)
@@ -203,7 +219,7 @@ func (e *Evaluator) Authorize(ctx context.Context, request tool.Request) (Resolu
 		return Resolution{}, &EvaluationError{Kind: EvaluationApprovalFailed, Requirement: evaluation.Unmet[0].Kind, Cause: err}
 	}
 	if action == ApprovalDeny {
-		return Resolution{}, nil
+		return deniedResolution(DenialRefused, evaluation.Unmet), nil
 	}
 	return e.Resolve(ctx, evaluation, action)
 }
@@ -228,6 +244,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, request tool.Request) (Evaluat
 		switch access {
 		case AccessDeny:
 			result.Denied = append(result.Denied, requirement.Clone())
+			result.denial = DenialStructural
 		case AccessGated:
 			gated = append(gated, requirement)
 		case AccessAllow:
@@ -248,6 +265,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, request tool.Request) (Evaluat
 		}
 		if matched {
 			result.Denied = append(result.Denied, requirement.Clone())
+			result.denial = DenialRefused
 		}
 	}
 	if len(result.Denied) != 0 {
@@ -284,14 +302,11 @@ func (e *Evaluator) Resolve(ctx context.Context, evaluation Evaluation, action A
 		return Resolution{}, err
 	}
 	if len(evaluation.Denied) != 0 {
-		if action == ApprovalDeny {
-			return Resolution{}, nil
-		}
-		return Resolution{}, &EvaluationError{Kind: EvaluationDenied, Requirement: evaluation.Denied[0].Kind, Cause: fmt.Errorf("configured or stored deny")}
+		return deniedResolution(evaluation.denial, evaluation.Denied), nil
 	}
 	switch action {
 	case ApprovalDeny:
-		return Resolution{}, nil
+		return deniedResolution(DenialRefused, evaluation.Unmet), nil
 	case ApprovalApprove:
 		// Once approval is intentionally ephemeral: nothing is persisted.
 	case ApprovalApproveAlwaysWorkspace:
@@ -346,6 +361,14 @@ func (e *Evaluator) Resolve(ctx context.Context, evaluation Evaluation, action A
 		grants = append(grants, token)
 	}
 	return Resolution{Approved: true, Grants: grants}, nil
+}
+
+func deniedResolution(reason DenialReason, requirements []tool.Requirement) Resolution {
+	description := ""
+	if len(requirements) != 0 {
+		description = requirements[0].Description
+	}
+	return Resolution{Denial: reason, DenialDescription: description}
 }
 
 func cloneRequirements(requirements []tool.Requirement) []tool.Requirement {

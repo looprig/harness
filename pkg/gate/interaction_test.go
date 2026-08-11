@@ -172,6 +172,9 @@ func TestInteractiveAuthorizeDenyWritesAndMintsNothing(t *testing.T) {
 	if resolution.Approved || len(resolution.Grants) != 0 {
 		t.Fatalf("Authorize() = %+v, want unapproved with no grants", resolution)
 	}
+	if resolution.Denial != DenialRefused || resolution.DenialDescription != "run command: git status" {
+		t.Fatalf("Authorize() = %#v, want refused command denial", resolution)
+	}
 	if len(writer.writes) != 0 || len(issuer.calls) != 0 {
 		t.Errorf("writes = %d, issuer calls = %d, want 0 and 0", len(writer.writes), len(issuer.calls))
 	}
