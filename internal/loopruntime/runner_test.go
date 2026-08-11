@@ -318,7 +318,7 @@ func TestRunBatch_ToolExecutionIDBindsToProviderToolUseID(t *testing.T) {
 		}
 		seenUse[r.ToolUseID] = true
 		// The result pairs back to the model by the provider ToolUseID only.
-		if got := toolResultMessage(r).ToolUseID; got != calls[i].ID {
+		if got := toolResultMessage(r, 0).ToolUseID; got != calls[i].ID {
 			t.Errorf("results[%d]: ToolResultMessage.ToolUseID = %q, want provider id %q", i, got, calls[i].ID)
 		}
 	}
