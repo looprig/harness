@@ -78,6 +78,14 @@ const (
 	diagnosticMaxBytes = 1024
 )
 
+type permissionDenialCategory string
+
+const (
+	permissionDenialOutOfScope    permissionDenialCategory = "out of scope"
+	permissionDenialNotAuthorized permissionDenialCategory = "not authorized"
+	permissionDenialUnavailable   permissionDenialCategory = "unavailable"
+)
+
 // result is the package-private outcome of one tool call. Results are returned in
 // the SAME ORDER as the requested calls (the model pairs tool_use↔tool_result by
 // position/ID), and each carries its originating ToolUseBlock.ID so runTurn can
@@ -565,6 +573,33 @@ func boundedDiagnostic(value string) string {
 	return value[:cut] + truncationMarker
 }
 
+func permissionDeniedMessage(category permissionDenialCategory, description string) string {
+	message := errPermissionDenied + " [" + string(category) + "]"
+	if description != "" {
+		message += ": " + description
+	}
+	return boundedDiagnostic(message)
+}
+
+func permissionDeniedForResolution(resolution gatedomain.Resolution) string {
+	switch resolution.Denial {
+	case gatedomain.DenialStructural:
+		return permissionDeniedMessage(permissionDenialOutOfScope, resolution.DenialDescription)
+	case gatedomain.DenialRefused:
+		return permissionDeniedMessage(permissionDenialNotAuthorized, resolution.DenialDescription)
+	default:
+		return permissionDeniedMessage(permissionDenialNotAuthorized, "")
+	}
+}
+
+func permissionDeniedForError(err error) string {
+	var evaluationError *gatedomain.EvaluationError
+	if errors.As(err, &evaluationError) && evaluationError.Kind == gatedomain.EvaluationApprovalRequired {
+		return permissionDeniedMessage(permissionDenialNotAuthorized, "")
+	}
+	return permissionDeniedMessage(permissionDenialUnavailable, "")
+}
+
 // resolveAccess runs one (resolvable) call's prepared request through the
 // combined access gate exactly once. The gate evaluates every requirement,
 // opens at most ONE interactive approval (routed back through this runner's
@@ -586,7 +621,7 @@ func resolveAccess(
 	if ts.Access == nil {
 		// No access gate wired → fail-secure: deny rather than fall through.
 		emitAccessDecided(ctx, r, event.PermissionEffectDeny, "access_gate_missing", emit)
-		r.fail(errPermissionDenied)
+		r.fail(permissionDeniedMessage(permissionDenialUnavailable, ""))
 		return nil
 	}
 
@@ -604,14 +639,14 @@ func resolveAccess(
 		if !r.prompted {
 			emitAccessDecided(ctx, r, event.PermissionEffectDeny, "access_error", emit)
 		}
-		r.fail(errPermissionDenied)
+		r.fail(permissionDeniedForError(err))
 		return err
 	}
 	if !resolution.Approved {
 		if !r.prompted {
 			emitAccessDecided(ctx, r, event.PermissionEffectDeny, "access_denied", emit)
 		}
-		r.fail(errPermissionDenied)
+		r.fail(permissionDeniedForResolution(resolution))
 		return nil
 	}
 	if !r.prompted {

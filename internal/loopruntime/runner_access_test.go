@@ -276,39 +276,69 @@ func TestRunBatch_MintsPreparesEvaluatesOnce(t *testing.T) {
 	}
 }
 
-// A denied evaluation never executes.
-func TestRunBatch_DeniedEvaluationNeverExecutes(t *testing.T) {
+func TestRunBatch_DenialMessages(t *testing.T) {
 	t.Parallel()
-	tl := &fakeRunTool{name: "T", output: "ok"}
-	access := &countingAccessGate{resolution: gatedomain.Resolution{Approved: false}}
-	ts := ToolSet{Access: access, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 2}
-	emit, _ := collectEmit()
-
-	results := runBatchNoGate(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, emit)
-
-	if len(results) != 1 || !results[0].IsError || !strings.Contains(resultText(results[0]), "permission denied") {
-		t.Fatalf("results = %+v, want one permission-denied error", results)
+	tests := []struct {
+		name       string
+		resolution gatedomain.Resolution
+		err        error
+		want       string
+	}{
+		{
+			name: "structural with description",
+			resolution: gatedomain.Resolution{
+				Denial:            gatedomain.DenialStructural,
+				DenialDescription: "read files under /workspace",
+			},
+			want: "error: permission denied [out of scope]: read files under /workspace",
+		},
+		{
+			name: "refused with description",
+			resolution: gatedomain.Resolution{
+				Denial:            gatedomain.DenialRefused,
+				DenialDescription: "run command: git push",
+			},
+			want: "error: permission denied [not authorized]: run command: git push",
+		},
+		{
+			name:       "unspecified fails closed",
+			resolution: gatedomain.Resolution{},
+			want:       "error: permission denied [not authorized]",
+		},
+		{
+			name: "headless approval required",
+			err: &gatedomain.EvaluationError{
+				Kind:  gatedomain.EvaluationApprovalRequired,
+				Cause: errors.New("headless gate cannot prompt"),
+			},
+			want: "error: permission denied [not authorized]",
+		},
+		{
+			name: "dependency error",
+			err:  errors.New("evaluator unavailable"),
+			want: "error: permission denied [unavailable]",
+		},
 	}
-	if tl.totalRuns != 0 {
-		t.Errorf("totalRuns = %d, want 0 for a denied call", tl.totalRuns)
-	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tl := &fakeRunTool{name: "T", output: "ok"}
+			access := &countingAccessGate{resolution: tt.resolution, err: tt.err}
+			ts := ToolSet{Access: access, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 2}
+			emit, _ := collectEmit()
 
-// An access-gate failure (including a headless approval-required denial) fails closed.
-func TestRunBatch_AuthorizeErrorFailsClosed(t *testing.T) {
-	t.Parallel()
-	tl := &fakeRunTool{name: "T", output: "ok"}
-	access := &countingAccessGate{err: errors.New("evaluator unavailable")}
-	ts := ToolSet{Access: access, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 2}
-	emit, _ := collectEmit()
+			results := runBatchNoGate(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, emit)
 
-	results := runBatchNoGate(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, emit)
-
-	if len(results) != 1 || !results[0].IsError || !strings.Contains(resultText(results[0]), "permission denied") {
-		t.Fatalf("results = %+v, want one permission-denied error", results)
-	}
-	if tl.totalRuns != 0 {
-		t.Errorf("totalRuns = %d, want 0 after an authorize failure", tl.totalRuns)
+			if len(results) != 1 || !results[0].IsError {
+				t.Fatalf("results = %+v, want one error", results)
+			}
+			if got := resultText(results[0]); got != tt.want {
+				t.Fatalf("result = %q, want %q", got, tt.want)
+			}
+			if tl.totalRuns != 0 {
+				t.Errorf("totalRuns = %d, want 0", tl.totalRuns)
+			}
+		})
 	}
 }
 
@@ -321,8 +351,11 @@ func TestRunBatch_NilAccessGateDenies(t *testing.T) {
 
 	results := runBatchNoGate(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, emit)
 
-	if len(results) != 1 || !results[0].IsError || !strings.Contains(resultText(results[0]), "permission denied") {
-		t.Fatalf("results = %+v, want one permission-denied error", results)
+	if len(results) != 1 || !results[0].IsError {
+		t.Fatalf("results = %+v, want one error", results)
+	}
+	if got, want := resultText(results[0]), "error: permission denied [unavailable]"; got != want {
+		t.Fatalf("result = %q, want %q", got, want)
 	}
 	if tl.totalRuns != 0 {
 		t.Errorf("totalRuns = %d, want 0 without an access gate", tl.totalRuns)
@@ -459,6 +492,66 @@ func TestRunBatch_InteractiveGateOpensOnceApproveOnce(t *testing.T) {
 	}
 }
 
+func TestRunBatch_InteractiveDenialIncludesReason(t *testing.T) {
+	t.Parallel()
+	tl := &fakeRunTool{name: "T", output: "ok"}
+	tl.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status", false), nil, nil
+	}
+	issuer := &recordingIssuer{}
+	ts := ToolSet{
+		Access:               interactiveEvaluator(t, gatedomain.AccessGated, &recordingRuleWriter{}, issuer),
+		Registry:             []tool.InvokableTool{tl},
+		MaxParallelToolCalls: 2,
+	}
+	emit, getEvents := collectEmit()
+
+	gateReg := make(chan gateRegistration, 1)
+	go func() {
+		reg := <-gateReg
+		reg.ack <- gateInstallAck{}
+		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Action: gatedomain.ApprovalDeny}
+	}()
+
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
+
+	if len(results) != 1 || !results[0].IsError {
+		t.Fatalf("results = %+v, want one error", results)
+	}
+	if got, want := resultText(results[0]), "error: permission denied [not authorized]: run command: git status"; got != want {
+		t.Fatalf("result = %q, want %q", got, want)
+	}
+	if tl.totalRuns != 0 || len(issuer.targets()) != 0 {
+		t.Fatalf("totalRuns = %d, issued grants = %v, want zero", tl.totalRuns, issuer.targets())
+	}
+	var requested int
+	for _, ev := range getEvents() {
+		if _, ok := ev.(event.PermissionRequested); ok {
+			requested++
+		}
+	}
+	if requested != 1 {
+		t.Fatalf("PermissionRequested count = %d, want 1", requested)
+	}
+}
+
+func TestPermissionDeniedMessageBounded(t *testing.T) {
+	description := "unsafe\n" + strings.Repeat("x", diagnosticMaxBytes)
+	got := permissionDeniedMessage(permissionDenialOutOfScope, description)
+	if strings.ContainsRune(got, '\n') {
+		t.Fatalf("permissionDeniedMessage() contains control character: %q", got)
+	}
+	if !strings.HasPrefix(got, "error: permission denied [out of scope]: unsafe ") {
+		t.Fatalf("permissionDeniedMessage() prefix = %q", got)
+	}
+	if !strings.HasSuffix(got, truncationMarker) {
+		t.Fatalf("permissionDeniedMessage() = %q, want truncation marker", got)
+	}
+	if len(got) > diagnosticMaxBytes {
+		t.Fatalf("permissionDeniedMessage() length = %d, want <= %d", len(got), diagnosticMaxBytes)
+	}
+}
+
 // An approve-always action persists the displayed candidates atomically before
 // grants are minted.
 func TestRunBatch_ApproveAlwaysPersistsCandidates(t *testing.T) {
@@ -520,8 +613,11 @@ func TestRunBatch_UnknownApprovalActionFailsClosed(t *testing.T) {
 
 	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
 
-	if len(results) != 1 || !results[0].IsError || !strings.Contains(resultText(results[0]), "permission denied") {
-		t.Fatalf("results = %+v, want one permission-denied error", results)
+	if len(results) != 1 || !results[0].IsError {
+		t.Fatalf("results = %+v, want one error", results)
+	}
+	if got, want := resultText(results[0]), "error: permission denied [not authorized]: run command: git status"; got != want {
+		t.Fatalf("result = %q, want %q", got, want)
 	}
 	if tl.totalRuns != 0 {
 		t.Errorf("totalRuns = %d, want 0", tl.totalRuns)
@@ -545,8 +641,11 @@ func TestRunBatch_HeadlessUnmetDeniesWithoutGate(t *testing.T) {
 
 	results := runBatchNoGate(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, emit)
 
-	if len(results) != 1 || !results[0].IsError || !strings.Contains(resultText(results[0]), "permission denied") {
-		t.Fatalf("results = %+v, want one permission-denied error", results)
+	if len(results) != 1 || !results[0].IsError {
+		t.Fatalf("results = %+v, want one error", results)
+	}
+	if got, want := resultText(results[0]), "error: permission denied [not authorized]"; got != want {
+		t.Fatalf("result = %q, want %q", got, want)
 	}
 	for _, ev := range getEvents() {
 		if _, ok := ev.(event.PermissionRequested); ok {
