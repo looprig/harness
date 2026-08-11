@@ -12,8 +12,9 @@ that archived `pkg/transcript` out of harness. Five corrections: (1) the read pl
 `serve.ReadHandler(reads)` — a harness Phase 0 prerequisite carving the stateless read routes out of
 the runner-coupled `serve.Handler` (the BFF hosts no agent, so it has no runner to pass); (2) the
 `transcript.html` shortcut and its render-parity oracle are dropped (`pkg/transcript` left harness for
-`looprig/cli`, which the client must not depend on); (3) the wire schema is **generated from
-`pkg/serve`'s Go structs** (`invopop/jsonschema` `go:generate`), not hand-maintained testdata; (4) the
+the charm/TUI-stack sibling module, which the client must not depend on); (3) ~~the wire schema is
+generated from `pkg/serve`'s Go structs (`invopop/jsonschema` `go:generate`)~~ — **superseded by
+Decision #17 below**: serve's schema is hand-authored and the client consumes it; (4) the
 SDK consumes `GET /v1/capabilities` for feature negotiation; (5) the `/gates` snapshot is explicitly
 BFF-synthesized, not a `serve` route. See Decision #16.
 Revised 2026-07-09 (independent review, Decision #17): read is now a **composition-time seam** —
@@ -24,9 +25,26 @@ hand-authored its schema to stay stdlib-only, by design); a DNS-rebind/`Host`/`O
 move to Phase 1a; the `sdk/react` placeholder is dropped and `pkg/bff` kept internal (export
 `pkg/webui` only); `id:`-stamped resume is **already shipped**, so lossless resume lands in 1c;
 `web/` → `app/`.
+Revised 2026-08-10 (re-validated against harness `pkg/serve` at HEAD; Decision #18): the core
+architecture holds — routes, `/capabilities`, `id:`-stamped `enduring` frames, the hand-authored
+schema + golden fixtures, the narrow `serve.Reader`, and the single `WaitingGateID` all verified
+as-designed. Six corrections: (1) **`serve.ReadHandler` still does not exist** — the Phase 0
+prerequisite is *unmet*, and the read handlers remain type-coupled to a rig; (2) `session.Runner`
+is **gone**, replaced by `serve.Rig[S, O]` + `session.SessionController`; (3) the SDK fold must
+also handle the `input_queued` and `compaction_started` ephemeral deltas, which shipped after this
+doc froze; (4) `catalogreader.New(catalog, store)` takes the **Store**, not an `OpenEventReplayer`;
+(5) the contract copy must be re-pinned from current harness HEAD — the wire artifacts changed
+after 2026-07-10; (6) `pkg/workspacestore` **now exists**, so the Phase 2 gate is open, and
+`looprig/cli` no longer exists (the TUI module is `github.com/looprig/tui`; `pkg/transcript` was
+archived, not rehomed). See Decision #18.
+Revised 2026-08-10 (Decision #19): **Phase 5's desktop/mobile shell flips from Tauri v2 to Wails
+v3.** Tauri was picked for mobile reach; Wails v3 now ships iOS/Android too, and its Go backend
+lets the shell link `internal/bff` in-process — one binary, no sidecar, no Rust toolchain, and no
+loopback HTTP listener in the packaged app. Phases 0–4 are unaffected.
 **Depends on:** `2026-07-06-serve-http-session-api-design.md` (the wire contract this client
 consumes), `2026-07-02-storekit-sessionstore-design.md` (reads through `pkg/sessionstore`),
-`2026-07-02-workspacestore-design.md` (Phase 2 workspace views)
+`2026-07-02-workspacestore-design.md` (Phase 2 workspace views — `pkg/workspacestore` has since
+been built)
 
 ## Problem
 
@@ -95,7 +113,8 @@ whole design:
   swapped in — zero client changes.
 - The client **hosts no agent**, so it never imports swe. It cannot *itself* be the compute for
   a session; it can proxy create/restore/input/gates/interrupt to a host that has a compiled
-  `session.Runner`, and it can browse all history with no host at all.
+  session factory (harness `serve.Rig[S, O]`, satisfied by `pkg/rig` over
+  `session.SessionController`), and it can browse all history with no host at all.
 
 ## Module & dependency boundary
 
@@ -104,8 +123,8 @@ matching the storekit backend-repo convention; final name is the owner's call).
 
 | Depends on | For |
 |---|---|
-| `github.com/looprig/harness` — `pkg/serve` | the mounted read-plane handler (`serve.ReadHandler`), the wire DTO / error-envelope types, and the protocol schema the SDK generates from |
-| `github.com/looprig/harness` — `pkg/serve/catalogreader` + `pkg/sessionstore` | **mounted-read mode only** — the store-backed read adapter behind `serve.ReadHandler` (`catalogreader.New` over `Catalog`, `OpenEventReplayer`) |
+| `github.com/looprig/harness` — `pkg/serve` | the mounted read-plane handler (`serve.ReadHandler` — **not yet built**, see Phase 0), the wire DTO / error-envelope types, and the shipped hand-authored protocol schema the SDK consumes |
+| `github.com/looprig/harness` — `pkg/serve/catalogreader` + `pkg/sessionstore` | **mounted-read mode only** — the store-backed read adapter behind `serve.ReadHandler` (`catalogreader.New(catalog *sessionstore.Catalog, store *sessionstore.Store)`; the event replayer is reached *through* the Store, not passed separately) |
 | harness `pkg/event`/`pkg/journal` + `github.com/looprig/core` `content`/`uuid` | **mounted-read mode only** — decode replayed records inside the mounted reader |
 | one storage backend — `github.com/looprig/fsstore` **or** `github.com/looprig/natsstore` | **mounted-read mode only** (laptop); the cloud/thin client proxies read and links **no** backend (Decision #17) |
 | stdlib `net/http` | the BFF server + the `pkg/serve` reverse-proxy client |
@@ -114,7 +133,7 @@ matching the storekit backend-repo convention; final name is the owner's call).
 consumer of the looprig SDK exactly like swe, minus the agent.
 
 Session **creation/restore** is a host job — the client proxies `POST /sessions` to a configured
-host, which owns the compiled `session.Runner`. swe may *also* embed this same SPA for an all-in-one
+host, which owns the compiled `serve.Rig`. swe may *also* embed this same SPA for an all-in-one
 local dev binary that both runs and shows sessions; that is a swe concern, out of scope here.
 
 ## The BFF surface (client protocol)
@@ -142,7 +161,7 @@ safety.
   injects `Authorization` on the proxied leg. No CORS surface.
 - **Event DTO is versioned** (`{"v":1, …}`) from day one; it decodes both a replayed
   `journal` record and a live SSE `enduring`/`ephemeral` frame into one shape (message blocks,
-  tool cards, gate prompts, subagent/step markers, status). The seam between "history" and "live"
+  tool cards, gate prompts, subagent/step markers, queued input, compaction, status). The seam between "history" and "live"
   is the journal sequence, and the join is **exact**: the SDK subscribes to `…/events`
   (buffering), pages `…/journal` to tip `T`, drops buffered frames with `journal_seq <= T`, and
   follows live (details below).
@@ -166,7 +185,12 @@ contract, many framework adapters.
   - `ServeTransport` for trusted/server-side/custom apps that call `pkg/serve` directly;
 - cold-history loading (`listSessions`, `readSession`, `readHistory`) and live SSE attachment;
 - a framework-neutral session state machine that folds history pages plus live `enduring` and
-  `ephemeral` frames into messages, tool cards, gates, status, and diagnostics;
+  `ephemeral` frames into messages, tool cards, gates, status, and diagnostics. The `ephemeral`
+  delta kinds are enumerated by serve's shipped `ephemeral_frame.schema.json` and the fold must
+  cover **all** of them: `token_delta` (a tagged chunk DTO — text / thinking / tool-use),
+  `tool_call_started`, `tool_call_completed`, `input_queued`, and `compaction_started` (attempt id,
+  reason, basis). The last two shipped after this doc's 2026-07-10 revision; an unhandled kind must
+  be a *typed, surfaced* fold error, not a silent drop, so the next wire addition is loud;
 - control methods (`createSession`, `restoreSession`, `submit`, `respondGate`, `interrupt`) with
   typed errors and retry metadata from the stable error envelope;
 - lossless resume via the exact sequence join (serve §7b) — serve **already** stamps `id:
@@ -190,8 +214,9 @@ Rendering is the **event DTO folded by the SDK core and rendered by Svelte**: th
 streaming into *rich, interactive* chat/tool/code components, which static server-rendered HTML
 can't do. An earlier revision kept a server-rendered `pkg/transcript/html` transcript as a Phase-1a
 shortcut and a render-parity test oracle, but `pkg/transcript` was archived out of harness
-(2026-07-09, headed to `looprig/cli`) and the client must not depend on `looprig/cli` (it drags the
-charm/TUI stack, forbidden above). So there is no HTML shortcut: Phase 1a renders a cold transcript
+(2026-07-09) and the client must not depend on the charm/TUI-stack sibling module (forbidden above;
+that module is `github.com/looprig/tui` — the once-planned `looprig/cli` never shipped, and
+`pkg/transcript` was archived rather than rehomed, so there is no HTML renderer to depend on at all). So there is no HTML shortcut: Phase 1a renders a cold transcript
 by folding the journal DTO through the SDK core, and the contract fixtures (not an HTML oracle)
 guard that folding.
 
@@ -219,9 +244,9 @@ authoritative `enduring` event.
 the first-party reference app, not the only supported frontend integration.
 
 - **Build:** SvelteKit with `adapter-static` + `export const ssr = false` (root layout) →
-  pure static assets, **no Node at serve time**. This is Tauri's documented path and embeds
-  cleanly into `embed.FS`. (SvelteKit is used purely as the router/build/tooling host; none of
-  its SSR/server features are in play.)
+  pure static assets, **no Node at serve time**. This is the documented path for both `embed.FS`
+  and the Phase 5 Wails v3 shell, which serves the same built assets. (SvelteKit is used purely as
+  the router/build/tooling host; none of its SSR/server features are in play.)
 - **Components (all verified current, 2026-07-02):**
   - Dashboard/UI: **shadcn-svelte** (on Bits UI) — cards, data table, dialogs, command palette.
   - Chat/transcript: **Svelte AI Elements** (shadcn-svelte registry) — message list, streaming
@@ -318,7 +343,7 @@ github.com/looprig/client
 ```
 
 - **`pkg/webui` is the only exported package** (Decision #17): swe's all-in-one binary **is** the
-  host (it has a runner), so it mounts full `serve.Handler` directly and reuses only the **SPA
+  host (it has a rig), so it mounts full `serve.Handler` directly and reuses only the **SPA
   embed** — not the proxying BFF. `webui.FS` is the reuse surface; the BFF (token custody + proxy)
   stays `internal/bff` until a real second consumer needs it, then it's promoted.
 - **`sdk/core` is the browser/runtime seam.** The Svelte app imports the same core that future
@@ -366,6 +391,11 @@ serve testdata/fixtures/* ──copy──────────────�
   needs no generator in either repo.
 - **Versioning:** schema + fixtures are pinned to the imported harness version; bumping harness
   re-copies them and any wire change surfaces as a fixture diff reviewed as a contract change.
+  **Take the first copy from current harness HEAD, not a July tag.** The wire artifacts moved after
+  this doc's 2026-07-10 revision — `enduring_frame.sse`, `journal_page.json`, `status_running.json`,
+  `openapi.yaml`, and `ephemeral_frame.schema.json` all changed, including two contract-affecting
+  commits (`ea7077c7` replaced the durable approval wires; `412ed9e0` scoped gate identity by
+  resolver). The drift mechanism below is the right one; it has simply never been exercised yet.
 - **Approved deps (client repo):** `ajv` and `json-schema-to-ts` (npm) — recorded in the client
   repo's own CLAUDE.md, which inherits looprig's rules and seeds its approved list (looprig,
   fsstore/natsstore; npm: svelte/vite/shadcn-svelte/AI Elements/virtua/shiki/svelte-exmarkdown). No
@@ -400,7 +430,9 @@ serve testdata/fixtures/* ──copy──────────────�
   change breaks a shared golden fixture → both repos fail (no `git diff --exit-code` regen guard, no
   generated schema to drift).
 - SDK core: state-machine tests fold cold history pages plus live `enduring` and `ephemeral` frames
-  into the same session view regardless of transport. Transport tests cover BFF path prefixes,
+  into the same session view regardless of transport — **one case per `ephemeral` delta kind** in
+  serve's schema enum (`token_delta` × each chunk type, `tool_call_started`, `tool_call_completed`,
+  `input_queued`, `compaction_started`) plus an unknown-kind case asserting a typed fold error. Transport tests cover BFF path prefixes,
   direct `serve` paths, typed error envelopes, aborts, and the exact seam join
   (subscribe-buffer → replay-to-tip → drop `<= tip`), including an event that lands inside the
   join window.
@@ -416,13 +448,20 @@ serve testdata/fixtures/* ──copy──────────────�
 ## Migration phases (detail in the implementation plan)
 
 - **Phase 0 (prerequisites):** the `pkg/sessionstore` read surface has **landed**, and harness
-  `pkg/serve` (runner-supplied handler, read plane, wire contract, ephemeral frames, **already**
+  `pkg/serve` (rig-supplied handler, read plane, wire contract, ephemeral frames, **already**
   `id`-stamped `enduring` frames, shipped hand-authored schema + golden fixtures) is **built**. The
-  one remaining serve ask is a **`serve.ReadHandler(reads Reader, opts...) http.Handler`** =
-  `newServer[LiveSession](nil, reads, cfg)` registering only `list/status/journal` (plus a reduced
-  `/capabilities` advertising `journal` only) — the existing `serve.Handler[S]` requires a runner
-  the BFF does not have. No schema-generation ask (serve owns the hand-authored schema by design).
-  The client consumes that contract only.
+  one remaining serve ask is a **`serve.ReadHandler(reads Reader, opts...) http.Handler`**
+  registering only `list/status/journal` (plus a reduced `/capabilities` advertising `journal`
+  only). No schema-generation ask (serve owns the hand-authored schema by design). The client
+  consumes that contract only.
+  **STATUS 2026-08-10: still unbuilt — this is the one hard blocker on Phase 1a.** As built,
+  `serve.Handler[S LiveSession, O any](rig Rig[S, O], reads Reader, opts ...Option)` is the only
+  constructor, and the read handlers are methods on the generic `server[S, O]`, so read is
+  **type-coupled** to a rig the BFF does not have. The earlier sketch of `newServer[LiveSession](nil,
+  reads, cfg)` no longer type-checks against the two-parameter generic. The minimal shape is now a
+  non-generic read server (or an instantiation over a `struct{}` option type with a nil rig) whose
+  three read handlers are lifted off `server[S, O]` — still no new request logic, but no longer a
+  one-line delegation. Land this in harness before client Phase 1a starts.
 - **Phase 1 — the client (v1):**
   - 1a. BFF binds loopback with the **`Host`/`Origin` + DNS-rebind guard and CSRF from the start**;
     read plane wired as a `ReadSource` (mounted `serve.ReadHandler` or proxy); `contract/` copied
@@ -438,15 +477,22 @@ serve testdata/fixtures/* ──copy──────────────�
     (inject server-side token, strip inbound `Authorization`) and fail-secure `Host == nil`
     browse-only**; TLS to any remote host; SDK control methods; the interactive chat composer +
     gate-approval UI. The two deployment modes wired at composition.
-- **Phase 2 — workspaces:** once `pkg/workspacestore` exists, add a workspaces/snapshots view
+- **Phase 2 — workspaces:** `pkg/workspacestore` **now exists** (`ref.go`, `snapshot.go`,
+  `archive.go`, `extract.go`), so this gate is open — add a workspaces/snapshots view
   (list `WorkspaceCheckpointed` refs from the journal; browse snapshot metadata).
 - **Phase 3 — additional framework adapters:** add `@looprig/react` first if demand exists, then
   Vue/Angular/Solid as needed. Each adapter is a small wrapper over `sdk/core`, not a new transport
   implementation.
 - **Phase 4 — retired:** lossless resume needs no separate phase and no pending serve work — the
   exact sequence join ships with 1c against the **already-shipped** `id:`-stamped `enduring` frames.
-- **Phase 5 — desktop/mobile:** wrap the *same* static SPA in **Tauri v2** (desktop + iOS/
-  Android); it points at a bundled-or-remote BFF. No SPA changes.
+- **Phase 5 — desktop/mobile:** wrap the *same* static SPA in **Wails v3** (desktop + iOS/Android;
+  Decision #19, superseding the original Tauri v2 choice). No SPA changes — the shell serves the
+  identical `adapter-static` build. Because Wails' backend is **Go**, the shell links
+  `internal/bff` **in-process**: one binary, no sidecar, no Rust toolchain, and no loopback HTTP
+  server in the packaged app. `ReadSource` and `Host` stay exactly as they are — the shell is one
+  more composition root, and mounted-read still links a storage backend while thin/remote proxies.
+  Mobile drops menus / tray / multi-window / save-file dialogs by design; the session browser wants
+  none of them.
 
 ## Decision log (from design discussion, 2026-07-02)
 
@@ -476,11 +522,13 @@ serve testdata/fixtures/* ──copy──────────────�
    Svelte app consumes the same core that future React/Vue/Angular/Solid adapters will consume.
    `@ai-sdk/svelte`'s *transport* is **not** adopted — looprig's event stream is its own protocol —
    only AI Elements' presentational components.
-9. **Workspaces deferred to Phase 2**, gated on `pkg/workspacestore` (design-only today).
+9. **Workspaces deferred to Phase 2**, gated on `pkg/workspacestore` (design-only when written;
+   **built as of 2026-08-10**, so the gate is open).
 10. **Additional framework adapters are future work.** `@looprig/svelte` ships first with the
     reference app; `@looprig/react` is the likely next adapter if users ask for it. Each adapter must
     wrap `sdk/core` and pass the shared fixture/conformance suite.
-11. **Desktop/mobile deferred to Phase 5** via Tauri v2 wrapping the same static SPA.
+11. **Desktop/mobile deferred to Phase 5** via ~~Tauri v2~~ **Wails v3** wrapping the same static
+    SPA (superseded by Decision #19, 2026-08-10).
 12. **Review fixes (2026-07-02):** gate-snapshot convenience view added (`GET …/gates`, derived
     from `ReadSession`/history so it does not require a `serve` open-gate registry); history→live
     **seam integrity** named a verification item (SSE must eventually be seq-resumable or
@@ -519,17 +567,21 @@ serve testdata/fixtures/* ──copy──────────────�
     (`github.com/looprig/fsstore`/`natsstore`, harness/core packages).
 16. **Reconciliation to the as-built `pkg/serve` + transcript archival (2026-07-09).** Five
     corrections after `pkg/serve` shipped and `pkg/transcript` was archived out of harness:
-    (1) **Read plane needs `serve.ReadHandler`.** As built, `serve.Handler[S](runner Runner[S], reads,
-    …)` welds the read routes onto a mux that *requires* a runner; there is no `serve.NewReader` and
-    no runner-free read handler. The BFF hosts no agent, so it has no runner — it therefore needs a
+    (1) **Read plane needs `serve.ReadHandler`.** As built, `serve.Handler` welds the read routes
+    onto a mux that *requires* a session factory; there is no `serve.NewReader` and
+    no factory-free read handler. The BFF hosts no agent, so it has none — it therefore needs a
     new harness `serve.ReadHandler(reads Reader, opts...) http.Handler` mounting only the stateless
     read group (list/status/journal). This preserves "one wire contract, one Go implementation" and
     is honest to serve's own "separate read route group" framing. The concrete read adapter is
     `serve/catalogreader.New(catalog, store)` behind serve's narrow `Reader` interface.
+    *(2026-08-10: the signature named here has since changed — it is now
+    `Handler[S LiveSession, O any](rig Rig[S, O], reads Reader, opts ...Option)`, and `Runner` is
+    gone entirely. The ask is unchanged and still outstanding; see Phase 0 and Decision #18.)*
     (2) **`transcript.html` shortcut dropped.** `pkg/transcript`/`.../html`/`journalsource` left
-    harness (headed to `looprig/cli`, whose charm/TUI stack the client forbids). The Phase-1a HTML
+    harness, whose charm/TUI stack the client forbids. The Phase-1a HTML
     milestone and the render-parity test oracle are removed; cold transcripts render through the
-    SDK's DTO folding, guarded by the contract fixtures.
+    SDK's DTO folding, guarded by the contract fixtures. *(2026-08-10: it was archived outright, not
+    rehomed to a `looprig/cli` — the TUI module is `github.com/looprig/tui` and carries no renderer.)*
     (3) **Schema as code — SUPERSEDED by Decision #17.** (This point had recommended serve
     `go:generate` its schema with `invopop`. That contradicts serve's deliberate stdlib-only,
     hand-authored schema; #17 instead consumes serve's shipped schema + fixtures and validates with
@@ -570,4 +622,58 @@ serve testdata/fixtures/* ──copy──────────────�
     **already shipped**, so lossless resume lands in 1c.
     (6) **ReadHandler ask stays minimal:** `newServer[LiveSession](nil, reads, cfg)` registering only
     the three read routes (+ reduced capabilities) — reuses the shipped unexported handlers verbatim,
-    zero new logic, trivially reviewable as a harness PR.
+    zero new logic, trivially reviewable as a harness PR. *(2026-08-10: this exact call no longer
+    type-checks — `newServer` is now two-parameter generic over `Rig[S, O]`. Still zero new request
+    logic, but the read handlers must be lifted off `server[S, O]` onto a rig-free receiver. See
+    Decision #18(1).)*
+
+18. **Re-validation against harness HEAD (2026-08-10).** The doc was checked line-by-line against
+    `pkg/serve` after a month of harness change (17 commits to `pkg/serve` since the last revision).
+    **Verified as-designed and unchanged:** all ten routes and the absence of `DELETE`
+    (`mux.go:15-24`); `GET /v1/capabilities` as a static discovery document (`handlers_capabilities.go`);
+    `id: <journal_seq>` on every `enduring` frame and never on `ephemeral` (`ephemeral.go`); the
+    `{"v":1,"event":…}` frame body; the hand-authored, stdlib-only JSON Schema + OpenAPI + golden
+    fixtures under `testdata/` with `schema_test.go` stating the rationale (so Decision #17's
+    consume-don't-generate stance is confirmed — `invopop/jsonschema` appears in `go.mod` only as an
+    *indirect* dep of the Anthropic SDK, and `pkg/serve` contains no `go:generate`); the narrow
+    `serve.Reader` (List/Status/Journal); and `SessionStatus.WaitingGateID` as a **single** UUID, so
+    the BFF-synthesized single-gate `/gates` view still matches reality. Six corrections were applied:
+    (1) **`serve.ReadHandler` is still unbuilt** and its shape got harder, not easier — the Phase 0
+    prerequisite is the sole hard blocker on Phase 1a;
+    (2) **`session.Runner` no longer exists** — `serve.Rig[S, O]` + `session.SessionController`
+    replaced it (`feat(rig): replace session runner lifecycle`, `refactor: enforce rig-only session
+    construction`);
+    (3) **the ephemeral delta set grew** — `input_queued` and `compaction_started` are in the shipped
+    schema enum and must be folded; an unhandled kind is now specified as a typed, surfaced error so
+    the next addition fails loudly instead of vanishing;
+    (4) **`catalogreader.New(catalog, store)`** takes the Store (the replayer is reached through it),
+    not an `OpenEventReplayer`;
+    (5) **the contract copy must be taken from harness HEAD**, since five wire artifacts changed
+    post-2026-07-10 including two contract-affecting commits;
+    (6) **`pkg/workspacestore` is built**, opening the Phase 2 gate, and `looprig/cli` never shipped
+    (`github.com/looprig/tui` is the TUI module; `pkg/transcript` was archived, not rehomed).
+    Nothing in the framework-neutral SDK design, the `sdk/core` ↔ `sdk/svelte` split, or the
+    security posture required revision.
+
+19. **Phase 5 shell: Wails v3, not Tauri v2 (2026-08-10).** Tauri v2 was chosen (#11) because it was
+    the option that reached **mobile** as well as desktop. Wails v3 now ships iOS and Android from
+    the same `main.go` and frontend (`wails3 task ios:run` / `android:run`, native WebView per
+    platform), so the sole differentiator behind #11 no longer holds — and on the remaining axes
+    Wails is the better fit for *this* module:
+    - **The BFF is already Go.** Wails' backend is Go, so the shell links `internal/bff`
+      **in-process** — one binary. Tauri's Rust core would require shipping the Go BFF as a sidecar
+      process or rewriting it, and adds a Rust toolchain to a Go + npm pipeline.
+    - **No loopback HTTP server in the packaged app.** Wails binds Go services to the WebView
+      directly, so the `Host`/`Origin` + DNS-rebind + CSRF guard becomes **browser-mode-only**. It
+      stays mandatory for the BFF's browser deployment (Phase 1a is unchanged) — the desktop/mobile
+      shell simply stops carrying a token-holding local HTTP listener as attack surface.
+    - **Nothing in Phases 0–4 changes.** The shell consumes the same `adapter-static` build, the
+      same `sdk/core`, and the same `ReadSource`/`Host` seams; it is one more composition root.
+    Accepted costs: Wails' mobile support is much newer than Tauri's (shipping since 2024) and has a
+    smaller ecosystem and track record; mobile is explicitly partial (no multiple windows, menus,
+    tray icons, or save-file dialogs — all irrelevant to a session browser). **Open verification
+    before Phase 5 starts:** confirm Wails v3's release channel and mobile maturity at that time —
+    this decision was taken from current documentation, not from shipping the thing, and Phase 5 is
+    far enough out that it should be re-checked rather than assumed. Reversibility is cheap by
+    construction: the SPA is framework-neutral and shell-agnostic, so switching back costs a
+    rewrite of a thin wrapper, not the app.
