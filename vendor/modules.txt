@@ -150,7 +150,7 @@ github.com/looprig/eval/rubric
 # github.com/looprig/fsstore v0.3.2
 ## explicit; go 1.25.8
 github.com/looprig/fsstore
-# github.com/looprig/inference v0.9.1
+# github.com/looprig/inference v0.9.2
 ## explicit; go 1.26.4
 github.com/looprig/inference
 github.com/looprig/inference/codec
