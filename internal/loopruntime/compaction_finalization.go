@@ -69,7 +69,11 @@ type compactionPreparedSuccess struct {
 	Model              model.ModelKey
 	RequestFingerprint [32]byte
 	Summary            *content.UserMessage
-	PostCount          compactionPostCount
+	// Retained is actor-private replacement material. It is never exposed by
+	// loop.CompactionOutput or persisted in CompactionCommitted; Task12 owns
+	// applying the retained suffix to live/restored state.
+	Retained  content.AgenticMessages
+	PostCount compactionPostCount
 }
 
 // compactionPostCount carries only the counted summary-candidate facts and the

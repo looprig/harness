@@ -1494,8 +1494,11 @@ func runLoop(cfg loopConfig, state loopState) {
 							return &contextCompactionOutcomeError{AttemptID: measured.attemptID}
 						}
 						return &contextReplacementDirective{
-							AttemptID:   measured.attemptID,
-							Replacement: turnContextReplacement{Summary: cloneUserMessage(disposition.replacement.Summary)},
+							AttemptID: measured.attemptID,
+							Replacement: turnContextReplacement{
+								Summary:  cloneUserMessage(disposition.replacement.Summary),
+								Retained: cloneMessages(disposition.replacement.Retained),
+							},
 						}
 					default:
 						return &contextCompactionAwaitError{AttemptID: measured.attemptID}
@@ -3020,7 +3023,10 @@ func runLoop(cfg loopConfig, state loopState) {
 					continue
 				}
 				replacementPlan.apply(&state, committed)
-				turnReplacement = &turnContextReplacement{Summary: cloneUserMessage(committed.Summary)}
+				turnReplacement = &turnContextReplacement{
+					Summary:  cloneUserMessage(committed.Summary),
+					Retained: cloneMessages(proposal.Success.Retained),
+				}
 			}
 			compactions.complete(outcome.attemptID)
 			rejection, rejected := terminal.(event.CompactionRejected)

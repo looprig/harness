@@ -3,6 +3,7 @@ package loopruntime
 import (
 	"context"
 	"errors"
+	"math"
 	"reflect"
 	"sync"
 
@@ -78,6 +79,20 @@ type compactionExecutionRun struct {
 	result chan compactionExecutionResult
 	cancel context.CancelFunc
 	scope  *compactionHookScope
+}
+
+// compactionRetainedTailTooLargeError reports a retained suffix that cannot
+// coexist with the maximum summary budget and the configured primary-output
+// reservation inside the original candidate input limit. It intentionally
+// carries measurements only; retained content never crosses this error
+// boundary.
+type compactionRetainedTailTooLargeError struct {
+	Candidate event.ContextMeasurement
+	Tail      event.ContextMeasurement
+}
+
+func (*compactionRetainedTailTooLargeError) Error() string {
+	return "loopruntime: retained compaction tail exceeds candidate context limit"
 }
 
 type compactionExecutor struct {
@@ -256,6 +271,12 @@ func (e *compactionExecutor) execute(
 		}
 	}
 	var prepared contextCompactionAwaitResult
+	if retainedCheck := e.preflightRetainedTail(ctx, attempt, candidate); retainedCheck != nil {
+		prepared = *retainedCheck
+		prepared.Proposal.hookScope = scope
+		setCompactionScopeTerminal(scope, ctx, prepared)
+		return compactionExecutionResult{outcome: prepared}
+	}
 	finalized := false
 	err := e.config.Compactor.CompactAndFinalize(ctx, *input, func(finalizeCtx context.Context, outcome CompactionOutcome) error {
 		finalized = true
@@ -268,6 +289,62 @@ func (e *compactionExecutor) execute(
 	prepared.Proposal.hookScope = scope
 	setCompactionScopeTerminal(scope, ctx, prepared)
 	return compactionExecutionResult{outcome: prepared}
+}
+
+// preflightRetainedTail counts only the protected suffix (plus the volatile
+// runtime tail, when present) before the compactor is invoked. The original
+// candidate request and measurement remain untouched: this count is a
+// feasibility check, not a replacement measurement.
+func (e *compactionExecutor) preflightRetainedTail(
+	ctx context.Context,
+	attempt compactionAttempt,
+	candidate compactionExecutionCandidate,
+) *contextCompactionAwaitResult {
+	// A retained suffix is the trigger for this feasibility pass. A runtime
+	// tail without a protected suffix is still included in post-count request
+	// construction, but does not create a retained-tail rejection on its own.
+	if len(candidate.Retained) == 0 {
+		return nil
+	}
+	request := candidate.Request
+	request.Messages = cloneMessages(candidate.Retained)
+	if candidate.RuntimeTail != nil {
+		request.Messages = append(request.Messages, cloneUserMessage(candidate.RuntimeTail))
+		request.TransientMessages = 1
+	} else {
+		request.TransientMessages = 0
+	}
+	tailMeasurement, err := measureRequestContext(
+		ctx, e.config.Counter, e.config.CounterCapability, candidate.InferenceCapability,
+		e.config.Settings, attempt.Basis, request, candidate.RuntimeRevision,
+	)
+	if err != nil {
+		return ptrContextCompactionAwaitResult(rejectedCompactionResultWithError(compactionRejectReason(err), err))
+	}
+	if !retainedTailFits(tailMeasurement.InputTokens, e.config.MaxSummaryTokens, e.config.Settings.ReservedOutput, candidate.Measurement.InputLimit) {
+		reason := event.CompactRejectRetainedTailTooLarge
+		return ptrContextCompactionAwaitResult(rejectedCompactionResultWithError(reason, &compactionRetainedTailTooLargeError{
+			Candidate: candidate.Measurement, Tail: tailMeasurement,
+		}))
+	}
+	return nil
+}
+
+func ptrContextCompactionAwaitResult(value contextCompactionAwaitResult) *contextCompactionAwaitResult {
+	return &value
+}
+
+func retainedTailFits(tailTokens, maxSummaryTokens, reservedOutput, inputLimit content.TokenCount) bool {
+	total := uint64(tailTokens)
+	if math.MaxUint64-total < uint64(maxSummaryTokens) {
+		return false
+	}
+	total += uint64(maxSummaryTokens)
+	if math.MaxUint64-total < uint64(reservedOutput) {
+		return false
+	}
+	total += uint64(reservedOutput)
+	return total <= uint64(inputLimit)
 }
 
 type compactionOperationError struct {
@@ -331,9 +408,15 @@ func (e *compactionExecutor) prepare(
 		return rejectedCompactionResult(event.CompactRejectInvalidSummary)
 	}
 	request := candidate.Request
-	request.Messages = content.AgenticMessages{cloneUserMessage(value.Summary)}
+	request.Messages = append(
+		content.AgenticMessages{cloneUserMessage(value.Summary)},
+		cloneMessages(candidate.Retained)...,
+	)
 	if candidate.RuntimeTail != nil {
 		request.Messages = append(request.Messages, cloneUserMessage(candidate.RuntimeTail))
+		request.TransientMessages = 1
+	} else {
+		request.TransientMessages = 0
 	}
 	measurement, err := measureRequestContext(
 		ctx, e.config.Counter, e.config.CounterCapability, candidate.InferenceCapability,
@@ -358,7 +441,8 @@ func (e *compactionExecutor) prepare(
 		Disposition: contextCompactionAwaitCommitted,
 		Proposal: compactionFinalizationProposal{Success: &compactionPreparedSuccess{
 			Model: candidate.Measurement.Model, RequestFingerprint: candidate.Measurement.RequestFingerprint,
-			Summary: cloneUserMessage(value.Summary),
+			Summary:  cloneUserMessage(value.Summary),
+			Retained: cloneMessages(candidate.Retained),
 			PostCount: compactionPostCount{
 				Model: measurement.Model, InputTokens: measurement.InputTokens, InputLimit: measurement.InputLimit,
 				Quality: measurement.Quality, Fingerprint: template,

@@ -406,8 +406,8 @@ func TestIdleManualCompactionBuildsStableBaseCandidate(t *testing.T) {
 			counter.mu.Lock()
 			requests := append([]inference.Request(nil), counter.requests...)
 			counter.mu.Unlock()
-			if len(requests) != 2 || requests[0].System != "stable system" || !reflect.DeepEqual(requests[0].Messages, transcript) {
-				t.Fatalf("count requests = %#v, want stable pre/post requests", requests)
+			if len(requests) != 3 || requests[0].System != "stable system" || !reflect.DeepEqual(requests[0].Messages, transcript) {
+				t.Fatalf("count requests = %#v, want stable candidate, retained-tail, and post-count requests", requests)
 			}
 			snapshotCtx, snapshotCancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer snapshotCancel()
@@ -424,8 +424,8 @@ func TestIdleManualCompactionBuildsStableBaseCandidate(t *testing.T) {
 			}
 			select {
 			case count := <-countsSeenBeforeStream:
-				if count != 3 {
-					t.Fatalf("counts before next primary inference = %d, want 3", count)
+				if count != 4 {
+					t.Fatalf("counts before next primary inference = %d, want 4", count)
 				}
 			case <-time.After(2 * time.Second):
 				t.Fatal("next primary inference did not start")
@@ -1119,6 +1119,245 @@ func TestCompactionExecutorCountsExactSummaryCandidateBeforeProposal(t *testing.
 	}
 }
 
+type retainedTailTestCompactor struct {
+	called  int
+	summary *content.UserMessage
+}
+
+func (c *retainedTailTestCompactor) CompactAndFinalize(
+	ctx context.Context,
+	input loop.CompactionInput,
+	finalize func(context.Context, CompactionOutcome) error,
+) error {
+	c.called++
+	return finalize(ctx, CompactionOutcome{Value: &loop.CompactionOutput{
+		Basis: input.Basis, Model: input.Model, RequestFingerprint: input.RequestFingerprint,
+		Summary: cloneUserMessage(c.summary),
+	}})
+}
+
+func TestCompactionExecutorPreflightsRetainedTailBeforeCompactor(t *testing.T) {
+	t.Parallel()
+
+	capability := contextTestCapability(contextcount.CountQualityExactLocal)
+	modelValue := testModel()
+	modelValue.Limits = testContextLimits{WindowTokens: 150, MaxInputTokens: 130, MaxOutputTokens: 20}
+	basis := event.ContextBasis{Revision: 7, ThroughEventID: uuid.UUID{7}}
+	fingerprint := [32]byte{8}
+	retained := replacementTestMessage("retained")
+	runtimeTail := replacementTestMessage("runtime tail")
+	compactor := &retainedTailTestCompactor{summary: validFinalizationSummary()}
+	counter := &sequenceContextCounter{
+		capability: capability,
+		// The first count is the tail-only feasibility request. It exactly fits
+		// tail + summary budget + reserved output at the candidate input limit.
+		counts: []content.TokenCount{100, 40},
+	}
+	executor, err := newCompactionExecutor(context.Background(), compactionExecutorConfig{
+		Compactor: compactor, Counter: counter, CounterCapability: capability,
+		Settings: contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second}, MaxSummaryTokens: 10,
+	})
+	if err != nil {
+		t.Fatalf("newCompactionExecutor() error = %v", err)
+	}
+	attempt := validFinalizationAttempt()
+	attempt.Basis = basis
+	candidate := compactionExecutionCandidate{
+		Measurement: event.ContextMeasurement{
+			Basis: basis, Model: modelValue.Key(), RequestFingerprint: fingerprint,
+			InputTokens: 120, InputLimit: 130, Quality: contextcount.CountQualityExactLocal,
+		},
+		Request: inference.Request{
+			Model: modelValue, System: "system",
+			Messages: content.AgenticMessages{replacementTestMessage("full request")},
+		},
+		RuntimeTail:         runtimeTail,
+		RuntimeRevision:     revisionDigest([]byte("runtime tail")),
+		Transcript:          content.AgenticMessages{replacementTestMessage("head")},
+		Retained:            content.AgenticMessages{retained},
+		InferenceCapability: contextTestInferenceCapability(),
+	}
+	if err := executor.CoordinateCompactionCandidate(context.Background(), compactionDisposition{
+		Kind: compactionDispositionStart, Attempt: &attempt,
+	}, candidate); err != nil {
+		t.Fatalf("CoordinateCompactionCandidate() error = %v", err)
+	}
+	result, err := executor.AwaitCompaction(context.Background(), attempt.AttemptID)
+	if err != nil {
+		t.Fatalf("AwaitCompaction() error = %v", err)
+	}
+	if result.Disposition != contextCompactionAwaitCommitted || result.Proposal.Success == nil {
+		t.Fatalf("result = %+v, want committed exact-fit retained tail", result)
+	}
+	if compactor.called != 1 {
+		t.Fatalf("compactor calls = %d, want one after exact-fit preflight", compactor.called)
+	}
+	if len(counter.requests) != 2 {
+		t.Fatalf("counter calls = %d, want feasibility and post-count", len(counter.requests))
+	}
+	feasibility := counter.requests[0]
+	if len(feasibility.Messages) != 2 || !reflect.DeepEqual(feasibility.Messages[0], retained) ||
+		!reflect.DeepEqual(feasibility.Messages[1], runtimeTail) || feasibility.TransientMessages != 1 {
+		t.Fatalf("feasibility request = %#v, want retained + runtime tail with transient marker", feasibility)
+	}
+	post := counter.requests[1]
+	if len(post.Messages) != 3 || !reflect.DeepEqual(post.Messages[0], compactor.summary) ||
+		!reflect.DeepEqual(post.Messages[1], retained) || !reflect.DeepEqual(post.Messages[2], runtimeTail) ||
+		post.TransientMessages != 1 {
+		t.Fatalf("post-count request = %#v, want summary + retained + runtime tail with transient marker", post)
+	}
+	if result.Proposal.Success.RequestFingerprint != fingerprint || result.Proposal.Success.Model != modelValue.Key() {
+		t.Fatalf("prepared CAS identity = model:%v fingerprint:%x, want original candidate identity", result.Proposal.Success.Model, result.Proposal.Success.RequestFingerprint)
+	}
+	retainedField, ok := reflect.TypeOf(*result.Proposal.Success).FieldByName("Retained")
+	if !ok || retainedField.Type != reflect.TypeOf(content.AgenticMessages(nil)) {
+		t.Fatalf("prepared success Retained field = %#v, want private AgenticMessages ownership", retainedField)
+	}
+	ownedRetained := reflect.ValueOf(result.Proposal.Success).Elem().FieldByName("Retained").Interface().(content.AgenticMessages)
+	if !reflect.DeepEqual(ownedRetained, content.AgenticMessages{retained}) {
+		t.Fatalf("prepared retained = %#v, want selected tail", ownedRetained)
+	}
+	retained.Blocks[0].(*content.TextBlock).Text = "caller mutation"
+	if got := ownedRetained[0].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text; got != "retained" {
+		t.Fatalf("prepared retained aliases candidate = %q, want retained", got)
+	}
+	retained.Blocks[0].(*content.TextBlock).Text = "retained"
+
+	// The one-over case must reject before any compactor call, while preserving
+	// the candidate's original full-request identity for the eventual CAS path.
+	compactor = &retainedTailTestCompactor{summary: validFinalizationSummary()}
+	counter = &sequenceContextCounter{capability: capability, counts: []content.TokenCount{101}}
+	executor, err = newCompactionExecutor(context.Background(), compactionExecutorConfig{
+		Compactor: compactor, Counter: counter, CounterCapability: capability,
+		Settings: contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second}, MaxSummaryTokens: 10,
+	})
+	if err != nil {
+		t.Fatalf("newCompactionExecutor(one-over) error = %v", err)
+	}
+	if err := executor.CoordinateCompactionCandidate(context.Background(), compactionDisposition{
+		Kind: compactionDispositionStart, Attempt: &attempt,
+	}, candidate); err != nil {
+		t.Fatalf("CoordinateCompactionCandidate(one-over) error = %v", err)
+	}
+	result, err = executor.AwaitCompaction(context.Background(), attempt.AttemptID)
+	if err != nil {
+		t.Fatalf("AwaitCompaction(one-over) error = %v", err)
+	}
+	if result.Disposition != contextCompactionAwaitRejected || result.Proposal.RejectReason != event.CompactRejectRetainedTailTooLarge {
+		t.Fatalf("one-over result = %+v, want retained-tail rejection", result)
+	}
+	if compactor.called != 0 {
+		t.Fatalf("one-over compactor calls = %d, want zero", compactor.called)
+	}
+
+	// A feasibility-count failure is terminal for this attempt and must not
+	// fall through to the compactor after the counter has already failed.
+	countErr := errors.New("retained-tail count failed")
+	compactor = &retainedTailTestCompactor{summary: validFinalizationSummary()}
+	counter = &sequenceContextCounter{
+		capability: capability, counts: []content.TokenCount{100}, errs: []error{countErr},
+	}
+	executor, err = newCompactionExecutor(context.Background(), compactionExecutorConfig{
+		Compactor: compactor, Counter: counter, CounterCapability: capability,
+		Settings: contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second}, MaxSummaryTokens: 10,
+	})
+	if err != nil {
+		t.Fatalf("newCompactionExecutor(count error) error = %v", err)
+	}
+	if err := executor.CoordinateCompactionCandidate(context.Background(), compactionDisposition{
+		Kind: compactionDispositionStart, Attempt: &attempt,
+	}, candidate); err != nil {
+		t.Fatalf("CoordinateCompactionCandidate(count error) error = %v", err)
+	}
+	result, err = executor.AwaitCompaction(context.Background(), attempt.AttemptID)
+	if err != nil {
+		t.Fatalf("AwaitCompaction(count error) error = %v", err)
+	}
+	if result.Disposition != contextCompactionAwaitRejected || result.Proposal.RejectReason != event.CompactRejectContextCountFailed {
+		t.Fatalf("count error result = %+v, want context-count rejection", result)
+	}
+	var typedCountErr *contextcount.ContextCountError
+	if !errors.As(result.ContinuationError, &typedCountErr) {
+		t.Fatalf("count error continuation = %T %v, want ContextCountError", result.ContinuationError, result.ContinuationError)
+	}
+	if compactor.called != 0 || len(counter.requests) != 1 {
+		t.Fatalf("count error compactor calls = %d, counter calls = %d, want zero and one", compactor.called, len(counter.requests))
+	}
+}
+
+func TestCompactionExecutorPostCountRetainedOrderAndTransientMarker(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		tail *content.UserMessage
+	}{
+		{name: "without runtime tail"},
+		{name: "with runtime tail", tail: replacementTestMessage("runtime tail")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			capability := contextTestCapability(contextcount.CountQualityExactLocal)
+			modelValue := testModel()
+			modelValue.Limits = testContextLimits{WindowTokens: 150, MaxInputTokens: 130, MaxOutputTokens: 20}
+			basis := event.ContextBasis{Revision: 9, ThroughEventID: uuid.UUID{9}}
+			fingerprint := [32]byte{0x91}
+			retained := content.AgenticMessages{replacementTestMessage("retained one"), replacementTestMessage("retained two")}
+			counter := &sequenceContextCounter{capability: capability, counts: []content.TokenCount{40}}
+			executor, err := newCompactionExecutor(context.Background(), compactionExecutorConfig{
+				Compactor: &retainedTailTestCompactor{summary: validFinalizationSummary()}, Counter: counter,
+				CounterCapability: capability, Settings: contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second},
+				MaxSummaryTokens: 10,
+			})
+			if err != nil {
+				t.Fatalf("newCompactionExecutor() error = %v", err)
+			}
+			candidate := compactionExecutionCandidate{
+				Measurement: event.ContextMeasurement{
+					Basis: basis, Model: modelValue.Key(), RequestFingerprint: fingerprint,
+					InputTokens: 40, InputLimit: 130, Quality: contextcount.CountQualityExactLocal,
+				},
+				Request: inference.Request{
+					Model: modelValue, System: "system", Messages: content.AgenticMessages{replacementTestMessage("full request")},
+				},
+				RuntimeTail: tt.tail, RuntimeRevision: revisionDigest([]byte("runtime")),
+				Transcript: content.AgenticMessages{replacementTestMessage("head")}, Retained: retained,
+				InferenceCapability: contextTestInferenceCapability(),
+			}
+			attempt := validFinalizationAttempt()
+			attempt.Basis = basis
+			outcome := CompactionOutcome{Value: &loop.CompactionOutput{
+				Basis: basis, Model: modelValue.Key(), RequestFingerprint: fingerprint, Summary: validFinalizationSummary(),
+			}}
+			prepared := executor.prepare(context.Background(), attempt, candidate, outcome)
+			if prepared.Disposition != contextCompactionAwaitCommitted || prepared.Proposal.Success == nil {
+				t.Fatalf("prepare() = %+v, want committed", prepared)
+			}
+			request := counter.requests[0]
+			wantMessages := content.AgenticMessages{outcome.Value.Summary, retained[0], retained[1]}
+			if tt.tail != nil {
+				wantMessages = append(wantMessages, tt.tail)
+			}
+			if !reflect.DeepEqual(request.Messages, wantMessages) {
+				t.Fatalf("post-count messages = %#v, want %#v", request.Messages, wantMessages)
+			}
+			wantTransient := 0
+			if tt.tail != nil {
+				wantTransient = 1
+			}
+			if request.TransientMessages != wantTransient {
+				t.Fatalf("post-count TransientMessages = %d, want %d", request.TransientMessages, wantTransient)
+			}
+			owned := reflect.ValueOf(prepared.Proposal.Success).Elem().FieldByName("Retained").Interface().(content.AgenticMessages)
+			if !reflect.DeepEqual(owned, retained) {
+				t.Fatalf("prepared retained = %#v, want %#v", owned, retained)
+			}
+			if _, ok := reflect.TypeOf(*outcome.Value).FieldByName("Retained"); ok {
+				t.Fatal("public CompactionOutput unexpectedly exposes Retained")
+			}
+		})
+	}
+}
+
 // TestCoordinateCompactionCandidateRejectsInvalidCapabilityAndCleansUpRun proves the
 // per-candidate InferenceCapability.Validate() check added to CoordinateCompactionCandidate
 // (mirroring the constructor-time check that used to live on compactionExecutorConfig) both
@@ -1371,9 +1610,9 @@ func TestLoopCompactionRejectionAdmissionAtToolContinuation(t *testing.T) {
 		wantError      string
 	}{
 		{name: "soft invalid summary continues original candidate", counts: []content.TokenCount{40, 65, 25}, invalidSummary: true, wantReason: event.CompactRejectInvalidSummary, wantPrimary: 2},
-		{name: "soft count failure continues original candidate", counts: []content.TokenCount{40, 65, 0, 25}, countErrs: []error{nil, nil, countErr}, wantReason: event.CompactRejectContextCountFailed, wantPrimary: 2},
-		{name: "hard original candidate blocks after invalid summary", counts: []content.TokenCount{40, 80}, invalidSummary: true, wantReason: event.CompactRejectInvalidSummary, wantPrimary: 1, wantError: "context_limit"},
-		{name: "summary too large blocks even when original is soft", counts: []content.TokenCount{40, 65, 80}, wantReason: event.CompactRejectSummaryTooLarge, wantPrimary: 1, wantError: "summary_too_large"},
+		{name: "soft count failure continues original candidate", counts: []content.TokenCount{40, 65, 20, 0, 25}, countErrs: []error{nil, nil, nil, countErr}, wantReason: event.CompactRejectContextCountFailed, wantPrimary: 2},
+		{name: "hard original candidate blocks after invalid summary", counts: []content.TokenCount{40, 80, 20}, invalidSummary: true, wantReason: event.CompactRejectInvalidSummary, wantPrimary: 1, wantError: "context_limit"},
+		{name: "summary too large blocks even when original is soft", counts: []content.TokenCount{40, 65, 20, 80}, wantReason: event.CompactRejectSummaryTooLarge, wantPrimary: 1, wantError: "summary_too_large"},
 		{name: "unknown post-summary limit blocks continuation", counts: []content.TokenCount{40, 65}, executorMargin: 80, wantReason: event.CompactRejectContextLimitUnknown, wantPrimary: 1, wantError: "limit_unknown"},
 	}
 	for _, tt := range tests {
@@ -1478,9 +1717,9 @@ func TestLoopTerminalCompactionRejectionPreservesProducedResponse(t *testing.T) 
 		executorMargin content.TokenCount
 		wantReason     event.CompactRejectReason
 	}{
-		{name: "invalid summary", counts: []content.TokenCount{40, 65}, invalidSummary: true, wantReason: event.CompactRejectInvalidSummary},
+		{name: "invalid summary", counts: []content.TokenCount{40, 65, 20}, invalidSummary: true, wantReason: event.CompactRejectInvalidSummary},
 		{name: "post-summary count failure", counts: []content.TokenCount{40, 65, 0}, countErrs: []error{nil, nil, countErr}, wantReason: event.CompactRejectContextCountFailed},
-		{name: "summary too large", counts: []content.TokenCount{40, 65, 80}, wantReason: event.CompactRejectSummaryTooLarge},
+		{name: "summary too large", counts: []content.TokenCount{40, 65, 20, 80}, wantReason: event.CompactRejectSummaryTooLarge},
 		{name: "post-summary limit unknown", counts: []content.TokenCount{40, 65}, executorMargin: 80, wantReason: event.CompactRejectContextLimitUnknown},
 	}
 	for _, tt := range tests {
@@ -1667,7 +1906,7 @@ func TestLoopTerminalCompactionCancellationPreemptsProducedResponse(t *testing.T
 			recorder := &recordingPublisher{}
 			client := &scriptedLLM{scripts: [][]content.Chunk{{textChunk("produced but canceled")}}}
 			counter := &loopContextCounter{
-				capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: []content.TokenCount{40, 65},
+				capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: []content.TokenCount{40, 65, 20},
 			}
 			model := testModel()
 			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
@@ -1781,7 +2020,7 @@ func TestLoopStartedCompactionCancellationIsActorOwned(t *testing.T) {
 			t.Cleanup(cancel)
 			recorder := &recordingPublisher{}
 			counter := &loopContextCounter{
-				capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: []content.TokenCount{65},
+				capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: []content.TokenCount{65, 20},
 			}
 			model := testModel()
 			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}

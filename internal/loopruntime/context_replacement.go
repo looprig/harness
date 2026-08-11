@@ -88,6 +88,10 @@ func (p actorContextReplacement) apply(state *loopState, committed event.Compact
 
 type turnContextReplacement struct {
 	Summary *content.UserMessage
+	// Retained is private actor-owned replacement material. It is carried across
+	// the turn handoff for the follow-up live-context work; durable compaction
+	// events remain summary-only.
+	Retained content.AgenticMessages
 }
 
 // applyTurnContextReplacement is the private turn-goroutine half of the actor
