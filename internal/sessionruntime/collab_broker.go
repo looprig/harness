@@ -40,6 +40,7 @@ const (
 	collabRateWindow       = time.Second
 	collabRateLimit        = 64
 	collabSocketName       = "broker.sock"
+	collabMaxUint32        = uint64(^uint32(0))
 )
 
 var (
@@ -116,6 +117,34 @@ func (s *Session) closeCollabBrokerWithTimeout(root context.Context, timeout tim
 		return err
 	}
 	return nil
+}
+
+func collabNonNegativeUint64(value int) (uint64, bool) {
+	if value < 0 {
+		return 0, false
+	}
+	converted := uint64(value) // #nosec G115 -- value is nonnegative after the guard.
+	return converted, true
+}
+
+func collabUint32FromNonNegativeInt(value int) (uint32, bool) {
+	converted, ok := collabNonNegativeUint64(value)
+	if !ok || converted > collabMaxUint32 {
+		return 0, false
+	}
+	narrowed := uint32(converted) // #nosec G115 -- converted is bounded by uint32's maximum above.
+	return narrowed, true
+}
+
+func collabFrameLimit(max int) (uint64, bool) {
+	limit, ok := collabNonNegativeUint64(max)
+	if !ok {
+		return 0, false
+	}
+	if limit > collabMaxUint32 {
+		limit = collabMaxUint32
+	}
+	return limit, true
 }
 
 type collabBroker struct {
@@ -213,7 +242,7 @@ func newCollabBrokerAt(session *Session, root, socketName string) (*collabBroker
 			return nil, errCollabBrokerProtocol
 		}
 	}
-	if err := os.Chmod(root, 0o700); err != nil {
+	if err := os.Chmod(root, 0o700); err != nil { // #nosec G302 -- root is a private directory; 0700 is required for traversal and socket creation.
 		if createdRoot {
 			_ = os.RemoveAll(root)
 		}
@@ -408,7 +437,12 @@ func (b *collabBroker) acceptLoop() {
 			if b.connectionSlots != nil {
 				defer func() { <-b.connectionSlots }()
 			}
-			b.handle(conn)
+			// Connection-level errors are intentionally contained here. handle
+			// closes the connection and returns only fixed protocol/auth outcomes;
+			// the accept loop has no caller-visible error channel.
+			if err := b.handle(conn); err != nil {
+				return
+			}
 		}()
 	}
 }
@@ -848,11 +882,16 @@ func writeCollabFrame(w io.Writer, payload []byte, max int) error {
 	if w == nil || len(payload) == 0 {
 		return errCollabBrokerProtocol
 	}
-	if len(payload) > max || uint64(len(payload)) > uint64(^uint32(0)) {
+	limit, ok := collabFrameLimit(max)
+	if !ok || uint64(len(payload)) > limit {
+		return errCollabBrokerLimit
+	}
+	payloadLength, ok := collabUint32FromNonNegativeInt(len(payload))
+	if !ok {
 		return errCollabBrokerLimit
 	}
 	var header [4]byte
-	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
+	binary.BigEndian.PutUint32(header[:], payloadLength)
 	if err := writeCollabFull(w, header[:]); err != nil {
 		return errCollabBrokerProtocol
 	}
@@ -880,12 +919,16 @@ func readCollabFrame(r io.Reader, max int) ([]byte, error) {
 	if r == nil {
 		return nil, errCollabBrokerProtocol
 	}
+	limit, ok := collabFrameLimit(max)
+	if !ok {
+		return nil, errCollabBrokerLimit
+	}
 	var header [4]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
 		return nil, errCollabBrokerProtocol
 	}
 	length := binary.BigEndian.Uint32(header[:])
-	if length == 0 || uint64(length) > uint64(max) {
+	if length == 0 || uint64(length) > limit {
 		return nil, errCollabBrokerLimit
 	}
 	payload := make([]byte, int(length))

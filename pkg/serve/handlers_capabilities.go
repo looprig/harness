@@ -16,6 +16,11 @@ const (
 	featureGateResponse = "gate_response"
 )
 
+// fullFeatures is the capability set a complete server (live + control + read)
+// advertises, in the canonical contract order. readOnlyFeatures (read_server.go) is
+// the honest subset for a handler with no live plane.
+var fullFeatures = []string{featureJournal, featureLiveSSE, featureEphemeralSSE, featureGateResponse}
+
 // capabilities is the typed discovery document returned by GET /v1/capabilities.
 // It is pure capability advertisement — not health, auth, or tenancy — so a client
 // can negotiate the protocol version and learn which optional planes this server
@@ -27,13 +32,14 @@ type capabilities struct {
 }
 
 // handleCapabilities serves GET /v1/capabilities: the static protocol-discovery
-// document (SPEC §6). It reads no request state and touches no server dependency —
-// it always emits the same 200 JSON body naming the protocol, its version, and the
-// supported feature planes in their canonical order.
-func (s *server[S, O]) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
+// document (SPEC §6). It reads no request state — the document is fixed at
+// construction from the feature set this server actually serves, so a read-only
+// server honestly advertises less than a full one. The Features order is part of
+// the contract.
+func (s *readServer) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, capabilities{
 		Protocol: protocolName,
 		Version:  protocolVersion,
-		Features: []string{featureJournal, featureLiveSSE, featureEphemeralSSE, featureGateResponse},
+		Features: s.features,
 	})
 }

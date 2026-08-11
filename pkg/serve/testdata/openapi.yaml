@@ -34,12 +34,24 @@ paths:
       tags: [discovery]
       summary: Static protocol-discovery document.
       operationId: getCapabilities
+      description: >
+        Served by both the full session surface (Handler) and the read-only
+        surface (ReadHandler). A full server advertises all four feature
+        planes; a ReadHandler deployment (no live session, e.g. a browse-only
+        BFF) advertises `journal` only — see the readOnly example.
       responses:
         "200":
           description: The protocol name, version, and supported feature planes.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Capabilities" }
+              examples:
+                full:
+                  summary: Full server (Handler) — all four planes.
+                  value: { protocol: looprig.serve, version: 1, features: [journal, live_sse, ephemeral_sse, gate_response] }
+                readOnly:
+                  summary: Read-only server (ReadHandler) — journal plane only.
+                  value: { protocol: looprig.serve, version: 1, features: [journal] }
 
   /sessions:
     post:

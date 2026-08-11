@@ -421,7 +421,7 @@ func (c *scopedController) resolveForeignForeground(ctx context.Context, s *Sess
 	coordinator := newForeignDeliveryCoordinator(c, s, childID, requestID, req.Name, hook, tracked, sub, false, req.TimeoutSeconds)
 	waitCtx, cancel := waitContext(ctx, req.TimeoutSeconds)
 	defer cancel()
-	for {
+	{
 		status, ok := coordinator.waitUpdate(waitCtx)
 		if !ok {
 			// A caller deadline and the hook transition can be concurrent. Give

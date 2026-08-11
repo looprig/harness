@@ -147,6 +147,37 @@ func TestCollabBrokerFramingWritesShortWritersFully(t *testing.T) {
 	}
 }
 
+func TestCollabBrokerFrameBoundsRejectNegativeLimits(t *testing.T) {
+	if got, ok := collabNonNegativeUint64(-1); ok || got != 0 {
+		t.Fatalf("collabNonNegativeUint64(-1) = (%d, %t), want (0, false)", got, ok)
+	}
+	if got, ok := collabUint32FromNonNegativeInt(-1); ok || got != 0 {
+		t.Fatalf("collabUint32FromNonNegativeInt(-1) = (%d, %t), want (0, false)", got, ok)
+	}
+
+	if err := writeCollabFrame(&bytes.Buffer{}, []byte("x"), -1); !errors.Is(err, errCollabBrokerLimit) {
+		t.Fatalf("writeCollabFrame() error = %v, want %v", err, errCollabBrokerLimit)
+	}
+	frame := append([]byte{0, 0, 0, 1}, []byte("x")...)
+	if _, err := readCollabFrame(bytes.NewReader(frame), -1); !errors.Is(err, errCollabBrokerLimit) {
+		t.Fatalf("readCollabFrame() error = %v, want %v", err, errCollabBrokerLimit)
+	}
+}
+
+func TestCollabBrokerFrameBoundsRejectUnrepresentableInt(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	maxValue, ok := collabNonNegativeUint64(maxInt)
+	if !ok || maxValue <= collabMaxUint32 {
+		t.Skip("int is not wider than uint32 on this architecture")
+	}
+	if got, ok := collabUint32FromNonNegativeInt(maxInt); ok || got != 0 {
+		t.Fatalf("collabUint32FromNonNegativeInt(maxInt) = (%d, %t), want (0, false)", got, ok)
+	}
+	if got, ok := collabFrameLimit(maxInt); !ok || got != collabMaxUint32 {
+		t.Fatalf("collabFrameLimit(maxInt) = (%d, %t), want (%d, true)", got, ok, collabMaxUint32)
+	}
+}
+
 func TestCollabBrokerRequestValidationRejectsForgedIdentityAndBounds(t *testing.T) {
 	valid := `{"agent_id":"55555555-5555-4555-8555-555555555555","message":"hello"}`
 	for _, field := range []string{"session_id", "origin_loop_id", "request_id", "parent_tool_use_id", "correlation_id"} {

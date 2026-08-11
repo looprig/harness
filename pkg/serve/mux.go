@@ -86,3 +86,33 @@ func Handler[S LiveSession, O any](rig Rig[S, O], reads Reader, opts ...Option) 
 
 	return &boundHandler{Handler: cfg.wrap(mux), hasAuth: cfg.hasAuth()}
 }
+
+// ReadHandler builds the stateless READ-ONLY session HTTP surface: capabilities plus
+// the list/status/journal routes, and nothing else. It exists for a process that
+// serves history but hosts no agent — a browse-only BFF or a read-plane pod — which
+// therefore has no Rig to hand to Handler.
+//
+// It reuses the identical handlers Handler registers (they hang off the shared
+// rig-free readServer), so there is exactly ONE implementation of each read route and
+// no second wire contract to drift. The live and control routes are NOT registered:
+// a control request 404s from the mux before any handler runs, so browse-only mode is
+// a property of the type system rather than a runtime authorization check that could
+// fall through (fail secure).
+//
+// The capability document it serves advertises `journal` only — a read-only server
+// must not claim planes it cannot serve.
+//
+// Like Handler it returns a *boundHandler carrying the has-auth bit, so a downstream
+// Server bind stays fail-secure for a public address.
+func ReadHandler(reads Reader, opts ...Option) http.Handler {
+	cfg := newConfig(opts...)
+	srv := &readServer{reader: reads, features: readOnlyFeatures}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(routeCapabilities, srv.handleCapabilities)
+	mux.HandleFunc(routeList, srv.handleListSessions)
+	mux.HandleFunc(routeStatus, srv.handleStatus)
+	mux.HandleFunc(routeJournal, srv.handleJournal)
+
+	return &boundHandler{Handler: cfg.wrap(mux), hasAuth: cfg.hasAuth()}
+}
