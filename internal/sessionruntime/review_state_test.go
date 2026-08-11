@@ -680,47 +680,35 @@ func TestStartPermissionReviewNoopsWhenSessionBreakerTripped(t *testing.T) {
 // no-op guard does not itself short-circuit the test — and classifier
 // registered as the session's permission-review classifier set.
 //
-// The bound controller is deliberately built from a tool-less "probe"
-// definition rather than classifier's own Hustle definition:
-// gate.NewPermissionClassifierSet requires every registered classifier's
-// definition to declare evidence tools, and wiring a real evidence-tool
-// runtime (hustleruntime.RuntimeConfig.Evidence) into the session-wide
-// controller is composition-root work outside this task's scope (see
-// review_adapter_test.go's identical note on
-// TestSessionStartPermissionReviewDoesNotWaitForScheduledClassifierRun).
-// Every assertion in the tests using this helper only depends on
-// StartPermissionReview's own SYNCHRONOUS behavior (the breaker check,
-// recordPermissionReviewBasis, and beginPermissionReviewCancellation all run
-// before the review goroutine is even dispatched), so a controller that
-// cannot actually resolve classifier's Hustle name is sufficient: the
-// dispatched goroutine's eventual RunAndFinalize failure is drained by an
-// explicit cancellation, never awaited.
+// The bound controller contains the classifiers' real Hustle definitions and
+// the minimal evidence runtime they require. The test classifier's inference
+// client blocks on ctx.Done(), so a started review keeps its cancellation
+// handle installed until the test explicitly cancels it. Registering an
+// unrelated probe definition here would let RunAndFinalize reject the
+// classifier immediately, racing the synchronous cancellation-handle
+// assertion against the review goroutine's deferred cleanup.
 func reviewStartSession(t *testing.T, set gate.PermissionClassifierSet) *Session {
 	t.Helper()
 	sessionID := mustUUID()
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	t.Cleanup(sessionCancel)
 	factory := event.NewFactory(uuid.New, time.Now)
-	probe, err := hustle.Define(
-		hustle.WithName("review-start-probe"),
-		hustle.WithParticipation(hustle.ParticipationBlocking),
-		hustle.WithTimeout(time.Second),
-		hustle.WithLimits(hustle.Limits{InputBytes: 1024, OutputBytes: 1024}),
-		hustle.WithNamedInference(&shutdownHustleClient{invoked: make(chan struct{}, 1)}, validModel("review-start-probe")),
-		hustle.WithSystemPrompt("unused probe prompt", "prompt-v1"),
-		hustle.WithPolicyRevision("policy-v1"),
-	)
-	if err != nil {
-		t.Fatalf("hustle.Define: %v", err)
+	classifiers := set.Classifiers()
+	definitions := make([]hustle.Definition, 0, len(classifiers))
+	for _, classifier := range classifiers {
+		definitions = append(definitions, classifier.Definition())
 	}
 	s := &Session{
 		sessionID: sessionID, sessionCtx: sessionCtx, sessionCancel: sessionCancel,
 		loops: map[uuid.UUID]*loopHandle{}, newID: uuid.New, now: time.Now, factory: factory,
-		hustleDefinitions: []hustle.Definition{probe}, hustleLimits: testHustleLimits(),
+		hustleDefinitions: definitions, hustleLimits: testHustleLimits(), wsRoot: t.TempDir(),
 		gates: map[gate.ID]gateEntry{},
 	}
 	s.hub = hub.New(sessionID, hub.WithFactory(factory))
 	withPermissionReview(set, validReviewPolicy(t))(s)
+	withPermissionReviewEvidence(
+		sessionEvidenceAccessStub{}, sessionEvidenceContainmentStub{}, []string{"filesystem.read"},
+	)(s)
 	if err := s.bindSessionHustles(); err != nil {
 		t.Fatalf("bindSessionHustles: %v", err)
 	}
