@@ -16,6 +16,18 @@ func TestShapeToolResultTextUnderLimitIsIdentity(t *testing.T) {
 	}
 }
 
+func TestShapeToolResultTextLargeValidUnderLimitUsesBoundedAllocations(t *testing.T) {
+	text := strings.Repeat("x", 1<<20)
+	allocs := testing.AllocsPerRun(10, func() {
+		if got := shapeToolResultText(text, len(text)+1); got != text {
+			t.Fatalf("shapeToolResultText() changed under-limit valid text")
+		}
+	})
+	if allocs > 1 {
+		t.Fatalf("under-limit valid shaping allocations = %.1f, want <= 1", allocs)
+	}
+}
+
 func TestShapeToolResultTextZeroLimitIsIdentity(t *testing.T) {
 	t.Parallel()
 	text := string([]byte{'a', 0xff, 'b'})
