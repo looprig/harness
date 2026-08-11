@@ -3,6 +3,9 @@ package tool
 import (
 	"context"
 	"reflect"
+	"time"
+
+	"github.com/looprig/core/uuid"
 )
 
 // SessionResource is session-owned state shared by tool definitions. Activate
@@ -31,12 +34,41 @@ type ProcessCompletionNotifier interface {
 	NotifyProcessCompletion(context.Context, ProcessCompletionNotification) error
 }
 
+// WorkflowActivityPublisher durably publishes bounded workflow lifecycle
+// metadata for one owning Harness session. The neutral DTO keeps pkg/tool below
+// the sealed event package in the dependency graph; the session runtime converts
+// it into event.WorkflowActivity and validates it before the Hub/journal path.
+type WorkflowActivityPublisher interface {
+	PublishWorkflowActivity(context.Context, WorkflowActivityMetadata) error
+}
+
+// WorkflowActivityMetadata is the transport-neutral, bounded input to the
+// trusted workflow publication seam. EventID is a stable source activity ID and
+// must be preserved across retries; the session runtime uses the validated
+// OccurredAt as the stable creation envelope when it stamps the sealed event.
+type WorkflowActivityMetadata struct {
+	EventID           uuid.UUID `json:"event_id,omitzero"`
+	SessionID         uuid.UUID `json:"session_id,omitzero"`
+	RunID             uuid.UUID `json:"run_id"`
+	WorkflowName      string    `json:"workflow_name"`
+	WorkflowVersion   string    `json:"workflow_version"`
+	Kind              string    `json:"kind"`
+	Status            string    `json:"status"`
+	VertexID          uuid.UUID `json:"vertex_id,omitzero"`
+	VertexLabel       string    `json:"vertex_label,omitempty"`
+	CompletedVertices uint32    `json:"completed_vertices,omitzero"`
+	TotalVertices     uint32    `json:"total_vertices,omitzero"`
+	Message           string    `json:"message,omitempty"`
+	OccurredAt        time.Time `json:"occurred_at"`
+}
+
 // SessionResourceServices is the immutable late-bound service set supplied to
 // every session resource after the live session has been constructed. Its zero
 // value is invalid; use NewSessionResourceServices.
 type SessionResourceServices struct {
 	processLifecyclePublisher ProcessLifecyclePublisher
 	processCompletionNotifier ProcessCompletionNotifier
+	workflowActivityPublisher WorkflowActivityPublisher
 }
 
 // SessionResourceServicesValidationError reports a missing or typed-nil
@@ -54,10 +86,12 @@ func (e *SessionResourceServicesValidationError) Error() string {
 func NewSessionResourceServices(
 	publisher ProcessLifecyclePublisher,
 	notifier ProcessCompletionNotifier,
+	workflowPublisher WorkflowActivityPublisher,
 ) (SessionResourceServices, error) {
 	services := SessionResourceServices{
 		processLifecyclePublisher: publisher,
 		processCompletionNotifier: notifier,
+		workflowActivityPublisher: workflowPublisher,
 	}
 	if err := services.Validate(); err != nil {
 		return SessionResourceServices{}, err
@@ -76,6 +110,10 @@ func (s SessionResourceServices) Validate() error {
 		nilReflectValue(reflect.ValueOf(s.processCompletionNotifier)) {
 		return &SessionResourceServicesValidationError{Field: "process_completion_notifier"}
 	}
+	if s.workflowActivityPublisher == nil ||
+		nilReflectValue(reflect.ValueOf(s.workflowActivityPublisher)) {
+		return &SessionResourceServicesValidationError{Field: "workflow_activity_publisher"}
+	}
 	return nil
 }
 
@@ -87,6 +125,11 @@ func (s SessionResourceServices) ProcessLifecyclePublisher() ProcessLifecyclePub
 // ProcessCompletionNotifier returns the validated completion notifier.
 func (s SessionResourceServices) ProcessCompletionNotifier() ProcessCompletionNotifier {
 	return s.processCompletionNotifier
+}
+
+// WorkflowActivityPublisher returns the validated trusted workflow publisher.
+func (s SessionResourceServices) WorkflowActivityPublisher() WorkflowActivityPublisher {
+	return s.workflowActivityPublisher
 }
 
 // ProcessBinding contains the session-scoped capabilities supplied to process

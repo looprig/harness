@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
@@ -29,11 +30,68 @@ func TestSessionProcessServiceBridgeIsValidatedAndUnavailable(t *testing.T) {
 	if services.ProcessCompletionNotifier() != bridge {
 		t.Fatal("completion notifier did not retain the stable bridge")
 	}
+	if services.WorkflowActivityPublisher() != bridge {
+		t.Fatal("workflow activity publisher did not retain the stable bridge")
+	}
 	if err := bridge.PublishProcessLifecycle(context.Background(), tool.ProcessLifecycleMetadata{}); !errors.Is(err, errSessionProcessServicesUnavailable) {
 		t.Fatalf("PublishProcessLifecycle() error = %v, want %v", err, errSessionProcessServicesUnavailable)
 	}
 	if err := bridge.NotifyProcessCompletion(context.Background(), tool.ProcessCompletionNotification{}); !errors.Is(err, errSessionProcessServicesUnavailable) {
 		t.Fatalf("NotifyProcessCompletion() error = %v, want %v", err, errSessionProcessServicesUnavailable)
+	}
+	if err := bridge.PublishWorkflowActivity(context.Background(), tool.WorkflowActivityMetadata{}); !errors.Is(err, errSessionProcessServicesUnavailable) {
+		t.Fatalf("PublishWorkflowActivity() error = %v, want %v", err, errSessionProcessServicesUnavailable)
+	}
+}
+
+type blockingWorkflowActivityPublisher struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingWorkflowActivityPublisher) PublishWorkflowActivity(context.Context, tool.WorkflowActivityMetadata) error {
+	close(p.started)
+	<-p.release
+	return nil
+}
+
+func TestSessionProcessServiceBridgeClosesAndDrainsWorkflowPublisher(t *testing.T) {
+	bridge, _, err := newSessionProcessServices()
+	if err != nil {
+		t.Fatalf("newSessionProcessServices() error = %v", err)
+	}
+	delegate := &blockingWorkflowActivityPublisher{started: make(chan struct{}), release: make(chan struct{})}
+	bridge.attachWorkflowActivityPublisher(delegate)
+
+	publicationDone := make(chan error, 1)
+	go func() {
+		publicationDone <- bridge.PublishWorkflowActivity(context.Background(), tool.WorkflowActivityMetadata{})
+	}()
+	select {
+	case <-delegate.started:
+	case <-time.After(time.Second):
+		t.Fatal("workflow publication did not reach its delegate")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- bridge.closeWorkflowActivityPublisher(context.Background())
+	}()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("closeWorkflowActivityPublisher() returned before in-flight publication drained: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(delegate.release)
+	if err := <-publicationDone; err != nil {
+		t.Fatalf("in-flight PublishWorkflowActivity() = %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("closeWorkflowActivityPublisher() = %v", err)
+	}
+	if err := bridge.PublishWorkflowActivity(context.Background(), tool.WorkflowActivityMetadata{}); !errors.Is(err, errSessionProcessServicesUnavailable) {
+		t.Fatalf("post-close PublishWorkflowActivity() error = %v, want %v", err, errSessionProcessServicesUnavailable)
 	}
 }
 
@@ -115,6 +173,18 @@ func TestNewAndRestoreActivateResourcesWithTheirStableProcessServiceBridge(t *te
 	if err := live.Shutdown(context.Background()); err != nil {
 		t.Fatalf("new Shutdown() error = %v", err)
 	}
+	capturesMu.Lock()
+	var liveCapture processServicesCapture
+	for _, captured := range captures {
+		liveCapture = captured
+		break
+	}
+	capturesMu.Unlock()
+	if err := liveCapture.resource.capturedServices().WorkflowActivityPublisher().PublishWorkflowActivity(
+		context.Background(), validWorkflowActivityMetadata(sessionID),
+	); !errors.Is(err, errSessionProcessServicesUnavailable) {
+		t.Fatalf("retained workflow publisher after normal Shutdown() error = %v, want %v", err, errSessionProcessServicesUnavailable)
+	}
 
 	restored, err := lifecycle.RestoreSession(context.Background(), sessionID)
 	if err != nil {
@@ -156,6 +226,9 @@ func assertCapturedProcessServices(
 		}
 		if services.ProcessCompletionNotifier() != captured.bridge {
 			t.Fatal("activated resource captured a replacement completion notifier")
+		}
+		if services.WorkflowActivityPublisher() != captured.bridge {
+			t.Fatal("activated resource captured a replacement workflow activity publisher")
 		}
 	}
 }

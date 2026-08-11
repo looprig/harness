@@ -40,6 +40,30 @@ func (f *Factory) Stamp(h Header) (Header, error) {
 	return h, nil
 }
 
+// StampWorkflowActivity stamps a fully specified WorkflowActivity with the
+// caller's stable source activity ID. Unlike Stamp, it never calls newID: retry
+// logic must be able to submit the same journal identity again. An explicit
+// CreatedAt is preserved so a deterministic producer can make the complete
+// journal payload byte-identical across retries; a zero CreatedAt uses the
+// factory clock for ordinary callers. The body is validated after stamping so
+// the returned value is safe to send through the normal Hub/journal path.
+func (f *Factory) StampWorkflowActivity(ev WorkflowActivity, deterministicID uuid.UUID) (WorkflowActivity, error) {
+	if deterministicID.IsZero() {
+		return WorkflowActivity{}, &InvalidEventError{Event: "WorkflowActivity", Field: FieldEventID, Rule: RuleRequired}
+	}
+	if !ev.EventID.IsZero() && ev.EventID != deterministicID {
+		return WorkflowActivity{}, &InvalidEventError{Event: "WorkflowActivity", Field: FieldEventID, Rule: RuleInvalid}
+	}
+	ev.EventID = deterministicID
+	if ev.CreatedAt.IsZero() {
+		ev.CreatedAt = f.now()
+	}
+	if err := ValidateEvent(ev); err != nil {
+		return WorkflowActivity{}, err
+	}
+	return ev, nil
+}
+
 // StampCompactWaiterResolved stamps CreatedAt while preserving and verifying a
 // resolved waiter's deterministic EventID. It cannot inject an arbitrary ID.
 func (f *Factory) StampCompactWaiterResolved(ev CompactWaiterResolved) (Header, error) {

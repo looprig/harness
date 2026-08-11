@@ -2627,8 +2627,13 @@ func (s *Session) activateProcessServiceBridge() error {
 	if err != nil {
 		return err
 	}
+	workflowPublisher, err := newCheckedWorkflowActivityPublisher(s.sessionID, s.hub, s.now)
+	if err != nil {
+		return err
+	}
 	s.resources.processServiceBridge.attachProcessLifecyclePublisher(publisher)
 	s.resources.processServiceBridge.attachProcessCompletionNotifier(s)
+	s.resources.processServiceBridge.attachWorkflowActivityPublisher(workflowPublisher)
 	return nil
 }
 

@@ -98,6 +98,13 @@ const (
 	FieldManifest           FieldName = "Manifest"
 	FieldDrift              FieldName = "Drift"
 	FieldMessage            FieldName = "Message"
+	FieldWorkflowName       FieldName = "WorkflowName"
+	FieldWorkflowVersion    FieldName = "WorkflowVersion"
+	FieldActivityKind       FieldName = "ActivityKind"
+	FieldOccurredAt         FieldName = "OccurredAt"
+	FieldVertexID           FieldName = "VertexID"
+	FieldVertexLabel        FieldName = "VertexLabel"
+	FieldProgress           FieldName = "Progress"
 	// FieldType names the whole event (not one coordinate) on the fail-secure
 	// unknown-type path, paired with RuleUnknownType.
 	FieldType FieldName = "Type"
@@ -208,6 +215,8 @@ func validateEventBody(ev Event) error {
 		if !e.State.Valid() {
 			return &InvalidEventError{Event: "DelegateDeliveryStateChanged", Field: FieldState, Rule: RuleInvalid}
 		}
+	case WorkflowActivity:
+		return validateWorkflowActivity(e)
 	case LoopInferenceChanged:
 		return validateModelRuntime("LoopInferenceChanged", e.Runtime)
 	case LoopModeChanged:
@@ -962,6 +971,8 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "ActiveLoopChanged", sessionProfile(), true
 	case DelegateDeliveryStateChanged:
 		return "DelegateDeliveryStateChanged", sessionProfile(), true
+	case WorkflowActivity:
+		return "WorkflowActivity", sessionProfile(), true
 	case LoopRestoreTombstoned:
 		return "LoopRestoreTombstoned", loopProfile(), true
 	case IntegrationStatus:

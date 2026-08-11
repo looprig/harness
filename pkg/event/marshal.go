@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/looprig/core/content"
@@ -188,7 +189,7 @@ func encodePayload(ev Event) ([]byte, error) {
 		PermissionReviewStarted, PermissionReviewCompleted,
 		ProcessStarted, ProcessBackgrounded, ProcessCompleted, ProcessStopRequested, ProcessLost,
 		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged,
-		LoopExternalToolsetChanged, ContextMeasured,
+		LoopExternalToolsetChanged, ContextMeasured, WorkflowActivity,
 		CompactionCommitted, CompactionRejected, CompactWaiterResolved, CompactWaiterRejected,
 		ForeignSessionBound, LoopAgentSessionBound, TurnRejected,
 		UserInputRequested, TurnInterrupted,
@@ -654,6 +655,8 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[ActiveLoopChanged](tag, data)
 	case "DelegateDeliveryStateChanged":
 		return decodeDelegateDeliveryStateChanged(data)
+	case "WorkflowActivity":
+		return decodeWorkflowActivity(data)
 	case "LoopRestoreTombstoned":
 		return decodePlain[LoopRestoreTombstoned](tag, data)
 	case "HustleStarted":
@@ -890,6 +893,61 @@ func decodeDelegateDeliveryStateChanged(data []byte) (Event, error) {
 		RequestID:    wire.RequestID,
 		TargetLoopID: wire.TargetLoopID,
 		State:        wire.State,
+	}, nil
+}
+
+// workflowActivityWire is deliberately explicit. WorkflowActivity is a public
+// journal ABI, so unlike ordinary plain events its decoder must reject a future
+// or transport-only field instead of silently accepting and dropping it.
+type workflowActivityWire struct {
+	Type string  `json:"type"`
+	V    *uint32 `json:"v"`
+	Header
+	RunID             uuid.UUID            `json:"run_id"`
+	WorkflowName      string               `json:"workflow_name"`
+	WorkflowVersion   string               `json:"workflow_version"`
+	Kind              WorkflowActivityKind `json:"kind"`
+	Status            WorkflowRunStatus    `json:"status"`
+	VertexID          uuid.UUID            `json:"vertex_id,omitzero"`
+	VertexLabel       string               `json:"vertex_label,omitempty"`
+	CompletedVertices uint32               `json:"completed_vertices,omitzero"`
+	TotalVertices     uint32               `json:"total_vertices,omitzero"`
+	Message           string               `json:"message,omitempty"`
+	OccurredAt        time.Time            `json:"occurred_at"`
+}
+
+func decodeWorkflowActivity(data []byte) (Event, error) {
+	const tag = "WorkflowActivity"
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+
+	var wire workflowActivityWire
+	if err := decoder.Decode(&wire); err != nil {
+		return nil, &EventDecodeError{Type: tag, Cause: err}
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = errors.New("trailing JSON value")
+		}
+		return nil, &EventDecodeError{Type: tag, Cause: err}
+	}
+	if wire.Type != "" && wire.Type != tag {
+		return nil, &EventDecodeError{Type: tag, Cause: fmt.Errorf("unexpected type %q", wire.Type)}
+	}
+
+	return WorkflowActivity{
+		Header:            wire.Header,
+		RunID:             wire.RunID,
+		WorkflowName:      wire.WorkflowName,
+		WorkflowVersion:   wire.WorkflowVersion,
+		Kind:              wire.Kind,
+		Status:            wire.Status,
+		VertexID:          wire.VertexID,
+		VertexLabel:       wire.VertexLabel,
+		CompletedVertices: wire.CompletedVertices,
+		TotalVertices:     wire.TotalVertices,
+		Message:           wire.Message,
+		OccurredAt:        wire.OccurredAt,
 	}, nil
 }
 
