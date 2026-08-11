@@ -9,6 +9,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 )
 
@@ -33,20 +34,24 @@ func (p *countingRuntimeProvider) Blocks(context.Context) []content.Block {
 // newLoopWithRuntime starts a loop wired with the given RuntimeContextProvider and
 // a recording client/publisher, mirroring newLoop but threading the provider into
 // loop.runtimeConfig. A nil provider exercises the OFF (current-behavior) path.
-func newLoopWithRuntime(t *testing.T, client inference.Client, rc RuntimeContextProvider) (*Loop, *recordingPublisher) {
+func newLoopWithRuntime(t *testing.T, client inference.Client, rc RuntimeContextProvider, toolSets ...ToolSet) (*Loop, *recordingPublisher) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	sessionID := mustID(t)
 	loopID := mustID(t)
 	rec := &recordingPublisher{}
-	l, err := newWithConfig(ctx, sessionID, loopID, Provenance{}, rec, runtimeConfig{
+	cfg := runtimeConfig{
 		Client:         client,
 		Model:          testModel(),
 		System:         "CACHED-PREFIX",
 		DrainTimeout:   200 * time.Millisecond,
 		RuntimeContext: rc,
-	})
+	}
+	if len(toolSets) > 0 {
+		cfg.Tools = toolSets[0]
+	}
+	l, err := newWithConfig(ctx, sessionID, loopID, Provenance{}, rec, cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -138,6 +143,9 @@ func TestRuntimeContextAppendedAtTurnTail(t *testing.T) {
 		if got := flattenToText(last1.Blocks); got != "<runtime_context>n=1</runtime_context>" {
 			t.Errorf("turn 1 tail = %q, want the first runtime block", got)
 		}
+		if r1.TransientMessages != 1 {
+			t.Errorf("turn 1 TransientMessages = %d, want 1", r1.TransientMessages)
+		}
 		// The user message ("turn one") must precede the runtime tail.
 		if len(r1.Messages) < 2 {
 			t.Fatalf("turn 1 request had %d messages, want >= 2 (user + runtime tail)", len(r1.Messages))
@@ -154,6 +162,9 @@ func TestRuntimeContextAppendedAtTurnTail(t *testing.T) {
 		r2 := reqs[1]
 		if texts := runtimeBlockTexts(r2); len(texts) != 1 || texts[0] != "<runtime_context>n=2</runtime_context>" {
 			t.Errorf("turn 2 runtime blocks = %v, want exactly [n=2]", texts)
+		}
+		if r2.TransientMessages != 1 {
+			t.Errorf("turn 2 TransientMessages = %d, want 1", r2.TransientMessages)
 		}
 
 		// Cache-safety: the system prompt (cached prefix) is byte-identical turn 1 vs
@@ -184,6 +195,9 @@ func TestRuntimeContextAppendedAtTurnTail(t *testing.T) {
 		if texts := runtimeBlockTexts(reqs[0]); len(texts) != 0 {
 			t.Errorf("nil provider appended runtime blocks %v, want none", texts)
 		}
+		if reqs[0].TransientMessages != 0 {
+			t.Errorf("nil-provider TransientMessages = %d, want 0", reqs[0].TransientMessages)
+		}
 	})
 
 	t.Run("empty provider blocks: nothing appended", func(t *testing.T) {
@@ -199,7 +213,46 @@ func TestRuntimeContextAppendedAtTurnTail(t *testing.T) {
 		if len(reqs[0].Messages) != 1 {
 			t.Fatalf("empty-provider request had %d messages, want 1", len(reqs[0].Messages))
 		}
+		if reqs[0].TransientMessages != 0 {
+			t.Errorf("empty-provider TransientMessages = %d, want 0", reqs[0].TransientMessages)
+		}
 	})
+}
+
+// TestRuntimeContextTransientMarkerAcrossToolContinuation proves the runtime tail
+// remains exactly one transient message on every request in a multi-step turn. The
+// second request includes the committed tool result, but the marker is not derived
+// from message contents and must not grow during continuation.
+func TestRuntimeContextTransientMarkerAcrossToolContinuation(t *testing.T) {
+	t.Parallel()
+	client := &scriptedLLM{scripts: [][]content.Chunk{
+		{toolUseChunk(0, "id-1", "Echo", `{}`)},
+		{textChunk("done")},
+	}}
+	rc := &countingRuntimeProvider{}
+	l, rec := newLoopWithRuntime(t, client, rc, agenticToolSet([]tool.InvokableTool{
+		&echoTool{name: "Echo", output: "tool result"},
+	}, 25, 100))
+
+	startTurn(t, l, rec, []content.Block{&content.TextBlock{Text: "run tool"}})
+	if _, ok := drainToTerminal(t, rec).(event.TurnDone); !ok {
+		t.Fatal("terminal != TurnDone")
+	}
+	reqs := waitForScriptedRequests(t, client, 2)
+	if len(reqs) != 2 {
+		t.Fatalf("recorded %d requests, want exactly 2 (initial + continuation)", len(reqs))
+	}
+	for i, req := range reqs {
+		if texts := runtimeBlockTexts(req); len(texts) != 1 {
+			t.Errorf("request %d runtime blocks = %v, want exactly one", i+1, texts)
+		}
+		if req.TransientMessages != 1 {
+			t.Errorf("request %d TransientMessages = %d, want 1", i+1, req.TransientMessages)
+		}
+	}
+	if reqs[1].TransientMessages != reqs[0].TransientMessages {
+		t.Errorf("continuation TransientMessages = %d, initial = %d; marker must not increase", reqs[1].TransientMessages, reqs[0].TransientMessages)
+	}
 }
 
 // TestRuntimeContextNotCommittedToHistory proves the appended runtime block is
@@ -231,5 +284,21 @@ func TestRuntimeContextNotCommittedToHistory(t *testing.T) {
 				t.Fatalf("committed history contains a runtime_context block %q; it must be transient", tb.Text)
 			}
 		}
+	}
+}
+
+// TestCloneInferenceRequestPreservesTransientMessages proves the scalar marker is
+// retained across the ownership boundary used by context measurement. The existing
+// struct-value copy is sufficient; no special clone branch should be needed.
+func TestCloneInferenceRequestPreservesTransientMessages(t *testing.T) {
+	t.Parallel()
+	request := inference.Request{TransientMessages: 1}
+	cloned := cloneInferenceRequest(request)
+	if cloned.TransientMessages != 1 {
+		t.Fatalf("clone TransientMessages = %d, want 1", cloned.TransientMessages)
+	}
+	request.TransientMessages = 0
+	if cloned.TransientMessages != 1 {
+		t.Fatalf("clone TransientMessages changed after source mutation: %d", cloned.TransientMessages)
 	}
 }

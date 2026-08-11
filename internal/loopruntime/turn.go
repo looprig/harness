@@ -589,9 +589,16 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 }
 
 func turnInferenceRequest(cfg turnConfig, state turnState, runtimeTail *content.UserMessage, output turnOutputPlan) inference.Request {
+	messages := requestMessages(cfg.base, state.msgs, runtimeTail)
+	transientMessages := 0
+	if runtimeTail != nil {
+		transientMessages = 1
+	}
 	return output.apply(inference.Request{
-		Model: cfg.model.Clone(), System: cfg.system,
-		Messages: requestMessages(cfg.base, state.msgs, runtimeTail),
+		Model:             cfg.model.Clone(),
+		System:            cfg.system,
+		Messages:          messages,
+		TransientMessages: transientMessages,
 	})
 }
 
