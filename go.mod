@@ -14,7 +14,7 @@ require (
 )
 
 require (
-	github.com/looprig/eval v0.1.0
+	github.com/looprig/eval v0.1.2
 	github.com/looprig/fsstore v0.3.2
 )
 

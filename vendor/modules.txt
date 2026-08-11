@@ -140,7 +140,7 @@ github.com/invopop/jsonschema
 github.com/looprig/core/content
 github.com/looprig/core/content/streamaccumulator
 github.com/looprig/core/uuid
-# github.com/looprig/eval v0.1.0
+# github.com/looprig/eval v0.1.2
 ## explicit; go 1.26.4
 github.com/looprig/eval
 github.com/looprig/eval/evaltest
