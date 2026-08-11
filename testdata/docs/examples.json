@@ -1,0 +1,119 @@
+{
+  "schemaVersion": 1,
+  "repository": "harness",
+  "proofSources": [
+    {
+      "id": "example-harness-lifecycle-fixture",
+      "type": "executable-fixture",
+      "path": "examples/lifecycle/example_test.go",
+      "symbol": "Example_toolLoopRigSessionLifecycle"
+    },
+    {
+      "id": "example-harness-persistence-fixture",
+      "type": "executable-fixture",
+      "path": "examples/persistence/example_test.go",
+      "symbol": "Example_sessionJournalAndWorkspaceStores"
+    },
+    {
+      "id": "example-harness-policy-fixture",
+      "type": "executable-fixture",
+      "path": "examples/policy/example_test.go",
+      "symbol": "Example_hooksAndHeadlessGateFallback"
+    },
+    {
+      "id": "example-harness-serving-fixture",
+      "type": "executable-fixture",
+      "path": "examples/serving/example_test.go",
+      "symbol": "Example_readOnlyHTTPAdapter"
+    },
+    {
+      "id": "example-harness-composition-fixture",
+      "type": "executable-fixture",
+      "path": "examples/composition/example_test.go",
+      "symbol": "Example_compactionAndDelegationComposition"
+    },
+    {
+      "id": "example-harness-manifest-contract-test",
+      "type": "test",
+      "path": "tests/example_test.go",
+      "symbol": "TestDocsExamplesArtifacts"
+    }
+  ],
+  "examples": [
+    {
+      "id": "example-harness-tool-loop-rig-session-lifecycle",
+      "ecosystem": "go",
+      "owner": "harness",
+      "sourcePath": "examples/lifecycle/example_test.go",
+      "availability": "source-workspace",
+      "versions": {"github.com/looprig/harness": "source-workspace"},
+      "offlineCommand": "GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache go test -race ./examples/...",
+      "assertion": "A factory-built tool composes into a loop and Rig, a session delivers a terminal event, shuts down, and restores with the same durable identity.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "The in-memory store is process-local, the event subscription is closed, and both live and restored sessions are shut down.",
+      "liveGate": null,
+      "proofIds": ["example-harness-lifecycle-fixture", "example-harness-manifest-contract-test"]
+    },
+    {
+      "id": "example-harness-journal-session-workspace-persistence",
+      "ecosystem": "go",
+      "owner": "harness",
+      "sourcePath": "examples/persistence/example_test.go",
+      "availability": "source-workspace",
+      "versions": {"github.com/looprig/harness": "source-workspace"},
+      "offlineCommand": "GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache go test -race ./examples/...",
+      "assertion": "A session store acquires a fenced journal writer, its public event replay hides the private fence, and a workspace snapshot materializes byte-identically.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "The lease is released and both temporary workspace directories are removed by the example.",
+      "liveGate": null,
+      "proofIds": ["example-harness-persistence-fixture", "example-harness-manifest-contract-test"]
+    },
+    {
+      "id": "example-harness-hooks-gate-fallback",
+      "ecosystem": "go",
+      "owner": "harness",
+      "sourcePath": "examples/policy/example_test.go",
+      "availability": "source-workspace",
+      "versions": {"github.com/looprig/harness": "source-workspace"},
+      "offlineCommand": "GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache go test -race ./examples/...",
+      "assertion": "Hook observers surround ordered guards, and an unmet gated capability in headless mode returns the typed approval-required fallback instead of silently authorizing it.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "No persistent resources are created; hook and gate collaborators are process-local values.",
+      "liveGate": null,
+      "proofIds": ["example-harness-policy-fixture", "example-harness-manifest-contract-test"]
+    },
+    {
+      "id": "example-harness-read-only-serving-adapter",
+      "ecosystem": "go",
+      "owner": "harness",
+      "sourcePath": "examples/serving/example_test.go",
+      "availability": "source-workspace",
+      "versions": {"github.com/looprig/harness": "source-workspace"},
+      "offlineCommand": "GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache go test -race ./examples/...",
+      "assertion": "The read-only HTTP adapter publishes discovery through an in-memory request and produces a hardened loopback server without opening a listener.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "No socket is opened; httptest retains the response in memory.",
+      "liveGate": null,
+      "proofIds": ["example-harness-serving-fixture", "example-harness-manifest-contract-test"]
+    },
+    {
+      "id": "example-harness-compaction-delegation-composition",
+      "ecosystem": "go",
+      "owner": "harness",
+      "sourcePath": "examples/composition/example_test.go",
+      "availability": "source-workspace",
+      "versions": {"github.com/looprig/harness": "source-workspace"},
+      "offlineCommand": "GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache go test -race ./examples/...",
+      "assertion": "A tool definition binds with session identity, a compaction policy validates against counter capability, and a managed planner-to-worker delegation graph forms a valid Rig.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "No session is started and every store or tool value is process-local.",
+      "liveGate": null,
+      "proofIds": ["example-harness-composition-fixture", "example-harness-manifest-contract-test"]
+    }
+  ]
+}

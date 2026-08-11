@@ -1,0 +1,26 @@
+name: Docs examples
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  docs-examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Run deterministic offline examples
+        run: GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache go test -race ./examples/...
+      - name: Run repository-native tests
+        run: GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache make test
+      - name: Run race-enabled standalone tests
+        run: GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache go test -race ./...
