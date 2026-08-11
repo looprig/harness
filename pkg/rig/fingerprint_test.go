@@ -371,7 +371,7 @@ func TestFingerprintWithMergesSwarmFields(t *testing.T) {
 
 	cfg := fpConfig("model-x", "prompt", "Read")
 	base := ConfigFingerprintFields{
-		AgentKind:     "carbon:operator",
+		AgentKind:     "coderig:operator",
 		RuntimeSkills: true,
 		WorkspaceRoot: "/home/user/repo",
 	}
@@ -389,7 +389,7 @@ func TestFingerprintWithMergesSwarmFields(t *testing.T) {
 	}
 
 	diffKind := base
-	diffKind.AgentKind = "carbon:reviewer"
+	diffKind.AgentKind = "coderig:reviewer"
 	diffSkills := base
 	diffSkills.RuntimeSkills = false
 	diffRoot := base
@@ -845,7 +845,7 @@ func TestManifestMatchesFingerprint(t *testing.T) {
 	// The new (Phase-1) ConfigFingerprintFields members are carried by the manifest
 	// but not by the legacy fingerprint; set them to prove they reach the manifest.
 	fields := ConfigFingerprintFields{
-		AgentKind:                 "carbon:operator",
+		AgentKind:                 "coderig:operator",
 		RuntimeSkills:             true,
 		WorkspaceRoot:             "/repo",
 		AdapterID:                 "claude",

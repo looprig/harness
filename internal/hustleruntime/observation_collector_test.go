@@ -184,7 +184,7 @@ func TestEvidenceRunnerNoCollectorAttachedIsANoOp(t *testing.T) {
 
 // TestRunAndFinalizeThreadsObservationCollectorThroughRealEvidenceExecution
 // is a regression test for a genuine cross-cutting gap this addendum's own
-// Carbon-side end-to-end test (carbon-permission-classifier's
+// CodeRig-side end-to-end test (coderig-permission-classifier's
 // TestPermissionReviewObservationSymlinkSwapBlocksAutoApprovalEndToEnd)
 // discovered: every OTHER test in this file attaches the
 // ObservationCollector directly to the ctx passed straight into

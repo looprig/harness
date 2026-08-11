@@ -551,7 +551,7 @@ func TestConfigurationAdoptedRoundTrip(t *testing.T) {
 		Drift:               []DriftChange{{Category: DriftModel, Old: "a", New: "b", Severity: DriftInfo}},
 		Source:              DecisionSourcePolicy,
 		Actor:               "op@host",
-		AppVersion:          "carbon/1.2.3",
+		AppVersion:          "coderig/1.2.3",
 		Message:             "accepted model change",
 	}
 	raw, err := MarshalEvent(original)

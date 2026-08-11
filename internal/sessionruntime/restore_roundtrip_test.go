@@ -814,13 +814,13 @@ func TestRestoreConfigMismatch(t *testing.T) {
 // is what stops a session silently resuming under a different skill-trust mode or repo.
 func TestRestoreSwarmFingerprintMismatch(t *testing.T) {
 	persistedFields := testFingerprintFields{
-		AgentKind:                 "carbon:operator",
+		AgentKind:                 "coderig:operator",
 		RuntimeSkills:             true,
 		WorkspaceRoot:             "/home/user/repo",
 		NativePermissionPolicyRev: "policyrev-aaa",
 	}
 	diffKind := persistedFields
-	diffKind.AgentKind = "carbon:reviewer"
+	diffKind.AgentKind = "coderig:reviewer"
 	diffSkills := persistedFields
 	diffSkills.RuntimeSkills = false
 	diffRoot := persistedFields

@@ -7,7 +7,7 @@
   "adopted_fingerprint": "6dfa05a68de160225451630245e9d7a3ce5e709f39dd376dfc6708bfd4a6da3e",
   "manifest": {
     "schema_version": 1,
-    "agent_kind": "carbon:operator",
+    "agent_kind": "coderig:operator",
     "topology_rev": "aaaa",
     "model_id": "claude-fable-5",
     "system_prompt_rev": "bbbb",
