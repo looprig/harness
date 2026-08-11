@@ -8,28 +8,77 @@ import (
 
 const toolResultTruncatedMarker = "\n[tool output truncated: omitted %d of %d bytes]\n"
 
+type normalizedToolResult struct {
+	text       string
+	runeStarts []int
+	sourceSpan []int
+}
+
+func normalizeToolResult(text string) normalizedToolResult {
+	normalized := strings.ToValidUTF8(text, "\uFFFD")
+	result := normalizedToolResult{text: normalized}
+	for offset := 0; offset < len(text); {
+		runeValue, size := utf8.DecodeRuneInString(text[offset:])
+		if runeValue == utf8.RuneError && size == 1 {
+			start := offset
+			offset += size
+			for offset < len(text) {
+				next, nextSize := utf8.DecodeRuneInString(text[offset:])
+				if next != utf8.RuneError || nextSize != 1 {
+					break
+				}
+				offset += nextSize
+			}
+			result.sourceSpan = append(result.sourceSpan, offset-start)
+			continue
+		}
+		result.sourceSpan = append(result.sourceSpan, size)
+		offset += size
+	}
+	for offset := 0; offset < len(normalized); {
+		result.runeStarts = append(result.runeStarts, offset)
+		_, size := utf8.DecodeRuneInString(normalized[offset:])
+		offset += size
+	}
+	return result
+}
+
+func (value normalizedToolResult) sourceBytes(start, end int) int {
+	result := 0
+	for index, runeStart := range value.runeStarts {
+		if runeStart >= end {
+			break
+		}
+		if runeStart >= start {
+			result += value.sourceSpan[index]
+		}
+	}
+	return result
+}
+
 func shapeToolResultText(text string, limit int) string {
 	if limit <= 0 {
 		return text
 	}
-	normalized := strings.ToValidUTF8(text, "\uFFFD")
-	if len(normalized) <= limit {
-		return normalized
+	normalized := normalizeToolResult(text)
+	if len(normalized.text) <= limit {
+		return normalized.text
 	}
 
 	originalBytes := len(text)
-	marker := fmt.Sprintf(toolResultTruncatedMarker, len(normalized), originalBytes)
+	marker := fmt.Sprintf(toolResultTruncatedMarker, originalBytes, originalBytes)
 	for i := 0; i < 8; i++ {
 		remaining := limit - len(marker)
 		if remaining <= 0 {
-			return boundedUTF8(normalized, limit)
+			return boundedUTF8(normalized.text, limit)
 		}
 		headBudget := remaining / 2
 		tailBudget := remaining - headBudget
-		head := normalized[:utf8Boundary(normalized, headBudget)]
-		tailStart := utf8TailBoundary(normalized, tailBudget)
-		tail := normalized[tailStart:]
-		omitted := len(normalized) - len(head) - len(tail)
+		headEnd := utf8Boundary(normalized.text, headBudget)
+		tailStart := utf8TailBoundary(normalized.text, tailBudget)
+		head := normalized.text[:headEnd]
+		tail := normalized.text[tailStart:]
+		omitted := originalBytes - normalized.sourceBytes(0, headEnd) - normalized.sourceBytes(tailStart, len(normalized.text))
 		updated := fmt.Sprintf(toolResultTruncatedMarker, omitted, originalBytes)
 		if updated == marker {
 			return head + marker + tail
@@ -39,13 +88,14 @@ func shapeToolResultText(text string, limit int) string {
 
 	remaining := limit - len(marker)
 	if remaining <= 0 {
-		return boundedUTF8(normalized, limit)
+		return boundedUTF8(normalized.text, limit)
 	}
 	headBudget := remaining / 2
 	tailBudget := remaining - headBudget
-	head := normalized[:utf8Boundary(normalized, headBudget)]
-	tailStart := utf8TailBoundary(normalized, tailBudget)
-	return head + marker + normalized[tailStart:]
+	headEnd := utf8Boundary(normalized.text, headBudget)
+	tailStart := utf8TailBoundary(normalized.text, tailBudget)
+	head := normalized.text[:headEnd]
+	return head + marker + normalized.text[tailStart:]
 }
 
 func utf8Boundary(value string, budget int) int {

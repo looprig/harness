@@ -1,6 +1,7 @@
 package loopruntime
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"testing"
@@ -92,6 +93,41 @@ func TestShapeToolResultTextMarkerReportsOriginalBytesAfterNormalization(t *test
 	}
 	if !strings.Contains(got, fmt.Sprintf(" of %d bytes]\n", len(text))) {
 		t.Fatalf("shaped output %q does not report original byte count %d", got, len(text))
+	}
+}
+
+func TestShapeToolResultTextAccountsOriginalBytesForAlternatingInvalidUTF8(t *testing.T) {
+	t.Parallel()
+	text := string(bytes.Repeat([]byte{'A', 0xff}, 600))
+	got := shapeToolResultText(text, 256)
+	const markerPrefix = "\n[tool output truncated: omitted "
+	markerStart := strings.Index(got, markerPrefix)
+	if markerStart < 0 {
+		t.Fatalf("shaped output lacks truncation marker: %q", got)
+	}
+	markerEnd := strings.Index(got[markerStart+len(markerPrefix):], "]\n")
+	if markerEnd < 0 {
+		t.Fatalf("shaped output marker is incomplete: %q", got)
+	}
+	markerEnd += markerStart + len(markerPrefix)
+	var omitted, total int
+	if _, err := fmt.Sscanf(got[markerStart+len(markerPrefix):markerEnd], "%d of %d bytes", &omitted, &total); err != nil {
+		t.Fatalf("parse marker: %v", err)
+	}
+	if omitted > total {
+		t.Fatalf("marker omitted %d bytes out of total %d bytes", omitted, total)
+	}
+	retained := got[:markerStart] + got[markerEnd+2:]
+	represented := 0
+	for _, r := range retained {
+		if r == '\uFFFD' {
+			represented++
+		} else {
+			represented += len(string(r))
+		}
+	}
+	if omitted+represented != len(text) {
+		t.Fatalf("marker accounting = omitted %d + represented %d = %d, want original %d", omitted, represented, omitted+represented, len(text))
 	}
 }
 

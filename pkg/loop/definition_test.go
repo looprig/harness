@@ -325,6 +325,15 @@ func TestPolicyRevisionDigest(t *testing.T) {
 	}
 }
 
+func TestPolicyRevisionIncludesToolResultBytes(t *testing.T) {
+	t.Parallel()
+	base := mustDefinition(t)
+	bounded := mustDefinition(t, WithToolLimits(ToolLimits{ResultBytes: minToolResultBytes}))
+	if got, want := bounded.PolicyRevision(), base.PolicyRevision(); got == want {
+		t.Fatalf("PolicyRevision() = %q for ResultBytes=%d, same as unbounded policy %q", got, minToolResultBytes, want)
+	}
+}
+
 // TestPolicyRevisionIncludesContextTransports proves PolicyRevision hashes
 // the declared ContextTransport set: adding a second declared transport
 // changes the digest, the hashed set is order-independent (proving the sort
