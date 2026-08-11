@@ -84,6 +84,45 @@ func (c *liveCompactionCounter) CounterCapability() contextcount.CounterCapabili
 	return c.capability
 }
 
+func (c *liveCompactionCounter) resetCounts(counts []content.TokenCount) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = 0
+	c.counts = append([]content.TokenCount(nil), counts...)
+}
+
+func waitCompactionFixtureIdle(t *testing.T, session *Session) {
+	t.Helper()
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := session.WaitIdle(waitCtx); err != nil {
+		t.Fatalf("WaitIdle() error = %v", err)
+	}
+	handle := session.loops[session.ActiveLoopID()]
+	if _, _, err := handle.backend.Snapshot(waitCtx); err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+}
+
+func submitCompactionFixtureTurn(t *testing.T, session *Session, text string) {
+	t.Helper()
+	sub, err := session.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeEvents(%q) error = %v", text, err)
+	}
+	defer sub.Close()
+	if _, err := session.Submit(context.Background(), []content.Block{&content.TextBlock{Text: text}}); err != nil {
+		t.Fatalf("Submit(%q) error = %v", text, err)
+	}
+	if _, ok := firstMatching[event.TurnDone](t, sub); !ok {
+		t.Fatalf("%q turn did not finish", text)
+	}
+	if _, ok := firstMatching[event.LoopIdle](t, sub); !ok {
+		t.Fatalf("%q loop did not become idle", text)
+	}
+	waitCompactionFixtureIdle(t, session)
+}
+
 type liveCompactionClient struct {
 	mu            sync.Mutex
 	invokes       int
@@ -176,15 +215,11 @@ func TestNativeSessionCompactionReachesRegisteredFocusedHustle(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &liveCompactionClient{invoked: make(chan struct{}, 1)}
-			if !tt.automatic {
-				client.streamStarted = make(chan struct{})
-				client.streamRelease = make(chan struct{})
-			}
 			capability := contextcount.CounterCapability{
 				Transport: contextcount.CounterTransportLocal, Retention: contextcount.RetentionNone,
 				TokenizerRev: "live-exact-v1", Quality: contextcount.CountQualityExactLocal,
 			}
-			counter := &liveCompactionCounter{capability: capability, counts: tt.counts}
+			counter := &liveCompactionCounter{capability: capability, counts: []content.TokenCount{20}}
 			model := validModel("live-compaction")
 			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			policy := loop.CompactionPolicy{
@@ -213,6 +248,9 @@ func TestNativeSessionCompactionReachesRegisteredFocusedHustle(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewSession() error = %v", err)
 			}
+			t.Cleanup(func() { _ = session.Shutdown(context.Background()) })
+			submitCompactionFixtureTurn(t, session, "prior history")
+			submitCompactionFixtureTurn(t, session, "older history")
 			if tt.restore {
 				sessionID := session.SessionID()
 				if err := session.Shutdown(context.Background()); err != nil {
@@ -222,8 +260,13 @@ func TestNativeSessionCompactionReachesRegisteredFocusedHustle(t *testing.T) {
 				if err != nil {
 					t.Fatalf("RestoreSession() error = %v", err)
 				}
+				waitCompactionFixtureIdle(t, session)
 			}
-			t.Cleanup(func() { _ = session.Shutdown(context.Background()) })
+			counter.resetCounts(tt.counts)
+			if !tt.automatic {
+				client.streamStarted = make(chan struct{})
+				client.streamRelease = make(chan struct{})
+			}
 			if _, err := session.Submit(context.Background(), []content.Block{&content.TextBlock{Text: "compact me"}}); err != nil {
 				t.Fatalf("Submit() error = %v", err)
 			}
@@ -357,6 +400,7 @@ func TestNativeSessionIdlePreStartCancellationPublishesWaiterOnly(t *testing.T) 
 			if err := session.WaitIdle(idleCtx); err != nil {
 				t.Fatalf("WaitIdle() error = %v", err)
 			}
+			submitCompactionFixtureTurn(t, session, "prior seed")
 			if tt.restore {
 				sessionID := session.SessionID()
 				if err := session.Shutdown(context.Background()); err != nil {
@@ -366,6 +410,7 @@ func TestNativeSessionIdlePreStartCancellationPublishesWaiterOnly(t *testing.T) 
 				if err != nil {
 					t.Fatalf("RestoreSession() error = %v", err)
 				}
+				waitCompactionFixtureIdle(t, session)
 			}
 			sub, err := session.SubscribeEvents(allFilter())
 			if err != nil {
