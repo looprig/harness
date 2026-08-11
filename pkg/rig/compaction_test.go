@@ -33,7 +33,7 @@ func neutralFingerprintConfig() compactionFingerprintConfig {
 	return compactionFingerprintConfig{
 		counter:   contextcount.CounterCapability{Transport: contextcount.CounterTransportLocal, Retention: contextcount.RetentionNone, TokenizerRev: "v1", Quality: contextcount.CountQualityExactLocal},
 		inference: contextcount.InferenceCapability{Transport: contextcount.InferenceTransportLocal, Retention: contextcount.RetentionNone},
-		policy:    loop.CompactionPolicy{ReservedOutput: 10, MaxSummaryTokens: 5, CountTimeout: time.Millisecond, Hustle: "context.compact"},
+		policy:    loop.CompactionPolicy{KeepRecentSegments: 1, KeepRecentTokens: 10000, ReservedOutput: 10, MaxSummaryTokens: 5, CountTimeout: time.Millisecond, Hustle: "context.compact"},
 	}
 }
 
@@ -49,7 +49,7 @@ func endpointFingerprintConfig() compactionFingerprintConfig {
 			Provider: "provider", Transport: contextcount.InferenceTransportTLS,
 			SecurityIdentity: identity, Retention: contextcount.RetentionLogged,
 		},
-		policy: loop.CompactionPolicy{SafetyMargin: 1, ReservedOutput: 10, MaxSummaryTokens: 5, CountTimeout: time.Millisecond, Hustle: "context.compact"},
+		policy: loop.CompactionPolicy{KeepRecentSegments: 1, KeepRecentTokens: 10000, SafetyMargin: 1, ReservedOutput: 10, MaxSummaryTokens: 5, CountTimeout: time.Millisecond, Hustle: "context.compact"},
 	}
 }
 
@@ -58,6 +58,7 @@ func automaticFingerprintConfig() compactionFingerprintConfig {
 	config.policy = loop.CompactionPolicy{
 		Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact,
 		CompactAt: 8_000, RearmBelow: 6_000, ReservedOutput: 10,
+		KeepRecentSegments: 1, KeepRecentTokens: 10000,
 		SafetyMargin: 1, MaxSummaryTokens: 5, CountTimeout: time.Millisecond,
 		Hustle: "context.compact",
 	}

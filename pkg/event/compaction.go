@@ -55,10 +55,11 @@ const (
 	CompactRejectSummaryTooLarge
 	CompactRejectInternal
 	CompactRejectContextLimitUnknown
+	CompactRejectRetainedTailTooLarge
 )
 
 func (r CompactRejectReason) Valid() bool {
-	return r >= CompactRejectControlLaneFull && r <= CompactRejectContextLimitUnknown
+	return r >= CompactRejectControlLaneFull && r <= CompactRejectRetainedTailTooLarge
 }
 
 type CompactionStarted struct {

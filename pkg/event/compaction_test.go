@@ -57,7 +57,8 @@ func TestCompactionReasonDomains(t *testing.T) {
 		{name: "reject summary too large", reason: CompactRejectSummaryTooLarge, valid: true},
 		{name: "reject internal", reason: CompactRejectInternal, valid: true},
 		{name: "reject context limit unknown", reason: CompactRejectContextLimitUnknown, valid: true},
-		{name: "reject unknown", reason: CompactRejectReason(14)},
+		{name: "reject retained tail too large", reason: CompactRejectRetainedTailTooLarge, valid: true},
+		{name: "reject unknown", reason: CompactRejectReason(15)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -128,6 +129,7 @@ func TestCompactRejectReasonWireValues(t *testing.T) {
 		{name: "summary too large is eleven", reason: CompactRejectSummaryTooLarge, want: 11, wantJSON: "11", valid: true},
 		{name: "internal is twelve", reason: CompactRejectInternal, want: 12, wantJSON: "12", valid: true},
 		{name: "context limit unknown is thirteen", reason: CompactRejectContextLimitUnknown, want: 13, wantJSON: "13", valid: true},
+		{name: "retained tail too large is fourteen", reason: CompactRejectRetainedTailTooLarge, want: 14, wantJSON: "14", valid: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -210,7 +212,7 @@ func TestCompactRejectReasonDurableDecodeRejectsOutOfDomain(t *testing.T) {
 		raw  string
 	}{
 		{name: "zero sentinel", raw: "0"},
-		{name: "unknown value", raw: "14"},
+		{name: "unknown value", raw: "15"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -276,7 +278,7 @@ func TestCompactionEventsValidate(t *testing.T) {
 		}(), wantErr: true},
 		{name: "rejected unspecified reason", event: func() Event { value := rejected; value.Reason = CompactionReasonUnspecified; return value }(), wantErr: true},
 		{name: "rejected invalid basis", event: func() Event { value := rejected; value.Basis = ContextBasis{}; return value }(), wantErr: true},
-		{name: "rejected unknown reason", event: func() Event { value := rejected; value.RejectReason = CompactRejectReason(14); return value }(), wantErr: true},
+		{name: "rejected unknown reason", event: func() Event { value := rejected; value.RejectReason = CompactRejectReason(15); return value }(), wantErr: true},
 		{name: "resolved nondeterministic event id", event: func() Event { value := resolved; value.EventID = uuid.UUID{0xff}; return value }(), wantErr: true},
 		{name: "rejected waiter missing command cause", event: func() Event { value := waiterRejected; value.Cause.CommandID = uuid.UUID{}; return value }(), wantErr: true},
 	}

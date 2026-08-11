@@ -28,7 +28,39 @@ type compactionExecutionCandidate struct {
 	RuntimeTail         *content.UserMessage
 	RuntimeRevision     string
 	Transcript          content.AgenticMessages
+	Retained            content.AgenticMessages
+	derivedPrefix       int
 	InferenceCapability contextcount.InferenceCapability
+}
+
+// selectCompactionExecutionCandidate narrows the model-facing transcript only
+// at the compaction boundary. Measurement identity and the original request
+// remain untouched; Retained is an owned copy of the unprojected suffix for
+// post-compaction context accounting and live replacement.
+func selectCompactionExecutionCandidate(
+	candidate compactionExecutionCandidate,
+	policy *loop.CompactionPolicy,
+) (compactionExecutionCandidate, event.CompactRejectReason) {
+	if policy == nil {
+		return candidate, event.CompactRejectUnavailable
+	}
+	selection, err := selectCompactionTail(
+		candidate.Transcript, candidate.derivedPrefix,
+		policy.KeepRecentSegments, policy.KeepRecentTokens,
+	)
+	if err != nil {
+		return candidate, event.CompactRejectUnavailable
+	}
+	candidate.Retained = cloneMessages(selection.Retained)
+	if len(selection.Head) <= candidate.derivedPrefix {
+		return candidate, event.CompactRejectUnavailable
+	}
+	projected, err := projectCompactionTranscript(selection.Head)
+	if err != nil {
+		return candidate, event.CompactRejectUnavailable
+	}
+	candidate.Transcript = projected
+	return candidate, event.CompactRejectUnspecified
 }
 
 type compactionExecutorError struct{ Field string }
@@ -167,6 +199,7 @@ func (e *compactionExecutor) CoordinateCompactionCandidate(
 	candidate.Request.Messages = cloneMessages(candidate.Request.Messages)
 	candidate.RuntimeTail = cloneUserMessage(candidate.RuntimeTail)
 	candidate.Transcript = cloneMessages(candidate.Transcript)
+	candidate.Retained = cloneMessages(candidate.Retained)
 	input := cloneCompactionHookInput(disposition.input)
 	go func() { result <- e.execute(runCtx, attempt, candidate, input, disposition.hookScope) }()
 	return nil

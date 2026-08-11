@@ -836,7 +836,8 @@ func TestHooksIntegrationHustleInferenceIsNotNativeInference(t *testing.T) {
 			Retention: contextcount.RetentionNone,
 		}),
 		loop.WithCompaction(loop.CompactionPolicy{
-			CounterPolicy:    loop.CounterPolicyRequireExact,
+			CounterPolicy:      loop.CounterPolicyRequireExact,
+			KeepRecentSegments: 1, KeepRecentTokens: 10000,
 			ReservedOutput:   20,
 			MaxSummaryTokens: 10,
 			CountTimeout:     time.Second,

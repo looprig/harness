@@ -32,7 +32,7 @@ func contextBoundDefinition(t *testing.T, client inference.Client) loop.BoundDef
 	definition, err := loop.Define(
 		loop.WithName("agent"), loop.WithInference(client, testModel()), loop.WithContextCounter(counter),
 		loop.WithInferenceCapability(contextcount.InferenceCapability{Transport: contextcount.InferenceTransportLocal, Retention: contextcount.RetentionNone}),
-		loop.WithCompaction(loop.CompactionPolicy{ReservedOutput: 10, MaxSummaryTokens: 5, CountTimeout: 37*time.Millisecond + time.Nanosecond, Hustle: "context.compact"}),
+		loop.WithCompaction(loop.CompactionPolicy{KeepRecentSegments: 1, KeepRecentTokens: 10000, ReservedOutput: 10, MaxSummaryTokens: 5, CountTimeout: 37*time.Millisecond + time.Nanosecond, Hustle: "context.compact"}),
 	)
 	if err != nil {
 		t.Fatal(err)

@@ -205,7 +205,7 @@ func TestLoopContextAdmissionBeforePrimaryInference(t *testing.T) {
 		},
 		{
 			name: "automatic soft rejection continues", count: 65,
-			compaction:  &loop.CompactionPolicy{Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 31 * time.Millisecond, Hustle: "context.compact"},
+			compaction:  &loop.CompactionPolicy{Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000, KeepRecentSegments: 1, KeepRecentTokens: 10000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 31 * time.Millisecond, Hustle: "context.compact"},
 			withAwaiter: true, release: contextCompactionAwaitResult{
 				Disposition: contextCompactionAwaitRejected,
 				Proposal:    compactionFinalizationProposal{RejectReason: event.CompactRejectExecutionFailed},
@@ -214,7 +214,7 @@ func TestLoopContextAdmissionBeforePrimaryInference(t *testing.T) {
 		},
 		{
 			name: "automatic hard rejection blocks after real attempt", count: 80,
-			compaction:  &loop.CompactionPolicy{Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 31 * time.Millisecond, Hustle: "context.compact"},
+			compaction:  &loop.CompactionPolicy{Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000, KeepRecentSegments: 1, KeepRecentTokens: 10000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 31 * time.Millisecond, Hustle: "context.compact"},
 			withAwaiter: true, release: contextCompactionAwaitResult{
 				Disposition: contextCompactionAwaitRejected,
 				Proposal:    compactionFinalizationProposal{RejectReason: event.CompactRejectExecutionFailed},
@@ -224,7 +224,7 @@ func TestLoopContextAdmissionBeforePrimaryInference(t *testing.T) {
 		},
 		{
 			name: "automatic hard without real attempt blocks immediately", count: 80,
-			compaction:   &loop.CompactionPolicy{Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 31 * time.Millisecond, Hustle: "context.compact"},
+			compaction:   &loop.CompactionPolicy{Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000, KeepRecentSegments: 1, KeepRecentTokens: 10000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 31 * time.Millisecond, Hustle: "context.compact"},
 			wantMeasured: true, wantPressure: event.PressureHardLimit,
 			wantTerminalErr: func(err error) bool { var target *loop.ContextLimitError; return errors.As(err, &target) },
 		},
@@ -523,6 +523,7 @@ func TestRestoredLoopFirstRequestUsesCompactedContextState(t *testing.T) {
 				Compaction: &loop.CompactionPolicy{
 					Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact,
 					CompactAt: 5_000, RearmBelow: 4_000, ReservedOutput: 20,
+					KeepRecentSegments: 1, KeepRecentTokens: 10000,
 					MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
 				},
 				compactionSink: sink,
@@ -617,7 +618,7 @@ func TestLoopAutomaticCompactionRetriesAfterManualOpenedRejection(t *testing.T) 
 			config := runtimeConfig{
 				Client: client, Model: model, System: "system", DrainTimeout: 200 * time.Millisecond,
 				ContextCounter: counter, CounterCapability: capability, InferenceCapability: contextTestInferenceCapability(),
-				Compaction:     &loop.CompactionPolicy{Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 5_000, RearmBelow: 4_000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 5 * time.Second, Hustle: "context.compact"},
+				Compaction:     &loop.CompactionPolicy{Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 5_000, RearmBelow: 4_000, KeepRecentSegments: 1, KeepRecentTokens: 10000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 5 * time.Second, Hustle: "context.compact"},
 				compactionSink: sink,
 			}
 			sessionID, loopID := uuid.UUID{21}, uuid.UUID{22}

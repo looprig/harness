@@ -190,6 +190,7 @@ func TestNativeSessionCompactionReachesRegisteredFocusedHustle(t *testing.T) {
 			policy := loop.CompactionPolicy{
 				Automatic: tt.automatic, CounterPolicy: loop.CounterPolicyRequireExact,
 				CompactAt: 8_000, RearmBelow: 6_000, ReservedOutput: 20,
+				KeepRecentSegments: 1, KeepRecentTokens: 10000,
 				MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
 			}
 			definition := mustDefine(
@@ -321,7 +322,7 @@ func TestNativeSessionIdlePreStartCancellationPublishesWaiterOnly(t *testing.T) 
 				loop.WithName("agent"), loop.WithInference(client, model), loop.WithDrainTimeout(200*time.Millisecond),
 				loop.WithContextCounter(counter),
 				loop.WithInferenceCapability(contextcount.InferenceCapability{Transport: contextcount.InferenceTransportLocal, Retention: contextcount.RetentionNone}),
-				loop.WithCompaction(loop.CompactionPolicy{CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 2 * time.Second, Hustle: "context.compact"}),
+				loop.WithCompaction(loop.CompactionPolicy{CounterPolicy: loop.CounterPolicyRequireExact, KeepRecentSegments: 1, KeepRecentTokens: 10000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 2 * time.Second, Hustle: "context.compact"}),
 			)
 			lifecycle, err := newTestLifecycle(definition, newRestoreStore(t), WithLifecycleHustles([]hustle.Definition{testHustleDefinition(t, "context.compact")}, testHustleLimits()))
 			if err != nil {

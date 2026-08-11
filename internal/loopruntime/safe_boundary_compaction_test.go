@@ -147,6 +147,14 @@ type preparationContextTool struct {
 	exited  chan struct{}
 }
 
+func task10CompactionBoundarySeed() RestoredState {
+	return RestoredState{
+		Msgs:      content.AgenticMessages{replacementTestMessage("prior history"), replacementTestMessage("committed history")},
+		TurnIndex: 1,
+		Basis:     event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{0x10}}, HasBasis: true,
+	}
+}
+
 func (t *preparationContextTool) Info(ctx context.Context) (*tool.ToolInfo, error) {
 	close(t.started)
 	<-ctx.Done()
@@ -341,12 +349,13 @@ func TestIdleManualCompactionBuildsStableBaseCandidate(t *testing.T) {
 			model := testModel()
 			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			basis := event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{0x81}}
-			transcript := content.AgenticMessages{replacementTestMessage("committed history")}
+			transcript := content.AgenticMessages{replacementTestMessage("prior history"), replacementTestMessage("committed history")}
 			actor, err := newRestoredWithConfig(ctx, uuid.UUID{0x82}, uuid.UUID{0x83}, recorder, runtimeConfig{
 				Client: client, Model: model, System: "stable system", DrainTimeout: 200 * time.Millisecond,
 				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
 				Compaction: &loop.CompactionPolicy{
 					CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20,
+					KeepRecentSegments: 1, KeepRecentTokens: 10000,
 					MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
 				},
 				compactionSink: executor,
@@ -391,8 +400,8 @@ func TestIdleManualCompactionBuildsStableBaseCandidate(t *testing.T) {
 				committed.PostContext.Basis.ThroughEventID != committed.EventID || committed.PostContext.InputTokens != 20 {
 				t.Fatalf("PostContext = %+v, want committed-derived basis and 20 tokens", committed.PostContext)
 			}
-			if input := compactor.capturedInput(); input.Basis != basis || !reflect.DeepEqual(input.Transcript, transcript) {
-				t.Fatalf("compactor input = %#v, want stable basis/transcript", input)
+			if input := compactor.capturedInput(); input.Basis != basis || !reflect.DeepEqual(input.Transcript, transcript[:1]) {
+				t.Fatalf("compactor input = %#v, want stable basis/projected head", input)
 			}
 			counter.mu.Lock()
 			requests := append([]inference.Request(nil), counter.requests...)
@@ -643,6 +652,7 @@ func TestIdleManualCompactionInterruptsPreCountWithoutStarting(t *testing.T) {
 				InferenceCapability: contextTestInferenceCapability(), DrainTimeout: 200 * time.Millisecond,
 				Compaction: &loop.CompactionPolicy{
 					CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20,
+					KeepRecentSegments: 1, KeepRecentTokens: 10000,
 					MaxSummaryTokens: 10, CountTimeout: 2 * time.Second, Hustle: "context.compact",
 				},
 				compactionSink: sink,
@@ -703,9 +713,9 @@ func TestIdleCompactionPreparationQueuesNewTurnBeforeMeasurement(t *testing.T) {
 			actor, err := newRestoredWithConfig(ctx, uuid.UUID{0xb1}, uuid.UUID{0xb2}, recorder, runtimeConfig{
 				Client: client, Model: model, ContextCounter: counter, CounterCapability: capability,
 				InferenceCapability: contextTestInferenceCapability(), DrainTimeout: 200 * time.Millisecond,
-				Compaction:     &loop.CompactionPolicy{CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 2 * time.Second, Hustle: "context.compact"},
+				Compaction:     &loop.CompactionPolicy{CounterPolicy: loop.CounterPolicyRequireExact, KeepRecentSegments: 1, KeepRecentTokens: 10000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 2 * time.Second, Hustle: "context.compact"},
 				compactionSink: executor,
-			}, RestoredState{Msgs: content.AgenticMessages{replacementTestMessage("history")}, TurnIndex: 1, Basis: event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{0xb0}}, HasBasis: true})
+			}, RestoredState{Msgs: content.AgenticMessages{replacementTestMessage("prior history"), replacementTestMessage("history")}, TurnIndex: 1, Basis: event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{0xb0}}, HasBasis: true})
 			if err != nil {
 				t.Fatalf("newRestoredWithConfig() error = %v", err)
 			}
@@ -770,7 +780,7 @@ func TestIdleCompactionToolDefinitionsUsePreparationContext(t *testing.T) {
 				Client: &scriptedLLM{}, Model: model, Tools: agenticToolSet([]tool.InvokableTool{blocking}, 25, 100),
 				ContextCounter: counter, CounterCapability: capability, InferenceCapability: contextTestInferenceCapability(),
 				DrainTimeout:   200 * time.Millisecond,
-				Compaction:     &loop.CompactionPolicy{CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 2 * time.Second, Hustle: "context.compact"},
+				Compaction:     &loop.CompactionPolicy{CounterPolicy: loop.CounterPolicyRequireExact, KeepRecentSegments: 1, KeepRecentTokens: 10000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 2 * time.Second, Hustle: "context.compact"},
 				compactionSink: sink,
 			}, RestoredState{Msgs: content.AgenticMessages{replacementTestMessage("history")}, TurnIndex: 1, Basis: event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{0xc0}}, HasBasis: true})
 			if err != nil {
@@ -843,11 +853,12 @@ func newRestoredIdleCompactionActor(
 		ContextCounter: counter, CounterCapability: capability, InferenceCapability: contextTestInferenceCapability(),
 		Compaction: &loop.CompactionPolicy{
 			CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20,
+			KeepRecentSegments: 1, KeepRecentTokens: 10000,
 			MaxSummaryTokens: 10, CountTimeout: 2 * time.Second, Hustle: "context.compact",
 		},
 		compactionSink: executor,
 	}, RestoredState{
-		Msgs: content.AgenticMessages{replacementTestMessage("committed history")}, TurnIndex: 1,
+		Msgs: content.AgenticMessages{replacementTestMessage("prior history"), replacementTestMessage("committed history")}, TurnIndex: 1,
 		Basis: event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{0x90}}, HasBasis: true,
 	})
 	if err != nil {
@@ -1191,18 +1202,19 @@ func TestLoopCompactsToolContinuationAtPostStepBoundary(t *testing.T) {
 			if err != nil {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
 			}
-			actor, err := newWithConfig(ctx, uuid.UUID{101}, uuid.UUID{102}, Provenance{}, recorder, runtimeConfig{
+			actor, err := newRestoredWithConfig(ctx, uuid.UUID{101}, uuid.UUID{102}, recorder, runtimeConfig{
 				Client: client, Model: model, System: "system", DrainTimeout: 200 * time.Millisecond,
 				Tools:          agenticToolSet([]tool.InvokableTool{&echoTool{name: "Echo", output: "tool output"}}, 25, 100),
 				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
 				Compaction: &loop.CompactionPolicy{
 					Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000,
+					KeepRecentSegments: 1, KeepRecentTokens: 10000,
 					ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
 				},
 				compactionSink: executor,
-			})
+			}, task10CompactionBoundarySeed())
 			if err != nil {
-				t.Fatalf("newWithConfig() error = %v", err)
+				t.Fatalf("newRestoredWithConfig() error = %v", err)
 			}
 			startTurn(t, actor, recorder, textBlocks("start"))
 			if terminal := drainToTerminal(t, recorder); reflect.TypeOf(terminal) != reflect.TypeOf(event.TurnDone{}) {
@@ -1264,18 +1276,19 @@ func TestLoopManualCompactionFreezesPostStepCandidate(t *testing.T) {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
 			}
 			sessionID, loopID := uuid.UUID{161}, uuid.UUID{162}
-			actor, err := newWithConfig(ctx, sessionID, loopID, Provenance{}, recorder, runtimeConfig{
+			actor, err := newRestoredWithConfig(ctx, sessionID, loopID, recorder, runtimeConfig{
 				Client: client, Model: model, DrainTimeout: 200 * time.Millisecond,
 				Tools:          agenticToolSet([]tool.InvokableTool{&echoTool{name: "Echo", output: "tool output"}}, 25, 100),
 				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
 				Compaction: &loop.CompactionPolicy{
 					CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20,
+					KeepRecentSegments: 1, KeepRecentTokens: 10000,
 					MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
 				},
 				compactionSink: executor,
-			})
+			}, task10CompactionBoundarySeed())
 			if err != nil {
-				t.Fatalf("newWithConfig() error = %v", err)
+				t.Fatalf("newRestoredWithConfig() error = %v", err)
 			}
 			startTurn(t, actor, recorder, textBlocks("start"))
 			select {
@@ -1334,8 +1347,8 @@ func TestLoopManualCompactionFreezesPostStepCandidate(t *testing.T) {
 			if input.Basis != postStep.Basis || input.RequestFingerprint != postStep.RequestFingerprint {
 				t.Fatalf("compactor candidate identity = basis %+v fingerprint %x, want %+v %x", input.Basis, input.RequestFingerprint, postStep.Basis, postStep.RequestFingerprint)
 			}
-			if len(input.Transcript) != 3 || !reflect.DeepEqual(input.Transcript[1:], steps[0].Messages) {
-				t.Fatalf("compactor transcript = %#v, want committed user plus first StepDone messages %#v", input.Transcript, steps[0].Messages)
+			if got, want := tailTexts(input.Transcript), []string{"prior history", "committed history"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("compactor transcript = %#v, want projected prior head %v", input.Transcript, want)
 			}
 			requests := client.requests()
 			if len(requests) != 2 || len(requests[1].Messages) != 1 || !reflect.DeepEqual(requests[1].Messages[0], validFinalizationSummary()) {
@@ -1391,18 +1404,19 @@ func TestLoopCompactionRejectionAdmissionAtToolContinuation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
 			}
-			actor, err := newWithConfig(ctx, uuid.UUID{131}, uuid.UUID{132}, Provenance{}, recorder, runtimeConfig{
+			actor, err := newRestoredWithConfig(ctx, uuid.UUID{131}, uuid.UUID{132}, recorder, runtimeConfig{
 				Client: client, Model: model, DrainTimeout: 200 * time.Millisecond,
 				Tools:          agenticToolSet([]tool.InvokableTool{&echoTool{name: "Echo", output: "tool output"}}, 25, 100),
 				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
 				Compaction: &loop.CompactionPolicy{
 					Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000,
+					KeepRecentSegments: 1, KeepRecentTokens: 10000,
 					ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
 				},
 				compactionSink: executor,
-			})
+			}, task10CompactionBoundarySeed())
 			if err != nil {
-				t.Fatalf("newWithConfig() error = %v", err)
+				t.Fatalf("newRestoredWithConfig() error = %v", err)
 			}
 			startTurn(t, actor, recorder, textBlocks("start"))
 			terminal := drainToTerminal(t, recorder)
@@ -1495,17 +1509,18 @@ func TestLoopTerminalCompactionRejectionPreservesProducedResponse(t *testing.T) 
 			if err != nil {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
 			}
-			actor, err := newWithConfig(ctx, uuid.UUID{141}, uuid.UUID{142}, Provenance{}, recorder, runtimeConfig{
+			actor, err := newRestoredWithConfig(ctx, uuid.UUID{141}, uuid.UUID{142}, recorder, runtimeConfig{
 				Client: client, Model: model, DrainTimeout: 200 * time.Millisecond,
 				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
 				Compaction: &loop.CompactionPolicy{
 					Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000,
+					KeepRecentSegments: 1, KeepRecentTokens: 10000,
 					ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
 				},
 				compactionSink: executor,
-			})
+			}, task10CompactionBoundarySeed())
 			if err != nil {
-				t.Fatalf("newWithConfig() error = %v", err)
+				t.Fatalf("newRestoredWithConfig() error = %v", err)
 			}
 			startTurn(t, actor, recorder, textBlocks("start"))
 			terminal := drainToTerminal(t, recorder)
@@ -1569,17 +1584,18 @@ func TestLoopTerminalResponseWaitsForCompactionAndRemainsUnchanged(t *testing.T)
 			if err != nil {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
 			}
-			actor, err := newWithConfig(ctx, uuid.UUID{111}, uuid.UUID{112}, Provenance{}, recorder, runtimeConfig{
+			actor, err := newRestoredWithConfig(ctx, uuid.UUID{111}, uuid.UUID{112}, recorder, runtimeConfig{
 				Client: client, Model: model, System: "system", DrainTimeout: 200 * time.Millisecond,
 				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
 				Compaction: &loop.CompactionPolicy{
 					Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000,
+					KeepRecentSegments: 1, KeepRecentTokens: 10000,
 					ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
 				},
 				compactionSink: executor,
-			})
+			}, task10CompactionBoundarySeed())
 			if err != nil {
-				t.Fatalf("newWithConfig() error = %v", err)
+				t.Fatalf("newRestoredWithConfig() error = %v", err)
 			}
 			startTurn(t, actor, recorder, textBlocks("start"))
 			select {
@@ -1669,17 +1685,18 @@ func TestLoopTerminalCompactionCancellationPreemptsProducedResponse(t *testing.T
 				t.Fatalf("newCompactionExecutor() error = %v", err)
 			}
 			sessionID, loopID := uuid.UUID{151}, uuid.UUID{152}
-			actor, err := newWithConfig(ctx, sessionID, loopID, Provenance{}, recorder, runtimeConfig{
+			actor, err := newRestoredWithConfig(ctx, sessionID, loopID, recorder, runtimeConfig{
 				Client: client, Model: model, DrainTimeout: 200 * time.Millisecond,
 				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
 				Compaction: &loop.CompactionPolicy{
 					Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000,
+					KeepRecentSegments: 1, KeepRecentTokens: 10000,
 					ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
 				},
 				compactionSink: executor,
-			})
+			}, task10CompactionBoundarySeed())
 			if err != nil {
-				t.Fatalf("newWithConfig() error = %v", err)
+				t.Fatalf("newRestoredWithConfig() error = %v", err)
 			}
 			inputID, _ := startTurn(t, actor, recorder, textBlocks("start"))
 			select {
@@ -1780,17 +1797,18 @@ func TestLoopStartedCompactionCancellationIsActorOwned(t *testing.T) {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
 			}
 			sessionID, loopID := uuid.UUID{121}, uuid.UUID{122}
-			actor, err := newWithConfig(ctx, sessionID, loopID, Provenance{}, recorder, runtimeConfig{
+			actor, err := newRestoredWithConfig(ctx, sessionID, loopID, recorder, runtimeConfig{
 				Client: &scriptedLLM{scripts: [][]content.Chunk{{textChunk("must not run")}}}, Model: model, DrainTimeout: 200 * time.Millisecond,
 				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
 				Compaction: &loop.CompactionPolicy{
 					Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000,
+					KeepRecentSegments: 1, KeepRecentTokens: 10000,
 					ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
 				},
 				compactionSink: executor,
-			})
+			}, task10CompactionBoundarySeed())
 			if err != nil {
-				t.Fatalf("newWithConfig() error = %v", err)
+				t.Fatalf("newRestoredWithConfig() error = %v", err)
 			}
 			startTurn(t, actor, recorder, textBlocks("start"))
 			select {
