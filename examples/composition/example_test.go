@@ -72,6 +72,7 @@ func Example_compactionAndDelegationComposition() {
 	}
 
 	policy := loop.CompactionPolicy{
+		KeepRecentSegments: 1, KeepRecentTokens: 512,
 		ReservedOutput: 1, MaxSummaryTokens: 128,
 		CountTimeout: time.Second, Hustle: hustle.Name("context.compact"),
 	}
