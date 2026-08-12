@@ -534,7 +534,6 @@ func TestCompactionCommittedRetainedHistoryRejectsMalformed(t *testing.T) {
 		{name: "unmatched tool call", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryCalls("unmatched")}},
 		{name: "result for unknown id", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryResult("unknown")}},
 		{name: "duplicate result", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryCalls("once"), compactionHistoryResult("once"), compactionHistoryResult("once")}},
-		{name: "tool pair crosses user boundary", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryCalls("crossing"), compactionHistoryUser("new user"), compactionHistoryResult("crossing")}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -595,6 +594,12 @@ func TestCompactionCommittedRetainedHistoryAcceptsProviderOrder(t *testing.T) {
 		{name: "assistant and user after completed pairs", retained: content.AgenticMessages{
 			compactionHistoryUser("user"), compactionHistoryCalls("first"), compactionHistoryResult("first"),
 			compactionHistoryAssistant("follow-up assistant"), compactionHistoryUser("next user"),
+		}},
+		// TurnFoldedInto can insert a folded user between a tool call and its
+		// result; selector-shaped retention expands to keep that complete pair.
+		{name: "folded user between tool call and result", retained: content.AgenticMessages{
+			compactionHistoryUser("anchor"), compactionHistoryCalls("folded-call"),
+			compactionHistoryUser("folded user"), compactionHistoryResult("folded-call"),
 		}},
 		{name: "old nil retained", retained: nil},
 		{name: "empty retained", retained: content.AgenticMessages{}},

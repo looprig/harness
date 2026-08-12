@@ -368,8 +368,9 @@ func validCompactionRetained(messages content.AgenticMessages) bool {
 // guaranteed by compaction-tail selection. An omitted or empty suffix is the
 // legacy summary-only representation and remains valid. A non-empty suffix is
 // a complete user-anchored sequence: an assistant tool-call batch is followed
-// by exactly one result for each call, with no other message allowed while a
-// batch is outstanding. This permits parallel calls/results (including result
+// by exactly one result for each call. Folded user messages may occur before
+// those results because TurnFoldedInto can add a user turn while the pair is
+// still outstanding. This permits parallel calls/results (including result
 // completion in any order) while rejecting orphan, duplicate, and crossing
 // pairs before restore can install them as provider history.
 func validCompactionRetainedHistory(messages content.AgenticMessages) bool {
@@ -385,7 +386,7 @@ func validCompactionRetainedHistory(messages content.AgenticMessages) bool {
 	for _, message := range messages {
 		switch typed := message.(type) {
 		case *content.UserMessage:
-			if typed == nil || typed.Role != content.RoleUser || len(outstanding) > 0 {
+			if typed == nil || typed.Role != content.RoleUser {
 				return false
 			}
 		case *content.AIMessage:
