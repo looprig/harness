@@ -2,7 +2,6 @@ package loopruntime
 
 import (
 	"encoding/json"
-	"math"
 
 	"github.com/looprig/core/content"
 )
@@ -11,9 +10,8 @@ import (
 // conversational boundary. Head is the history that may be summarized; Retained
 // is the newest protected suffix that must survive compaction unchanged.
 type compactionTailSelection struct {
-	Head           content.AgenticMessages
-	Retained       content.AgenticMessages
-	TargetExceeded bool
+	Head     content.AgenticMessages
+	Retained content.AgenticMessages
 }
 
 type compactionTailError struct{ field string }
@@ -66,7 +64,7 @@ func selectCompactionTail(
 		return compactionTailSelection{Head: cloneMessages(transcript)}, nil
 	}
 
-	startSegment, retainedTokens := chooseCompactionTailSegments(segments, maxSegments, maxTokens)
+	startSegment := chooseCompactionTailSegments(segments, maxSegments, maxTokens)
 	// A tool result can legally arrive after a user message folded into the
 	// running turn. If the initial suffix cut would separate its call from its
 	// result, move the cut to the call's segment. This can exceed either target,
@@ -84,24 +82,21 @@ func selectCompactionTail(
 			break
 		}
 		startSegment = adjusted
-		retainedTokens = compactionTailSegmentTokenSum(segments[startSegment:])
 	}
 
 	cut := segments[startSegment].start
 	retained := cloneMessages(transcript[cut:])
 	head := cloneMessages(transcript[:cut])
-	return compactionTailSelection{
-		Head: head, Retained: retained, TargetExceeded: retainedTokens > maxTokens,
-	}, nil
+	return compactionTailSelection{Head: head, Retained: retained}, nil
 }
 
 func chooseCompactionTailSegments(
 	segments []compactionTailSegment,
 	maxSegments int,
 	maxTokens content.TokenCount,
-) (start int, retainedTokens content.TokenCount) {
+) (start int) {
 	start = len(segments) - 1
-	retainedTokens = segments[start].tokens
+	retainedTokens := segments[start].tokens
 	retainedSegments := 1
 	for start > 0 && retainedSegments < maxSegments {
 		if retainedTokens > maxTokens {
@@ -115,18 +110,7 @@ func chooseCompactionTailSegments(
 		retainedSegments++
 		retainedTokens += candidate
 	}
-	return start, retainedTokens
-}
-
-func compactionTailSegmentTokenSum(segments []compactionTailSegment) content.TokenCount {
-	var total content.TokenCount
-	for _, segment := range segments {
-		if math.MaxUint64-uint64(total) < uint64(segment.tokens) {
-			return ^content.TokenCount(0)
-		}
-		total += segment.tokens
-	}
-	return total
+	return start
 }
 
 func compactionTailSegmentIndex(segments []compactionTailSegment, messageIndex int) int {

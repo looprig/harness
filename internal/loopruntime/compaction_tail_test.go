@@ -78,8 +78,8 @@ func TestSelectCompactionTailShortTranscriptIsNoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("selectCompactionTail() error = %v", err)
 	}
-	if len(selection.Head) != 0 || !reflect.DeepEqual(selection.Retained, transcript) || selection.TargetExceeded {
-		t.Fatalf("selection = head:%v retained:%v exceeded:%v, want no-op retained transcript", tailTexts(selection.Head), tailTexts(selection.Retained), selection.TargetExceeded)
+	if len(selection.Head) != 0 || !reflect.DeepEqual(selection.Retained, transcript) {
+		t.Fatalf("selection = head:%v retained:%v, want no-op retained transcript", tailTexts(selection.Head), tailTexts(selection.Retained))
 	}
 }
 
@@ -98,9 +98,6 @@ func TestSelectCompactionTailRetainsNewestUserAnchoredSegments(t *testing.T) {
 	}
 	if got, want := tailTexts(selection.Retained), []string{"second", "second-answer", "third", "third-answer"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("retained = %v, want %v", got, want)
-	}
-	if selection.TargetExceeded {
-		t.Fatal("TargetExceeded = true, want false")
 	}
 }
 
@@ -136,9 +133,6 @@ func TestSelectCompactionTailStopsAtTokenTarget(t *testing.T) {
 	if got, want := tailTexts(selection.Retained), []string{"new", "new answer"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("retained = %v, want %v", got, want)
 	}
-	if selection.TargetExceeded {
-		t.Fatal("TargetExceeded = true, want false")
-	}
 }
 
 func TestSelectCompactionTailRetainsNewestOversizedSegment(t *testing.T) {
@@ -160,8 +154,8 @@ func TestSelectCompactionTailRetainsNewestOversizedSegment(t *testing.T) {
 	if got, want := tailTexts(selection.Retained), []string{"new", "this segment is deliberately larger than its target"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("retained = %v, want %v", got, want)
 	}
-	if !selection.TargetExceeded {
-		t.Fatal("TargetExceeded = false, want true")
+	if got := tailTokenSum(t, selection.Retained); got <= newestTokens-1 {
+		t.Fatalf("retained token estimate = %d, want it to exceed target %d", got, newestTokens-1)
 	}
 }
 
@@ -206,12 +200,16 @@ func TestSelectCompactionTailMovesCutToKeepCrossSegmentToolPairTogether(t *testi
 		tailUser("old"), tailToolAI("call-a"),
 		tailUser("folded"), tailToolResult("call-a"),
 	}
-	selection, err := selectCompactionTail(transcript, 0, 1, 1000)
+	const maxTokens = content.TokenCount(1)
+	selection, err := selectCompactionTail(transcript, 0, 1, maxTokens)
 	if err != nil {
 		t.Fatalf("selectCompactionTail() error = %v", err)
 	}
 	if len(selection.Head) != 0 || len(selection.Retained) != len(transcript) {
 		t.Fatalf("selection split tool pair: head:%v retained:%v", tailTexts(selection.Head), tailTexts(selection.Retained))
+	}
+	if got := tailTokenSum(t, selection.Retained); got <= maxTokens {
+		t.Fatalf("retained token estimate = %d, want complete tool pair to exceed target %d", got, maxTokens)
 	}
 }
 
