@@ -69,9 +69,9 @@ type compactionPreparedSuccess struct {
 	Model              model.ModelKey
 	RequestFingerprint [32]byte
 	Summary            *content.UserMessage
-	// Retained is actor-private replacement material. It is never exposed by
-	// loop.CompactionOutput or persisted in CompactionCommitted; Task12 owns
-	// applying the retained suffix to live/restored state.
+	// Retained is actor-private replacement material until finalization, then is
+	// deep-cloned into the canonical CompactionCommitted event. It is never
+	// exposed by loop.CompactionOutput.
 	Retained  content.AgenticMessages
 	PostCount compactionPostCount
 }
@@ -318,6 +318,7 @@ func (f *compactionFinalizer) buildTerminal(
 		terminal = event.CompactionCommitted{
 			AttemptID: attempt.AttemptID, WaiterCommandIDs: append([]uuid.UUID(nil), attempt.WaiterCommandIDs...),
 			Reason: attempt.Reason, Basis: attempt.Basis, Summary: cloneUserMessage(proposal.Success.Summary),
+			Retained: cloneRetainedMessages(proposal.Success.Retained),
 			Duration: duration,
 		}
 	} else {

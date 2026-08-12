@@ -1497,7 +1497,7 @@ func runLoop(cfg loopConfig, state loopState) {
 							AttemptID: measured.attemptID,
 							Replacement: turnContextReplacement{
 								Summary:  cloneUserMessage(disposition.replacement.Summary),
-								Retained: cloneMessages(disposition.replacement.Retained),
+								Retained: cloneRetainedMessages(disposition.replacement.Retained),
 							},
 						}
 					default:
@@ -3025,7 +3025,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				replacementPlan.apply(&state, committed)
 				turnReplacement = &turnContextReplacement{
 					Summary:  cloneUserMessage(committed.Summary),
-					Retained: cloneMessages(proposal.Success.Retained),
+					Retained: cloneRetainedMessages(committed.Retained),
 				}
 			}
 			compactions.complete(outcome.attemptID)

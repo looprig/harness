@@ -507,6 +507,15 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"ForeignSessionBound", ForeignSessionBound{Header: fullHeaderLoop(), ForeignSID: "sid"}},
 		{"TurnStarted", TurnStarted{Header: fullHeaderTurn(), TurnIndex: 7, Message: userMsg("hi")}},
 		{"StepDone", StepDone{Header: fullHeader(), Messages: sampleMessages()}},
+		// CompactionCommitted's additive retained suffix uses the same tagged
+		// message codec as StepDone and must survive the generic enduring-event
+		// marshal/unmarshal path.
+		{"CompactionCommitted with retained", CompactionCommitted{
+			Header: fullHeaderLoop(), AttemptID: CompactAttemptID(seededUUID(0x91)),
+			WaiterCommandIDs: []uuid.UUID{seededUUID(0x92)}, Reason: CompactionReasonManual,
+			Basis: validCompactionMeasurement(1).Basis, Summary: userMsg("summary"), Retained: sampleMessages(),
+			PostContext: validCompactionMeasurement(2),
+		}},
 		{"TurnFoldedInto", TurnFoldedInto{Header: fullHeaderTurn(), TurnIndex: 2, Message: userMsg("fold")}},
 		{"InputCancelled", InputCancelled{Header: fullHeaderLoop(), TurnIndex: 1, Reason: CancelTurnInterrupted, Message: userMsg("retract")}},
 		{"TurnRejected", TurnRejected{Header: fullHeaderLoop(), Reason: RejectQueueFull}},

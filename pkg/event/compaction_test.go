@@ -327,6 +327,157 @@ func TestCompactionEnduringRoundTrip(t *testing.T) {
 	}
 }
 
+// Task 12's retained suffix is additive: records written before the field
+// existed must still decode as summary-only, while a record carrying a tagged
+// message array must survive the event codec with the exact message graph.
+func TestCompactionCommittedRetainedWireCompatibility(t *testing.T) {
+	t.Parallel()
+	base := CompactionCommitted{
+		Header: fullHeaderLoop(), AttemptID: CompactAttemptID(uuid.UUID{0xb1}),
+		WaiterCommandIDs: []uuid.UUID{{0xb2}}, Reason: CompactionReasonManual,
+		Basis: validCompactionMeasurement(1).Basis, Summary: compactionSummaryFixture(),
+		PostContext: validCompactionMeasurement(2),
+	}
+	oldWire, err := MarshalEvent(base)
+	if err != nil {
+		t.Fatalf("MarshalEvent(old): %v", err)
+	}
+	old, err := UnmarshalEvent(oldWire)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent(old): %v", err)
+	}
+	if committed, ok := old.(CompactionCommitted); !ok {
+		t.Fatalf("old event = %T, want CompactionCommitted", old)
+	} else if retainedField := reflect.ValueOf(committed).FieldByName("Retained"); retainedField.IsValid() && !retainedField.IsNil() {
+		t.Fatalf("old event retained = %#v, want nil", retainedField.Interface())
+	}
+
+	fields := map[string]json.RawMessage{}
+	if err := json.Unmarshal(oldWire, &fields); err != nil {
+		t.Fatalf("decode old wire: %v", err)
+	}
+	retained := content.AgenticMessages{
+		&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "retained user"}}}},
+		&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: "retained assistant"}}}},
+		&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: "retained tool"}}}, ToolUseID: "call-1"},
+	}
+	withRetained := base
+	withRetained.Retained = retained
+	newWire, err := MarshalEvent(withRetained)
+	if err != nil {
+		t.Fatalf("MarshalEvent(new): %v", err)
+	}
+	newFields := map[string]json.RawMessage{}
+	if err := json.Unmarshal(newWire, &newFields); err != nil {
+		t.Fatalf("decode new wire: %v", err)
+	}
+	if _, ok := newFields["retained"]; !ok {
+		t.Fatalf("new wire = %s, want retained field", newWire)
+	}
+	decoded, err := UnmarshalEvent(newWire)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent(new): %v", err)
+	}
+	committed, ok := decoded.(CompactionCommitted)
+	if !ok {
+		t.Fatalf("new event = %T, want CompactionCommitted", decoded)
+	}
+	field := reflect.ValueOf(committed).FieldByName("Retained")
+	if !field.IsValid() {
+		t.Fatal("CompactionCommitted has no Retained field")
+	}
+	got := field.Interface().(content.AgenticMessages)
+	if !reflect.DeepEqual(got, retained) {
+		t.Fatalf("retained = %#v, want %#v", got, retained)
+	}
+
+	// Both nil and an explicitly empty in-memory slice are omitted by the
+	// additive field's omitempty contract.
+	emptyValue := base
+	emptyValue.Retained = content.AgenticMessages{}
+	emptyWire, err := MarshalEvent(emptyValue)
+	if err != nil {
+		t.Fatalf("MarshalEvent(empty retained): %v", err)
+	}
+	emptyFields := map[string]json.RawMessage{}
+	if err := json.Unmarshal(emptyWire, &emptyFields); err != nil {
+		t.Fatalf("decode empty retained wire: %v", err)
+	}
+	if _, ok := emptyFields["retained"]; ok {
+		t.Fatalf("empty retained wire = %s, want retained omitted", emptyWire)
+	}
+
+	// Explicit [] is normalized to the same nil in-memory value as an omitted
+	// field, preserving omitempty's old/new fixed point.
+	newFields["retained"] = json.RawMessage(`[]`)
+	emptyWire, err = json.Marshal(newFields)
+	if err != nil {
+		t.Fatalf("marshal empty retained wire: %v", err)
+	}
+	emptyDecoded, err := UnmarshalEvent(emptyWire)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent(empty retained): %v", err)
+	}
+	emptyField := reflect.ValueOf(emptyDecoded.(CompactionCommitted)).FieldByName("Retained")
+	if !emptyField.IsNil() {
+		t.Fatalf("empty retained = %#v, want nil normalization", emptyField.Interface())
+	}
+}
+
+func TestCompactionCommittedRejectsInvalidRetainedWire(t *testing.T) {
+	t.Parallel()
+	base := CompactionCommitted{
+		Header: fullHeaderLoop(), AttemptID: CompactAttemptID(uuid.UUID{0xc1}),
+		WaiterCommandIDs: []uuid.UUID{{0xc2}}, Reason: CompactionReasonManual,
+		Basis: validCompactionMeasurement(1).Basis, Summary: compactionSummaryFixture(),
+		PostContext: validCompactionMeasurement(2),
+	}
+	wire, err := MarshalEvent(base)
+	if err != nil {
+		t.Fatalf("MarshalEvent: %v", err)
+	}
+	tests := []struct {
+		name      string
+		retained  string
+		decodeErr bool
+	}{
+		{name: "null message", retained: `[null]`},
+		{name: "unknown role", retained: `[{"role":"alien","blocks":[]}]`, decodeErr: true},
+		{name: "nil nested block", retained: `[{"role":"user","blocks":[null]}]`, decodeErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fields := map[string]json.RawMessage{}
+			if err := json.Unmarshal(wire, &fields); err != nil {
+				t.Fatal(err)
+			}
+			fields["retained"] = json.RawMessage(tt.retained)
+			mutated, err := json.Marshal(fields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := UnmarshalEvent(mutated)
+			if got != nil {
+				t.Fatalf("event = %#v, want nil", got)
+			}
+			if tt.decodeErr {
+				var decode *EventDecodeError
+				if !errors.As(err, &decode) || decode.Type != "CompactionCommitted" {
+					t.Fatalf("error = %T %v, want CompactionCommitted EventDecodeError", err, err)
+				}
+				return
+			}
+			var invalid *InvalidEventError
+			if !errors.As(err, &invalid) {
+				t.Fatalf("error = %T %v, want InvalidEventError", err, err)
+			}
+			if invalid.Event != "CompactionCommitted" || invalid.Field != FieldName("Retained") || invalid.Rule != RuleInvalid {
+				t.Fatalf("invalid = %#v, want CompactionCommitted/Retained/invalid", invalid)
+			}
+		})
+	}
+}
+
 func TestCompactionStartedCannotPersist(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

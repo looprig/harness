@@ -415,8 +415,9 @@ func TestIdleManualCompactionBuildsStableBaseCandidate(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Snapshot() error = %v", err)
 			}
-			if len(messages) != 1 || !reflect.DeepEqual(messages[0], validFinalizationSummary()) {
-				t.Fatalf("snapshot messages = %#v, want summary-only replacement", messages)
+			wantSnapshot := append(content.AgenticMessages{committed.Summary}, committed.Retained...)
+			if !reflect.DeepEqual(messages, wantSnapshot) {
+				t.Fatalf("snapshot messages = %#v, want summary plus retained replacement %#v", messages, wantSnapshot)
 			}
 			startTurn(t, actor, recorder, textBlocks("after compaction"))
 			if _, ok := drainToTerminal(t, recorder).(event.TurnDone); !ok {
@@ -1415,7 +1416,7 @@ func TestLoopCompactsToolContinuationAtPostStepBoundary(t *testing.T) {
 	tests := []struct {
 		name string
 	}{
-		{name: "post step attempt commits before summary only continuation"},
+		{name: "post step attempt commits before retained continuation"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1460,8 +1461,16 @@ func TestLoopCompactsToolContinuationAtPostStepBoundary(t *testing.T) {
 				t.Fatalf("terminal = %T %+v, want TurnDone", terminal, terminal)
 			}
 			requests := client.requests()
-			if len(requests) != 2 || len(requests[1].Messages) != 1 || !reflect.DeepEqual(requests[1].Messages[0], validFinalizationSummary()) {
-				t.Fatalf("primary requests = %#v, want second request with summary only", requests)
+			var committed event.CompactionCommitted
+			for _, published := range recorder.events() {
+				if value, ok := published.(event.CompactionCommitted); ok {
+					committed = value
+					break
+				}
+			}
+			wantMessages := append(content.AgenticMessages{committed.Summary}, committed.Retained...)
+			if len(requests) != 2 || !reflect.DeepEqual(requests[1].Messages, wantMessages) {
+				t.Fatalf("primary requests = %#v, want second request with summary plus retained %#v", requests, wantMessages)
 			}
 			var names []string
 			for _, published := range recorder.events() {
@@ -1590,8 +1599,9 @@ func TestLoopManualCompactionFreezesPostStepCandidate(t *testing.T) {
 				t.Fatalf("compactor transcript = %#v, want projected prior head %v", input.Transcript, want)
 			}
 			requests := client.requests()
-			if len(requests) != 2 || len(requests[1].Messages) != 1 || !reflect.DeepEqual(requests[1].Messages[0], validFinalizationSummary()) {
-				t.Fatalf("continuation request = %#v, want summary only", requests)
+			wantMessages := append(content.AgenticMessages{committed.Summary}, committed.Retained...)
+			if len(requests) != 2 || !reflect.DeepEqual(requests[1].Messages, wantMessages) {
+				t.Fatalf("continuation request = %#v, want summary plus retained %#v", requests, wantMessages)
 			}
 		})
 	}

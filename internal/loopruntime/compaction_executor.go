@@ -52,7 +52,7 @@ func selectCompactionExecutionCandidate(
 	if err != nil {
 		return candidate, event.CompactRejectUnavailable
 	}
-	candidate.Retained = cloneMessages(selection.Retained)
+	candidate.Retained = cloneRetainedMessages(selection.Retained)
 	if len(selection.Head) <= candidate.derivedPrefix {
 		return candidate, event.CompactRejectUnavailable
 	}
@@ -214,7 +214,7 @@ func (e *compactionExecutor) CoordinateCompactionCandidate(
 	candidate.Request.Messages = cloneMessages(candidate.Request.Messages)
 	candidate.RuntimeTail = cloneUserMessage(candidate.RuntimeTail)
 	candidate.Transcript = cloneMessages(candidate.Transcript)
-	candidate.Retained = cloneMessages(candidate.Retained)
+	candidate.Retained = cloneRetainedMessages(candidate.Retained)
 	input := cloneCompactionHookInput(disposition.input)
 	go func() { result <- e.execute(runCtx, attempt, candidate, input, disposition.hookScope) }()
 	return nil
@@ -307,7 +307,7 @@ func (e *compactionExecutor) preflightRetainedTail(
 		return nil
 	}
 	request := candidate.Request
-	request.Messages = cloneMessages(candidate.Retained)
+	request.Messages = cloneRetainedMessages(candidate.Retained)
 	if candidate.RuntimeTail != nil {
 		request.Messages = append(request.Messages, cloneUserMessage(candidate.RuntimeTail))
 		request.TransientMessages = 1
@@ -410,7 +410,7 @@ func (e *compactionExecutor) prepare(
 	request := candidate.Request
 	request.Messages = append(
 		content.AgenticMessages{cloneUserMessage(value.Summary)},
-		cloneMessages(candidate.Retained)...,
+		cloneRetainedMessages(candidate.Retained)...,
 	)
 	if candidate.RuntimeTail != nil {
 		request.Messages = append(request.Messages, cloneUserMessage(candidate.RuntimeTail))
@@ -442,7 +442,7 @@ func (e *compactionExecutor) prepare(
 		Proposal: compactionFinalizationProposal{Success: &compactionPreparedSuccess{
 			Model: candidate.Measurement.Model, RequestFingerprint: candidate.Measurement.RequestFingerprint,
 			Summary:  cloneUserMessage(value.Summary),
-			Retained: cloneMessages(candidate.Retained),
+			Retained: cloneRetainedMessages(candidate.Retained),
 			PostCount: compactionPostCount{
 				Model: measurement.Model, InputTokens: measurement.InputTokens, InputLimit: measurement.InputLimit,
 				Quality: measurement.Quality, Fingerprint: template,
