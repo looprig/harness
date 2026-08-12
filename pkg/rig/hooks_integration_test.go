@@ -893,6 +893,7 @@ func TestHooksIntegrationHustleInferenceIsNotNativeInference(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = live.Shutdown(context.Background()) })
 	waitForHookIntegrationTurn(t, ctx, live, "seed")
+	waitForHookIntegrationTurn(t, ctx, live, "prior history")
 	nativeInferences.Store(0)
 	sub, err := live.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
 	if err != nil {
