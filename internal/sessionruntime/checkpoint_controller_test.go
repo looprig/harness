@@ -2391,11 +2391,11 @@ func TestSessionIdleBestEffortDoesNotBlockCallerOnHeldWorkspaceLease(t *testing.
 	// test exercises the reported conflict rather than passing vacuously.
 	awaitQueued(t, coordinator, 1)
 
-	// The actor must not be held anywhere near the full policy timeout. 500ms is a
-	// generous, implementation-independent SLA: comfortably above a healthy
+	// The actor must not be held anywhere near the full policy timeout. One second is a
+	// generous, race-enabled test watchdog: comfortably above a healthy
 	// permit-acquire round trip, comfortably below the 2s policyTimeout the buggy
 	// code needs (it can only unblock once Acquire's own context times out).
-	const maxCallerWait = 500 * time.Millisecond
+	const maxCallerWait = time.Second
 	select {
 	case err := <-idleDone:
 		if err != nil {

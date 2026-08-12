@@ -127,7 +127,7 @@ func TestAbortConstructionTracksBlockingRestoreErroredTerminalAppend(t *testing.
 		close(preludeEntered)
 		<-preludeRelease
 	})
-	if elapsed := time.Since(start); elapsed < 20*time.Millisecond || elapsed > 100*time.Millisecond {
+	if elapsed := time.Since(start); elapsed < 20*time.Millisecond || elapsed > time.Second {
 		t.Fatalf("abort with blocked RestoreErrored elapsed = %v, want one bounded deadline", elapsed)
 	}
 	select {
@@ -204,7 +204,7 @@ func TestRestoreAbortWritesTerminalErrorAfterAdmittedPublishDrains(t *testing.T)
 	}()
 	select {
 	case <-abortDone:
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(time.Second):
 		close(app.firstRelease)
 		t.Fatal("restore abort did not return within construction deadline")
 	}

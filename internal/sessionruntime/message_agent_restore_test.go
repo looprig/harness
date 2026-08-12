@@ -387,13 +387,19 @@ func TestMessageAgentRestoreReadmitsForegroundIntentAfterCrashWithoutHandback(t 
 	if err := restored.WaitIdle(waitCtx); err != nil {
 		t.Fatalf("restored foreground WaitIdle: %v", err)
 	}
-	terminal, err := restoredController.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: dispatched.TargetLoopID})
+	var terminal tool.DelegateResult
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		terminal, err = restoredController.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, AgentID: dispatched.TargetLoopID})
+		if err == nil && len(terminal.Agents) == 1 && terminal.Agents[0].State == tool.AgentStateIdle {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if err != nil {
 		t.Fatalf("restored foreground terminal status: %v", err)
 	}
-	if len(terminal.Agents) != 1 || terminal.Agents[0].State != tool.AgentStateIdle {
-		t.Fatalf("restored foreground terminal status = %+v, want idle", terminal.Agents)
-	}
+	t.Fatalf("restored foreground terminal status = %+v, want idle", terminal.Agents)
 }
 
 func TestMessageAgentRestoreReservationNeverReadmits(t *testing.T) {

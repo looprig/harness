@@ -388,16 +388,26 @@ func TestEvidenceExecutionTimeoutPoisonsControllerWhenToolIgnoresCancellation(t 
 		MaxResultBytes: 1024, MaxEvidenceBytes: 2048,
 	}, 20*time.Millisecond)
 	controller := runtimeEvidenceControllerWith(t, sessionID, definition, &runtimeTestAudit{}, time.Second, 10*time.Millisecond)
+	var deadline *controlledDeadlineContext
+	controller.runtime.newExecutionContext = func(parent context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+		deadline = newControlledDeadlineContext(parent)
+		return deadline, deadline.expire
+	}
 
-	err := controller.RunAndFinalize(context.Background(), runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID), acceptResult, noOpFinalizer)
+	result := make(chan error, 1)
+	go func() {
+		result <- controller.RunAndFinalize(context.Background(), runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID), acceptResult, noOpFinalizer)
+	}()
+	select {
+	case <-blocking.started:
+	case <-time.After(time.Second):
+		t.Fatal("blocking tool did not start")
+	}
+	deadline.expire()
+	err := <-result
 	var runErr *RunError
 	if !errors.As(err, &runErr) || runErr.ReasonCode != hustle.ReasonTimeout {
 		t.Fatalf("error = %T %v, want run timeout", err, err)
-	}
-	select {
-	case <-blocking.started:
-	default:
-		t.Fatal("blocking tool did not start")
 	}
 	secondErr := controller.RunAndFinalize(context.Background(), runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID), acceptResult, noOpFinalizer)
 	var admission *AdmissionError
@@ -424,16 +434,26 @@ func TestEvidenceExecutionTimeoutPoisonsControllerWhenInferenceIgnoresCancellati
 		MaxResultBytes: 1024, MaxEvidenceBytes: 2048,
 	}, 20*time.Millisecond)
 	controller := runtimeEvidenceControllerWith(t, sessionID, definition, &runtimeTestAudit{}, time.Second, 10*time.Millisecond)
+	var deadline *controlledDeadlineContext
+	controller.runtime.newExecutionContext = func(parent context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+		deadline = newControlledDeadlineContext(parent)
+		return deadline, deadline.expire
+	}
 
-	err := controller.RunAndFinalize(context.Background(), runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID), acceptResult, noOpFinalizer)
+	result := make(chan error, 1)
+	go func() {
+		result <- controller.RunAndFinalize(context.Background(), runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID), acceptResult, noOpFinalizer)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("blocking inference did not start")
+	}
+	deadline.expire()
+	err := <-result
 	var runErr *RunError
 	if !errors.As(err, &runErr) || runErr.ReasonCode != hustle.ReasonTimeout {
 		t.Fatalf("error = %T %v, want run timeout", err, err)
-	}
-	select {
-	case <-started:
-	default:
-		t.Fatal("blocking inference did not start")
 	}
 	secondErr := controller.RunAndFinalize(context.Background(), runtimeEvidenceRequest(t, definition.Name(), sessionID, loopID), acceptResult, noOpFinalizer)
 	var admission *AdmissionError
@@ -736,6 +756,29 @@ type blockingEvidenceTool struct {
 	release chan struct{}
 	once    sync.Once
 }
+
+type controlledDeadlineContext struct {
+	context.Context
+	done chan struct{}
+	once sync.Once
+}
+
+func newControlledDeadlineContext(parent context.Context) *controlledDeadlineContext {
+	return &controlledDeadlineContext{Context: parent, done: make(chan struct{})}
+}
+
+func (c *controlledDeadlineContext) Done() <-chan struct{} { return c.done }
+
+func (c *controlledDeadlineContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func (c *controlledDeadlineContext) expire() { c.once.Do(func() { close(c.done) }) }
 
 type cancelAwareEvidenceTool struct {
 	*preparedEvidenceTool

@@ -27,6 +27,7 @@ type stubLLM struct {
 	chunks           []content.Chunk
 	blockUntilCancel bool
 	ignoreCtx        bool // with blockUntilCancel: block forever (provider ignores ctx)
+	started          chan<- struct{}
 }
 
 type channelBackend struct {
@@ -48,6 +49,12 @@ func (s *stubLLM) Invoke(ctx context.Context, req inference.Request) (*inference
 	return nil, errors.New("stubLLM.Invoke not used")
 }
 func (s *stubLLM) Stream(ctx context.Context, req inference.Request) (*stream.StreamReader[content.Chunk], error) {
+	if s.started != nil {
+		select {
+		case s.started <- struct{}{}:
+		default:
+		}
+	}
 	i := 0
 	next := func() (content.Chunk, error) {
 		if i < len(s.chunks) {
@@ -65,6 +72,42 @@ func (s *stubLLM) Stream(ctx context.Context, req inference.Request) (*stream.St
 		return nil, io.EOF
 	}
 	return stream.NewStreamReader(next, nil), nil
+}
+
+type shutdownObservingBackend struct {
+	backend  loop.Backend
+	commands chan command.Command
+	received chan struct{}
+}
+
+func observeShutdown(backend loop.Backend) *shutdownObservingBackend {
+	observed := &shutdownObservingBackend{
+		backend: backend, commands: make(chan command.Command), received: make(chan struct{}),
+	}
+	go func() {
+		for {
+			select {
+			case cmd := <-observed.commands:
+				select {
+				case observed.backend.CommandSink() <- cmd:
+					if _, ok := cmd.(command.Shutdown); ok {
+						close(observed.received)
+					}
+				case <-observed.backend.DoneChan():
+					return
+				}
+			case <-observed.backend.DoneChan():
+				return
+			}
+		}
+	}()
+	return observed
+}
+
+func (b *shutdownObservingBackend) CommandSink() chan<- command.Command { return b.commands }
+func (b *shutdownObservingBackend) DoneChan() <-chan struct{}           { return b.backend.DoneChan() }
+func (b *shutdownObservingBackend) Snapshot(ctx context.Context) (content.AgenticMessages, event.TurnIndex, error) {
+	return b.backend.Snapshot(ctx)
 }
 
 // recordingSub drains a hub Subscription — the same consumer API the TUI/CLI use
@@ -1120,7 +1163,8 @@ func TestShutdownCtxCancelledBeforeSend(t *testing.T) {
 func TestShutdownSurfacesLoopTerminatedError(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
-	s, err := newTestSession(ctx, cfg(&stubLLM{blockUntilCancel: true, ignoreCtx: true}))
+	providerStarted := make(chan struct{}, 1)
+	s, err := newTestSession(ctx, cfg(&stubLLM{blockUntilCancel: true, ignoreCtx: true, started: providerStarted}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -1128,12 +1172,27 @@ func TestShutdownSurfacesLoopTerminatedError(t *testing.T) {
 	if _, err := s.Submit(context.Background(), nil); err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
-	time.Sleep(40 * time.Millisecond)
+	select {
+	case <-providerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not start")
+	}
+	s.loopsMu.Lock()
+	handle := s.loops[s.activeLoopID]
+	observed := observeShutdown(handle.backend)
+	handle.backend = observed
+	s.loopsMu.Unlock()
 
 	// Shutdown parks waiting for the (never-arriving) internal result.
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.Shutdown(context.Background()) }()
-	time.Sleep(40 * time.Millisecond) // ensure the Shutdown command reached the actor
+	select {
+	case <-observed.received:
+	case err := <-errCh:
+		t.Fatalf("Shutdown returned before reaching the loop: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown command did not reach the loop")
+	}
 
 	cancel() // root-ctx kill: after DrainTimeout the actor acks LoopTerminatedError then closes Done
 
