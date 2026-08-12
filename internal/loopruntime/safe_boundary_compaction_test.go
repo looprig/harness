@@ -1150,9 +1150,9 @@ func TestCompactionExecutorPreflightsRetainedTailBeforeCompactor(t *testing.T) {
 	compactor := &retainedTailTestCompactor{summary: validFinalizationSummary()}
 	counter := &sequenceContextCounter{
 		capability: capability,
-		// The first count is the tail-only feasibility request. It exactly fits
-		// the tail + summary budget at the candidate input limit; reserved output
-		// has already been removed by ResolveContextLimits.
+		// The first count is the tail-only feasibility request. Equality with the
+		// candidate input limit is rejected because post-count treats the limit as
+		// exclusive; reserved output has already been removed upstream.
 		counts: []content.TokenCount{100, 40},
 	}
 	executor, err := newCompactionExecutor(context.Background(), compactionExecutorConfig{
@@ -1188,11 +1188,40 @@ func TestCompactionExecutorPreflightsRetainedTailBeforeCompactor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AwaitCompaction() error = %v", err)
 	}
+	if result.Disposition != contextCompactionAwaitRejected || result.Proposal.RejectReason != event.CompactRejectRetainedTailTooLarge {
+		t.Fatalf("result = %+v, want equality retained-tail rejection", result)
+	}
+	if compactor.called != 0 || len(counter.requests) != 1 {
+		t.Fatalf("equality compactor/counter calls = %d/%d, want zero/one", compactor.called, len(counter.requests))
+	}
+
+	// One below the exclusive limit must pass preflight and reach the compactor.
+	modelValue.Limits = testContextLimits{WindowTokens: 150, MaxInputTokens: 111, MaxOutputTokens: 20}
+	candidate.Request.Model = modelValue
+	candidate.Measurement.InputLimit = 111
+	compactor = &retainedTailTestCompactor{summary: validFinalizationSummary()}
+	counter = &sequenceContextCounter{capability: capability, counts: []content.TokenCount{100, 40}}
+	executor, err = newCompactionExecutor(context.Background(), compactionExecutorConfig{
+		Compactor: compactor, Counter: counter, CounterCapability: capability,
+		Settings: contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second}, MaxSummaryTokens: 10,
+	})
+	if err != nil {
+		t.Fatalf("newCompactionExecutor(one-below) error = %v", err)
+	}
+	if err := executor.CoordinateCompactionCandidate(context.Background(), compactionDisposition{
+		Kind: compactionDispositionStart, Attempt: &attempt,
+	}, candidate); err != nil {
+		t.Fatalf("CoordinateCompactionCandidate(one-below) error = %v", err)
+	}
+	result, err = executor.AwaitCompaction(context.Background(), attempt.AttemptID)
+	if err != nil {
+		t.Fatalf("AwaitCompaction(one-below) error = %v", err)
+	}
 	if result.Disposition != contextCompactionAwaitCommitted || result.Proposal.Success == nil {
-		t.Fatalf("result = %+v, want committed exact-fit retained tail", result)
+		t.Fatalf("result = %+v, want committed one-below retained tail", result)
 	}
 	if compactor.called != 1 {
-		t.Fatalf("compactor calls = %d, want one after exact-fit preflight", compactor.called)
+		t.Fatalf("compactor calls = %d, want one after one-below preflight", compactor.called)
 	}
 	if len(counter.requests) != 2 {
 		t.Fatalf("counter calls = %d, want feasibility and post-count", len(counter.requests))
@@ -1228,7 +1257,7 @@ func TestCompactionExecutorPreflightsRetainedTailBeforeCompactor(t *testing.T) {
 	// The one-over case must reject before any compactor call, while preserving
 	// the candidate's original full-request identity for the eventual CAS path.
 	compactor = &retainedTailTestCompactor{summary: validFinalizationSummary()}
-	counter = &sequenceContextCounter{capability: capability, counts: []content.TokenCount{101}}
+	counter = &sequenceContextCounter{capability: capability, counts: []content.TokenCount{102}}
 	executor, err = newCompactionExecutor(context.Background(), compactionExecutorConfig{
 		Compactor: compactor, Counter: counter, CounterCapability: capability,
 		Settings: contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second}, MaxSummaryTokens: 10,

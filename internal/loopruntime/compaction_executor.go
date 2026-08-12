@@ -340,7 +340,7 @@ func retainedTailFits(tailTokens, maxSummaryTokens, inputLimit content.TokenCoun
 		return false
 	}
 	total += uint64(maxSummaryTokens)
-	return total <= uint64(inputLimit)
+	return total < uint64(inputLimit)
 }
 
 type compactionOperationError struct {
