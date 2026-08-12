@@ -390,6 +390,48 @@ func TestMarshalCompactionInputWithinReplacesMultipleOldToolResultsInOrder(t *te
 	}
 }
 
+func TestMarshalCompactionInputWithinSkipsEarlyStubThatGrowsSerializedInput(t *testing.T) {
+	t.Parallel()
+	const stub = "[old tool result omitted for compaction]"
+	const shortBody = "x"
+	original := compactionInputWithToolBodies(shortBody, strings.Repeat("l", 500))
+	wantInput := compactionInputWithToolBodies(shortBody, stub)
+	bothStubbedInput := compactionInputWithToolBodies(stub, stub)
+	want, err := marshalCompactionInput(wantInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bothStubbed, err := marshalCompactionInput(bothStubbedInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := marshalCompactionInput(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initial) <= len(want) || len(bothStubbed) <= len(want) {
+		t.Fatalf("fixture sizes initial=%d want=%d both-stubbed=%d do not exercise non-monotonic fitting", len(initial), len(want), len(bothStubbed))
+	}
+
+	fitted, err := marshalCompactionInputWithin(original, len(want))
+	if err != nil {
+		t.Fatalf("marshalCompactionInputWithin() error = %v, want preserved short result plus later omission", err)
+	}
+	if got, wantLen := len(fitted), len(want); got != wantLen {
+		t.Fatalf("fitted wire length = %d, want exact boundary %d", got, wantLen)
+	}
+	decoded, err := unmarshalCompactionInput(fitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decoded.Transcript[1].(*content.ToolResultMessage).Blocks[0].(*content.TextBlock).Text; got != shortBody {
+		t.Fatalf("short oldest result = %q, want preserved body %q", got, shortBody)
+	}
+	if got := decoded.Transcript[3].(*content.ToolResultMessage).Blocks[0].(*content.TextBlock).Text; got != stub {
+		t.Fatalf("later result = %q, want stub %q", got, stub)
+	}
+}
+
 func TestCompactionAdapterRejectsProtectedOversizedInputBeforeRunner(t *testing.T) {
 	t.Parallel()
 	input := validCompactionInput(t)

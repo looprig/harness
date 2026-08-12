@@ -255,11 +255,22 @@ func marshalCompactionInputWithin(input loop.CompactionInput, inputBytes int) (j
 		if !ok || toolResult == nil || len(toolResult.Blocks) == 0 {
 			continue
 		}
+		originalBlocks := toolResult.Blocks
 		toolResult.Blocks = []content.Block{&content.TextBlock{Text: compactionOldToolResultStub}}
-		raw, err = marshalCompactionInput(cloned)
-		if err != nil {
-			return nil, err
+		candidate, marshalErr := marshalCompactionInput(cloned)
+		if marshalErr != nil {
+			return nil, marshalErr
 		}
+		// Compare the complete JSON candidate, not the body strings: escaping,
+		// metadata, and wrapper structure all contribute to the actual limit.
+		// A short result can make the fixed stub larger, so do not commit a
+		// non-shrinking candidate; leave the clone unchanged and try the next
+		// chronological result.
+		if len(candidate) >= len(raw) {
+			toolResult.Blocks = originalBlocks
+			continue
+		}
+		raw = candidate
 		if len(raw) <= inputBytes {
 			return raw, nil
 		}
