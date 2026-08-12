@@ -3,6 +3,7 @@ package loopruntime
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/looprig/core/content"
 )
@@ -98,7 +99,7 @@ func projectCompactionMessage(message content.Conversation) (content.Conversatio
 			return nil, err
 		}
 		return &content.ToolResultMessage{
-			Message:   content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: capCompactionToolResult(body)}}},
+			Message:   content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: body}}},
 			ToolUseID: typed.ToolUseID,
 			IsError:   typed.IsError,
 		}, nil
@@ -129,15 +130,167 @@ func projectCompactionToolResultBody(blocks []content.Block, depth int) (string,
 	if depth > compactionProjectionMaxDepth {
 		return "", &compactionProjectionError{field: "depth"}
 	}
-	var body strings.Builder
+	var accumulator compactionRuneAccumulator
 	for _, block := range blocks {
-		text, err := projectCompactionBlock(block, depth)
-		if err != nil {
+		if err := accumulator.appendBlock(block, depth); err != nil {
 			return "", err
 		}
-		body.WriteString(text)
 	}
-	return body.String(), nil
+	return accumulator.string(), nil
+}
+
+// compactionRuneFragment retains one rune's original bytes. Keeping fragments
+// rather than []rune preserves Go's range semantics for invalid UTF-8 while
+// bounding auxiliary storage to the projection cap.
+type compactionRuneFragment struct {
+	bytes [utf8.UTFMax]byte
+	count int
+}
+
+type compactionRuneAccumulator struct {
+	head      []compactionRuneFragment
+	tail      []compactionRuneFragment
+	tailStart int
+	tailCount int
+	total     int
+}
+
+func (a *compactionRuneAccumulator) appendBlock(block content.Block, depth int) error {
+	if depth > compactionProjectionMaxDepth || block == nil {
+		return &compactionProjectionError{field: "block"}
+	}
+	switch typed := block.(type) {
+	case *content.TextBlock:
+		if typed == nil {
+			return &compactionProjectionError{field: "block"}
+		}
+		a.appendString(typed.Text)
+	case *content.ToolUseBlock:
+		if typed == nil {
+			return &compactionProjectionError{field: "block"}
+		}
+		a.appendString("[called tool: ")
+		a.appendString(typed.Name)
+		a.appendString("]")
+	case *content.ThinkingBlock:
+		if typed == nil {
+			return &compactionProjectionError{field: "block"}
+		}
+		a.appendString(compactionThinkingPlaceholder)
+	case *content.ImageBlock:
+		if typed == nil {
+			return &compactionProjectionError{field: "block"}
+		}
+		a.appendString(compactionImagePlaceholder)
+	case *content.AudioBlock:
+		if typed == nil {
+			return &compactionProjectionError{field: "block"}
+		}
+		a.appendString(compactionAudioPlaceholder)
+	case *content.DocumentBlock:
+		if typed == nil {
+			return &compactionProjectionError{field: "block"}
+		}
+		a.appendString(compactionDocumentPlaceholder)
+	case *content.ToolResultBlock:
+		if typed == nil {
+			return &compactionProjectionError{field: "block"}
+		}
+		nested, err := projectCompactionToolResultBody(typed.Content, depth+1)
+		if err != nil {
+			return err
+		}
+		a.appendString(nested)
+	default:
+		return &compactionProjectionError{field: "block"}
+	}
+	return nil
+}
+
+func (a *compactionRuneAccumulator) appendString(value string) {
+	for offset := 0; offset < len(value); {
+		runeValue, size := utf8.DecodeRuneInString(value[offset:])
+		if runeValue == utf8.RuneError && size == 0 {
+			size = 1
+		}
+		var fragment compactionRuneFragment
+		fragment.count = size
+		copy(fragment.bytes[:], value[offset:offset+size])
+		a.append(fragment)
+		offset += size
+	}
+}
+
+func (a *compactionRuneAccumulator) append(fragment compactionRuneFragment) {
+	a.total++
+	if len(a.head) < compactionToolResultRunes {
+		a.head = append(a.head, fragment)
+	}
+	if len(a.tail) < compactionToolResultRunes {
+		a.tail = append(a.tail, fragment)
+		a.tailCount++
+		return
+	}
+	a.tail[a.tailStart] = fragment
+	a.tailStart = (a.tailStart + 1) % compactionToolResultRunes
+}
+
+func (a *compactionRuneAccumulator) string() string {
+	if a.total <= compactionToolResultRunes {
+		return a.fragmentsString(a.head, 0, len(a.head))
+	}
+	marker := fmt.Sprintf(compactionToolResultTruncatedMarker, a.total)
+	for iteration := 0; iteration < 8; iteration++ {
+		available := compactionToolResultRunes - utf8.RuneCountInString(marker)
+		if available <= 0 {
+			return string([]rune(marker)[:compactionToolResultRunes])
+		}
+		headCount := available / 2
+		tailCount := available - headCount
+		updated := fmt.Sprintf(compactionToolResultTruncatedMarker, a.total-headCount-tailCount)
+		if updated == marker {
+			return a.fragmentsStringWithMarker(headCount, marker, tailCount)
+		}
+		marker = updated
+	}
+	available := compactionToolResultRunes - utf8.RuneCountInString(marker)
+	if available <= 0 {
+		return string([]rune(marker)[:compactionToolResultRunes])
+	}
+	headCount := available / 2
+	tailCount := available - headCount
+	return a.fragmentsStringWithMarker(headCount, marker, tailCount)
+}
+
+func (a *compactionRuneAccumulator) fragmentsStringWithMarker(headCount int, marker string, tailCount int) string {
+	var builder strings.Builder
+	builder.Grow(len(marker) + headCount + tailCount)
+	a.writeFragments(&builder, a.head, 0, headCount)
+	builder.WriteString(marker)
+	start := (a.tailStart + a.tailCount - tailCount) % compactionToolResultRunes
+	a.writeFragmentsRing(&builder, start, tailCount)
+	return builder.String()
+}
+
+func (a *compactionRuneAccumulator) fragmentsString(fragments []compactionRuneFragment, start, count int) string {
+	var builder strings.Builder
+	for index := start; index < start+count; index++ {
+		builder.Write(fragments[index].bytes[:fragments[index].count])
+	}
+	return builder.String()
+}
+
+func (a *compactionRuneAccumulator) writeFragments(builder *strings.Builder, fragments []compactionRuneFragment, start, count int) {
+	for index := start; index < start+count; index++ {
+		builder.Write(fragments[index].bytes[:fragments[index].count])
+	}
+}
+
+func (a *compactionRuneAccumulator) writeFragmentsRing(builder *strings.Builder, start, count int) {
+	for index := 0; index < count; index++ {
+		fragment := a.tail[(start+index)%compactionToolResultRunes]
+		builder.Write(fragment.bytes[:fragment.count])
+	}
 }
 
 func projectCompactionBlock(block content.Block, depth int) (string, error) {

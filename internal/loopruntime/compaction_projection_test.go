@@ -1,7 +1,9 @@
 package loopruntime
 
 import (
+	"fmt"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -140,6 +142,151 @@ func TestProjectCompactionTranscriptCapsNestedOversizedToolResult(t *testing.T) 
 	if !strings.Contains(text, "[tool result truncated for compaction") {
 		t.Fatalf("nested tool result projection = %q, want truncation marker", text)
 	}
+}
+
+func TestProjectCompactionTranscriptLargeToolResultUsesBoundedAllocation(t *testing.T) {
+	const largeRunes = 16 << 20
+	small := content.AgenticMessages{&content.ToolResultMessage{Message: content.Message{
+		Role: content.RoleTool,
+		Blocks: []content.Block{&content.ToolResultBlock{Content: []content.Block{
+			&content.TextBlock{Text: strings.Repeat("small", 8)},
+		}}},
+	}, ToolUseID: "small"}}
+	large := content.AgenticMessages{&content.ToolResultMessage{Message: content.Message{
+		Role: content.RoleTool,
+		Blocks: []content.Block{&content.ToolResultBlock{Content: []content.Block{
+			&content.TextBlock{Text: strings.Repeat("large", largeRunes/5)},
+		}}},
+	}, ToolUseID: "large"}}
+
+	smallAllocs := testing.AllocsPerRun(3, func() {
+		if _, err := projectCompactionTranscript(small); err != nil {
+			t.Fatalf("small projection error = %v", err)
+		}
+	})
+	largeAllocs := testing.AllocsPerRun(3, func() {
+		if _, err := projectCompactionTranscript(large); err != nil {
+			t.Fatalf("large projection error = %v", err)
+		}
+	})
+	smallBytes := projectionTotalAllocBytes(t, small)
+	largeBytes := projectionTotalAllocBytes(t, large)
+	t.Logf("projection allocations: small=%.0f large=%.0f; bytes: small=%d large=%d", smallAllocs, largeAllocs, smallBytes, largeBytes)
+	if largeAllocs > smallAllocs*2+1 {
+		t.Fatalf("large projection allocations = %.0f, small = %.0f; cap should avoid input-sized allocation", largeAllocs, smallAllocs)
+	}
+	if largeBytes > smallBytes*32+1<<20 {
+		t.Fatalf("large projection allocated %d bytes, small = %d; cap should bound auxiliary memory", largeBytes, smallBytes)
+	}
+}
+
+func TestProjectCompactionTranscriptBoundedAccumulatorMatchesReference(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		blocks []content.Block
+	}{
+		{name: "empty", blocks: []content.Block{&content.TextBlock{Text: ""}}},
+		{name: "ascii boundary", blocks: []content.Block{&content.TextBlock{Text: strings.Repeat("a", 2000)}, &content.TextBlock{Text: "b"}}},
+		{name: "multibyte", blocks: []content.Block{&content.TextBlock{Text: strings.Repeat("界", 2001)}}},
+		{name: "invalid utf8", blocks: []content.Block{&content.TextBlock{Text: string([]byte{'a', 0xff, 'z'})}}},
+		{name: "nested and typed", blocks: []content.Block{
+			&content.ToolResultBlock{Content: []content.Block{&content.TextBlock{Text: strings.Repeat("nested", 500)}}},
+			&content.ToolUseBlock{Name: "search"},
+			&content.ThinkingBlock{Thinking: "hidden"},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := content.AgenticMessages{&content.ToolResultMessage{Message: content.Message{
+				Role: content.RoleTool, Blocks: tt.blocks,
+			}}}
+			projected, err := projectCompactionTranscript(input)
+			if err != nil {
+				t.Fatalf("projection error = %v", err)
+			}
+			got := projectedText(t, projected[0])
+			want, err := referenceCompactionToolResultBody(tt.blocks, 0)
+			if err != nil {
+				t.Fatalf("reference error = %v", err)
+			}
+			if got != want {
+				t.Fatalf("bounded output differs from reference: got %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func referenceCompactionToolResultBody(blocks []content.Block, depth int) (string, error) {
+	if depth > compactionProjectionMaxDepth {
+		return "", &compactionProjectionError{field: "depth"}
+	}
+	var body strings.Builder
+	for _, block := range blocks {
+		text, err := referenceCompactionBlock(block, depth)
+		if err != nil {
+			return "", err
+		}
+		body.WriteString(text)
+	}
+	return capCompactionToolResult(body.String()), nil
+}
+
+func referenceCompactionBlock(block content.Block, depth int) (string, error) {
+	if depth > compactionProjectionMaxDepth || block == nil {
+		return "", &compactionProjectionError{field: "block"}
+	}
+	switch typed := block.(type) {
+	case *content.TextBlock:
+		if typed == nil {
+			return "", &compactionProjectionError{field: "block"}
+		}
+		return typed.Text, nil
+	case *content.ToolUseBlock:
+		if typed == nil {
+			return "", &compactionProjectionError{field: "block"}
+		}
+		return "[called tool: " + typed.Name + "]", nil
+	case *content.ThinkingBlock:
+		if typed == nil {
+			return "", &compactionProjectionError{field: "block"}
+		}
+		return compactionThinkingPlaceholder, nil
+	case *content.ImageBlock:
+		if typed == nil {
+			return "", &compactionProjectionError{field: "block"}
+		}
+		return compactionImagePlaceholder, nil
+	case *content.AudioBlock:
+		if typed == nil {
+			return "", &compactionProjectionError{field: "block"}
+		}
+		return compactionAudioPlaceholder, nil
+	case *content.DocumentBlock:
+		if typed == nil {
+			return "", &compactionProjectionError{field: "block"}
+		}
+		return compactionDocumentPlaceholder, nil
+	case *content.ToolResultBlock:
+		if typed == nil {
+			return "", &compactionProjectionError{field: "block"}
+		}
+		return referenceCompactionToolResultBody(typed.Content, depth+1)
+	default:
+		return "", fmt.Errorf("unknown reference block %T", block)
+	}
+}
+
+func projectionTotalAllocBytes(t *testing.T, messages content.AgenticMessages) uint64 {
+	t.Helper()
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := projectCompactionTranscript(messages); err != nil {
+		t.Fatalf("projection error = %v", err)
+	}
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
 }
 
 func TestProjectCompactionTranscriptUsesTypedPlaceholders(t *testing.T) {
