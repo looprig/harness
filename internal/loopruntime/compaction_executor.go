@@ -321,7 +321,7 @@ func (e *compactionExecutor) preflightRetainedTail(
 	if err != nil {
 		return ptrContextCompactionAwaitResult(rejectedCompactionResultWithError(compactionRejectReason(err), err))
 	}
-	if !retainedTailFits(tailMeasurement.InputTokens, e.config.MaxSummaryTokens, e.config.Settings.ReservedOutput, candidate.Measurement.InputLimit) {
+	if !retainedTailFits(tailMeasurement.InputTokens, e.config.MaxSummaryTokens, candidate.Measurement.InputLimit) {
 		reason := event.CompactRejectRetainedTailTooLarge
 		return ptrContextCompactionAwaitResult(rejectedCompactionResultWithError(reason, &compactionRetainedTailTooLargeError{
 			Candidate: candidate.Measurement, Tail: tailMeasurement,
@@ -334,16 +334,12 @@ func ptrContextCompactionAwaitResult(value contextCompactionAwaitResult) *contex
 	return &value
 }
 
-func retainedTailFits(tailTokens, maxSummaryTokens, reservedOutput, inputLimit content.TokenCount) bool {
+func retainedTailFits(tailTokens, maxSummaryTokens, inputLimit content.TokenCount) bool {
 	total := uint64(tailTokens)
 	if math.MaxUint64-total < uint64(maxSummaryTokens) {
 		return false
 	}
 	total += uint64(maxSummaryTokens)
-	if math.MaxUint64-total < uint64(reservedOutput) {
-		return false
-	}
-	total += uint64(reservedOutput)
 	return total <= uint64(inputLimit)
 }
 

@@ -1142,7 +1142,7 @@ func TestCompactionExecutorPreflightsRetainedTailBeforeCompactor(t *testing.T) {
 
 	capability := contextTestCapability(contextcount.CountQualityExactLocal)
 	modelValue := testModel()
-	modelValue.Limits = testContextLimits{WindowTokens: 150, MaxInputTokens: 130, MaxOutputTokens: 20}
+	modelValue.Limits = testContextLimits{WindowTokens: 150, MaxInputTokens: 110, MaxOutputTokens: 20}
 	basis := event.ContextBasis{Revision: 7, ThroughEventID: uuid.UUID{7}}
 	fingerprint := [32]byte{8}
 	retained := replacementTestMessage("retained")
@@ -1151,7 +1151,8 @@ func TestCompactionExecutorPreflightsRetainedTailBeforeCompactor(t *testing.T) {
 	counter := &sequenceContextCounter{
 		capability: capability,
 		// The first count is the tail-only feasibility request. It exactly fits
-		// tail + summary budget + reserved output at the candidate input limit.
+		// the tail + summary budget at the candidate input limit; reserved output
+		// has already been removed by ResolveContextLimits.
 		counts: []content.TokenCount{100, 40},
 	}
 	executor, err := newCompactionExecutor(context.Background(), compactionExecutorConfig{
@@ -1166,7 +1167,7 @@ func TestCompactionExecutorPreflightsRetainedTailBeforeCompactor(t *testing.T) {
 	candidate := compactionExecutionCandidate{
 		Measurement: event.ContextMeasurement{
 			Basis: basis, Model: modelValue.Key(), RequestFingerprint: fingerprint,
-			InputTokens: 120, InputLimit: 130, Quality: contextcount.CountQualityExactLocal,
+			InputTokens: 120, InputLimit: 110, Quality: contextcount.CountQualityExactLocal,
 		},
 		Request: inference.Request{
 			Model: modelValue, System: "system",
