@@ -358,7 +358,10 @@ func TestCompactionCommittedRetainedWireCompatibility(t *testing.T) {
 	}
 	retained := content.AgenticMessages{
 		&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "retained user"}}}},
-		&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: "retained assistant"}}}},
+		&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{
+			&content.TextBlock{Text: "retained assistant"},
+			&content.ToolUseBlock{ID: "call-1", Name: "tool", Input: json.RawMessage(`{}`)},
+		}}},
 		&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: "retained tool"}}}, ToolUseID: "call-1"},
 	}
 	withRetained := base
@@ -473,6 +476,150 @@ func TestCompactionCommittedRejectsInvalidRetainedWire(t *testing.T) {
 			}
 			if invalid.Event != "CompactionCommitted" || invalid.Field != FieldName("Retained") || invalid.Rule != RuleInvalid {
 				t.Fatalf("invalid = %#v, want CompactionCommitted/Retained/invalid", invalid)
+			}
+		})
+	}
+}
+
+func compactionHistoryUser(text string) *content.UserMessage {
+	return &content.UserMessage{Message: content.Message{
+		Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: text}},
+	}}
+}
+
+func compactionHistoryAssistant(text string) *content.AIMessage {
+	return &content.AIMessage{Message: content.Message{
+		Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: text}},
+	}}
+}
+
+func compactionHistoryCalls(ids ...string) *content.AIMessage {
+	blocks := make([]content.Block, 0, len(ids))
+	for _, id := range ids {
+		blocks = append(blocks, &content.ToolUseBlock{ID: id, Name: "tool", Input: json.RawMessage(`{}`)})
+	}
+	return &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: blocks}}
+}
+
+func compactionHistoryResult(id string) *content.ToolResultMessage {
+	return &content.ToolResultMessage{
+		Message:   content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: "ok"}}},
+		ToolUseID: id,
+	}
+}
+
+func compactionCommittedWithRetained(retained content.AgenticMessages) CompactionCommitted {
+	return CompactionCommitted{
+		Header: fullHeaderLoop(), AttemptID: CompactAttemptID(uuid.UUID{0xd1}),
+		WaiterCommandIDs: []uuid.UUID{{0xd2}}, Reason: CompactionReasonManual,
+		Basis: validCompactionMeasurement(1).Basis, Summary: compactionSummaryFixture(), Retained: retained,
+		PostContext: validCompactionMeasurement(2),
+	}
+}
+
+// TestCompactionCommittedRetainedHistoryRejectsMalformed is intentionally
+// adversarial: before the event-local history validator exists, both durable
+// encode and decode accept these structurally invalid suffixes. Keep the two
+// paths in the same table so a future change cannot validate only one boundary.
+func TestCompactionCommittedRetainedHistoryRejectsMalformed(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		retained content.AgenticMessages
+	}{
+		{name: "non-user anchor", retained: content.AgenticMessages{compactionHistoryAssistant("assistant first")}},
+		{name: "leading orphan result", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryResult("missing")}},
+		{name: "empty tool-use id", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryCalls("")}},
+		{name: "duplicate tool-use ids", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryCalls("duplicate", "duplicate"), compactionHistoryResult("duplicate"), compactionHistoryResult("duplicate")}},
+		{name: "unmatched tool call", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryCalls("unmatched")}},
+		{name: "result for unknown id", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryResult("unknown")}},
+		{name: "duplicate result", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryCalls("once"), compactionHistoryResult("once"), compactionHistoryResult("once")}},
+		{name: "tool pair crosses user boundary", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryCalls("crossing"), compactionHistoryUser("new user"), compactionHistoryResult("crossing")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value := compactionCommittedWithRetained(tt.retained)
+			if _, err := MarshalEvent(value); err == nil {
+				t.Errorf("MarshalEvent accepted malformed retained history")
+			} else {
+				var invalid *InvalidEventError
+				if !errors.As(err, &invalid) || invalid.Event != "CompactionCommitted" || invalid.Field != FieldRetained || invalid.Rule != RuleInvalid {
+					t.Errorf("MarshalEvent error = %T(%v), want InvalidEventError{Event: CompactionCommitted, Field: Retained, Rule: is invalid}", err, err)
+				}
+			}
+
+			baseWire, err := MarshalEvent(compactionCommittedWithRetained(nil))
+			if err != nil {
+				t.Fatalf("MarshalEvent(summary-only base): %v", err)
+			}
+			fields := map[string]json.RawMessage{}
+			if err := json.Unmarshal(baseWire, &fields); err != nil {
+				t.Fatalf("decode summary-only base: %v", err)
+			}
+			retainedWire, err := marshalMessages(tt.retained)
+			if err != nil {
+				t.Fatalf("marshal malformed retained: %v", err)
+			}
+			fields["retained"] = retainedWire
+			mutatedWire, err := json.Marshal(fields)
+			if err != nil {
+				t.Fatalf("marshal malformed event wire: %v", err)
+			}
+			if decoded, err := UnmarshalEvent(mutatedWire); err == nil {
+				t.Errorf("UnmarshalEvent accepted malformed retained history: %#v", decoded)
+			} else {
+				var invalid *InvalidEventError
+				if !errors.As(err, &invalid) || invalid.Event != "CompactionCommitted" || invalid.Field != FieldRetained || invalid.Rule != RuleInvalid {
+					t.Errorf("UnmarshalEvent error = %T(%v), want InvalidEventError{Event: CompactionCommitted, Field: Retained, Rule: is invalid}", err, err)
+				}
+			}
+		})
+	}
+}
+
+func TestCompactionCommittedRetainedHistoryAcceptsProviderOrder(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		retained content.AgenticMessages
+	}{
+		{name: "ordinary user assistant segment", retained: content.AgenticMessages{compactionHistoryUser("user"), compactionHistoryAssistant("assistant")}},
+		{name: "sequential call result pairs", retained: content.AgenticMessages{
+			compactionHistoryUser("user"), compactionHistoryCalls("first"), compactionHistoryResult("first"),
+			compactionHistoryCalls("second"), compactionHistoryResult("second"),
+		}},
+		{name: "parallel calls and results", retained: content.AgenticMessages{
+			compactionHistoryUser("user"), compactionHistoryCalls("first", "second"),
+			compactionHistoryResult("second"), compactionHistoryResult("first"),
+		}},
+		{name: "assistant and user after completed pairs", retained: content.AgenticMessages{
+			compactionHistoryUser("user"), compactionHistoryCalls("first"), compactionHistoryResult("first"),
+			compactionHistoryAssistant("follow-up assistant"), compactionHistoryUser("next user"),
+		}},
+		{name: "old nil retained", retained: nil},
+		{name: "empty retained", retained: content.AgenticMessages{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value := compactionCommittedWithRetained(tt.retained)
+			wire, err := MarshalEvent(value)
+			if err != nil {
+				t.Fatalf("MarshalEvent() error = %v", err)
+			}
+			decoded, err := UnmarshalEvent(wire)
+			if err != nil {
+				t.Fatalf("UnmarshalEvent() error = %v", err)
+			}
+			committed, ok := decoded.(CompactionCommitted)
+			if !ok {
+				t.Fatalf("decoded event = %T, want CompactionCommitted", decoded)
+			}
+			if len(tt.retained) == 0 {
+				if committed.Retained != nil {
+					t.Fatalf("decoded retained = %#v, want nil normalization", committed.Retained)
+				}
+			} else if !reflect.DeepEqual(committed.Retained, tt.retained) {
+				t.Fatalf("decoded retained = %#v, want %#v", committed.Retained, tt.retained)
 			}
 		})
 	}

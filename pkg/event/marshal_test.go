@@ -513,7 +513,7 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"CompactionCommitted with retained", CompactionCommitted{
 			Header: fullHeaderLoop(), AttemptID: CompactAttemptID(seededUUID(0x91)),
 			WaiterCommandIDs: []uuid.UUID{seededUUID(0x92)}, Reason: CompactionReasonManual,
-			Basis: validCompactionMeasurement(1).Basis, Summary: userMsg("summary"), Retained: sampleMessages(),
+			Basis: validCompactionMeasurement(1).Basis, Summary: userMsg("summary"), Retained: append(content.AgenticMessages{userMsg("retained")}, sampleMessages()...),
 			PostContext: validCompactionMeasurement(2),
 		}},
 		{"TurnFoldedInto", TurnFoldedInto{Header: fullHeaderTurn(), TurnIndex: 2, Message: userMsg("fold")}},

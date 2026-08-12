@@ -236,7 +236,7 @@ func validateCompactionCommitted(value CompactionCommitted) error {
 	if !validCompactionSummary(value.Summary) {
 		return invalidCompaction(name, FieldSummary)
 	}
-	if !validCompactionRetained(value.Retained) {
+	if !validCompactionRetained(value.Retained) || !validCompactionRetainedHistory(value.Retained) {
 		return invalidCompaction(name, FieldRetained)
 	}
 	if err := value.PostContext.Validate(); err != nil {
@@ -362,6 +362,67 @@ func validCompactionRetained(messages content.AgenticMessages) bool {
 		}
 	}
 	return true
+}
+
+// validCompactionRetainedHistory validates the provider transcript ordering
+// guaranteed by compaction-tail selection. An omitted or empty suffix is the
+// legacy summary-only representation and remains valid. A non-empty suffix is
+// a complete user-anchored sequence: an assistant tool-call batch is followed
+// by exactly one result for each call, with no other message allowed while a
+// batch is outstanding. This permits parallel calls/results (including result
+// completion in any order) while rejecting orphan, duplicate, and crossing
+// pairs before restore can install them as provider history.
+func validCompactionRetainedHistory(messages content.AgenticMessages) bool {
+	if len(messages) == 0 {
+		return true
+	}
+	if user, ok := messages[0].(*content.UserMessage); !ok || user == nil || user.Role != content.RoleUser {
+		return false
+	}
+
+	seenCalls := make(map[string]struct{})
+	outstanding := make(map[string]struct{})
+	for _, message := range messages {
+		switch typed := message.(type) {
+		case *content.UserMessage:
+			if typed == nil || typed.Role != content.RoleUser || len(outstanding) > 0 {
+				return false
+			}
+		case *content.AIMessage:
+			if typed == nil || typed.Role != content.RoleAssistant || len(outstanding) > 0 {
+				return false
+			}
+			for _, block := range typed.Blocks {
+				call, ok := block.(*content.ToolUseBlock)
+				if !ok {
+					continue
+				}
+				if call == nil || call.ID == "" {
+					return false
+				}
+				if _, duplicate := seenCalls[call.ID]; duplicate {
+					return false
+				}
+				seenCalls[call.ID] = struct{}{}
+				outstanding[call.ID] = struct{}{}
+			}
+		case *content.ToolResultMessage:
+			if typed == nil || typed.Role != content.RoleTool || typed.ToolUseID == "" {
+				return false
+			}
+			if _, exists := outstanding[typed.ToolUseID]; !exists {
+				return false
+			}
+			delete(outstanding, typed.ToolUseID)
+		case *content.SystemMessage:
+			if typed == nil || typed.Role != content.RoleSystem || len(outstanding) > 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return len(outstanding) == 0
 }
 
 func compactionMessageBlocks(message content.Conversation) ([]content.Block, bool) {
