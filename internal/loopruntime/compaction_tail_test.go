@@ -223,8 +223,20 @@ func TestSelectCompactionTailRejectsMalformedHistory(t *testing.T) {
 	}{
 		{name: "nil message", transcript: content.AgenticMessages{nil}},
 		{name: "typed nil message", transcript: content.AgenticMessages{(*content.UserMessage)(nil)}},
+		{name: "nil block", transcript: content.AgenticMessages{&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{nil}}}}},
+		{name: "typed nil block", transcript: content.AgenticMessages{&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{(*content.TextBlock)(nil)}}}}},
+		{name: "invalid message role", transcript: content.AgenticMessages{&content.UserMessage{Message: content.Message{Role: content.RoleAssistant}}}},
 		{name: "orphan result", transcript: content.AgenticMessages{tailUser("user"), tailToolResult("missing")}},
 		{name: "orphan call", transcript: content.AgenticMessages{tailUser("user"), tailToolAI("missing")}},
+		{name: "duplicate tool call ids", transcript: content.AgenticMessages{tailUser("user"), tailToolAI("duplicate", "duplicate"), tailToolResult("duplicate")}},
+		{name: "duplicate tool result", transcript: content.AgenticMessages{tailUser("user"), tailToolAI("once"), tailToolResult("once"), tailToolResult("once")}},
+		{
+			name: "tool pair crosses derived prefix",
+			transcript: content.AgenticMessages{
+				tailUser("derived"), tailToolAI("cross"), tailUser("retained"), tailToolResult("cross"),
+			},
+			derived: 2,
+		},
 		{name: "derived prefix out of bounds", transcript: content.AgenticMessages{tailUser("user")}, derived: 2},
 	}
 	for _, tt := range tests {
@@ -271,6 +283,35 @@ func TestSelectCompactionTailReturnsNonAliasingClones(t *testing.T) {
 	}
 }
 
+func TestSelectCompactionTailClonesNestedRetainedBlocks(t *testing.T) {
+	transcript := content.AgenticMessages{
+		tailUser("anchor"),
+		tailToolAI("call"),
+		tailUser("folded user"),
+		&content.ToolResultMessage{Message: content.Message{
+			Role: content.RoleTool,
+			Blocks: []content.Block{&content.ToolResultBlock{
+				ToolUseID: "call", Content: []content.Block{&content.TextBlock{Text: "result"}},
+			}},
+		}, ToolUseID: "call"},
+	}
+	selection, err := selectCompactionTail(transcript, 0, 1, 1000)
+	if err != nil {
+		t.Fatalf("selectCompactionTail() error = %v", err)
+	}
+	if len(selection.Head) != 0 || len(selection.Retained) != len(transcript) {
+		t.Fatalf("selection = head:%d retained:%d, want all retained for complete pair", len(selection.Head), len(selection.Retained))
+	}
+	selection.Retained[1].(*content.AIMessage).Blocks[0].(*content.ToolUseBlock).Input = json.RawMessage(`{"query":"changed"}`)
+	selection.Retained[3].(*content.ToolResultMessage).Blocks[0].(*content.ToolResultBlock).Content[0].(*content.TextBlock).Text = "changed result"
+	if got := string(transcript[1].(*content.AIMessage).Blocks[0].(*content.ToolUseBlock).Input); got != `{}` {
+		t.Fatalf("source tool input changed to %q", got)
+	}
+	if got := transcript[3].(*content.ToolResultMessage).Blocks[0].(*content.ToolResultBlock).Content[0].(*content.TextBlock).Text; got != "result" {
+		t.Fatalf("source nested tool result changed to %q", got)
+	}
+}
+
 func TestSelectCompactionExecutionCandidateProjectsHeadAndRetainsExactTail(t *testing.T) {
 	transcript := content.AgenticMessages{tailUser("old head"), tailAI("old answer"), tailUser("new tail"), tailAI("new answer")}
 	measurement := event.ContextMeasurement{Basis: event.ContextBasis{Revision: 7}, RequestFingerprint: [32]byte{1}}
@@ -307,6 +348,29 @@ func TestSelectCompactionExecutionCandidateForcesDerivedPrefixIntoProjectedHead(
 	}
 	if got, want := tailTexts(selected.Transcript), []string{"previous summary", "old head", "old answer"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("projected head = %v, want %v", got, want)
+	}
+}
+
+func TestSelectCompactionExecutionCandidateKeepsPriorDerivedPrefixesBeforeRetainedCut(t *testing.T) {
+	transcript := content.AgenticMessages{
+		tailUser("prior summary"), tailUser("latest summary"),
+		tailUser("old head"), tailAI("old answer"),
+		tailUser("new retained"), tailAI("new answer"),
+	}
+	candidate := compactionExecutionCandidate{Transcript: cloneMessages(transcript), derivedPrefix: 2}
+	selected, reason := selectCompactionExecutionCandidate(candidate, &loop.CompactionPolicy{KeepRecentSegments: 1, KeepRecentTokens: 1000})
+	if reason != event.CompactRejectUnspecified {
+		t.Fatalf("selection rejection = %v, want unspecified", reason)
+	}
+	if got, want := tailTexts(selected.Transcript), []string{"prior summary", "latest summary", "old head", "old answer"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("projected head = %v, want %v", got, want)
+	}
+	if got, want := tailTexts(selected.Retained), []string{"new retained", "new answer"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("retained tail = %v, want %v", got, want)
+	}
+	selected.Retained[0].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text = "mutated retained"
+	if got := transcript[4].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text; got != "new retained" {
+		t.Fatalf("retained selection aliases candidate transcript with %q", got)
 	}
 }
 

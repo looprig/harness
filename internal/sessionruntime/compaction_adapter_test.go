@@ -372,6 +372,36 @@ func TestMarshalCompactionInputWithinReplacesOldestToolResultBodyAtExactBoundary
 	}
 }
 
+func TestMarshalCompactionInputWithinFitsEscapedToolResultAtExactBoundary(t *testing.T) {
+	t.Parallel()
+	firstBody := strings.Repeat("f\"\\n界", 20)
+	secondBody := strings.Repeat("s", 100)
+	original := compactionInputWithToolBodies(firstBody, secondBody)
+	limitInput := compactionInputWithToolBodies(compactionOldToolResultStub, secondBody)
+	limitRaw, err := marshalCompactionInput(limitInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fitted, err := marshalCompactionInputWithin(original, len(limitRaw))
+	if err != nil {
+		t.Fatalf("marshalCompactionInputWithin() error = %v", err)
+	}
+	if got, want := len(fitted), len(limitRaw); got != want {
+		t.Fatalf("fitted escaped wire length = %d, want exact boundary %d", got, want)
+	}
+	decoded, err := unmarshalCompactionInput(fitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decoded.Transcript[1].(*content.ToolResultMessage).Blocks[0].(*content.TextBlock).Text; got != compactionOldToolResultStub {
+		t.Fatalf("oldest escaped result body = %q, want %q", got, compactionOldToolResultStub)
+	}
+	if got := original.Transcript[1].(*content.ToolResultMessage).Blocks[0].(*content.TextBlock).Text; got != firstBody {
+		t.Fatalf("input escaped result mutated = %q", got)
+	}
+}
+
 func TestMarshalCompactionInputWithinReplacesMultipleOldToolResultsInOrder(t *testing.T) {
 	t.Parallel()
 	const stub = "[old tool result omitted for compaction]"

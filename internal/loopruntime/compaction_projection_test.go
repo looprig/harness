@@ -68,6 +68,25 @@ func TestProjectCompactionTranscriptTurnsToolUseIntoText(t *testing.T) {
 	}
 }
 
+func TestProjectCompactionTranscriptOmitsOversizedToolInput(t *testing.T) {
+	t.Parallel()
+	messages := content.AgenticMessages{&content.AIMessage{Message: content.Message{
+		Role: content.RoleAssistant,
+		Blocks: []content.Block{&content.ToolUseBlock{
+			ID: "oversized-call", Name: "search",
+			Input: []byte(`{"payload":"` + strings.Repeat("x", 64<<10) + `"}`),
+		}},
+	}}}
+
+	projected, err := projectCompactionTranscript(messages)
+	if err != nil {
+		t.Fatalf("projectCompactionTranscript() error = %v", err)
+	}
+	if got, want := projectedText(t, projected[0]), "[called tool: search]"; got != want {
+		t.Fatalf("oversized tool input projection = %q, want %q", got, want)
+	}
+}
+
 func TestProjectCompactionTranscriptCapsToolResultRunesDeterministically(t *testing.T) {
 	t.Parallel()
 	const sourceRunes = 2501
@@ -94,6 +113,32 @@ func TestProjectCompactionTranscriptCapsToolResultRunesDeterministically(t *test
 	}
 	if !strings.Contains(firstText, "[tool result truncated for compaction") {
 		t.Fatalf("projected tool result = %q, want deterministic truncation marker", firstText)
+	}
+}
+
+func TestProjectCompactionTranscriptCapsNestedOversizedToolResult(t *testing.T) {
+	t.Parallel()
+	messages := content.AgenticMessages{&content.ToolResultMessage{Message: content.Message{
+		Role: content.RoleTool,
+		Blocks: []content.Block{
+			&content.ToolResultBlock{
+				ToolUseID: "nested-call",
+				Content:   []content.Block{&content.TextBlock{Text: strings.Repeat("界", 2501)}},
+			},
+			&content.TextBlock{Text: ` suffix "quoted"`},
+		},
+	}, ToolUseID: "call-1"}}
+
+	projected, err := projectCompactionTranscript(messages)
+	if err != nil {
+		t.Fatalf("projectCompactionTranscript() error = %v", err)
+	}
+	text := projectedText(t, projected[0])
+	if got := len([]rune(text)); got > compactionToolResultRunes {
+		t.Fatalf("nested tool result projection rune count = %d, want <= %d", got, compactionToolResultRunes)
+	}
+	if !strings.Contains(text, "[tool result truncated for compaction") {
+		t.Fatalf("nested tool result projection = %q, want truncation marker", text)
 	}
 }
 
@@ -129,6 +174,7 @@ func TestProjectCompactionTranscriptRejectsMalformedContent(t *testing.T) {
 		{name: "invalid role", messages: content.AgenticMessages{&content.UserMessage{Message: content.Message{Role: content.RoleAssistant}}}},
 		{name: "nil block", messages: content.AgenticMessages{&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{nil}}}}},
 		{name: "typed nil block", messages: content.AgenticMessages{&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{(*content.TextBlock)(nil)}}}}},
+		{name: "nested typed nil block", messages: content.AgenticMessages{&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.ToolResultBlock{Content: []content.Block{(*content.TextBlock)(nil)}}}}, ToolUseID: "call-1"}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

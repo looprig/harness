@@ -213,7 +213,13 @@ func (c *compactionHookCompactor) CompactAndFinalize(
 	c.sawHookContext = ctx.Value(compactionHookContextKey{}) == "derived"
 	c.mu.Unlock()
 	if len(input.Transcript) != 0 {
-		input.Transcript[0] = replacementTestMessage("compactor-local mutation")
+		if message, ok := input.Transcript[0].(*content.UserMessage); ok && len(message.Blocks) != 0 {
+			if text, ok := message.Blocks[0].(*content.TextBlock); ok && text != nil {
+				text.Text = "compactor-local nested mutation"
+			}
+		} else {
+			input.Transcript[0] = replacementTestMessage("compactor-local mutation")
+		}
 	}
 	if !publishedCompactionEvent(c.recorder.events(), func(value event.Event) bool {
 		_, ok := value.(event.CompactionStarted)
