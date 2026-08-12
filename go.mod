@@ -13,10 +13,7 @@ require (
 	golang.org/x/sys v0.47.0
 )
 
-require (
-	github.com/looprig/eval v0.1.2
-	github.com/looprig/fsstore v0.3.2
-)
+require github.com/looprig/fsstore v0.3.2
 
 require (
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect

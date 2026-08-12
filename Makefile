@@ -16,7 +16,6 @@ export GOFLAGS := -mod=vendor
 VENDOR_DIR ?= vendor
 LOCAL_REPLACE_VENDOR_DIRS := \
 	$(VENDOR_DIR)/github.com/looprig/core \
-	$(VENDOR_DIR)/github.com/looprig/eval \
 	$(VENDOR_DIR)/github.com/looprig/inference \
 	$(VENDOR_DIR)/github.com/looprig/storage
 
