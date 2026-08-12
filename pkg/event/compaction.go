@@ -381,7 +381,6 @@ func validCompactionRetainedHistory(messages content.AgenticMessages) bool {
 		return false
 	}
 
-	seenCalls := make(map[string]struct{})
 	outstanding := make(map[string]struct{})
 	for _, message := range messages {
 		switch typed := message.(type) {
@@ -401,10 +400,9 @@ func validCompactionRetainedHistory(messages content.AgenticMessages) bool {
 				if call == nil || call.ID == "" {
 					return false
 				}
-				if _, duplicate := seenCalls[call.ID]; duplicate {
+				if _, duplicate := outstanding[call.ID]; duplicate {
 					return false
 				}
-				seenCalls[call.ID] = struct{}{}
 				outstanding[call.ID] = struct{}{}
 			}
 		case *content.ToolResultMessage:

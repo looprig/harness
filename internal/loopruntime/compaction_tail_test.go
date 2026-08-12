@@ -195,6 +195,16 @@ func TestSelectCompactionTailKeepsParallelToolPairsTogether(t *testing.T) {
 	}
 }
 
+func TestSelectCompactionTailAllowsCompletedToolIDReuse(t *testing.T) {
+	transcript := content.AgenticMessages{
+		tailUser("first"), tailToolAI("reused"), tailToolResult("reused"),
+		tailUser("second"), tailToolAI("reused"), tailToolResult("reused"),
+	}
+	if _, err := selectCompactionTail(transcript, 0, 1, 1000); err != nil {
+		t.Fatalf("selectCompactionTail() rejected sequential completed ID reuse: %v", err)
+	}
+}
+
 func TestSelectCompactionTailMovesCutToKeepCrossSegmentToolPairTogether(t *testing.T) {
 	transcript := content.AgenticMessages{
 		tailUser("old"), tailToolAI("call-a"),

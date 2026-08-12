@@ -587,6 +587,10 @@ func TestCompactionCommittedRetainedHistoryAcceptsProviderOrder(t *testing.T) {
 			compactionHistoryUser("user"), compactionHistoryCalls("first"), compactionHistoryResult("first"),
 			compactionHistoryCalls("second"), compactionHistoryResult("second"),
 		}},
+		{name: "sequential completed reuse", retained: content.AgenticMessages{
+			compactionHistoryUser("user"), compactionHistoryCalls("reused"), compactionHistoryResult("reused"),
+			compactionHistoryUser("next user"), compactionHistoryCalls("reused"), compactionHistoryResult("reused"),
+		}},
 		{name: "parallel calls and results", retained: content.AgenticMessages{
 			compactionHistoryUser("user"), compactionHistoryCalls("first", "second"),
 			compactionHistoryResult("second"), compactionHistoryResult("first"),

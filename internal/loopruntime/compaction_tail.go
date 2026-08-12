@@ -212,17 +212,15 @@ func validateCompactionTailTranscript(
 				return nil, &compactionTailError{field: "tool_result"}
 			}
 			call.used = true
-			calls[typed.ToolUseID] = call
+			delete(calls, typed.ToolUseID)
 			if call.index < derivedPrefix && index >= derivedPrefix {
 				return nil, &compactionTailError{field: "derived_tool_pair"}
 			}
 			pairs = append(pairs, compactionTailToolPair{call: call.index, result: index})
 		}
 	}
-	for _, call := range calls {
-		if !call.used {
-			return nil, &compactionTailError{field: "orphan_tool_call"}
-		}
+	if len(calls) != 0 {
+		return nil, &compactionTailError{field: "orphan_tool_call"}
 	}
 	return pairs, nil
 }
