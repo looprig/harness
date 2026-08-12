@@ -31,6 +31,12 @@ const appendTimeout = 5 * time.Second
 // (for every offloaded record) fetch a whole session's history, not one record.
 const hydrateTimeout = 30 * time.Second
 
+// openingFenceMaxAttempts bounds ownership handoff retries. A predecessor append
+// may already have passed its lease check when the old owner releases; if that
+// append lands between this owner's Tip read and fence CAS, Open refreshes the
+// tip and retries. Persistent contention still fails closed instead of spinning.
+const openingFenceMaxAttempts = 8
+
 // blobsInfix is the name segment separating a session's ledger prefix from its
 // content-addressed offload blobs: a blob lands at "sessions/<uuid>/blobs/<sha>".
 const blobsInfix = "/blobs/"
@@ -170,9 +176,11 @@ func (s *Store) OpenJournalWithOpeningAppend(
 	// see handBackRequest) could land a write on this ledger and advance the tip
 	// out from under a tip value cached before a slow walk. The first append is
 	// the opening fence, stamping the lease
-	// epoch and fenced on the current tip. A stale prior owner (or higher-epoch
-	// successor) that advanced the ledger causes this CAS to conflict and Open to
-	// fail closed. Only once it commits is the journal ready.
+	// epoch and fenced on the current tip. A predecessor append that passed its
+	// lease check before handoff may still advance the ledger here; the bounded
+	// loop refreshes the tip and retries while this lease remains valid. Any other
+	// append failure or persistent contention fails closed. Only once the fence
+	// commits is the journal ready.
 	fence := journal.NewFenceRecord(id, journal.LeaseFence{Epoch: lease.Epoch()})
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -190,7 +198,29 @@ func (s *Store) OpenJournalWithOpeningAppend(
 		// even a repeated lease epoch (whose id would otherwise look like a prior
 		// duplicate) still physically advances the tip and fences out a stale
 		// writer.
-		fenceSeq, fenceErr = j.writeLocked(appendCtx, fence)
+		for attempt := 0; attempt < openingFenceMaxAttempts; attempt++ {
+			fenceSeq, fenceErr = j.writeLocked(appendCtx, fence)
+			if fenceErr == nil {
+				break
+			}
+			var conflict *storage.ConflictError
+			if !errors.As(fenceErr, &conflict) || attempt == openingFenceMaxAttempts-1 {
+				break
+			}
+			if !j.leaseHeld() {
+				fenceErr = &journal.JournalLeaseLostError{SessionID: id, Epoch: lease.Epoch()}
+				break
+			}
+			refreshCtx, refreshCancel := context.WithTimeout(appendCtx, appendTimeout)
+			refreshedTip, refreshErr := s.backend.Ledger.Tip(refreshCtx, name)
+			refreshCancel()
+			if refreshErr != nil {
+				fenceErr = refreshErr
+				break
+			}
+			tip = refreshedTip
+			j.trackedTip = refreshedTip
+		}
 		return fenceSeq, fenceErr
 	})
 	if middleware != nil {

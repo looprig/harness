@@ -908,6 +908,71 @@ func TestOpenJournalFenceSurvivesConcurrentWriteDuringHydration(t *testing.T) {
 	}
 }
 
+// TestOpenJournalRetriesFenceAfterPredecessorWrite tests the handoff boundary
+// separately from the hydration race above. A predecessor append can already
+// have passed its lease check when the old owner releases; if it lands between
+// the successor's Tip read and opening-fence CAS, the successor must refresh
+// the tip and claim ownership instead of failing the restore spuriously.
+func TestOpenJournalRetriesFenceAfterPredecessorWrite(t *testing.T) {
+	t.Parallel()
+	backend := memstore.New()
+	id := newTestUUID(t)
+	name := ledgerName(id)
+	st1, err := Open(backend)
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	lease1, err := st1.AcquireLease(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AcquireLease() err = %v", err)
+	}
+	if _, err := st1.OpenJournal(context.Background(), id, lease1); err != nil {
+		t.Fatalf("first OpenJournal() err = %v", err)
+	}
+	if err := lease1.Release(context.Background()); err != nil {
+		t.Fatalf("Release() err = %v", err)
+	}
+
+	racerID := newTestUUID(t)
+	racer := event.SessionStarted{
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: id}, EventID: racerID},
+	}
+	body, err := event.MarshalEvent(racer)
+	if err != nil {
+		t.Fatalf("MarshalEvent() err = %v", err)
+	}
+	racerFrame, err := encodeEnvelope(envelope{V: envelopeVersion, Kind: string(kindEvent), ID: racerID.String(), Body: body})
+	if err != nil {
+		t.Fatalf("encodeEnvelope() err = %v", err)
+	}
+
+	raced := &fenceRaceLedger{inner: backend.Ledger, name: name, racer: racerFrame}
+	comp := &storage.Composite{Ledger: raced, Leaser: backend.Leaser, KV: backend.KV, Blobs: backend.Blobs}
+	st2, err := Open(comp)
+	if err != nil {
+		t.Fatalf("Open() raced backend err = %v", err)
+	}
+	lease2, err := st2.AcquireLease(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AcquireLease() err = %v", err)
+	}
+	opened, err := st2.OpenJournal(context.Background(), id, lease2)
+	if err != nil {
+		t.Fatalf("OpenJournal() err = %v, want retry after predecessor append", err)
+	}
+	idempotent, ok := opened.(journal.IdempotentJournal)
+	if !ok {
+		t.Fatalf("OpenJournal() = %T, want journal.IdempotentJournal", opened)
+	}
+	result, err := idempotent.AppendIdempotent(context.Background(), journal.NewEventRecord(racer))
+	if err != nil {
+		t.Fatalf("AppendIdempotent(predecessor record) err = %v", err)
+	}
+	if result.Appended || result.Sequence != 2 {
+		t.Fatalf("AppendIdempotent(predecessor record) = %+v, want deduplicated seq 2", result)
+	}
+}
+
 // --- test doubles ---------------------------------------------------------
 
 // openRaceLedger fires a one-time side effect the instant Read is called for its
@@ -920,6 +985,36 @@ type openRaceLedger struct {
 	name  string
 	once  sync.Once
 	fire  func()
+}
+
+// fenceRaceLedger injects one predecessor record immediately before the first
+// opening-fence append. The first fence CAS therefore conflicts deterministically;
+// a correct handoff retries against the refreshed tip.
+type fenceRaceLedger struct {
+	inner storage.Ledger
+	name  string
+	racer []byte
+	once  sync.Once
+}
+
+func (l *fenceRaceLedger) Append(ctx context.Context, name string, expected uint64, payload []byte) error {
+	if name == l.name {
+		l.once.Do(func() {
+			if err := l.inner.Append(context.Background(), name, expected, l.racer); err != nil {
+				panic(err)
+			}
+		})
+	}
+	return l.inner.Append(ctx, name, expected, payload)
+}
+func (l *fenceRaceLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
+	return l.inner.Read(ctx, name, from)
+}
+func (l *fenceRaceLedger) Tip(ctx context.Context, name string) (uint64, error) {
+	return l.inner.Tip(ctx, name)
+}
+func (l *fenceRaceLedger) Delete(ctx context.Context, name string) error {
+	return l.inner.Delete(ctx, name)
 }
 
 func (l *openRaceLedger) Append(ctx context.Context, name string, expected uint64, payload []byte) error {
@@ -1078,4 +1173,5 @@ var (
 	_ storage.Ledger = (*blockingLedger)(nil)
 	_ storage.Ledger = (*verifyFailLedger)(nil)
 	_ storage.Ledger = (*openRaceLedger)(nil)
+	_ storage.Ledger = (*fenceRaceLedger)(nil)
 )
