@@ -82,6 +82,7 @@ func TestLoopCompactionOutcomeAppliesReplacementAfterDurableCommit(t *testing.T)
 				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
 				Compaction: &loop.CompactionPolicy{
 					Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000,
+					KeepRecentSegments: 1, KeepRecentTokens: 10000,
 					ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
 				},
 				compactionSink: sink,
@@ -308,6 +309,7 @@ func TestLoopMalformedStartedCompactionFinalizesInternalRejection(t *testing.T) 
 				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
 				Compaction: &loop.CompactionPolicy{
 					Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000,
+					KeepRecentSegments: 1, KeepRecentTokens: 10000,
 					ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
 				},
 				compactionSink: sink,

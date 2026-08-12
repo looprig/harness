@@ -162,6 +162,70 @@ func TestCapturePermissionReviewContextTreatsBaseRetainedAsDerivedNotUser(t *tes
 	}
 }
 
+func TestPermissionReviewProvenanceAfterLiveRetainedReplacement(t *testing.T) {
+	t.Parallel()
+	coordinates := identity.Coordinates{
+		SessionID: mustReviewUUID(t), LoopID: mustReviewUUID(t), TurnID: mustReviewUUID(t), StepID: mustReviewUUID(t),
+	}
+	summary := reviewUserMessage("derived compaction summary")
+	retained := content.AgenticMessages{
+		reviewUserMessage("genuine retained user"),
+		reviewAIMessage(&content.TextBlock{Text: "retained assistant"}, &content.ToolUseBlock{ID: "retained-call", Name: "Read"}),
+		&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: "retained tool"}}}, ToolUseID: "retained-call"},
+	}
+	state := turnState{}
+	applyTurnContextReplacement(&turnConfig{}, &state, turnContextReplacement{Summary: summary, Retained: retained})
+	if state.derivedUserPrefix != 1 {
+		t.Fatalf("derivedUserPrefix = %d, want 1", state.derivedUserPrefix)
+	}
+	got, err := capturePermissionReviewContext(reviewContextCapture{
+		Coordinates: coordinates,
+		Retained:    state.msgs[:state.derivedUserPrefix], Staged: state.msgs[state.derivedUserPrefix:],
+		Active: reviewAIMessage(&content.ToolUseBlock{
+			ID: "live-retained-call", Name: "Read", Input: json.RawMessage(`{"path":"README.md"}`),
+		}),
+		Metadata: reviewContextMetadata{WorkspaceRoot: "/workspace", WorkingDirectory: "/workspace", SecurityCeiling: "workspace-write", GatePolicyRevision: "gate-policy-v1"},
+		Policy:   testReviewContextPolicy(),
+	})
+	if err != nil {
+		t.Fatalf("capturePermissionReviewContext() error = %v", err)
+	}
+	assertReviewEntry(t, got.Entries, gate.ReviewContextOriginRuntime, gate.ReviewContextKindRuntimeContext, "derived compaction summary")
+	assertReviewEntry(t, got.Entries, gate.ReviewContextOriginUser, gate.ReviewContextKindUserMessage, "genuine retained user")
+	assertReviewEntry(t, got.Entries, gate.ReviewContextOriginAssistant, gate.ReviewContextKindAssistantMessage, "retained assistant")
+	assertReviewEntry(t, got.Entries, gate.ReviewContextOriginTool, gate.ReviewContextKindToolResult, "retained tool")
+}
+
+func TestPermissionReviewProvenanceAfterRestoreRetainedReplacement(t *testing.T) {
+	t.Parallel()
+	coordinates := identity.Coordinates{
+		SessionID: mustReviewUUID(t), LoopID: mustReviewUUID(t), TurnID: mustReviewUUID(t), StepID: mustReviewUUID(t),
+	}
+	// sessionruntime.foldLoop seeds RestoredState.DerivedPrefix=1 and the
+	// constructor carries that split into loopState.msgsDerivedPrefix before
+	// the first restored turn is installed.
+	state := loopState{msgs: content.AgenticMessages{
+		reviewUserMessage("restored compaction summary"),
+		reviewUserMessage("restored retained user"),
+		reviewAIMessage(&content.TextBlock{Text: "restored retained assistant"}),
+	}, msgsDerivedPrefix: 1}
+	got, err := capturePermissionReviewContext(reviewContextCapture{
+		Coordinates:  coordinates,
+		BaseRetained: state.msgs[:state.msgsDerivedPrefix], Base: state.msgs[state.msgsDerivedPrefix:],
+		Active: reviewAIMessage(&content.ToolUseBlock{
+			ID: "restored-retained-call", Name: "Read", Input: json.RawMessage(`{"path":"README.md"}`),
+		}),
+		Metadata: reviewContextMetadata{WorkspaceRoot: "/workspace", WorkingDirectory: "/workspace", SecurityCeiling: "workspace-write", GatePolicyRevision: "gate-policy-v1"},
+		Policy:   testReviewContextPolicy(),
+	})
+	if err != nil {
+		t.Fatalf("capturePermissionReviewContext() error = %v", err)
+	}
+	assertReviewEntry(t, got.Entries, gate.ReviewContextOriginRuntime, gate.ReviewContextKindRuntimeContext, "restored compaction summary")
+	assertReviewEntry(t, got.Entries, gate.ReviewContextOriginUser, gate.ReviewContextKindUserMessage, "restored retained user")
+	assertReviewEntry(t, got.Entries, gate.ReviewContextOriginAssistant, gate.ReviewContextKindAssistantMessage, "restored retained assistant")
+}
+
 func TestPermissionReviewCaptureFailsClosedBeforeUnboundedEncoding(t *testing.T) {
 	t.Parallel()
 

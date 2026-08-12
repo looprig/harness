@@ -213,7 +213,13 @@ func (c *compactionHookCompactor) CompactAndFinalize(
 	c.sawHookContext = ctx.Value(compactionHookContextKey{}) == "derived"
 	c.mu.Unlock()
 	if len(input.Transcript) != 0 {
-		input.Transcript[0] = replacementTestMessage("compactor-local mutation")
+		if message, ok := input.Transcript[0].(*content.UserMessage); ok && len(message.Blocks) != 0 {
+			if text, ok := message.Blocks[0].(*content.TextBlock); ok && text != nil {
+				text.Text = "compactor-local nested mutation"
+			}
+		} else {
+			input.Transcript[0] = replacementTestMessage("compactor-local mutation")
+		}
 	}
 	if !publishedCompactionEvent(c.recorder.events(), func(value event.Event) bool {
 		_, ok := value.(event.CompactionStarted)
@@ -285,7 +291,7 @@ func TestCompactionHooksSuccessFreezesCallPropagatesContextAndFinishesAfterCommi
 		t.Fatalf("finish identity = %#v; start = %#v", result.Call, started)
 	}
 	if len(started.Compaction.Input.Transcript) != 1 ||
-		!reflect.DeepEqual(started.Compaction.Input.Transcript[0], replacementTestMessage("committed history")) {
+		!reflect.DeepEqual(started.Compaction.Input.Transcript[0], replacementTestMessage("prior history")) {
 		t.Fatalf("hook input aliased compactor input: %#v", started.Compaction.Input.Transcript)
 	}
 	if calls, derived := compactor.snapshot(); calls != 1 || !derived {
@@ -817,11 +823,12 @@ func newCompactionHooksActor(
 		InferenceCapability: contextTestInferenceCapability(), DrainTimeout: 200 * time.Millisecond,
 		Compaction: &loop.CompactionPolicy{
 			CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20,
+			KeepRecentSegments: 1, KeepRecentTokens: 10000,
 			MaxSummaryTokens: 10, CountTimeout: 2 * time.Second, Hustle: "context.compact",
 		},
 		compactionSink: executor,
 	}, RestoredState{
-		Msgs: content.AgenticMessages{replacementTestMessage("committed history")}, TurnIndex: 1,
+		Msgs: content.AgenticMessages{replacementTestMessage("prior history"), replacementTestMessage("committed history")}, TurnIndex: 1,
 		Basis: event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{0xd0}}, HasBasis: true,
 	})
 	if err != nil {
@@ -858,8 +865,8 @@ func newActiveTurnCompactionHooksActor(
 	}
 	runtimeModel := testModel()
 	runtimeModel.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
-	actor, err := newWithConfig(
-		ctx, uuid.UUID{0xc1}, uuid.UUID{0xc2}, Provenance{}, publisher,
+	actor, err := newRestoredWithConfig(
+		ctx, uuid.UUID{0xc1}, uuid.UUID{0xc2}, publisher,
 		runtimeConfig{
 			Client: &scriptedLLM{scripts: [][]content.Chunk{{textChunk("terminal response")}}},
 			Model:  runtimeModel, System: "stable system", AgentName: "compactor", Hooks: hooks,
@@ -868,9 +875,13 @@ func newActiveTurnCompactionHooksActor(
 			Compaction: &loop.CompactionPolicy{
 				Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact,
 				CompactAt: 8_000, RearmBelow: 6_000, ReservedOutput: 20,
+				KeepRecentSegments: 1, KeepRecentTokens: 10000,
 				MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
 			},
 			compactionSink: executor,
+		}, RestoredState{
+			Msgs: content.AgenticMessages{replacementTestMessage("prior history"), replacementTestMessage("committed history")}, TurnIndex: 1,
+			Basis: event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{0xc0}}, HasBasis: true,
 		},
 	)
 	if err != nil {

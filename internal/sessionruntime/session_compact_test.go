@@ -29,6 +29,7 @@ func compactDispatchDefinition(engine loop.Engine) loop.Definition {
 			loop.WithInferenceCapability(contextcount.InferenceCapability{Transport: contextcount.InferenceTransportLocal, Retention: contextcount.RetentionNone}),
 			loop.WithCompaction(loop.CompactionPolicy{
 				CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20,
+				KeepRecentSegments: 1, KeepRecentTokens: 10000,
 				MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
 			}),
 		)

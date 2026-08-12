@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
@@ -47,9 +48,15 @@ func TestCrossProviderModelSwitchPreservesConversationAndCapability(t *testing.T
 	var counter *loopContextCounter
 	var capture effectiveConfigCapture
 	summary := validFinalizationSummary()
-	l, rec := newBoundLoopWithConfig(t, bound, nil, func(cfg *runtimeConfig) {
+	seed := &RestoredState{
+		Msgs:      content.AgenticMessages{replacementTestMessage("prior history"), replacementTestMessage("committed history")},
+		TurnIndex: 1,
+		Basis:     event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{0x10}}, HasBasis: true,
+	}
+	l, rec := newBoundLoopWithConfig(t, bound, seed, func(cfg *runtimeConfig) {
 		counter = cfg.ContextCounter.(*loopContextCounter)
 		cfg.afterEffectiveConfigChange = capture.capture
+		cfg.Compaction = &loop.CompactionPolicy{KeepRecentSegments: 1, KeepRecentTokens: 10000, MaxSummaryTokens: 10, ReservedOutput: 20, CountTimeout: time.Second, Hustle: "context.compact"}
 		executor, err := newCompactionExecutor(context.Background(), compactionExecutorConfig{
 			Compactor: &echoExecutorCompactor{summary: summary},
 			Counter:   cfg.ContextCounter, CounterCapability: cfg.CounterCapability,

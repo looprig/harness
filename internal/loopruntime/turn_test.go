@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	gatedomain "github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
@@ -248,6 +250,25 @@ type echoTool struct {
 	runs   int
 }
 
+// rawGraphTool returns a nested result graph so the turn admission seam can
+// prove it flattens/shapes a derived message without mutating hook-owned data.
+type rawGraphTool struct {
+	name string
+	raw  []content.Block
+}
+
+func (r *rawGraphTool) Info(context.Context) (*tool.ToolInfo, error) {
+	return &tool.ToolInfo{Name: r.name, Desc: "returns a nested graph", Schema: json.RawMessage(`{"type":"object"}`)}, nil
+}
+
+func (*rawGraphTool) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{}, nil, nil
+}
+
+func (r *rawGraphTool) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
+	return &tool.ToolResult{Content: r.raw}, nil
+}
+
 func (e *echoTool) Info(ctx context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{Name: e.name, Desc: "echoes", Schema: json.RawMessage(`{"type":"object"}`)}, nil
 }
@@ -377,26 +398,51 @@ func TestToolResultMessage(t *testing.T) {
 	tests := []struct {
 		name        string
 		in          result
+		maxBytes    int
 		wantText    string
 		wantIsError bool
+		bounded     bool
 	}{
 		{
 			name:        "error result carries IsError true",
 			in:          result{ToolUseID: "tu-err", Content: []content.Block{&content.TextBlock{Text: "tool error: boom"}}, IsError: true},
+			maxBytes:    0,
 			wantText:    "tool error: boom",
 			wantIsError: true,
 		},
 		{
 			name:        "success result carries IsError false",
 			in:          result{ToolUseID: "tu-ok", Content: []content.Block{&content.TextBlock{Text: "ran"}}, IsError: false},
+			maxBytes:    0,
 			wantText:    "ran",
 			wantIsError: false,
 		},
 		{
 			name:        "empty content still pairs by id, IsError preserved",
 			in:          result{ToolUseID: "tu-empty", Content: nil, IsError: true},
+			maxBytes:    0,
 			wantText:    flattenToText(nil),
 			wantIsError: true,
+		},
+		{
+			name: "oversized nested content is one bounded text block",
+			in: result{
+				ToolUseID: "tu-big",
+				Content: []content.Block{
+					&content.TextBlock{Text: "HEAD-"},
+					&content.ToolResultBlock{Content: []content.Block{
+						&content.TextBlock{Text: strings.Repeat("body-", 40)},
+						&content.ToolResultBlock{Content: []content.Block{
+							&content.TextBlock{Text: "nested-body-"},
+						}},
+					}},
+					&content.TextBlock{Text: "-TAIL"},
+				},
+				IsError: true,
+			},
+			maxBytes:    96,
+			wantIsError: true,
+			bounded:     true,
 		},
 	}
 
@@ -404,17 +450,123 @@ func TestToolResultMessage(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := toolResultMessage(tt.in)
+			got := toolResultMessage(tt.in, tt.maxBytes)
 			if got.ToolUseID != tt.in.ToolUseID {
 				t.Errorf("ToolUseID = %q, want %q", got.ToolUseID, tt.in.ToolUseID)
 			}
 			if got.IsError != tt.wantIsError {
 				t.Errorf("IsError = %v, want %v (dropped?)", got.IsError, tt.wantIsError)
 			}
-			if text := flattenToText(got.Blocks); text != tt.wantText {
-				t.Errorf("text = %q, want %q", text, tt.wantText)
+			if len(got.Blocks) != 1 {
+				t.Fatalf("blocks = %d, want exactly one TextBlock", len(got.Blocks))
+			}
+			block, ok := got.Blocks[0].(*content.TextBlock)
+			if !ok {
+				t.Fatalf("block[0] = %T, want *content.TextBlock", got.Blocks[0])
+			}
+			wantText := tt.wantText
+			if tt.bounded {
+				wantText = shapeToolResultText(flattenToText(tt.in.Content), tt.maxBytes)
+				if len(wantText) > tt.maxBytes {
+					t.Fatalf("expected shaped text bytes = %d, want <= %d", len(wantText), tt.maxBytes)
+				}
+			}
+			if block.Text != wantText {
+				t.Errorf("text = %q, want %q", block.Text, wantText)
 			}
 		})
+	}
+}
+
+func TestRunTurnToolResultShaping(t *testing.T) {
+	t.Parallel()
+
+	const maxBytes = 96
+	raw := []content.Block{
+		&content.TextBlock{Text: "HEAD-"},
+		&content.ToolResultBlock{Content: []content.Block{
+			&content.TextBlock{Text: strings.Repeat("body-", 40)},
+			&content.ToolResultBlock{Content: []content.Block{
+				&content.TextBlock{Text: "nested-body-"},
+			}},
+		}},
+		&content.TextBlock{Text: "-TAIL"},
+	}
+	wantRaw := cloneBlocks(raw)
+	rawText := flattenToText(raw)
+	rawTool := &rawGraphTool{name: "RawGraph", raw: raw}
+	client := &scriptedLLM{scripts: [][]content.Chunk{
+		{toolUseChunk(0, "id-raw", "RawGraph", `{}`)},
+		{textChunk("done")},
+	}}
+	ts := agenticToolSet([]tool.InvokableTool{rawTool}, 25, 100)
+	ts.MaxToolResultBytes = maxBytes
+	cfg, st, rec := newTurnFixture(nil, nil, ts, client, noGateReg())
+	var executionResult *tool.ToolResult
+	cfg.hooks = compileRuntimeHooks(t, hook.Set{Around: []hook.Around{{
+		Operation: hook.OperationToolExecution,
+		Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+			return ctx, func(got hook.Result) {
+				if got.ToolExecution != nil {
+					executionResult = got.ToolExecution.Result
+				}
+			}
+		},
+	}}})
+
+	terminal := runTurn(context.Background(), cfg, st)
+	if _, ok := terminal.(event.TurnDone); !ok {
+		t.Fatalf("terminal = %T, want TurnDone", terminal)
+	}
+	if executionResult == nil {
+		t.Fatal("execution hook did not receive a ToolExecution.Result")
+	}
+	if !reflect.DeepEqual(executionResult.Content, wantRaw) {
+		t.Fatalf("execution hook result = %#v, want raw graph %#v", executionResult.Content, wantRaw)
+	}
+
+	wantShaped := shapeToolResultText(rawText, maxBytes)
+	sds := stepDones(rec.events())
+	if len(sds) != 2 {
+		t.Fatalf("StepDone count = %d, want 2", len(sds))
+	}
+	if len(sds[0].Messages) != 2 {
+		t.Fatalf("tool StepDone.Messages len = %d, want 2", len(sds[0].Messages))
+	}
+	trm, ok := sds[0].Messages[1].(*content.ToolResultMessage)
+	if !ok {
+		t.Fatalf("tool StepDone.Messages[1] = %T, want *content.ToolResultMessage", sds[0].Messages[1])
+	}
+	if len(trm.Blocks) != 1 {
+		t.Fatalf("StepDone tool result blocks = %d, want exactly one", len(trm.Blocks))
+	}
+	stepText, ok := trm.Blocks[0].(*content.TextBlock)
+	if !ok {
+		t.Fatalf("StepDone tool result block = %T, want *content.TextBlock", trm.Blocks[0])
+	}
+	if stepText.Text != wantShaped {
+		t.Fatalf("StepDone tool result text = %q, want %q", stepText.Text, wantShaped)
+	}
+	if len(stepText.Text) > maxBytes {
+		t.Fatalf("StepDone tool result bytes = %d, want <= %d", len(stepText.Text), maxBytes)
+	}
+
+	reqs := client.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("inference request count = %d, want 2", len(reqs))
+	}
+	var requestText string
+	for _, msg := range reqs[1].Messages {
+		if candidate, ok := msg.(*content.ToolResultMessage); ok {
+			requestText = flattenToText(candidate.Blocks)
+			break
+		}
+	}
+	if requestText != wantShaped {
+		t.Fatalf("next inference tool result text = %q, want %q", requestText, wantShaped)
+	}
+	if requestText != stepText.Text {
+		t.Fatalf("StepDone tool result text %q differs from next request %q", stepText.Text, requestText)
 	}
 }
 

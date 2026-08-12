@@ -63,8 +63,8 @@ github.com/looprig/credentials v0.1.0 h1:puPS7dvBSJXHvkbTPt6lTMeilRJETYM+jsWjwIo
 github.com/looprig/credentials v0.1.0/go.mod h1:t4P2CIcxZBbui/7rUmynxyUGW6MW7urfaJHUiExa4B0=
 github.com/looprig/fsstore v0.3.2 h1:WJ7+ZTH01faSMB98iRyzUIYxpi3QP9Lmw1dJZyxoYbE=
 github.com/looprig/fsstore v0.3.2/go.mod h1:UhqNjy8ZGjXqV0vetwwR44uA5bivxaoOlItKYwLv6II=
-github.com/looprig/inference v0.9.2 h1:GQ5X4oX5Jkswco4scZ3y2DGRwg9dSMywA3t8W6UqNFA=
-github.com/looprig/inference v0.9.2/go.mod h1:zG3ZXQzVTFE3dUkeQUsV0u+9w8TWUZOow0nkZLF20Eo=
+github.com/looprig/inference v0.10.0 h1:A6NbQfKJb88JLFVdLIwcYAxmVNh1wb+CnzKXsqHOmz8=
+github.com/looprig/inference v0.10.0/go.mod h1:zG3ZXQzVTFE3dUkeQUsV0u+9w8TWUZOow0nkZLF20Eo=
 github.com/looprig/secrets v0.1.0 h1:YmDlIGNuP3X1Nihjb4N23NIXKRxQzePjx7SBFDED1ps=
 github.com/looprig/secrets v0.1.0/go.mod h1:aENJw340bY5iNwOkanyYkp8i8R/X5DSiL6eKXfrbxKU=
 github.com/looprig/storage v0.3.1 h1:b42G4Yz/+zRgt3f/P3WL3IhyKq9uAHCptLmf2Vy1bz0=

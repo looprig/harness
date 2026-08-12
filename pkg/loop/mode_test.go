@@ -24,6 +24,8 @@ func TestModeValidation(t *testing.T) {
 		{name: "invalid effort", modes: []Mode{{Name: "plan", Effort: model.Effort("huge")}}, initial: "plan", kind: DefinitionInvalidMode},
 		{name: "invalid model sampling effort", modes: []Mode{{Name: "plan", Model: modelWithEffort(model.Effort("huge"))}}, initial: "plan", kind: DefinitionInvalidMode},
 		{name: "invalid limits", modes: []Mode{{Name: "plan", ToolLimits: ToolLimits{Parallel: -1}}}, initial: "plan", kind: DefinitionInvalidMode},
+		{name: "negative result bytes", modes: []Mode{{Name: "plan", ToolLimits: ToolLimits{ResultBytes: -1}}}, initial: "plan", kind: DefinitionInvalidMode},
+		{name: "result bytes below minimum", modes: []Mode{{Name: "plan", ToolLimits: ToolLimits{ResultBytes: minToolResultBytes - 1}}}, initial: "plan", kind: DefinitionInvalidMode},
 		{name: "initial without modes", initial: "plan", kind: DefinitionInvalidInitialMode},
 	}
 	for _, tt := range tests {
@@ -55,8 +57,8 @@ func TestDefinitionRejectsInvalidBaseSamplingEffort(t *testing.T) {
 func TestModeResolutionAndCopy(t *testing.T) {
 	t.Parallel()
 	modeTools := []tool.Definition{testToolDefinition("mode", nil, nil)}
-	modes := []Mode{{Name: "plan", Model: model.Model{}, Effort: model.EffortHigh, Tools: modeTools, ToolLimits: ToolLimits{Calls: 7}, Instructions: "plan more"}}
-	d := mustDefinition(t, WithToolLimits(ToolLimits{Iterations: 3, Parallel: 2}), WithModes(modes...), WithInitialMode("plan"))
+	modes := []Mode{{Name: "plan", Model: model.Model{}, Effort: model.EffortHigh, Tools: modeTools, ToolLimits: ToolLimits{Calls: 7, ResultBytes: 2048}, Instructions: "plan more"}}
+	d := mustDefinition(t, WithToolLimits(ToolLimits{Iterations: 3, Parallel: 2, ResultBytes: 1024}), WithModes(modes...), WithInitialMode("plan"))
 	modes[0].Name = "changed"
 	modeTools[0] = testToolDefinition("changed", nil, nil)
 	b, err := d.Bind(context.Background(), validToolBindings(t))
@@ -70,8 +72,46 @@ func TestModeResolutionAndCopy(t *testing.T) {
 	if mode.Model.Name != testModel().Name || mode.Effort != model.EffortHigh || mode.Instructions != "plan more" {
 		t.Fatalf("resolved mode = %+v", mode)
 	}
-	if mode.ToolLimits != (ToolLimits{Iterations: 3, Calls: 7, Parallel: 2}) {
+	if mode.ToolLimits != (ToolLimits{Iterations: 3, Calls: 7, Parallel: 2, ResultBytes: 2048}) {
 		t.Fatalf("resolved limits = %+v", mode.ToolLimits)
+	}
+}
+
+func TestToolLimitsResultBytesResolution(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		base     ToolLimits
+		override ToolLimits
+		want     ToolLimits
+	}{
+		{
+			name:     "base inheritance",
+			base:     ToolLimits{ResultBytes: 1024},
+			override: ToolLimits{},
+			want:     ToolLimits{ResultBytes: 1024},
+		},
+		{
+			name:     "mode override",
+			base:     ToolLimits{ResultBytes: 1024},
+			override: ToolLimits{ResultBytes: 2048},
+			want:     ToolLimits{ResultBytes: 2048},
+		},
+		{
+			name:     "zero base stays off",
+			base:     ToolLimits{},
+			override: ToolLimits{},
+			want:     ToolLimits{},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := resolveLimits(tt.base, tt.override); got != tt.want {
+				t.Fatalf("resolveLimits(%+v, %+v) = %+v, want %+v", tt.base, tt.override, got, tt.want)
+			}
+		})
 	}
 }
 

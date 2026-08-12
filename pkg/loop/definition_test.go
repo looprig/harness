@@ -35,6 +35,8 @@ func TestDefineValidation(t *testing.T) {
 		{name: "nil option", opts: []Option{WithName("agent"), nil, WithInference(&fakeLLM{}, testModel())}, kind: DefinitionNilOption},
 		{name: "duplicate name", opts: []Option{WithName("a"), WithName("b"), WithInference(&fakeLLM{}, testModel())}, kind: DefinitionDuplicateOption},
 		{name: "negative limits", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolLimits(ToolLimits{Calls: -1})}, kind: DefinitionInvalidToolLimits},
+		{name: "negative result bytes", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolLimits(ToolLimits{ResultBytes: -1})}, kind: DefinitionInvalidToolLimits},
+		{name: "result bytes below minimum", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolLimits(ToolLimits{ResultBytes: minToolResultBytes - 1})}, kind: DefinitionInvalidToolLimits},
 		{name: "negative drain", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithDrainTimeout(-time.Second)}, kind: DefinitionInvalidDrainTimeout},
 		{name: "nil middleware", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolMiddlewares(nil)}, kind: DefinitionInvalidMiddleware},
 		{name: "invalid engine", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithEngine(Engine(99))}, kind: DefinitionInvalidEngine},
@@ -205,7 +207,7 @@ func TestDefinitionDefaultsAndDefensiveCopies(t *testing.T) {
 	if b.Delegates()[0] != "worker" {
 		t.Fatal("Delegates aliases returned slice")
 	}
-	if got := b.ToolLimits(); got != (ToolLimits{Iterations: 25, Calls: 100, Parallel: 8}) {
+	if got := b.ToolLimits(); got != (ToolLimits{Iterations: 25, Calls: 100, Parallel: 8, ResultBytes: 0}) {
 		t.Fatalf("ToolLimits = %+v", got)
 	}
 	if got := b.DrainTimeout(); got != 5*time.Second {
@@ -320,6 +322,15 @@ func TestPolicyRevisionDigest(t *testing.T) {
 	}
 	if got == different.PolicyRevision() {
 		t.Error("PolicyRevision() did not change for a differing system prompt (digest collapsed?)")
+	}
+}
+
+func TestPolicyRevisionIncludesToolResultBytes(t *testing.T) {
+	t.Parallel()
+	base := mustDefinition(t)
+	bounded := mustDefinition(t, WithToolLimits(ToolLimits{ResultBytes: minToolResultBytes}))
+	if got, want := bounded.PolicyRevision(), base.PolicyRevision(); got == want {
+		t.Fatalf("PolicyRevision() = %q for ResultBytes=%d, same as unbounded policy %q", got, minToolResultBytes, want)
 	}
 }
 

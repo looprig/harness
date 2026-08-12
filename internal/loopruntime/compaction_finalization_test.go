@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -120,6 +121,42 @@ func TestCompactionFinalizerOwnsCanonicalTerminalAndWaiterProjection(t *testing.
 				}
 			}
 		})
+	}
+}
+
+func TestCompactionFinalizerPersistsRetainedWithIndependentOwnership(t *testing.T) {
+	t.Parallel()
+	attempt := validFinalizationAttempt()
+	retained := content.AgenticMessages{replacementTestMessage("retained user"), replacementTestMessage("retained follow-up")}
+	success := validPreparedFinalizationSuccess(9)
+	success.Retained = retained
+	publisher := &compactionFinalizationPublisher{}
+	finalizer := newCompactionFinalizer(compactionFinalizerConfig{
+		Publisher: publisher, Factory: finalizationFactory(), SessionID: uuid.UUID{21}, LoopID: uuid.UUID{22},
+		Now: func() time.Time { return attempt.StartedAt.Add(5 * time.Second) },
+	})
+	terminal, err := finalizer.Finalize(context.Background(), attempt, compactionFinalizationProposal{Success: success})
+	if err != nil {
+		t.Fatalf("Finalize() error = %v", err)
+	}
+	committed, ok := terminal.(event.CompactionCommitted)
+	if !ok {
+		t.Fatalf("terminal = %T, want CompactionCommitted", terminal)
+	}
+	if !reflect.DeepEqual(committed.Retained, retained) {
+		t.Fatalf("terminal retained = %#v, want %#v", committed.Retained, retained)
+	}
+	retained[0].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text = "mutated source"
+	if got := committed.Retained[0].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text; got == "mutated source" {
+		t.Fatal("canonical terminal retained aliases prepared success")
+	}
+	published, ok := publisher.snapshot()[0].(event.CompactionCommitted)
+	if !ok {
+		t.Fatal("published terminal is not CompactionCommitted")
+	}
+	published.Retained[0].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text = "mutated published"
+	if got := committed.Retained[0].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text; got == "mutated published" {
+		t.Fatal("returned terminal aliases published retained")
 	}
 }
 

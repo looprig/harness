@@ -329,6 +329,215 @@ func TestCompactionAdapterValidatesBeforeFinalization(t *testing.T) {
 	}
 }
 
+func TestMarshalCompactionInputWithinReplacesOldestToolResultBodyAtExactBoundary(t *testing.T) {
+	t.Parallel()
+	const stub = "[old tool result omitted for compaction]"
+	firstBody := strings.Repeat("f", 100)
+	secondBody := strings.Repeat("s", 100)
+	original := compactionInputWithToolBodies(firstBody, secondBody)
+	firstReplaced := compactionInputWithToolBodies(stub, secondBody)
+	limitRaw, err := marshalCompactionInput(firstReplaced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalWire, err := marshalCompactionInput(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(originalWire) <= len(limitRaw) {
+		t.Fatalf("fixture is not oversized: original=%d limit=%d", len(originalWire), len(limitRaw))
+	}
+
+	fitted, err := marshalCompactionInputWithin(original, len(limitRaw))
+	if err != nil {
+		t.Fatalf("marshalCompactionInputWithin() error = %v", err)
+	}
+	if got, want := len(fitted), len(limitRaw); got != want {
+		t.Fatalf("fitted wire length = %d, want exact boundary %d", got, want)
+	}
+	decoded, err := unmarshalCompactionInput(fitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := decoded.Transcript[1].(*content.ToolResultMessage)
+	second := decoded.Transcript[3].(*content.ToolResultMessage)
+	if got := first.Blocks[0].(*content.TextBlock).Text; got != stub {
+		t.Fatalf("oldest result body = %q, want %q", got, stub)
+	}
+	if got := second.Blocks[0].(*content.TextBlock).Text; got != secondBody {
+		t.Fatalf("newer result body = %q, want unchanged body", got)
+	}
+	if got := original.Transcript[1].(*content.ToolResultMessage).Blocks[0].(*content.TextBlock).Text; got != firstBody {
+		t.Fatalf("input oldest result mutated = %q", got)
+	}
+}
+
+func TestMarshalCompactionInputWithinFitsEscapedToolResultAtExactBoundary(t *testing.T) {
+	t.Parallel()
+	firstBody := strings.Repeat("f\"\\n界", 20)
+	secondBody := strings.Repeat("s", 100)
+	original := compactionInputWithToolBodies(firstBody, secondBody)
+	limitInput := compactionInputWithToolBodies(compactionOldToolResultStub, secondBody)
+	limitRaw, err := marshalCompactionInput(limitInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fitted, err := marshalCompactionInputWithin(original, len(limitRaw))
+	if err != nil {
+		t.Fatalf("marshalCompactionInputWithin() error = %v", err)
+	}
+	if got, want := len(fitted), len(limitRaw); got != want {
+		t.Fatalf("fitted escaped wire length = %d, want exact boundary %d", got, want)
+	}
+	decoded, err := unmarshalCompactionInput(fitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decoded.Transcript[1].(*content.ToolResultMessage).Blocks[0].(*content.TextBlock).Text; got != compactionOldToolResultStub {
+		t.Fatalf("oldest escaped result body = %q, want %q", got, compactionOldToolResultStub)
+	}
+	if got := original.Transcript[1].(*content.ToolResultMessage).Blocks[0].(*content.TextBlock).Text; got != firstBody {
+		t.Fatalf("input escaped result mutated = %q", got)
+	}
+}
+
+func TestMarshalCompactionInputWithinReplacesMultipleOldToolResultsInOrder(t *testing.T) {
+	t.Parallel()
+	const stub = "[old tool result omitted for compaction]"
+	original := compactionInputWithToolBodies(strings.Repeat("a", 300), strings.Repeat("b", 300))
+	allReplaced := compactionInputWithToolBodies(stub, stub)
+	limitRaw, err := marshalCompactionInput(allReplaced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fitted, err := marshalCompactionInputWithin(original, len(limitRaw))
+	if err != nil {
+		t.Fatalf("marshalCompactionInputWithin() error = %v", err)
+	}
+	if got, want := string(fitted), string(limitRaw); got != want {
+		t.Fatalf("fitted wire differs from all-old-results replacement:\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestMarshalCompactionInputWithinSkipsEarlyStubThatGrowsSerializedInput(t *testing.T) {
+	t.Parallel()
+	const stub = "[old tool result omitted for compaction]"
+	const shortBody = "x"
+	original := compactionInputWithToolBodies(shortBody, strings.Repeat("l", 500))
+	wantInput := compactionInputWithToolBodies(shortBody, stub)
+	bothStubbedInput := compactionInputWithToolBodies(stub, stub)
+	want, err := marshalCompactionInput(wantInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bothStubbed, err := marshalCompactionInput(bothStubbedInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := marshalCompactionInput(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initial) <= len(want) || len(bothStubbed) <= len(want) {
+		t.Fatalf("fixture sizes initial=%d want=%d both-stubbed=%d do not exercise non-monotonic fitting", len(initial), len(want), len(bothStubbed))
+	}
+
+	fitted, err := marshalCompactionInputWithin(original, len(want))
+	if err != nil {
+		t.Fatalf("marshalCompactionInputWithin() error = %v, want preserved short result plus later omission", err)
+	}
+	if got, wantLen := len(fitted), len(want); got != wantLen {
+		t.Fatalf("fitted wire length = %d, want exact boundary %d", got, wantLen)
+	}
+	decoded, err := unmarshalCompactionInput(fitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decoded.Transcript[1].(*content.ToolResultMessage).Blocks[0].(*content.TextBlock).Text; got != shortBody {
+		t.Fatalf("short oldest result = %q, want preserved body %q", got, shortBody)
+	}
+	if got := decoded.Transcript[3].(*content.ToolResultMessage).Blocks[0].(*content.TextBlock).Text; got != stub {
+		t.Fatalf("later result = %q, want stub %q", got, stub)
+	}
+}
+
+func TestCompactionAdapterRejectsProtectedOversizedInputBeforeRunner(t *testing.T) {
+	t.Parallel()
+	input := validCompactionInput(t)
+	raw, err := marshalCompactionInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) < 2 {
+		t.Fatal("fixture unexpectedly too small")
+	}
+	descriptor := testHustleDefinition(t, "conversation.compact").Descriptor()
+	descriptor.Limits.InputBytes = len(raw) - 1
+	runner := &compactionRunnerStub{}
+	loopID, _ := uuid.New()
+	adapter, err := newCompactionAdapter(runner, descriptor, loopID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalized := false
+	err = adapter.CompactAndFinalize(context.Background(), input, func(context.Context, loopruntime.CompactionOutcome) error {
+		finalized = true
+		return nil
+	})
+	var tooLarge *CompactionInputTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("CompactAndFinalize() error = %T %v, want CompactionInputTooLargeError", err, err)
+	}
+	if tooLarge.Limit != descriptor.Limits.InputBytes || tooLarge.Size != len(raw) {
+		t.Fatalf("too-large details = %+v, want limit=%d size=%d", tooLarge, descriptor.Limits.InputBytes, len(raw))
+	}
+	if runner.runCalls != 0 {
+		t.Fatalf("runner calls = %d, want local rejection", runner.runCalls)
+	}
+	if finalized {
+		t.Fatal("finalizer invoked on local input rejection")
+	}
+}
+
+func TestCompactionAdapterAcceptsSerializedInputAtExactLimit(t *testing.T) {
+	t.Parallel()
+	input := validCompactionInput(t)
+	raw, err := marshalCompactionInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := testHustleDefinition(t, "conversation.compact").Descriptor()
+	descriptor.Limits.InputBytes = len(raw)
+	runner := &compactionRunnerStub{result: hustle.Result{Output: validCompactionOutputJSON(t, input, validCompactionXML), Usage: &content.Usage{OutputTokens: 1}}}
+	loopID, _ := uuid.New()
+	adapter, err := newCompactionAdapter(runner, descriptor, loopID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.CompactAndFinalize(context.Background(), input, func(context.Context, loopruntime.CompactionOutcome) error { return nil }); err != nil {
+		t.Fatalf("CompactAndFinalize() error = %v", err)
+	}
+	if runner.runCalls != 1 {
+		t.Fatalf("runner calls = %d, want one exact-boundary invocation", runner.runCalls)
+	}
+}
+
+func TestNewCompactionAdapterStoresInputAndOutputLimits(t *testing.T) {
+	t.Parallel()
+	loopID, _ := uuid.New()
+	descriptor := testHustleDefinition(t, "conversation.compact").Descriptor()
+	descriptor.Limits.InputBytes = 321
+	descriptor.Limits.OutputBytes = 123
+	adapter, err := newCompactionAdapter(&compactionRunnerStub{}, descriptor, loopID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adapter.inputBytes != 321 || adapter.outputBytes != 123 {
+		t.Fatalf("adapter limits = input %d output %d, want 321/123", adapter.inputBytes, adapter.outputBytes)
+	}
+}
+
 func TestCompactionAdapterStoresOnlyFocusedCapability(t *testing.T) {
 	t.Parallel()
 	typ := reflect.TypeOf(compactionAdapter{})
@@ -350,9 +559,11 @@ type compactionRunnerStub struct {
 	result                   hustle.Result
 	runtimeErr               error
 	validatorBeforeFinalizer bool
+	runCalls                 int
 }
 
 func (s *compactionRunnerStub) RunAndFinalize(ctx context.Context, request hustle.Request, validate hustleruntime.ValidateResult, finalizer hustleruntime.Finalizer) error {
+	s.runCalls++
 	s.request = request
 	var outcome hustle.Outcome
 	if s.runtimeErr != nil {
@@ -383,6 +594,26 @@ func validCompactionInput(t *testing.T) loop.CompactionInput {
 		Transcript: content.AgenticMessages{&content.UserMessage{Message: content.Message{
 			Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "hello"}},
 		}}},
+		MaxSummaryTokens: 32,
+	}
+}
+
+func compactionInputWithToolBodies(first, second string) loop.CompactionInput {
+	var fingerprint [32]byte
+	for index := range fingerprint {
+		fingerprint[index] = byte(index + 1)
+	}
+	eventID := uuid.MustParse("00000000-0000-4000-8000-000000000001")
+	return loop.CompactionInput{
+		Basis:              event.ContextBasis{Revision: 3, ThroughEventID: eventID},
+		Model:              model.ModelKey{Provider: "provider", Model: "model"},
+		RequestFingerprint: fingerprint,
+		Transcript: content.AgenticMessages{
+			&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "before"}}}},
+			&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: first}}}, ToolUseID: "call-1", IsError: true},
+			&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: "between"}}}},
+			&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: second}}}, ToolUseID: "call-2"},
+		},
 		MaxSummaryTokens: 32,
 	}
 }

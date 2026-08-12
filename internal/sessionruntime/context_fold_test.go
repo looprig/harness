@@ -2,6 +2,7 @@ package sessionruntime
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -138,7 +139,7 @@ func TestFoldLoopRecordsDerivedPrefixAfterCompactionCommitted(t *testing.T) {
 	if folded.DerivedPrefix != 1 {
 		t.Fatalf("folded.DerivedPrefix = %d, want 1 (msgs was just replaced by a compaction summary)", folded.DerivedPrefix)
 	}
-	if len(folded.Msgs) != 1 || folded.Msgs[0] != committed.Summary {
+	if len(folded.Msgs) != 1 || !reflect.DeepEqual(folded.Msgs[0], committed.Summary) {
 		t.Fatalf("folded.Msgs = %+v, want exactly [committed.Summary] (CompactionCommitted fully replaces msgs)", folded.Msgs)
 	}
 
@@ -157,6 +158,40 @@ func TestFoldLoopRecordsDerivedPrefixAfterCompactionCommitted(t *testing.T) {
 	}
 	if seed := restoredStateFrom(uncompacted, restoredInference{}, nil); seed.DerivedPrefix != 0 {
 		t.Fatalf("uncompacted restoredStateFrom().DerivedPrefix = %d, want 0", seed.DerivedPrefix)
+	}
+}
+
+func TestFoldLoopRetainsCompactionSuffixAfterSummaryAndClonesIt(t *testing.T) {
+	t.Parallel()
+	committed := restoredCommitted(42)
+	retained := content.AgenticMessages{
+		foldUserMsg("retained user"),
+		aiMessage("retained assistant"),
+		&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: "retained tool"}}}, ToolUseID: "fold-call"},
+	}
+	committed.Retained = retained
+	folded := foldLoop([]event.Event{committed})
+	if folded.Err != nil {
+		t.Fatalf("foldLoop() error = %v", folded.Err)
+	}
+	want := append(content.AgenticMessages{committed.Summary}, retained...)
+	if !reflect.DeepEqual(folded.Msgs, want) {
+		t.Fatalf("folded messages = %#v, want %#v", folded.Msgs, want)
+	}
+	if folded.DerivedPrefix != 1 {
+		t.Fatalf("DerivedPrefix = %d, want 1 (summary only)", folded.DerivedPrefix)
+	}
+	committed.Summary.Blocks[0].(*content.TextBlock).Text = "mutated event summary"
+	retained[0].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text = "mutated event retained"
+	if got := folded.Msgs[0].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text; got == "mutated event summary" {
+		t.Fatal("folded summary aliases committed event")
+	}
+	if got := folded.Msgs[1].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text; got == "mutated event retained" {
+		t.Fatal("folded retained message aliases committed event")
+	}
+	seed := restoredStateFrom(folded, restoredInference{}, nil)
+	if seed.DerivedPrefix != 1 {
+		t.Fatalf("restored seed DerivedPrefix = %d, want 1", seed.DerivedPrefix)
 	}
 }
 

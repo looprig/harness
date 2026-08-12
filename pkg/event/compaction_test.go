@@ -57,7 +57,8 @@ func TestCompactionReasonDomains(t *testing.T) {
 		{name: "reject summary too large", reason: CompactRejectSummaryTooLarge, valid: true},
 		{name: "reject internal", reason: CompactRejectInternal, valid: true},
 		{name: "reject context limit unknown", reason: CompactRejectContextLimitUnknown, valid: true},
-		{name: "reject unknown", reason: CompactRejectReason(14)},
+		{name: "reject retained tail too large", reason: CompactRejectRetainedTailTooLarge, valid: true},
+		{name: "reject unknown", reason: CompactRejectReason(15)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -128,6 +129,7 @@ func TestCompactRejectReasonWireValues(t *testing.T) {
 		{name: "summary too large is eleven", reason: CompactRejectSummaryTooLarge, want: 11, wantJSON: "11", valid: true},
 		{name: "internal is twelve", reason: CompactRejectInternal, want: 12, wantJSON: "12", valid: true},
 		{name: "context limit unknown is thirteen", reason: CompactRejectContextLimitUnknown, want: 13, wantJSON: "13", valid: true},
+		{name: "retained tail too large is fourteen", reason: CompactRejectRetainedTailTooLarge, want: 14, wantJSON: "14", valid: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -210,7 +212,7 @@ func TestCompactRejectReasonDurableDecodeRejectsOutOfDomain(t *testing.T) {
 		raw  string
 	}{
 		{name: "zero sentinel", raw: "0"},
-		{name: "unknown value", raw: "14"},
+		{name: "unknown value", raw: "15"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -276,7 +278,7 @@ func TestCompactionEventsValidate(t *testing.T) {
 		}(), wantErr: true},
 		{name: "rejected unspecified reason", event: func() Event { value := rejected; value.Reason = CompactionReasonUnspecified; return value }(), wantErr: true},
 		{name: "rejected invalid basis", event: func() Event { value := rejected; value.Basis = ContextBasis{}; return value }(), wantErr: true},
-		{name: "rejected unknown reason", event: func() Event { value := rejected; value.RejectReason = CompactRejectReason(14); return value }(), wantErr: true},
+		{name: "rejected unknown reason", event: func() Event { value := rejected; value.RejectReason = CompactRejectReason(15); return value }(), wantErr: true},
 		{name: "resolved nondeterministic event id", event: func() Event { value := resolved; value.EventID = uuid.UUID{0xff}; return value }(), wantErr: true},
 		{name: "rejected waiter missing command cause", event: func() Event { value := waiterRejected; value.Cause.CommandID = uuid.UUID{}; return value }(), wantErr: true},
 	}
@@ -320,6 +322,313 @@ func TestCompactionEnduringRoundTrip(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tt.event) {
 				t.Errorf("round trip = %#v, want %#v", got, tt.event)
+			}
+		})
+	}
+}
+
+// Task 12's retained suffix is additive: records written before the field
+// existed must still decode as summary-only, while a record carrying a tagged
+// message array must survive the event codec with the exact message graph.
+func TestCompactionCommittedRetainedWireCompatibility(t *testing.T) {
+	t.Parallel()
+	base := CompactionCommitted{
+		Header: fullHeaderLoop(), AttemptID: CompactAttemptID(uuid.UUID{0xb1}),
+		WaiterCommandIDs: []uuid.UUID{{0xb2}}, Reason: CompactionReasonManual,
+		Basis: validCompactionMeasurement(1).Basis, Summary: compactionSummaryFixture(),
+		PostContext: validCompactionMeasurement(2),
+	}
+	oldWire, err := MarshalEvent(base)
+	if err != nil {
+		t.Fatalf("MarshalEvent(old): %v", err)
+	}
+	old, err := UnmarshalEvent(oldWire)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent(old): %v", err)
+	}
+	if committed, ok := old.(CompactionCommitted); !ok {
+		t.Fatalf("old event = %T, want CompactionCommitted", old)
+	} else if retainedField := reflect.ValueOf(committed).FieldByName("Retained"); retainedField.IsValid() && !retainedField.IsNil() {
+		t.Fatalf("old event retained = %#v, want nil", retainedField.Interface())
+	}
+
+	fields := map[string]json.RawMessage{}
+	if err := json.Unmarshal(oldWire, &fields); err != nil {
+		t.Fatalf("decode old wire: %v", err)
+	}
+	retained := content.AgenticMessages{
+		&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "retained user"}}}},
+		&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{
+			&content.TextBlock{Text: "retained assistant"},
+			&content.ToolUseBlock{ID: "call-1", Name: "tool", Input: json.RawMessage(`{}`)},
+		}}},
+		&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: "retained tool"}}}, ToolUseID: "call-1"},
+	}
+	withRetained := base
+	withRetained.Retained = retained
+	newWire, err := MarshalEvent(withRetained)
+	if err != nil {
+		t.Fatalf("MarshalEvent(new): %v", err)
+	}
+	newFields := map[string]json.RawMessage{}
+	if err := json.Unmarshal(newWire, &newFields); err != nil {
+		t.Fatalf("decode new wire: %v", err)
+	}
+	if _, ok := newFields["retained"]; !ok {
+		t.Fatalf("new wire = %s, want retained field", newWire)
+	}
+	decoded, err := UnmarshalEvent(newWire)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent(new): %v", err)
+	}
+	committed, ok := decoded.(CompactionCommitted)
+	if !ok {
+		t.Fatalf("new event = %T, want CompactionCommitted", decoded)
+	}
+	field := reflect.ValueOf(committed).FieldByName("Retained")
+	if !field.IsValid() {
+		t.Fatal("CompactionCommitted has no Retained field")
+	}
+	got := field.Interface().(content.AgenticMessages)
+	if !reflect.DeepEqual(got, retained) {
+		t.Fatalf("retained = %#v, want %#v", got, retained)
+	}
+
+	// Both nil and an explicitly empty in-memory slice are omitted by the
+	// additive field's omitempty contract.
+	emptyValue := base
+	emptyValue.Retained = content.AgenticMessages{}
+	emptyWire, err := MarshalEvent(emptyValue)
+	if err != nil {
+		t.Fatalf("MarshalEvent(empty retained): %v", err)
+	}
+	emptyFields := map[string]json.RawMessage{}
+	if err := json.Unmarshal(emptyWire, &emptyFields); err != nil {
+		t.Fatalf("decode empty retained wire: %v", err)
+	}
+	if _, ok := emptyFields["retained"]; ok {
+		t.Fatalf("empty retained wire = %s, want retained omitted", emptyWire)
+	}
+
+	// Explicit [] is normalized to the same nil in-memory value as an omitted
+	// field, preserving omitempty's old/new fixed point.
+	newFields["retained"] = json.RawMessage(`[]`)
+	emptyWire, err = json.Marshal(newFields)
+	if err != nil {
+		t.Fatalf("marshal empty retained wire: %v", err)
+	}
+	emptyDecoded, err := UnmarshalEvent(emptyWire)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent(empty retained): %v", err)
+	}
+	emptyField := reflect.ValueOf(emptyDecoded.(CompactionCommitted)).FieldByName("Retained")
+	if !emptyField.IsNil() {
+		t.Fatalf("empty retained = %#v, want nil normalization", emptyField.Interface())
+	}
+}
+
+func TestCompactionCommittedRejectsInvalidRetainedWire(t *testing.T) {
+	t.Parallel()
+	base := CompactionCommitted{
+		Header: fullHeaderLoop(), AttemptID: CompactAttemptID(uuid.UUID{0xc1}),
+		WaiterCommandIDs: []uuid.UUID{{0xc2}}, Reason: CompactionReasonManual,
+		Basis: validCompactionMeasurement(1).Basis, Summary: compactionSummaryFixture(),
+		PostContext: validCompactionMeasurement(2),
+	}
+	wire, err := MarshalEvent(base)
+	if err != nil {
+		t.Fatalf("MarshalEvent: %v", err)
+	}
+	tests := []struct {
+		name      string
+		retained  string
+		decodeErr bool
+	}{
+		{name: "null message", retained: `[null]`},
+		{name: "unknown role", retained: `[{"role":"alien","blocks":[]}]`, decodeErr: true},
+		{name: "nil nested block", retained: `[{"role":"user","blocks":[null]}]`, decodeErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fields := map[string]json.RawMessage{}
+			if err := json.Unmarshal(wire, &fields); err != nil {
+				t.Fatal(err)
+			}
+			fields["retained"] = json.RawMessage(tt.retained)
+			mutated, err := json.Marshal(fields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := UnmarshalEvent(mutated)
+			if got != nil {
+				t.Fatalf("event = %#v, want nil", got)
+			}
+			if tt.decodeErr {
+				var decode *EventDecodeError
+				if !errors.As(err, &decode) || decode.Type != "CompactionCommitted" {
+					t.Fatalf("error = %T %v, want CompactionCommitted EventDecodeError", err, err)
+				}
+				return
+			}
+			var invalid *InvalidEventError
+			if !errors.As(err, &invalid) {
+				t.Fatalf("error = %T %v, want InvalidEventError", err, err)
+			}
+			if invalid.Event != "CompactionCommitted" || invalid.Field != FieldName("Retained") || invalid.Rule != RuleInvalid {
+				t.Fatalf("invalid = %#v, want CompactionCommitted/Retained/invalid", invalid)
+			}
+		})
+	}
+}
+
+func compactionHistoryUser(text string) *content.UserMessage {
+	return &content.UserMessage{Message: content.Message{
+		Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: text}},
+	}}
+}
+
+func compactionHistoryAssistant(text string) *content.AIMessage {
+	return &content.AIMessage{Message: content.Message{
+		Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: text}},
+	}}
+}
+
+func compactionHistoryCalls(ids ...string) *content.AIMessage {
+	blocks := make([]content.Block, 0, len(ids))
+	for _, id := range ids {
+		blocks = append(blocks, &content.ToolUseBlock{ID: id, Name: "tool", Input: json.RawMessage(`{}`)})
+	}
+	return &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: blocks}}
+}
+
+func compactionHistoryResult(id string) *content.ToolResultMessage {
+	return &content.ToolResultMessage{
+		Message:   content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: "ok"}}},
+		ToolUseID: id,
+	}
+}
+
+func compactionCommittedWithRetained(retained content.AgenticMessages) CompactionCommitted {
+	return CompactionCommitted{
+		Header: fullHeaderLoop(), AttemptID: CompactAttemptID(uuid.UUID{0xd1}),
+		WaiterCommandIDs: []uuid.UUID{{0xd2}}, Reason: CompactionReasonManual,
+		Basis: validCompactionMeasurement(1).Basis, Summary: compactionSummaryFixture(), Retained: retained,
+		PostContext: validCompactionMeasurement(2),
+	}
+}
+
+// TestCompactionCommittedRetainedHistoryRejectsMalformed is intentionally
+// adversarial: before the event-local history validator exists, both durable
+// encode and decode accept these structurally invalid suffixes. Keep the two
+// paths in the same table so a future change cannot validate only one boundary.
+func TestCompactionCommittedRetainedHistoryRejectsMalformed(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		retained content.AgenticMessages
+	}{
+		{name: "non-user anchor", retained: content.AgenticMessages{compactionHistoryAssistant("assistant first")}},
+		{name: "leading orphan result", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryResult("missing")}},
+		{name: "empty tool-use id", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryCalls("")}},
+		{name: "duplicate tool-use ids", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryCalls("duplicate", "duplicate"), compactionHistoryResult("duplicate"), compactionHistoryResult("duplicate")}},
+		{name: "unmatched tool call", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryCalls("unmatched")}},
+		{name: "result for unknown id", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryResult("unknown")}},
+		{name: "duplicate result", retained: content.AgenticMessages{compactionHistoryUser("anchor"), compactionHistoryCalls("once"), compactionHistoryResult("once"), compactionHistoryResult("once")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value := compactionCommittedWithRetained(tt.retained)
+			if _, err := MarshalEvent(value); err == nil {
+				t.Errorf("MarshalEvent accepted malformed retained history")
+			} else {
+				var invalid *InvalidEventError
+				if !errors.As(err, &invalid) || invalid.Event != "CompactionCommitted" || invalid.Field != FieldRetained || invalid.Rule != RuleInvalid {
+					t.Errorf("MarshalEvent error = %T(%v), want InvalidEventError{Event: CompactionCommitted, Field: Retained, Rule: is invalid}", err, err)
+				}
+			}
+
+			baseWire, err := MarshalEvent(compactionCommittedWithRetained(nil))
+			if err != nil {
+				t.Fatalf("MarshalEvent(summary-only base): %v", err)
+			}
+			fields := map[string]json.RawMessage{}
+			if err := json.Unmarshal(baseWire, &fields); err != nil {
+				t.Fatalf("decode summary-only base: %v", err)
+			}
+			retainedWire, err := marshalMessages(tt.retained)
+			if err != nil {
+				t.Fatalf("marshal malformed retained: %v", err)
+			}
+			fields["retained"] = retainedWire
+			mutatedWire, err := json.Marshal(fields)
+			if err != nil {
+				t.Fatalf("marshal malformed event wire: %v", err)
+			}
+			if decoded, err := UnmarshalEvent(mutatedWire); err == nil {
+				t.Errorf("UnmarshalEvent accepted malformed retained history: %#v", decoded)
+			} else {
+				var invalid *InvalidEventError
+				if !errors.As(err, &invalid) || invalid.Event != "CompactionCommitted" || invalid.Field != FieldRetained || invalid.Rule != RuleInvalid {
+					t.Errorf("UnmarshalEvent error = %T(%v), want InvalidEventError{Event: CompactionCommitted, Field: Retained, Rule: is invalid}", err, err)
+				}
+			}
+		})
+	}
+}
+
+func TestCompactionCommittedRetainedHistoryAcceptsProviderOrder(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		retained content.AgenticMessages
+	}{
+		{name: "ordinary user assistant segment", retained: content.AgenticMessages{compactionHistoryUser("user"), compactionHistoryAssistant("assistant")}},
+		{name: "sequential call result pairs", retained: content.AgenticMessages{
+			compactionHistoryUser("user"), compactionHistoryCalls("first"), compactionHistoryResult("first"),
+			compactionHistoryCalls("second"), compactionHistoryResult("second"),
+		}},
+		{name: "sequential completed reuse", retained: content.AgenticMessages{
+			compactionHistoryUser("user"), compactionHistoryCalls("reused"), compactionHistoryResult("reused"),
+			compactionHistoryUser("next user"), compactionHistoryCalls("reused"), compactionHistoryResult("reused"),
+		}},
+		{name: "parallel calls and results", retained: content.AgenticMessages{
+			compactionHistoryUser("user"), compactionHistoryCalls("first", "second"),
+			compactionHistoryResult("second"), compactionHistoryResult("first"),
+		}},
+		{name: "assistant and user after completed pairs", retained: content.AgenticMessages{
+			compactionHistoryUser("user"), compactionHistoryCalls("first"), compactionHistoryResult("first"),
+			compactionHistoryAssistant("follow-up assistant"), compactionHistoryUser("next user"),
+		}},
+		// TurnFoldedInto can insert a folded user between a tool call and its
+		// result; selector-shaped retention expands to keep that complete pair.
+		{name: "folded user between tool call and result", retained: content.AgenticMessages{
+			compactionHistoryUser("anchor"), compactionHistoryCalls("folded-call"),
+			compactionHistoryUser("folded user"), compactionHistoryResult("folded-call"),
+		}},
+		{name: "old nil retained", retained: nil},
+		{name: "empty retained", retained: content.AgenticMessages{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value := compactionCommittedWithRetained(tt.retained)
+			wire, err := MarshalEvent(value)
+			if err != nil {
+				t.Fatalf("MarshalEvent() error = %v", err)
+			}
+			decoded, err := UnmarshalEvent(wire)
+			if err != nil {
+				t.Fatalf("UnmarshalEvent() error = %v", err)
+			}
+			committed, ok := decoded.(CompactionCommitted)
+			if !ok {
+				t.Fatalf("decoded event = %T, want CompactionCommitted", decoded)
+			}
+			if len(tt.retained) == 0 {
+				if committed.Retained != nil {
+					t.Fatalf("decoded retained = %#v, want nil normalization", committed.Retained)
+				}
+			} else if !reflect.DeepEqual(committed.Retained, tt.retained) {
+				t.Fatalf("decoded retained = %#v, want %#v", committed.Retained, tt.retained)
 			}
 		})
 	}

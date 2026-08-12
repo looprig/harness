@@ -38,11 +38,11 @@ func localInferenceCapability() contextcount.InferenceCapability {
 }
 
 func manualCompactionPolicy() CompactionPolicy {
-	return CompactionPolicy{ReservedOutput: 10, MaxSummaryTokens: 5, CountTimeout: 17 * time.Millisecond, Hustle: "context.compact"}
+	return CompactionPolicy{KeepRecentSegments: 2, KeepRecentTokens: 100, ReservedOutput: 10, MaxSummaryTokens: 5, CountTimeout: 17 * time.Millisecond, Hustle: "context.compact"}
 }
 
 func automaticCompactionPolicy() CompactionPolicy {
-	return CompactionPolicy{Automatic: true, CounterPolicy: CounterPolicyAllowConservative, CompactAt: 8_000, RearmBelow: 6_000, ReservedOutput: 10, SafetyMargin: 2, MaxSummaryTokens: 5, CountTimeout: 17 * time.Millisecond, Hustle: "context.compact"}
+	return CompactionPolicy{Automatic: true, CounterPolicy: CounterPolicyAllowConservative, CompactAt: 8_000, RearmBelow: 6_000, KeepRecentSegments: 2, KeepRecentTokens: 100, ReservedOutput: 10, SafetyMargin: 2, MaxSummaryTokens: 5, CountTimeout: 17 * time.Millisecond, Hustle: "context.compact"}
 }
 
 func contextDefinitionOptions(counter contextcount.ContextCounter, capability contextcount.InferenceCapability, policy CompactionPolicy) []Option {
@@ -94,6 +94,13 @@ func TestCompactionPolicyValidation(t *testing.T) {
 			return value
 		}(), capability: heuristic, wantErr: true},
 		{name: "zero reserved output", policy: func() CompactionPolicy { value := manualCompactionPolicy(); value.ReservedOutput = 0; return value }(), capability: exact, wantErr: true},
+		{name: "zero retained segments", policy: func() CompactionPolicy { value := manualCompactionPolicy(); value.KeepRecentSegments = 0; return value }(), capability: exact, wantErr: true},
+		{name: "negative retained segments", policy: func() CompactionPolicy {
+			value := manualCompactionPolicy()
+			value.KeepRecentSegments = -1
+			return value
+		}(), capability: exact, wantErr: true},
+		{name: "zero retained tokens", policy: func() CompactionPolicy { value := manualCompactionPolicy(); value.KeepRecentTokens = 0; return value }(), capability: exact, wantErr: true},
 		{name: "zero summary budget", policy: func() CompactionPolicy { value := manualCompactionPolicy(); value.MaxSummaryTokens = 0; return value }(), capability: exact, wantErr: true},
 		{name: "zero count timeout", policy: func() CompactionPolicy { value := manualCompactionPolicy(); value.CountTimeout = 0; return value }(), capability: exact, wantErr: true},
 		{name: "negative count timeout", policy: func() CompactionPolicy { value := manualCompactionPolicy(); value.CountTimeout = -1; return value }(), capability: exact, wantErr: true},
@@ -113,6 +120,30 @@ func TestCompactionPolicyValidation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPolicyRevisionIncludesRetainedTailPolicy(t *testing.T) {
+	t.Parallel()
+	counter := &policyCounter{capability: exactCounterCapability()}
+	base := manualCompactionPolicy()
+	define := func(policy CompactionPolicy) Definition {
+		definition, err := Define(contextDefinitionOptions(counter, localInferenceCapability(), policy)...)
+		if err != nil {
+			t.Fatalf("Define() error = %v", err)
+		}
+		return definition
+	}
+	baseRevision := define(base).PolicyRevision()
+	for _, mutate := range []func(*CompactionPolicy){
+		func(policy *CompactionPolicy) { policy.KeepRecentSegments++ },
+		func(policy *CompactionPolicy) { policy.KeepRecentTokens++ },
+	} {
+		changed := base
+		mutate(&changed)
+		if got := define(changed).PolicyRevision(); got == baseRevision {
+			t.Fatalf("PolicyRevision() = %q after retained-tail policy change, want a different digest", got)
+		}
 	}
 }
 

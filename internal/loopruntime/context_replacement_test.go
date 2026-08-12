@@ -124,6 +124,40 @@ func TestActorContextReplacementResetsCommittedStateAndPreservesQueue(t *testing
 	}
 }
 
+func TestActorContextReplacementInstallsSummaryThenRetainedWithoutAliasing(t *testing.T) {
+	t.Parallel()
+	state, attempt, success, settings := validActorReplacementFixture(t)
+	retained := content.AgenticMessages{
+		replacementTestMessage("retained user"),
+		&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: "retained assistant"}}}},
+		&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: "retained tool"}}}, ToolUseID: "retained-call"},
+	}
+	committed := event.CompactionCommitted{
+		Header: event.Header{EventID: uuid.UUID{0x71}}, AttemptID: attempt.AttemptID, Basis: attempt.Basis,
+		Summary: cloneUserMessage(success.Summary), Retained: retained, PostContext: validFinalizationMeasurement(71),
+	}
+	plan, err := prepareActorContextReplacement(state, attempt, success, settings)
+	if err != nil {
+		t.Fatalf("prepareActorContextReplacement() error = %v", err)
+	}
+	plan.apply(&state, committed)
+	want := append(content.AgenticMessages{committed.Summary}, retained...)
+	if !reflect.DeepEqual(state.msgs, want) {
+		t.Fatalf("actor messages = %#v, want %#v", state.msgs, want)
+	}
+	if state.msgsDerivedPrefix != 1 {
+		t.Fatalf("msgsDerivedPrefix = %d, want 1", state.msgsDerivedPrefix)
+	}
+	committed.Summary.Blocks[0].(*content.TextBlock).Text = "mutated summary"
+	retained[0].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text = "mutated retained"
+	if got := state.msgs[0].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text; got == "mutated summary" {
+		t.Fatal("actor summary aliases committed event")
+	}
+	if got := state.msgs[1].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text; got == "mutated retained" {
+		t.Fatal("actor retained message aliases committed event")
+	}
+}
+
 func TestTurnContextReplacementResetsOnlyRequestHistory(t *testing.T) {
 	tests := []struct {
 		name string
@@ -140,7 +174,8 @@ func TestTurnContextReplacementResetsOnlyRequestHistory(t *testing.T) {
 				toolIterations: 7, toolCalls: 8,
 			}
 
-			applyTurnContextReplacement(&cfg, &state, turnContextReplacement{Summary: summary})
+			retained := content.AgenticMessages{replacementTestMessage("retained user"), replacementTestMessage("retained follow-up")}
+			applyTurnContextReplacement(&cfg, &state, turnContextReplacement{Summary: summary, Retained: retained})
 
 			if len(cfg.base) != 0 {
 				t.Fatalf("turn base = %#v, want empty", cfg.base)
@@ -155,8 +190,9 @@ func TestTurnContextReplacementResetsOnlyRequestHistory(t *testing.T) {
 				t.Fatalf("turn baseDerivedPrefix = %d, want 0 (reset alongside the now-empty base)", cfg.baseDerivedPrefix)
 			}
 			request := requestMessages(cfg.base, state.msgs, nil)
-			if len(request) != 1 || !reflect.DeepEqual(request[0], summary) {
-				t.Fatalf("next request = %#v, want only validated summary", request)
+			wantRequest := append(content.AgenticMessages{summary}, retained...)
+			if !reflect.DeepEqual(request, wantRequest) {
+				t.Fatalf("next request = %#v, want %#v", request, wantRequest)
 			}
 			if state.sessionID != (uuid.UUID{1}) || state.loopID != (uuid.UUID{2}) || state.id != (uuid.UUID{3}) || state.index != 4 || state.causationID != (uuid.UUID{5}) ||
 				state.usage.InputTokens != 6 || state.toolIterations != 7 || state.toolCalls != 8 {
@@ -165,6 +201,10 @@ func TestTurnContextReplacementResetsOnlyRequestHistory(t *testing.T) {
 			summary.Blocks[0].(*content.TextBlock).Text = "mutated outside turn"
 			if state.msgs[0].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text == "mutated outside turn" {
 				t.Fatal("turn replacement aliases handshake summary")
+			}
+			retained[0].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text = "mutated outside retained"
+			if state.msgs[1].(*content.UserMessage).Blocks[0].(*content.TextBlock).Text == "mutated outside retained" {
+				t.Fatal("turn replacement aliases handshake retained message")
 			}
 		})
 	}
