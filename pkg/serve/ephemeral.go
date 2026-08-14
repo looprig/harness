@@ -33,6 +33,8 @@ const (
 	chunkTypeText     = "text"
 	chunkTypeThinking = "thinking"
 	chunkTypeToolUse  = "tool_use"
+	chunkTypeRefusal  = "refusal"
+	chunkTypeImage    = "image"
 )
 
 // enduringFrame is the wire body of an `event: enduring` SSE frame: a schema version
@@ -74,6 +76,33 @@ type toolUseChunkDTO struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
 	InputJSON string `json:"input_json"`
+}
+
+// refusalChunkDTO is the tagged live wire form of a content.RefusalChunk. It
+// carries its OWN chunk_type rather than riding on "text": a client that saw a
+// refusal as text would render the model answering a request it declined, and
+// the two are not interchangeable on the wire any more than they are in memory.
+type refusalChunkDTO struct {
+	ChunkType string `json:"chunk_type"` // "refusal"
+	Text      string `json:"text"`
+}
+
+// imageChunkDTO is the tagged live wire form of a content.ImageChunk, flattened
+// like toolUseChunkDTO rather than nesting the source.
+//
+// Index and MediaType are carried because image deltas are per-image and a
+// client cannot reassemble them without both — splicing one image's bytes onto
+// another's yields a file nothing can decode or detect. Data is the delta's RAW
+// bytes, base64-encoded by the JSON codec, and rides the frame verbatim: a frame
+// that described an image without its data would be one a client can only render
+// as a hole. URL arrives whole rather than fragmented and replaces any earlier
+// value; Data fragments append in arrival order.
+type imageChunkDTO struct {
+	ChunkType string            `json:"chunk_type"` // "image"
+	Index     int               `json:"index"`
+	MediaType content.MediaType `json:"media_type,omitempty"`
+	URL       string            `json:"url,omitempty"`
+	Data      []byte            `json:"data,omitempty"`
 }
 
 // toolCallStartedDelta is the Delta payload for a ToolCallStarted ephemeral frame:
@@ -201,6 +230,12 @@ func buildEphemeralFrame(ev event.Event) (ephemeralFrame, bool) {
 // (*content.TextChunk)(nil)), or an unknown variant yields ok==false so the enclosing
 // TokenDelta frame is skipped — content.Chunk itself is NEVER serialized, and a
 // typed-nil deref never panics deep in the request path (fail closed).
+//
+// Every variant of the sealed union needs an arm. Falling through to the skip is
+// fail-closed for a malformed value but is data loss for a real one: the runtime
+// accumulates the chunk into the turn while the live stream silently omits it,
+// so a viewer watches an answer take shape that does not match the message the
+// turn commits.
 func encodeChunkDelta(chunk content.Chunk) (json.RawMessage, bool) {
 	switch c := chunk.(type) {
 	case *content.TextChunk:
@@ -218,6 +253,19 @@ func encodeChunkDelta(chunk content.Chunk) (json.RawMessage, bool) {
 			return nil, false
 		}
 		return marshalDelta(toolUseChunkDTO{ChunkType: chunkTypeToolUse, Index: c.Index, ID: c.ID, Name: c.Name, InputJSON: c.InputJSON})
+	case *content.RefusalChunk:
+		if c == nil {
+			return nil, false
+		}
+		return marshalDelta(refusalChunkDTO{ChunkType: chunkTypeRefusal, Text: c.Text})
+	case *content.ImageChunk:
+		if c == nil {
+			return nil, false
+		}
+		return marshalDelta(imageChunkDTO{
+			ChunkType: chunkTypeImage, Index: c.Index, MediaType: c.MediaType,
+			URL: c.Source.URL, Data: c.Source.Data,
+		})
 	default:
 		return nil, false
 	}

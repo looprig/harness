@@ -96,6 +96,15 @@ type runtimeConfig struct {
 	DrainTimeout time.Duration    // optional — bounds the hard-kill wait for a cancelled turn to drain; New defaults it to 5s
 	Hooks        *hook.Runner
 
+	// truncatedCommitGrace bounds the detached commit that saves a CANCELLED
+	// turn's partial reply (see commitTruncatedStep). It is unexported so the
+	// composition root cannot lengthen the pause a user feels on Ctrl-C; zero
+	// means the production default. It exists as a timing seam so a test can
+	// state which property it is asserting — a grace too large to expire proves
+	// the content is durable, a tiny one proves the wait is bounded — instead of
+	// racing a wall clock under a loaded scheduler.
+	truncatedCommitGrace time.Duration
+
 	// AgentName is the immutable attribution name the loop runs under (the agent/role
 	// driving it, e.g. "operator"). It is stamped onto the loop's LoopStarted at creation
 	// and never changes. Empty (the zero value) means an unnamed/plain loop. The session

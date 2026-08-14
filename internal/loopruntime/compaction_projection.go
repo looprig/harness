@@ -21,6 +21,18 @@ const (
 	compactionDocumentPlaceholder       = "[document omitted for compaction]"
 )
 
+// A refusal projects as a LABELED quotation rather than as one of the omission
+// placeholders above, because unlike an image or a reasoning block its content
+// is text the summarizer can actually use, and unlike a text block it is not an
+// answer. Both halves are load-bearing: dropping the wording loses the reason a
+// later turn may be reacting to, while dropping the label lets the summary
+// record a refusal as though the model had complied. The wrapper follows the
+// "[called tool: name]" convention already used for tool calls.
+const (
+	compactionRefusalPrefix = "[model refused: "
+	compactionRefusalSuffix = "]"
+)
+
 const compactionProjectionMaxDepth = 128
 
 // projectCompactionTranscript builds a fresh, text-oriented view for a
@@ -172,6 +184,13 @@ func (a *compactionRuneAccumulator) appendBlock(block content.Block, depth int) 
 		a.appendString("[called tool: ")
 		a.appendString(typed.Name)
 		a.appendString("]")
+	case *content.RefusalBlock:
+		if typed == nil {
+			return &compactionProjectionError{field: "block"}
+		}
+		a.appendString(compactionRefusalPrefix)
+		a.appendString(typed.Text)
+		a.appendString(compactionRefusalSuffix)
 	case *content.ThinkingBlock:
 		if typed == nil {
 			return &compactionProjectionError{field: "block"}
@@ -308,6 +327,11 @@ func projectCompactionBlock(block content.Block, depth int) (string, error) {
 			return "", &compactionProjectionError{field: "block"}
 		}
 		return "[called tool: " + typed.Name + "]", nil
+	case *content.RefusalBlock:
+		if typed == nil {
+			return "", &compactionProjectionError{field: "block"}
+		}
+		return compactionRefusalPrefix + typed.Text + compactionRefusalSuffix, nil
 	case *content.ThinkingBlock:
 		if typed == nil {
 			return "", &compactionProjectionError{field: "block"}

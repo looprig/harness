@@ -118,6 +118,18 @@ func preflightToolResponse(response *inference.Response, limits toolResponseLimi
 			if typed.Name != inference.StructuredOutputToolName {
 				ordinaryCalls++
 			}
+		case *content.RefusalBlock:
+			// A refusal is rejected HERE, in the shape pass, which runs to
+			// completion before the byte-accounting pass below. That ordering is
+			// what keeps refusal text out of the output budget entirely: it can
+			// neither consume the budget nor slip past it, because no arm below
+			// ever sees the block. A typed nil is a malformed payload rather than
+			// a refusal — the block's presence is the signal, and a nil pointer is
+			// not a block.
+			if typed == nil {
+				return toolResponseError(ToolResponseFailureInvalidShape)
+			}
+			return toolResponseError(ToolResponseFailureRefused)
 		case *content.ImageBlock:
 			return toolResponseError(ToolResponseFailureInvalidShape)
 		case *content.AudioBlock:
@@ -210,6 +222,14 @@ func inspectToolResponseBlocks(blocks []content.Block) (inspectedToolResponse, T
 			} else {
 				shape.ordinary = append(shape.ordinary, typed)
 			}
+		case *content.RefusalBlock:
+			// Preflight already rejects a refusal before this runs; the arm is kept
+			// so the two passes cannot disagree about what a refusal means if they
+			// are ever called in the other order. See preflightToolResponse.
+			if typed == nil {
+				return inspectedToolResponse{}, ToolResponseFailureInvalidShape
+			}
+			return inspectedToolResponse{}, ToolResponseFailureRefused
 		case *content.ImageBlock:
 			return inspectedToolResponse{}, ToolResponseFailureInvalidShape
 		case *content.AudioBlock:

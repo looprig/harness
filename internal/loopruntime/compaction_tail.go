@@ -274,6 +274,14 @@ func validateCompactionTailBlocks(blocks []content.Block, depth int) error {
 			if typed == nil {
 				return &compactionTailError{field: "block"}
 			}
+		case *content.RefusalBlock:
+			// Accepted like any other declared variant: the tail is already
+			// committed history, so rejecting a refusal would fail the compaction
+			// rather than the block. Only nil payloads and foreign implementations
+			// of the sealed interface are refused here.
+			if typed == nil {
+				return &compactionTailError{field: "block"}
+			}
 		case *content.ImageBlock:
 			if typed == nil {
 				return &compactionTailError{field: "block"}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/looprig/core/content"
@@ -35,8 +36,19 @@ func TestSessionMetaRejectsInvalidLoopProjection(t *testing.T) {
 		{name: "runtime model is empty", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, Runtime: event.ModelRuntime{Key: model.ModelKey{Provider: "provider"}}, RuntimeSeq: 1, RuntimeValueSeq: 1}}}},
 		{name: "runtime limits are invalid", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, Runtime: event.ModelRuntime{Key: validRuntime.Key, Limits: model.ContextLimits{WindowTokens: 10, MaxInputTokens: 11}}, RuntimeSeq: 1, RuntimeValueSeq: 1}}}},
 		{name: "runtime effort is invalid", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, Runtime: event.ModelRuntime{Key: validRuntime.Key, Effort: model.Effort("invalid")}, RuntimeSeq: 1, RuntimeValueSeq: 1}}}},
-		{name: "usage is invalid", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, CumulativeUsage: content.Usage{OutputTokens: 1, ReasoningTokens: 2}}}}},
 		{name: "valid projection", meta: SessionMeta{Loops: []LoopUsageMeta{validLoop}}},
+		{
+			// A stored session must round-trip whatever its provider reported.
+			// These are the live counts from an OpenRouter HTTP 200 against
+			// nvidia/nemotron-3-ultra-550b-a55b:free; rejecting them made the
+			// catalog itself unreadable over an accounting field.
+			name: "valid projection with usage diverging from the reasoning convention",
+			meta: SessionMeta{Loops: []LoopUsageMeta{func() LoopUsageMeta {
+				loop := validLoop
+				loop.CumulativeUsage = content.Usage{InputTokens: 31, OutputTokens: 216, ReasoningTokens: 226}
+				return loop
+			}()}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -47,7 +59,7 @@ func TestSessionMetaRejectsInvalidLoopProjection(t *testing.T) {
 			}
 			_, decodeErr := decodeSessionMeta(raw)
 			_, encodeErr := encodeSessionMeta(tt.meta)
-			wantErr := tt.name != "valid projection"
+			wantErr := !strings.HasPrefix(tt.name, "valid projection")
 			if (decodeErr != nil) != wantErr {
 				t.Errorf("decodeSessionMeta() error = %v, wantErr %v", decodeErr, wantErr)
 			}

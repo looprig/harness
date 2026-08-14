@@ -61,6 +61,16 @@ func TestCompactionInputValidate(t *testing.T) {
 		{name: "typed nil tool result block", mutate: func(v *CompactionInput) {
 			v.Transcript[0].(*content.UserMessage).Blocks = []content.Block{(*content.ToolResultBlock)(nil)}
 		}, wantField: CompactionInputFieldTranscript, wantBlock: true},
+		{name: "typed nil refusal block", mutate: func(v *CompactionInput) {
+			v.Transcript[0].(*content.UserMessage).Blocks = []content.Block{(*content.RefusalBlock)(nil)}
+		}, wantField: CompactionInputFieldTranscript, wantBlock: true},
+		// A transcript is not invalid because the model once declined. Rejecting a
+		// refusal here would make every session that contains one permanently
+		// uncompactable, which fails the turn that triggered compaction rather than
+		// the block that caused it.
+		{name: "refusal block is a valid transcript block", mutate: func(v *CompactionInput) {
+			v.Transcript[0].(*content.UserMessage).Blocks = []content.Block{&content.RefusalBlock{Text: "declined"}}
+		}},
 		{name: "nested typed nil tool result content", mutate: func(v *CompactionInput) {
 			v.Transcript[0].(*content.UserMessage).Blocks = []content.Block{&content.ToolResultBlock{Content: []content.Block{(*content.TextBlock)(nil)}}}
 		}, wantField: CompactionInputFieldTranscript, wantBlock: true},

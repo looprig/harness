@@ -866,7 +866,9 @@ func validateCatalogHustleCompleted(terminal event.HustleCompleted) error {
 	if err := validateCatalogRuntime(terminal.Run.Runtime); err != nil {
 		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle, RunID: terminal.Run.RunID, Cause: err}
 	}
-	return validateCatalogHustleUsage(terminal.Run.RunID, terminal.Usage)
+	// terminal.Usage is recorded, not judged; see
+	// content.Usage.ReasoningWithinOutput.
+	return nil
 }
 
 func validateCatalogHustleFailed(terminal event.HustleFailed) error {
@@ -883,16 +885,8 @@ func validateCatalogHustleFailed(terminal event.HustleFailed) error {
 	if err := validateCatalogRuntime(terminal.Run.Runtime); err != nil {
 		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle, RunID: terminal.Run.RunID, Cause: err}
 	}
-	return validateCatalogHustleUsage(terminal.Run.RunID, terminal.Usage)
-}
-
-func validateCatalogHustleUsage(runID hustle.RunID, usage *content.Usage) error {
-	if usage == nil {
-		return nil
-	}
-	if err := usage.Validate(); err != nil {
-		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle, RunID: runID, Cause: err}
-	}
+	// The terminal's usage is recorded, not judged; see
+	// content.Usage.ReasoningWithinOutput.
 	return nil
 }
 
@@ -1175,9 +1169,6 @@ func validateSessionMeta(meta SessionMeta) error {
 		} else if err := validateCatalogRuntime(loop.Runtime); err != nil {
 			return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldRuntime, Rule: CatalogMetaRuleInvalid, Cause: err}
 		}
-		if err := loop.CumulativeUsage.Validate(); err != nil {
-			return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldCumulativeUsage, Rule: CatalogMetaRuleInvalid, Cause: err}
-		}
 		if loop.ContextValueSeq > loop.ContextSeq {
 			return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldContextValueSeq, Rule: CatalogMetaRuleExceedsContext}
 		}
@@ -1244,7 +1235,7 @@ func validateHustleUsageAggregate(aggregate HustleUsageAggregate) error {
 	} else if aggregate.Runtime != (event.ModelRuntime{}) {
 		return &CatalogHustleError{Kind: CatalogHustleRuntimeMismatch}
 	}
-	return aggregate.CumulativeUsage.Validate()
+	return nil
 }
 
 type namedHustleRuntimeKey struct {

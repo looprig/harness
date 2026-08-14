@@ -183,12 +183,19 @@ const (
 	OutputFailureEmptyText    OutputFailureReason = "empty_text"
 	OutputFailureTooLarge     OutputFailureReason = "too_large"
 	OutputFailureInvalidJSON  OutputFailureReason = "invalid_json"
+	// OutputFailureRefused reports that the model DECLINED to produce the
+	// output. It is distinct from invalid_shape for the same reason
+	// ToolResponseFailureRefused is: the response is not defective, the request
+	// was refused, and only the latter is worth surfacing to a human. It names
+	// the outcome, never the provider's wording.
+	OutputFailureRefused OutputFailureReason = "refused"
 )
 
 // Valid reports whether the reason is a recognized extraction failure.
 func (r OutputFailureReason) Valid() bool {
 	return r == OutputFailureInvalidShape || r == OutputFailureEmptyText ||
-		r == OutputFailureTooLarge || r == OutputFailureInvalidJSON
+		r == OutputFailureTooLarge || r == OutputFailureInvalidJSON ||
+		r == OutputFailureRefused
 }
 
 // OutputError reports an invalid provider response or consumer validation
@@ -233,6 +240,13 @@ const (
 	ToolResponseFailureDuplicateTerminal  ToolResponseFailureReason = "duplicate_terminal"
 	ToolResponseFailureInvalidTerminal    ToolResponseFailureReason = "invalid_terminal"
 	ToolResponseFailureTooLarge           ToolResponseFailureReason = "too_large"
+	// ToolResponseFailureRefused reports that the model DECLINED to answer,
+	// which is a fact about the request and not a defect in the response. It is
+	// kept distinct from invalid_shape because the two lead somewhere different:
+	// a malformed response is a bug to investigate, a refusal is a decision to
+	// surface. Like every other reason it names only the shape, never the
+	// provider's wording.
+	ToolResponseFailureRefused ToolResponseFailureReason = "refused"
 )
 
 // Valid reports whether the reason is a recognized response-shape failure.
@@ -247,7 +261,8 @@ func (r ToolResponseFailureReason) Valid() bool {
 		ToolResponseFailureMixed,
 		ToolResponseFailureDuplicateTerminal,
 		ToolResponseFailureInvalidTerminal,
-		ToolResponseFailureTooLarge:
+		ToolResponseFailureTooLarge,
+		ToolResponseFailureRefused:
 		return true
 	default:
 		return false

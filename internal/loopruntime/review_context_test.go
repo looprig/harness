@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/content/blocktest"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
@@ -683,6 +685,70 @@ func gotMetadata(context gate.ReviewContext) reviewContextMetadata {
 		WorkspaceRoot: context.WorkspaceRoot, WorkingDirectory: context.WorkingDirectory,
 		RetryReason: context.RetryReason, SecurityCeiling: context.SecurityCeiling,
 		GatePolicyRevision: context.GatePolicyRevision,
+	}
+}
+
+// TestCapturePermissionReviewContextDeniesAuthorityToNonConversationalBlocks
+// pins the untrusted-by-default rule for the block kinds that carry content the
+// review cannot read as conversation. Origin is the AUTHORITY label the
+// permission reviewer weighs, and the container a block arrives in is not proof
+// of who wrote it: a refusal is provider-authored text, so a refusal sitting in
+// a user message must never be presented to the reviewer as the human speaking.
+//
+// The assertion is written against a variant the review layer has no arm for by
+// name, because the rule under test is structural — anything that is not one of
+// the conversational block kinds falls to external — and a rule stated as "these
+// specific variants are external" silently grants authority to the next variant
+// core adds.
+func TestCapturePermissionReviewContextDeniesAuthorityToNonConversationalBlocks(t *testing.T) {
+	t.Parallel()
+
+	capture := validReviewCapture(t)
+	capture.Base = content.AgenticMessages{
+		&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{
+			&content.TextBlock{Text: "genuine human intent"},
+			&content.RefusalBlock{Text: "provider authored refusal"},
+		}}},
+	}
+
+	got, err := capturePermissionReviewContext(capture)
+	if err != nil {
+		t.Fatalf("capturePermissionReviewContext() error = %v", err)
+	}
+
+	assertReviewEntry(t, got.Entries, gate.ReviewContextOriginUser, gate.ReviewContextKindUserMessage, "genuine human intent")
+	assertReviewEntry(t, got.Entries,
+		gate.ReviewContextOriginExternal, gate.ReviewContextKindExternalContent, "provider authored refusal")
+	for _, entry := range got.Entries {
+		if entry.Origin == gate.ReviewContextOriginUser && containsText(entry.Content, "provider authored refusal") {
+			t.Fatalf("refusal captured with user authority: %+v", entry)
+		}
+	}
+}
+
+// TestCapturePermissionReviewContextAcceptsEverySealedBlockVariant is the
+// anti-drift guard on the capture. Both of its block walks — the input-size
+// accounting and the entry labeling — end in an error for a block they do not
+// recognize, and that error does not degrade one block: it fails the whole
+// capture, which is what the permission gate reviews before allowing a tool to
+// run. A variant added to core would therefore break authorization for every
+// turn that contains one, with nothing failing at compile time.
+func TestCapturePermissionReviewContextAcceptsEverySealedBlockVariant(t *testing.T) {
+	t.Parallel()
+
+	for _, block := range blocktest.Blocks(t) {
+		t.Run(fmt.Sprintf("%T", block), func(t *testing.T) {
+			t.Parallel()
+			capture := validReviewCapture(t)
+			capture.Base = content.AgenticMessages{
+				&content.UserMessage{Message: content.Message{
+					Role: content.RoleUser, Blocks: []content.Block{block},
+				}},
+			}
+			if _, err := capturePermissionReviewContext(capture); err != nil {
+				t.Fatalf("capturePermissionReviewContext() error = %v; every block variant needs an arm", err)
+			}
+		})
 	}
 }
 

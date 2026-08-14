@@ -51,6 +51,14 @@ func (r *turnRecorder) emit(ev event.Event) {
 }
 
 func (r *turnRecorder) commit(ctx context.Context, tc turnCommit) error {
+	// The production handshake is ctx-cancellable by design, so a commit offered
+	// under a CANCELLED ctx is refused rather than applied. The fixture must refuse
+	// it too: a recorder that quietly accepted one would report a cancelled turn's
+	// content as committed when the real actor would have dropped it — which is the
+	// loss commitTruncatedStep exists to prevent, hidden by its own test.
+	if err := ctx.Err(); err != nil {
+		return &CommitError{Reason: CommitTurnCancelled, Cause: err}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.commitErr != nil {
@@ -492,7 +500,7 @@ func TestRunTurnToolResultShaping(t *testing.T) {
 		}},
 		&content.TextBlock{Text: "-TAIL"},
 	}
-	wantRaw := cloneBlocks(raw)
+	wantRaw := content.CloneBlocks(raw)
 	rawText := flattenToText(raw)
 	rawTool := &rawGraphTool{name: "RawGraph", raw: raw}
 	client := &scriptedLLM{scripts: [][]content.Chunk{
@@ -1359,7 +1367,12 @@ func TestRunTurn(t *testing.T) {
 		}
 	})
 
-	t.Run("mid-stream Next error discards the in-flight step with typed cause", func(t *testing.T) {
+	// A mid-stream failure still fails the turn, but the chunks that already
+	// reached the user as TokenDeltas are committed as a truncated group rather
+	// than abandoned. TestRunTurnTruncationCommits owns the detail of what
+	// survives; this case pins the terminal and the commit count alongside its
+	// sibling terminal scenarios.
+	t.Run("mid-stream Next error fails the turn but commits the truncated prefix", func(t *testing.T) {
 		t.Parallel()
 		boom := &model.ValidationError{Field: "y", Reason: "midstream"}
 		client := &fakeLLM{chunks: []content.Chunk{textChunk("partial")}, nextErr: boom}
@@ -1374,8 +1387,11 @@ func TestRunTurn(t *testing.T) {
 		if !errors.As(failed.Err, &ve) {
 			t.Fatalf("TurnFailed.Err = %T, want *model.ValidationError", failed.Err)
 		}
-		if len(rec.commits) != 0 {
-			t.Errorf("commit count = %d, want 0 (in-flight step discarded)", len(rec.commits))
+		if len(rec.commits) != 1 {
+			t.Fatalf("commit count = %d, want 1 (the truncated prefix)", len(rec.commits))
+		}
+		if calls, results := countToolUseInHistory(rec.committedMsgs()); calls != 0 || results != 0 {
+			t.Errorf("committed tool_use/tool_result = %d/%d, want 0/0", calls, results)
 		}
 	})
 

@@ -155,9 +155,17 @@ func validateCompactionBlocks(blocks []content.Block, depth int) error {
 	return nil
 }
 
+// validCompactionLeafBlock reports whether a non-nested transcript block is one
+// core declares and is not a typed nil. Every variant is accepted: the check
+// exists to reject nil payloads and foreign implementations of the sealed
+// interface, not to decide which content is worth compacting. Rejecting a
+// variant here would make a session permanently uncompactable the moment the
+// model produced one — a refusal in particular is ordinary assistant output.
 func validCompactionLeafBlock(block content.Block) bool {
 	switch typed := block.(type) {
 	case *content.TextBlock:
+		return typed != nil
+	case *content.RefusalBlock:
 		return typed != nil
 	case *content.ImageBlock:
 		return typed != nil

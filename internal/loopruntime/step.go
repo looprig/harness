@@ -35,6 +35,13 @@ const (
 	// stepFailed marks a step whose LLM cycle produced a terminal (provider error,
 	// empty response, or interrupt); no AIMessage was stored.
 	stepFailed
+	// stepTruncated marks a step whose stream produced a terminal AFTER the model
+	// had already delivered replayable content. Like stepFailed the step never
+	// completed and the turn still ends on its terminal, but UNLIKE stepFailed the
+	// safe prefix of the response was materialized into msgs[0] (see
+	// truncatedAssistantMessage) so runTurn can commit it instead of discarding
+	// content the user already watched stream in.
+	stepTruncated
 )
 
 // stepConfig carries the dependencies of one LLM request/response cycle: the
@@ -195,8 +202,7 @@ func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st 
 			break
 		}
 		if nextErr != nil {
-			st.status = stepFailed
-			return stepResult{state: st, terminal: streamFailure(ctx, turnIndex, nextErr)}
+			return truncatedStepResult(ctx, turnIndex, st, nextErr)
 		}
 		proc.process(chunk, turnIndex)
 	}
@@ -232,6 +238,32 @@ func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st 
 	st.msgs = content.AgenticMessages{aiMsg}
 	st.status = stepDone
 	return stepResult{state: st, streamResult: streamResult, terminal: nil}
+}
+
+// truncatedStepResult ends a step whose stream was cut short part-way through
+// the response, by a provider failure OR by a cancellation. The terminal is
+// unchanged — the turn still fails (or, on a cancelled ctx, interrupts) — but the
+// chunks already folded into st.blocks were ALSO already emitted as live
+// TokenDeltas, so the user has seen them. Rather than abandon them, the safe
+// prefix is materialized into msgs[0] and the step is marked stepTruncated;
+// runTurn commits that group before returning the terminal.
+//
+// The two causes are treated identically here on purpose: the accumulator's
+// contents, and therefore the safe prefix, do not depend on WHY the stream
+// stopped. Only the notice differs (truncationNotice), because a reader must not
+// be told a stream failed when the user stopped it.
+//
+// No StreamResult is carried: stream.StreamReader.Result reports false after any
+// non-EOF failure, so a truncated step has no authoritative usage to attribute.
+// The provider very likely billed for the tokens the user watched arrive; that is
+// an accounting gap in the provider contract, not a reason to also lose the text.
+func truncatedStepResult(ctx context.Context, turnIndex event.TurnIndex, st stepState, err error) stepResult {
+	st.status = stepFailed
+	if partial := truncatedAssistantMessage(&st.blocks, truncationNotice(ctx)); partial != nil {
+		st.msgs = content.AgenticMessages{partial}
+		st.status = stepTruncated
+	}
+	return stepResult{state: st, terminal: streamFailure(ctx, turnIndex, err)}
 }
 
 func inferenceResultMessage(result stepResult) *content.AIMessage {

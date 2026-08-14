@@ -119,9 +119,6 @@ func TestRunAndFinalizeRejectsNonCanonicalOutputShapes(t *testing.T) {
 		{name: "over output bound", limit: len(valid) - 1, makeAI: func() *content.AIMessage {
 			return &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: valid}}}}
 		}, reason: OutputFailureTooLarge},
-		{name: "invalid usage", limit: len(valid), usage: &content.Usage{OutputTokens: 1, ReasoningTokens: 2}, makeAI: func() *content.AIMessage {
-			return &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: valid}}}}
-		}},
 	}
 	for _, tt := range tests {
 		testCase := tt
@@ -160,6 +157,49 @@ func TestRunAndFinalizeRejectsNonCanonicalOutputShapes(t *testing.T) {
 				t.Fatalf("terminal event = %#v, want failed with nil invalid usage", events[len(events)-1])
 			}
 		})
+	}
+}
+
+// TestRunAndFinalizeAcceptsUsageDivergingFromReasoningConvention pins that an
+// accounting field cannot fail a run whose output is canonical. The counts are
+// the live ones from an OpenRouter HTTP 200 against
+// nvidia/nemotron-3-ultra-550b-a55b:free: completion_tokens=216 with
+// reasoning_tokens=226. This used to be a case in the non-canonical-output
+// table above, which was wrong twice over — usage is not an output shape, and
+// the reply it described was complete.
+func TestRunAndFinalizeAcceptsUsageDivergingFromReasoningConvention(t *testing.T) {
+	t.Parallel()
+
+	const output = `{"x":1}`
+	divergent := &content.Usage{InputTokens: 31, OutputTokens: 216, ReasoningTokens: 226}
+	client := &runtimeTestClient{invoke: func(context.Context, inference.Request) (*inference.Response, error) {
+		return runtimeResponse(output, divergent), nil
+	}}
+	definition := runtimeDefinitionWithLimits(t, "test.divergent-usage", client, hustle.Limits{InputBytes: 1024, OutputBytes: len(output)})
+	audit := &runtimeTestAudit{}
+	controller := runtimeTestController(t, definition, audit, &runtimeTestFaults{}, &runtimeTestActivity{})
+
+	var validations atomic.Int32
+	err := controller.RunAndFinalize(context.Background(), runtimeRequest(t, "test.divergent-usage"), func(_ context.Context, result hustle.Result) error {
+		validations.Add(1)
+		if string(result.Output) != output {
+			t.Errorf("output = %s, want %s", result.Output, output)
+		}
+		return nil
+	}, noOpFinalizer)
+	if err != nil {
+		t.Fatalf("RunAndFinalize() error = %v; an accounting field must not fail a completed run", err)
+	}
+	if validations.Load() != 1 {
+		t.Fatalf("validation calls = %d, want 1", validations.Load())
+	}
+	events := audit.snapshot()
+	completed, ok := events[len(events)-1].(event.HustleCompleted)
+	if !ok {
+		t.Fatalf("terminal event = %#v, want HustleCompleted", events[len(events)-1])
+	}
+	if completed.Usage == nil || *completed.Usage != *divergent {
+		t.Errorf("completed usage = %+v, want %+v reported unchanged", completed.Usage, divergent)
 	}
 }
 

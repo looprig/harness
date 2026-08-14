@@ -272,6 +272,29 @@ func TestHandleEventsStreamsEphemeral(t *testing.T) {
 			wantHasDelta: true,
 		},
 		{
+			// A refusal reaches the live stream as its own chunk_type. Mapping it
+			// onto "text" would show a viewer the model answering when it declined,
+			// and dropping the frame would show the model saying nothing at all.
+			name:         "token_delta refusal chunk",
+			ev:           event.TokenDelta{TurnIndex: 1, Chunk: &content.RefusalChunk{Text: "I can't"}},
+			wantKind:     "token_delta",
+			wantInDelta:  []string{`"chunk_type":"refusal"`, `"text":"I can't"`},
+			wantHasDelta: true,
+		},
+		{
+			// Index and media type ride along because image deltas are per-image and
+			// a client cannot reassemble them without both. The bytes are carried
+			// verbatim: a frame that described an image without its data would be a
+			// frame a client can only render as a hole.
+			name: "token_delta image chunk",
+			ev: event.TokenDelta{TurnIndex: 1, Chunk: &content.ImageChunk{
+				Index: 3, MediaType: "image/png", Source: content.ImageSource{Data: []byte{0x89, 0x50}},
+			}},
+			wantKind:     "token_delta",
+			wantInDelta:  []string{`"chunk_type":"image"`, `"index":3`, `"media_type":"image/png"`, `"data":"iVA="`},
+			wantHasDelta: true,
+		},
+		{
 			name:         "tool_call_started",
 			ev:           event.ToolCallStarted{ToolExecutionID: execID, ToolName: "Bash", Summary: "ls -la"},
 			wantKind:     "tool_call_started",

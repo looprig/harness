@@ -88,81 +88,20 @@ func cloneToolResultMessage(message *content.ToolResultMessage) *content.ToolRes
 	}
 }
 
+// cloneMessage copies the blocks through content.CloneBlocks rather than
+// through a type switch of its own. The switch used to live here, one module
+// away from the sealed union it enumerated, so core could add a variant and
+// this file would keep compiling while dropping it — which is how ProviderState
+// went missing from this clone and two others at once. Core now owns the copy,
+// so a new variant and its copy arm land together.
+//
+// The behaviour this delegation changes, deliberately: the old arms rebuilt
+// thinking and tool-use blocks through core's CONSTRUCTORS, which normalize. An
+// empty non-nil Input came back nil and a ProviderStateFormat whose
+// ProviderState was empty came back cleared. content.CloneBlock is faithful
+// instead — see its doc comment — so this clone now hands the request build,
+// the durable commit, and the restore seed exactly the value the runtime holds.
+// It can only preserve more than it did.
 func cloneMessage(message content.Message) content.Message {
-	return content.Message{Role: message.Role, Blocks: cloneBlocks(message.Blocks)}
-}
-
-func cloneBlocks(blocks []content.Block) []content.Block {
-	if blocks == nil {
-		return nil
-	}
-	cloned := make([]content.Block, len(blocks))
-	for i, block := range blocks {
-		cloned[i] = cloneBlock(block)
-	}
-	return cloned
-}
-
-func cloneBlock(block content.Block) content.Block {
-	switch typed := block.(type) {
-	case *content.TextBlock:
-		if typed == nil {
-			return (*content.TextBlock)(nil)
-		}
-		return &content.TextBlock{Text: typed.Text}
-	case *content.ImageBlock:
-		if typed == nil {
-			return (*content.ImageBlock)(nil)
-		}
-		return &content.ImageBlock{
-			MediaType: typed.MediaType,
-			Source: content.ImageSource{
-				URL:  typed.Source.URL,
-				Data: cloneBytes(typed.Source.Data),
-			},
-		}
-	case *content.AudioBlock:
-		if typed == nil {
-			return (*content.AudioBlock)(nil)
-		}
-		return &content.AudioBlock{MediaType: typed.MediaType, Data: cloneBytes(typed.Data)}
-	case *content.DocumentBlock:
-		if typed == nil {
-			return (*content.DocumentBlock)(nil)
-		}
-		return &content.DocumentBlock{
-			MediaType: typed.MediaType,
-			Name:      typed.Name,
-			Data:      cloneBytes(typed.Data),
-			Text:      typed.Text,
-		}
-	case *content.ThinkingBlock:
-		if typed == nil {
-			return (*content.ThinkingBlock)(nil)
-		}
-		return &content.ThinkingBlock{Thinking: typed.Thinking, Signature: typed.Signature}
-	case *content.ToolUseBlock:
-		if typed == nil {
-			return (*content.ToolUseBlock)(nil)
-		}
-		return &content.ToolUseBlock{ID: typed.ID, Name: typed.Name, Input: cloneBytes(typed.Input)}
-	case *content.ToolResultBlock:
-		if typed == nil {
-			return (*content.ToolResultBlock)(nil)
-		}
-		return &content.ToolResultBlock{
-			ToolUseID: typed.ToolUseID,
-			Content:   cloneBlocks(typed.Content),
-			IsError:   typed.IsError,
-		}
-	default:
-		return nil
-	}
-}
-
-func cloneBytes(value []byte) []byte {
-	if value == nil {
-		return nil
-	}
-	return append([]byte(nil), value...)
+	return content.Message{Role: message.Role, Blocks: content.CloneBlocks(message.Blocks)}
 }

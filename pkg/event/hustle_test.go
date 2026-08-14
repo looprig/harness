@@ -203,7 +203,10 @@ func TestHustleLifecycleValidation(t *testing.T) {
 	overLimitDefinition.Definition.Limits.InputBytes = 16*1024*1024 + 1
 	zeroPromptHashDefinition := validRun
 	zeroPromptHashDefinition.Definition.PromptSHA256 = [32]byte{}
-	invalidUsage := &content.Usage{OutputTokens: 1, ReasoningTokens: 2}
+	// The live counts from an OpenRouter HTTP 200 against
+	// nvidia/nemotron-3-ultra-550b-a55b:free. Reasoning above output breaks the
+	// documented convention and is still recorded: the hustle completed.
+	divergentUsage := &content.Usage{InputTokens: 31, OutputTokens: 216, ReasoningTokens: 226}
 	tests := []struct {
 		name    string
 		ev      Event
@@ -214,7 +217,7 @@ func TestHustleLifecycleValidation(t *testing.T) {
 		{name: "completed zero duration", ev: HustleCompleted{Header: validHustleHeader(Internal), Run: validRun}},
 		{name: "completed negative duration", ev: HustleCompleted{Header: validHustleHeader(Internal), Run: validRun, Duration: -1}, wantErr: true},
 		{name: "completed missing runtime", ev: HustleCompleted{Header: validHustleHeader(Internal), Run: zeroRuntimeRun}, wantErr: true},
-		{name: "completed invalid usage", ev: HustleCompleted{Header: validHustleHeader(Internal), Run: validRun, Usage: invalidUsage}, wantErr: true},
+		{name: "completed usage diverging from the reasoning convention", ev: HustleCompleted{Header: validHustleHeader(Internal), Run: validRun, Usage: divergentUsage}},
 		{name: "failed queue without runtime", ev: HustleFailed{Header: validHustleHeader(Internal), Run: zeroRuntimeRun, Stage: hustle.StageQueue, ReasonCode: hustle.ReasonCanceled}},
 		{name: "failed resolution without runtime", ev: HustleFailed{Header: validHustleHeader(Internal), Run: zeroRuntimeRun, Stage: hustle.StageModelResolution, ReasonCode: hustle.ReasonModelResolution}},
 		{name: "failed queue rejects resolved runtime", ev: HustleFailed{Header: validHustleHeader(Internal), Run: validRun, Stage: hustle.StageQueue, ReasonCode: hustle.ReasonCanceled}, wantErr: true},

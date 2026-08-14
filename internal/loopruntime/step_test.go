@@ -174,6 +174,40 @@ func TestRunStep(t *testing.T) {
 		}
 	})
 
+	t.Run("refusal-only response stores one AIMessage and no terminal", func(t *testing.T) {
+		t.Parallel()
+		// The step boundary is where an empty response is turned into a terminal,
+		// so it is where a refusal-only reply is most easily mistaken for one: the
+		// refusal carries no text block, no reasoning, and no tool call. It is
+		// still the model's answer, and the step has to commit it.
+		client := &fakeLLM{chunks: []content.Chunk{&content.RefusalChunk{Text: "I can't help with that."}}}
+		var emitted []event.Event
+		cfg := stepConfig{req: inference.Request{Model: testModel()}, client: client, emit: drainEmit(&emitted)}
+
+		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
+
+		if res.terminal != nil {
+			t.Fatalf("terminal = %v, want nil (a refusal is an answer, not an empty response)", res.terminal)
+		}
+		if len(res.state.msgs) != 1 {
+			t.Fatalf("msgs len = %d, want 1", len(res.state.msgs))
+		}
+		ai, ok := res.state.msgs[0].(*content.AIMessage)
+		if !ok {
+			t.Fatalf("msgs[0] = %T, want *content.AIMessage", res.state.msgs[0])
+		}
+		if len(ai.Blocks) != 1 {
+			t.Fatalf("AIMessage blocks = %d, want 1", len(ai.Blocks))
+		}
+		refusal, ok := ai.Blocks[0].(*content.RefusalBlock)
+		if !ok {
+			t.Fatalf("block[0] = %T, want *content.RefusalBlock", ai.Blocks[0])
+		}
+		if refusal.Text != "I can't help with that." {
+			t.Errorf("stored refusal = %q, want %q", refusal.Text, "I can't help with that.")
+		}
+	})
+
 	t.Run("empty-string-only chunks are empty (zero-length blocks, not zero blocks)", func(t *testing.T) {
 		t.Parallel()
 		chunks := []content.Chunk{textChunk(""), textChunk("")}

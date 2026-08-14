@@ -198,6 +198,13 @@ func TestExtractStructuredResultEnforcesRawSemanticOutputLimit(t *testing.T) {
 		{name: "future reason precedes oversized", response: response(stream.FinishReason("future"), text(padded)), limit: len(compact), wantFinish: inference.StructuredOutputFinishReasonOther},
 		{name: "malformed JSON precedes oversized", response: response(stream.FinishReasonStop, text(strings.Repeat("not-json", 16))), limit: 1, wantMalformed: true},
 		{name: "ambiguous representation precedes oversized", response: response(stream.FinishReasonUnknown, text(padded), terminal()), limit: 1, wantMalformed: true},
+		// A refusal is reported as a refusal, ahead of the shape, size, and
+		// representation checks. Every one of those would also fail closed, but
+		// each of them names a defect, and a model that declined produced no
+		// defect — reporting one sends the reader after a bug that does not exist.
+		{name: "refusal is classified as a refusal", response: response(stream.FinishReasonStop, &content.RefusalBlock{Text: "secret-value"}), limit: len(compact), wantReason: OutputFailureRefused},
+		{name: "refusal precedes oversized", response: response(stream.FinishReasonStop, &content.RefusalBlock{Text: strings.Repeat("secret-value", 64)}), limit: 1, wantReason: OutputFailureRefused},
+		{name: "refusal beside text is still a refusal", response: response(stream.FinishReasonStop, text(compact), &content.RefusalBlock{}), limit: len(compact), wantReason: OutputFailureRefused},
 		{name: "zero limit fails closed", response: response(stream.FinishReasonStop, text(compact)), limit: 0, wantReason: OutputFailureTooLarge},
 		{name: "negative limit fails closed", response: response(stream.FinishReasonStop, text(compact)), limit: -1, wantReason: OutputFailureTooLarge},
 	}

@@ -1050,6 +1050,12 @@ func previewOf(r result) (string, bool) {
 // through (concatenated); any non-text block becomes a visible
 // "[unsupported <type>]" placeholder — NEVER empty/silent, so a tool-result is
 // always non-empty on the wire.
+//
+// A refusal takes the placeholder rather than passing its text through, and the
+// distinction is deliberate: these are TOOL results, and a tool does not
+// decline. Rendering the words would splice model-authored prose into the
+// message the model reads back as its own tool's output, where nothing marks it
+// as anything but the tool speaking.
 func flattenToText(blocks []content.Block) string {
 	var sb strings.Builder
 	for _, b := range blocks {
@@ -1066,9 +1072,13 @@ func flattenToText(blocks []content.Block) string {
 }
 
 // blockTypeOf returns the BlockType tag for a non-text block, used to build a
-// visible placeholder in flattenToText.
+// visible placeholder in flattenToText. Every variant core declares must have an
+// arm: the "unknown" fallback names nothing, so a placeholder built from it
+// tells an operator only that something was dropped, not what.
 func blockTypeOf(b content.Block) content.BlockType {
 	switch b.(type) {
+	case *content.RefusalBlock:
+		return content.TypeRefusal
 	case *content.ImageBlock:
 		return content.TypeImage
 	case *content.AudioBlock:

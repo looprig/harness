@@ -32,19 +32,17 @@ func newChunkProcessor(emit func(event.Event), state chunkState) chunkProcessor 
 
 // process handles one streamed chunk: it emits the live TokenDelta for the chunk
 // FIRST, then folds the chunk into the blockState, dispatching by the chunk's
-// concrete type (TextChunk -> text, ThinkingChunk -> thinking, ToolUseChunk ->
-// toolUses). Emission and accumulation are independent: a chunk is folded even
-// when the emit sink drops it, and a chunk type the block layer does not
-// accumulate is still emitted as a live TokenDelta.
+// concrete type — one arm per variant of core's sealed Chunk union. Emission and
+// accumulation are independent: a chunk is folded even when the emit sink drops
+// it.
+//
+// Every variant MUST have an arm. A chunk that is emitted as a live TokenDelta
+// but never accumulated is the worst shape of loss available here, because the
+// live display shows the model producing content that the materialized message,
+// the committed history, and the next request all lack. That is how streamed
+// refusals and streamed images were dropped: the consumer watched the model
+// decline, and the turn recorded nothing.
 func (p chunkProcessor) process(chunk content.Chunk, turnIndex event.TurnIndex) {
 	p.emit(event.TokenDelta{TurnIndex: turnIndex, Chunk: chunk})
-	msgs := &p.state.blocks.msgs
-	switch c := chunk.(type) {
-	case *content.TextChunk:
-		msgs.text.Add(c)
-	case *content.ThinkingChunk:
-		msgs.thinking.Add(c)
-	case *content.ToolUseChunk:
-		msgs.toolUses.Add(c)
-	}
+	p.state.blocks.msgs.add(chunk)
 }

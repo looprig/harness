@@ -1,6 +1,7 @@
 package loopruntime
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 
@@ -13,14 +14,7 @@ import (
 func feedBlock(chunks []content.Chunk) *blockState {
 	st := &blockState{}
 	for _, c := range chunks {
-		switch v := c.(type) {
-		case *content.TextChunk:
-			st.msgs.text.Add(v)
-		case *content.ThinkingChunk:
-			st.msgs.thinking.Add(v)
-		case *content.ToolUseChunk:
-			st.msgs.toolUses.Add(v)
-		}
+		st.msgs.add(c)
 	}
 	return st
 }
@@ -75,6 +69,50 @@ func TestBlockStateAIMessage(t *testing.T) {
 			},
 		},
 		{
+			name:   "refusal only yields a single RefusalBlock",
+			chunks: []content.Chunk{&content.RefusalChunk{Text: "I can't help with that."}},
+			wantBlocks: []content.Block{
+				&content.RefusalBlock{Text: "I can't help with that."},
+			},
+		},
+		{
+			// The accumulator materializes on having RECEIVED a delta, not on the
+			// text being non-empty: a provider may decline without explaining, and
+			// the block's presence is the signal.
+			name:       "an empty refusal delta still yields a RefusalBlock",
+			chunks:     []content.Chunk{&content.RefusalChunk{}},
+			wantBlocks: []content.Block{&content.RefusalBlock{}},
+		},
+		{
+			name: "image deltas fold per Index and materialize in ascending Index order",
+			chunks: []content.Chunk{
+				&content.ImageChunk{Index: 1, MediaType: "image/jpeg", Source: content.ImageSource{Data: []byte{0xff}}},
+				&content.ImageChunk{Index: 0, MediaType: "image/png", Source: content.ImageSource{Data: []byte{0x89}}},
+				&content.ImageChunk{Index: 0, Source: content.ImageSource{Data: []byte{'P'}}},
+			},
+			wantBlocks: []content.Block{
+				&content.ImageBlock{MediaType: "image/png", Source: content.ImageSource{Data: []byte{0x89, 'P'}}},
+				&content.ImageBlock{MediaType: "image/jpeg", Source: content.ImageSource{Data: []byte{0xff}}},
+			},
+		},
+		{
+			name: "every variant materializes in provider emission order",
+			chunks: []content.Chunk{
+				&content.ToolUseChunk{Index: 0, ID: "id-1", Name: "Echo", InputJSON: `{"x":1}`},
+				&content.ImageChunk{Index: 0, MediaType: "image/png", Source: content.ImageSource{Data: []byte{0x89}}},
+				&content.RefusalChunk{Text: "no"},
+				&content.TextChunk{Text: "the answer"},
+				&content.ThinkingChunk{Thinking: "thinking..."},
+			},
+			wantBlocks: []content.Block{
+				&content.ToolUseBlock{ID: "id-1", Name: "Echo", Input: []byte(`{"x":1}`)},
+				&content.ImageBlock{MediaType: "image/png", Source: content.ImageSource{Data: []byte{0x89}}},
+				&content.RefusalBlock{Text: "no"},
+				&content.TextBlock{Text: "the answer"},
+				&content.ThinkingBlock{Thinking: "thinking..."},
+			},
+		},
+		{
 			name: "multiple tool_use blocks materialize in ascending Index order after thinking+text",
 			chunks: []content.Chunk{
 				&content.TextChunk{Text: "t"},
@@ -85,6 +123,21 @@ func TestBlockStateAIMessage(t *testing.T) {
 				&content.TextBlock{Text: "t"},
 				&content.ToolUseBlock{ID: "id-a", Name: "A", Input: []byte(`{"k":1}`)},
 				&content.ToolUseBlock{ID: "id-b", Name: "B", Input: []byte(`{"k":2}`)},
+			},
+		},
+		{
+			name: "interleaved thinking and tool calls retain provider emission order",
+			chunks: []content.Chunk{
+				&content.ThinkingChunk{Index: 0, Thinking: "first", Signature: "sig-0"},
+				&content.ToolUseChunk{Index: 1, ID: "id-1", Name: "A", InputJSON: `{"x":1}`},
+				&content.ThinkingChunk{Index: 2, Thinking: "second", Signature: "sig-2"},
+				&content.ToolUseChunk{Index: 3, ID: "id-2", Name: "B", InputJSON: `{"x":2}`},
+			},
+			wantBlocks: []content.Block{
+				content.NewThinkingBlock("first", "sig-0", nil, ""),
+				&content.ToolUseBlock{ID: "id-1", Name: "A", Input: []byte(`{"x":1}`)},
+				content.NewThinkingBlock("second", "sig-2", nil, ""),
+				&content.ToolUseBlock{ID: "id-2", Name: "B", Input: []byte(`{"x":2}`)},
 			},
 		},
 	}
@@ -103,6 +156,71 @@ func TestBlockStateAIMessage(t *testing.T) {
 			}
 			if !reflect.DeepEqual(msg.Blocks, tt.wantBlocks) {
 				t.Errorf("AIMessage().Blocks = %#v, want %#v", msg.Blocks, tt.wantBlocks)
+			}
+		})
+	}
+}
+
+// TestBlockStateAIMessageEmitsEveryThinkingBlock proves a multi-reasoning-block
+// response is materialized in full. Anthropic interleaved thinking opens a FRESH
+// thinking (or redacted_thinking) block around every tool call, and each block
+// carries its own signature or opaque provider state that must be replayed
+// block-for-block. Emitting only the accumulator's lowest-index block silently
+// discards reasoning blocks 2..N along with their continuation state.
+func TestBlockStateAIMessageEmitsEveryThinkingBlock(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		chunks     []content.Chunk
+		wantBlocks []content.Block
+	}{
+		{
+			name: "several thinking blocks materialize in ascending Index order",
+			chunks: []content.Chunk{
+				&content.ThinkingChunk{Index: 1, Thinking: "second", Signature: "sig-1"},
+				&content.ThinkingChunk{Index: 0, Thinking: "first", Signature: "sig-0"},
+			},
+			wantBlocks: []content.Block{
+				content.NewThinkingBlock("first", "sig-0", nil, ""),
+				content.NewThinkingBlock("second", "sig-1", nil, ""),
+			},
+		},
+		{
+			name: "each thinking block keeps its OWN provider state",
+			chunks: []content.Chunk{
+				&content.ThinkingChunk{Index: 0, Thinking: "first", ProviderState: json.RawMessage(`{"s":0}`), ProviderStateFormat: "anthropic"},
+				&content.ThinkingChunk{Index: 1, Thinking: "second", ProviderState: json.RawMessage(`{"s":1}`), ProviderStateFormat: "anthropic"},
+			},
+			wantBlocks: []content.Block{
+				content.NewThinkingBlock("first", "", json.RawMessage(`{"s":0}`), "anthropic"),
+				content.NewThinkingBlock("second", "", json.RawMessage(`{"s":1}`), "anthropic"),
+			},
+		},
+		{
+			name: "all thinking blocks precede text and tool use",
+			chunks: []content.Chunk{
+				&content.ThinkingChunk{Index: 0, Thinking: "a"},
+				&content.ThinkingChunk{Index: 2, Thinking: "b"},
+				&content.TextChunk{Text: "answer"},
+				&content.ToolUseChunk{Index: 0, ID: "id-1", Name: "Echo", InputJSON: `{"x":1}`},
+			},
+			wantBlocks: []content.Block{
+				content.NewThinkingBlock("a", "", nil, ""),
+				content.NewThinkingBlock("b", "", nil, ""),
+				&content.TextBlock{Text: "answer"},
+				&content.ToolUseBlock{ID: "id-1", Name: "Echo", Input: []byte(`{"x":1}`)},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := feedBlock(tt.chunks).AIMessage().Blocks
+			if !reflect.DeepEqual(got, tt.wantBlocks) {
+				t.Errorf("AIMessage().Blocks = %#v, want %#v", got, tt.wantBlocks)
 			}
 		})
 	}

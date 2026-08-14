@@ -254,11 +254,17 @@ func TestHustleUsageAggregateCodecValidation(t *testing.T) {
 			value.Runtime.Key.Model = "other"
 			return value
 		}()}}, wantErr: true},
-		{name: "invalid usage", meta: SessionMeta{Hustles: []HustleUsageAggregate{func() HustleUsageAggregate {
-			value := valid
-			value.CumulativeUsage = content.Usage{OutputTokens: 1, ReasoningTokens: 2}
-			return value
-		}()}}, wantErr: true},
+		{
+			// The live counts from an OpenRouter HTTP 200 against
+			// nvidia/nemotron-3-ultra-550b-a55b:free: reasoning above output
+			// breaks the documented convention and still round-trips, because a
+			// stored aggregate records what happened.
+			name: "usage diverging from the reasoning convention round trips", meta: SessionMeta{Hustles: []HustleUsageAggregate{func() HustleUsageAggregate {
+				value := valid
+				value.CumulativeUsage = content.Usage{InputTokens: 31, OutputTokens: 216, ReasoningTokens: 226}
+				return value
+			}()}},
+		},
 		{name: "unsorted", meta: SessionMeta{Hustles: []HustleUsageAggregate{valid, func() HustleUsageAggregate { value := valid; value.Name = "  alpha  "; return value }()}}, wantErr: true},
 		{name: "duplicate", meta: SessionMeta{Hustles: []HustleUsageAggregate{valid, valid}}, wantErr: true},
 		{name: "same named identity has conflicting runtimes across statuses", meta: SessionMeta{Hustles: []HustleUsageAggregate{valid, func() HustleUsageAggregate {

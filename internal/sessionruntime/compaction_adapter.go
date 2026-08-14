@@ -329,78 +329,14 @@ func cloneCompactionMessage(message content.Conversation) content.Conversation {
 	}
 }
 
+// cloneCompactionMessageValue copies the blocks through content.CloneBlocks.
+// The per-variant switch this used to hold sat one module away from the sealed
+// union it enumerated, which is how its ToolUseBlock arm lost ProviderState
+// while its ThinkingBlock arm kept it — a divergence inside one function that
+// nothing could have failed on. Core owns the copy now, so the arms cannot
+// disagree with each other or with the union.
 func cloneCompactionMessageValue(message content.Message) content.Message {
-	return content.Message{Role: message.Role, Blocks: cloneCompactionBlocks(message.Blocks)}
-}
-
-func cloneCompactionBlocks(blocks []content.Block) []content.Block {
-	if blocks == nil {
-		return nil
-	}
-	cloned := make([]content.Block, len(blocks))
-	for index, block := range blocks {
-		cloned[index] = cloneCompactionBlock(block)
-	}
-	return cloned
-}
-
-func cloneCompactionBlock(block content.Block) content.Block {
-	switch typed := block.(type) {
-	case *content.TextBlock:
-		if typed == nil {
-			return (*content.TextBlock)(nil)
-		}
-		return &content.TextBlock{Text: typed.Text}
-	case *content.ImageBlock:
-		if typed == nil {
-			return (*content.ImageBlock)(nil)
-		}
-		return &content.ImageBlock{
-			MediaType: typed.MediaType,
-			Source:    content.ImageSource{URL: typed.Source.URL, Data: cloneCompactionBytes(typed.Source.Data)},
-		}
-	case *content.AudioBlock:
-		if typed == nil {
-			return (*content.AudioBlock)(nil)
-		}
-		return &content.AudioBlock{MediaType: typed.MediaType, Data: cloneCompactionBytes(typed.Data)}
-	case *content.DocumentBlock:
-		if typed == nil {
-			return (*content.DocumentBlock)(nil)
-		}
-		return &content.DocumentBlock{
-			MediaType: typed.MediaType, Name: typed.Name, Data: cloneCompactionBytes(typed.Data), Text: typed.Text,
-		}
-	case *content.ThinkingBlock:
-		if typed == nil {
-			return (*content.ThinkingBlock)(nil)
-		}
-		return &content.ThinkingBlock{
-			Thinking: typed.Thinking, Signature: typed.Signature,
-			ProviderState: cloneCompactionBytes(typed.ProviderState), ProviderStateFormat: typed.ProviderStateFormat,
-		}
-	case *content.ToolUseBlock:
-		if typed == nil {
-			return (*content.ToolUseBlock)(nil)
-		}
-		return &content.ToolUseBlock{ID: typed.ID, Name: typed.Name, Input: cloneCompactionBytes(typed.Input)}
-	case *content.ToolResultBlock:
-		if typed == nil {
-			return (*content.ToolResultBlock)(nil)
-		}
-		return &content.ToolResultBlock{
-			ToolUseID: typed.ToolUseID, Content: cloneCompactionBlocks(typed.Content), IsError: typed.IsError,
-		}
-	default:
-		return nil
-	}
-}
-
-func cloneCompactionBytes(value []byte) []byte {
-	if value == nil {
-		return nil
-	}
-	return append([]byte(nil), value...)
+	return content.Message{Role: message.Role, Blocks: content.CloneBlocks(message.Blocks)}
 }
 
 func unmarshalCompactionInput(raw []byte) (loop.CompactionInput, error) {
@@ -482,9 +418,10 @@ func validateCompactionUsage(usage *content.Usage, maximum content.TokenCount) e
 	if usage == nil || usage.OutputTokens == 0 {
 		return &loop.InvalidSummaryError{Reason: loop.InvalidSummaryTokenUsage}
 	}
-	if err := usage.Validate(); err != nil {
-		return &loop.InvalidSummaryError{Reason: loop.InvalidSummaryTokenUsage, Cause: err}
-	}
+	// A reasoning count larger than the output count is a provider accounting
+	// fault, not a bad summary; the only usage property this gate exists to
+	// enforce is the output budget below. See
+	// content.Usage.ReasoningWithinOutput.
 	if usage.OutputTokens > maximum {
 		return &loop.InvalidSummaryError{Reason: loop.InvalidSummaryTokenLimit}
 	}
@@ -660,15 +597,13 @@ func decodeCompactionHistoricalUsage(wire *compactionUsageWire) (*content.Usage,
 	if wire == nil {
 		return nil, nil
 	}
-	usage := &content.Usage{
+	// Historical usage decodes verbatim: a stored record must stay readable
+	// whatever the provider reported about it.
+	return &content.Usage{
 		InputTokens: wire.InputTokens, OutputTokens: wire.OutputTokens,
 		CacheReadTokens: wire.CacheReadTokens, CacheCreationTokens: wire.CacheCreationTokens,
 		ReasoningTokens: wire.ReasoningTokens,
-	}
-	if err := usage.Validate(); err != nil {
-		return nil, err
-	}
-	return usage, nil
+	}, nil
 }
 
 func decodeCompactionToolMessage(raw json.RawMessage) (content.Conversation, error) {
@@ -830,6 +765,26 @@ type compactionTextBlockDecodeWire struct {
 	Text *string            `json:"text"`
 }
 
+// The refusal wire is byte-identical to the text wire apart from its "type"
+// tag, and that tag is the whole point: it is the only thing that keeps a
+// restored refusal from coming back as ordinary assistant prose. The two must
+// never share an encoder arm.
+//
+// Text is required in both directions, with no omitempty and no optional decode
+// field. An empty refusal is a real value — a provider may decline without
+// explaining — so "absent" and "empty" have to stay distinguishable, and the
+// strict decoder must reject a payload that lost its text rather than
+// manufacture an unexplained refusal out of it.
+type compactionRefusalBlockWire struct {
+	Type content.BlockType `json:"type"`
+	Text string            `json:"text"`
+}
+
+type compactionRefusalBlockDecodeWire struct {
+	Type *content.BlockType `json:"type"`
+	Text *string            `json:"text"`
+}
+
 type compactionImageSourceWire struct {
 	URL  string `json:"url"`
 	Data []byte `json:"data"`
@@ -880,30 +835,54 @@ type compactionDocumentBlockDecodeWire struct {
 	Text      *string            `json:"text"`
 }
 
+// The provider-state fields are OPTIONAL on this wire in both directions, and
+// deliberately so. Decoding runs with DisallowUnknownFields, so every field a
+// producer can emit must exist on the decode wire or the payload becomes a hard
+// error rather than a lossy one; encoding uses omitempty so a block without
+// provider state produces byte-identical output to the pre-provider-state
+// format and already-persisted transcripts still decode unchanged.
+// signature_format is optional on this wire for the same reason the
+// provider-state pair is: it did not exist when the first transcripts were
+// written, and a decode that runs with DisallowUnknownFields must still accept
+// them. It is nonetheless load-bearing, not decorative. A reasoning signature
+// is verified by the endpoint that minted it, and a restored block whose label
+// was dropped is an UNTAGGED signature, which every codec now refuses — so a
+// compaction round trip that loses this key turns every restored reasoning turn
+// into a hard encode failure rather than a slightly lossier one.
 type compactionThinkingBlockWire struct {
-	Type      content.BlockType `json:"type"`
-	Thinking  string            `json:"thinking"`
-	Signature string            `json:"signature"`
+	Type                content.BlockType `json:"type"`
+	Thinking            string            `json:"thinking"`
+	Signature           string            `json:"signature"`
+	SignatureFormat     string            `json:"signature_format,omitempty"`
+	ProviderState       json.RawMessage   `json:"provider_state,omitempty"`
+	ProviderStateFormat string            `json:"provider_state_format,omitempty"`
 }
 
 type compactionThinkingBlockDecodeWire struct {
-	Type      *content.BlockType `json:"type"`
-	Thinking  *string            `json:"thinking"`
-	Signature *string            `json:"signature"`
+	Type                *content.BlockType `json:"type"`
+	Thinking            *string            `json:"thinking"`
+	Signature           *string            `json:"signature"`
+	SignatureFormat     *string            `json:"signature_format"`
+	ProviderState       json.RawMessage    `json:"provider_state"`
+	ProviderStateFormat *string            `json:"provider_state_format"`
 }
 
 type compactionToolUseBlockWire struct {
-	Type  content.BlockType `json:"type"`
-	ID    string            `json:"id"`
-	Name  string            `json:"name"`
-	Input json.RawMessage   `json:"input"`
+	Type                content.BlockType `json:"type"`
+	ID                  string            `json:"id"`
+	Name                string            `json:"name"`
+	Input               json.RawMessage   `json:"input"`
+	ProviderState       json.RawMessage   `json:"provider_state,omitempty"`
+	ProviderStateFormat string            `json:"provider_state_format,omitempty"`
 }
 
 type compactionToolUseBlockDecodeWire struct {
-	Type  *content.BlockType `json:"type"`
-	ID    *string            `json:"id"`
-	Name  *string            `json:"name"`
-	Input json.RawMessage    `json:"input"`
+	Type                *content.BlockType `json:"type"`
+	ID                  *string            `json:"id"`
+	Name                *string            `json:"name"`
+	Input               json.RawMessage    `json:"input"`
+	ProviderState       json.RawMessage    `json:"provider_state"`
+	ProviderStateFormat *string            `json:"provider_state_format"`
 }
 
 type compactionToolResultBlockWire struct {
@@ -924,6 +903,8 @@ func encodeCompactionBlock(block content.Block, depth int) (json.RawMessage, err
 	switch typed := block.(type) {
 	case *content.TextBlock:
 		return json.Marshal(compactionTextBlockWire{Type: content.TypeText, Text: typed.Text})
+	case *content.RefusalBlock:
+		return json.Marshal(compactionRefusalBlockWire{Type: content.TypeRefusal, Text: typed.Text})
 	case *content.ImageBlock:
 		return json.Marshal(compactionImageBlockWire{Type: content.TypeImage, MediaType: typed.MediaType, Source: compactionImageSourceWire{URL: typed.Source.URL, Data: typed.Source.Data}})
 	case *content.AudioBlock:
@@ -931,9 +912,16 @@ func encodeCompactionBlock(block content.Block, depth int) (json.RawMessage, err
 	case *content.DocumentBlock:
 		return json.Marshal(compactionDocumentBlockWire{Type: content.TypeDocument, MediaType: typed.MediaType, Name: typed.Name, Data: typed.Data, Text: typed.Text})
 	case *content.ThinkingBlock:
-		return json.Marshal(compactionThinkingBlockWire{Type: content.TypeThinking, Thinking: typed.Thinking, Signature: typed.Signature})
+		return json.Marshal(compactionThinkingBlockWire{
+			Type: content.TypeThinking, Thinking: typed.Thinking, Signature: typed.Signature,
+			SignatureFormat: typed.SignatureFormat,
+			ProviderState:   typed.ProviderState, ProviderStateFormat: typed.ProviderStateFormat,
+		})
 	case *content.ToolUseBlock:
-		return json.Marshal(compactionToolUseBlockWire{Type: content.TypeToolUse, ID: typed.ID, Name: typed.Name, Input: typed.Input})
+		return json.Marshal(compactionToolUseBlockWire{
+			Type: content.TypeToolUse, ID: typed.ID, Name: typed.Name, Input: typed.Input,
+			ProviderState: typed.ProviderState, ProviderStateFormat: typed.ProviderStateFormat,
+		})
 	case *content.ToolResultBlock:
 		nested, err := encodeCompactionBlocks(typed.Content, depth+1)
 		if err != nil {
@@ -953,6 +941,8 @@ func decodeCompactionBlock(raw json.RawMessage, depth int) (content.Block, error
 	switch *probe.Type {
 	case content.TypeText:
 		return decodeCompactionTextBlock(raw)
+	case content.TypeRefusal:
+		return decodeCompactionRefusalBlock(raw)
 	case content.TypeImage:
 		return decodeCompactionImageBlock(raw)
 	case content.TypeAudio:
@@ -978,12 +968,28 @@ func decodeCompactionTextBlock(raw json.RawMessage) (content.Block, error) {
 	return &content.TextBlock{Text: *wire.Text}, nil
 }
 
+// decodeCompactionRefusalBlock restores a refusal. See compactionRefusalBlockWire
+// for why every field is required.
+func decodeCompactionRefusalBlock(raw json.RawMessage) (content.Block, error) {
+	var wire compactionRefusalBlockDecodeWire
+	if err := decodeStrictJSON(raw, &wire); err != nil || wire.Type == nil || wire.Text == nil {
+		return nil, &compactionMessageWireError{}
+	}
+	return &content.RefusalBlock{Text: *wire.Text}, nil
+}
+
 func decodeCompactionThinkingBlock(raw json.RawMessage) (content.Block, error) {
 	var wire compactionThinkingBlockDecodeWire
 	if err := decodeStrictJSON(raw, &wire); err != nil || wire.Thinking == nil || wire.Signature == nil {
 		return nil, &compactionMessageWireError{}
 	}
-	return &content.ThinkingBlock{Thinking: *wire.Thinking, Signature: *wire.Signature}, nil
+	// Both label pairs are optional (an older payload omits them), so an absent
+	// format decodes as empty; core's constructor then normalizes the half-set
+	// combinations away.
+	return content.NewSignedThinkingBlock(
+		*wire.Thinking, *wire.Signature, optionalString(wire.SignatureFormat),
+		wire.ProviderState, optionalString(wire.ProviderStateFormat),
+	), nil
 }
 
 func decodeCompactionToolUseBlock(raw json.RawMessage) (content.Block, error) {
@@ -991,7 +997,21 @@ func decodeCompactionToolUseBlock(raw json.RawMessage) (content.Block, error) {
 	if err := decodeStrictJSON(raw, &wire); err != nil || wire.ID == nil || wire.Name == nil || wire.Input == nil {
 		return nil, &compactionMessageWireError{}
 	}
-	return &content.ToolUseBlock{ID: *wire.ID, Name: *wire.Name, Input: append(json.RawMessage(nil), wire.Input...)}, nil
+	// See decodeCompactionThinkingBlock: optional provider state, and the
+	// constructor copies Input so the decoded block never aliases raw.
+	return content.NewToolUseBlock(
+		*wire.ID, *wire.Name, wire.Input, wire.ProviderState, optionalString(wire.ProviderStateFormat),
+	), nil
+}
+
+// optionalString reads a wire field that is allowed to be absent, which is how
+// the compaction wire distinguishes "field the producer never emitted" from
+// "field the producer emitted empty" without making either one an error.
+func optionalString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func decodeCompactionToolResultBlock(raw json.RawMessage, depth int) (content.Block, error) {

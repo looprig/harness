@@ -271,6 +271,17 @@ func cloneMessage(message content.Message) content.Message {
 	return content.Message{Role: message.Role, Blocks: cloneBlocks(message.Blocks)}
 }
 
+// cloneBlocks walks the slice itself only so each element can carry this
+// package's escalation policy; the copy is content.CloneBlock's.
+//
+// The nil-versus-empty requirement this package used to satisfy by hand — build
+// through core's constructor, then restore the raw provider-state pair verbatim
+// because the constructor NORMALIZES a half-set or empty-but-non-nil pair away
+// — is now the documented guarantee of content.CloneBlock itself: a clone is a
+// copy, not a normalization. The hand-restore is gone because the behaviour it
+// produced is the behaviour content promises. Nothing was dropped; the
+// requirement was promoted to the type's owner, where the other four clones in
+// the workspace get it too.
 func cloneBlocks(blocks []content.Block) []content.Block {
 	if blocks == nil {
 		return nil
@@ -282,64 +293,18 @@ func cloneBlocks(blocks []content.Block) []content.Block {
 	return cloned
 }
 
+// cloneBlock copies one block and keeps this package's fail-secure policy: a
+// value the sealed union does not cover panics with *CloneError rather than
+// becoming a silent nil, which would erase content from the payload a hook
+// inspects. content.CloneBlock returns a nil interface only for a nil block —
+// a typed-nil payload comes back as the same typed nil, in a non-nil interface
+// — so that is the exact condition to escalate.
 func cloneBlock(block content.Block) content.Block {
-	switch typed := block.(type) {
-	case *content.TextBlock:
-		if typed == nil {
-			return (*content.TextBlock)(nil)
-		}
-		return &content.TextBlock{Text: typed.Text}
-	case *content.ImageBlock:
-		if typed == nil {
-			return (*content.ImageBlock)(nil)
-		}
-		return &content.ImageBlock{
-			MediaType: typed.MediaType,
-			Source: content.ImageSource{
-				URL:  typed.Source.URL,
-				Data: cloneBytes(typed.Source.Data),
-			},
-		}
-	case *content.AudioBlock:
-		if typed == nil {
-			return (*content.AudioBlock)(nil)
-		}
-		return &content.AudioBlock{MediaType: typed.MediaType, Data: cloneBytes(typed.Data)}
-	case *content.DocumentBlock:
-		if typed == nil {
-			return (*content.DocumentBlock)(nil)
-		}
-		return &content.DocumentBlock{
-			MediaType: typed.MediaType,
-			Name:      typed.Name,
-			Data:      cloneBytes(typed.Data),
-			Text:      typed.Text,
-		}
-	case *content.ThinkingBlock:
-		if typed == nil {
-			return (*content.ThinkingBlock)(nil)
-		}
-		return &content.ThinkingBlock{Thinking: typed.Thinking, Signature: typed.Signature}
-	case *content.ToolUseBlock:
-		if typed == nil {
-			return (*content.ToolUseBlock)(nil)
-		}
-		return &content.ToolUseBlock{
-			ID: typed.ID, Name: typed.Name, Input: cloneRawMessage(typed.Input),
-		}
-	case *content.ToolResultBlock:
-		if typed == nil {
-			return (*content.ToolResultBlock)(nil)
-		}
-		return &content.ToolResultBlock{
-			ToolUseID: typed.ToolUseID,
-			Content:   cloneBlocks(typed.Content),
-			IsError:   typed.IsError,
-		}
-	default:
-		// See cloneConversation: silent nil would erase future content.
+	cloned := content.CloneBlock(block)
+	if cloned == nil {
 		panic(&CloneError{Kind: CloneUnknownBlock, ValueType: fmt.Sprintf("%T", block)})
 	}
+	return cloned
 }
 
 func cloneUsage(usage *content.Usage) *content.Usage {
@@ -355,15 +320,6 @@ func cloneRawMessage(value json.RawMessage) json.RawMessage {
 		return nil
 	}
 	cloned := make(json.RawMessage, len(value))
-	copy(cloned, value)
-	return cloned
-}
-
-func cloneBytes(value []byte) []byte {
-	if value == nil {
-		return nil
-	}
-	cloned := make([]byte, len(value))
 	copy(cloned, value)
 	return cloned
 }

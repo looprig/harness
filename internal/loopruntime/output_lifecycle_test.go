@@ -97,14 +97,14 @@ func TestRunTurnContextMeasurementKeepsSelectedStructuredRequestShape(t *testing
 			final:      []content.Chunk{textChunk(` { "answer": "done" } `)},
 			wantNative: true,
 			wantTools:  []string{"Echo"},
-			wantChoice: inference.ToolChoiceAuto,
+			wantChoice: inference.ToolAuto(),
 		},
 		{
 			name:       "terminal fallback with ordinary tools",
 			caps:       model.Capabilities{Tools: true},
 			final:      []content.Chunk{terminalOutputChunk(0, "terminal-1", ` { "answer": "done" } `)},
 			wantTools:  []string{"Echo", inference.StructuredOutputToolName},
-			wantChoice: inference.ToolChoiceRequired,
+			wantChoice: inference.ToolRequired(),
 		},
 	}
 	for _, tt := range tests {
@@ -444,6 +444,10 @@ func mutateBlocks(blocks []content.Block) {
 				if len(typed.Input) > 0 {
 					typed.Input[0] = '['
 				}
+			}
+		case *content.RefusalBlock:
+			if typed != nil {
+				typed.Text = "mutated refusal"
 			}
 		case *content.ToolResultBlock:
 			if typed != nil {

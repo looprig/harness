@@ -169,6 +169,18 @@ type turnConfig struct {
 	// afterContextReplacement is the test-only peer of runtimeConfig's seam.
 	afterContextReplacement func()
 
+	// lifetime is the LOOP's context (not the turn's): it stays live across an
+	// Interrupt or a graceful Shutdown and is cancelled only when the loop itself
+	// is torn down. See commitTruncatedStep — it is read for exactly one purpose,
+	// bounding the detached commit of a cancelled turn's partial reply, and never
+	// as the parent of ordinary turn work. A nil lifetime disables only that
+	// refinement (the grace bound still applies), so a fixture need not set it.
+	lifetime context.Context
+
+	// commitGrace bounds that same detached commit. Zero means the production
+	// default (see resolveTruncatedCommitGrace).
+	commitGrace time.Duration
+
 	// reviewContext enables live-only permission-review capture for this turn.
 	// Nil preserves the ordinary loop path. A non-nil invalid configuration
 	// fails the tool step before access evaluation.
@@ -365,6 +377,12 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			agentName: cfg.agentName, cause: cfg.cause, now: cfg.now,
 		}, ts.index, st, releaseAdmission)
 		if res.terminal != nil {
+			// The step did not complete, but a stream that failed PART-WAY may already
+			// have delivered content the user watched arrive as TokenDeltas. Commit
+			// that safe prefix first, before any terminal below is chosen, so the
+			// outcome is the same whichever terminal wins. It is not staged into
+			// ts.msgs: the turn ends here, so no further request is built from it.
+			commitTruncatedStep(stepCtx, cfg, outputPlan, res.state)
 			// A clean native stream with no semantic blocks is still an output-stage
 			// result: finish metadata takes precedence (length/filter/tool_use), while
 			// stop/unknown are classified by the shared extractor as empty structured
@@ -741,6 +759,170 @@ func commitStep(ctx context.Context, cfg turnConfig, st stepState) error {
 	})
 }
 
+// truncatedCommitGrace bounds the detached commit of a CANCELLED turn's partial
+// reply — the one place the runtime deliberately keeps working after its context
+// is cancelled, so it is the one place a bound is mandatory.
+//
+// The bound is a latency budget, not a timeout for slow work. What it covers is
+// a channel handoff to an actor that is already awake in its select, one durable
+// event publication, and the ack back: local work, microseconds when healthy.
+// The wait is paid at most ONCE per cancelled turn (a truncated step ends the
+// turn), and only when the actor is slower than the store it fronts.
+//
+// 250ms is chosen as the largest delay that still reads as instant on a Ctrl-C.
+// Above roughly a quarter second an interrupt starts to feel like it did not
+// register, and a user who presses again gets no better outcome — the content is
+// already committed or already unreachable. Below it, a durable append that
+// briefly contends on fsync would be abandoned for no reason. Exceeding the
+// budget means the store is unhealthy; at that point responsiveness wins and the
+// partial reply is dropped with a log line, because a Ctrl-C that visibly hangs
+// is a worse defect than a lost prefix.
+//
+// It is deliberately not a consumer knob. Tuning it would trade away interrupt
+// responsiveness — the property the bound exists to protect — and the existing
+// DrainTimeout already covers the case where a whole turn must be abandoned. The
+// only override is runtimeConfig's unexported test seam, which exists because an
+// assertion about a 250ms wall-clock budget is not reproducible inside a
+// saturated race-instrumented suite: a test must be able to ask for a bound so
+// large it cannot expire (proving durability) or so small it certainly does
+// (proving the bound), without either question depending on the scheduler.
+const defaultTruncatedCommitGrace = 250 * time.Millisecond
+
+// resolveTruncatedCommitGrace applies the default when the grace is unset, so a
+// turnConfig assembled without one still bounds its detached commit.
+func resolveTruncatedCommitGrace(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultTruncatedCommitGrace
+	}
+	return d
+}
+
+// commitTruncatedStep commits the safe prefix of a step whose stream was cut
+// short (stepTruncated), by a provider failure or by a cancellation. A step in
+// any other state — including a stepFailed that decoded nothing usable — commits
+// nothing, preserving the historical "discard the in-flight step" outcome
+// exactly.
+//
+// A structured-output turn is excluded entirely. Its answer is a schema-governed
+// payload that only becomes an answer once validateNativeStep/validateTerminalStep
+// canonicalizes it, and the existing atomicity rule is that an unvalidated final is
+// wholly unobservable. Committing half a JSON document — or a whole one that never
+// passed the schema — would publish exactly the thing that rule exists to withhold,
+// so a structured-output turn keeps discarding its in-flight step. The defect this
+// function fixes is conversational text the user watched arrive; a structured
+// payload was never that.
+//
+// The committed group is a lone AIMessage ending in the notice that names why it
+// is only a prefix (TruncatedResponseNotice or InterruptedResponseNotice, chosen
+// by truncationNotice), and it
+// carries no tool_use block by construction (see replayableTruncatedBlocks), so it
+// leaves committed history well-formed: no orphaned call for a provider or the
+// compaction tail validator to reject, and nothing for the tool runner to execute.
+//
+// A commit failure is logged, not surfaced. The turn's outcome is already decided
+// by the step's terminal, and re-reporting a failed handshake as a different
+// terminal would change an interrupt into something else.
+//
+// CANCELLATION is the case this function exists to survive. cfg.commit is
+// deliberately ctx-cancellable so an Interrupt/Shutdown frees a parked runTurn,
+// which means the ordinary handshake cannot land once the turn ctx is cancelled —
+// and a user hitting Ctrl-C mid-stream is the COMMON way a reply gets cut short,
+// not the rare one. So this one commit is re-issued on a context detached from
+// the turn's cancellation (truncatedCommitContext) under truncatedCommitGrace.
+//
+// Doing so is safe because a cancelled turn is not a torn-down loop. An Interrupt
+// cancels only the turn ctx, and a graceful Shutdown cancels the turn ctx and
+// then keeps the actor in its select until the turn's terminal arrives; in both
+// cases the actor is still reading commits and still owns an open store, so the
+// handshake completes normally. Interrupt and Shutdown therefore get identical
+// treatment: from inside the turn they are the same event, and the content the
+// user watched arrive is worth the same in both. The case that genuinely differs
+// is the LOOP being torn down, which cfg.lifetime detects — see
+// truncatedCommitContext.
+//
+// The detach happens BEFORE the first attempt, never as a retry after a failed
+// one, and that ordering is load-bearing. cfg.commit reports a cancellation from
+// either half of its handshake, including the half AFTER the request reached the
+// actor — so a cancelled commit that returned an error may nonetheless have been
+// applied to loopState.msgs. A retry could therefore append the same message
+// twice. Issuing the commit once, on a context that will not be cancelled out
+// from under it, keeps the outcome unambiguous.
+//
+// It cannot double-commit. stepTruncated is set only by truncatedStepResult, on
+// the path where runStep returns a terminal, and runTurn returns immediately
+// after this call: the step is never staged into ts.msgs and never reaches
+// commitStep again. Nor can it write after the turn has parked — the actor is a
+// single goroutine that reads this commit before it can read the turn's terminal
+// (runTurn sends the terminal only after this returns), so committed history can
+// never grow after the terminal is delivered.
+//
+// One loss is deliberate and remains: a COMPLETE step whose ordinary commitStep
+// handshake is cancelled is still discarded. Its content is not a prefix the user
+// is owed a record of but a whole step whose group may include tool results, and
+// re-issuing it detached would resurrect a full step — with its StepDone — after
+// the turn was already told to stop. The prefix case is narrow by construction
+// (one assistant message, no tool_use, ending in a notice that says it is a
+// remnant); a completed step is not.
+func commitTruncatedStep(ctx context.Context, cfg turnConfig, plan turnOutputPlan, st stepState) {
+	if st.status != stepTruncated || len(st.msgs) == 0 {
+		return
+	}
+	if plan.strategy != outputStrategyNone {
+		return
+	}
+	commitCtx, release, ok := truncatedCommitContext(ctx, cfg.lifetime, cfg.commitGrace)
+	if !ok {
+		slog.Warn("loop: truncated step not committed", "reason", "loop terminated")
+		return
+	}
+	defer release()
+	if err := commitStep(commitCtx, cfg, st); err != nil {
+		slog.Warn("loop: truncated step not committed", "error", err)
+	}
+}
+
+// truncatedCommitContext yields the context the truncated-step commit runs under,
+// plus the release its caller must defer. ok is false when the commit must not be
+// attempted at all.
+//
+// A LIVE turn ctx is returned unchanged: the ordinary handshake is already
+// correct there, and wrapping it would silently cap a healthy commit.
+//
+// A CANCELLED turn ctx is detached with context.WithoutCancel and re-bounded by
+// grace. WithoutCancel (rather than a fresh context.Background) is
+// what keeps the hook/observation values the actor's durable publication reads
+// off the step ctx; only the cancellation is dropped, which is the single thing
+// standing between the user's text and the store.
+//
+// lifetime is the LOOP's context and decides whether detaching is worth anything.
+// When it is already cancelled the loop is being torn down: the actor has left
+// the select that serves commits and is counting down DrainTimeout for this very
+// goroutine, so a detached commit could not land and would only spend the grace
+// delaying the terminal — and could push the actor past DrainTimeout into
+// reporting a wedged turn that is in fact politely waiting. So the attempt is
+// skipped outright. While the loop is alive, context.AfterFunc arms the same
+// decision for the rest of the wait, collapsing the check-then-block race: a loop
+// killed DURING the grace ends the commit immediately instead of at the bound.
+// A nil lifetime (unit fixtures) simply forgoes that refinement; the grace bound
+// still applies, so the wait is bounded either way.
+func truncatedCommitContext(ctx context.Context, lifetime context.Context, grace time.Duration) (context.Context, func(), bool) {
+	if ctx.Err() == nil {
+		return ctx, func() {}, true
+	}
+	if lifetime != nil && lifetime.Err() != nil {
+		return nil, nil, false
+	}
+	detached, cancel := context.WithTimeout(context.WithoutCancel(ctx), resolveTruncatedCommitGrace(grace))
+	if lifetime == nil {
+		return detached, cancel, true
+	}
+	stop := context.AfterFunc(lifetime, cancel)
+	return detached, func() {
+		stop()
+		cancel()
+	}, true
+}
+
 // stepDoneEvent builds the Enduring StepDone for one COMPLETED step: its Header is
 // stamped from the step's identity (SessionID/LoopID/TurnID/StepID), and Messages
 // is the finalized step group (the single AIMessage followed by its
@@ -771,9 +953,26 @@ func closeStream(sr *stream.StreamReader[content.Chunk]) {
 }
 
 // isEmptyAssistantMessage reports whether a materialized assistant message
-// carries no usable content: no non-empty text, no non-empty thinking, and no
-// tool calls. This is the EmptyResponseError trigger and matches the prior
+// carries no usable content: no non-empty text, no reasoning, and no tool
+// calls. This is the EmptyResponseError trigger and matches the prior
 // builder-length check (a zero-length block does not count as content).
+//
+// A thinking block counts as reasoning when it has visible text OR opaque
+// provider state. Anthropic REDACTED thinking decodes to an empty Thinking with
+// the whole block carried in ProviderState (a Gemini thoughtSignature on an
+// empty-text part has the same shape), so gating on Thinking alone would fail a
+// perfectly valid redacted-only reply with EmptyResponseError.
+//
+// A refusal counts as content UNCONDITIONALLY, empty text included. A refusal is
+// the model's answer — it declined — and a structured-output refusal routinely
+// arrives with no explanation at all, so its presence is the signal and its text
+// is not. Requiring text here would fail the turn outright on a reply the
+// provider considers complete, and would report an empty answer for a request
+// the model actively refused.
+//
+// Any other non-text block a provider can emit (an image the model generated) is
+// content on the same reasoning: it is output the caller asked for, and only a
+// text-shaped notion of "content" would call a picture nothing.
 func isEmptyAssistantMessage(aiMsg *content.AIMessage, rawCalls []content.ToolUseBlock) bool {
 	if len(rawCalls) > 0 {
 		return false
@@ -785,19 +984,42 @@ func isEmptyAssistantMessage(aiMsg *content.AIMessage, rawCalls []content.ToolUs
 				return false
 			}
 		case *content.ThinkingBlock:
-			if v.Thinking != "" {
+			if hasReasoning(v) {
 				return false
 			}
+		default:
+			return false
 		}
 	}
 	return true
 }
 
+// hasReasoning reports whether a thinking block carries anything worth keeping:
+// visible reasoning text, or provider-private state that the next request must
+// replay verbatim. The two predicates that decide a thinking block's fate
+// (isEmptyAssistantMessage and sanitizeAssistantBlocks) share this so they can
+// never disagree about which blocks exist.
+func hasReasoning(b *content.ThinkingBlock) bool {
+	return b != nil && (b.Thinking != "" || len(b.ProviderState) > 0)
+}
+
 // sanitizeAssistantBlocks returns the storable form of the materialized blocks:
-// zero-length text/thinking blocks are dropped (prior behavior only stored them
+// content-free text/thinking blocks are dropped (prior behavior only stored them
 // when non-empty), and a tool-use block with invalid Input is rewritten to a
 // fresh, valid-JSON "{}" so the stored history re-encodes cleanly. A fresh block
 // allocation keeps each history block's Input independently owned.
+//
+// "Content-free" for a thinking block means neither visible text NOR provider
+// state (see hasReasoning). A redacted thinking block is empty-looking but is
+// the ONLY copy of the continuation state the provider requires on the next
+// request, so dropping it here would silently disable reasoning replay for the
+// rest of the session.
+//
+// A refusal is stored whatever its text, which is deliberately NOT the rule
+// applied to an empty text block above. The asymmetry is the point: an empty
+// text block carries nothing, while an empty refusal carries the fact that the
+// model declined. Dropping it would leave a committed turn that the emptiness
+// check already ruled non-empty holding no blocks at all.
 func sanitizeAssistantBlocks(blocks []content.Block) []content.Block {
 	out := make([]content.Block, 0, len(blocks))
 	for _, b := range blocks {
@@ -807,7 +1029,7 @@ func sanitizeAssistantBlocks(blocks []content.Block) []content.Block {
 				out = append(out, v)
 			}
 		case *content.ThinkingBlock:
-			if v.Thinking != "" {
+			if hasReasoning(v) {
 				out = append(out, v)
 			}
 		case *content.ToolUseBlock:
@@ -816,6 +1038,8 @@ func sanitizeAssistantBlocks(blocks []content.Block) []content.Block {
 				stored.Input = json.RawMessage("{}")
 			}
 			out = append(out, &stored)
+		case *content.RefusalBlock:
+			out = append(out, v)
 		default:
 			out = append(out, b)
 		}

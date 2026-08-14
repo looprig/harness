@@ -96,6 +96,7 @@ func TestClassifyToolResponseRejectsInvalidShapesWithoutEcho(t *testing.T) {
 	var nilThinking *content.ThinkingBlock
 	var nilTool *content.ToolUseBlock
 	var nilImage *content.ImageBlock
+	var nilRefusal *content.RefusalBlock
 
 	tests := []struct {
 		name     string
@@ -134,6 +135,23 @@ func TestClassifyToolResponseRejectsInvalidShapesWithoutEcho(t *testing.T) {
 			&content.ToolUseBlock{ID: "terminal-1", Name: inference.StructuredOutputToolName, Input: json.RawMessage(`{"secret":"` + secret + `"}`)},
 			&content.ToolUseBlock{ID: "terminal-2", Name: inference.StructuredOutputToolName, Input: json.RawMessage(`{"allowed":true}`)},
 		), want: ToolResponseFailureDuplicateTerminal},
+		// A refusal is classified as a refusal, never as an invalid shape: the
+		// hustle's caller has to be able to tell "the model declined" from "the
+		// provider sent something malformed", and only one of those is worth
+		// re-prompting a human about.
+		{name: "refusal", response: toolResponse(stream.FinishReasonStop, &content.RefusalBlock{Text: secret}), want: ToolResponseFailureRefused},
+		{name: "refusal beside text", response: toolResponse(stream.FinishReasonStop,
+			toolResponseText(`{"allowed":true}`), &content.RefusalBlock{Text: secret},
+		), want: ToolResponseFailureRefused},
+		// A typed nil is a malformed payload, not a refusal; the block's presence
+		// is the refusal signal and a nil pointer is not a block.
+		{name: "typed nil refusal", response: toolResponse(stream.FinishReasonStop, nilRefusal), want: ToolResponseFailureInvalidShape},
+		// The rejection precedes every byte-budget arm in preflight, so refusal
+		// text can never be counted toward — or slip past — the output budget. If
+		// that order ever inverted this case would report too_large instead.
+		{name: "oversized refusal", response: toolResponse(stream.FinishReasonStop,
+			&content.RefusalBlock{Text: strings.Repeat("x", 4096)},
+		), want: ToolResponseFailureRefused},
 		{name: "empty terminal text", response: toolResponse(stream.FinishReasonStop, toolResponseText("")), want: ToolResponseFailureInvalidTerminal},
 		{name: "malformed terminal text", response: toolResponse(stream.FinishReasonStop, toolResponseText(secret)), want: ToolResponseFailureInvalidTerminal},
 	}

@@ -58,7 +58,7 @@ func resolveTurnOutput(current model.Model, configured *inference.OutputSchema, 
 	}
 
 	plan.strategy = outputStrategyTerminalTool
-	plan.toolChoice = inference.ToolChoiceRequired
+	plan.toolChoice = inference.ToolRequired()
 	plan.tools = append(plan.tools, terminalOutputTool(output))
 	return plan, nil
 }
@@ -270,6 +270,16 @@ func validateRawToolFrame(message *content.AIMessage, calls []content.ToolUseBlo
 			if typed == nil {
 				return &inference.StructuredOutputConflictError{Feature: "inconsistent_tool_frame"}
 			}
+		case *content.RefusalBlock:
+			// Reported as a refusal, not as an inconsistent frame. Both fail the
+			// turn closed, but the frame classification would send a reader hunting
+			// a codec or accumulator defect when the model simply declined to
+			// produce the structured output. A typed nil is a genuine frame defect
+			// and keeps the frame classification.
+			if typed == nil {
+				return &inference.StructuredOutputConflictError{Feature: "inconsistent_tool_frame"}
+			}
+			return &inference.StructuredOutputConflictError{Feature: "model_refusal"}
 		case *content.ToolUseBlock:
 			if typed == nil || callIndex >= len(calls) {
 				return &inference.StructuredOutputConflictError{Feature: "inconsistent_tool_frame"}

@@ -107,6 +107,9 @@ func FuzzProviderOutputBoundary(f *testing.F) {
 		{shape: 14, role: string(content.RoleAssistant)},
 		{shape: 15, role: string(content.RoleAssistant)},
 		{shape: 16, role: string(content.RoleAssistant)},
+		{shape: 17, role: string(content.RoleAssistant)},
+		{shape: 17, role: string(content.RoleAssistant), output: []byte(`{"ok":true}`), limit: 64},
+		{shape: 18, role: string(content.RoleAssistant)},
 	}
 	for _, seed := range seeds {
 		f.Add(seed.shape, seed.role, seed.output, seed.limit, seed.outputTokens, seed.reasoningTokens)
@@ -114,10 +117,7 @@ func FuzzProviderOutputBoundary(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, shape uint8, role string, output []byte, limit int16, outputTokens uint16, reasoningTokens uint16) {
 		response := runtimeFuzzResponse(shape, content.Role(role), string(output), outputTokens, reasoningTokens)
-		usage, usageErr := responseUsage(response)
-		if usageErr != nil {
-			usage = nil
-		}
+		usage := responseUsage(response)
 		result, err := extractResult(response, usage, int(limit))
 		if err != nil {
 			var outputErr *OutputError
@@ -168,7 +168,7 @@ func runtimeFuzzResponse(shape uint8, role content.Role, output string, outputTo
 	if shape&0x80 != 0 {
 		response.Usage = nil
 	}
-	switch shape % 17 {
+	switch shape % 19 {
 	case 0:
 		return nil
 	case 1:
@@ -209,6 +209,11 @@ func runtimeFuzzResponse(shape uint8, role content.Role, output string, outputTo
 	case 16:
 		var block *content.ToolResultBlock
 		message.Blocks = []content.Block{block}
+	case 17:
+		message.Blocks = []content.Block{&content.RefusalBlock{Text: output}}
+	case 18:
+		var block *content.RefusalBlock
+		message.Blocks = []content.Block{block}
 	}
 	return response
 }
@@ -231,6 +236,11 @@ func runtimeFuzzSemanticTextLength(message *content.AIMessage) (int, bool) {
 			if typed == nil {
 				return 0, false
 			}
+		case *content.RefusalBlock:
+			// Mirrors nativeStructuredTextSize: a refusal is not text and never
+			// counts toward the output budget, so the reference model must agree
+			// that no structured output can be accepted from it.
+			return 0, false
 		default:
 			return 0, false
 		}
@@ -239,7 +249,7 @@ func runtimeFuzzSemanticTextLength(message *content.AIMessage) (int, bool) {
 }
 
 func runtimeFuzzFinish(shape uint8) stream.FinishReason {
-	switch shape / 17 % 6 {
+	switch shape / 19 % 6 {
 	case 0:
 		return stream.FinishReasonUnknown
 	case 1:

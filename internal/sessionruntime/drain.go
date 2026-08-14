@@ -285,25 +285,64 @@ func handleCorrelatedEvent(
 	return "", false, nil
 }
 
-// aiText concatenates the text of every TextBlock in an AIMessage. A nil message
-// or a message with no text blocks yields the empty string.
+// delegateAnswerText reports the text one block of a delegate's terminal message
+// contributes to the answer handed back to the parent, and whether it
+// contributes at all.
+//
+// A *content.RefusalBlock contributes its text alongside *content.TextBlock. A
+// refusal IS the child's answer — it declined — and a provider that delivers the
+// decline on its dedicated refusal channel (OpenAI's `refusal`) sends no text
+// part at all. Filtering it hands the parent "" for a turn that completed
+// successfully, which is precisely the zero-block-success confusion core's
+// RefusalBlock was introduced to prevent; the parent then reads its child as
+// having produced nothing rather than as having refused.
+//
+// The text is contributed verbatim and UNMARKED, byte-identical to prose. This
+// string becomes the delegate tool result a parent MODEL reads, so any label
+// ("[refusal] …") would be harness-authored words the child never said, sitting
+// inside the child's quoted answer where the parent may quote or act on them.
+// The structured disposition belongs on the typed result instead —
+// tool.DelegateResult already carries State and ResponseStatus for exactly that
+// purpose — not smuggled into the answer bytes. This matches the sibling judge
+// projection (eval/judge, blocksText), which reached the same conclusion for the
+// same reason.
+//
+// Thinking and tool-use blocks contribute nothing: they are not the answer.
+func delegateAnswerText(blk content.Block) (string, bool) {
+	switch t := blk.(type) {
+	case *content.TextBlock:
+		return t.Text, true
+	case *content.RefusalBlock:
+		return t.Text, true
+	default:
+		return "", false
+	}
+}
+
+// aiText concatenates the answer text of every contributing block in an
+// AIMessage (see delegateAnswerText), in block order and bounded by
+// maxDelegateOutputBytes. A nil message, or one with no contributing block,
+// yields the empty string. The bound applies across block kinds, so a refusal
+// cannot be used to exceed it.
 func aiText(m *content.AIMessage) string {
 	if m == nil {
 		return ""
 	}
 	var b strings.Builder
 	for _, blk := range m.Blocks {
-		if tb, ok := blk.(*content.TextBlock); ok {
-			remaining := maxDelegateOutputBytes - b.Len()
-			if remaining <= 0 {
-				break
-			}
-			if len(tb.Text) > remaining {
-				b.WriteString(tb.Text[:remaining])
-				break
-			}
-			b.WriteString(tb.Text)
+		text, ok := delegateAnswerText(blk)
+		if !ok {
+			continue
 		}
+		remaining := maxDelegateOutputBytes - b.Len()
+		if remaining <= 0 {
+			break
+		}
+		if len(text) > remaining {
+			b.WriteString(text[:remaining])
+			break
+		}
+		b.WriteString(text)
 	}
 	return b.String()
 }

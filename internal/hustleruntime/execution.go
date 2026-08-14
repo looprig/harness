@@ -322,7 +322,7 @@ func (r *runtimeController) executeSingle(ctx context.Context, definition hustle
 		return hustle.Result{}, runtime, nil, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: err})
 	}
 	response, err := r.invoke(executionCtx, runID, binding.Client, request)
-	usage, usageErr := responseUsage(response)
+	usage := responseUsage(response)
 	if err != nil {
 		reason := hustle.ReasonInference
 		var panicErr *WorkerPanicError
@@ -331,9 +331,6 @@ func (r *runtimeController) executeSingle(ctx context.Context, definition hustle
 			r.reportFault(panicErr)
 		}
 		return hustle.Result{}, runtime, usage, executionError(name, runID, hustle.StageInference, reason, executionCtx, err)
-	}
-	if usageErr != nil {
-		return hustle.Result{}, runtime, nil, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: usageErr})
 	}
 	var result hustle.Result
 	if output == nil {
@@ -471,7 +468,11 @@ func (r *runtimeController) prepareEvidenceExecution(
 		Messages: content.AgenticMessages{&content.UserMessage{Message: content.Message{
 			Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: string(input)}},
 		}}},
-		Tools: tools, Output: output, ToolChoice: inference.ToolChoiceAuto,
+		// Stated rather than left to the zero value: an evidence round deliberately
+		// lets the model choose between calling an evidence tool and emitting the
+		// terminal structured output, and that is a decision this request makes,
+		// not one it inherits.
+		Tools: tools, Output: output, ToolChoice: inference.ToolAuto(),
 	}
 	if err := validateEvidenceRequestFeatures(request); err != nil {
 		return evidenceExecutionPlan{}, runtime, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: err})
@@ -520,13 +521,11 @@ func (r *runtimeController) executeEvidenceAttempt(
 				maxCallsPerRound: plan.policy.Limits.MaxCallsPerRound,
 			})
 		}
-		roundUsage, usageErr := responseUsage(response)
-		if usageErr == nil {
-			var addErr error
-			aggregate, addErr = addUsage(aggregate, roundUsage)
-			if addErr != nil {
-				return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: addErr})
-			}
+		roundUsage := responseUsage(response)
+		var addErr error
+		aggregate, addErr = addUsage(aggregate, roundUsage)
+		if addErr != nil {
+			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: addErr})
 		}
 		if invokeErr != nil {
 			reason := hustle.ReasonInference
@@ -536,9 +535,6 @@ func (r *runtimeController) executeEvidenceAttempt(
 				r.reportFault(panicErr)
 			}
 			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageInference, reason, executionCtx, invokeErr)
-		}
-		if usageErr != nil {
-			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, &OutputError{Cause: usageErr})
 		}
 		if classifyErr != nil {
 			return hustle.Result{}, aggregate, executionError(name, runID, hustle.StageOutput, hustle.ReasonInvalidOutput, executionCtx, classifyErr)
@@ -939,6 +935,13 @@ func extractStructuredResult(response *inference.Response, usage *content.Usage,
 	if err := nativeStructuredFinishError(response); err != nil {
 		return hustle.Result{}, &OutputError{Cause: err}
 	}
+	// Checked ahead of extraction, because every downstream check would also
+	// reject a refusal but each would misname it — as a malformed
+	// representation, a shape violation, or an oversized output. None of those
+	// happened: the model declined, and that is the fact the caller needs.
+	if response != nil && containsRefusal(response.Message) {
+		return hustle.Result{}, &OutputError{Reason: OutputFailureRefused}
+	}
 	output, err := inference.StructuredResult(response)
 	if err != nil {
 		return hustle.Result{}, &OutputError{Cause: err}
@@ -969,6 +972,21 @@ func nativeStructuredFinishError(response *inference.Response) error {
 		return &inference.StructuredOutputFinishError{Reason: inference.StructuredOutputFinishReasonOther}
 	}
 	return nil
+}
+
+// containsRefusal reports whether the assistant declined. A typed nil is not a
+// refusal: the block's presence is the signal, and a nil pointer is a malformed
+// payload the ordinary shape checks classify.
+func containsRefusal(message *content.AIMessage) bool {
+	if message == nil {
+		return false
+	}
+	for _, block := range message.Blocks {
+		if refusal, ok := block.(*content.RefusalBlock); ok && refusal != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func containsNonNilToolUse(message *content.AIMessage) bool {
@@ -1007,6 +1025,13 @@ func nativeStructuredTextSize(response *inference.Response) (int, bool, bool) {
 			}
 		case *content.ToolUseBlock:
 			return 0, false, false
+		case *content.RefusalBlock:
+			// A refusal is never text and never contributes to the output budget:
+			// it is not the structured output, so counting its bytes would charge
+			// the caller's limit for content it did not ask for and did not get.
+			// extractStructuredResult rejects a refusal before this runs, so the
+			// arm only pins the classification against a future caller.
+			return 0, false, false
 		default:
 			return 0, false, false
 		}
@@ -1014,15 +1039,15 @@ func nativeStructuredTextSize(response *inference.Response) (int, bool, bool) {
 	return total, textSeen, false
 }
 
-func responseUsage(response *inference.Response) (*content.Usage, error) {
+// responseUsage copies a response's usage. It cannot fail: the counts are
+// metrics attached to a reply that already arrived, so nothing about them can
+// justify failing the run that produced it. See
+// content.Usage.ReasoningWithinOutput.
+func responseUsage(response *inference.Response) *content.Usage {
 	if response == nil || response.Usage == nil {
-		return nil, nil
+		return nil
 	}
-	usage := cloneUsage(response.Usage)
-	if err := usage.Validate(); err != nil {
-		return nil, err
-	}
-	return usage, nil
+	return cloneUsage(response.Usage)
 }
 
 func cloneUsage(usage *content.Usage) *content.Usage {

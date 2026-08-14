@@ -138,6 +138,28 @@ func TestStepDoneUnknownRoleRemainsCodecError(t *testing.T) {
 	}
 }
 
+// TestMarshalEventKeepsTurnDoneWithDivergentUsage pins that TurnDone — the
+// record that a turn FINISHED — survives usage its provider reported
+// inconsistently. These are the live counts from an OpenRouter HTTP 200 against
+// nvidia/nemotron-3-ultra-550b-a55b:free. Rejecting the event here lost the
+// completed turn over an accounting field, which is why the gate is gone; see
+// content.Usage.ReasoningWithinOutput.
+func TestMarshalEventKeepsTurnDoneWithDivergentUsage(t *testing.T) {
+	t.Parallel()
+
+	divergent := content.Usage{InputTokens: 31, OutputTokens: 216, ReasoningTokens: 226}
+	turn := TurnDone{Header: fullHeaderTurn(), Usage: divergent}
+	if err := ValidateEvent(turn); err != nil {
+		t.Fatalf("ValidateEvent(TurnDone) error = %v, want nil", err)
+	}
+	if _, err := MarshalEvent(turn); err != nil {
+		t.Fatalf("MarshalEvent(TurnDone) error = %v, want nil", err)
+	}
+	if divergent.ReasoningWithinOutput() {
+		t.Error("ReasoningWithinOutput() = true, want false for the reported counts")
+	}
+}
+
 func TestMarshalEventValidatesDurableBodies(t *testing.T) {
 	t.Parallel()
 
@@ -152,7 +174,6 @@ func TestMarshalEventValidatesDurableBodies(t *testing.T) {
 		{name: "LoopStarted runtime", event: LoopStarted{Header: fullHeaderLoop(), Runtime: invalidRuntime}, wantEvent: "LoopStarted", wantField: FieldModelKey},
 		{name: "LoopModeChanged runtime", event: LoopModeChanged{Header: fullHeaderLoop(), Runtime: invalidRuntime}, wantEvent: "LoopModeChanged", wantField: FieldModelKey},
 		{name: "LoopInferenceChanged runtime", event: LoopInferenceChanged{Header: fullHeaderLoop(), Runtime: invalidRuntime}, wantEvent: "LoopInferenceChanged", wantField: FieldModelKey},
-		{name: "TurnDone usage", event: TurnDone{Header: fullHeaderTurn(), Usage: content.Usage{OutputTokens: 1, ReasoningTokens: 2}}, wantEvent: "TurnDone", wantField: FieldUsage},
 	}
 	for _, tt := range tests {
 		tt := tt

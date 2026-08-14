@@ -46,11 +46,11 @@ func TestResolveTurnOutputStrategy(t *testing.T) {
 		wantChoice inference.ToolChoice
 		wantErr    bool
 	}{
-		{name: "no configured output", tools: ordinary, want: outputStrategyNone, wantTools: []string{"Read"}, wantChoice: inference.ToolChoiceAuto},
-		{name: "output only native", output: &output, caps: model.Capabilities{StructuredOutput: true}, want: outputStrategyNative, wantOutput: true, wantChoice: inference.ToolChoiceAuto},
-		{name: "ordinary tools and native combined", output: &output, tools: ordinary, caps: model.Capabilities{Tools: true, StructuredOutput: true, StructuredOutputWithTools: true}, want: outputStrategyNative, wantOutput: true, wantTools: []string{"Read"}, wantChoice: inference.ToolChoiceAuto},
-		{name: "ordinary tools terminal fallback despite base native", output: &output, tools: ordinary, caps: model.Capabilities{Tools: true, StructuredOutput: true}, want: outputStrategyTerminalTool, wantTools: []string{"Read", inference.StructuredOutputToolName}, wantChoice: inference.ToolChoiceRequired},
-		{name: "output only terminal fallback", output: &output, caps: model.Capabilities{Tools: true}, want: outputStrategyTerminalTool, wantTools: []string{inference.StructuredOutputToolName}, wantChoice: inference.ToolChoiceRequired},
+		{name: "no configured output", tools: ordinary, want: outputStrategyNone, wantTools: []string{"Read"}, wantChoice: inference.ToolAuto()},
+		{name: "output only native", output: &output, caps: model.Capabilities{StructuredOutput: true}, want: outputStrategyNative, wantOutput: true, wantChoice: inference.ToolAuto()},
+		{name: "ordinary tools and native combined", output: &output, tools: ordinary, caps: model.Capabilities{Tools: true, StructuredOutput: true, StructuredOutputWithTools: true}, want: outputStrategyNative, wantOutput: true, wantTools: []string{"Read"}, wantChoice: inference.ToolAuto()},
+		{name: "ordinary tools terminal fallback despite base native", output: &output, tools: ordinary, caps: model.Capabilities{Tools: true, StructuredOutput: true}, want: outputStrategyTerminalTool, wantTools: []string{"Read", inference.StructuredOutputToolName}, wantChoice: inference.ToolRequired()},
+		{name: "output only terminal fallback", output: &output, caps: model.Capabilities{Tools: true}, want: outputStrategyTerminalTool, wantTools: []string{inference.StructuredOutputToolName}, wantChoice: inference.ToolRequired()},
 		{name: "unsupported", output: &output, wantErr: true},
 		{name: "invalid combined capabilities", output: &output, caps: model.Capabilities{StructuredOutputWithTools: true}, wantErr: true},
 		{name: "reserved terminal tool collision", output: &output, tools: []inference.Tool{{Name: inference.StructuredOutputToolName}}, caps: model.Capabilities{Tools: true}, wantErr: true},
@@ -256,7 +256,7 @@ func TestRunTurnOutputStrategyIsStableAcrossContinuation(t *testing.T) {
 		t.Fatalf("requests = %d, want 2", len(requests))
 	}
 	for i, request := range requests {
-		if request.Output == nil || request.Output.Name != configured.Name || request.ToolChoice != inference.ToolChoiceAuto {
+		if request.Output == nil || request.Output.Name != configured.Name || request.ToolChoice.Mode() != inference.ToolChoiceModeAuto {
 			t.Fatalf("request %d output shape = %#v", i, request)
 		}
 		if len(request.Tools) != 1 || request.Tools[0].Name != "Echo" {

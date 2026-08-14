@@ -453,6 +453,11 @@ func compactionMessageBlocks(message content.Conversation) ([]content.Block, boo
 
 const maxCompactionRetainedBlockDepth = 128
 
+// validCompactionRetainedBlocks rejects nil payloads, foreign implementations of
+// the sealed Block interface, and unbounded nesting. It accepts every variant
+// core declares, including a refusal: the retained tail is history the loop
+// already committed, so a variant rejected here would fail the compaction event
+// itself rather than the block, stranding the session's context.
 func validCompactionRetainedBlocks(blocks []content.Block, depth int) bool {
 	if depth > maxCompactionRetainedBlockDepth {
 		return false
@@ -469,6 +474,10 @@ func validCompactionRetainedBlocks(blocks []content.Block, depth int) bool {
 		}
 		switch typed := block.(type) {
 		case *content.TextBlock:
+			if typed == nil {
+				return false
+			}
+		case *content.RefusalBlock:
 			if typed == nil {
 				return false
 			}

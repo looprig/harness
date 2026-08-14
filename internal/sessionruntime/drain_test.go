@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -87,6 +88,161 @@ func TestAITextBoundsDelegatedOutput(t *testing.T) {
 	got := aiText(aiMessage(strings.Repeat("x", maxDelegateOutputBytes+1)))
 	if len(got) != maxDelegateOutputBytes {
 		t.Fatalf("aiText length = %d, want %d", len(got), maxDelegateOutputBytes)
+	}
+}
+
+// aiRefusalMessage builds an assistant message that declines on the provider's
+// dedicated refusal channel — the shape core's *content.RefusalBlock exists to
+// keep distinguishable from an empty successful answer.
+func aiRefusalMessage(text string) *content.AIMessage {
+	return &content.AIMessage{Message: content.Message{
+		Role:   content.RoleAssistant,
+		Blocks: []content.Block{&content.RefusalBlock{Text: text}},
+	}}
+}
+
+// TestAITextCarriesRefusal pins the projection aiText applies to the blocks of a
+// delegate's terminal message. A refusal is the child's answer — it declined —
+// and dropping it hands the parent "" for a turn that completed, which is the
+// zero-block-success failure RefusalBlock was added to prevent.
+func TestAITextCarriesRefusal(t *testing.T) {
+	t.Parallel()
+
+	const refusal = "I'm sorry, I can't help with that."
+
+	tests := []struct {
+		name string
+		msg  *content.AIMessage
+		want string
+	}{
+		{
+			name: "refusal-only reply is the delegate answer",
+			msg:  aiRefusalMessage(refusal),
+			want: refusal,
+		},
+		{
+			name: "prose then refusal keeps both in order",
+			msg: &content.AIMessage{Message: content.Message{
+				Role: content.RoleAssistant,
+				Blocks: []content.Block{
+					&content.TextBlock{Text: "Here is what I can say. "},
+					&content.RefusalBlock{Text: refusal},
+				},
+			}},
+			want: "Here is what I can say. " + refusal,
+		},
+		{
+			name: "refusal then prose keeps both in order",
+			msg: &content.AIMessage{Message: content.Message{
+				Role: content.RoleAssistant,
+				Blocks: []content.Block{
+					&content.RefusalBlock{Text: refusal},
+					&content.TextBlock{Text: " Try a safer phrasing."},
+				},
+			}},
+			want: refusal + " Try a safer phrasing.",
+		},
+		{
+			name: "unexplained refusal contributes no text and yields the empty string",
+			msg:  aiRefusalMessage(""),
+			want: "",
+		},
+		{
+			name: "thinking and tool-use blocks still contribute nothing",
+			msg: &content.AIMessage{Message: content.Message{
+				Role: content.RoleAssistant,
+				Blocks: []content.Block{
+					&content.ThinkingBlock{Thinking: "internal"},
+					&content.ToolUseBlock{ID: "t1", Name: "Bash"},
+					&content.RefusalBlock{Text: refusal},
+				},
+			}},
+			want: refusal,
+		},
+		{
+			name: "nil message is the empty string",
+			msg:  nil,
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := aiText(tt.msg); got != tt.want {
+				t.Fatalf("aiText() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAITextBoundsRefusalOutput proves the delegate output cap applies to a
+// refusal exactly as it does to prose: a hostile provider cannot bypass the
+// bound by moving its payload onto the refusal channel.
+func TestAITextBoundsRefusalOutput(t *testing.T) {
+	t.Parallel()
+	got := aiText(aiRefusalMessage(strings.Repeat("x", maxDelegateOutputBytes+1)))
+	if len(got) != maxDelegateOutputBytes {
+		t.Fatalf("aiText length = %d, want %d", len(got), maxDelegateOutputBytes)
+	}
+}
+
+// TestDrainToFinalTextReturnsRefusalTerminal drives the drain helper itself with
+// a scripted refusal terminal, so the defect is pinned at the helper boundary as
+// well as at the projection.
+func TestDrainToFinalTextReturnsRefusalTerminal(t *testing.T) {
+	t.Parallel()
+	const refusal = "I'm sorry, I can't help with that."
+	cmd, turn := drainUUID(0x21), drainUUID(0x22)
+	sub := newFakeSubscription(4)
+	sub.feed(turnStarted(cmd, turn))
+	sub.feed(turnDone(turn, aiRefusalMessage(refusal)))
+
+	got, err := drainDelegateAnswer(context.Background(), sub, cmd, nil)
+	if err != nil {
+		t.Fatalf("drainDelegateAnswer() error = %v", err)
+	}
+	if got != refusal {
+		t.Fatalf("drainDelegateAnswer() = %q, want %q", got, refusal)
+	}
+}
+
+// delegateRefusingChild is a child agent whose provider declines on the
+// dedicated refusal channel: the stream carries a *content.RefusalChunk and no
+// text at all, exactly as an OpenAI `refusal` delta arrives. The loop runtime
+// materializes it into a *content.RefusalBlock on the terminal AIMessage.
+func delegateRefusingChild(name, refusal string) loop.Definition {
+	return mustDefine(
+		loop.WithName(identity.AgentName(name)),
+		loop.WithInference(&stubLLM{chunks: []content.Chunk{&content.RefusalChunk{Text: refusal}}}, validModel(name)),
+		loop.WithDrainTimeout(100*time.Millisecond),
+	)
+}
+
+// TestDelegateStartSyncReturnsChildRefusal is the decisive end-to-end case: a
+// real refusing subagent is started synchronously and its answer travels the
+// whole managed-delegation path — provider stream, loop runtime, TurnDone,
+// drain, delegate tool result. The parent must receive the refusal. Receiving ""
+// would tell the parent model the child completed and produced nothing, which is
+// the zero-block-success confusion *content.RefusalBlock exists to prevent.
+func TestDelegateStartSyncReturnsChildRefusal(t *testing.T) {
+	t.Parallel()
+	const refusal = "I'm sorry, I can't help with that."
+	parent := delegateParent(loop.DelegationManaged, "child")
+	s := newDelegationSession(t, parent, nil, delegateRefusingChild("child", refusal))
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+
+	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, AgentType: "child", Name: "api_planner", Message: "go", WaitForResponse: true,
+	})
+	if err != nil {
+		t.Fatalf("Execute(start) error = %v", err)
+	}
+	if res.ResponseStatus != tool.DelegateResponseCompleted || res.State != tool.AgentStateIdle {
+		t.Fatalf("result state/status = %v/%v, want idle/completed", res.State, res.ResponseStatus)
+	}
+	if res.Response != refusal {
+		t.Fatalf("delegate response = %q, want the child's refusal %q", res.Response, refusal)
 	}
 }
 

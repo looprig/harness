@@ -70,6 +70,65 @@ func TestProjectCompactionTranscriptTurnsToolUseIntoText(t *testing.T) {
 	}
 }
 
+// TestProjectCompactionTranscriptLabelsRefusals proves the summarization view
+// keeps BOTH facts a refusal carries: that the model declined, and what it said.
+// Projecting the text bare would hand the summarizer prose indistinguishable
+// from an answer; projecting a bare placeholder would erase the wording a later
+// turn may depend on. Both halves also have to survive the tool-result path,
+// which flattens nested blocks through a separate accumulator.
+func TestProjectCompactionTranscriptLabelsRefusals(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		message content.Conversation
+		want    string
+	}{
+		{
+			name: "assistant refusal is labeled and keeps its wording",
+			message: &content.AIMessage{Message: content.Message{
+				Role:   content.RoleAssistant,
+				Blocks: []content.Block{&content.RefusalBlock{Text: "I can't help with that."}},
+			}},
+			want: "[model refused: I can't help with that.]",
+		},
+		{
+			name: "an unexplained refusal still projects as a refusal",
+			message: &content.AIMessage{Message: content.Message{
+				Role:   content.RoleAssistant,
+				Blocks: []content.Block{&content.RefusalBlock{}},
+			}},
+			want: "[model refused: ]",
+		},
+		{
+			name: "a refusal in a tool result flattens through the accumulator",
+			message: &content.ToolResultMessage{Message: content.Message{
+				Role: content.RoleTool,
+				Blocks: []content.Block{
+					&content.TextBlock{Text: "before"},
+					&content.RefusalBlock{Text: "no"},
+					&content.TextBlock{Text: "after"},
+				},
+			}, ToolUseID: "call-1"},
+			want: "before[model refused: no]after",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			projected, err := projectCompactionTranscript(content.AgenticMessages{tt.message})
+			if err != nil {
+				t.Fatalf("projectCompactionTranscript() error = %v", err)
+			}
+			if got := projectedText(t, projected[0]); got != tt.want {
+				t.Fatalf("projected text = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestProjectCompactionTranscriptOmitsOversizedToolInput(t *testing.T) {
 	t.Parallel()
 	messages := content.AgenticMessages{&content.AIMessage{Message: content.Message{
@@ -247,6 +306,11 @@ func referenceCompactionBlock(block content.Block, depth int) (string, error) {
 			return "", &compactionProjectionError{field: "block"}
 		}
 		return "[called tool: " + typed.Name + "]", nil
+	case *content.RefusalBlock:
+		if typed == nil {
+			return "", &compactionProjectionError{field: "block"}
+		}
+		return compactionRefusalPrefix + typed.Text + compactionRefusalSuffix, nil
 	case *content.ThinkingBlock:
 		if typed == nil {
 			return "", &compactionProjectionError{field: "block"}

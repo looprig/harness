@@ -419,6 +419,10 @@ func reviewBlockInputBytes(block content.Block, depth int) (int, error) {
 		if typed != nil {
 			return checkedReviewInputSize(len(typed.ID), len(typed.Name), len(typed.Input))
 		}
+	case *content.RefusalBlock:
+		if typed != nil {
+			return checkedReviewInputSize(len(typed.Text))
+		}
 	case *content.ToolResultBlock:
 		if typed != nil {
 			total, err := checkedReviewInputSize(len(typed.ToolUseID))
@@ -535,6 +539,19 @@ func appendAssistantReviewBlocks(
 	return entries, nil
 }
 
+// appendReviewBlocks labels each block of a non-assistant message with the
+// authority the permission reviewer should weigh it under. The message's own
+// origin is inherited ONLY by the block kinds that are genuinely the
+// conversation the container claims to be — text, reasoning, and the tool
+// call/result structure. Everything else is demoted to external content.
+//
+// The rule is stated as an allow list on purpose. Its inverse — naming the
+// variants that get demoted — hands the container's authority to whatever
+// variant core adds next, and the failure is silent and in the worst direction:
+// provider- or tool-supplied content presented to the reviewer as if the human
+// had written it. content.RefusalBlock is exactly that case; it is
+// provider-authored prose, and inside a user message it would otherwise have
+// been labeled with the user's authority.
 func appendReviewBlocks(
 	entries []gate.ReviewContextEntry,
 	blocks []content.Block,
@@ -542,10 +559,10 @@ func appendReviewBlocks(
 	kind gate.ReviewContextKind,
 ) ([]gate.ReviewContextEntry, error) {
 	for _, block := range blocks {
-		entryOrigin, entryKind := origin, kind
+		entryOrigin, entryKind := gate.ReviewContextOriginExternal, gate.ReviewContextKindExternalContent
 		switch block.(type) {
-		case *content.ImageBlock, *content.AudioBlock, *content.DocumentBlock:
-			entryOrigin, entryKind = gate.ReviewContextOriginExternal, gate.ReviewContextKindExternalContent
+		case *content.TextBlock, *content.ThinkingBlock, *content.ToolUseBlock, *content.ToolResultBlock:
+			entryOrigin, entryKind = origin, kind
 		}
 		var err error
 		entries, err = appendReviewBlock(entries, block, entryOrigin, entryKind)

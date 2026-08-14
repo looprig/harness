@@ -86,10 +86,20 @@ type TurnStarted struct {
 	Message   *content.UserMessage `json:"message,omitzero"`
 }
 
-// StepDone is the enduring event emitted when a completed step's finalized group
-// is committed: the step's single AIMessage followed by its ToolResultMessages.
-// It is emitted at step completion (the actor-owned commit point once the commit
-// handshake lands), so it is never a lie.
+// StepDone is the enduring event emitted when a step's finalized group is
+// committed: the step's single AIMessage followed by its ToolResultMessages. It is
+// emitted at the actor-owned commit point, once the commit handshake lands, so it
+// never claims a commit that did not happen — Messages is exactly what entered
+// history.
+//
+// It is emitted for a TRUNCATED step too. When a stream fails after the model has
+// already delivered content, the loop commits the safe prefix of that response
+// (text and sealed reasoning; never a partial or unpaired tool call) so the content
+// the user watched arrive is not silently discarded. Such a group is a lone
+// AIMessage whose last block is the truncation notice, and the turn still ends on
+// TurnFailed. A consumer that needs to distinguish the two reads the turn terminal;
+// a consumer that only renders history sees the notice. A step that decoded nothing
+// usable commits nothing and emits no StepDone at all.
 type StepDone struct {
 	enduring
 	loopScoped

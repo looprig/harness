@@ -401,6 +401,7 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		return nil, &ConfigError{Kind: ConfigMissingPublisher}
 	}
 	cfg.DrainTimeout = resolveDrainTimeout(cfg.DrainTimeout)
+	cfg.truncatedCommitGrace = resolveTruncatedCommitGrace(cfg.truncatedCommitGrace)
 	cfg.Tools = resolveToolSetCaps(cfg.Tools)
 	if cfg.idGen == nil {
 		cfg.idGen = uuid.New
@@ -1510,9 +1511,17 @@ func runLoop(cfg loopConfig, state loopState) {
 		// at turn start, into this per-turn value), so a change that landed since the last
 		// turn takes effect now while a change that lands DURING this turn does not. The
 		// remaining fields are immutable loop wiring, so they ride the frozen config.
+		//
+		// lifetime is the LOOP ctx, deliberately NOT the turn ctx: it outlives an
+		// Interrupt and a graceful Shutdown and dies only with the actor, which is
+		// what lets commitTruncatedStep tell "this turn was cancelled" (commit the
+		// partial reply the user saw) from "this loop is gone" (nobody is left to
+		// accept it).
 		return turnConfig{
 			base:                    base,
 			baseDerivedPrefix:       baseDerivedPrefix,
+			lifetime:                ctx,
+			commitGrace:             config.truncatedCommitGrace,
 			runtimeContext:          config.RuntimeContext,
 			model:                   state.effective.model,
 			system:                  state.effective.system,
@@ -1667,7 +1676,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	// userMessageFromBlocks wraps an owned clone of submit blocks into the committed
 	// UserMessage form. Command callers retain ownership of their input graph.
 	userMessageFromBlocks := func(blocks []content.Block) *content.UserMessage {
-		return &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: cloneBlocks(blocks)}}
+		return &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: content.CloneBlocks(blocks)}}
 	}
 
 	// returnEntry resolves ONE removed-from-inbox entry as returned: it emits the

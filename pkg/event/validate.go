@@ -297,9 +297,6 @@ func validateEventBody(ev Event) error {
 		if err := validateModelRuntime("HustleCompleted", e.Run.Runtime); err != nil {
 			return invalidHustle("HustleCompleted", FieldRuntime)
 		}
-		if err := validateOptionalUsage("HustleCompleted", e.Usage); err != nil {
-			return err
-		}
 	case HustleFailed:
 		return validateHustleFailed(e)
 	case PermissionReviewStarted:
@@ -319,9 +316,11 @@ func validateEventBody(ev Event) error {
 	case StepDone:
 		return validateStepDoneMessages(e.Messages)
 	case TurnDone:
-		if err := e.Usage.Validate(); err != nil {
-			return &InvalidEventError{Event: "TurnDone", Field: FieldUsage, Rule: RuleInvalid}
-		}
+		// Usage is not validated. TurnDone is the record that a turn FINISHED,
+		// and a provider whose reasoning count disagrees with its output count
+		// must not be able to invalidate that record — the event would be
+		// rejected and the completed turn lost over an accounting field. See
+		// content.Usage.ReasoningWithinOutput.
 	case ConfigurationAdopted:
 		return validateConfigurationAdopted(e)
 	}
@@ -707,16 +706,6 @@ func validateHustleFailed(e HustleFailed) error {
 	}
 	if err := validateModelRuntime(name, e.Run.Runtime); err != nil {
 		return invalidHustle(name, FieldRuntime)
-	}
-	return validateOptionalUsage(name, e.Usage)
-}
-
-func validateOptionalUsage(name EventName, usage *content.Usage) error {
-	if usage == nil {
-		return nil
-	}
-	if err := usage.Validate(); err != nil {
-		return invalidHustle(name, FieldUsage)
 	}
 	return nil
 }
