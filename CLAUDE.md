@@ -94,7 +94,9 @@ and must not be added manually to a consumer's tool definitions.
 
 **Build** — Always build with `CGO_ENABLED=0 go build -trimpath`. Never ship a binary without `-trimpath` (leaks local paths).
 
-**Format** — All Go code must be `gofmt`-clean. Run `make fmt` to format the whole module in place; `make fmt-check` fails if anything is unformatted and is wired into `make lint` (so `make secure` enforces it). Scope is `go list -f '{{.Dir}}' ./...`, which excludes `vendor/` and the nested `.worktrees/` modules — never reformat vendored or worktree files.
+**Format** — All Go code must be `gofmt`-clean. Run `make fmt` to format the whole module in place; `make fmt-check` fails if anything is unformatted and is wired into `make lint` (so `make secure` enforces it). Scope is `GO_FILES` — each of this module's own package directories' `.go` files, never a directory operand, so gofmt cannot recurse into the nested `.worktrees/` checkouts. Never reformat worktree files.
+
+**Dependencies are pinned, not vendored.** `go.mod` pins exact versions and `go.sum` verifies their content hashes, which is what makes a build reproducible. This module deliberately has no `vendor/`: a vendor tree is ignored under a `go.work` but silently satisfies a `GOWORK=off` build, so a stale one lets standalone verification pass against the vendored copy rather than the version `go.mod` actually pins — defeating the purpose of verifying standalone. Run `GOWORK=off go test ./...` to check a module against its real pinned dependencies.
 
 **Tests** — Always run with `-race`: `go test -race ./...`. A test that passes without `-race` but not with it is not passing.
 
@@ -146,3 +148,40 @@ func TestFoo(t *testing.T) {
 - Keep packages shallow and cohesive; avoid circular imports.
 - Introduce interfaces when a consumer boundary or multiple implementations justify them.
 - Split long functions when doing so clarifies ownership, invariants, or control flow. Do not optimize for an arbitrary line count.
+
+## Provider-opaque content state
+
+Reasoning signatures, encrypted reasoning and vendor continuation blobs live in
+`ProviderState`/`ProviderStateFormat` on `core/content` blocks. Harness never
+interprets them, but it must never lose them either: they are what lets a provider
+accept the next turn of a tool loop.
+
+**Every helper that copies, sanitizes, journals or reconstructs a content block must
+preserve every exported field.** A hand-written struct literal drifts from the type
+the moment `core` gains a field, and the loss is silent — the codecs keep replaying
+state that was already stripped upstream.
+
+For a COPY, call `content.CloneBlock` / `content.CloneBlocks`. Do not write another
+one: three lived in this module, they were written three different ways, and they had
+already drifted into disagreeing about the same input. The shared one copies the struct
+whole instead of enumerating fields, and it is faithful — nil-versus-empty and a
+half-set provider-state pair come back exactly as they went in, because a copy is not a
+normalization. Keep your own escalation policy on top of it if you need one: it returns
+a nil interface only for a nil block.
+
+For CONSTRUCTION from parts, use the `core/content` constructors, which normalize on
+purpose. Pin either with a reflection-driven test that populates every exported field
+of every block variant (`core/content/blocktest`), so a new field fails the test rather
+than disappearing.
+
+**A block is not empty just because its text is.** Redacted reasoning decodes to an
+empty `Thinking` with the payload in `ProviderState`; treating it as empty drops the
+block, and on a redacted-only turn fails the turn outright. Emptiness checks must
+consider provider state.
+
+**Strict decoders and lossy encoders must change together.** The compaction wire
+format decodes with `DisallowUnknownFields`, so adding a field to the encoder without
+the decoder turns a silent drop into a hard failure. Land both halves in one change.
+These are greenfield projects with no persisted payloads worth protecting, so choose
+the correct wire format rather than an additive one — do not carry migration handling
+for shapes nothing has written.

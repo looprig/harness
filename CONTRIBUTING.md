@@ -44,7 +44,7 @@ Run these before pushing. CI runs the same.
 ```sh
 make fmt       # gofmt the whole module in place
 make test      # go test -race ./...           (always -race)
-make secure    # fmt-check + vendor-check + vet + staticcheck + gosec
+make secure    # fmt-check + vet + staticcheck + gosec
                # + go mod verify + govulncheck
 ```
 
@@ -53,9 +53,14 @@ paths. Integration tests are tagged `//go:build integration` and run
 explicitly: `go test -tags integration -race ./...`. Fuzz any parser of
 external input: `go test -fuzz=FuzzXxx ./pkg -fuzztime=30s`.
 
-The module **vendors** its dependency tree. Do not run `go get` casually;
-`make vendor` refreshes `vendor/`, scrubs the VCS metadata of local-replace
-dependencies, and verifies no forbidden metadata leaked in.
+**Dependencies are pinned, not vendored.** `go.mod` pins exact versions and
+`go.sum` verifies their content hashes, which is what makes a build
+reproducible. This module deliberately has no `vendor/`: a vendor tree is
+ignored under a `go.work` but silently satisfies a `GOWORK=off` build, so a
+stale one lets standalone verification pass against the vendored copy rather
+than the version `go.mod` actually pins — defeating the purpose of verifying
+standalone. Run `GOWORK=off go test ./...` to check this module against its
+real pinned dependencies. Do not run `go get` casually.
 
 ## Tests
 

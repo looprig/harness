@@ -31,9 +31,9 @@
 # Migration review provenance (Codex review outputs) — keep locally, don't commit
 /scripts/migration/codex_review_*
 
-# Vendored dependency tree — committed in full and built offline (-mod=vendor).
-# The global ignores above (*.pem, *.key, .env.*, *.test, *.out, ...) otherwise
-# silently drop vendored files (e.g. go-tdx-guest's embedded trusted_root.pem),
-# yielding a tree that fails `go build`/`go test` from a clean checkout. This
-# negation must stay LAST so it re-includes everything under vendor/.
-!/vendor/**
+# This module does not vendor. go.mod pins exact versions and go.sum verifies
+# their content hashes; a vendor tree would add only offline builds and
+# source-level dependency diffs, at the cost of masking which version a
+# GOWORK=off build actually resolves. Ignored so a stray `go mod vendor` cannot
+# be committed by accident.
+/vendor/

@@ -328,9 +328,8 @@ harness/
 │   ├── pathutil/         canonical path normalization
 │   └── buildtest/        build/lint test helpers
 ├── docs/                 architecture, plans, releases, ecosystem
-├── vendor/               audited vendored dependency tree
 ├── scripts/              build/lint helper scripts
-├── Makefile              fmt, lint, secure, fuzz, vendor targets
+├── Makefile              fmt, lint, secure, fuzz targets
 ├── go.mod / go.sum       module graph
 ├── CLAUDE.md / AGENTS.md development guidelines (AGENTS.md is a symlink)
 ├── CONTRIBUTING.md       how to contribute
@@ -340,17 +339,20 @@ harness/
 
 ## Building and verifying
 
-This module vendors its dependencies and builds offline. The `Makefile`
+Dependencies are pinned by `go.mod`/`go.sum`, not vendored. The `Makefile`
 encodes the rules; the short version:
 
 ```sh
 make test      # go test -race ./...
 make fmt       # gofmt the whole module in place
-make lint      # fmt-check + vendor-check + vet + staticcheck + gosec
+make lint      # fmt-check + vet + staticcheck + gosec
 make vuln      # go mod verify + govulncheck
 make secure    # lint + vuln — run before every commit
-make vendor    # refresh the vendored tree, scrub local-replace VCS metadata
 ```
+
+Add `GOWORK=off` to check the module against its real pinned dependency
+versions rather than the sibling working copies `../go.work` supplies:
+`GOWORK=off go test ./...`.
 
 Build with `CGO_ENABLED=0 go build -trimpath` so binaries never leak local
 paths. Run tests with `-race`; a test that only passes without `-race` is
