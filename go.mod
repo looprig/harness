@@ -13,7 +13,7 @@ require (
 	golang.org/x/sys v0.47.0
 )
 
-require github.com/looprig/fsstore v0.3.2
+require github.com/looprig/fsstore v0.4.0
 
 require (
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
@@ -42,9 +42,9 @@ require (
 	github.com/gookit/color v1.6.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
-	github.com/looprig/core v0.5.1
-	github.com/looprig/inference v0.10.0
-	github.com/looprig/storage v0.3.1
+	github.com/looprig/core v0.6.0
+	github.com/looprig/inference v0.11.0
+	github.com/looprig/storage v0.4.0
 	github.com/openai/openai-go/v3 v3.50.0 // indirect
 	github.com/securego/gosec/v2 v2.28.0 // indirect
 	github.com/standard-webhooks/standard-webhooks/libraries v0.0.1 // indirect
