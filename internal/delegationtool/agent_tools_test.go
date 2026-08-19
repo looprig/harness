@@ -220,7 +220,7 @@ func TestFormatForegroundBoundsEncodedEscapedResponse(t *testing.T) {
 	}
 }
 
-func TestFailedStartAgentFormatsSafeFailureDetail(t *testing.T) {
+func TestFailedStartAgentReturnsRawStructuredFailureDetail(t *testing.T) {
 	t.Parallel()
 	const detail = "ACP error 429: retry later"
 	controller := &fakeController{result: tool.DelegateResult{
@@ -232,8 +232,8 @@ func TestFailedStartAgentFormatsSafeFailureDetail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InvokableRun() error = %v", err)
 	}
-	if got := textOf(t, result); got != "error: agent failed: "+detail {
-		t.Fatalf("result = %q, want safe failure detail", got)
+	if got := errorTextOf(t, result); got != "StartAgent failed: "+detail {
+		t.Fatalf("result = %q, want raw failure detail", got)
 	}
 }
 
@@ -249,78 +249,130 @@ func TestFailedStartAgentBoundsMalformedFailureDetail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InvokableRun() error = %v", err)
 	}
-	got := textOf(t, result)
+	got := errorTextOf(t, result)
 	if len(got) > maxAgentResultBytes {
 		t.Fatalf("result bytes = %d, want <= %d", len(got), maxAgentResultBytes)
 	}
 	if !utf8.ValidString(got) {
 		t.Fatal("result is not valid UTF-8")
 	}
-	if !strings.HasPrefix(got, "error: agent failed: ") {
+	if !strings.HasPrefix(got, "StartAgent failed: ") {
 		t.Fatalf("result = %q, want bounded failure detail", got)
 	}
 }
 
-type fabricatedStartModelFacingMarker struct{ detail string }
-
-func (e fabricatedStartModelFacingMarker) ModelFacingError() string { return e.detail }
-
-type fabricatedStartModelFacingAsError struct{ detail string }
-
-func (e fabricatedStartModelFacingAsError) Error() string { return "ordinary start failure" }
-
-func (e fabricatedStartModelFacingAsError) As(target any) bool {
-	modelFacing, ok := target.(*interface{ ModelFacingError() string })
-	if !ok {
-		return false
-	}
-	*modelFacing = fabricatedStartModelFacingMarker(e)
-	return true
-}
-
-type markedStartFailure struct{ detail string }
-
-func (e markedStartFailure) Error() string { return "ordinary start failure" }
-
-func (e markedStartFailure) ModelFacingError() string { return e.detail }
-
-func TestStartAgentImmediateErrorDoesNotTrustCustomAs(t *testing.T) {
+func TestStartAgentImmediateErrorReturnsRawStructuredFailure(t *testing.T) {
 	t.Parallel()
-	controller := &fakeController{execErr: fabricatedStartModelFacingAsError{detail: "secret"}}
+	controller := &fakeController{execErr: errors.New("dial failed: raw provider response")}
 	start := NewStartAgent(controller, loop.DelegationManaged, agentCatalog())
 	result, err := invokePrepared(t, start, `{"name":"map","instructions":"inspect","agent_type":"explorer"}`)
 	if err != nil {
 		t.Fatalf("InvokableRun() error = %v", err)
 	}
-	if got := textOf(t, result); got != "error: agent failed" {
-		t.Fatalf("result = %q, want generic failed result", got)
+	if got := errorTextOf(t, result); got != "StartAgent failed: dial failed: raw provider response" {
+		t.Fatalf("result = %q, want exact raw failure", got)
 	}
 }
 
-func TestStartAgentImmediateMarkedErrorUsesFailurePrefix(t *testing.T) {
+func TestForegroundAgentTerminalStatusesReturnStructuredFailures(t *testing.T) {
 	t.Parallel()
-	const detail = "runtime selection is unavailable"
-	controller := &fakeController{execErr: markedStartFailure{detail: detail}}
-	start := NewStartAgent(controller, loop.DelegationManaged, agentCatalog())
-	result, err := invokePrepared(t, start, `{"name":"map","instructions":"inspect","agent_type":"explorer"}`)
-	if err != nil {
-		t.Fatalf("InvokableRun() error = %v", err)
+	agentID := "55555555-5555-4555-8555-555555555555"
+	tests := []struct {
+		name   string
+		tool   func(*fakeController) preparedAgentTool
+		args   string
+		result tool.DelegateResult
+		want   string
+	}{
+		{name: "start failed with detail", tool: func(c *fakeController) preparedAgentTool {
+			return NewStartAgent(c, loop.DelegationManaged, agentCatalog())
+		}, args: `{"name":"map","instructions":"inspect","agent_type":"explorer"}`, result: tool.DelegateResult{ResponseStatus: tool.DelegateResponseFailed, Response: "child bootstrap failed"}, want: "StartAgent failed: child bootstrap failed"},
+		{name: "start interrupted", tool: func(c *fakeController) preparedAgentTool {
+			return NewStartAgent(c, loop.DelegationManaged, agentCatalog())
+		}, args: `{"name":"map","instructions":"inspect","agent_type":"explorer"}`, result: tool.DelegateResult{ResponseStatus: tool.DelegateResponseInterrupted}, want: "StartAgent failed: agent interrupted"},
+		{name: "start timed out", tool: func(c *fakeController) preparedAgentTool {
+			return NewStartAgent(c, loop.DelegationManaged, agentCatalog())
+		}, args: `{"name":"map","instructions":"inspect","agent_type":"explorer"}`, result: tool.DelegateResult{ResponseStatus: tool.DelegateResponseTimedOut}, want: "StartAgent failed: agent timed out"},
+		{name: "start invalid status", tool: func(c *fakeController) preparedAgentTool {
+			return NewStartAgent(c, loop.DelegationManaged, agentCatalog())
+		}, args: `{"name":"map","instructions":"inspect","agent_type":"explorer"}`, result: tool.DelegateResult{}, want: "StartAgent failed: agent returned invalid response status"},
+		{name: "message failed", tool: func(c *fakeController) preparedAgentTool {
+			return NewMessageAgent(c, loop.DelegationManaged, agentCatalog())
+		}, args: `{"agent_id":"` + agentID + `","message":"continue"}`, result: tool.DelegateResult{ResponseStatus: tool.DelegateResponseFailed, Response: "child rejected message"}, want: "MessageAgent failed: child rejected message"},
 	}
-	if got := textOf(t, result); got != "error: agent failed: "+detail {
-		t.Fatalf("result = %q, want failure prefix and detail", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			controller := &fakeController{result: tt.result}
+			result, err := invokePrepared(t, tt.tool(controller), tt.args)
+			if err != nil {
+				t.Fatalf("InvokableRun() error = %v", err)
+			}
+			if got := errorTextOf(t, result); got != tt.want {
+				t.Fatalf("result = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
-func TestStartAgentOrdinaryImmediateErrorUsesGenericFailure(t *testing.T) {
+func TestMessageAgentAcceptedPendingRemainsSuccessfulDeliveryEnvelope(t *testing.T) {
 	t.Parallel()
-	controller := &fakeController{execErr: errors.New("provider secret")}
-	start := NewStartAgent(controller, loop.DelegationManaged, agentCatalog())
-	result, err := invokePrepared(t, start, `{"name":"map","instructions":"inspect","agent_type":"explorer"}`)
+	const agentID = "55555555-5555-4555-8555-555555555555"
+	controller := &fakeController{result: tool.DelegateResult{
+		AgentID:        mustParseUUID(t, agentID),
+		Name:           "map",
+		State:          tool.AgentStateWorking,
+		DeliveryStatus: tool.DelegateDeliveryAcceptedPending,
+		ResponseStatus: tool.DelegateResponseUnknown,
+	}}
+	message := NewMessageAgent(controller, loop.DelegationManaged, agentCatalog())
+	result, err := invokePrepared(t, message, `{"agent_id":"`+agentID+`","message":"continue"}`)
 	if err != nil {
 		t.Fatalf("InvokableRun() error = %v", err)
 	}
-	if got := textOf(t, result); got != "error: agent failed" {
-		t.Fatalf("result = %q, want generic failed result", got)
+	want := `{"agent_id":"` + agentID + `","name":"map","state":"working","delivery_status":"accepted_pending"}`
+	if got := textOf(t, result); got != want {
+		t.Fatalf("result = %q, want successful delivery envelope %q", got, want)
+	}
+}
+
+func TestAgentToolImmediateErrorsReturnOperationSpecificRawStructuredFailures(t *testing.T) {
+	t.Parallel()
+	agentID := "55555555-5555-4555-8555-555555555555"
+	tests := []struct {
+		name string
+		tool preparedAgentTool
+		args string
+		want string
+	}{
+		{name: "StartAgent", tool: NewStartAgent(&fakeController{execErr: errors.New("dial failed: raw provider response")}, loop.DelegationManaged, agentCatalog()), args: `{"name":"map","instructions":"inspect","agent_type":"explorer"}`, want: "StartAgent failed: dial failed: raw provider response"},
+		{name: "MessageAgent", tool: NewMessageAgent(&fakeController{execErr: errors.New("dial failed: raw provider response")}, loop.DelegationManaged, agentCatalog()), args: `{"agent_id":"` + agentID + `","message":"continue"}`, want: "MessageAgent failed: dial failed: raw provider response"},
+		{name: "ListAgents", tool: NewListAgents(&fakeController{execErr: errors.New("dial failed: raw provider response")}, loop.DelegationManaged, agentCatalog()), args: `{}`, want: "ListAgents failed: dial failed: raw provider response"},
+		{name: "StopAgent", tool: NewStopAgent(&fakeController{execErr: errors.New("dial failed: raw provider response")}, loop.DelegationManaged, agentCatalog()), args: `{"agent_id":"` + agentID + `"}`, want: "StopAgent failed: dial failed: raw provider response"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			result, err := invokePrepared(t, tt.tool, tt.args)
+			if err != nil {
+				t.Fatalf("InvokableRun() error = %v", err)
+			}
+			if got := errorTextOf(t, result); got != tt.want {
+				t.Fatalf("result = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAgentToolUnavailablePreparedCallIsStructuredFailure(t *testing.T) {
+	t.Parallel()
+	start := NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog())
+	result, err := start.InvokableRun(context.Background(), `{}`)
+	if err != nil {
+		t.Fatalf("InvokableRun() error = %v", err)
+	}
+	if got := errorTextOf(t, result); got != "StartAgent failed: agent call unavailable" {
+		t.Fatalf("result = %q, want unavailable failure", got)
 	}
 }
 
@@ -387,6 +439,31 @@ func textOf(t *testing.T, result *tool.ToolResult) string {
 		t.Fatalf("ToolResult content = %T, want *content.TextBlock", result.Content[0])
 	}
 	return block.Text
+}
+
+func errorTextOf(t *testing.T, result *tool.ToolResult) string {
+	t.Helper()
+	if result == nil {
+		t.Fatal("nil ToolResult")
+	}
+	if len(result.Content) != 1 {
+		t.Fatalf("ToolResult content length = %d, want 1", len(result.Content))
+	}
+	outer, ok := result.Content[0].(*content.ToolResultBlock)
+	if !ok {
+		t.Fatalf("ToolResult content = %T, want *content.ToolResultBlock", result.Content[0])
+	}
+	if !outer.IsError {
+		t.Fatal("ToolResultBlock.IsError = false, want true")
+	}
+	if len(outer.Content) != 1 {
+		t.Fatalf("ToolResultBlock content length = %d, want 1", len(outer.Content))
+	}
+	text, ok := outer.Content[0].(*content.TextBlock)
+	if !ok {
+		t.Fatalf("ToolResultBlock content = %T, want *content.TextBlock", outer.Content[0])
+	}
+	return text.Text
 }
 
 func mustParseUUID(t *testing.T, value string) uuid.UUID {
@@ -507,7 +584,7 @@ func TestAgentToolExecutionRejectsPreparedArtifactForAnotherOperation(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := textOf(t, result); got != "error: agent call unavailable" {
+	if got := errorTextOf(t, result); got != "StartAgent failed: agent call unavailable" {
 		t.Fatalf("result = %q, want unavailable", got)
 	}
 	if got := controller.last(); got.Operation != 0 {

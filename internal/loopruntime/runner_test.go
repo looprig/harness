@@ -12,6 +12,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/delegationtool"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	gatedomain "github.com/looprig/harness/pkg/gate"
@@ -155,6 +156,12 @@ func (denyAllGate) Authorize(context.Context, tool.Request) (gatedomain.Resoluti
 	return gatedomain.Resolution{}, nil
 }
 
+type failingDelegateController struct{ err error }
+
+func (f failingDelegateController) Execute(context.Context, tool.DelegateRequest) (tool.DelegateResult, error) {
+	return tool.DelegateResult{}, f.err
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -278,6 +285,96 @@ func TestRunBatch_ResultOrderMatchesCalls(t *testing.T) {
 	}
 	if !strings.Contains(resultText(results[0]), "rb") || !strings.Contains(resultText(results[1]), "ra") {
 		t.Errorf("results out of order: %q, %q", resultText(results[0]), resultText(results[1]))
+	}
+}
+
+func TestRunBatch_AgentExecutionErrorPropagatesThroughEventResultAndModelMessage(t *testing.T) {
+	t.Parallel()
+
+	const want = "StartAgent failed: dial failed: raw provider response"
+	start := delegationtool.NewStartAgent(
+		failingDelegateController{err: errors.New("dial failed: raw provider response")},
+		loop.DelegationManaged,
+		[]delegationtool.AgentCatalogEntry{{Name: "explorer", Description: "inspect the workspace"}},
+	)
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{start}}
+	emit, getEvents := collectEmit()
+	results := runBatchNoGate(context.Background(), []content.ToolUseBlock{
+		call(t, "StartAgent", `{"name":"map","instructions":"inspect","agent_type":"explorer"}`),
+	}, ts, emit)
+
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+	if !results[0].IsError {
+		t.Fatal("result.IsError = false, want true")
+	}
+	if got := resultText(results[0]); got != want {
+		t.Fatalf("result text = %q, want %q", got, want)
+	}
+	if len(results[0].Content) != 1 {
+		t.Fatalf("result content length = %d, want 1", len(results[0].Content))
+	}
+	outer, ok := results[0].Content[0].(*content.ToolResultBlock)
+	if !ok || !outer.IsError {
+		t.Fatalf("result content = %#v, want outer error ToolResultBlock", results[0].Content)
+	}
+
+	var completed *event.ToolCallCompleted
+	for _, emitted := range getEvents() {
+		if value, ok := emitted.(event.ToolCallCompleted); ok {
+			value := value
+			completed = &value
+		}
+	}
+	if completed == nil {
+		t.Fatal("ToolCallCompleted event not emitted")
+	}
+	if !completed.IsError || completed.ResultPreview != want {
+		t.Fatalf("ToolCallCompleted = %+v, want IsError and exact preview %q", *completed, want)
+	}
+
+	client := &scriptedLLM{scripts: [][]content.Chunk{
+		{toolUseChunk(0, "start-agent-call", "StartAgent", `{"name":"map","instructions":"inspect","agent_type":"explorer"}`)},
+		{textChunk("done")},
+	}}
+	turnTools := agenticToolSet([]tool.InvokableTool{start}, 25, 100)
+	cfg, state, recorder := newTurnFixture(nil, nil, turnTools, client, noGateReg())
+	terminal := runTurn(context.Background(), cfg, state)
+	if _, ok := terminal.(event.TurnDone); !ok {
+		t.Fatalf("runTurn() terminal = %T, want event.TurnDone", terminal)
+	}
+
+	var committed *content.ToolResultMessage
+	for _, message := range recorder.committedMsgs() {
+		if value, ok := message.(*content.ToolResultMessage); ok {
+			committed = value
+		}
+	}
+	if committed == nil {
+		t.Fatal("committed ToolResultMessage not found")
+	}
+	if !committed.IsError {
+		t.Fatal("committed ToolResultMessage.IsError = false, want true")
+	}
+	if len(committed.Blocks) != 1 {
+		t.Fatalf("committed blocks length = %d, want 1", len(committed.Blocks))
+	}
+	text, ok := committed.Blocks[0].(*content.TextBlock)
+	if !ok || text.Text != want {
+		t.Fatalf("committed content = %#v, want exact text %q", committed.Blocks, want)
+	}
+	reqs := client.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("model requests = %d, want 2", len(reqs))
+	}
+	continuationResult, ok := reqs[1].Messages[2].(*content.ToolResultMessage)
+	if !ok || !continuationResult.IsError || len(continuationResult.Blocks) != 1 {
+		t.Fatalf("continuation tool result = %#v, want exact error ToolResultMessage", reqs[1].Messages[2])
+	}
+	continuationText, ok := continuationResult.Blocks[0].(*content.TextBlock)
+	if !ok || continuationText.Text != want {
+		t.Fatalf("continuation content = %#v, want exact text %q", continuationResult.Blocks, want)
 	}
 }
 

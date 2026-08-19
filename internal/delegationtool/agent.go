@@ -3,8 +3,10 @@ package delegationtool
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"unicode/utf8"
 
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -51,11 +53,11 @@ func (c *agentToolConfig) startSchema() string {
 func executeAgentCall(ctx context.Context, controller tool.DelegateController, operation tool.DelegateOperation, format func(tool.DelegateRequest, tool.DelegateResult) string) (*tool.ToolResult, error) {
 	prepared, ok := loop.PreparedCallFromContext(ctx)
 	if !ok {
-		return tool.TextResult("error: agent call unavailable"), nil
+		return agentFailureResult(operation, "agent call unavailable"), nil
 	}
 	artifact, ok := prepared.Artifact.(tool.DelegateArtifact)
 	if !ok || artifact.Request.Operation != operation {
-		return tool.TextResult("error: agent call unavailable"), nil
+		return agentFailureResult(operation, "agent call unavailable"), nil
 	}
 	req := artifact.Request
 	req.Runtime = artifact.Runtime
@@ -65,18 +67,63 @@ func executeAgentCall(ctx context.Context, controller tool.DelegateController, o
 	}
 	result, err := controller.Execute(ctx, req)
 	if err != nil {
-		if operation == tool.DelegateStart {
-			if detail, marked := tool.ModelFacingErrorDetail(err); marked {
-				return tool.TextResult(formatStartAgentFailure(detail)), nil
-			}
-			return tool.TextResult("error: agent failed"), nil
-		}
-		if detail, marked := tool.ModelFacingErrorDetail(err); marked && detail != "" {
-			return tool.TextResult("error: " + tool.BoundModelFacingErrorDetail(detail)), nil
-		}
-		return tool.TextResult("error: agent request failed"), nil
+		return agentFailureResult(operation, err.Error()), nil
+	}
+	if detail, failed := terminalAgentFailure(req, result); failed {
+		return agentFailureResult(operation, detail), nil
 	}
 	return tool.TextResult(format(req, result)), nil
+}
+
+func agentFailureResult(operation tool.DelegateOperation, detail string) *tool.ToolResult {
+	message := agentOperationName(operation) + " failed"
+	if detail != "" {
+		message += ": " + detail
+	}
+	message = boundAgentOutput(strings.ToValidUTF8(message, "\uFFFD"))
+	return &tool.ToolResult{Content: []content.Block{&content.ToolResultBlock{
+		IsError: true,
+		Content: []content.Block{&content.TextBlock{Text: message}},
+	}}}
+}
+
+func agentOperationName(operation tool.DelegateOperation) string {
+	switch operation {
+	case tool.DelegateStart:
+		return startAgentToolName
+	case tool.DelegateSend:
+		return messageAgentToolName
+	case tool.DelegateStatus:
+		return listAgentsToolName
+	case tool.DelegateInterrupt:
+		return stopAgentToolName
+	default:
+		return "AgentTool"
+	}
+}
+
+func terminalAgentFailure(req tool.DelegateRequest, result tool.DelegateResult) (string, bool) {
+	if !req.WaitForResponse || (req.Operation != tool.DelegateStart && req.Operation != tool.DelegateSend) {
+		return "", false
+	}
+	if result.DeliveryStatus != "" {
+		return "", false
+	}
+	switch result.ResponseStatus {
+	case tool.DelegateResponseCompleted:
+		return "", false
+	case tool.DelegateResponseFailed:
+		if result.Response != "" {
+			return result.Response, true
+		}
+		return "agent failed", true
+	case tool.DelegateResponseInterrupted:
+		return "agent interrupted", true
+	case tool.DelegateResponseTimedOut:
+		return "agent timed out", true
+	default:
+		return "agent returned invalid response status", true
+	}
 }
 
 func formatForeground(result tool.DelegateResult) string {
