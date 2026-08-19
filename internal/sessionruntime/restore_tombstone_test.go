@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -382,10 +383,10 @@ func TestAttachAndActivateActiveNativeRestoreFailureIsFatal(t *testing.T) {
 		event.ActiveLoopChanged{ActiveLoopID: childID},
 	}, []loopPlan{plan}, rootID)
 	var restoreErr *RestoreError
-	var sessionErr *SessionError
+	var runtimeErr *RestoreRuntimeMismatchError
 	if !errors.As(err, &restoreErr) || restoreErr.Kind != RestoreLoopFailed ||
-		!errors.As(err, &sessionErr) || sessionErr.Kind != SessionLoopExited {
-		t.Fatalf("attachAndActivate error = %v, want RestoreLoopFailed wrapping SessionLoopExited", err)
+		!errors.As(err, &runtimeErr) || runtimeErr.Kind != RestoreRuntimeUnavailable || runtimeErr.Harness != "codex" {
+		t.Fatalf("attachAndActivate error = %v, want RestoreLoopFailed retaining codex runtime mismatch", err)
 	}
 	if got := s.ActiveLoopID(); got != rootID {
 		t.Fatalf("active loop = %v, want root %v after failed activation", got, rootID)
@@ -432,17 +433,20 @@ func nativeRuntimeFailureRestoreFixture(
 func TestAttachAndActivateActiveChildRuntimeFailureIsFatal(t *testing.T) {
 	t.Parallel()
 	s, rootID, childID, plan := runtimeFailureRestoreFixture(t,
-		&RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}, nil)
+		&RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable, Harness: "codex"}, nil)
 
 	err := attachAndActivate(s, []event.Event{
 		plan.started,
 		event.ActiveLoopChanged{ActiveLoopID: childID},
 	}, []loopPlan{plan}, rootID)
 	var restoreErr *RestoreError
-	var sessionErr *SessionError
+	var runtimeErr *RestoreRuntimeMismatchError
 	if !errors.As(err, &restoreErr) || restoreErr.Kind != RestoreLoopFailed ||
-		!errors.As(err, &sessionErr) || sessionErr.Kind != SessionLoopExited {
-		t.Fatalf("attachAndActivate error = %v, want RestoreLoopFailed wrapping SessionLoopExited", err)
+		!errors.As(err, &runtimeErr) || runtimeErr.Kind != RestoreRuntimeUnavailable || runtimeErr.Harness != "codex" {
+		t.Fatalf("attachAndActivate error = %v, want RestoreLoopFailed retaining codex runtime mismatch", err)
+	}
+	if got := err.Error(); !strings.Contains(got, `used harness "codex" is not currently configured or runnable`) {
+		t.Fatalf("active runtime error = %q, want actionable harness diagnostic", got)
 	}
 	if got := s.ActiveLoopID(); got != rootID {
 		t.Fatalf("active loop = %v, want root %v after failed activation", got, rootID)

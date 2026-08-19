@@ -120,7 +120,8 @@ type Lifecycle struct {
 	// assessment. NewSession never reads it. Nil leaves the restored session on its
 	// fail-secure DefaultPolicyDecider{} default. Classified NewTopologyLifecycle-time
 	// for the same serve.Rig interface-minimalism reason as allowConfigMismatch.
-	restoreDecider RestoreDecider
+	restoreDecider         RestoreDecider
+	runtimeRestoreResolver RuntimeRestoreResolver
 
 	fingerprint       FingerprintProvider
 	frozenFingerprint *event.ConfigFingerprint
@@ -586,6 +587,16 @@ func WithLifecycleRestoreDecider(decider RestoreDecider) LifecycleOption {
 	}
 }
 
+// WithLifecycleRuntimeRestoreResolver captures the optional composition-owned
+// runtime reconstruction fallback for restored sessions.
+func WithLifecycleRuntimeRestoreResolver(resolver RuntimeRestoreResolver) LifecycleOption {
+	return func(r *Lifecycle) {
+		if resolver != nil {
+			r.runtimeRestoreResolver = resolver
+		}
+	}
+}
+
 // NewTopologyLifecycle binds an immutable, validated multi-primer graph to storage.
 func NewTopologyLifecycle(topology Topology, store *sessionstore.Store, opts ...LifecycleOption) (*Lifecycle, error) {
 	if store == nil {
@@ -860,6 +871,9 @@ func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session,
 	}
 	if r.restoreDecider != nil {
 		opts = append(opts, WithRestoreDecider(r.restoreDecider))
+	}
+	if r.runtimeRestoreResolver != nil {
+		opts = append(opts, WithRuntimeRestoreResolver(r.runtimeRestoreResolver))
 	}
 	if r.placement.Configured() {
 		opts = append(opts, withPlacementSpec(r.placement))

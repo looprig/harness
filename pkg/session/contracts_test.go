@@ -34,6 +34,7 @@ import (
 var publicSessionContracts = map[string]bool{
 	"Session": true, "SessionController": true, "GateHost": true,
 	"RestoreDecider": true, "RestoreDecision": true,
+	"RuntimeRestoreRequest": true, "RuntimeRestoreResolver": true,
 	"DefaultPolicyDecider": true, "AcceptAllDecider": true,
 }
 

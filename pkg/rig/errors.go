@@ -16,6 +16,7 @@ const (
 	DefinitionInvalidForeignBuilders          DefinitionErrorKind = "invalid_foreign_builders"
 	DefinitionInvalidGateCaps                 DefinitionErrorKind = "invalid_gate_caps"
 	DefinitionInvalidRestoreDecider           DefinitionErrorKind = "invalid_restore_decider"
+	DefinitionInvalidRuntimeRestoreResolver   DefinitionErrorKind = "invalid_runtime_restore_resolver"
 	DefinitionDuplicateOption                 DefinitionErrorKind = "duplicate_option"
 	DefinitionInvalidHustle                   DefinitionErrorKind = "invalid_hustle"
 	DefinitionDuplicateHustle                 DefinitionErrorKind = "duplicate_hustle"

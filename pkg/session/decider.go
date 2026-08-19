@@ -4,6 +4,8 @@ import (
 	"context"
 
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // RestoreDecision is an application's answer to a drift assessment. Source,
@@ -35,6 +37,23 @@ type RestoreDecision struct {
 // durable ConfigurationAdopted.
 type RestoreDecider interface {
 	DecideRestore(ctx context.Context, assessment event.DriftAssessment) (RestoreDecision, error)
+}
+
+// RuntimeRestoreRequest is the bounded, secret-free runtime selection context
+// a composition may use when exact durable runtime reconstruction fails.
+type RuntimeRestoreRequest struct {
+	AgentName identity.AgentName
+	Harness   loop.AgentHarnessName
+	Profile   loop.RuntimeProfileName
+	Mismatch  string
+	Catalog   loop.RuntimeCatalog
+}
+
+// RuntimeRestoreResolver lets the composition layer authorize a current
+// runtime selection for a durable loop. Omitting it keeps exact, fail-closed
+// reconstruction.
+type RuntimeRestoreResolver interface {
+	ResolveRuntimeRestore(context.Context, RuntimeRestoreRequest) (loop.Resolved, error)
 }
 
 // DefaultPolicyDecider is the fail-secure default: accept when every change is

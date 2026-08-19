@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // recordingDecider is a comparable stand-in used to prove a specific decider
@@ -13,6 +14,12 @@ type recordingDecider struct{ tag string }
 
 func (recordingDecider) DecideRestore(context.Context, event.DriftAssessment) (RestoreDecision, error) {
 	return RestoreDecision{Accept: true, Source: event.DecisionSourcePolicy}, nil
+}
+
+type recordingRuntimeRestoreResolver struct{ tag string }
+
+func (recordingRuntimeRestoreResolver) ResolveRuntimeRestore(context.Context, RuntimeRestoreRequest) (loop.Resolved, error) {
+	return loop.Resolved{}, nil
 }
 
 func TestWithRestoreDeciderStoresOnSession(t *testing.T) {
@@ -60,5 +67,27 @@ func TestWithLifecycleRestoreDeciderStoresOnLifecycle(t *testing.T) {
 	}
 	if nilLc.restoreDecider != nil {
 		t.Errorf("Lifecycle.restoreDecider = %#v, want nil (RestoreSession then defaults to DefaultPolicyDecider)", nilLc.restoreDecider)
+	}
+}
+
+func TestRuntimeRestoreResolverPlumbsThroughSessionAndLifecycle(t *testing.T) {
+	t.Parallel()
+	custom := recordingRuntimeRestoreResolver{tag: "runtime"}
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{}), WithRuntimeRestoreResolver(custom))
+	if err != nil {
+		t.Fatalf("newTestSession: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+	if s.runtimeRestoreResolver != custom {
+		t.Errorf("Session.runtimeRestoreResolver = %#v, want %#v", s.runtimeRestoreResolver, custom)
+	}
+
+	store := newRestoreStore(t)
+	lc, err := newTestLifecycle(cfg(&stubLLM{}), store, WithLifecycleRuntimeRestoreResolver(custom))
+	if err != nil {
+		t.Fatalf("newTestLifecycle: %v", err)
+	}
+	if lc.runtimeRestoreResolver != custom {
+		t.Errorf("Lifecycle.runtimeRestoreResolver = %#v, want %#v", lc.runtimeRestoreResolver, custom)
 	}
 }

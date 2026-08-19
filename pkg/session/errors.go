@@ -8,6 +8,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 type SessionErrorKind string
@@ -197,13 +198,17 @@ const (
 // Its public text is deliberately category-only: journal selectors, model keys,
 // credentials, and catalog/provider details never reach model-facing errors.
 type RestoreRuntimeMismatchError struct {
-	Kind  string
-	Cause error
+	Kind    string
+	Harness loop.AgentHarnessName
+	Cause   error
 }
 
 func (e *RestoreRuntimeMismatchError) Error() string {
 	if e == nil || e.Kind == "" {
 		return "session: restore runtime mismatch"
+	}
+	if e.Kind == RestoreRuntimeUnavailable && e.Harness != "" {
+		return "session: restore runtime unavailable: used harness " + strconv.Quote(string(e.Harness)) + " is not currently configured or runnable"
 	}
 	return "session: restore runtime mismatch: " + string(e.Kind)
 }

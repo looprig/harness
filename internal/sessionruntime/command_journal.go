@@ -152,6 +152,16 @@ func WithRestoreDecider(decider RestoreDecider) Option {
 	}
 }
 
+// WithRuntimeRestoreResolver installs the optional composition-owned runtime
+// reconstruction fallback. A nil resolver preserves the fail-closed default.
+func WithRuntimeRestoreResolver(resolver RuntimeRestoreResolver) Option {
+	return func(s *Session) {
+		if resolver != nil {
+			s.runtimeRestoreResolver = resolver
+		}
+	}
+}
+
 // WithInterruptReleasePolicy installs the pluggable admission-barrier release policy (the
 // Dependency-Inversion seam of the interrupt machinery). After an interrupt cancels a running
 // turn, the session holds the interrupt-pending marks until the policy's AwaitRelease returns,

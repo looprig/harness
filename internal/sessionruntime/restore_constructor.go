@@ -480,7 +480,7 @@ func restoreTopologySession(
 	if newPath {
 		planAllowMismatch = true
 	}
-	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, planAllowMismatch, contextDisposition, manager, probe.newWorkspaceBinding, resources)
+	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, planAllowMismatch, contextDisposition, manager, probe.runtimeRestoreResolver, probe.newWorkspaceBinding, resources)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -805,7 +805,7 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 // unknown (children of a single-definition run). It is the single Bind of each loop,
 // performed inside the restore lease. It returns the ordered plans and the active plan, or a
 // typed error the caller records as a RestoreErrored.
-func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, wsBind func() *tool.WorkspaceBinding, resources *sessionResources) ([]loopPlan, loopPlan, error) {
+func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, runtimeResolver RuntimeRestoreResolver, wsBind func() *tool.WorkspaceBinding, resources *sessionResources) ([]loopPlan, loopPlan, error) {
 	plans := make([]loopPlan, 0, len(starts))
 	activeIndex := -1
 	for _, started := range starts {
@@ -861,7 +861,7 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		plans[i].folded = folded
 		ri := foldLoopInference(plans[i].events)
 		catalog, hasCatalog := manager.catalogFor(plans[i].definition)
-		bound, runtimeErr := restoreRuntimeBinding(plans[i].started, plans[i].bound, ri, catalog, hasCatalog, findForeignSID(plans[i].events) != "")
+		bound, runtimeErr := restoreRuntimeBindingWithResolver(sessionCtx, plans[i].started, plans[i].bound, ri, catalog, hasCatalog, findForeignSID(plans[i].events) != "", runtimeResolver)
 		if runtimeErr != nil {
 			var mismatch *RestoreRuntimeMismatchError
 			if !errors.As(runtimeErr, &mismatch) || i == activeIndex {
@@ -895,6 +895,41 @@ func hasLoopRestoreTombstone(events []event.Event) bool {
 // initially binds as native; OverrideBoundRuntimeSelection turns that view into
 // the adapter view only after every durable selector and target identity matches.
 func restoreRuntimeBinding(started event.LoopStarted, bound loop.BoundDefinition, ri restoredInference, catalog loop.RuntimeCatalog, hasCatalog bool, hasForeignSID bool) (loop.BoundDefinition, error) {
+	return restoreRuntimeBindingWithResolver(context.Background(), started, bound, ri, catalog, hasCatalog, hasForeignSID, nil)
+}
+
+func restoreRuntimeBindingWithResolver(ctx context.Context, started event.LoopStarted, bound loop.BoundDefinition, ri restoredInference, catalog loop.RuntimeCatalog, hasCatalog bool, hasForeignSID bool, resolver RuntimeRestoreResolver) (loop.BoundDefinition, error) {
+	got, err := restoreRuntimeBindingExact(started, bound, ri, catalog, hasCatalog, hasForeignSID)
+	if err == nil || resolver == nil {
+		return got, err
+	}
+	var mismatch *RestoreRuntimeMismatchError
+	if !errors.As(err, &mismatch) || started.AgentRuntime == nil || !hasCatalog {
+		return nil, err
+	}
+	runtime := started.AgentRuntime
+	if runtime.Harness == "" || runtime.Profile == "" {
+		return nil, err
+	}
+	request := RuntimeRestoreRequest{
+		AgentName: started.AgentName,
+		Harness:   loop.AgentHarnessName(runtime.Harness),
+		Profile:   loop.RuntimeProfileName(runtime.Profile),
+		Mismatch:  mismatch.Kind,
+		Catalog:   catalog,
+	}
+	resolved, resolveErr := resolver.ResolveRuntimeRestore(ctx, request)
+	if resolveErr != nil {
+		return nil, &RestoreRuntimeMismatchError{Kind: mismatch.Kind, Cause: resolveErr}
+	}
+	validated, validateErr := validateRuntimeRestoreResolution(request, resolved)
+	if validateErr != nil {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable, Cause: validateErr}
+	}
+	return overrideRestoredRuntime(bound, catalog, validated)
+}
+
+func restoreRuntimeBindingExact(started event.LoopStarted, bound loop.BoundDefinition, ri restoredInference, catalog loop.RuntimeCatalog, hasCatalog bool, hasForeignSID bool) (loop.BoundDefinition, error) {
 	if ri.AgentRuntime == nil {
 		if bound.Engine() != loop.EngineNative || hasForeignSID {
 			return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeMissing}
@@ -984,6 +1019,52 @@ func restoreRuntimeBinding(started event.LoopStarted, bound loop.BoundDefinition
 	return bound, nil
 }
 
+func validateRuntimeRestoreResolution(request RuntimeRestoreRequest, resolved loop.Resolved) (loop.Resolved, error) {
+	if resolved.AgentType != request.AgentName || resolved.AgentHarness != request.Harness {
+		return loop.Resolved{}, errors.New("runtime restore resolver crossed durable identity")
+	}
+	if resolved.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+		validated, err := request.Catalog.ResolveTargetAliasWithSource(request.AgentName, request.Harness, resolved.Source, "", inferencemodel.EffortNone)
+		if err != nil || validated.Profile != resolved.Profile || validated.SelectionKind != resolved.SelectionKind || validated.Credential != resolved.Credential {
+			return loop.Resolved{}, errors.New("runtime restore resolver returned unavailable managed selection")
+		}
+		return validated, nil
+	}
+	alias := resolved.TargetAlias
+	if alias == "" {
+		alias = resolved.ModelAlias
+	}
+	if alias == "" {
+		return loop.Resolved{}, errors.New("runtime restore resolver returned no alias")
+	}
+	validated, err := request.Catalog.ResolveTargetAliasWithSource(request.AgentName, request.Harness, resolved.Source, alias, resolved.Effort)
+	if err != nil || validated.Profile != resolved.Profile || validated.SelectionKind != resolved.SelectionKind || validated.Credential != resolved.Credential || validated.Target.Key() != resolved.Target.Key() {
+		return loop.Resolved{}, errors.New("runtime restore resolver returned unavailable selection")
+	}
+	return validated, nil
+}
+
+func overrideRestoredRuntime(bound loop.BoundDefinition, catalog loop.RuntimeCatalog, resolved loop.Resolved) (loop.BoundDefinition, error) {
+	var err error
+	if resolved.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+		bound, err = loop.OverrideBoundRuntimeManaged(bound, resolved.Profile)
+	} else {
+		alias := resolved.TargetAlias
+		if alias == "" {
+			alias = resolved.ModelAlias
+		}
+		bound, err = loop.OverrideBoundRuntimeSelectionWithIdentity(bound, resolved.Profile, alias, resolved.Target, resolved.Effort, resolved.Source, resolved.SelectionKind)
+	}
+	if err != nil {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+	}
+	bound, err = loop.OverrideBoundRuntimeCatalog(bound, catalog)
+	if err != nil {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+	}
+	return bound, nil
+}
+
 // attachAndActivate registers every non-root restored loop, resolves the durable active
 // selection (the last ActiveLoopChanged, else the initially active root), validates it is
 // registered, and sets it as the session's active loop under loopsMu — the post-build wiring performed after the
@@ -1006,7 +1087,7 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 		parent := loop.Provenance{LoopID: plan.started.Cause.Coordinates.LoopID, TurnID: plan.started.Cause.Coordinates.TurnID, StepID: plan.started.Cause.Coordinates.StepID}
 		if plan.runtimeMismatch != nil || plan.tombstoned {
 			if plan.started.LoopID == activeID {
-				return &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopExited}}
+				return &RestoreError{Kind: RestoreLoopFailed, Cause: runtimeMismatchForPlan(*plan)}
 			}
 			if err := s.attachRestoredTombstonedLoop(*plan, parent); err != nil {
 				return err
@@ -1019,7 +1100,7 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 				return err
 			}
 			if plan.started.LoopID == activeID {
-				return &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopExited}}
+				return &RestoreError{Kind: RestoreLoopFailed, Cause: runtimeMismatchForPlan(loopPlan{started: plan.started, runtimeMismatch: mismatch})}
 			}
 			// A runtime-classified failure can arise after the preflight fold (for
 			// example, an adapter session/load failure). Keep the same per-child
@@ -1036,7 +1117,7 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 	}
 	for _, plan := range plans {
 		if (plan.tombstoned || plan.runtimeMismatch != nil) && plan.started.LoopID == activeID {
-			return &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopExited}}
+			return &RestoreError{Kind: RestoreLoopFailed, Cause: runtimeMismatchForPlan(plan)}
 		}
 	}
 	if _, ok := s.Loop(activeID); !ok {
@@ -1051,6 +1132,24 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 	}
 	s.loopsMu.Unlock()
 	return nil
+}
+
+func runtimeMismatchForPlan(plan loopPlan) *RestoreRuntimeMismatchError {
+	if plan.runtimeMismatch == nil {
+		return &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable, Harness: runtimeHarnessForStarted(plan.started)}
+	}
+	mismatch := *plan.runtimeMismatch
+	if mismatch.Harness == "" {
+		mismatch.Harness = runtimeHarnessForStarted(plan.started)
+	}
+	return &mismatch
+}
+
+func runtimeHarnessForStarted(started event.LoopStarted) loop.AgentHarnessName {
+	if started.AgentRuntime == nil {
+		return ""
+	}
+	return loop.AgentHarnessName(started.AgentRuntime.Harness)
 }
 
 func classifyRestoredChildRuntimeFailure(bound loop.BoundDefinition, err error) (*RestoreRuntimeMismatchError, bool) {

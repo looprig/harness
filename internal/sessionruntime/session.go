@@ -245,6 +245,9 @@ type Session struct {
 	// DefaultPolicyDecider{} (reject on any Warn) when the composition root supplies
 	// none. A later task consumes it in the restore path; today it is stored only.
 	restoreDecider RestoreDecider
+	// runtimeRestoreResolver is an optional composition-owned fallback used
+	// only after exact durable runtime reconstruction fails.
+	runtimeRestoreResolver RuntimeRestoreResolver
 
 	// fingerprint is required composition wiring supplied by rig and is the single
 	// projection used by both new and restored sessions.

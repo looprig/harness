@@ -33,6 +33,7 @@ const (
 	keyGateCaps                        singletonKey = "gate_caps"
 	keyAllowConfigMismatch             singletonKey = "allow_config_mismatch"
 	keyRestoreDecider                  singletonKey = "restore_decider"
+	keyRuntimeRestoreResolver          singletonKey = "runtime_restore_resolver"
 	keySnapshots                       singletonKey = "snapshots"
 	keyOffloadGC                       singletonKey = "offload_gc"
 	keyHustleLimits                    singletonKey = "hustle_limits"
@@ -470,6 +471,19 @@ func WithRestoreDecider(decider session.RestoreDecider) Option {
 			return &DefinitionError{Kind: DefinitionInvalidRestoreDecider}
 		}
 		return singletonCompile(keyRestoreDecider, sessionruntime.WithLifecycleRestoreDecider(decider))(state)
+	}
+}
+
+// WithRuntimeRestoreResolver installs the composition-owned policy used only
+// when exact durable runtime reconstruction fails. Omitting it preserves the
+// fail-closed Harness default.
+func WithRuntimeRestoreResolver(resolver session.RuntimeRestoreResolver) Option {
+	return func(state *definitionState) error {
+		if resolver == nil {
+			return &DefinitionError{Kind: DefinitionInvalidRuntimeRestoreResolver}
+		}
+		return singletonCompile(keyRuntimeRestoreResolver,
+			sessionruntime.WithLifecycleRuntimeRestoreResolver(resolver))(state)
 	}
 }
 

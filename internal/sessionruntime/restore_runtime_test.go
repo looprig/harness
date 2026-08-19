@@ -40,6 +40,36 @@ func restoreRuntimeStarted(key model.ModelKey) event.LoopStarted {
 	}
 }
 
+type currentHarnessDefaultResolver struct {
+	called  bool
+	request RuntimeRestoreRequest
+}
+
+func (r *currentHarnessDefaultResolver) ResolveRuntimeRestore(_ context.Context, request RuntimeRestoreRequest) (loop.Resolved, error) {
+	r.called = true
+	r.request = request
+	return request.Catalog.Resolve(request.AgentName, request.Harness, "", model.EffortNone)
+}
+
+func TestRestoreRuntimeBindingUsesComposerResolverAfterExactMismatch(t *testing.T) {
+	t.Parallel()
+	catalog := restoreRuntimeCatalog(t)
+	started := restoreRuntimeStarted(model.ModelKey{Provider: "provider", Model: "removed-target"})
+	bound := bindCfg(engineCfg(&stubLLM{}, loop.EngineNative, "system"), mustUUID(), started.LoopID)
+	resolver := &currentHarnessDefaultResolver{}
+
+	got, err := restoreRuntimeBindingWithResolver(context.Background(), started, bound, foldLoopInference([]event.Event{started}), catalog, true, false, resolver)
+	if err != nil {
+		t.Fatalf("restoreRuntimeBindingWithResolver: %v", err)
+	}
+	if !resolver.called || resolver.request.Harness != "codex" || resolver.request.AgentName != "worker" {
+		t.Fatalf("resolver request = %+v, called=%v", resolver.request, resolver.called)
+	}
+	if got.Engine() != loop.EngineAdapter || got.RuntimeProfile() != "acp/codex" || got.Model().Name != "luna-target" {
+		t.Fatalf("remapped runtime = engine %v profile %q model %q", got.Engine(), got.RuntimeProfile(), got.Model().Name)
+	}
+}
+
 func TestRestoreRuntimeBindingNativeLegacyUnchanged(t *testing.T) {
 	t.Parallel()
 	bound := bindCfg(engineCfg(&stubLLM{}, loop.EngineNative, "system"), mustUUID(), mustUUID())
