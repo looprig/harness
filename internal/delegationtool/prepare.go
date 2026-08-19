@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -36,11 +38,96 @@ const (
 
 var errPreparationSentinel = errors.New("agent preparation rejected")
 
-type preparationError struct{ category string }
+type preparationError struct {
+	category string
+	detail   string
+}
 
-func (e *preparationError) Error() string      { return errPreparationSentinel.Error() + ": " + e.category }
-func (e *preparationError) Unwrap() error      { return errPreparationSentinel }
-func preparationFailure(category string) error { return &preparationError{category: category} }
+func (e *preparationError) Error() string {
+	detail := e.detail
+	if detail == "" {
+		detail = e.category
+	}
+	return errPreparationSentinel.Error() + ": " + detail
+}
+func (e *preparationError) Unwrap() error { return errPreparationSentinel }
+
+func preparationFailure(category string) error {
+	return &preparationError{category: category}
+}
+
+func missingFieldFailure(name string) error {
+	return &preparationError{category: errCategoryMissingField, detail: "missing field " + strconv.Quote(name)}
+}
+
+func invalidFieldFailure(name string, value any) error {
+	return &preparationError{category: errCategoryInvalidValue, detail: "invalid field " + strconv.Quote(name) + ": " + preparationValue(value)}
+}
+
+func invalidFieldWithoutValueFailure(name string) error {
+	return &preparationError{category: errCategoryInvalidValue, detail: "invalid field " + strconv.Quote(name)}
+}
+
+func forbiddenFieldFailure(name string) error {
+	return &preparationError{category: errCategoryFieldNotAllowed, detail: "field " + strconv.Quote(name) + " is not allowed"}
+}
+
+func unknownFieldFailure(name string) error {
+	return &preparationError{category: errCategoryUnknownField, detail: "unknown field " + strconv.Quote(name)}
+}
+
+func malformedJSONFailure(err error) error {
+	detail := "malformed JSON"
+	if err != nil {
+		detail += ": " + err.Error()
+	}
+	return &preparationError{category: errCategoryMalformed, detail: detail}
+}
+
+func unavailableSelectorFailure(detail string) error {
+	return &preparationError{category: errCategoryUnknownRuntime, detail: detail}
+}
+
+func unavailableAgentTypeFailure(agentType string) error {
+	return unavailableSelectorFailure("agent type " + strconv.Quote(agentType) + " is unavailable")
+}
+
+func unselectableAgentModeFailure(agentType string) error {
+	return &preparationError{
+		category: errCategoryFieldNotAllowed,
+		detail:   "field \"agent_mode\" is not selectable for agent type " + strconv.Quote(agentType),
+	}
+}
+
+func unavailableAgentModeFailure(mode, agentType string) error {
+	return unavailableSelectorFailure("agent mode " + strconv.Quote(mode) + " is unavailable for agent type " + strconv.Quote(agentType))
+}
+
+func unavailableAgentHarnessFailure(harness, agentType string) error {
+	return unavailableSelectorFailure("agent harness " + strconv.Quote(harness) + " is unavailable for agent type " + strconv.Quote(agentType))
+}
+
+func unavailableAgentSourceFailure(source, agentType, harness string) error {
+	return unavailableSelectorFailure("agent source " + strconv.Quote(source) + " is unavailable for agent type " + strconv.Quote(agentType) + " and harness " + strconv.Quote(harness))
+}
+
+func unavailableModelFailure(model, agentType, harness, source string) error {
+	return unavailableSelectorFailure("model " + strconv.Quote(model) + " is unavailable for agent type " + strconv.Quote(agentType) + ", harness " + strconv.Quote(harness) + ", and source " + strconv.Quote(source))
+}
+
+func unavailableEffortFailure(effort, model string) error {
+	return unavailableSelectorFailure("effort " + strconv.Quote(effort) + " is unavailable for model " + strconv.Quote(model))
+}
+
+func preparationValue(value any) string {
+	if value == nil {
+		return "null"
+	}
+	if text, ok := value.(string); ok {
+		return strconv.Quote(text)
+	}
+	return fmt.Sprint(value)
+}
 
 type startAgentWire struct {
 	AgentType       string  `json:"agent_type"`
@@ -139,10 +226,10 @@ func prepareStartAgent(argsJSON string) (PreparedStartAgent, error) {
 		switch *wire.Effort {
 		case "none", "low", "medium", "high", "max":
 		default:
-			return PreparedStartAgent{}, preparationFailure(errCategoryInvalidValue)
+			return PreparedStartAgent{}, invalidFieldFailure("effort", *wire.Effort)
 		}
 	} else if _, supplied := present["effort"]; supplied {
-		return PreparedStartAgent{}, preparationFailure(errCategoryInvalidValue)
+		return PreparedStartAgent{}, invalidFieldFailure("effort", nil)
 	}
 	return PreparedStartAgent{
 		AgentType: wire.AgentType, Name: wire.Name, Instructions: wire.Instructions,
@@ -207,27 +294,30 @@ func decodeStrictAgentJSON(argsJSON string, destination any) (map[string]json.Ra
 		return nil, preparationFailure(errCategoryOversized)
 	}
 	if !utf8.ValidString(argsJSON) {
-		return nil, preparationFailure(errCategoryMalformed)
+		return nil, malformedJSONFailure(errors.New("input is not valid UTF-8"))
 	}
 	raw, err := oneJSONValue([]byte(argsJSON))
 	if err != nil {
-		return nil, preparationFailure(errCategoryMalformed)
+		return nil, malformedJSONFailure(err)
 	}
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return nil, preparationFailure(errCategoryMalformed)
+		return nil, malformedJSONFailure(errors.New("expected JSON object"))
 	}
 	present := make(map[string]json.RawMessage)
 	if err := json.Unmarshal(trimmed, &present); err != nil || present == nil {
-		return nil, preparationFailure(errCategoryMalformed)
+		return nil, malformedJSONFailure(err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(trimmed))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
-		if strings.Contains(err.Error(), "unknown field") {
-			return nil, preparationFailure(errCategoryUnknownField)
+		const unknownFieldPrefix = "json: unknown field "
+		if encodedName, found := strings.CutPrefix(err.Error(), unknownFieldPrefix); found {
+			if name, unquoteErr := strconv.Unquote(encodedName); unquoteErr == nil {
+				return nil, unknownFieldFailure(name)
+			}
 		}
-		return nil, preparationFailure(errCategoryMalformed)
+		return nil, malformedJSONFailure(err)
 	}
 	return present, nil
 }
@@ -253,23 +343,29 @@ func hasField(present map[string]json.RawMessage, name string) bool {
 
 func validateWaitAndTimeout(wait *bool, timeout *int, present map[string]json.RawMessage) error {
 	if wait == nil && hasField(present, "wait_for_response") {
-		return preparationFailure(errCategoryInvalidValue)
+		return invalidFieldFailure("wait_for_response", nil)
 	}
 	if timeout == nil && hasField(present, "timeout_seconds") {
-		return preparationFailure(errCategoryInvalidValue)
+		return invalidFieldFailure("timeout_seconds", nil)
 	}
 	if timeout != nil && (*timeout < 0 || *timeout > maxTimeoutSeconds) {
-		return preparationFailure(errCategoryInvalidValue)
+		return invalidFieldFailure("timeout_seconds", *timeout)
 	}
 	return nil
 }
 
 func requireText(name, value string, present map[string]json.RawMessage, limit int) error {
 	if !hasField(present, name) {
-		return preparationFailure(errCategoryMissingField)
+		return missingFieldFailure(name)
 	}
-	if strings.TrimSpace(value) == "" || len(value) > limit || !utf8.ValidString(value) {
-		return preparationFailure(errCategoryInvalidValue)
+	if strings.TrimSpace(value) == "" {
+		if name == "instructions" || name == "message" {
+			return invalidFieldWithoutValueFailure(name)
+		}
+		return invalidFieldFailure(name, value)
+	}
+	if len(value) > limit || !utf8.ValidString(value) {
+		return invalidFieldWithoutValueFailure(name)
 	}
 	return nil
 }
@@ -278,26 +374,32 @@ func validateOptionalText(name, value string, present map[string]json.RawMessage
 	if !hasField(present, name) {
 		return nil
 	}
-	if strings.TrimSpace(value) == "" || len(value) > limit || !utf8.ValidString(value) {
-		return preparationFailure(errCategoryInvalidValue)
+	if strings.TrimSpace(value) == "" {
+		return invalidFieldFailure(name, value)
+	}
+	if len(value) > limit || !utf8.ValidString(value) {
+		return invalidFieldWithoutValueFailure(name)
 	}
 	return nil
 }
 
 func requireAgentID(value *string, present map[string]json.RawMessage) (uuid.UUID, error) {
 	if !hasField(present, "agent_id") {
-		return uuid.UUID{}, preparationFailure(errCategoryMissingField)
+		return uuid.UUID{}, missingFieldFailure("agent_id")
 	}
 	return parseAgentID(value)
 }
 
 func parseAgentID(value *string) (uuid.UUID, error) {
 	if value == nil || len(*value) > 36 || !utf8.ValidString(*value) {
-		return uuid.UUID{}, preparationFailure(errCategoryInvalidValue)
+		if value == nil {
+			return uuid.UUID{}, invalidFieldFailure("agent_id", nil)
+		}
+		return uuid.UUID{}, invalidFieldFailure("agent_id", *value)
 	}
 	id, err := uuid.Parse(*value)
 	if err != nil || id.IsZero() {
-		return uuid.UUID{}, preparationFailure(errCategoryInvalidValue)
+		return uuid.UUID{}, invalidFieldFailure("agent_id", *value)
 	}
 	return id, nil
 }
@@ -308,7 +410,7 @@ func (s *agentToolConfig) prepareStartAgent(argsJSON string) (PreparedStartAgent
 		return PreparedStartAgent{}, err
 	}
 	if !s.hasAgentType(prepared.AgentType) {
-		return PreparedStartAgent{}, preparationFailure(errCategoryUnknownRuntime)
+		return PreparedStartAgent{}, unavailableAgentTypeFailure(prepared.AgentType)
 	}
 	if err := s.validateAgentMode(prepared); err != nil {
 		return PreparedStartAgent{}, err
@@ -331,57 +433,57 @@ func (s *agentToolConfig) validateAgentMode(prepared PreparedStartAgent) error {
 		}
 		modes := selectableAgentModes(role.Modes)
 		if len(modes) < 2 {
-			return preparationFailure(errCategoryFieldNotAllowed)
+			return unselectableAgentModeFailure(prepared.AgentType)
 		}
 		for _, mode := range modes {
 			if mode == prepared.AgentMode {
 				return nil
 			}
 		}
-		return preparationFailure(errCategoryInvalidValue)
+		return unavailableAgentModeFailure(prepared.AgentMode, prepared.AgentType)
 	}
-	return preparationFailure(errCategoryUnknownRuntime)
+	return unavailableAgentTypeFailure(prepared.AgentType)
 }
 
 func (s *agentToolConfig) resolveDelegateRuntime(prepared PreparedStartAgent) (*tool.DelegateRuntime, error) {
 	if !s.hasRuntimeCatalog {
-		if prepared.agentHarnessSet || prepared.agentSourceSet || prepared.modelSet || prepared.effortSet {
-			return nil, preparationFailure(errCategoryFieldNotAllowed)
+		if field := firstExplicitRuntimeField(prepared); field != "" {
+			return nil, forbiddenFieldFailure(field)
 		}
 		return nil, nil
 	}
 	entries := s.runtimeCatalog.EntriesFor(identity.AgentName(prepared.AgentType))
 	if len(entries) == 0 {
 		if !s.runtimeCatalog.HasEntries() {
-			if prepared.agentHarnessSet || prepared.agentSourceSet || prepared.modelSet || prepared.effortSet {
-				return nil, preparationFailure(errCategoryFieldNotAllowed)
+			if field := firstExplicitRuntimeField(prepared); field != "" {
+				return nil, forbiddenFieldFailure(field)
 			}
 			return nil, nil
 		}
-		return nil, preparationFailure(errCategoryUnknownRuntime)
+		return nil, unavailableAgentTypeFailure(prepared.AgentType)
 	}
 	selected := runtimeDefaultEntry(entries)
 	selectedHarness := selected.AgentHarness
 	if prepared.agentHarnessSet {
 		if !runtimeHarnessSelectable(entries) {
-			return nil, preparationFailure(errCategoryFieldNotAllowed)
+			return nil, forbiddenFieldFailure("agent_harness")
 		}
 		selectedHarness = loop.AgentHarnessName(prepared.AgentHarness)
 		harnessEntries := runtimeEntriesForHarness(entries, selectedHarness)
 		if len(harnessEntries) == 0 {
-			return nil, preparationFailure(errCategoryUnknownRuntime)
+			return nil, unavailableAgentHarnessFailure(prepared.AgentHarness, prepared.AgentType)
 		}
 		selected = runtimeDefaultEntry(harnessEntries)
 	}
 	harnessEntries := runtimeEntriesForHarness(entries, selectedHarness)
 	if prepared.agentSourceSet {
 		if !runtimeSourceSelectableForEntries(harnessEntries) {
-			return nil, preparationFailure(errCategoryFieldNotAllowed)
+			return nil, forbiddenFieldFailure("agent_source")
 		}
 		var found bool
 		selected, found = runtimeEntryForSource(harnessEntries, loop.RuntimeSourceName(prepared.AgentSource))
 		if !found {
-			return nil, preparationFailure(errCategoryUnknownRuntime)
+			return nil, unavailableAgentSourceFailure(prepared.AgentSource, prepared.AgentType, string(selectedHarness))
 		}
 	}
 	if !prepared.agentSourceSet && runtimeSourceSelectableForEntries(harnessEntries) {
@@ -391,11 +493,11 @@ func (s *agentToolConfig) resolveDelegateRuntime(prepared PreparedStartAgent) (*
 	}
 	advertised := runtimeAdvertisedSelectors(entries, selected)
 	if prepared.agentSourceSet && !advertised.Source {
-		return nil, preparationFailure(errCategoryFieldNotAllowed)
+		return nil, forbiddenFieldFailure("agent_source")
 	}
 	if prepared.modelSet {
 		if !advertised.Model {
-			return nil, preparationFailure(errCategoryFieldNotAllowed)
+			return nil, forbiddenFieldFailure("model")
 		}
 		found := false
 		for _, option := range selected.Models {
@@ -405,15 +507,24 @@ func (s *agentToolConfig) resolveDelegateRuntime(prepared PreparedStartAgent) (*
 			}
 		}
 		if !found {
-			return nil, preparationFailure(errCategoryUnknownRuntime)
+			return nil, unavailableModelFailure(prepared.Model, prepared.AgentType, string(selectedHarness), string(selected.Source))
 		}
 	}
 	var effort inferencemodel.Effort
 	if prepared.effortSet {
 		if !advertised.Effort {
-			return nil, preparationFailure(errCategoryFieldNotAllowed)
+			return nil, forbiddenFieldFailure("effort")
 		}
 		effort = parseDelegateEffort(*prepared.Effort)
+		modelAlias := selected.DefaultModel
+		if prepared.modelSet {
+			modelAlias = loop.ModelAlias(prepared.Model)
+		}
+		for _, option := range selected.Models {
+			if option.Alias == modelAlias && !runtimeOptionAllowsEffort(option, effort) {
+				return nil, unavailableEffortFailure(*prepared.Effort, string(modelAlias))
+			}
+		}
 	}
 	selectedSource := loop.RuntimeSourceName("")
 	if prepared.agentSourceSet {
@@ -421,7 +532,7 @@ func (s *agentToolConfig) resolveDelegateRuntime(prepared PreparedStartAgent) (*
 	}
 	resolved, err := s.runtimeCatalog.ResolveWithExplicitSource(identity.AgentName(prepared.AgentType), selectedHarness, selectedSource, loop.ModelAlias(prepared.Model), effort, prepared.effortSet)
 	if err != nil {
-		return nil, preparationFailure(errCategoryUnknownRuntime)
+		return nil, unavailableSelectorFailure(err.Error())
 	}
 	runtimeModel := string(resolved.ModelAlias)
 	runtimeEffort := delegateEffortString(resolved.Effort)
@@ -433,6 +544,30 @@ func (s *agentToolConfig) resolveDelegateRuntime(prepared PreparedStartAgent) (*
 		Model: runtimeModel, SmallModel: string(resolved.SmallModel), Effort: runtimeEffort,
 		Explicit: tool.DelegateRuntimeExplicit{Harness: prepared.agentHarnessSet, Source: prepared.agentSourceSet, Model: prepared.modelSet, Effort: prepared.effortSet},
 	}, nil
+}
+
+func firstExplicitRuntimeField(prepared PreparedStartAgent) string {
+	switch {
+	case prepared.agentHarnessSet:
+		return "agent_harness"
+	case prepared.agentSourceSet:
+		return "agent_source"
+	case prepared.modelSet:
+		return "model"
+	case prepared.effortSet:
+		return "effort"
+	default:
+		return ""
+	}
+}
+
+func runtimeOptionAllowsEffort(option loop.RuntimeModelOption, effort inferencemodel.Effort) bool {
+	for _, available := range option.Efforts {
+		if available == effort {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *agentToolConfig) hasAgentType(agent string) bool {

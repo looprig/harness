@@ -3,6 +3,7 @@ package delegationtool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -55,7 +56,7 @@ func TestPrepareStartAgentRuntimeDefaultsAndExplicitTuple(t *testing.T) {
 	})
 }
 
-func TestPrepareStartAgentRuntimeSelectorErrorsAreBounded(t *testing.T) {
+func TestPrepareStartAgentRuntimeSelectorErrorsRetainCategories(t *testing.T) {
 	t.Parallel()
 	catalog := testPreparationCatalog(t)
 	tests := []struct {
@@ -73,11 +74,92 @@ func TestPrepareStartAgentRuntimeSelectorErrorsAreBounded(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog(), catalog)
 			_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), tt.args)
-			if err == nil || !strings.Contains(err.Error(), tt.category) {
-				t.Fatalf("PrepareCall() error = %v, want category %q", err, tt.category)
+			assertPrepareCategory(t, err, tt.category)
+		})
+	}
+}
+
+func TestPrepareStartAgentRuntimeSelectorErrorsAreActionable(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		catalog loop.RuntimeCatalog
+		args    string
+		want    string
+	}{
+		{
+			name: "unavailable agent type", catalog: testPreparationCatalog(t),
+			args: `{"agent_type":"missing","instructions":"p"}`,
+			want: `agent preparation rejected: agent type "missing" is unavailable`,
+		},
+		{
+			name: "unavailable harness", catalog: testPreparationCatalog(t),
+			args: `{"agent_type":"worker","instructions":"p","agent_harness":"missing"}`,
+			want: `agent preparation rejected: agent harness "missing" is unavailable for agent type "worker"`,
+		},
+		{
+			name: "unavailable source", catalog: mixedSourcePreparationCatalog(t),
+			args: `{"agent_type":"worker","instructions":"p","agent_source":"missing"}`,
+			want: `agent preparation rejected: agent source "missing" is unavailable for agent type "worker" and harness "codex"`,
+		},
+		{
+			name: "unavailable model", catalog: testPreparationCatalog(t),
+			args: `{"agent_type":"worker","instructions":"p","agent_harness":"codex","model":"missing"}`,
+			want: `agent preparation rejected: model "missing" is unavailable for agent type "worker", harness "codex", and source "gateway"`,
+		},
+		{
+			name: "incompatible effort", catalog: testPreparationCatalog(t),
+			args: `{"agent_type":"worker","instructions":"p","agent_harness":"claude-code","model":"sonnet","effort":"low"}`,
+			want: `agent preparation rejected: effort "low" is unavailable for model "sonnet"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog(), tt.catalog)
+			_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), tt.args)
+			if err == nil {
+				t.Fatal("PrepareCall() error = nil, want rejection")
 			}
-			if strings.Contains(err.Error(), "missing") || strings.Contains(err.Error(), `"low"`) {
-				t.Fatalf("error echoed selector: %v", err)
+			if got := err.Error(); got != tt.want {
+				t.Fatalf("PrepareCall() error = %q, want %q", got, tt.want)
+			}
+			if !errors.Is(err, errPreparationSentinel) {
+				t.Fatalf("errors.Is(%v, errPreparationSentinel) = false", err)
+			}
+		})
+	}
+}
+
+func TestPrepareStartAgentModeErrorsAreActionable(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		catalog []AgentCatalogEntry
+		mode    string
+		want    string
+	}{
+		{
+			name: "mode is not selectable", catalog: []AgentCatalogEntry{{Name: "worker", Modes: []loop.ModeName{"review"}}}, mode: "review",
+			want: `agent preparation rejected: field "agent_mode" is not selectable for agent type "worker"`,
+		},
+		{
+			name: "mode is unavailable", catalog: []AgentCatalogEntry{{Name: "worker", Modes: []loop.ModeName{"review", "build"}}}, mode: "ghost",
+			want: `agent preparation rejected: agent mode "ghost" is unavailable for agent type "worker"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, tt.catalog, emptyRuntimeCatalog(t))
+			args := `{"agent_type":"worker","instructions":"p","agent_mode":"` + tt.mode + `"}`
+			_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), args)
+			if err == nil {
+				t.Fatal("PrepareCall() error = nil, want rejection")
+			}
+			if got := err.Error(); got != tt.want {
+				t.Fatalf("PrepareCall() error = %q, want %q", got, tt.want)
+			}
+			if !errors.Is(err, errPreparationSentinel) {
+				t.Fatalf("errors.Is(%v, errPreparationSentinel) = false", err)
 			}
 		})
 	}
@@ -97,9 +179,7 @@ func TestPrepareStartAgentRuntimeIsParentScopedAndOptional(t *testing.T) {
 	t.Run("other parent cannot grant codex", func(t *testing.T) {
 		toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog(), claudeCatalog)
 		_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"agent_type":"worker","instructions":"p","agent_harness":"codex"}`)
-		if err == nil || !strings.Contains(err.Error(), errCategoryFieldNotAllowed) {
-			t.Fatalf("PrepareCall() error = %v, want %s", err, errCategoryFieldNotAllowed)
-		}
+		assertPrepareCategory(t, err, errCategoryFieldNotAllowed)
 	})
 
 	t.Run("no runtime choices leave runtime nil", func(t *testing.T) {
@@ -116,9 +196,7 @@ func TestPrepareStartAgentRuntimeIsParentScopedAndOptional(t *testing.T) {
 	t.Run("explicit harness with no choices is not allowed", func(t *testing.T) {
 		toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, agentCatalog(), noChoice)
 		_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"agent_type":"worker","instructions":"p","agent_harness":"claude-code"}`)
-		if err == nil || !strings.Contains(err.Error(), errCategoryFieldNotAllowed) {
-			t.Fatalf("PrepareCall() error = %v, want %s", err, errCategoryFieldNotAllowed)
-		}
+		assertPrepareCategory(t, err, errCategoryFieldNotAllowed)
 	})
 
 	t.Run("unrelated role entries make the missing role unavailable", func(t *testing.T) {
@@ -130,13 +208,9 @@ func TestPrepareStartAgentRuntimeIsParentScopedAndOptional(t *testing.T) {
 		}
 		toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker"}}, unrelated)
 		_, _, err = toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"agent_type":"worker","instructions":"p"}`)
-		if err == nil || !strings.Contains(err.Error(), errCategoryUnknownRuntime) {
-			t.Fatalf("PrepareCall() omitted selectors error = %v, want %s", err, errCategoryUnknownRuntime)
-		}
+		assertPrepareCategory(t, err, errCategoryUnknownRuntime)
 		_, _, err = toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"agent_type":"worker","instructions":"p","agent_harness":"claude-code"}`)
-		if err == nil || !strings.Contains(err.Error(), errCategoryUnknownRuntime) {
-			t.Fatalf("PrepareCall() explicit selector error = %v, want %s", err, errCategoryUnknownRuntime)
-		}
+		assertPrepareCategory(t, err, errCategoryUnknownRuntime)
 	})
 }
 
@@ -145,9 +219,7 @@ func TestPrepareStartAgentRuntimeAllowsModelEffortAndRejectsUnselectableHarness(
 	catalog := singleChoicePreparationCatalog(t)
 	toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker"}}, catalog)
 	_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"agent_type":"worker","instructions":"p","agent_harness":"claude-code"}`)
-	if err == nil || !strings.Contains(err.Error(), errCategoryFieldNotAllowed) {
-		t.Fatalf("single harness error = %v, want %s", err, errCategoryFieldNotAllowed)
-	}
+	assertPrepareCategory(t, err, errCategoryFieldNotAllowed)
 	_, prepared, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"agent_type":"worker","instructions":"p","model":"sonnet","effort":"medium"}`)
 	if err != nil {
 		t.Fatalf("single model/effort selection error = %v", err)
@@ -194,9 +266,7 @@ func TestPrepareStartAgentRuntimeResolvesHarnessManagedNativeWithoutSelectors(t 
 		`{"agent_type":"worker","instructions":"p","effort":"high"}`,
 	} {
 		_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), args)
-		if err == nil || !strings.Contains(err.Error(), errCategoryFieldNotAllowed) {
-			t.Errorf("PrepareCall(%s) error = %v, want %s", args, err, errCategoryFieldNotAllowed)
-		}
+		assertPrepareCategory(t, err, errCategoryFieldNotAllowed)
 	}
 
 	info, err := toolInstance.Info(context.Background())
@@ -285,9 +355,7 @@ func TestPrepareStartAgentRuntimeResolvesMixedSourcesWithAgentSourceSelector(t *
 		`{"agent_type":"worker","instructions":"p","agent_source":"unknown"}`,
 	} {
 		_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), args)
-		if err == nil || !strings.Contains(err.Error(), errCategoryFieldNotAllowed) && !strings.Contains(err.Error(), errCategoryUnknownRuntime) {
-			t.Errorf("PrepareCall(%s) error = %v, want bounded source/model/effort rejection", args, err)
-		}
+		assertPrepareCategoryOneOf(t, err, errCategoryFieldNotAllowed, errCategoryUnknownRuntime)
 	}
 }
 
@@ -338,9 +406,24 @@ func TestPrepareStartAgentRuntimeResolvesPerModelSourcesWithinOneEntry(t *testin
 	}
 
 	_, _, err = toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"agent_type":"worker","instructions":"p","agent_source":"native","model":"gateway"}`)
-	if err == nil || !strings.Contains(err.Error(), errCategoryFieldNotAllowed) && !strings.Contains(err.Error(), errCategoryUnknownRuntime) {
-		t.Fatalf("model from another effective source error = %v, want bounded rejection", err)
+	assertPrepareCategoryOneOf(t, err, errCategoryFieldNotAllowed, errCategoryUnknownRuntime)
+}
+
+func assertPrepareCategoryOneOf(t *testing.T, err error, wants ...string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("prepare error = nil, want one of %v", wants)
 	}
+	var preparationErr *preparationError
+	if !errors.As(err, &preparationErr) {
+		t.Fatalf("error = %q, want *preparationError", err)
+	}
+	for _, want := range wants {
+		if preparationErr.category == want {
+			return
+		}
+	}
+	t.Fatalf("error = %q, category = %q, want one of %v", err, preparationErr.category, wants)
 }
 
 func TestPrepareStartAgentRuntimeDefaultsSourceWithinExplicitHarness(t *testing.T) {

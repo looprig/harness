@@ -1,6 +1,7 @@
 package delegationtool
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -117,6 +118,37 @@ func TestPrepareAgentRequiredFields(t *testing.T) {
 	}
 }
 
+func TestPrepareAgentErrorsIdentifyFieldsAndValues(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		prepare func(string) error
+		args    string
+		want    string
+	}{
+		{name: "missing agent type", prepare: startPreparationError, args: `{"instructions":"p"}`, want: `agent preparation rejected: missing field "agent_type"`},
+		{name: "invalid agent type", prepare: startPreparationError, args: `{"agent_type":"","instructions":"p"}`, want: `agent preparation rejected: invalid field "agent_type": ""`},
+		{name: "invalid instructions do not echo value", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":" \n "}`, want: `agent preparation rejected: invalid field "instructions"`},
+		{name: "invalid timeout", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":"p","timeout_seconds":-1}`, want: `agent preparation rejected: invalid field "timeout_seconds": -1`},
+		{name: "invalid effort", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":"p","effort":"ultra"}`, want: `agent preparation rejected: invalid field "effort": "ultra"`},
+		{name: "unknown field", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":"p","bogus":true}`, want: `agent preparation rejected: unknown field "bogus"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.prepare(tt.args)
+			if err == nil {
+				t.Fatal("prepare error = nil, want rejection")
+			}
+			if got := err.Error(); got != tt.want {
+				t.Fatalf("prepare error = %q, want %q", got, tt.want)
+			}
+			if !errors.Is(err, errPreparationSentinel) {
+				t.Fatalf("errors.Is(%v, errPreparationSentinel) = false", err)
+			}
+		})
+	}
+}
+
 func TestPrepareAgentLimitsUTF8AndJSONDiscipline(t *testing.T) {
 	t.Parallel()
 	invalidUTF8 := string([]byte{0xff})
@@ -161,8 +193,8 @@ func TestPrepareAgentErrorsDoNotEchoInput(t *testing.T) {
 	if err == nil {
 		t.Fatal("prepare error = nil, want rejection")
 	}
-	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "xhigh") {
-		t.Fatalf("error = %q, contains user input", err)
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("error = %q, contains instructions", err)
 	}
 }
 
@@ -176,10 +208,14 @@ func assertPrepareCategory(t *testing.T, err error, want string) {
 	if err == nil {
 		t.Fatalf("prepare error = nil, want category %q", want)
 	}
-	if !strings.Contains(err.Error(), want) {
-		t.Fatalf("error = %q, want category %q", err, want)
+	var preparationErr *preparationError
+	if !errors.As(err, &preparationErr) {
+		t.Fatalf("error = %q, want *preparationError", err)
 	}
-	if len(err.Error()) > 96 {
+	if preparationErr.category != want {
+		t.Fatalf("error = %q, category = %q, want %q", err, preparationErr.category, want)
+	}
+	if len(err.Error()) > 512 {
 		t.Fatalf("error length = %d, want bounded", len(err.Error()))
 	}
 }
