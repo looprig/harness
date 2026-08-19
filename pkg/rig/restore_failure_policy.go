@@ -1,5 +1,14 @@
 package rig
 
+import (
+	"context"
+
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/session"
+)
+
+const restoreFailurePolicyAdoptionMessage = "adopted configuration allowed by Rig restore failure policy"
+
 // RestoreFailureOption is one declarative exception to Harness's fail-closed
 // restore policy. Implementations are sealed so every option retains bounded,
 // versioned semantics owned by Harness.
@@ -48,6 +57,74 @@ func compileRestoreFailurePolicy(options ...RestoreFailureOption) restoreFailure
 }
 
 func (p restoreFailurePolicy) allowanceCount() int { return len(p.allow) }
+
+func (p restoreFailurePolicy) has(allowance restoreAllowance) bool {
+	_, ok := p.allow[allowance]
+	return ok
+}
+
+func (p restoreFailurePolicy) DecideRestore(_ context.Context, assessment event.DriftAssessment) (session.RestoreDecision, error) {
+	for _, change := range assessment.Changes {
+		if change.Severity == event.DriftWarn && !p.allowsChange(change) {
+			return session.RestoreDecision{Source: event.DecisionSourcePolicy}, nil
+		}
+	}
+	return session.RestoreDecision{
+		Accept:  true,
+		Source:  event.DecisionSourcePolicy,
+		Message: restoreFailurePolicyAdoptionMessage,
+	}, nil
+}
+
+func (p restoreFailurePolicy) allowsChange(change event.DriftChange) bool {
+	switch change.Category {
+	case event.DriftModel:
+		return p.has(restoreAllowModel)
+	case event.DriftExternal:
+		return p.has(restoreAllowExternalCapability)
+	case event.DriftConfinement:
+		return p.has(restoreAllowConfinement)
+	case event.DriftPermission:
+		if p.has(restoreAllowPermission) {
+			return true
+		}
+		switch change.Field {
+		case "posture":
+			return p.has(restoreAllowPermissionPosture)
+		case "review_configured", "review_policy_rev":
+			return p.has(restoreAllowPermissionReview)
+		default:
+			return false
+		}
+	case event.DriftWorkspace:
+		return p.has(restoreAllowWorkspace)
+	case event.DriftTrust:
+		return p.has(restoreAllowTrust)
+	case event.DriftAgentKind:
+		return p.has(restoreAllowAgentKind)
+	case event.DriftAgentName:
+		return p.has(restoreAllowAgentName)
+	case event.DriftAdapter:
+		return p.has(restoreAllowAdapter)
+	case event.DriftRuntimeSkills:
+		return p.has(restoreAllowRuntimeSkills)
+	case event.DriftHookPolicy:
+		return p.has(restoreAllowHookPolicy)
+	case event.DriftRuntime:
+		switch change.Field {
+		case "profile":
+			return p.has(restoreAllowRuntimeProfile)
+		case "catalog_rev":
+			return p.has(restoreAllowRuntimeCatalog)
+		case "identity_rev":
+			return p.has(restoreAllowRuntimeProfile) || p.has(restoreAllowModel) || p.has(restoreAllowCredential) || p.has(restoreAllowEffort)
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
 
 func allowRestoreDrift(allowance restoreAllowance) RestoreFailureOption {
 	return restoreFailureOptionFunc(func(policy *restoreFailurePolicy) {
