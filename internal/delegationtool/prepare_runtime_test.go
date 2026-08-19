@@ -82,35 +82,36 @@ func TestPrepareStartAgentRuntimeSelectorErrorsRetainCategories(t *testing.T) {
 func TestPrepareStartAgentRuntimeSelectorErrorsAreActionable(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name    string
-		catalog loop.RuntimeCatalog
-		args    string
-		want    string
+		name     string
+		catalog  loop.RuntimeCatalog
+		args     string
+		want     string
+		category string
 	}{
 		{
 			name: "unavailable agent type", catalog: testPreparationCatalog(t),
 			args: `{"agent_type":"missing","instructions":"p"}`,
-			want: `agent preparation rejected: agent type "missing" is unavailable`,
+			want: `agent preparation rejected: agent type "missing" is unavailable`, category: errCategoryUnknownRuntime,
 		},
 		{
 			name: "unavailable harness", catalog: testPreparationCatalog(t),
 			args: `{"agent_type":"worker","instructions":"p","agent_harness":"missing"}`,
-			want: `agent preparation rejected: agent harness "missing" is unavailable for agent type "worker"`,
+			want: `agent preparation rejected: agent harness "missing" is unavailable for agent type "worker"`, category: errCategoryUnknownRuntime,
 		},
 		{
 			name: "unavailable source", catalog: mixedSourcePreparationCatalog(t),
 			args: `{"agent_type":"worker","instructions":"p","agent_source":"missing"}`,
-			want: `agent preparation rejected: agent source "missing" is unavailable for agent type "worker" and harness "codex"`,
+			want: `agent preparation rejected: agent source "missing" is unavailable for agent type "worker" and harness "codex"`, category: errCategoryUnknownRuntime,
 		},
 		{
 			name: "unavailable model", catalog: testPreparationCatalog(t),
 			args: `{"agent_type":"worker","instructions":"p","agent_harness":"codex","model":"missing"}`,
-			want: `agent preparation rejected: model "missing" is unavailable for agent type "worker", harness "codex", and source "gateway"`,
+			want: `agent preparation rejected: model "missing" is unavailable for agent type "worker", harness "codex", and source "gateway"`, category: errCategoryUnknownRuntime,
 		},
 		{
 			name: "incompatible effort", catalog: unavailableEffortPreparationCatalog(t),
 			args: `{"agent_type":"worker","instructions":"p","agent_harness":"codex","model":"luna","effort":"high"}`,
-			want: `agent preparation rejected: effort "high" is unavailable for model "luna"`,
+			want: `agent preparation rejected: effort "high" is unavailable for model "luna"`, category: errCategoryUnknownRuntime,
 		},
 	}
 	for _, tt := range tests {
@@ -126,6 +127,7 @@ func TestPrepareStartAgentRuntimeSelectorErrorsAreActionable(t *testing.T) {
 			if !errors.Is(err, errPreparationSentinel) {
 				t.Fatalf("errors.Is(%v, errPreparationSentinel) = false", err)
 			}
+			assertPrepareCategory(t, err, tt.category)
 		})
 	}
 }
@@ -133,18 +135,19 @@ func TestPrepareStartAgentRuntimeSelectorErrorsAreActionable(t *testing.T) {
 func TestPrepareStartAgentModeErrorsAreActionable(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name    string
-		catalog []AgentCatalogEntry
-		mode    string
-		want    string
+		name     string
+		catalog  []AgentCatalogEntry
+		mode     string
+		want     string
+		category string
 	}{
 		{
 			name: "mode is not selectable", catalog: []AgentCatalogEntry{{Name: "worker", Modes: []loop.ModeName{"review"}}}, mode: "review",
-			want: `agent preparation rejected: field "agent_mode" is not selectable for agent type "worker"`,
+			want: `agent preparation rejected: field "agent_mode" is not selectable for agent type "worker"`, category: errCategoryFieldNotAllowed,
 		},
 		{
 			name: "mode is unavailable", catalog: []AgentCatalogEntry{{Name: "worker", Modes: []loop.ModeName{"review", "build"}}}, mode: "ghost",
-			want: `agent preparation rejected: agent mode "ghost" is unavailable for agent type "worker"`,
+			want: `agent preparation rejected: agent mode "ghost" is unavailable for agent type "worker"`, category: errCategoryInvalidValue,
 		},
 	}
 	for _, tt := range tests {
@@ -161,6 +164,7 @@ func TestPrepareStartAgentModeErrorsAreActionable(t *testing.T) {
 			if !errors.Is(err, errPreparationSentinel) {
 				t.Fatalf("errors.Is(%v, errPreparationSentinel) = false", err)
 			}
+			assertPrepareCategory(t, err, tt.category)
 		})
 	}
 }

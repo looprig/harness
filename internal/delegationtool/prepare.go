@@ -18,12 +18,13 @@ import (
 )
 
 const (
-	maxAgentArgsBytes    = 256 << 10
-	maxAgentNameBytes    = 256
-	maxAgentMessageBytes = 192 << 10
-	maxAgentTypeBytes    = 128
-	maxAgentModeBytes    = 128
-	maxTimeoutSeconds    = 24 * 60 * 60
+	maxAgentArgsBytes        = 256 << 10
+	maxAgentNameBytes        = 256
+	maxAgentMessageBytes     = 192 << 10
+	maxAgentTypeBytes        = 128
+	maxAgentModeBytes        = 128
+	maxTimeoutSeconds        = 24 * 60 * 60
+	maxPreparationErrorBytes = 512
 )
 
 const (
@@ -48,7 +49,8 @@ func (e *preparationError) Error() string {
 	if detail == "" {
 		detail = e.category
 	}
-	return errPreparationSentinel.Error() + ": " + detail
+	prefix := errPreparationSentinel.Error() + ": "
+	return prefix + boundPreparationDiagnostic(detail, maxPreparationErrorBytes-len(prefix))
 }
 func (e *preparationError) Unwrap() error { return errPreparationSentinel }
 
@@ -100,7 +102,10 @@ func unselectableAgentModeFailure(agentType string) error {
 }
 
 func unavailableAgentModeFailure(mode, agentType string) error {
-	return unavailableSelectorFailure("agent mode " + strconv.Quote(mode) + " is unavailable for agent type " + strconv.Quote(agentType))
+	return &preparationError{
+		category: errCategoryInvalidValue,
+		detail:   "agent mode " + strconv.Quote(mode) + " is unavailable for agent type " + strconv.Quote(agentType),
+	}
 }
 
 func unavailableAgentHarnessFailure(harness, agentType string) error {
@@ -127,6 +132,26 @@ func preparationValue(value any) string {
 		return strconv.Quote(text)
 	}
 	return fmt.Sprint(value)
+}
+
+func boundPreparationDiagnostic(text string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	text = strings.ToValidUTF8(text, "\uFFFD")
+	if len(text) <= maxBytes {
+		return text
+	}
+	const marker = "..."
+	limit := maxBytes - len(marker)
+	if limit <= 0 {
+		return marker[:maxBytes]
+	}
+	text = text[:limit]
+	for !utf8.ValidString(text) {
+		text = text[:len(text)-1]
+	}
+	return text + marker
 }
 
 type startAgentWire struct {

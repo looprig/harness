@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/looprig/core/uuid"
 )
@@ -121,17 +122,18 @@ func TestPrepareAgentRequiredFields(t *testing.T) {
 func TestPrepareAgentErrorsIdentifyFieldsAndValues(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name    string
-		prepare func(string) error
-		args    string
-		want    string
+		name     string
+		prepare  func(string) error
+		args     string
+		want     string
+		category string
 	}{
-		{name: "missing agent type", prepare: startPreparationError, args: `{"instructions":"p"}`, want: `agent preparation rejected: missing field "agent_type"`},
-		{name: "invalid agent type", prepare: startPreparationError, args: `{"agent_type":"","instructions":"p"}`, want: `agent preparation rejected: invalid field "agent_type": ""`},
-		{name: "invalid instructions do not echo value", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":" \n "}`, want: `agent preparation rejected: invalid field "instructions"`},
-		{name: "invalid timeout", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":"p","timeout_seconds":-1}`, want: `agent preparation rejected: invalid field "timeout_seconds": -1`},
-		{name: "invalid effort", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":"p","effort":"ultra"}`, want: `agent preparation rejected: invalid field "effort": "ultra"`},
-		{name: "unknown field", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":"p","bogus":true}`, want: `agent preparation rejected: unknown field "bogus"`},
+		{name: "missing agent type", prepare: startPreparationError, args: `{"instructions":"p"}`, want: `agent preparation rejected: missing field "agent_type"`, category: errCategoryMissingField},
+		{name: "invalid agent type", prepare: startPreparationError, args: `{"agent_type":"","instructions":"p"}`, want: `agent preparation rejected: invalid field "agent_type": ""`, category: errCategoryInvalidValue},
+		{name: "invalid instructions do not echo value", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":" \n "}`, want: `agent preparation rejected: invalid field "instructions"`, category: errCategoryInvalidValue},
+		{name: "invalid timeout", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":"p","timeout_seconds":-1}`, want: `agent preparation rejected: invalid field "timeout_seconds": -1`, category: errCategoryInvalidValue},
+		{name: "invalid effort", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":"p","effort":"ultra"}`, want: `agent preparation rejected: invalid field "effort": "ultra"`, category: errCategoryInvalidValue},
+		{name: "unknown field", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":"p","bogus":true}`, want: `agent preparation rejected: unknown field "bogus"`, category: errCategoryUnknownField},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -145,6 +147,7 @@ func TestPrepareAgentErrorsIdentifyFieldsAndValues(t *testing.T) {
 			if !errors.Is(err, errPreparationSentinel) {
 				t.Fatalf("errors.Is(%v, errPreparationSentinel) = false", err)
 			}
+			assertPrepareCategory(t, err, tt.category)
 		})
 	}
 }
@@ -188,13 +191,78 @@ func TestPrepareAgentLimitsUTF8AndJSONDiscipline(t *testing.T) {
 }
 
 func TestPrepareAgentErrorsDoNotEchoInput(t *testing.T) {
-	secret := "do-not-echo-this-message"
-	err := startPreparationError(`{"agent_type":"worker","instructions":"` + secret + `","effort":"xhigh"}`)
-	if err == nil {
-		t.Fatal("prepare error = nil, want rejection")
+	tests := []struct {
+		name    string
+		prepare func(string) error
+		args    string
+		secret  string
+	}{
+		{
+			name: "unrelated valid instructions", prepare: startPreparationError,
+			args: `{"agent_type":"worker","instructions":"do-not-echo-this-message","effort":"xhigh"}`, secret: "do-not-echo-this-message",
+		},
+		{
+			name: "invalid instructions", prepare: startPreparationError,
+			args: `{"agent_type":"worker","instructions":"` + strings.Repeat("instruction-secret", maxAgentMessageBytes/len("instruction-secret")+1) + `"}`, secret: "instruction-secret",
+		},
+		{
+			name: "invalid message", prepare: messagePreparationError,
+			args: `{"agent_id":"` + validAgentID + `","message":"` + strings.Repeat("message-secret", maxAgentMessageBytes/len("message-secret")+1) + `"}`, secret: "message-secret",
+		},
 	}
-	if strings.Contains(err.Error(), secret) {
-		t.Fatalf("error = %q, contains instructions", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.prepare(tt.args)
+			if err == nil {
+				t.Fatal("prepare error = nil, want rejection")
+			}
+			if strings.Contains(err.Error(), tt.secret) {
+				t.Fatalf("error contains instructions/message content")
+			}
+		})
+	}
+}
+
+func TestPreparationErrorsBoundDiagnostics(t *testing.T) {
+	t.Parallel()
+	large := strings.Repeat("x", maxAgentArgsBytes-128)
+	tests := []struct {
+		name     string
+		prepare  func(string) error
+		args     string
+		category string
+	}{
+		{
+			name: "effort", prepare: startPreparationError,
+			args: `{"agent_type":"worker","instructions":"p","effort":"` + large + `"}`, category: errCategoryInvalidValue,
+		},
+		{
+			name: "agent id", prepare: stopPreparationError,
+			args: `{"agent_id":"` + large + `"}`, category: errCategoryInvalidValue,
+		},
+		{
+			name: "unknown field", prepare: startPreparationError,
+			args: `{"agent_type":"worker","instructions":"p","` + large + `":true}`, category: errCategoryUnknownField,
+		},
+		{
+			name: "malformed numeric field", prepare: startPreparationError,
+			args: `{"agent_type":"worker","instructions":"p","timeout_seconds":` + strings.Repeat("9", maxAgentArgsBytes-128) + `}`, category: errCategoryMalformed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.prepare(tt.args)
+			if err == nil {
+				t.Fatal("prepare error = nil, want rejection")
+			}
+			if got := len(err.Error()); got != maxPreparationErrorBytes {
+				t.Fatalf("error length = %d, want %d", got, maxPreparationErrorBytes)
+			}
+			if !strings.HasSuffix(err.Error(), "...") || !utf8.ValidString(err.Error()) {
+				t.Fatalf("bounded error suffix/UTF-8 invalid")
+			}
+			assertPrepareCategory(t, err, tt.category)
+		})
 	}
 }
 
@@ -208,6 +276,9 @@ func assertPrepareCategory(t *testing.T, err error, want string) {
 	if err == nil {
 		t.Fatalf("prepare error = nil, want category %q", want)
 	}
+	if !errors.Is(err, errPreparationSentinel) {
+		t.Fatalf("errors.Is(%v, errPreparationSentinel) = false", err)
+	}
 	var preparationErr *preparationError
 	if !errors.As(err, &preparationErr) {
 		t.Fatalf("error = %q, want *preparationError", err)
@@ -215,7 +286,7 @@ func assertPrepareCategory(t *testing.T, err error, want string) {
 	if preparationErr.category != want {
 		t.Fatalf("error = %q, category = %q, want %q", err, preparationErr.category, want)
 	}
-	if len(err.Error()) > 512 {
+	if len(err.Error()) > maxPreparationErrorBytes {
 		t.Fatalf("error length = %d, want bounded", len(err.Error()))
 	}
 }
