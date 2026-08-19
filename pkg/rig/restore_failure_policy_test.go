@@ -2,6 +2,7 @@ package rig
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/looprig/harness/pkg/event"
@@ -176,4 +177,79 @@ func restoreFailurePolicyCatalog(t *testing.T) loop.RuntimeCatalog {
 		t.Fatal(err)
 	}
 	return catalog
+}
+
+type restorePolicyTestDecider struct{}
+
+func (restorePolicyTestDecider) DecideRestore(context.Context, event.DriftAssessment) (session.RestoreDecision, error) {
+	return session.RestoreDecision{}, nil
+}
+
+type restorePolicyTestResolver struct{}
+
+func (restorePolicyTestResolver) ResolveRuntimeRestore(context.Context, session.RuntimeRestoreRequest) (loop.Resolved, error) {
+	return loop.Resolved{}, nil
+}
+
+func TestWithRestoreFailurePolicyInstallsBothRestoreCollaborators(t *testing.T) {
+	t.Parallel()
+	state := &definitionState{seen: make(map[singletonKey]bool)}
+	err := WithRestoreFailurePolicy(AllowExternalCapabilityDrift(), AllowModelDrift())(state)
+	if err != nil {
+		t.Fatalf("WithRestoreFailurePolicy() error = %v", err)
+	}
+	if !state.seen[keyRestoreFailurePolicy] || len(state.lifecycleOptions) != 2 {
+		t.Fatalf("compiled state seen=%v lifecycle options=%d, want policy and two collaborators", state.seen, len(state.lifecycleOptions))
+	}
+}
+
+func TestWithRestoreFailurePolicyEmptyIsValidAndNilOptionFails(t *testing.T) {
+	t.Parallel()
+	state := &definitionState{seen: make(map[singletonKey]bool)}
+	if err := WithRestoreFailurePolicy()(state); err != nil {
+		t.Fatalf("empty WithRestoreFailurePolicy() error = %v", err)
+	}
+
+	state = &definitionState{seen: make(map[singletonKey]bool)}
+	err := WithRestoreFailurePolicy(nil)(state)
+	var definitionErr *DefinitionError
+	if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionInvalidRestoreFailurePolicy {
+		t.Fatalf("nil policy option error = %T %v, want invalid restore failure policy", err, err)
+	}
+}
+
+func TestRestorePolicyEntryPointsAreMutuallyExclusive(t *testing.T) {
+	t.Parallel()
+	policy := WithRestoreFailurePolicy(AllowModelDrift())
+	others := []struct {
+		name   string
+		option Option
+	}{
+		{name: "decider", option: WithRestoreDecider(restorePolicyTestDecider{})},
+		{name: "runtime resolver", option: WithRuntimeRestoreResolver(restorePolicyTestResolver{})},
+		{name: "legacy mismatch", option: WithAllowConfigMismatch()},
+	}
+	for _, other := range others {
+		other := other
+		for _, order := range []struct {
+			name    string
+			options []Option
+		}{
+			{name: "policy first", options: []Option{policy, other.option}},
+			{name: "policy second", options: []Option{other.option, policy}},
+		} {
+			order := order
+			t.Run(other.name+"/"+order.name, func(t *testing.T) {
+				state := &definitionState{seen: make(map[singletonKey]bool)}
+				if err := order.options[0](state); err != nil {
+					t.Fatalf("first option error = %v", err)
+				}
+				err := order.options[1](state)
+				var definitionErr *DefinitionError
+				if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionDuplicateOption {
+					t.Fatalf("second option error = %T %v, want duplicate policy", err, err)
+				}
+			})
+		}
+	}
 }

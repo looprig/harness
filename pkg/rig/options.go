@@ -34,6 +34,7 @@ const (
 	keyAllowConfigMismatch             singletonKey = "allow_config_mismatch"
 	keyRestoreDecider                  singletonKey = "restore_decider"
 	keyRuntimeRestoreResolver          singletonKey = "runtime_restore_resolver"
+	keyRestoreFailurePolicy            singletonKey = "restore_failure_policy"
 	keySnapshots                       singletonKey = "snapshots"
 	keyOffloadGC                       singletonKey = "offload_gc"
 	keyHustleLimits                    singletonKey = "hustle_limits"
@@ -456,7 +457,7 @@ func WithGateCaps(caps GateCaps) Option {
 }
 
 func WithAllowConfigMismatch() Option {
-	return singletonCompile(keyAllowConfigMismatch, sessionruntime.WithLifecycleAllowConfigMismatch())
+	return exclusiveRestorePolicyCompile(keyAllowConfigMismatch, sessionruntime.WithLifecycleAllowConfigMismatch())
 }
 
 // WithRestoreDecider installs the application policy that decides whether a
@@ -470,7 +471,7 @@ func WithRestoreDecider(decider session.RestoreDecider) Option {
 		if decider == nil {
 			return &DefinitionError{Kind: DefinitionInvalidRestoreDecider}
 		}
-		return singletonCompile(keyRestoreDecider, sessionruntime.WithLifecycleRestoreDecider(decider))(state)
+		return exclusiveRestorePolicyCompile(keyRestoreDecider, sessionruntime.WithLifecycleRestoreDecider(decider))(state)
 	}
 }
 
@@ -482,9 +483,56 @@ func WithRuntimeRestoreResolver(resolver session.RuntimeRestoreResolver) Option 
 		if resolver == nil {
 			return &DefinitionError{Kind: DefinitionInvalidRuntimeRestoreResolver}
 		}
-		return singletonCompile(keyRuntimeRestoreResolver,
+		return exclusiveRestorePolicyCompile(keyRuntimeRestoreResolver,
 			sessionruntime.WithLifecycleRuntimeRestoreResolver(resolver))(state)
 	}
+}
+
+// WithRestoreFailurePolicy installs one fail-closed declarative restore policy.
+// Each Allow…Drift option exempts only its named fact; unlisted warnings remain
+// fatal and exact runtime reconstruction remains the first restore attempt.
+func WithRestoreFailurePolicy(options ...RestoreFailureOption) Option {
+	return func(state *definitionState) error {
+		for _, option := range options {
+			if option == nil {
+				return &DefinitionError{Kind: DefinitionInvalidRestoreFailurePolicy}
+			}
+		}
+		if err := restorePolicyConflict(state, keyRestoreFailurePolicy); err != nil {
+			return err
+		}
+		policy := compileRestoreFailurePolicy(options...)
+		return singleton(keyRestoreFailurePolicy, func(state *definitionState) {
+			state.lifecycleOptions = append(state.lifecycleOptions,
+				sessionruntime.WithLifecycleRestoreDecider(policy),
+				sessionruntime.WithLifecycleRuntimeRestoreResolver(policy),
+			)
+		})(state)
+	}
+}
+
+func exclusiveRestorePolicyCompile(name singletonKey, option sessionruntime.LifecycleOption) Option {
+	return func(state *definitionState) error {
+		if err := restorePolicyConflict(state, name); err != nil {
+			return err
+		}
+		return singletonCompile(name, option)(state)
+	}
+}
+
+func restorePolicyConflict(state *definitionState, installing singletonKey) error {
+	if installing == keyRestoreFailurePolicy {
+		for _, name := range []singletonKey{keyAllowConfigMismatch, keyRestoreDecider, keyRuntimeRestoreResolver} {
+			if state.seen[name] {
+				return &DefinitionError{Kind: DefinitionDuplicateOption, Name: string(name)}
+			}
+		}
+		return nil
+	}
+	if state.seen[keyRestoreFailurePolicy] {
+		return &DefinitionError{Kind: DefinitionDuplicateOption, Name: string(keyRestoreFailurePolicy)}
+	}
+	return nil
 }
 
 func singleton(name singletonKey, apply func(*definitionState)) Option {
