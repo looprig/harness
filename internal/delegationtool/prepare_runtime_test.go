@@ -108,9 +108,9 @@ func TestPrepareStartAgentRuntimeSelectorErrorsAreActionable(t *testing.T) {
 			want: `agent preparation rejected: model "missing" is unavailable for agent type "worker", harness "codex", and source "gateway"`,
 		},
 		{
-			name: "incompatible effort", catalog: testPreparationCatalog(t),
-			args: `{"agent_type":"worker","instructions":"p","agent_harness":"claude-code","model":"sonnet","effort":"low"}`,
-			want: `agent preparation rejected: effort "low" is unavailable for model "sonnet"`,
+			name: "incompatible effort", catalog: unavailableEffortPreparationCatalog(t),
+			args: `{"agent_type":"worker","instructions":"p","agent_harness":"codex","model":"luna","effort":"high"}`,
+			want: `agent preparation rejected: effort "high" is unavailable for model "luna"`,
 		},
 	}
 	for _, tt := range tests {
@@ -468,6 +468,18 @@ func testPreparationCatalog(t *testing.T) loop.RuntimeCatalog {
 		testPreparationEntry("claude-code", "acp/claude-code", "sonnet", inferencemodel.EffortMedium),
 		testPreparationEntry("codex", "acp/codex", "luna", inferencemodel.EffortHigh),
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return catalog
+}
+
+func unavailableEffortPreparationCatalog(t *testing.T) loop.RuntimeCatalog {
+	t.Helper()
+	defaultEntry := testPreparationEntry("claude-code", "acp/claude-code", "sonnet", inferencemodel.EffortMedium)
+	lunaEntry := testPreparationEntry("codex", "acp/codex", "luna", inferencemodel.EffortMedium)
+	lunaEntry.Models[0].Efforts = []inferencemodel.Effort{inferencemodel.EffortMedium}
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{defaultEntry, lunaEntry})
 	if err != nil {
 		t.Fatal(err)
 	}
