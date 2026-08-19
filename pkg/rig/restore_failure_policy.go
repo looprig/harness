@@ -2,9 +2,12 @@ package rig
 
 import (
 	"context"
+	"errors"
 
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/session"
+	model "github.com/looprig/inference/model"
 )
 
 const restoreFailurePolicyAdoptionMessage = "adopted configuration allowed by Rig restore failure policy"
@@ -121,6 +124,35 @@ func (p restoreFailurePolicy) allowsChange(change event.DriftChange) bool {
 		default:
 			return false
 		}
+	default:
+		return false
+	}
+}
+
+func (p restoreFailurePolicy) ResolveRuntimeRestore(ctx context.Context, request session.RuntimeRestoreRequest) (loop.Resolved, error) {
+	if err := ctx.Err(); err != nil {
+		return loop.Resolved{}, err
+	}
+	if !p.allowsRuntimeMismatch(request.Mismatch) {
+		return loop.Resolved{}, errors.New("rig: runtime restore mismatch is critical")
+	}
+	resolved, err := request.Catalog.Resolve(request.AgentName, request.Harness, "", model.EffortNone)
+	if err != nil || resolved.AgentType != request.AgentName || resolved.AgentHarness != request.Harness {
+		return loop.Resolved{}, errors.New("rig: current same-harness runtime unavailable")
+	}
+	return resolved, nil
+}
+
+func (p restoreFailurePolicy) allowsRuntimeMismatch(mismatch string) bool {
+	switch mismatch {
+	case session.RestoreRuntimeTargetMismatch:
+		return p.has(restoreAllowModel)
+	case session.RestoreRuntimeCredentialMismatch:
+		return p.has(restoreAllowCredential)
+	case session.RestoreRuntimeEffortMismatch:
+		return p.has(restoreAllowEffort)
+	case session.RestoreRuntimeUnavailable:
+		return p.has(restoreAllowRuntimeProfile)
 	default:
 		return false
 	}

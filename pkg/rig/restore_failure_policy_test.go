@@ -5,6 +5,10 @@ import (
 	"testing"
 
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/session"
+	model "github.com/looprig/inference/model"
 )
 
 func TestRestoreFailurePolicyOptionsCompileAndDeduplicate(t *testing.T) {
@@ -106,4 +110,70 @@ func TestRestoreFailurePolicyDeciderPermissionScope(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRestoreFailurePolicyRuntimeAllowsOnlyConfiguredMismatch(t *testing.T) {
+	t.Parallel()
+	catalog := restoreFailurePolicyCatalog(t)
+	tests := []struct {
+		name      string
+		policy    restoreFailurePolicy
+		mismatch  string
+		wantError bool
+	}{
+		{name: "model allows target", policy: compileRestoreFailurePolicy(AllowModelDrift()), mismatch: session.RestoreRuntimeTargetMismatch},
+		{name: "effort allows effort", policy: compileRestoreFailurePolicy(AllowEffortDrift()), mismatch: session.RestoreRuntimeEffortMismatch},
+		{name: "credential allows credential", policy: compileRestoreFailurePolicy(AllowCredentialDrift()), mismatch: session.RestoreRuntimeCredentialMismatch},
+		{name: "profile allows unavailable", policy: compileRestoreFailurePolicy(AllowRuntimeProfileDrift()), mismatch: session.RestoreRuntimeUnavailable},
+		{name: "catalog alone does not allow target", policy: compileRestoreFailurePolicy(AllowRuntimeCatalogDrift()), mismatch: session.RestoreRuntimeTargetMismatch, wantError: true},
+		{name: "effort does not allow target", policy: compileRestoreFailurePolicy(AllowEffortDrift()), mismatch: session.RestoreRuntimeTargetMismatch, wantError: true},
+		{name: "missing runtime is never recoverable", policy: compileRestoreFailurePolicy(AllowRuntimeProfileDrift(), AllowModelDrift(), AllowCredentialDrift(), AllowEffortDrift()), mismatch: session.RestoreRuntimeMissing, wantError: true},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			resolved, err := testCase.policy.ResolveRuntimeRestore(context.Background(), session.RuntimeRestoreRequest{
+				AgentName: "worker", Harness: "codex", Profile: "acp/old", Mismatch: testCase.mismatch, Catalog: catalog,
+			})
+			if testCase.wantError {
+				if err == nil {
+					t.Fatalf("ResolveRuntimeRestore() = %+v, nil; want error", resolved)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveRuntimeRestore() error = %v", err)
+			}
+			if resolved.AgentType != "worker" || resolved.AgentHarness != "codex" || resolved.Profile != "acp/current" || resolved.ModelAlias != "current" || resolved.Effort != model.EffortHigh {
+				t.Fatalf("resolved = %+v, want current same-harness default", resolved)
+			}
+		})
+	}
+}
+
+func TestRestoreFailurePolicyRuntimeCannotResolveMissingHarness(t *testing.T) {
+	t.Parallel()
+	policy := compileRestoreFailurePolicy(AllowRuntimeProfileDrift())
+	resolved, err := policy.ResolveRuntimeRestore(context.Background(), session.RuntimeRestoreRequest{
+		AgentName: "worker", Harness: "claude-code", Profile: "acp/claude-code", Mismatch: session.RestoreRuntimeUnavailable, Catalog: restoreFailurePolicyCatalog(t),
+	})
+	if err == nil {
+		t.Fatalf("ResolveRuntimeRestore() = %+v, nil; want missing harness error", resolved)
+	}
+}
+
+func restoreFailurePolicyCatalog(t *testing.T) loop.RuntimeCatalog {
+	t.Helper()
+	catalog, err := loop.NewRuntimeCatalog([]loop.RuntimeCatalogEntry{{
+		AgentType: identity.AgentName("worker"), AgentHarness: "codex", Profile: "acp/current",
+		Credential: loop.CredentialGatewayBacked, Default: true, DefaultModel: "current",
+		Models: []loop.RuntimeModelOption{{
+			Alias: "current", Target: model.Model{Provider: "provider", Name: "current-target"},
+			DefaultEffort: model.EffortHigh, Efforts: []model.Effort{model.EffortMedium, model.EffortHigh},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return catalog
 }
