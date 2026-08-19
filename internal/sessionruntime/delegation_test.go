@@ -155,6 +155,12 @@ type releasedFailureLLM struct {
 	once    sync.Once
 }
 
+type secondTurnFailureLLM struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
 type queuedMessageLLM struct {
 	mu      sync.Mutex
 	started chan string
@@ -217,6 +223,28 @@ func (l *releasedFailureLLM) Stream(context.Context, inference.Request) (*stream
 	}, nil), nil
 }
 
+func (*secondTurnFailureLLM) Invoke(context.Context, inference.Request) (*inference.Response, error) {
+	return nil, errors.New("secondTurnFailureLLM.Invoke not used")
+}
+
+func (l *secondTurnFailureLLM) Stream(_ context.Context, req inference.Request) (*stream.StreamReader[content.Chunk], error) {
+	l.mu.Lock()
+	l.calls++
+	call := l.calls
+	l.mu.Unlock()
+	emitted := false
+	return stream.NewStreamReader(func() (content.Chunk, error) {
+		if emitted {
+			return nil, io.EOF
+		}
+		emitted = true
+		if call == 2 {
+			return nil, l.err
+		}
+		return textChunk("reply " + latestUserText(req.Messages)), nil
+	}, nil), nil
+}
+
 func delegateChildWithModes(name, finalText string) loop.Definition {
 	return mustDefine(
 		loop.WithName(identity.AgentName(name)),
@@ -276,6 +304,61 @@ func TestDelegateStartSyncReturnsChildText(t *testing.T) {
 	s.loopsMu.RUnlock()
 	if !ok || handle.parent.LoopID != s.ActiveLoopID() {
 		t.Errorf("child not registered as owned by parent %v", s.ActiveLoopID())
+	}
+}
+
+func TestDelegateForegroundStartPreservesOrdinaryChildFailure(t *testing.T) {
+	t.Parallel()
+	providerErr := errors.New("provider rejected model alias")
+	client := &releasedFailureLLM{started: make(chan struct{}), release: make(chan struct{}), err: providerErr}
+	close(client.release)
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := mustDefine(
+		loop.WithName("child"),
+		loop.WithInference(client, validModel("child")),
+		loop.WithDrainTimeout(100*time.Millisecond),
+	)
+	s := newDelegationSession(t, parent, nil, child)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+
+	result, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, AgentType: "child", Message: "go", WaitForResponse: true,
+	})
+	if err != nil {
+		t.Fatalf("Execute(start) error = %v", err)
+	}
+	if result.ResponseStatus != tool.DelegateResponseFailed || result.Response != providerErr.Error() {
+		t.Fatalf("foreground start result = %+v, want failed response %q", result, providerErr)
+	}
+}
+
+func TestDelegateForegroundMessagePreservesOrdinaryChildFailure(t *testing.T) {
+	t.Parallel()
+	providerErr := errors.New("provider rejected model alias")
+	client := &secondTurnFailureLLM{err: providerErr}
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := mustDefine(
+		loop.WithName("child"),
+		loop.WithInference(client, validModel("child")),
+		loop.WithDrainTimeout(100*time.Millisecond),
+	)
+	s := newDelegationSession(t, parent, nil, child)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+
+	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, AgentType: "child", Message: "start", WaitForResponse: true,
+	})
+	if err != nil || started.ResponseStatus != tool.DelegateResponseCompleted {
+		t.Fatalf("Execute(start) = %+v, %v; want completed", started, err)
+	}
+	result, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateSend, AgentID: started.AgentID, Message: "continue", WaitForResponse: true,
+	})
+	if err != nil {
+		t.Fatalf("Execute(send) error = %v", err)
+	}
+	if result.ResponseStatus != tool.DelegateResponseFailed || result.Response != providerErr.Error() {
+		t.Fatalf("foreground message result = %+v, want failed response %q", result, providerErr)
 	}
 }
 
@@ -1105,7 +1188,7 @@ func TestRestoreDoesNotAdmitForegroundDelegateIntentAsBackgroundHandBack(t *test
 	}
 }
 
-func TestDelegateFailureDetailUsesOnlyMarkedTurnFailureCause(t *testing.T) {
+func TestDelegateFailureDetailPreservesEveryTurnFailureCause(t *testing.T) {
 	t.Parallel()
 	requestID, turnID, childID := mustUUID(), mustUUID(), mustUUID()
 	started := event.TurnStarted{Header: event.Header{
@@ -1116,12 +1199,11 @@ func TestDelegateFailureDetailUsesOnlyMarkedTurnFailureCause(t *testing.T) {
 		name       string
 		err        error
 		wantDetail string
-		wantMarked bool
 		wantStatus tool.DelegateStatusValue
 	}{
-		{name: "marked", err: &markedDelegateFailure{detail: "ACP error 429: retry later"}, wantDetail: "ACP error 429: retry later", wantMarked: true, wantStatus: tool.DelegateStatusFailed},
-		{name: "ordinary", err: errors.New("provider secret must stay hidden"), wantStatus: tool.DelegateStatusFailed},
-		{name: "oversized malformed marked", err: &markedDelegateFailure{detail: strings.Repeat("界", maxDelegateOutputBytes) + "\xff"}, wantMarked: true, wantStatus: tool.DelegateStatusFailed},
+		{name: "marked", err: &markedDelegateFailure{detail: "ACP error 429: retry later"}, wantDetail: "ordinary failure: ACP error 429: retry later", wantStatus: tool.DelegateStatusFailed},
+		{name: "ordinary", err: errors.New("provider rejected model alias"), wantDetail: "provider rejected model alias", wantStatus: tool.DelegateStatusFailed},
+		{name: "oversized malformed", err: errors.New(strings.Repeat("界", maxDelegateOutputBytes) + "\xff"), wantStatus: tool.DelegateStatusFailed},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -1134,13 +1216,10 @@ func TestDelegateFailureDetailUsesOnlyMarkedTurnFailureCause(t *testing.T) {
 			if !ok || resolved.status != tt.wantStatus {
 				t.Fatalf("resolved = %+v, %v; want failed terminal", resolved, ok)
 			}
-			if tt.wantMarked && tt.wantDetail != "" && resolved.text != tt.wantDetail {
+			if tt.wantDetail != "" && resolved.text != tt.wantDetail {
 				t.Fatalf("resolved detail = %q, want %q", resolved.text, tt.wantDetail)
 			}
-			if !tt.wantMarked && resolved.text != "" {
-				t.Fatalf("ordinary failure detail = %q, want generic empty detail", resolved.text)
-			}
-			if tt.name == "oversized malformed marked" {
+			if tt.name == "oversized malformed" {
 				if len(resolved.text) > maxDelegateOutputBytes {
 					t.Fatalf("resolved detail bytes = %d, want <= %d", len(resolved.text), maxDelegateOutputBytes)
 				}
@@ -1152,36 +1231,40 @@ func TestDelegateFailureDetailUsesOnlyMarkedTurnFailureCause(t *testing.T) {
 	}
 }
 
-func TestDelegateFailureDetailTraversesDrainWrapper(t *testing.T) {
+func TestDelegateFailureDetailPreservesDrainWrapperErrorText(t *testing.T) {
 	t.Parallel()
 	const detail = "ACP error 429: retry later"
-	if got := delegateFailureDetail(&drainFailedError{Cause: &markedDelegateFailure{detail: detail}}); got != detail {
-		t.Fatalf("wrapped marked detail = %q, want %q", got, detail)
+	wantMarked := "drain: turn failed: ordinary failure: " + detail
+	if got := delegateFailureDetail(&drainFailedError{Cause: &markedDelegateFailure{detail: detail}}); got != wantMarked {
+		t.Fatalf("wrapped marked detail = %q, want %q", got, wantMarked)
 	}
-	if got := delegateFailureDetail(&drainFailedError{Cause: errors.New("provider secret must stay hidden")}); got != "" {
-		t.Fatalf("wrapped ordinary detail = %q, want generic empty detail", got)
+	wantOrdinary := "drain: turn failed: provider rejected model alias"
+	if got := delegateFailureDetail(&drainFailedError{Cause: errors.New("provider rejected model alias")}); got != wantOrdinary {
+		t.Fatalf("wrapped ordinary detail = %q, want %q", got, wantOrdinary)
 	}
 }
 
-func TestDelegateFailureDetailRejectsFabricatedAsAndSecretJoinSiblings(t *testing.T) {
+func TestDelegateFailureDetailUsesExactTopLevelErrorText(t *testing.T) {
 	t.Parallel()
 	const secret = "provider secret must stay hidden"
-	if got := delegateFailureDetail(fabricatedModelFacingAsError{detail: secret}); got != "" {
-		t.Fatalf("malicious As detail = %q, want empty", got)
+	if got := delegateFailureDetail(fabricatedModelFacingAsError{detail: secret}); got != "ordinary failure with malicious As" {
+		t.Fatalf("custom As error detail = %q, want exact Error text", got)
 	}
-	if got := delegateFailureDetail(errors.Join(errors.New(secret), fabricatedModelFacingAsError{detail: secret})); got != "" {
-		t.Fatalf("joined malicious As detail = %q, want empty", got)
+	wantJoined := secret + "\nordinary failure with malicious As"
+	if got := delegateFailureDetail(errors.Join(errors.New(secret), fabricatedModelFacingAsError{detail: secret})); got != wantJoined {
+		t.Fatalf("joined error detail = %q, want %q", got, wantJoined)
 	}
 	const safe = "retry later"
-	if got := delegateFailureDetail(errors.Join(errors.New(secret), &markedDelegateFailure{detail: safe})); got != safe {
-		t.Fatalf("joined marked detail = %q, want %q", got, safe)
+	wantMarkedJoin := secret + "\nordinary failure: " + safe
+	if got := delegateFailureDetail(errors.Join(errors.New(secret), &markedDelegateFailure{detail: safe})); got != wantMarkedJoin {
+		t.Fatalf("joined marked detail = %q, want %q", got, wantMarkedJoin)
 	}
 }
 
 func TestRestoredBackgroundFailureDetailUsesDurableTurnFailure(t *testing.T) {
 	t.Parallel()
 	requestID, turnID, childID, parentID, sessionID := mustUUID(), mustUUID(), mustUUID(), mustUUID(), mustUUID()
-	const detail = "ACP error 429: retry later"
+	const detail = "provider rejected model alias"
 	background := command.UserInput{
 		Header:             command.Header{CommandID: requestID, Agency: identity.AgencyMachine},
 		NoFold:             true,
@@ -1201,7 +1284,7 @@ func TestRestoredBackgroundFailureDetailUsesDurableTurnFailure(t *testing.T) {
 			Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID},
 			Cause:       identity.Cause{CommandID: requestID},
 		}},
-		event.TurnFailed{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: childID, TurnID: turnID}, EventID: mustUUID()}, Err: &markedDelegateFailure{detail: detail}},
+		event.TurnFailed{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: childID, TurnID: turnID}, EventID: mustUUID()}, Err: errors.New(detail)},
 	}
 	serializedFailure, err := event.MarshalEvent(replayed[2])
 	if err != nil {
@@ -1225,12 +1308,13 @@ func TestRestoredBackgroundFailureDetailUsesDurableTurnFailure(t *testing.T) {
 	if len(plan) != 1 {
 		t.Fatalf("restore plan = %+v, want one failure completion", plan)
 	}
-	if plan[0].resolved.status != tool.DelegateStatusFailed || plan[0].resolved.text != detail {
-		t.Fatalf("restored result = %+v, want failed detail %q", plan[0].resolved, detail)
+	restoredDetail := restoredFailure.(event.TurnFailed).Err.Error()
+	if plan[0].resolved.status != tool.DelegateStatusFailed || plan[0].resolved.text != restoredDetail {
+		t.Fatalf("restored result = %+v, want failed detail %q", plan[0].resolved, restoredDetail)
 	}
 	completion, ok := decodeBackgroundCompletion(backgroundCompletionBlocks(childID, plan[0].name, requestID, plan[0].resolved.status, plan[0].resolved.text))
-	if !ok || completion.ResponseStatus != tool.DelegateResponseFailed || completion.Response != detail {
-		t.Fatalf("restored completion = %+v, %v; want failed detail %q", completion, ok, detail)
+	if !ok || completion.ResponseStatus != tool.DelegateResponseFailed || completion.Response != restoredDetail {
+		t.Fatalf("restored completion = %+v, %v; want failed detail %q", completion, ok, restoredDetail)
 	}
 }
 

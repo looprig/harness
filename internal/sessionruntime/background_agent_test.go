@@ -130,6 +130,61 @@ func TestBackgroundAgentReturnsImmediatelyAndHandsBackExactlyOnce(t *testing.T) 
 	}
 }
 
+func TestBackgroundAgentFailureDetailIsDurable(t *testing.T) {
+	parentLLM := newControlledAgentLLM()
+	providerErr := errors.New("provider rejected model alias")
+	childLLM := &releasedFailureLLM{started: make(chan struct{}), release: make(chan struct{}), err: providerErr}
+	appender := &blockingSubagentResultAppender{reached: make(chan struct{}), release: make(chan struct{})}
+	parent := backgroundNode("parent", parentLLM, "child")
+	child := backgroundNode("child", childLLM)
+	s := newDelegationSession(t, parent, []Option{WithCommandAppender(appender)}, child)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
+
+	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{
+		Operation: tool.DelegateStart, AgentType: "child", Name: "worker", Message: "go", WaitForResponse: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-childLLM.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("child did not start")
+	}
+	close(childLLM.release)
+	select {
+	case <-appender.reached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("failed child did not append durable SubagentResult")
+	}
+
+	appender.mu.Lock()
+	records := append([]journal.CommandRecord(nil), appender.records...)
+	appender.mu.Unlock()
+	var handBack command.SubagentResult
+	var found bool
+	for _, record := range records {
+		if result, ok := record.Command().(command.SubagentResult); ok {
+			handBack, found = result, true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("durable records = %+v, want command.SubagentResult", records)
+	}
+	completion, ok := decodeBackgroundCompletion(handBack.Blocks)
+	if !ok || completion.ResponseStatus != tool.DelegateResponseFailed || completion.Response != providerErr.Error() || completion.CorrelationID != started.CorrelationID.String() {
+		t.Fatalf("durable failure completion = %+v, %v; want failed response %q correlated to %v", completion, ok, providerErr, started.CorrelationID)
+	}
+
+	close(appender.release)
+	parentCompletion := receiveBackgroundCompletion(t, parentLLM)
+	if parentCompletion.ResponseStatus != tool.DelegateResponseFailed || parentCompletion.Response != providerErr.Error() {
+		t.Fatalf("parent failure completion = %+v, want failed response %q", parentCompletion, providerErr)
+	}
+	parentLLM.release <- struct{}{}
+}
+
 func TestBackgroundAgentQueuesHandBackWhileParentWorking(t *testing.T) {
 	parentLLM := newControlledAgentLLM()
 	parent := backgroundNode("parent", parentLLM, "child")

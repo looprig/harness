@@ -1566,7 +1566,7 @@ func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.U
 			status = tool.DelegateStatusTimedOut
 		}
 		if status == tool.DelegateStatusFailed && text == "" {
-			text = delegateFailureDetail(err)
+			text = delegateObservedFailureDetail(err)
 		}
 		var blocks []content.Block
 		if suppressInterrupt {
@@ -2148,7 +2148,7 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 			status = tool.DelegateStatusTimedOut
 		}
 		if status == tool.DelegateStatusFailed && text == "" {
-			text = delegateFailureDetail(err)
+			text = delegateObservedFailureDetail(err)
 		}
 		observerExpired := drainObserverExpired(err)
 		if observerExpired && nativeMessage {
@@ -2298,21 +2298,22 @@ func boundUTF8(value string, limit int) string {
 	return value[:end]
 }
 
-// delegateFailureDetail crosses the child-to-parent boundary only for an error
-// that explicitly opts into the narrow model-facing projection. The drain wraps
-// TurnFailed.Err; the shared traversal follows only real wrapper/join links and
-// never invokes a custom errors.As implementation. A malformed or oversized
-// projection is made valid and bounded before it reaches a result or durable
-// completion envelope.
+// delegateFailureDetail returns the exact error text, made valid and bounded before
+// it reaches a foreground result or durable completion envelope.
 func delegateFailureDetail(err error) (detail string) {
 	if err == nil {
 		return ""
 	}
-	detail, marked := tool.ModelFacingErrorDetail(err)
-	if !marked {
-		return ""
+	return boundUTF8(err.Error(), maxDelegateOutputBytes)
+}
+
+// delegateObservedFailureDetail removes the drain's mechanical wrapper so the
+// parent receives the exact TurnFailed.Err text emitted by the child.
+func delegateObservedFailureDetail(err error) string {
+	if failed, ok := err.(*drainFailedError); ok && failed.Cause != nil {
+		return delegateFailureDetail(failed.Cause)
 	}
-	return boundUTF8(detail, maxDelegateOutputBytes)
+	return delegateFailureDetail(err)
 }
 
 func runePrefixEnds(value string) []int {
