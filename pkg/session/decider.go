@@ -6,6 +6,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
+	model "github.com/looprig/inference/model"
 )
 
 // RestoreDecision is an application's answer to a drift assessment. Source,
@@ -42,11 +43,17 @@ type RestoreDecider interface {
 // RuntimeRestoreRequest is the bounded, secret-free runtime selection context
 // a composition may use when exact durable runtime reconstruction fails.
 type RuntimeRestoreRequest struct {
-	AgentName identity.AgentName
-	Harness   loop.AgentHarnessName
-	Profile   loop.RuntimeProfileName
-	Mismatch  string
-	Catalog   loop.RuntimeCatalog
+	AgentName       identity.AgentName
+	Harness         loop.AgentHarnessName
+	Profile         loop.RuntimeProfileName
+	Source          loop.RuntimeSourceName
+	Credential      loop.CredentialMode
+	Target          model.ModelKey
+	Effort          model.Effort
+	SelectionKind   loop.RuntimeSelectionKind
+	SmallModelAlias loop.ModelAlias
+	Mismatch        string
+	Catalog         loop.RuntimeCatalog
 }
 
 // RuntimeRestoreResolver lets the composition layer authorize a current

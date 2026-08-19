@@ -912,11 +912,17 @@ func restoreRuntimeBindingWithResolver(ctx context.Context, started event.LoopSt
 		return nil, err
 	}
 	request := RuntimeRestoreRequest{
-		AgentName: started.AgentName,
-		Harness:   loop.AgentHarnessName(runtime.Harness),
-		Profile:   loop.RuntimeProfileName(runtime.Profile),
-		Mismatch:  mismatch.Kind,
-		Catalog:   catalog,
+		AgentName:       started.AgentName,
+		Harness:         loop.AgentHarnessName(runtime.Harness),
+		Profile:         loop.RuntimeProfileName(runtime.Profile),
+		Source:          loop.RuntimeSourceName(runtime.Source),
+		Credential:      loop.CredentialMode(runtime.CredentialMode),
+		Target:          ri.Runtime.Key,
+		Effort:          ri.Runtime.Effort,
+		SelectionKind:   loop.RuntimeSelectionKind(runtime.SelectionKind),
+		SmallModelAlias: loop.ModelAlias(runtime.SmallModelAlias),
+		Mismatch:        mismatch.Kind,
+		Catalog:         catalog,
 	}
 	resolved, resolveErr := resolver.ResolveRuntimeRestore(ctx, request)
 	if resolveErr != nil {

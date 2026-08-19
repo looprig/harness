@@ -139,11 +139,69 @@ func (p restoreFailurePolicy) ResolveRuntimeRestore(ctx context.Context, request
 	if !p.allowsRuntimeMismatch(request.Mismatch) {
 		return loop.Resolved{}, errors.New("rig: runtime restore mismatch is critical")
 	}
-	resolved, err := request.Catalog.Resolve(request.AgentName, request.Harness, "", model.EffortNone)
+	alias, err := p.runtimeFallbackAlias(request)
+	if err != nil {
+		return loop.Resolved{}, err
+	}
+	source := request.Source
+	if p.has(restoreAllowCredential) {
+		source = ""
+	}
+	effort := request.Effort
+	explicitEffort := true
+	if p.has(restoreAllowEffort) || request.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+		effort = model.EffortNone
+		explicitEffort = false
+	}
+	resolved, err := request.Catalog.ResolveWithExplicitSource(request.AgentName, request.Harness, source, alias, effort, explicitEffort)
 	if err != nil || resolved.AgentType != request.AgentName || resolved.AgentHarness != request.Harness {
 		return loop.Resolved{}, errors.New("rig: current same-harness runtime unavailable")
 	}
+	if err := p.validateRuntimeFallback(request, resolved); err != nil {
+		return loop.Resolved{}, err
+	}
 	return resolved, nil
+}
+
+func (p restoreFailurePolicy) runtimeFallbackAlias(request session.RuntimeRestoreRequest) (loop.ModelAlias, error) {
+	if p.has(restoreAllowModel) {
+		return "", nil
+	}
+	if request.Target == (model.ModelKey{}) {
+		return "", nil
+	}
+	for _, entry := range request.Catalog.EntriesFor(request.AgentName) {
+		if entry.AgentHarness != request.Harness {
+			continue
+		}
+		for _, option := range entry.Models {
+			if option.Target.Key() == request.Target {
+				return option.Alias, nil
+			}
+		}
+	}
+	return "", errors.New("rig: durable runtime target unavailable")
+}
+
+func (p restoreFailurePolicy) validateRuntimeFallback(request session.RuntimeRestoreRequest, resolved loop.Resolved) error {
+	if !p.has(restoreAllowRuntimeProfile) && resolved.Profile != request.Profile {
+		return errors.New("rig: runtime fallback changed critical profile")
+	}
+	if !p.has(restoreAllowCredential) && (resolved.Source != request.Source || resolved.Credential != request.Credential) {
+		return errors.New("rig: runtime fallback changed critical credential")
+	}
+	if !p.has(restoreAllowModel) {
+		if resolved.Target.Key() != request.Target || resolved.SmallModel != request.SmallModelAlias {
+			return errors.New("rig: runtime fallback changed critical model")
+		}
+	}
+	if !p.has(restoreAllowEffort) && resolved.Effort != request.Effort {
+		return errors.New("rig: runtime fallback changed critical effort")
+	}
+	if request.SelectionKind != "" && resolved.SelectionKind != request.SelectionKind {
+		return errors.New("rig: runtime fallback changed selection kind")
+	}
+	return nil
 }
 
 func (p restoreFailurePolicy) allowsRuntimeMismatch(mismatch string) bool {
