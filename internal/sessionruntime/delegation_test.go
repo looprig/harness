@@ -1261,6 +1261,34 @@ func TestDelegateFailureDetailUsesExactTopLevelErrorText(t *testing.T) {
 	}
 }
 
+func TestDelegateFailureDetailUsesOriginalRestoredMessage(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "ordinary restored error",
+			err:  &event.RestoredError{Kind: event.KindUnknown, Message: "provider rejected model alias"},
+			want: "provider rejected model alias",
+		},
+		{
+			name: "formerly model-facing restored error",
+			err:  &event.RestoredModelFacingError{Kind: event.KindUnknown, Message: "provider rejected model alias", Detail: "legacy projection"},
+			want: "provider rejected model alias",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := delegateFailureDetail(tt.err); got != tt.want {
+				t.Fatalf("delegateFailureDetail(%T) = %q, want original message %q", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRestoredBackgroundFailureDetailUsesDurableTurnFailure(t *testing.T) {
 	t.Parallel()
 	requestID, turnID, childID, parentID, sessionID := mustUUID(), mustUUID(), mustUUID(), mustUUID(), mustUUID()
@@ -1308,13 +1336,12 @@ func TestRestoredBackgroundFailureDetailUsesDurableTurnFailure(t *testing.T) {
 	if len(plan) != 1 {
 		t.Fatalf("restore plan = %+v, want one failure completion", plan)
 	}
-	restoredDetail := restoredFailure.(event.TurnFailed).Err.Error()
-	if plan[0].resolved.status != tool.DelegateStatusFailed || plan[0].resolved.text != restoredDetail {
-		t.Fatalf("restored result = %+v, want failed detail %q", plan[0].resolved, restoredDetail)
+	if plan[0].resolved.status != tool.DelegateStatusFailed || plan[0].resolved.text != detail {
+		t.Fatalf("restored result = %+v, want failed detail %q", plan[0].resolved, detail)
 	}
 	completion, ok := decodeBackgroundCompletion(backgroundCompletionBlocks(childID, plan[0].name, requestID, plan[0].resolved.status, plan[0].resolved.text))
-	if !ok || completion.ResponseStatus != tool.DelegateResponseFailed || completion.Response != restoredDetail {
-		t.Fatalf("restored completion = %+v, %v; want failed detail %q", completion, ok, restoredDetail)
+	if !ok || completion.ResponseStatus != tool.DelegateResponseFailed || completion.Response != detail {
+		t.Fatalf("restored completion = %+v, %v; want failed detail %q", completion, ok, detail)
 	}
 }
 

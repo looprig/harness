@@ -2298,13 +2298,27 @@ func boundUTF8(value string, limit int) string {
 	return value[:end]
 }
 
-// delegateFailureDetail returns the exact error text, made valid and bounded before
-// it reaches a foreground result or durable completion envelope.
+// delegateFailureDetail returns the exact live error text. Restored errors retain
+// the original serialized text in Message while Error adds a durable kind prefix,
+// so restoration uses Message directly. Either form is made valid and bounded
+// before it reaches a foreground result or durable completion envelope.
 func delegateFailureDetail(err error) (detail string) {
 	if err == nil {
 		return ""
 	}
-	return boundUTF8(err.Error(), maxDelegateOutputBytes)
+	switch restored := err.(type) {
+	case *event.RestoredError:
+		if restored != nil {
+			detail = restored.Message
+		}
+	case *event.RestoredModelFacingError:
+		if restored != nil {
+			detail = restored.Message
+		}
+	default:
+		detail = err.Error()
+	}
+	return boundUTF8(detail, maxDelegateOutputBytes)
 }
 
 // delegateObservedFailureDetail removes the drain's mechanical wrapper so the
