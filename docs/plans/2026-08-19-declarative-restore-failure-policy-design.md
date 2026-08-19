@@ -31,6 +31,7 @@ Harness understands:
 - `AllowExternalCapabilityDrift()`
 - `AllowConfinementDrift()`
 - `AllowPermissionDrift()`
+- `AllowNativePermissionDrift()`
 - `AllowPermissionPostureDrift()`
 - `AllowPermissionReviewDrift()`
 - `AllowWorkspaceDrift()`

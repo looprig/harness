@@ -19,6 +19,7 @@ func TestRestoreFailurePolicyOptionsCompileAndDeduplicate(t *testing.T) {
 		AllowExternalCapabilityDrift(),
 		AllowConfinementDrift(),
 		AllowPermissionDrift(),
+		AllowNativePermissionDrift(),
 		AllowPermissionPostureDrift(),
 		AllowPermissionReviewDrift(),
 		AllowWorkspaceDrift(),
@@ -96,6 +97,7 @@ func TestRestoreFailurePolicyDeciderPermissionScope(t *testing.T) {
 		wantAccept []bool
 	}{
 		{name: "broad", policy: compileRestoreFailurePolicy(AllowPermissionDrift()), wantAccept: []bool{true, true, true, true}},
+		{name: "native only", policy: compileRestoreFailurePolicy(AllowNativePermissionDrift()), wantAccept: []bool{true, false, false, false}},
 		{name: "posture only", policy: compileRestoreFailurePolicy(AllowPermissionPostureDrift()), wantAccept: []bool{false, true, false, false}},
 		{name: "review only", policy: compileRestoreFailurePolicy(AllowPermissionReviewDrift()), wantAccept: []bool{false, false, true, true}},
 	} {

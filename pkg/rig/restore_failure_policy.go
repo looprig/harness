@@ -30,6 +30,7 @@ const (
 	restoreAllowExternalCapability restoreAllowance = "external_capability"
 	restoreAllowConfinement        restoreAllowance = "confinement"
 	restoreAllowPermission         restoreAllowance = "permission"
+	restoreAllowNativePermission   restoreAllowance = "native_permission"
 	restoreAllowPermissionPosture  restoreAllowance = "permission_posture"
 	restoreAllowPermissionReview   restoreAllowance = "permission_review"
 	restoreAllowWorkspace          restoreAllowance = "workspace"
@@ -92,6 +93,8 @@ func (p restoreFailurePolicy) allowsChange(change event.DriftChange) bool {
 			return true
 		}
 		switch change.Field {
+		case "":
+			return p.has(restoreAllowNativePermission)
 		case "posture":
 			return p.has(restoreAllowPermissionPosture)
 		case "review_configured", "review_policy_rev":
@@ -176,6 +179,10 @@ func AllowConfinementDrift() RestoreFailureOption {
 
 func AllowPermissionDrift() RestoreFailureOption {
 	return allowRestoreDrift(restoreAllowPermission)
+}
+
+func AllowNativePermissionDrift() RestoreFailureOption {
+	return allowRestoreDrift(restoreAllowNativePermission)
 }
 
 func AllowPermissionPostureDrift() RestoreFailureOption {

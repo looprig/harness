@@ -63,6 +63,7 @@ AllowModelDrift
 AllowExternalCapabilityDrift
 AllowConfinementDrift
 AllowPermissionDrift
+AllowNativePermissionDrift
 AllowPermissionPostureDrift
 AllowPermissionReviewDrift
 AllowWorkspaceDrift
@@ -259,6 +260,7 @@ rig.WithRestoreFailurePolicy(
     rig.AllowExternalCapabilityDrift(),
     rig.AllowRuntimeSkillsDrift(),
     rig.AllowConfinementDrift(),
+    rig.AllowNativePermissionDrift(),
     rig.AllowPermissionPostureDrift(),
     rig.AllowRuntimeProfileDrift(),
     rig.AllowRuntimeCatalogDrift(),
@@ -384,4 +386,3 @@ Check root `go.work`, `repositories.mk`, and dependency documentation. Update on
 **Step 6: Install the released Carbon binaries**
 
 With published pins and `GOWORK=off`, install `cmd/carbon` and `cmd/carbon-collab-mcp` into `/Users/ipotter/.looprig/bin`, then verify a fresh login shell resolves both executables without ACP environment overrides.
-
