@@ -17,7 +17,6 @@ rig.WithRestoreFailurePolicy(
     rig.AllowExternalCapabilityDrift(),
     rig.AllowModelDrift(),
     rig.AllowEffortDrift(),
-    rig.AllowAppFieldDrift("access_profile"),
 )
 ```
 
@@ -25,12 +24,10 @@ The absence of `WithRestoreFailurePolicy` preserves the existing fail-closed
 default. An explicitly empty failure policy is also fail-closed. A composition
 names only drift that it permits; every unlisted warning remains fatal.
 
-The initial option set follows facts Harness understands:
+The initial option set follows warning-level facts and typed runtime failures
+Harness understands:
 
-- `AllowToolDrift()`
 - `AllowModelDrift()`
-- `AllowPromptDrift()`
-- `AllowTopologyDrift()`
 - `AllowExternalCapabilityDrift()`
 - `AllowConfinementDrift()`
 - `AllowPermissionDrift()`
@@ -45,18 +42,21 @@ The initial option set follows facts Harness understands:
 - `AllowHookPolicyDrift()`
 - `AllowRuntimeProfileDrift()`
 - `AllowRuntimeCatalogDrift()`
-- `AllowRuntimeTargetDrift()`
 - `AllowCredentialDrift()`
 - `AllowEffortDrift()`
-- `AllowAppFieldDrift(name)`
+
+Information-only manifest changes such as prompt, tool, topology, and
+application-field changes already restore under the default policy, so the API
+does not add no-op allowances for them. `AllowModelDrift` remains meaningful
+because it also governs a typed per-loop runtime target mismatch.
 
 Broad options cover their narrower forms. For example,
 `AllowPermissionDrift()` covers native permission policy, foreign posture, and
 permission-review changes; the narrower permission options allow a composition
 to keep review policy critical while accepting access-posture changes.
 
-Duplicate allow options are idempotent. An empty application-field name is a
-definition error. `WithRestoreFailurePolicy` is mutually exclusive with the
+Duplicate allow options are idempotent. `WithRestoreFailurePolicy` is mutually
+exclusive with the
 advanced `WithRestoreDecider`, `WithRuntimeRestoreResolver`, and legacy
 `WithAllowConfigMismatch` paths so option order cannot silently change policy.
 
@@ -65,8 +65,9 @@ advanced `WithRestoreDecider`, `WithRuntimeRestoreResolver`, and legacy
 The policy names Harness facts, not product integrations. Harness therefore
 offers `AllowExternalCapabilityDrift`, not `AllowMCPDrift`: Carbon uses the
 external-capability revision for MCP, but another composition may use it for a
-different attached capability set. Likewise, product concepts such as Carbon's
-access profile use `AllowAppFieldDrift("access_profile")`.
+different attached capability set. Product application fields remain
+information-level under Harness's existing drift classification and need no
+allowance.
 
 The manifest intentionally includes both Harness-derived and
 composition-supplied facts. Harness derives model, prompt, tools, topology,
