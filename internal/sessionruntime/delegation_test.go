@@ -1261,7 +1261,7 @@ func TestDelegateFailureDetailUsesExactTopLevelErrorText(t *testing.T) {
 	}
 }
 
-func TestDelegateFailureDetailUsesOriginalRestoredMessage(t *testing.T) {
+func TestDelegateFailureDetailUsesRestoredErrorText(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name string
@@ -1271,19 +1271,19 @@ func TestDelegateFailureDetailUsesOriginalRestoredMessage(t *testing.T) {
 		{
 			name: "ordinary restored error",
 			err:  &event.RestoredError{Kind: event.KindUnknown, Message: "provider rejected model alias"},
-			want: "provider rejected model alias",
+			want: "unknown: provider rejected model alias",
 		},
 		{
 			name: "formerly model-facing restored error",
 			err:  &event.RestoredModelFacingError{Kind: event.KindUnknown, Message: "provider rejected model alias", Detail: "legacy projection"},
-			want: "provider rejected model alias",
+			want: "unknown: provider rejected model alias",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			if got := delegateFailureDetail(tt.err); got != tt.want {
-				t.Fatalf("delegateFailureDetail(%T) = %q, want original message %q", tt.err, got, tt.want)
+				t.Fatalf("delegateFailureDetail(%T) = %q, want Error text %q", tt.err, got, tt.want)
 			}
 		})
 	}
