@@ -243,6 +243,10 @@ func reviewEvidencePolicy() hustle.EvidenceToolPolicy {
 // schema, and an evidence-tool policy.
 func newValidReviewClassifierDefinition(t *testing.T, client inference.Client, name hustle.Name, revision string) hustle.Definition {
 	t.Helper()
+	reviewer := validModel("reviewer")
+	reviewer.Caps.Tools = true
+	reviewer.Caps.StructuredOutput = true
+	reviewer.Caps.StructuredOutputWithTools = true
 	definition, err := hustle.Define(
 		hustle.WithName(name),
 		hustle.WithParticipation(hustle.ParticipationBlocking),
@@ -250,7 +254,7 @@ func newValidReviewClassifierDefinition(t *testing.T, client inference.Client, n
 		hustle.WithLimits(hustle.Limits{InputBytes: 4096, OutputBytes: 4096}),
 		hustle.WithSystemPrompt("review permission requests safely", "prompt-v1"),
 		hustle.WithPolicyRevision(revision),
-		hustle.WithNamedInference(client, validModel("reviewer")),
+		hustle.WithNamedInference(client, reviewer),
 		hustle.WithOutputSchema(inference.OutputSchema{
 			Name: "permission_assessment",
 			Schema: json.RawMessage(`{
@@ -275,6 +279,18 @@ func newValidReviewClassifier(t *testing.T, name hustle.Name, revision string, a
 		name: name, revision: revision, applies: applies,
 		definition: newValidReviewClassifierDefinition(t, &reviewClassifierClient{}, name, revision),
 	}
+}
+
+// newBlockingReviewClassifier exposes the live inference client's invocation
+// boundary so integration tests can prove the review reached its blocking
+// phase before inspecting asynchronous lifecycle state.
+func newBlockingReviewClassifier(t *testing.T, name hustle.Name, revision string, applies bool) (*reviewClassifierStub, <-chan struct{}) {
+	t.Helper()
+	invoked := make(chan struct{})
+	return &reviewClassifierStub{
+		name: name, revision: revision, applies: applies,
+		definition: newValidReviewClassifierDefinition(t, &reviewClassifierClient{invoked: invoked}, name, revision),
+	}, invoked
 }
 
 func validReviewPolicy(t *testing.T) gate.PermissionReviewPolicy {

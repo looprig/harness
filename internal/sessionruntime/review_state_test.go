@@ -755,7 +755,7 @@ func TestStartPermissionReviewNoopsWhenBreakerTripped(t *testing.T) {
 // block review from starting.
 func TestStartPermissionReviewProceedsWhenBreakerNotTripped(t *testing.T) {
 	t.Parallel()
-	classifier := newValidReviewClassifier(t, "classifier", "rev-1", true)
+	classifier, invoked := newBlockingReviewClassifier(t, "classifier", "rev-1", true)
 	set, err := gate.NewPermissionClassifierSet(classifier)
 	if err != nil {
 		t.Fatalf("NewPermissionClassifierSet: %v", err)
@@ -764,9 +764,15 @@ func TestStartPermissionReviewProceedsWhenBreakerNotTripped(t *testing.T) {
 
 	gateID := mustUUID()
 	req := validReviewRequest(t, gateID, mustUUID())
+	req.ReviewContext.Coordinates.SessionID = s.sessionID
 	s.gates[gateID] = gateEntry{}
 
 	s.StartPermissionReview(context.Background(), req)
+	select {
+	case <-invoked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StartPermissionReview never reached the configured classifier's inference client")
+	}
 
 	s.gatesMu.Lock()
 	basis := s.gates[gateID].reviewBasis
