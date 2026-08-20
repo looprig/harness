@@ -92,6 +92,22 @@ func messageAgentText(t *testing.T, result *tool.ToolResult) string {
 	return block.Text
 }
 
+func messageAgentErrorText(t *testing.T, result *tool.ToolResult) string {
+	t.Helper()
+	if result == nil || len(result.Content) != 1 {
+		t.Fatalf("MessageAgent result = %#v, want one error block", result)
+	}
+	outer, ok := result.Content[0].(*content.ToolResultBlock)
+	if !ok || !outer.IsError || len(outer.Content) != 1 {
+		t.Fatalf("MessageAgent result content = %#v, want one error ToolResultBlock", result.Content)
+	}
+	text, ok := outer.Content[0].(*content.TextBlock)
+	if !ok {
+		t.Fatalf("MessageAgent error content = %T, want *content.TextBlock", outer.Content[0])
+	}
+	return text.Text
+}
+
 func nativeListAgentState(t *testing.T, fixture nativeMessageAgentFixture) tool.AgentState {
 	t.Helper()
 	listAgents := delegationtool.NewListAgents(fixture.controller, loop.DelegationManaged, nil)
@@ -329,7 +345,7 @@ func TestMessageAgentNativeForegroundFoldedReportsInjectedDisposition(t *testing
 	}
 }
 
-func TestMessageAgentNativeForegroundTimeoutRetainsQueuedDisposition(t *testing.T) {
+func TestMessageAgentNativeForegroundTimeoutReturnsStructuredFailure(t *testing.T) {
 	fixture := newNativeMessageAgentFixture(t)
 	messageAgent := delegationtool.NewMessageAgent(fixture.controller, loop.DelegationManaged, nil)
 	args := `{"agent_id":"` + fixture.childID.String() + `","message":"timeout foreground","wait_for_response":true,"timeout_seconds":1}`
@@ -365,22 +381,15 @@ func TestMessageAgentNativeForegroundTimeoutRetainsQueuedDisposition(t *testing.
 		if call.err != nil {
 			t.Fatalf("MessageAgent timeout foreground InvokableRun: %v", call.err)
 		}
-		var got struct {
-			DeliveryStatus string `json:"delivery_status"`
-			ResponseStatus string `json:"response_status"`
-		}
-		if err := json.Unmarshal([]byte(messageAgentText(t, call.result)), &got); err != nil {
-			t.Fatalf("timeout foreground MessageAgent result JSON: %v", err)
-		}
-		if got.DeliveryStatus != string(tool.DelegateDeliveryQueued) || got.ResponseStatus != "timed_out" {
-			t.Fatalf("timeout foreground result = %+v, want queued/timed_out", got)
+		if got := messageAgentErrorText(t, call.result); got != "MessageAgent failed: agent timed out" {
+			t.Fatalf("timeout foreground result = %q, want structured timeout failure", got)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout foreground MessageAgent did not return")
 	}
 }
 
-func TestMessageAgentNativeTimeoutBeforeOpeningPreservesPendingObservation(t *testing.T) {
+func TestMessageAgentNativeTimeoutBeforeOpeningReturnsStructuredFailure(t *testing.T) {
 	fixture := newNativeMessageAgentFixture(t)
 	messageAgent := delegationtool.NewMessageAgent(fixture.controller, loop.DelegationManaged, nil)
 	args := `{"agent_id":"` + fixture.childID.String() + `","message":"timeout before opening","wait_for_response":true,"timeout_seconds":0}`
@@ -411,23 +420,15 @@ func TestMessageAgentNativeTimeoutBeforeOpeningPreservesPendingObservation(t *te
 		if call.err != nil {
 			t.Fatalf("MessageAgent timeout-before-opening InvokableRun: %v", call.err)
 		}
-		var got struct {
-			State          string `json:"state"`
-			DeliveryStatus string `json:"delivery_status"`
-			ResponseStatus string `json:"response_status"`
-		}
-		if err := json.Unmarshal([]byte(messageAgentText(t, call.result)), &got); err != nil {
-			t.Fatalf("timeout-before-opening result JSON: %v", err)
-		}
-		if got.State != string(tool.AgentStateWorking) || got.DeliveryStatus != string(tool.DelegateDeliveryAcceptedPending) || got.ResponseStatus != "timed_out" {
-			t.Fatalf("timeout-before-opening result = %+v, want working/accepted_pending/timed_out", got)
+		if got := messageAgentErrorText(t, call.result); got != "MessageAgent failed: agent timed out" {
+			t.Fatalf("timeout-before-opening result = %q, want structured timeout failure", got)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("MessageAgent timeout-before-opening did not return")
 	}
 }
 
-func TestMessageAgentNativeCancellationBeforeOpeningPreservesPendingObservation(t *testing.T) {
+func TestMessageAgentNativeCancellationBeforeOpeningReturnsStructuredFailure(t *testing.T) {
 	fixture := newNativeMessageAgentFixture(t)
 	messageAgent := delegationtool.NewMessageAgent(fixture.controller, loop.DelegationManaged, nil)
 	args := `{"agent_id":"` + fixture.childID.String() + `","message":"cancel before opening","wait_for_response":true}`
@@ -461,16 +462,8 @@ func TestMessageAgentNativeCancellationBeforeOpeningPreservesPendingObservation(
 		if call.err != nil {
 			t.Fatalf("MessageAgent cancellation-before-opening InvokableRun: %v", call.err)
 		}
-		var got struct {
-			State          string `json:"state"`
-			DeliveryStatus string `json:"delivery_status"`
-			ResponseStatus string `json:"response_status"`
-		}
-		if err := json.Unmarshal([]byte(messageAgentText(t, call.result)), &got); err != nil {
-			t.Fatalf("cancellation-before-opening result JSON: %v", err)
-		}
-		if got.State != string(tool.AgentStateWorking) || got.DeliveryStatus != string(tool.DelegateDeliveryAcceptedPending) || got.ResponseStatus != "interrupted" {
-			t.Fatalf("cancellation-before-opening result = %+v, want working/accepted_pending/interrupted", got)
+		if got := messageAgentErrorText(t, call.result); got != "MessageAgent failed: agent interrupted" {
+			t.Fatalf("cancellation-before-opening result = %q, want structured interruption failure", got)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("MessageAgent cancellation-before-opening did not return")
@@ -847,7 +840,7 @@ func TestMessageAgentCallerCancellationAfterDispatchBeforeAcceptanceDoesNotRetra
 	}
 }
 
-func TestMessageAgentCallerTimeoutAfterAcceptanceEmitsNoInterrupt(t *testing.T) {
+func TestMessageAgentCallerTimeoutAfterAcceptanceReturnsFailureWithoutInterrupt(t *testing.T) {
 	fixture := newNativeMessageAgentFixture(t)
 	messageAgent := delegationtool.NewMessageAgent(fixture.controller, loop.DelegationManaged, nil)
 	args := `{"agent_id":"` + fixture.childID.String() + `","message":"steer","wait_for_response":true,"timeout_seconds":0}`
@@ -878,16 +871,8 @@ func TestMessageAgentCallerTimeoutAfterAcceptanceEmitsNoInterrupt(t *testing.T) 
 		if call.err != nil {
 			t.Fatalf("MessageAgent InvokableRun after timeout: %v", call.err)
 		}
-		var got struct {
-			State          string `json:"state"`
-			DeliveryStatus string `json:"delivery_status"`
-			ResponseStatus string `json:"response_status"`
-		}
-		if err := json.Unmarshal([]byte(messageAgentText(t, call.result)), &got); err != nil {
-			t.Fatalf("timeout result JSON: %v", err)
-		}
-		if got.State != string(tool.AgentStateWorking) || got.DeliveryStatus != string(tool.DelegateDeliveryAcceptedPending) || got.ResponseStatus != "timed_out" {
-			t.Fatalf("timeout result = %+v, want working/accepted_pending/timed_out", got)
+		if got := messageAgentErrorText(t, call.result); got != "MessageAgent failed: agent timed out" {
+			t.Fatalf("timeout result = %q, want structured timeout failure", got)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("MessageAgent did not return after caller timeout")

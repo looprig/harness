@@ -1099,18 +1099,62 @@ func blockTypeOf(b content.Block) content.BlockType {
 // capPreview caps a preview string by BOTH a byte budget and a line budget, with a
 // visible truncation marker appended when either is exceeded.
 func capPreview(s string) string {
-	truncated := false
+	var normalized strings.Builder
+	normalizing := false
+	outputBytes := 0
+	markerPrefixBytes := 0
+	lines := 1
 
-	if lines := strings.Split(s, "\n"); len(lines) > previewMaxLines {
-		s = strings.Join(lines[:previewMaxLines], "\n")
-		truncated = true
+	for offset := 0; offset < len(s); {
+		r, size := utf8.DecodeRuneInString(s[offset:])
+		invalid := r == utf8.RuneError && size == 1
+		outputSize := size
+		if invalid {
+			outputSize = utf8.RuneLen(utf8.RuneError)
+		}
+
+		if !invalid && r == '\n' && lines == previewMaxLines {
+			return markedPreview(previewPrefix(s, offset, &normalized, normalizing), markerPrefixBytes)
+		}
+		if outputBytes+outputSize > previewMaxBytes {
+			return markedPreview(previewPrefix(s, offset, &normalized, normalizing), markerPrefixBytes)
+		}
+
+		if invalid && !normalizing {
+			normalized.Grow(previewMaxBytes)
+			normalized.WriteString(s[:offset])
+			normalizing = true
+		}
+		if normalizing {
+			if invalid {
+				normalized.WriteRune(utf8.RuneError)
+			} else {
+				normalized.WriteString(s[offset : offset+size])
+			}
+		}
+
+		outputBytes += outputSize
+		if outputBytes <= previewMaxBytes-len(truncationMarker) {
+			markerPrefixBytes = outputBytes
+		}
+		if r == '\n' {
+			lines++
+		}
+		offset += size
 	}
-	if len(s) > previewMaxBytes {
-		s = s[:previewMaxBytes]
-		truncated = true
-	}
-	if truncated {
-		return s + truncationMarker
+	if normalizing {
+		return normalized.String()
 	}
 	return s
+}
+
+func previewPrefix(source string, offset int, normalized *strings.Builder, normalizing bool) string {
+	if normalizing {
+		return normalized.String()
+	}
+	return source[:offset]
+}
+
+func markedPreview(prefix string, markerPrefixBytes int) string {
+	return prefix[:markerPrefixBytes] + truncationMarker
 }

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -1082,6 +1083,118 @@ func TestRunBatch_ResultPreviewCapped(t *testing.T) {
 	}
 	if smallPreview != "tiny" {
 		t.Errorf("small preview = %q, want %q (not truncated)", smallPreview, "tiny")
+	}
+}
+
+func TestRunBatch_ResultPreviewCappedAtCompleteUTF8Rune(t *testing.T) {
+	t.Parallel()
+	const runeText = "界"
+	raw := strings.Repeat(runeText, previewMaxBytes)
+	tl := &fakeRunTool{name: "Multibyte", output: raw}
+	emit, getEvents := collectEmit()
+	results := runBatchNoGate(context.Background(), []content.ToolUseBlock{call(t, "Multibyte", `{}`)}, ToolSet{
+		Access: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 1,
+	}, emit)
+
+	if len(results) != 1 || resultText(results[0]) != raw {
+		t.Fatal("runner altered the durable full tool result")
+	}
+	var preview string
+	for _, emitted := range getEvents() {
+		if completed, ok := emitted.(event.ToolCallCompleted); ok {
+			preview = completed.ResultPreview
+		}
+	}
+	if len(preview) > previewMaxBytes {
+		t.Fatalf("preview bytes = %d, want <= %d", len(preview), previewMaxBytes)
+	}
+	if !utf8.ValidString(preview) {
+		t.Fatalf("preview is invalid UTF-8: %q", preview)
+	}
+	if !strings.HasSuffix(preview, truncationMarker) {
+		t.Fatalf("preview = %q, want truncation marker", preview)
+	}
+	wantRunes := (previewMaxBytes - len(truncationMarker)) / len(runeText)
+	want := strings.Repeat(runeText, wantRunes) + truncationMarker
+	if preview != want {
+		t.Fatalf("preview = %q, want deterministic complete-rune prefix %q", preview, want)
+	}
+}
+
+func TestCapPreviewNormalizesMalformedUTF8(t *testing.T) {
+	t.Parallel()
+
+	t.Run("short invalid input", func(t *testing.T) {
+		t.Parallel()
+		if got, want := capPreview("before\xffafter"), "before\uFFFDafter"; got != want {
+			t.Fatalf("capPreview() = %q, want deterministic replacement %q", got, want)
+		} else if !utf8.ValidString(got) {
+			t.Fatalf("capPreview() returned invalid UTF-8: %q", got)
+		}
+	})
+
+	t.Run("oversized malformed multibyte input", func(t *testing.T) {
+		t.Parallel()
+		raw := "\xff" + strings.Repeat("界", previewMaxBytes)
+		got := capPreview(raw)
+		if len(got) > previewMaxBytes {
+			t.Fatalf("preview bytes = %d, want <= %d", len(got), previewMaxBytes)
+		}
+		if !utf8.ValidString(got) {
+			t.Fatalf("preview is invalid UTF-8: %q", got)
+		}
+		if !strings.HasSuffix(got, truncationMarker) {
+			t.Fatalf("preview = %q, want truncation marker", got)
+		}
+		budget := previewMaxBytes - len(truncationMarker)
+		want := "\uFFFD" + strings.Repeat("界", (budget-len("\uFFFD"))/len("界")) + truncationMarker
+		if got != want {
+			t.Fatalf("preview = %q, want normalized complete-rune prefix %q", got, want)
+		}
+	})
+
+	t.Run("valid short input unchanged", func(t *testing.T) {
+		t.Parallel()
+		const want = "short 界 preview"
+		if got := capPreview(want); got != want {
+			t.Fatalf("capPreview() = %q, want exact valid input %q", got, want)
+		}
+	})
+
+	t.Run("line boundary preserves exactly twenty lines", func(t *testing.T) {
+		t.Parallel()
+		twentyLines := strings.Repeat("line\n", previewMaxLines-1) + "line"
+		if got := capPreview(twentyLines); got != twentyLines {
+			t.Fatalf("twenty-line preview changed: got %q, want %q", got, twentyLines)
+		}
+		if got, want := capPreview(twentyLines+"\noverflow"), twentyLines+truncationMarker; got != want {
+			t.Fatalf("twenty-one-line preview = %q, want %q", got, want)
+		}
+	})
+}
+
+var capPreviewSink string
+
+func TestCapPreviewMalformedAllocationIsBoundedByPreviewSize(t *testing.T) {
+	small := strings.Repeat("\xff", previewMaxBytes)
+	large := strings.Repeat("\xff", 4<<20)
+	allocatedBytes := func(input string) int64 {
+		result := testing.Benchmark(func(b *testing.B) {
+			for range b.N {
+				capPreviewSink = capPreview(input)
+			}
+		})
+		return result.AllocedBytesPerOp()
+	}
+
+	smallBytes := allocatedBytes(small)
+	largeBytes := allocatedBytes(large)
+	t.Logf("capPreview allocated bytes/op: small=%d large=%d", smallBytes, largeBytes)
+	if largeBytes > smallBytes+8*previewMaxBytes {
+		t.Fatalf("capPreview allocation scales with input: small=%d bytes/op large=%d bytes/op", smallBytes, largeBytes)
+	}
+	if len(capPreviewSink) > previewMaxBytes || !utf8.ValidString(capPreviewSink) || !strings.HasSuffix(capPreviewSink, truncationMarker) {
+		t.Fatalf("huge malformed preview = %q, want bounded valid marked output", capPreviewSink)
 	}
 }
 

@@ -299,6 +299,15 @@ func TestForegroundAgentTerminalStatusesReturnStructuredFailures(t *testing.T) {
 		{name: "message failed", tool: func(c *fakeController) preparedAgentTool {
 			return NewMessageAgent(c, loop.DelegationManaged, agentCatalog())
 		}, args: `{"agent_id":"` + agentID + `","message":"continue"}`, result: tool.DelegateResult{ResponseStatus: tool.DelegateResponseFailed, Response: "child rejected message"}, want: "MessageAgent failed: child rejected message"},
+		{name: "message queued failed", tool: func(c *fakeController) preparedAgentTool {
+			return NewMessageAgent(c, loop.DelegationManaged, agentCatalog())
+		}, args: `{"agent_id":"` + agentID + `","message":"continue"}`, result: tool.DelegateResult{DeliveryStatus: tool.DelegateDeliveryQueued, ResponseStatus: tool.DelegateResponseFailed, Response: "foreign child failed"}, want: "MessageAgent failed: foreign child failed"},
+		{name: "message injected interrupted", tool: func(c *fakeController) preparedAgentTool {
+			return NewMessageAgent(c, loop.DelegationManaged, agentCatalog())
+		}, args: `{"agent_id":"` + agentID + `","message":"continue"}`, result: tool.DelegateResult{DeliveryStatus: tool.DelegateDeliveryInjected, ResponseStatus: tool.DelegateResponseInterrupted}, want: "MessageAgent failed: agent interrupted"},
+		{name: "message queued timed out", tool: func(c *fakeController) preparedAgentTool {
+			return NewMessageAgent(c, loop.DelegationManaged, agentCatalog())
+		}, args: `{"agent_id":"` + agentID + `","message":"continue"}`, result: tool.DelegateResult{DeliveryStatus: tool.DelegateDeliveryQueued, ResponseStatus: tool.DelegateResponseTimedOut}, want: "MessageAgent failed: agent timed out"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -333,6 +342,28 @@ func TestMessageAgentAcceptedPendingRemainsSuccessfulDeliveryEnvelope(t *testing
 	want := `{"agent_id":"` + agentID + `","name":"map","state":"working","delivery_status":"accepted_pending"}`
 	if got := textOf(t, result); got != want {
 		t.Fatalf("result = %q, want successful delivery envelope %q", got, want)
+	}
+}
+
+func TestMessageAgentUnknownDeliveryDoesNotSurfaceUncorrelatedTerminalResponse(t *testing.T) {
+	t.Parallel()
+	const agentID = "55555555-5555-4555-8555-555555555555"
+	controller := &fakeController{result: tool.DelegateResult{
+		AgentID:        mustParseUUID(t, agentID),
+		Name:           "map",
+		State:          tool.AgentStateWorking,
+		DeliveryStatus: tool.DelegateDeliveryUnknown,
+		ResponseStatus: tool.DelegateResponseFailed,
+		Response:       "uncorrelated failure must not surface",
+	}}
+	message := NewMessageAgent(controller, loop.DelegationManaged, agentCatalog())
+	result, err := invokePrepared(t, message, `{"agent_id":"`+agentID+`","message":"continue"}`)
+	if err != nil {
+		t.Fatalf("InvokableRun() error = %v", err)
+	}
+	want := `{"agent_id":"` + agentID + `","name":"map","state":"working","delivery_status":"delivery_unknown"}`
+	if got := textOf(t, result); got != want {
+		t.Fatalf("result = %q, want uncorrelated delivery envelope %q", got, want)
 	}
 }
 

@@ -106,7 +106,7 @@ func terminalAgentFailure(req tool.DelegateRequest, result tool.DelegateResult) 
 	if !req.WaitForResponse || (req.Operation != tool.DelegateStart && req.Operation != tool.DelegateSend) {
 		return "", false
 	}
-	if result.DeliveryStatus != "" {
+	if result.DeliveryStatus == tool.DelegateDeliveryUnknown || result.DeliveryStatus == tool.DelegateDeliveryUntrackable {
 		return "", false
 	}
 	switch result.ResponseStatus {
@@ -122,6 +122,9 @@ func terminalAgentFailure(req tool.DelegateRequest, result tool.DelegateResult) 
 	case tool.DelegateResponseTimedOut:
 		return "agent timed out", true
 	default:
+		if result.DeliveryStatus != "" {
+			return "", false
+		}
 		return "agent returned invalid response status", true
 	}
 }
