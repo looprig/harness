@@ -1345,6 +1345,40 @@ func TestRestoredBackgroundFailureDetailUsesDurableTurnFailure(t *testing.T) {
 	}
 }
 
+func TestFoldDelegateTerminalsUsesOriginalRestoredModelFacingMessage(t *testing.T) {
+	t.Parallel()
+	requestID, turnID, childID, sessionID := mustUUID(), mustUUID(), mustUUID(), mustUUID()
+	rawErr := &markedDelegateFailure{detail: "provider rejected model alias"}
+	failure := event.TurnFailed{
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: childID, TurnID: turnID}, EventID: mustUUID()},
+		Err:    rawErr,
+	}
+	encoded, err := event.MarshalEvent(failure)
+	if err != nil {
+		t.Fatalf("MarshalEvent(TurnFailed) error = %v", err)
+	}
+	decoded, err := event.UnmarshalEvent(encoded)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent(TurnFailed) error = %v", err)
+	}
+	decodedFailure := decoded.(event.TurnFailed)
+	var restored *event.RestoredModelFacingError
+	if !errors.As(decodedFailure.Err, &restored) {
+		t.Fatalf("restored failure = %T, want *event.RestoredModelFacingError", decodedFailure.Err)
+	}
+
+	resolved, ok := foldDelegateTerminals([]event.Event{
+		event.TurnStarted{Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: childID, TurnID: turnID},
+			Cause:       identity.Cause{CommandID: requestID},
+		}},
+		decodedFailure,
+	})[requestID]
+	if !ok || resolved.status != tool.DelegateStatusFailed || resolved.text != rawErr.Error() {
+		t.Fatalf("restored model-facing fold = %+v/%v, want failed response %q", resolved, ok, rawErr)
+	}
+}
+
 func TestRestoreOverlaysAdmittedQueuedCancellationReason(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

@@ -356,7 +356,7 @@ func (c *foreignDeliveryCoordinator) sendTargetHandBack(status tool.DelegateDeli
 		responseStatus = tool.DelegateStatusTimedOut
 	}
 	if responseStatus == tool.DelegateStatusFailed && text == "" {
-		text = delegateFailureDetail(err)
+		text = delegateObservedFailureDetail(err)
 	}
 	if c.session.sessionCtx.Err() != nil {
 		return
@@ -467,7 +467,7 @@ func (c *scopedController) resolveForeignForeground(ctx context.Context, s *Sess
 			responseStatus = tool.DelegateStatusTimedOut
 		}
 		if responseStatus == tool.DelegateStatusFailed && text == "" {
-			text = delegateFailureDetail(err)
+			text = delegateObservedFailureDetail(err)
 		}
 		if drainObserverExpired(err) {
 			coordinator.detach()

@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -379,6 +380,88 @@ func TestMessageAgentForeignQueuedWaitReportsQueuedDeliveryAndResponse(t *testin
 	}
 	if call.result.DeliveryStatus != tool.DelegateDeliveryQueued || call.result.ResponseStatus != tool.DelegateResponseCompleted || call.result.Response != "queued answer" {
 		t.Fatalf("result = %+v, want queued/completed/queued answer", call.result)
+	}
+}
+
+func TestMessageAgentForeignQueuedForegroundPreservesFailureCause(t *testing.T) {
+	fixture := newForeignMessageAgentFixture(t)
+	providerErr := errors.New("provider rejected model alias")
+	resultCh := make(chan struct {
+		result tool.DelegateResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := fixture.controller.Execute(context.Background(), foreignMessageRequest(fixture.childID, true))
+		resultCh <- struct {
+			result tool.DelegateResult
+			err    error
+		}{result: result, err: err}
+	}()
+	cmd := (<-fixture.child.Commands).(command.UserInput)
+	if err := fixture.hook.QueueFallback(context.Background(), foreignFallbackIntent(cmd.CommandID, fixture.childID)); err != nil {
+		t.Fatalf("QueueFallback: %v", err)
+	}
+	cmd.Accepted <- nil
+	turnID := mustUUID()
+	fixture.sub.feed(foreignTurnEvent(fixture, cmd.CommandID, turnID, false))
+	fixture.sub.feed(event.TurnFailed{Header: event.Header{Coordinates: identity.Coordinates{
+		SessionID: fixture.session.sessionID, LoopID: fixture.childID, TurnID: turnID,
+	}}, Err: providerErr})
+
+	select {
+	case call := <-resultCh:
+		if call.err != nil {
+			t.Fatalf("Execute: %v", call.err)
+		}
+		if call.result.DeliveryStatus != tool.DelegateDeliveryQueued || call.result.ResponseStatus != tool.DelegateResponseFailed || call.result.Response != providerErr.Error() {
+			t.Fatalf("foreground failure = %+v, want queued/failed/%q", call.result, providerErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("foreground failure did not resolve")
+	}
+}
+
+func TestMessageAgentForeignQueuedBackgroundPreservesFailureCause(t *testing.T) {
+	fixture := newForeignMessageAgentFixture(t)
+	providerErr := errors.New("provider rejected model alias")
+	resultCh := make(chan struct {
+		result tool.DelegateResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := fixture.controller.Execute(context.Background(), foreignMessageRequest(fixture.childID, false))
+		resultCh <- struct {
+			result tool.DelegateResult
+			err    error
+		}{result: result, err: err}
+	}()
+	cmd := (<-fixture.child.Commands).(command.UserInput)
+	if err := fixture.hook.QueueFallback(context.Background(), foreignFallbackIntent(cmd.CommandID, fixture.childID)); err != nil {
+		t.Fatalf("QueueFallback: %v", err)
+	}
+	cmd.Accepted <- nil
+	call := <-resultCh
+	if call.err != nil || call.result.DeliveryStatus != tool.DelegateDeliveryQueued || call.result.CorrelationID != cmd.CommandID {
+		t.Fatalf("background admission = %+v/%v, want queued correlation=%v", call.result, call.err, cmd.CommandID)
+	}
+	turnID := mustUUID()
+	fixture.sub.feed(foreignTurnEvent(fixture, cmd.CommandID, turnID, false))
+	fixture.sub.feed(event.TurnFailed{Header: event.Header{Coordinates: identity.Coordinates{
+		SessionID: fixture.session.sessionID, LoopID: fixture.childID, TurnID: turnID,
+	}}, Err: providerErr})
+
+	select {
+	case raw := <-fixture.parent.Commands:
+		handBack, ok := raw.(command.SubagentResult)
+		if !ok {
+			t.Fatalf("failure handback = %T, want command.SubagentResult", raw)
+		}
+		completion, ok := decodeBackgroundCompletion(handBack.Blocks)
+		if !ok || completion.DeliveryStatus != tool.DelegateDeliveryQueued || completion.ResponseStatus != tool.DelegateResponseFailed || completion.Response != providerErr.Error() || completion.CorrelationID != cmd.CommandID.String() {
+			t.Fatalf("background failure = %+v/%v, want queued/failed/%q correlation=%v", completion, ok, providerErr, cmd.CommandID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("background failure handback did not arrive")
 	}
 }
 
