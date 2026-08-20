@@ -35,9 +35,8 @@ func TestNewRuntimeCatalogInvariants(t *testing.T) {
 		{name: "duplicate harness entry", mutate: func(entries []RuntimeCatalogEntry) { entries[1].AgentHarness = entries[0].AgentHarness }, wantKind: RuntimeCatalogDuplicateHarness},
 		{name: "two default harnesses", mutate: func(entries []RuntimeCatalogEntry) { entries[0].Default = true }, wantKind: RuntimeCatalogDefaultHarnessCount},
 		{name: "no default harness", mutate: func(entries []RuntimeCatalogEntry) { entries[0].Default = false; entries[1].Default = false }, wantKind: RuntimeCatalogDefaultHarnessCount},
-		{name: "invalid effort xhigh", mutate: func(entries []RuntimeCatalogEntry) { entries[0].Models[0].Efforts = []model.Effort{"xhigh"} }, wantKind: RuntimeCatalogInvalidEffort},
 		{name: "invalid effort ultra", mutate: func(entries []RuntimeCatalogEntry) { entries[0].Models[0].Efforts = []model.Effort{"ultra"} }, wantKind: RuntimeCatalogInvalidEffort},
-		{name: "invalid default effort", mutate: func(entries []RuntimeCatalogEntry) { entries[0].Models[0].DefaultEffort = "xhigh" }, wantKind: RuntimeCatalogInvalidEffort},
+		{name: "invalid default effort", mutate: func(entries []RuntimeCatalogEntry) { entries[0].Models[0].DefaultEffort = "ultra" }, wantKind: RuntimeCatalogInvalidEffort},
 		{name: "duplicate effort", mutate: func(entries []RuntimeCatalogEntry) {
 			entries[0].Models[0].Efforts = []model.Effort{model.EffortLow, model.EffortLow}
 		}, wantKind: RuntimeCatalogDuplicateEffort},
@@ -166,6 +165,10 @@ func TestRuntimeCatalogAcceptsSafeProfileSegmentsAndRejectsPathLikeProfiles(t *t
 
 func TestRuntimeCatalogSortsEntriesAndModels(t *testing.T) {
 	entries := testCatalogEntries()
+	entries[0].Models[0].Efforts = []model.Effort{
+		model.EffortMax, model.EffortNone, model.EffortXHigh, model.EffortLow,
+		model.EffortMinimal, model.EffortHigh, model.EffortMedium,
+	}
 	entries[0].Models = append(entries[0].Models, RuntimeModelOption{
 		Alias: "aaa", Target: runtimeModel("aaa-target", model.EffortNone), DefaultEffort: model.EffortNone,
 		Efforts: []model.Effort{model.EffortNone},
@@ -188,6 +191,13 @@ func TestRuntimeCatalogSortsEntriesAndModels(t *testing.T) {
 	}
 	if got[1].Models[0].Alias != "aaa" || got[1].Models[1].Alias != "o3" {
 		t.Fatalf("sorted model aliases = %q, %q", got[1].Models[0].Alias, got[1].Models[1].Alias)
+	}
+	wantEfforts := []model.Effort{
+		model.EffortNone, model.EffortMinimal, model.EffortLow, model.EffortMedium,
+		model.EffortHigh, model.EffortXHigh, model.EffortMax,
+	}
+	if gotEfforts := got[1].Models[1].Efforts; !reflect.DeepEqual(gotEfforts, wantEfforts) {
+		t.Fatalf("sorted efforts = %v, want %v", gotEfforts, wantEfforts)
 	}
 }
 

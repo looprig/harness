@@ -43,7 +43,7 @@ require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
 	github.com/looprig/core v0.6.0
-	github.com/looprig/inference v0.11.0
+	github.com/looprig/inference v0.12.0
 	github.com/looprig/storage v0.4.0
 	github.com/openai/openai-go/v3 v3.50.0 // indirect
 	github.com/securego/gosec/v2 v2.28.0 // indirect

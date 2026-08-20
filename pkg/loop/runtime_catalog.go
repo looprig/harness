@@ -846,16 +846,20 @@ func effortRank(effort model.Effort) int {
 	switch effort {
 	case model.EffortNone:
 		return 0
-	case model.EffortLow:
+	case model.EffortMinimal:
 		return 1
-	case model.EffortMedium:
+	case model.EffortLow:
 		return 2
-	case model.EffortHigh:
+	case model.EffortMedium:
 		return 3
-	case model.EffortMax:
+	case model.EffortHigh:
 		return 4
-	default:
+	case model.EffortXHigh:
 		return 5
+	case model.EffortMax:
+		return 6
+	default:
+		return 7
 	}
 }
 
