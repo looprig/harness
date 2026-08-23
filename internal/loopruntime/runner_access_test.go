@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/looprig/core/content"
@@ -52,6 +53,26 @@ type fixedAccessSource struct{ access uint8 }
 
 func (fixedAccessSource) AccessVersion() uint16                  { return gatedomain.CurrentAccessVersion }
 func (s fixedAccessSource) AccessFor(_, _ string) (uint8, error) { return s.access, nil }
+
+// mutationPreviewArtifact is a test-only prepared artifact that records when
+// the runner asks it to render its pending mutation. Embedding TokenArtifact
+// deliberately preserves the tool package's sealed PreparedArtifact contract.
+type mutationPreviewArtifact struct {
+	tool.TokenArtifact
+	preview tool.MutationPreview
+	ok      bool
+	calls   atomic.Int32
+}
+
+func (a *mutationPreviewArtifact) MutationPreview() (tool.MutationPreview, bool) {
+	a.calls.Add(1)
+	return a.preview, a.ok
+}
+
+var (
+	_ tool.PreparedArtifact  = (*mutationPreviewArtifact)(nil)
+	_ tool.MutationPreviewer = (*mutationPreviewArtifact)(nil)
+)
 
 // recordingRuleWriter records atomically persisted candidate batches. A
 // non-nil err makes persistence fail (nothing is recorded).
@@ -427,7 +448,7 @@ func TestRunBatch_InteractiveGateOpensOnceApproveOnce(t *testing.T) {
 	t.Parallel()
 	tl := &fakeRunTool{name: "T", output: "ok"}
 	tl.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
-		return commandRequest(executionID, "git push", true), nil, nil
+		return commandRequest(executionID, "git push", true), tool.TokenArtifact{Token: "opaque"}, nil
 	}
 	var mu sync.Mutex
 	var gotGrants []string
@@ -481,14 +502,146 @@ func TestRunBatch_InteractiveGateOpensOnceApproveOnce(t *testing.T) {
 	if len(writer.batches()) != 0 {
 		t.Errorf("writer batches = %d, want 0 for a once approval", len(writer.batches()))
 	}
-	var nRequested int
+	var requested []event.PermissionRequested
 	for _, ev := range getEvents() {
-		if _, ok := ev.(event.PermissionRequested); ok {
-			nRequested++
+		if permission, ok := ev.(event.PermissionRequested); ok {
+			requested = append(requested, permission)
 		}
 	}
-	if nRequested != 1 {
-		t.Errorf("PermissionRequested count = %d, want 1", nRequested)
+	if len(requested) != 1 {
+		t.Errorf("PermissionRequested count = %d, want 1", len(requested))
+	}
+	if len(requested) == 1 && requested[0].Preview != nil {
+		t.Errorf("PermissionRequested.Preview = %+v, want nil for an artifact without MutationPreviewer", requested[0].Preview)
+	}
+}
+
+func TestRunBatch_AutoAllowedCallDoesNotComputeMutationPreview(t *testing.T) {
+	t.Parallel()
+
+	artifact := &mutationPreviewArtifact{
+		preview: tool.MutationPreview{Path: "config.yaml", UnifiedDiff: "@@ -1 +1 @@"},
+		ok:      true,
+	}
+	tl := &fakeRunTool{name: "T", output: "ok"}
+	tl.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status", false), artifact, nil
+	}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 2}
+	emit, getEvents := collectEmit()
+
+	results := runBatchNoGate(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, emit)
+
+	if len(results) != 1 || results[0].IsError {
+		t.Fatalf("results = %+v, want one auto-approved success", results)
+	}
+	if got := artifact.calls.Load(); got != 0 {
+		t.Fatalf("MutationPreview calls = %d, want 0 when no permission gate opens", got)
+	}
+	for _, ev := range getEvents() {
+		if permission, ok := ev.(event.PermissionRequested); ok {
+			t.Fatalf("PermissionRequested = %+v, want no permission request for auto-allowed call", permission)
+		}
+	}
+}
+
+func TestRunBatch_GatedPermissionRequestCarriesMutationPreview(t *testing.T) {
+	t.Parallel()
+
+	wantPreview := tool.MutationPreview{
+		Path:        "config.yaml",
+		Creates:     true,
+		UnifiedDiff: "@@ -0,0 +1 @@\n+enabled: true",
+	}
+	artifact := &mutationPreviewArtifact{preview: wantPreview, ok: true}
+	tl := &fakeRunTool{name: "T", output: "ok"}
+	tl.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status", false), artifact, nil
+	}
+	ts := ToolSet{
+		Access:               interactiveEvaluator(t, gatedomain.AccessGated, &recordingRuleWriter{}, &recordingIssuer{}),
+		Registry:             []tool.InvokableTool{tl},
+		MaxParallelToolCalls: 2,
+	}
+	emit, getEvents := collectEmit()
+	gateReg := make(chan gateRegistration, 1)
+	go func() {
+		reg := <-gateReg
+		reg.ack <- gateInstallAck{gateID: reg.gate.Subject.ToolExecutionID}
+		reg.reply <- command.ApproveToolCall{
+			GateRoute: command.GateRoute{ToolExecutionID: reg.callID},
+			Action:    gatedomain.ApprovalApprove,
+		}
+	}()
+
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
+
+	if len(results) != 1 || results[0].IsError {
+		t.Fatalf("results = %+v, want one approved success", results)
+	}
+	if got := artifact.calls.Load(); got != 1 {
+		t.Fatalf("MutationPreview calls = %d, want 1 for one real permission gate", got)
+	}
+	var requested []event.PermissionRequested
+	for _, ev := range getEvents() {
+		if permission, ok := ev.(event.PermissionRequested); ok {
+			requested = append(requested, permission)
+		}
+	}
+	if len(requested) != 1 {
+		t.Fatalf("PermissionRequested count = %d, want 1", len(requested))
+	}
+	if requested[0].Preview == nil {
+		t.Fatal("PermissionRequested.Preview = nil, want artifact mutation preview")
+	}
+	if got := *requested[0].Preview; got != wantPreview {
+		t.Errorf("PermissionRequested.Preview = %+v, want %+v", got, wantPreview)
+	}
+}
+
+func TestRunBatch_GatedPermissionRequestKeepsNilPreviewWhenUnavailable(t *testing.T) {
+	t.Parallel()
+
+	artifact := &mutationPreviewArtifact{ok: false}
+	tl := &fakeRunTool{name: "T", output: "ok"}
+	tl.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status", false), artifact, nil
+	}
+	ts := ToolSet{
+		Access:               interactiveEvaluator(t, gatedomain.AccessGated, &recordingRuleWriter{}, &recordingIssuer{}),
+		Registry:             []tool.InvokableTool{tl},
+		MaxParallelToolCalls: 2,
+	}
+	emit, getEvents := collectEmit()
+	gateReg := make(chan gateRegistration, 1)
+	go func() {
+		reg := <-gateReg
+		reg.ack <- gateInstallAck{gateID: reg.gate.Subject.ToolExecutionID}
+		reg.reply <- command.ApproveToolCall{
+			GateRoute: command.GateRoute{ToolExecutionID: reg.callID},
+			Action:    gatedomain.ApprovalApprove,
+		}
+	}()
+
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, BatchRuntime{GateRegistrations: gateReg, IDGen: uuid.New, Emit: emit})
+
+	if len(results) != 1 || results[0].IsError {
+		t.Fatalf("results = %+v, want one approved success when preview is unavailable", results)
+	}
+	if got := artifact.calls.Load(); got != 1 {
+		t.Fatalf("MutationPreview calls = %d, want 1 for one real permission gate", got)
+	}
+	var requested []event.PermissionRequested
+	for _, ev := range getEvents() {
+		if permission, ok := ev.(event.PermissionRequested); ok {
+			requested = append(requested, permission)
+		}
+	}
+	if len(requested) != 1 {
+		t.Fatalf("PermissionRequested count = %d, want 1", len(requested))
+	}
+	if requested[0].Preview != nil {
+		t.Errorf("PermissionRequested.Preview = %+v, want nil when preview is unavailable", requested[0].Preview)
 	}
 }
 

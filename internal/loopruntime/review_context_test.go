@@ -404,9 +404,13 @@ func TestPermissionReviewCaptureUsesCanonicalDeterministicTruncation(t *testing.
 func TestConfiguredReviewCaptureFailureStopsBeforeGateAndTool(t *testing.T) {
 	t.Parallel()
 
+	artifact := &mutationPreviewArtifact{
+		preview: tool.MutationPreview{Path: "config.yaml", UnifiedDiff: "@@ -1 +1 @@"},
+		ok:      true,
+	}
 	runTool := &fakeRunTool{name: "T", output: "must not run"}
 	runTool.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
-		return commandRequest(executionID, "git status", false), nil, nil
+		return commandRequest(executionID, "git status", false), artifact, nil
 	}
 	tools := resolveToolSetCaps(ToolSet{
 		Access:   interactiveEvaluator(t, gate.AccessGated, &recordingRuleWriter{}, &recordingIssuer{}),
@@ -433,6 +437,9 @@ func TestConfiguredReviewCaptureFailureStopsBeforeGateAndTool(t *testing.T) {
 	}
 	if atomic.LoadInt32(&runTool.totalRuns) != 0 {
 		t.Fatal("tool executed after review capture failure")
+	}
+	if got := artifact.calls.Load(); got != 1 {
+		t.Fatalf("MutationPreview calls = %d, want 1 before review capture fails", got)
 	}
 	select {
 	case <-gateReg:

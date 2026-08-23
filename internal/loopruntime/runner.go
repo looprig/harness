@@ -689,6 +689,17 @@ func approvalRequesterFor(
 	emit eventEmitter,
 ) loop.ApprovalRequestFunc {
 	return func(ctx context.Context, prompt gatedomain.ApprovalPrompt) (gatedomain.ApprovalAction, error) {
+		// Reaching the interactive approval callback means the evaluator found
+		// unmet gated requirements. Render the preview once at this gate-open
+		// boundary, before review-context capture, and keep that live-only value
+		// available for the rest of this gate path without a second query.
+		var preview *tool.MutationPreview
+		if previewer, ok := r.prepared.Artifact.(tool.MutationPreviewer); ok {
+			if value, ok := previewer.MutationPreview(); ok {
+				preview = &value
+			}
+		}
+
 		// Triggered BEFORE r.prompted is set: this is the earliest point a
 		// permission gate is genuinely about to open, so it is also the
 		// earliest (and only) point this batch's lazy review-context capture
@@ -732,7 +743,7 @@ func approvalRequesterFor(
 
 		// Install-before-emit: only now is the gate guaranteed installed, so the
 		// matching Approve/Deny cannot be dropped on a race.
-		emit(ctx, event.PermissionRequested{ToolExecutionID: r.callID, Request: displayed})
+		emit(ctx, event.PermissionRequested{ToolExecutionID: r.callID, Request: displayed, Preview: preview})
 
 		g.ID = installed.gateID
 		waitCtx, waitCall, finishWait, waitErr := startGateWaitWithRunner(ctx, r.hookCall, g, r.hooks)
