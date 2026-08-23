@@ -708,7 +708,7 @@ func approvalRequesterFor(
 		// because r.prompted stays false, resolveAccess's fail path still emits
 		// a PermissionDecided audit for this call instead of silently dropping
 		// it.
-		reviewContext, err := reviewContextForApproval(ctx)
+		reviewContext, err := reviewContextForApproval(ctx, preview)
 		if err != nil {
 			return "", err
 		}

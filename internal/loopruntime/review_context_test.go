@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/content/blocktest"
@@ -367,6 +368,373 @@ func TestRunTurnClonesOnePrivateReviewContextPerPermissionGate(t *testing.T) {
 	}
 	if _, ok := loopapi.ToolUseIDFrom(toolContext); ok {
 		t.Fatal("public tool-use API retrieved private review context")
+	}
+}
+
+func TestReviewContextForApprovalDoesNotFabricatePreviewWithoutProvider(t *testing.T) {
+	t.Parallel()
+
+	got, err := reviewContextForApproval(context.Background(), &tool.MutationPreview{
+		UnifiedDiff: "@@ -1 +1 @@\n-before\n+after\n",
+	})
+	if err != nil {
+		t.Fatalf("reviewContextForApproval() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, gate.ReviewContext{}) {
+		t.Fatalf("reviewContextForApproval() = %+v, want an unfabricated zero context", got)
+	}
+}
+
+func TestReviewContextForApprovalDoesNotFabricatePreviewWithNilProvider(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.WithValue(
+		context.Background(),
+		permissionReviewCaptureKey{},
+		(*reviewContextCaptureProvider)(nil),
+	)
+	got, err := reviewContextForApproval(ctx, &tool.MutationPreview{
+		UnifiedDiff: "@@ -1 +1 @@\n-before\n+after\n",
+	})
+	if err != nil {
+		t.Fatalf("reviewContextForApproval() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, gate.ReviewContext{}) {
+		t.Fatalf("reviewContextForApproval() = %+v, want an unfabricated zero context", got)
+	}
+}
+
+func TestReviewContextForApprovalAppendsAndBoundsPendingPreview(t *testing.T) {
+	t.Parallel()
+
+	ctx, provider := reviewContextCaptureContext(t)
+	base, err := provider.capture()
+	if err != nil {
+		t.Fatalf("capture() error = %v", err)
+	}
+	preview := &tool.MutationPreview{
+		Path:        "config.yaml",
+		Creates:     true,
+		UnifiedDiff: "@@ -0,0 +1 @@\n+enabled: true\n",
+	}
+
+	got, err := reviewContextForApproval(ctx, preview)
+	if err != nil {
+		t.Fatalf("reviewContextForApproval() error = %v", err)
+	}
+	if got.ContextRevision == "" || got.ContextRevision == base.ContextRevision {
+		t.Fatalf("ContextRevision = %q, want a non-empty revision distinct from captured base %q", got.ContextRevision, base.ContextRevision)
+	}
+	previews := reviewContextToolPreviews(got)
+	if len(previews) != 1 {
+		t.Fatalf("tool preview entries = %+v, want exactly one", previews)
+	}
+	if previews[0].Origin != gate.ReviewContextOriginTool ||
+		previews[0].Kind != gate.ReviewContextKindToolPreview ||
+		previews[0].Content != preview.UnifiedDiff ||
+		previews[0].Truncated {
+		t.Fatalf("tool preview entry = %+v, want the untruncated pending unified diff", previews[0])
+	}
+	bounded, err := gate.BuildReviewContext(got, provider.policy)
+	if err != nil {
+		t.Fatalf("gate.BuildReviewContext() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, bounded) {
+		t.Fatalf("review context was not already bounded:\n got: %#v\nwant: %#v", got, bounded)
+	}
+}
+
+func TestReviewContextForApprovalReboundsTruncatedCapturedBaseWithPreview(t *testing.T) {
+	t.Parallel()
+
+	input := validReviewCapture(t)
+	input.Base = content.AgenticMessages{
+		reviewAIMessage(&content.TextBlock{Text: strings.Repeat("older assistant evidence ", 20)}),
+	}
+	input.Policy.MaxAgentEntryBytes = 128
+	ctx, provider := reviewContextCaptureContextFrom(t, input)
+	base, err := provider.capture()
+	if err != nil {
+		t.Fatalf("capture() error = %v", err)
+	}
+	if base.Truncation.Applied&gate.ReviewTruncationAssistantEntry == 0 {
+		t.Fatalf("base truncation = %+v, want assistant-entry truncation", base.Truncation)
+	}
+
+	got, err := reviewContextForApproval(ctx, &tool.MutationPreview{
+		UnifiedDiff: "@@ -1 +1 @@\n-before\n+after\n",
+	})
+	if err != nil {
+		t.Fatalf("reviewContextForApproval() error = %v", err)
+	}
+	assertOnlyReviewContextToolPreview(t, got, "@@ -1 +1 @@\n-before\n+after\n", "unrelated preview")
+	again, err := provider.capture()
+	if err != nil {
+		t.Fatalf("second capture() error = %v", err)
+	}
+	if !reflect.DeepEqual(again, base) {
+		t.Fatalf("preview append mutated shared captured base:\n got: %#v\nwant: %#v", again, base)
+	}
+}
+
+func TestReviewContextForApprovalWithoutPreviewReturnsCapturedBase(t *testing.T) {
+	t.Parallel()
+
+	ctx, provider := reviewContextCaptureContext(t)
+	want, err := provider.capture()
+	if err != nil {
+		t.Fatalf("capture() error = %v", err)
+	}
+
+	got, err := reviewContextForApproval(ctx, nil)
+	if err != nil {
+		t.Fatalf("reviewContextForApproval() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("reviewContextForApproval(nil) = %#v, want captured base %#v", got, want)
+	}
+}
+
+func TestRunTurnGatedBatchKeepsMutationPreviewPerClassifierSnapshot(t *testing.T) {
+	t.Parallel()
+
+	const firstDiff = "@@ -1 +1 @@\n-first\n+FIRST\n"
+	const secondDiff = "@@ -1 +1 @@\n-second\n+SECOND\n"
+	firstArtifact := &mutationPreviewArtifact{preview: tool.MutationPreview{UnifiedDiff: firstDiff}, ok: true}
+	secondArtifact := &mutationPreviewArtifact{preview: tool.MutationPreview{UnifiedDiff: secondDiff}, ok: true}
+	firstTool := &fakeRunTool{name: "First", output: "ok"}
+	firstTool.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status first", false), firstArtifact, nil
+	}
+	secondTool := &fakeRunTool{name: "Second", output: "ok"}
+	secondTool.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status second", false), secondArtifact, nil
+	}
+	tools := resolveToolSetCaps(ToolSet{
+		Access:               interactiveEvaluator(t, gate.AccessGated, &recordingRuleWriter{}, &recordingIssuer{}),
+		Registry:             []tool.InvokableTool{firstTool, secondTool},
+		MaxParallelToolCalls: 2,
+	})
+	client := &scriptedLLM{scripts: [][]content.Chunk{
+		{
+			toolUseChunk(0, "active-first", "First", `{}`),
+			toolUseChunk(1, "active-second", "Second", `{}`),
+		},
+		{textChunk("done")},
+	}}
+	gateReg := make(chan gateRegistration)
+	registrations := make(chan gateRegistration, 2)
+	go func() {
+		for index := 0; index < 2; index++ {
+			registration := <-gateReg
+			registrations <- registration
+			close(registration.ack)
+			registration.reply <- approveCommand(registration.callID)
+		}
+	}()
+
+	cfg, state, _ := newTurnFixture(
+		[]content.Block{&content.TextBlock{Text: "current request"}},
+		content.AgenticMessages{reviewUserMessage("earlier user intent")},
+		tools,
+		client,
+		gateReg,
+	)
+	cfg.reviewContext = &reviewContextConfiguration{
+		Metadata: reviewContextMetadata{
+			WorkspaceRoot:      "/workspace",
+			WorkingDirectory:   "/workspace",
+			SecurityCeiling:    "workspace-write; unmet-requirements=true",
+			GatePolicyRevision: "gate-policy-v1",
+		},
+		Policy: testReviewContextPolicy(),
+	}
+	if terminal := runTurn(context.Background(), cfg, state); terminal == nil {
+		t.Fatal("runTurn() terminal = nil")
+	}
+
+	first := <-registrations
+	second := <-registrations
+	assertOnlyReviewContextToolPreview(t, first.reviewContext, firstDiff, secondDiff)
+	assertOnlyReviewContextToolPreview(t, second.reviewContext, secondDiff, firstDiff)
+	if first.reviewContext.ContextRevision == second.reviewContext.ContextRevision {
+		t.Fatalf("preview-specific context revisions match: %q", first.reviewContext.ContextRevision)
+	}
+	if got := firstArtifact.calls.Load(); got != 1 {
+		t.Fatalf("first MutationPreview calls = %d, want 1", got)
+	}
+	if got := secondArtifact.calls.Load(); got != 1 {
+		t.Fatalf("second MutationPreview calls = %d, want 1", got)
+	}
+}
+
+func TestLoopPermissionReviewStarterKeepsMutationPreviewsIsolated(t *testing.T) {
+	t.Parallel()
+
+	const firstDiff = "@@ -1 +1 @@\n-first\n+FIRST\n"
+	const secondDiff = "@@ -1 +1 @@\n-second\n+SECOND\n"
+	firstArtifact := &mutationPreviewArtifact{preview: tool.MutationPreview{UnifiedDiff: firstDiff}, ok: true}
+	secondArtifact := &mutationPreviewArtifact{preview: tool.MutationPreview{UnifiedDiff: secondDiff}, ok: true}
+	firstTool := &fakeRunTool{name: "First", output: "ok"}
+	firstTool.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status first", false), firstArtifact, nil
+	}
+	secondTool := &fakeRunTool{name: "Second", output: "ok"}
+	secondTool.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status second", false), secondArtifact, nil
+	}
+	tools := resolveToolSetCaps(ToolSet{
+		Access:               interactiveEvaluator(t, gate.AccessGated, &recordingRuleWriter{}, &recordingIssuer{}),
+		Registry:             []tool.InvokableTool{firstTool, secondTool},
+		MaxParallelToolCalls: 2,
+	})
+	client := &scriptedLLM{scripts: [][]content.Chunk{
+		{
+			toolUseChunk(0, "active-first", "First", `{}`),
+			toolUseChunk(1, "active-second", "Second", `{}`),
+		},
+		{textChunk("done")},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	publisher := &reviewLifecyclePublisher{}
+	instance, err := newWithConfig(ctx, mustID(t), mustID(t), Provenance{}, publisher, runtimeConfig{
+		Client:       client,
+		Model:        testModel(),
+		Tools:        tools,
+		DrainTimeout: 200 * time.Millisecond,
+		reviewContext: &reviewContextConfiguration{
+			Metadata: reviewContextMetadata{
+				WorkspaceRoot:      "/workspace",
+				WorkingDirectory:   "/workspace",
+				SecurityCeiling:    "workspace-write; unmet-requirements=true",
+				GatePolicyRevision: "gate-policy-v1",
+			},
+			Policy: testReviewContextPolicy(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("newWithConfig() error = %v", err)
+	}
+
+	startTurn(t, instance, &publisher.recordingPublisher, []content.Block{&content.TextBlock{Text: "current request"}})
+	awaitReviewCalls(t, publisher, 1)
+	firstRequest := publisher.reviewRequests()[0]
+	if !sendCmd(t, instance, command.ApproveToolCall{
+		GateRoute: command.GateRoute{GateID: firstRequest.GateID, ToolExecutionID: firstRequest.ToolExecutionID},
+		Action:    gate.ApprovalApprove,
+	}) {
+		t.Fatal("first approval was not delivered to the loop")
+	}
+
+	// Access resolution is sequential, so the first gate must be answered
+	// before the batch can reach the second real review-starter handoff.
+	awaitReviewCalls(t, publisher, 2)
+	requests := publisher.reviewRequests()
+	secondRequest := requests[1]
+	if !sendCmd(t, instance, command.ApproveToolCall{
+		GateRoute: command.GateRoute{GateID: secondRequest.GateID, ToolExecutionID: secondRequest.ToolExecutionID},
+		Action:    gate.ApprovalApprove,
+	}) {
+		t.Fatal("second approval was not delivered to the loop")
+	}
+	if _, ok := drainToTerminal(t, &publisher.recordingPublisher).(event.TurnDone); !ok {
+		t.Fatal("turn terminal is not TurnDone")
+	}
+
+	if len(requests) != 2 {
+		t.Fatalf("permission review requests = %d, want 2", len(requests))
+	}
+	firstIndex := reviewRequestWithToolPreview(t, requests, firstDiff)
+	secondIndex := reviewRequestWithToolPreview(t, requests, secondDiff)
+	assertOnlyReviewContextToolPreview(t, requests[firstIndex].ReviewContext, firstDiff, secondDiff)
+	assertOnlyReviewContextToolPreview(t, requests[secondIndex].ReviewContext, secondDiff, firstDiff)
+
+	// The review starter receives the classifier-visible snapshots. Mutate one
+	// only after the turn has ended, when no actor goroutine can observe these
+	// test snapshots, and prove the other request owns a distinct entry slice.
+	firstPreviewEntry := reviewContextToolPreviewEntryIndex(t, requests[firstIndex].ReviewContext)
+	secondPreviewEntry := reviewContextToolPreviewEntryIndex(t, requests[secondIndex].ReviewContext)
+	secondBefore := requests[secondIndex].ReviewContext.Entries[secondPreviewEntry].Content
+	requests[firstIndex].ReviewContext.Entries[firstPreviewEntry].Content = "mutated first classifier snapshot"
+	if got := requests[secondIndex].ReviewContext.Entries[secondPreviewEntry].Content; got != secondBefore {
+		t.Fatalf("mutating first classifier snapshot changed second preview to %q, want %q", got, secondBefore)
+	}
+}
+
+func reviewContextCaptureContext(t *testing.T) (context.Context, *reviewContextCaptureProvider) {
+	t.Helper()
+	return reviewContextCaptureContextFrom(t, validReviewCapture(t))
+}
+
+func reviewContextCaptureContextFrom(
+	t *testing.T,
+	input reviewContextCapture,
+) (context.Context, *reviewContextCaptureProvider) {
+	t.Helper()
+	base := append(append(content.AgenticMessages(nil), input.BaseRetained...), input.Base...)
+	msgs := append(append(content.AgenticMessages(nil), input.Retained...), input.Staged...)
+	provider := newReviewContextCaptureProvider(
+		input.Coordinates,
+		base,
+		len(input.BaseRetained),
+		msgs,
+		len(input.Retained),
+		input.Active,
+		input.RuntimeTail,
+		input.Metadata,
+		input.Policy,
+	)
+	return withPermissionReviewCapture(context.Background(), provider), provider
+}
+
+func reviewContextToolPreviews(review gate.ReviewContext) []gate.ReviewContextEntry {
+	var previews []gate.ReviewContextEntry
+	for _, entry := range review.Entries {
+		if entry.Kind == gate.ReviewContextKindToolPreview {
+			previews = append(previews, entry)
+		}
+	}
+	return previews
+}
+
+func reviewRequestWithToolPreview(t *testing.T, requests []PermissionReviewRequest, want string) int {
+	t.Helper()
+	for index, request := range requests {
+		previews := reviewContextToolPreviews(request.ReviewContext)
+		if len(previews) == 1 && previews[0].Content == want {
+			return index
+		}
+	}
+	t.Fatalf("no permission review request contains tool preview %q: %+v", want, requests)
+	return -1
+}
+
+func reviewContextToolPreviewEntryIndex(t *testing.T, review gate.ReviewContext) int {
+	t.Helper()
+	for index, entry := range review.Entries {
+		if entry.Kind == gate.ReviewContextKindToolPreview {
+			return index
+		}
+	}
+	t.Fatalf("no tool preview entry in review context: %+v", review)
+	return -1
+}
+
+func assertOnlyReviewContextToolPreview(
+	t *testing.T,
+	review gate.ReviewContext,
+	want, absent string,
+) {
+	t.Helper()
+	previews := reviewContextToolPreviews(review)
+	if len(previews) != 1 || previews[0].Origin != gate.ReviewContextOriginTool || previews[0].Content != want {
+		t.Fatalf("tool preview entries = %+v, want exactly one tool preview %q", previews, want)
+	}
+	for _, entry := range review.Entries {
+		if strings.Contains(entry.Content, absent) {
+			t.Fatalf("review context leaked another gate's preview %q into %+v", absent, review.Entries)
+		}
 	}
 }
 

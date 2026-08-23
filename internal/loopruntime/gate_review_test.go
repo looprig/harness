@@ -37,6 +37,7 @@ type reviewLifecyclePublisher struct {
 	reviewSeq   int
 	reviewCalls int
 	lastReview  PermissionReviewRequest
+	reviews     []PermissionReviewRequest
 }
 
 func (p *reviewLifecyclePublisher) nextSequence() int {
@@ -79,6 +80,7 @@ func (p *reviewLifecyclePublisher) StartPermissionReview(_ context.Context, req 
 	p.reviewSeq = seq
 	p.reviewCalls++
 	p.lastReview = req
+	p.reviews = append(p.reviews, req)
 	release := p.releaseReview
 	p.mu.Unlock()
 	if release != nil {
@@ -92,6 +94,15 @@ func (p *reviewLifecyclePublisher) snapshot() (calls, prepareSeq, activateSeq, r
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.reviewCalls, p.prepareSeq, p.activateSeq, p.reviewSeq, p.lastReview
+}
+
+// reviewRequests returns an owned list of the classifier-visible handoffs.
+// The individual ReviewContext entry slices deliberately remain untouched: the
+// caller can test whether separate classifier requests share backing storage.
+func (p *reviewLifecyclePublisher) reviewRequests() []PermissionReviewRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]PermissionReviewRequest(nil), p.reviews...)
 }
 
 func newLoopWithReviewPublisher(t *testing.T, pub *reviewLifecyclePublisher) (*Loop, context.CancelFunc) {
@@ -119,6 +130,21 @@ func awaitReviewCall(t *testing.T, pub *reviewLifecyclePublisher) {
 		select {
 		case <-deadline:
 			t.Fatal("permission review never started")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+func awaitReviewCalls(t *testing.T, pub *reviewLifecyclePublisher, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		if calls, _, _, _, _ := pub.snapshot(); calls >= want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("permission review calls = fewer than %d", want)
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
