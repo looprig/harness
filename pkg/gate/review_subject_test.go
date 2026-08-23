@@ -1078,6 +1078,39 @@ func TestPermissionReviewSubjectAcceptsGeneratedTruncation(t *testing.T) {
 	}
 }
 
+func TestPermissionReviewSubjectAcceptsTruncatedToolPreview(t *testing.T) {
+	t.Parallel()
+
+	basis, request, input := validPermissionReviewSubjectInput()
+	input.Entries = append([]gate.ReviewContextEntry{{
+		Origin:  gate.ReviewContextOriginTool,
+		Kind:    gate.ReviewContextKindToolPreview,
+		Content: strings.Repeat("preview ", 20),
+	}}, input.Entries...)
+	policy := validReviewContextPolicy()
+	policy.MaxToolEntryBytes = 64
+
+	built, err := gate.BuildReviewContext(input, policy)
+	if err != nil {
+		t.Fatalf("BuildReviewContext() error = %v", err)
+	}
+	wantTruncation := gate.ReviewTruncation{
+		Applied:  gate.ReviewTruncationToolEntry,
+		Material: gate.ReviewTruncationToolEntry,
+	}
+	if !reflect.DeepEqual(built.Truncation, wantTruncation) {
+		t.Fatalf("BuildReviewContext() truncation = %#v, want %#v", built.Truncation, wantTruncation)
+	}
+
+	subject, err := gate.NewPermissionReviewSubject(basis, request, built)
+	if err != nil {
+		t.Fatalf("NewPermissionReviewSubject() error = %v", err)
+	}
+	if !reflect.DeepEqual(subject.Context.Truncation, wantTruncation) {
+		t.Errorf("subject context truncation = %#v, want %#v", subject.Context.Truncation, wantTruncation)
+	}
+}
+
 func TestPermissionReviewSubjectDigestStableAndSensitive(t *testing.T) {
 	t.Parallel()
 

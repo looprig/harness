@@ -46,6 +46,7 @@ const (
 	ReviewContextKindAssistantMessage     ReviewContextKind = "assistant_message"
 	ReviewContextKindAssistantToolRequest ReviewContextKind = "assistant_tool_request"
 	ReviewContextKindToolResult           ReviewContextKind = "tool_result"
+	ReviewContextKindToolPreview          ReviewContextKind = "tool_preview"
 	ReviewContextKindRuntimeContext       ReviewContextKind = "runtime_context"
 	ReviewContextKindExternalContent      ReviewContextKind = "external_content"
 	ReviewContextKindOmission             ReviewContextKind = "omission"
@@ -58,6 +59,7 @@ func ParseReviewContextKind(value string) (ReviewContextKind, bool) {
 		ReviewContextKindAssistantMessage,
 		ReviewContextKindAssistantToolRequest,
 		ReviewContextKindToolResult,
+		ReviewContextKindToolPreview,
 		ReviewContextKindRuntimeContext,
 		ReviewContextKindExternalContent,
 		ReviewContextKindOmission:
@@ -379,7 +381,7 @@ func validReviewContextPair(origin ReviewContextOrigin, kind ReviewContextKind) 
 		return origin == ReviewContextOriginUser
 	case ReviewContextKindAssistantMessage, ReviewContextKindAssistantToolRequest:
 		return origin == ReviewContextOriginAssistant
-	case ReviewContextKindToolResult:
+	case ReviewContextKindToolResult, ReviewContextKindToolPreview:
 		return origin == ReviewContextOriginTool
 	case ReviewContextKindRuntimeContext:
 		return origin == ReviewContextOriginRuntime
@@ -406,7 +408,7 @@ func entryLimit(entry ReviewContextEntry, policy ReviewContextPolicy) (int, Revi
 		return policy.MaxUserEntryBytes, ReviewTruncationUserEntry
 	case ReviewContextKindAssistantMessage, ReviewContextKindAssistantToolRequest:
 		return policy.MaxAgentEntryBytes, ReviewTruncationAssistantEntry
-	case ReviewContextKindToolResult:
+	case ReviewContextKindToolResult, ReviewContextKindToolPreview:
 		return policy.MaxToolEntryBytes, ReviewTruncationToolEntry
 	default:
 		return policy.MaxBlockBytes, ReviewTruncationBlock
@@ -417,6 +419,7 @@ func materialReviewContextKind(kind ReviewContextKind) bool {
 	switch kind {
 	case ReviewContextKindUserMessage,
 		ReviewContextKindToolResult,
+		ReviewContextKindToolPreview,
 		ReviewContextKindRuntimeContext,
 		ReviewContextKindExternalContent,
 		ReviewContextKindAssistantToolRequest:

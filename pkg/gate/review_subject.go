@@ -619,7 +619,7 @@ func reviewTruncationMaskForEntry(entry ReviewContextEntry) ReviewTruncationMask
 		return ReviewTruncationUserEntry | ReviewTruncationBlock
 	case ReviewContextKindAssistantMessage, ReviewContextKindAssistantToolRequest:
 		return ReviewTruncationAssistantEntry | ReviewTruncationBlock
-	case ReviewContextKindToolResult:
+	case ReviewContextKindToolResult, ReviewContextKindToolPreview:
 		return ReviewTruncationToolEntry | ReviewTruncationBlock
 	default:
 		return ReviewTruncationBlock
