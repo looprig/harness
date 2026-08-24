@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 const reviewContextRevisionDomain = "harness.loop.permission-review-context/v1"
@@ -139,8 +140,12 @@ type reviewContextCaptureProvider struct {
 	metadata          reviewContextMetadata
 	policy            gate.ReviewContextPolicy
 
-	review gate.ReviewContext
-	err    error
+	// reviewBase is the validated, pre-bound capture from which each gate's
+	// context is derived. It remains immutable after the batch's sync.Once
+	// capture, so one gate's preview cannot affect another's snapshot.
+	reviewBase gate.ReviewContext
+	review     gate.ReviewContext
+	err        error
 }
 
 // newReviewContextCaptureProvider builds a provider for one tool batch. The
@@ -168,12 +173,12 @@ func newReviewContextCaptureProvider(
 	}
 }
 
-// capture runs capturePermissionReviewContext at most once for this batch —
-// on the FIRST call, from whichever gate opens first — and returns an
-// independent clone of the memoized result on every call, so two gates opened
-// in the same batch can never alias or mutate each other's entries. A nil
-// receiver (no review context configured for this turn at all) reports the
-// pre-existing "nothing to review" zero value with no error.
+// capture runs the review-context capture and bounding construction at most
+// once for this batch — on the FIRST call, from whichever gate opens first —
+// and returns an independent clone of the memoized result on every call, so
+// two gates opened in the same batch can never alias or mutate each other's
+// entries. A nil receiver (no review context configured for this turn at all)
+// reports the pre-existing "nothing to review" zero value with no error.
 func (p *reviewContextCaptureProvider) capture() (gate.ReviewContext, error) {
 	if p == nil {
 		return gate.ReviewContext{}, nil
@@ -188,7 +193,7 @@ func (p *reviewContextCaptureProvider) capture() (gate.ReviewContext, error) {
 			p.err = &reviewContextCaptureError{Field: "base_derived_context"}
 			return
 		}
-		p.review, p.err = capturePermissionReviewContext(reviewContextCapture{
+		input := reviewContextCapture{
 			Coordinates:  p.coordinates,
 			Base:         p.base[p.baseDerivedPrefix:],
 			BaseRetained: p.base[:p.baseDerivedPrefix],
@@ -198,7 +203,12 @@ func (p *reviewContextCaptureProvider) capture() (gate.ReviewContext, error) {
 			RuntimeTail:  p.runtimeTail,
 			Metadata:     p.metadata,
 			Policy:       p.policy,
-		})
+		}
+		p.reviewBase, p.err = capturePermissionReviewContextBase(input)
+		if p.err != nil {
+			return
+		}
+		p.review, p.err = boundPermissionReviewContext(p.reviewBase, p.policy)
 	})
 	if p.err != nil {
 		return gate.ReviewContext{}, p.err
@@ -251,15 +261,56 @@ func permissionReviewCaptureFromContext(ctx context.Context) (*reviewContextCapt
 // treat that exactly as before ("nothing to review"). A non-nil error means
 // review WAS configured and its one-per-batch capture attempt failed closed:
 // the caller must refuse to open the gate.
-func reviewContextForApproval(ctx context.Context) (gate.ReviewContext, error) {
+func reviewContextForApproval(
+	ctx context.Context,
+	preview *tool.MutationPreview,
+) (gate.ReviewContext, error) {
 	provider, ok := permissionReviewCaptureFromContext(ctx)
-	if !ok {
+	if !ok || provider == nil {
 		return gate.ReviewContext{}, nil
 	}
-	return provider.capture()
+	captured, err := provider.capture()
+	if err != nil {
+		return gate.ReviewContext{}, err
+	}
+	if preview == nil || preview.UnifiedDiff == "" {
+		return captured, nil
+	}
+
+	// The capture is shared by every gate in this batch, so append to a copy of
+	// the immutable pre-bound base and re-derive the revision and bounds for
+	// this gate alone. Starting from the pre-bound base matters when the shared
+	// captured result was truncated: gate.BuildReviewContext deliberately does
+	// not accept its own bounded output as a new input.
+	withPreview := provider.reviewBase
+	withPreview.Entries = append(
+		append(make([]gate.ReviewContextEntry, 0, len(provider.reviewBase.Entries)+1), provider.reviewBase.Entries...),
+		gate.ReviewContextEntry{
+			Origin:  gate.ReviewContextOriginTool,
+			Kind:    gate.ReviewContextKindToolPreview,
+			Content: preview.UnifiedDiff,
+		},
+	)
+	withPreview.ContextRevision, err = permissionReviewContextRevision(withPreview, provider.policy)
+	if err != nil {
+		return gate.ReviewContext{}, err
+	}
+	return boundPermissionReviewContext(withPreview, provider.policy)
 }
 
 func capturePermissionReviewContext(input reviewContextCapture) (gate.ReviewContext, error) {
+	context, err := capturePermissionReviewContextBase(input)
+	if err != nil {
+		return gate.ReviewContext{}, err
+	}
+	return boundPermissionReviewContext(context, input.Policy)
+}
+
+// capturePermissionReviewContextBase produces the validated, full snapshot
+// before policy truncation. The batch provider memoizes this immutable form so
+// each gate can append only its own live preview before applying the same
+// revision and bounds construction.
+func capturePermissionReviewContextBase(input reviewContextCapture) (gate.ReviewContext, error) {
 	if input.Metadata.WorkspaceRoot == "" ||
 		input.Metadata.WorkingDirectory == "" ||
 		input.Metadata.SecurityCeiling == "" ||
@@ -314,7 +365,14 @@ func capturePermissionReviewContext(input reviewContextCapture) (gate.ReviewCont
 	if err != nil {
 		return gate.ReviewContext{}, err
 	}
-	bounded, err := gate.BuildReviewContext(context, input.Policy)
+	return context, nil
+}
+
+func boundPermissionReviewContext(
+	context gate.ReviewContext,
+	policy gate.ReviewContextPolicy,
+) (gate.ReviewContext, error) {
+	bounded, err := gate.BuildReviewContext(context, policy)
 	if err != nil {
 		return gate.ReviewContext{}, &reviewContextCaptureError{Field: "bounded_context", Cause: err}
 	}

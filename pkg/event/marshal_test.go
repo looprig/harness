@@ -1,6 +1,7 @@
 package event
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -114,17 +115,22 @@ func TestEventBodyJSONKeysAreStableSnakeCase(t *testing.T) {
 			wantKeys: []string{"tool_execution_id", "is_error", "result_preview"},
 		},
 		{
-			// Request is a no-codec sealed interface tagged json:"-"; even a NON-nil
-			// request must never reach the journal (it would marshal to lossy,
-			// un-keyed PascalCase). Only the addressable tool_execution_id survives.
-			name: "PermissionRequested journals tool_execution_id but never request",
+			// Request is a no-codec sealed interface and Preview is live-only review
+			// data. Both are tagged json:"-" and must never reach direct JSON output;
+			// only the addressable tool_execution_id survives.
+			name: "PermissionRequested journals tool_execution_id but never request or preview",
 			event: PermissionRequested{
 				Header:          hdr,
 				ToolExecutionID: seededUUID(0x77),
 				Request:         gateWireRequest(),
+				Preview: &tool.MutationPreview{
+					Path:        "/etc/preview-path-sentinel",
+					Creates:     true,
+					UnifiedDiff: "@@ -1 +1 @@\n-secret-diff-sentinel\n+public\n",
+				},
 			},
 			wantKeys:   []string{"tool_execution_id"},
-			absentKeys: []string{"request", "Request"},
+			absentKeys: []string{"request", "Request", "preview", "Preview"},
 		},
 		{
 			name: "PermissionDecided carries redacted decision fields",
@@ -986,6 +992,53 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 	// The non-Request header fields must also survive intact.
 	if !reflect.DeepEqual(pr.EventHeader(), ev.EventHeader()) {
 		t.Errorf("header mismatch: got %#v, want %#v", pr.EventHeader(), ev.EventHeader())
+	}
+}
+
+// TestPermissionRequestedPreviewNeverSerializes proves the mutation preview is
+// live-only review data: it must not reach the durable journal and a restored
+// PermissionRequested therefore carries no preview.
+func TestPermissionRequestedPreviewNeverSerializes(t *testing.T) {
+	t.Parallel()
+
+	original := PermissionRequested{
+		Header:          fullHeader(),
+		ToolExecutionID: seededUUID(0x77),
+		Request:         gateWireRequest(),
+		Preview: &tool.MutationPreview{
+			Path:        "/etc/preview-path-sentinel",
+			Creates:     true,
+			UnifiedDiff: "@@ -1 +1 @@\n-secret-diff-sentinel\n+public\n",
+		},
+	}
+
+	data, err := MarshalEvent(original)
+	if err != nil {
+		t.Fatalf("MarshalEvent() error = %v", err)
+	}
+	for _, forbidden := range [][]byte{
+		[]byte("secret-diff-sentinel"),
+		[]byte("/etc/preview-path-sentinel"),
+		[]byte("preview"),
+		[]byte("Preview"),
+		[]byte("UnifiedDiff"),
+		[]byte("Creates"),
+	} {
+		if bytes.Contains(data, forbidden) {
+			t.Fatalf("preview content %q reached the wire: %s", forbidden, data)
+		}
+	}
+
+	decoded, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent() error = %v", err)
+	}
+	got, ok := decoded.(PermissionRequested)
+	if !ok {
+		t.Fatalf("UnmarshalEvent() = %T, want PermissionRequested", decoded)
+	}
+	if got.Preview != nil {
+		t.Fatalf("decoded a preview that must never round trip: %+v", got.Preview)
 	}
 }
 

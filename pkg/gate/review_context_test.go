@@ -47,6 +47,7 @@ func TestReviewContextEnumsAreClosed(t *testing.T) {
 		"assistant_message",
 		"assistant_tool_request",
 		"tool_result",
+		"tool_preview",
 		"runtime_context",
 		"external_content",
 		"omission",
@@ -56,6 +57,7 @@ func TestReviewContextEnumsAreClosed(t *testing.T) {
 		gate.ReviewContextKindAssistantMessage,
 		gate.ReviewContextKindAssistantToolRequest,
 		gate.ReviewContextKindToolResult,
+		gate.ReviewContextKindToolPreview,
 		gate.ReviewContextKindRuntimeContext,
 		gate.ReviewContextKindExternalContent,
 		gate.ReviewContextKindOmission,
@@ -75,6 +77,53 @@ func TestReviewContextEnumsAreClosed(t *testing.T) {
 		if got, ok := gate.ParseReviewContextKind(raw); ok || got != "" {
 			t.Errorf("ParseReviewContextKind(%q) = (%q, %t), want zero, false", raw, got, ok)
 		}
+	}
+}
+
+func TestToolPreviewKindParses(t *testing.T) {
+	t.Parallel()
+
+	got, ok := gate.ParseReviewContextKind("tool_preview")
+	if !ok || got != gate.ReviewContextKindToolPreview {
+		t.Fatalf("ParseReviewContextKind(\"tool_preview\") = (%q, %t), want (%q, true)", got, ok, gate.ReviewContextKindToolPreview)
+	}
+}
+
+func TestToolPreviewIsDistinctFromToolResult(t *testing.T) {
+	t.Parallel()
+
+	if gate.ReviewContextKindToolPreview == gate.ReviewContextKindToolResult {
+		t.Fatal("a pending mutation must not share a kind with an executed tool result")
+	}
+}
+
+func TestToolPreviewUsesToolEntryLimitAndMaterialTruncation(t *testing.T) {
+	t.Parallel()
+
+	const limit = 40
+	input := validReviewContext()
+	input.Entries = append([]gate.ReviewContextEntry{{
+		Origin:  gate.ReviewContextOriginTool,
+		Kind:    gate.ReviewContextKindToolPreview,
+		Content: strings.Repeat("x", limit+1),
+	}}, input.Entries...)
+	policy := validReviewContextPolicy()
+	policy.MaxToolEntryBytes = limit
+	policy.MaxBlockBytes = limit + 1
+
+	got, err := gate.BuildReviewContext(input, policy)
+	if err != nil {
+		t.Fatalf("BuildReviewContext() error = %v", err)
+	}
+	preview := got.Entries[0]
+	if !preview.Truncated || len(preview.Content) > policy.MaxToolEntryBytes {
+		t.Errorf("preview = %#v, want truncated to MaxToolEntryBytes", preview)
+	}
+	if got.Truncation.Applied != gate.ReviewTruncationToolEntry {
+		t.Errorf("Applied = %#x, want %#x", got.Truncation.Applied, gate.ReviewTruncationToolEntry)
+	}
+	if got.Truncation.Material != gate.ReviewTruncationToolEntry {
+		t.Errorf("Material = %#x, want %#x", got.Truncation.Material, gate.ReviewTruncationToolEntry)
 	}
 }
 
@@ -117,6 +166,7 @@ func TestReviewContextAcceptsOnlyAuthorityKindPairs(t *testing.T) {
 		{Origin: gate.ReviewContextOriginAssistant, Kind: gate.ReviewContextKindAssistantMessage, Content: "assistant"},
 		{Origin: gate.ReviewContextOriginAssistant, Kind: gate.ReviewContextKindAssistantToolRequest, Content: "action"},
 		{Origin: gate.ReviewContextOriginTool, Kind: gate.ReviewContextKindToolResult, Content: "tool"},
+		{Origin: gate.ReviewContextOriginTool, Kind: gate.ReviewContextKindToolPreview, Content: "preview"},
 		{Origin: gate.ReviewContextOriginRuntime, Kind: gate.ReviewContextKindRuntimeContext, Content: "runtime"},
 		{Origin: gate.ReviewContextOriginExternal, Kind: gate.ReviewContextKindExternalContent, Content: "external"},
 	}
@@ -145,6 +195,7 @@ func TestReviewContextAcceptsOnlyAuthorityKindPairs(t *testing.T) {
 		gate.ReviewContextKindAssistantMessage:     gate.ReviewContextOriginAssistant,
 		gate.ReviewContextKindAssistantToolRequest: gate.ReviewContextOriginAssistant,
 		gate.ReviewContextKindToolResult:           gate.ReviewContextOriginTool,
+		gate.ReviewContextKindToolPreview:          gate.ReviewContextOriginTool,
 		gate.ReviewContextKindRuntimeContext:       gate.ReviewContextOriginRuntime,
 		gate.ReviewContextKindExternalContent:      gate.ReviewContextOriginExternal,
 		gate.ReviewContextKindOmission:             gate.ReviewContextOriginOmission,
@@ -333,6 +384,13 @@ func TestReviewContextAppliesPerEntryLimitsDeterministically(t *testing.T) {
 		{
 			name:         "tool",
 			entry:        gate.ReviewContextEntry{Origin: gate.ReviewContextOriginTool, Kind: gate.ReviewContextKindToolResult},
+			setLimit:     func(p *gate.ReviewContextPolicy, n int) { p.MaxToolEntryBytes = n },
+			wantApplied:  gate.ReviewTruncationToolEntry,
+			wantMaterial: gate.ReviewTruncationToolEntry,
+		},
+		{
+			name:         "tool preview",
+			entry:        gate.ReviewContextEntry{Origin: gate.ReviewContextOriginTool, Kind: gate.ReviewContextKindToolPreview},
 			setLimit:     func(p *gate.ReviewContextPolicy, n int) { p.MaxToolEntryBytes = n },
 			wantApplied:  gate.ReviewTruncationToolEntry,
 			wantMaterial: gate.ReviewTruncationToolEntry,

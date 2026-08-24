@@ -30,6 +30,16 @@ type PermissionRequested struct {
 	// token-bearing record can neither be journaled nor restored. It is
 	// projected by the marshaler rather than serialized directly.
 	Request tool.Request `json:"-"`
+	// Preview is the pending mutation the human is being asked to authorize.
+	// It is display-and-review only and is deliberately NOT projected by the
+	// marshaler: unlike Request (which json:"-" hides from the struct tag but
+	// the marshaler projects into the durable record), Preview reaches neither
+	// the journal nor any wire. A restored session therefore never carries one;
+	// see the runtime's re-derivation on restore.
+	//
+	// Nil means no preview: a non-mutating tool, or a preview attempt that
+	// failed. Never treat nil as an error.
+	Preview *tool.MutationPreview `json:"-"`
 }
 
 // PermissionDecided is emitted for a non-gated permission decision. Subject and
