@@ -117,7 +117,7 @@ func TestDocsExamplesArtifacts(t *testing.T) {
 	for _, literal := range []string{
 		"docs-examples:",
 		offlineExamplesCommand,
-		"GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache make test",
+		"GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache make check",
 		"GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache go test -race ./...",
 	} {
 		if !strings.Contains(string(workflow), literal) {

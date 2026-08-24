@@ -21,6 +21,6 @@ jobs:
       - name: Run deterministic offline examples
         run: GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache go test -race ./examples/...
       - name: Run repository-native tests
-        run: GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache make test
+        run: GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache make check
       - name: Run race-enabled standalone tests
         run: GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache go test -race ./...
