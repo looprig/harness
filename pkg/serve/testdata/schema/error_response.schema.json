@@ -17,6 +17,7 @@
           "description": "Stable machine-readable code a client can switch on.",
           "enum": [
             "internal",
+            "unauthorized",
             "invalid_body",
             "invalid_parameter",
             "session_not_found",

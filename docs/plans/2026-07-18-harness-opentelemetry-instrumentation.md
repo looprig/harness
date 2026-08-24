@@ -6,7 +6,9 @@
 
 **Architecture:** A cohesive `pkg/telemetry` package owns every signal name, attribute, error classification, content/cardinality policy, and OTel helper. `rig.WithTelemetry` carries one immutable instance through session composition into the real runtime boundaries. Production code imports only OTel APIs and pinned semantic-convention constants; applications own SDKs, exporters, resources, sampling, shutdown, dashboards, and alerts.
 
-**Tech Stack:** Go 1.26, OpenTelemetry Go API v1.44, pinned `semconv/v1.41.0`, Go `testing`, and the OTel SDK only in `_test.go` support.
+**Tech Stack:** Go 1.26, OpenTelemetry Go API v1.45.0, general `semconv/v1.43.0`, GenAI names bound from `semconv/v1.41.0` (the last otel-go package carrying them), Go `testing`, and the OTel SDK only in `_test.go` support.
+
+**Revised 2026-08-14:** Task 1 drops the vendoring steps — this module has no `vendor/` tree and workspace policy forbids one — and pins the current OTel versions with the split general/GenAI semconv selection described in the design. The design also added an opt-in content tier and backend-compatibility deliverables; those land as new tasks between Task 8 and Task 9 and are not yet written up here.
 
 ---
 
@@ -25,7 +27,6 @@ pointer.
 **Files:**
 - Modify: `go.mod`
 - Modify: `go.sum`
-- Modify: `vendor/modules.txt`
 - Modify: `CLAUDE.md`
 - Test: `pkg/telemetry/dependencies_test.go`
 
@@ -44,15 +45,19 @@ Expected: FAIL because `pkg/telemetry` does not exist.
 
 **Step 3: Make the approved API dependencies direct**
 
-Move these existing indirect modules to direct requirements without changing
-their current v1.44 versions:
+Move these existing indirect modules to direct requirements at their current
+v1.45.0 versions:
 
 - `go.opentelemetry.io/otel`
 - `go.opentelemetry.io/otel/metric`
 - `go.opentelemetry.io/otel/trace`
 
-Use the already-vendored `go.opentelemetry.io/otel/semconv/v1.41.0` package and
-do not mix it with `semconv/v1.37.0`. Do not add an exporter. Keep
+Select semconv packages per the design's split pin: `semconv/v1.43.0` for
+general attributes and schema URL, and `semconv/v1.41.0` (plus its `genaiconv`
+subpackage) for GenAI names, because v1.42.0 removed all 119 `GenAI*`
+declarations when the conventions moved to `semantic-conventions-genai`. Both
+packages ship in the same otel module version. Do not import
+`semconv/v1.37.0`, and do not add an exporter. Keep
 `go.opentelemetry.io/otel/sdk` and `/sdk/metric` test-only in usage even though
 Go records test dependencies in the same module graph.
 
@@ -60,15 +65,16 @@ Add the approved packages to `CLAUDE.md`, identifying APIs/semconv as production
 dependencies and the SDK as test support. This conversation is the explicit
 dependency approval required by that file.
 
-**Step 4: Create the minimal package and vendor consistently**
+**Step 4: Create the minimal package**
 
 Create `pkg/telemetry/doc.go` with the package contract, then run:
 
 `GOWORK=off go mod tidy`
 
-`GOWORK=off go mod vendor`
-
-Do not hand-edit vendored source.
+This module is not vendored. Do not run `go mod vendor` or create a `vendor/`
+tree; `go.mod` pins and `go.sum` hashes are the reproducibility mechanism, and
+`GOWORK=off` verification exists precisely to check the module against those
+pins.
 
 **Step 5: Verify and commit**
 
@@ -629,12 +635,12 @@ Commit: `feat: add foreign loop telemetry adapter`
 - Test: `pkg/telemetry/otellog/emitter_test.go`
 - Modify: `go.mod`
 - Modify: `go.sum`
-- Modify: `vendor/modules.txt`
 - Modify: `CLAUDE.md`
 
 **Step 1: Write adapter tests**
 
-Using the pinned beta Logs API test provider, assert occurrence timestamp,
+Using the pinned experimental Logs API test provider (`go.opentelemetry.io/otel/log`
+is still pre-stable — v0.21.0 alongside otel v1.45.0), assert occurrence timestamp,
 severity, record name/body, attributes, trace correlation from context, and
 panic/failure isolation. Assert no log API import appears elsewhere in Harness.
 
@@ -647,8 +653,9 @@ Expected: FAIL because the adapter does not exist.
 **Step 3: Implement the isolated adapter**
 
 Translate `telemetry.Record` into one OTel log record. Keep the core
-`RecordEmitter` contract stable if the beta OTel API changes. Add the exact logs
-module/API to `CLAUDE.md` as an approved isolated dependency, then tidy/vendor.
+`RecordEmitter` contract stable if the experimental OTel API changes. Add the
+exact logs module/API to `CLAUDE.md` as an approved isolated dependency, then
+run `GOWORK=off go mod tidy`.
 If the pinned logs API cannot satisfy the contract cleanly, stop this task and
 retain the core emitter seam; do not leak beta types into `pkg/telemetry`.
 

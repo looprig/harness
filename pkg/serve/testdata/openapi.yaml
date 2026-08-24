@@ -484,7 +484,7 @@ components:
     EnduringFrame:
       type: object
       additionalProperties: false
-      description: The data: payload of an `event: enduring` SSE frame.
+      description: "The data: payload of an `event: enduring` SSE frame."
       required: [v, event]
       properties:
         v: { type: integer, const: 1 }
@@ -493,7 +493,7 @@ components:
     EphemeralFrame:
       type: object
       additionalProperties: false
-      description: The data: payload of an `event: ephemeral` SSE frame (no id: line).
+      description: "The data: payload of an `event: ephemeral` SSE frame (no id: line)."
       required: [v, kind]
       properties:
         v: { type: integer, const: 1 }
@@ -517,6 +517,7 @@ components:
               type: string
               enum:
                 - internal
+                - unauthorized
                 - invalid_body
                 - invalid_parameter
                 - session_not_found
