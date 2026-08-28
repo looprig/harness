@@ -68,10 +68,17 @@ type createResponse struct {
 	CommandID *uuid.UUID `json:"command_id,omitempty"`
 }
 
-// restoreResponse is the 200 body for POST /v1/sessions/{sid}/restore: the id of
-// the session that was rebuilt and reattached to the live registry.
+// restoreResponse is the 200 body for POST /v1/sessions/{sid}/restore.
+//
+// SessionID is the session now live in the registry. Restored distinguishes the
+// route's two success paths, which are otherwise indistinguishable from outside the
+// process: true when the rig rebuilt the session from durable history, false when an
+// already-live session was reused (attach). It is never omitted — a consumer that
+// cannot tell an attach from a rebuild cannot test that the attach path is still
+// short-circuiting the rig, which is the whole point of the route being idempotent.
 type restoreResponse struct {
 	SessionID uuid.UUID `json:"session_id"`
+	Restored  bool      `json:"restored"`
 }
 
 // handleCreate serves POST /v1/sessions: bring up a fresh session and, if the
@@ -251,5 +258,5 @@ func (s *server[S, O]) handleRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.registry.put(sid, sess)
-	writeJSON(w, http.StatusOK, restoreResponse{SessionID: sid})
+	writeJSON(w, http.StatusOK, restoreResponse{SessionID: sid, Restored: true})
 }

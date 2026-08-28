@@ -287,6 +287,7 @@ func TestServerHandleRestore(t *testing.T) {
 		wantStatus       int
 		wantAttached     bool
 		wantRestoreCalls int
+		wantRestored     bool
 	}{
 		{
 			name:             "restore happy path",
@@ -294,6 +295,7 @@ func TestServerHandleRestore(t *testing.T) {
 			wantStatus:       http.StatusOK,
 			wantAttached:     true,
 			wantRestoreCalls: 1,
+			wantRestored:     true,
 		},
 		{
 			name:             "malformed sid is 400 restore not called",
@@ -359,6 +361,9 @@ func TestServerHandleRestore(t *testing.T) {
 				}
 				if resp.SessionID != sid {
 					t.Errorf("session_id = %v, want %v", resp.SessionID, sid)
+				}
+				if resp.Restored != tt.wantRestored {
+					t.Errorf("restored = %v, want %v", resp.Restored, tt.wantRestored)
 				}
 			} else if tt.wantStatus != http.StatusOK {
 				assertErrorEnvelope(t, rec)

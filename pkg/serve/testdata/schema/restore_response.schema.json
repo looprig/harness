@@ -2,11 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://looprig.dev/serve/v1/restore_response.schema.json",
   "title": "RestoreResponse",
-  "description": "200 body for POST /v1/sessions/{sid}/restore: the id of the rebuilt-and-reattached session.",
+  "description": "200 body for POST /v1/sessions/{sid}/restore, which is attach-or-restore: the id of the session now live in the registry, and whether the rig actually rebuilt it. restored is true when the session was rebuilt from durable history and false when an already-live session was reused (attach). Both are 200; the field is never omitted, so a client can distinguish them without inspecting server internals.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["session_id"],
+  "required": ["session_id", "restored"],
   "properties": {
-    "session_id": { "$ref": "uuid.schema.json" }
+    "session_id": { "$ref": "uuid.schema.json" },
+    "restored": { "type": "boolean" }
   }
 }

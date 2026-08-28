@@ -102,13 +102,21 @@ paths:
   /sessions/{sid}/restore:
     post:
       tags: [lifecycle]
-      summary: Rebuild a prior session from durable history and reattach it live.
+      summary: Attach to a live session, or rebuild a prior one from durable history.
       operationId: restoreSession
+      description: >
+        Idempotent. If {sid} is already live in this process the rig is NOT touched
+        and the response carries restored=false; the caller keeps every existing
+        event subscription. Otherwise the session is rebuilt from durable history,
+        attached, and restored=true is returned. Rebuilding an already-live session
+        would either fail on its exclusive workspace lease or mint a second runtime
+        over the same journal and orphan existing subscribers, so the live case
+        short-circuits before the rig is consulted.
       parameters:
         - $ref: "#/components/parameters/Sid"
       responses:
         "200":
-          description: Session rebuilt and reattached.
+          description: Session attached (already live) or rebuilt and reattached.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/RestoreResponse" }
@@ -377,9 +385,14 @@ components:
     RestoreResponse:
       type: object
       additionalProperties: false
-      required: [session_id]
+      required: [session_id, restored]
       properties:
         session_id: { $ref: "#/components/schemas/UUID" }
+        restored:
+          type: boolean
+          description: >
+            true when the rig rebuilt the session from durable history; false when
+            an already-live session was reused (attach). Both are 200.
 
     InputResponse:
       type: object
