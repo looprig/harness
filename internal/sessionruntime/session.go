@@ -80,22 +80,17 @@ type Session struct {
 	closing bool
 
 	// shutdownMu makes teardown single-owner. Every concurrent or repeated caller
-	// joins shutdownDone and observes the same cleanup result; its own context error
+	// joins cleanupDone and observes the same cleanup result; its own context error
 	// is added only after the shared, session-bounded teardown has completed.
 	shutdownMu      sync.Mutex
 	shutdownStarted bool
-	shutdownDone    chan struct{}
+	cleanupDone     chan struct{}
 	shutdownErr     error
-	// done closes when Shutdown first begins (teardown admits no new work); never
-	// reopens. It is the session's outward liveness signal, read through Done(), and is
-	// closed under shutdownMu in the same critical section that flips shutdownStarted
-	// false->true — the one single-owner point, so the close happens exactly once.
-	// Unlike shutdownDone (which a joining caller waits on for the cleanup RESULT), this
-	// fires at the START of teardown: an observer must learn the session is dying before
-	// cleanup completes, not after. Every constructor allocates it; a struct-literal test
-	// session leaves it nil, so the close is nil-guarded and Done() then blocks forever
-	// (never observed dead), which is the safe direction for a session nobody tore down
-	// through Shutdown.
+	// done closes when Shutdown first begins; Done() carries the full contract. It is
+	// distinct from cleanupDone above, which closes when cleanup FINISHES. Only the two
+	// escaping constructors allocate it (newSessionTopology, buildRestoredSession); the
+	// non-escaping &Session{} option probes they each build first leave it nil, as do
+	// same-package struct-literal test sessions, so the close is nil-guarded.
 	done chan struct{}
 	// shutdownTimeouts is a package-private test seam. Production leaves it zero
 	// and derives every phase budget from the session's already-validated loop,
@@ -2708,16 +2703,16 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	}
 	s.shutdownMu.Lock()
 	if s.shutdownStarted {
-		done := s.shutdownDone
+		cleanupDone := s.cleanupDone
 		s.shutdownMu.Unlock()
-		<-done
+		<-cleanupDone
 		s.shutdownMu.Lock()
 		cleanupErr := s.shutdownErr
 		s.shutdownMu.Unlock()
 		return shutdownResult(cleanupErr, ctx.Err())
 	}
 	s.shutdownStarted = true
-	s.shutdownDone = make(chan struct{})
+	s.cleanupDone = make(chan struct{})
 	// Publish liveness NOW, not after cleanup: the closing latch below already refuses
 	// new work, so an observer (pkg/serve's registry, which cannot see this session's
 	// error types) must be able to notice the session is dying while teardown runs.
@@ -2731,7 +2726,7 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	cleanupErr := s.shutdown()
 	s.shutdownMu.Lock()
 	s.shutdownErr = cleanupErr
-	close(s.shutdownDone)
+	close(s.cleanupDone)
 	s.shutdownMu.Unlock()
 	return shutdownResult(cleanupErr, ctx.Err())
 }
