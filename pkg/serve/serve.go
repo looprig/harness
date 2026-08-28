@@ -46,6 +46,27 @@ type LiveSession interface {
 	Interrupt(ctx context.Context) (bool, error)
 }
 
+// SessionDone is the OPTIONAL liveness extension of LiveSession: a session that can
+// report its own death exposes a channel closed once its shutdown has begun.
+//
+// It is deliberately separate from LiveSession rather than folded into it. A session
+// is drivable whether or not it can report death, so requiring the method would force
+// every implementor (tui, acp, consumer fakes) to grow one for a capability most of
+// them do not have — an Interface Segregation violation, and a compile break across
+// three repositories for one optional bit. Being structural, it also means
+// session.SessionController need not widen: serve type-asserts the DYNAMIC type, and
+// *sessionruntime.Session satisfies it today.
+//
+// Absence is not death. A session that does not satisfy SessionDone is treated as live
+// forever, which is exactly today's behaviour; only a session that opts in can be
+// evicted. A wrapper around a live session MUST forward Done, or it silently opts its
+// wrapped session out and reintroduces the corpse-pinning leak this exists to fix.
+type SessionDone interface {
+	// Done returns a channel closed once the session has begun shutting down. It never
+	// reopens, and a receive means "admits no new work", not "cleanup finished".
+	Done() <-chan struct{}
+}
+
 // Rig is the narrow session-factory view serve depends on. It is generic over the
 // concrete live-session type S (constrained to LiveSession) so a caller keeps the
 // real type through NewSession/RestoreSession without serve importing it: the composition

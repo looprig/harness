@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/looprig/harness/internal/sessionruntime"
 	"github.com/looprig/harness/pkg/rig"
 	"github.com/looprig/harness/pkg/serve"
 	"github.com/looprig/harness/pkg/session"
@@ -78,6 +79,12 @@ var Runner = func() {}
 var (
 	_ serve.LiveSession                                       = (session.Session)(nil)
 	_ serve.Rig[session.SessionController, rig.SessionOption] = (*rig.Rig)(nil)
+	// SessionDone is OPTIONAL, so nothing else forces the concrete session to satisfy
+	// it — which is exactly why it is asserted here. It is the one contract in this
+	// file whose breach is silent: drop or rename Done, or interpose a wrapper that
+	// does not forward it, and serve simply stops evicting dead sessions. No compile
+	// error, no failing handler test, just the corpse-pinned SSE stream returning.
+	_ serve.SessionDone = (*sessionruntime.Session)(nil)
 )
 
 // allowedImports is the EXACT set of import paths the production (non-test) serve

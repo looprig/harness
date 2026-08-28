@@ -201,3 +201,67 @@ func TestRegistryConcurrent(t *testing.T) {
 		t.Errorf("post-churn delete() ok = false, want true")
 	}
 }
+
+// TestRegistryDeleteMatching pins the identity guard. An eviction is driven by an
+// observation of one specific session's death, and that observation can be stale by
+// the time it reaches the map: a restore may already have re-registered a NEW live
+// session under the same sid. An unguarded delete would then remove the live
+// replacement on the corpse's behalf, silently 404-ing a session that is running.
+func TestRegistryDeleteMatching(t *testing.T) {
+	t.Parallel()
+	id := mustUUID(t)
+	original := fakeLiveSession{id: 1}
+	replacement := fakeLiveSession{id: 2}
+
+	tests := []struct {
+		name        string
+		seed        LiveSession // nil means leave the id unregistered
+		target      LiveSession // the session the observation claims died
+		wantRemoved bool
+		wantPresent LiveSession // nil means the id must be absent afterwards
+	}{
+		{
+			name:        "removes the entry it was handed",
+			seed:        original,
+			target:      original,
+			wantRemoved: true,
+		},
+		{
+			name:        "declines to remove a re-registered session",
+			seed:        replacement,
+			target:      original,
+			wantRemoved: false,
+			wantPresent: replacement,
+		},
+		{
+			name:   "absent id reports no removal",
+			target: original,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := newRegistry()
+			if tt.seed != nil {
+				r.put(id, tt.seed)
+			}
+			if removed := r.deleteMatching(id, tt.target); removed != tt.wantRemoved {
+				t.Fatalf("deleteMatching() = %v, want %v", removed, tt.wantRemoved)
+			}
+			got, ok := r.get(id)
+			if tt.wantPresent == nil {
+				if ok {
+					t.Fatalf("get() after deleteMatching = %v, want absent", got)
+				}
+				return
+			}
+			if !ok {
+				t.Fatal("get() after deleteMatching: entry missing, want the re-registered session kept")
+			}
+			if got != tt.wantPresent {
+				t.Errorf("get() = %v, want %v (identity guard removed the wrong session)", got, tt.wantPresent)
+			}
+		})
+	}
+}

@@ -57,6 +57,32 @@ func (r *registry) putIfAbsent(id uuid.UUID, s LiveSession) bool {
 	return true
 }
 
+// deleteMatching removes id ONLY if it currently maps to s, reporting whether it
+// removed anything. It is the eviction counterpart to putIfAbsent's fail-secure
+// no-overwrite: an eviction is driven by an observation of one specific session's
+// death, and that observation can be stale by the time it reaches the map, because a
+// restore may already have re-registered a NEW live session under the same sid. An
+// unguarded delete would then remove the live replacement on the corpse's behalf,
+// 404-ing a running session. Comparing identity first makes a stale observation a
+// no-op.
+//
+// Like every registry method it touches the map and returns, calling nothing on the
+// session under the lock.
+//
+// The identity test is interface ==, so a LiveSession must be comparable — every
+// implementation is a pointer, and a struct held by value with a slice, map or func
+// field would panic here as it would anywhere else Go compares it. This is the same
+// precondition context.WithValue places on a key.
+func (r *registry) deleteMatching(id uuid.UUID, s LiveSession) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if current, ok := r.sessions[id]; !ok || current != s {
+		return false
+	}
+	delete(r.sessions, id)
+	return true
+}
+
 // delete removes id from the table and returns the entry it removed (and whether
 // one existed), so the caller can tear the session down OUTSIDE the lock. delete
 // performs no session call itself, precisely so nothing blocks under the lock.
