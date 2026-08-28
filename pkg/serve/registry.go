@@ -76,22 +76,25 @@ func (r *registry) put(id uuid.UUID, s LiveSession) uint64 {
 	return token
 }
 
-// putIfAbsent registers s under id only if no session is already live for id,
-// reporting whether it stored. It is the fail-secure guard against a client-
-// controlled id silently overwriting (and orphaning) a live session: a collision
-// is rejected rather than clobbering the existing entry.
-func (r *registry) putIfAbsent(id uuid.UUID, s LiveSession) bool {
+// putIfAbsent registers s under id only if no session is already live for id, returning
+// the token identifying this registration and whether it stored. It is the fail-secure
+// guard against an id silently overwriting (and orphaning) a live session: a collision is
+// rejected rather than clobbering the existing entry.
+//
+// The token is returned for the same reason put returns one — a caller that stores may
+// then watch for that session's death and hand the token back to deleteMatching. On a
+// COLLISION the returned token is 0, which names no registration (tokens start at 1), so
+// even a caller that ignores the bool and evicts on the returned token removes nothing:
+// the incumbent it lost to cannot be evicted on the loser's behalf.
+func (r *registry) putIfAbsent(id uuid.UUID, s LiveSession) (uint64, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, exists := r.sessions[id]; exists {
-		return false
+		return 0, false
 	}
-	// The token is minted but not returned: no caller of putIfAbsent watches for the
-	// session's death. Every entry still gets a distinct one, which is what keeps
-	// deleteMatching's check total over the map.
 	r.nextToken++
 	r.sessions[id] = registration{sess: s, token: r.nextToken}
-	return true
+	return r.nextToken, true
 }
 
 // deleteMatching removes id ONLY if it is still held by the registration named by

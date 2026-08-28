@@ -281,6 +281,23 @@ func (s *server[S, O]) handleRestore(w http.ResponseWriter, r *http.Request) {
 		writeErrorCause(w, http.StatusInternalServerError, codeInternal, msgRestoreFailed, false, err)
 		return
 	}
-	s.register(sid, sess)
+	// registerIfAbsent, never register: the live check above and this store are not one
+	// atomic step, so a second restore of the same cold sid may have rebuilt and attached
+	// while this one was rebuilding. That incumbent has already been answered as this
+	// sid's session and may already have subscribers, so a lost race yields to it — the
+	// same answer, restored=false, that the attach path above gives, because the client is
+	// in the same position either way: the sid is live, and the runtime serving it is not
+	// the one this call built. Claiming restored=true would name a runtime no route
+	// resolves.
+	//
+	// The rebuilt-but-unstored session cannot be torn down here — LiveSession is
+	// deliberately observation-only, the HTTP plane does not own session lifecycle — so it
+	// leaks. Nobody was ever subscribed to it, which is what makes that strictly better
+	// than clobbering a session someone is actively watching; see registerIfAbsent for why
+	// a rig fenced by the session's single-writer lease never reaches this at all.
+	if !s.registerIfAbsent(sid, sess) {
+		writeJSON(w, http.StatusOK, restoreResponse{SessionID: sid, Restored: false})
+		return
+	}
 	writeJSON(w, http.StatusOK, restoreResponse{SessionID: sid, Restored: true})
 }

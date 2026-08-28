@@ -63,18 +63,64 @@ func newServer[S LiveSession, O any](rig Rig[S, O], reader Reader, cfg *config) 
 // stay pinned until the process exits. Something has to be watching.
 //
 // The goroutine costs one blocked receive per live session and ends at the first of the
-// session's death or process exit. It closes over the id and the TOKEN put minted for
-// this registration — not over the session — so its delete removes only the entry it was
-// started for: a session replaced under the same sid before it dies evicts nothing.
-// Carrying the token rather than the session is also what keeps the watcher from ever
-// comparing interface values, which would panic here, on a background goroutine, for any
-// implementor whose dynamic type is uncomparable (see registry.deleteMatching).
+// session's death or process exit. Its mechanics — and why it carries a token rather than
+// the session — are watchDeath's.
+//
+// register OVERWRITES any incumbent. That is right for a caller holding an id nothing else
+// can be holding (create, whose id the rig has just minted); a caller whose id may already
+// be live wants registerIfAbsent.
 func (s *server[S, O]) register(id uuid.UUID, sess LiveSession) {
 	token := s.registry.put(id, sess)
+	s.watchDeath(id, sess, token)
+}
+
+// registerIfAbsent is register's fail-secure variant: it registers sess as id ONLY if no
+// session is live for id already, reporting whether it stored. It is what a caller uses
+// when losing a race is a legitimate outcome rather than a bug — the restore route, whose
+// live check and store cannot be one step, so two restores of the same cold sid can both
+// miss the check and both rebuild.
+//
+// Yielding rather than overwriting is the point. The incumbent has already been answered
+// as this sid's session and may already have subscribers hanging off it; replacing it
+// would leave them subscribed to a runtime no route resolves, which is precisely the
+// orphaning the live check exists to prevent, arriving through the window the check
+// cannot cover.
+//
+// The watcher starts ONLY on a store. Starting one for a session that was not registered
+// would park a goroutine on a Done channel that never closes: serve never shuts a session
+// down (LiveSession has no teardown), and an unregistered one can never be reached by a
+// route that might. It could not evict the incumbent even so — putIfAbsent hands back
+// token 0 on a collision and deleteMatching declines it — but a permanent goroutine per
+// lost race is reason enough on its own.
+//
+// A caller that loses gets nothing back to tear down, because there is nothing serve can
+// do with it: the session it built stays alive and unreferenced until the process exits.
+// That leak is the accepted cost of not widening LiveSession, and it is bounded by how
+// rarely it happens — a rig backed by sessionstore fences restore with the session's
+// single-writer lease, so the losing rebuild fails there and no second session is ever
+// built. Only a Rig with no such fence can reach it at all.
+func (s *server[S, O]) registerIfAbsent(id uuid.UUID, sess LiveSession) bool {
+	token, stored := s.registry.putIfAbsent(id, sess)
+	if !stored {
+		return false
+	}
+	s.watchDeath(id, sess, token)
+	return true
+}
+
+// watchDeath starts the eviction watcher for the registration named by token, if sess can
+// report its own death at all. A session that cannot stays registered until a lifecycle
+// route removes it — exactly the behaviour that predates the liveness work.
+//
+// It closes over the id and the TOKEN, not over the session, so its delete removes only
+// the registration it was started for: a session replaced under the same sid before it
+// dies evicts nothing. Carrying the token rather than the session is also what keeps the
+// watcher from ever comparing interface values, which would panic here, on a background
+// goroutine, for any implementor whose dynamic type is uncomparable (see
+// registry.deleteMatching).
+func (s *server[S, O]) watchDeath(id uuid.UUID, sess LiveSession, token uint64) {
 	reporter, reportsDeath := sess.(SessionDone)
 	if !reportsDeath {
-		// The session cannot report death, so there is nothing to watch. It stays
-		// registered until a lifecycle route removes it — exactly today's behaviour.
 		return
 	}
 	done := reporter.Done()

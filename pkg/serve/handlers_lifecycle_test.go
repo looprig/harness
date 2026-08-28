@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -465,6 +466,209 @@ func TestServerHandleRestoreRebuildsShutDownSession(t *testing.T) {
 	}
 	if !resp.Restored {
 		t.Error("restored = false, want true (the session was rebuilt from durable history)")
+	}
+}
+
+// racedSession is a live session that reports its own death AND counts Done()
+// observations. The count is what turns "no watcher was started for this session" into
+// a deterministic assertion rather than a goroutine-timing one: register's watcher calls
+// Done() SYNCHRONOUSLY, on the registering goroutine, before it spawns anything
+// (server_core.go), so the count is final by the time handleRestore returns.
+type racedSession struct {
+	*fakeSession
+	done      chan struct{}
+	doneCalls atomic.Int64
+}
+
+func newRacedSession() *racedSession {
+	return &racedSession{fakeSession: &fakeSession{}, done: make(chan struct{})}
+}
+
+func (r *racedSession) Done() <-chan struct{} {
+	r.doneCalls.Add(1)
+	return r.done
+}
+
+// racedCallerKey tags a restore request with the identity of the caller that issued it,
+// so the fake rig can hand a KNOWN session to a KNOWN caller. Without the tag the two
+// concurrent calls are indistinguishable and a test could only assert aggregate counts;
+// with it, "the registry holds the session belonging to the request that answered
+// restored=true" becomes a checkable statement.
+type racedCallerKey struct{}
+
+// gatedRig blocks inside RestoreSession until the test releases it, which is what makes
+// the race deterministic instead of timing-dependent. Every caller announces its arrival
+// on entered and then parks on release, so the test can prove BOTH restores are past
+// handleRestore's live check and inside the rebuild — the exact window in which the
+// store has to be safe — before either is allowed to reach the registry. Nothing here
+// sleeps and nothing depends on the scheduler: the handshake is blocking channel
+// operations on both sides.
+type gatedRig struct {
+	entered  chan string
+	release  chan struct{}
+	sessions map[string]*racedSession
+
+	mu    sync.Mutex
+	calls int
+}
+
+func newGatedRig(sessions map[string]*racedSession) *gatedRig {
+	return &gatedRig{entered: make(chan string), release: make(chan struct{}), sessions: sessions}
+}
+
+func (g *gatedRig) NewSession(context.Context, ...fakeSessionOption) (*racedSession, error) {
+	return nil, errBoom
+}
+
+func (g *gatedRig) RestoreSession(ctx context.Context, _ uuid.UUID) (*racedSession, error) {
+	caller, _ := ctx.Value(racedCallerKey{}).(string)
+	g.mu.Lock()
+	g.calls++
+	g.mu.Unlock()
+	g.entered <- caller
+	<-g.release
+	return g.sessions[caller], nil
+}
+
+func (g *gatedRig) restoreCallCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.calls
+}
+
+// runRestoreRace drives one concurrent cold restore of sidStr per caller, holds every
+// one of them inside RestoreSession until all have arrived, then releases them together
+// and returns each caller's decoded 200 body. The two blocking handshakes are the whole
+// point: when close(release) runs, every caller is provably past the live check and
+// about to store, so the outcome exercises the real race window on every run rather than
+// on a lucky interleaving.
+func runRestoreRace(t *testing.T, srv *server[*racedSession, fakeSessionOption], rig *gatedRig, sidStr string, callers ...string) map[string]restoreResponse {
+	t.Helper()
+
+	recs := make(map[string]*httptest.ResponseRecorder, len(callers))
+	var wg sync.WaitGroup
+	for _, caller := range callers {
+		rec := httptest.NewRecorder()
+		recs[caller] = rec
+		req := restoreRequest(sidStr)
+		req = req.WithContext(context.WithValue(req.Context(), racedCallerKey{}, caller))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			srv.handleRestore(rec, req)
+		}()
+	}
+	for range callers {
+		<-rig.entered
+	}
+	close(rig.release)
+	wg.Wait()
+
+	out := make(map[string]restoreResponse, len(callers))
+	for caller, rec := range recs {
+		if rec.Code != http.StatusOK {
+			t.Fatalf("caller %s: status = %d, want %d (body %s)", caller, rec.Code, http.StatusOK, rec.Body.String())
+		}
+		out[caller] = decodeRestore200(t, rec)
+	}
+	return out
+}
+
+// TestServerHandleRestoreConcurrentColdRestoreYieldsToTheWinner is the reason the cold
+// path stores with putIfAbsent rather than put. handleRestore's live check and its store
+// are not one atomic step, so two restores of the same COLD sid can both miss the check
+// and both rebuild. A clobbering store would let the second one replace the first in the
+// registry — and the first has already been answered restored=true, so its client is
+// entitled to subscribe to it, while every route now resolves the sid to the other
+// runtime. Those subscribers are orphaned exactly as they would be by a re-restore of a
+// live session, which is what the live check exists to prevent; this is the same bug
+// arriving through the window the check cannot cover.
+//
+// The contract is one winner: exactly one caller may be told it rebuilt the session, the
+// registry must hold THAT caller's session, and the loser is told what an attach would
+// have told it. Both callers really did call the rig (restoreCallCount == 2) — this is a
+// lost race, not a short-circuit.
+func TestServerHandleRestoreConcurrentColdRestoreYieldsToTheWinner(t *testing.T) {
+	t.Parallel()
+
+	const sidStr = "5a5a5a5a-5a5a-5a5a-5a5a-5a5a5a5a5a5a"
+	sid := parseTestUUID(t, sidStr)
+
+	sessions := map[string]*racedSession{"a": newRacedSession(), "b": newRacedSession()}
+	rig := newGatedRig(sessions)
+	srv := newServer[*racedSession, fakeSessionOption](rig, nil, newConfig())
+
+	got := runRestoreRace(t, srv, rig, sidStr, "a", "b")
+
+	if calls := rig.restoreCallCount(); calls != 2 {
+		t.Fatalf("restore calls = %d, want 2 (both callers must have missed the live check and rebuilt)", calls)
+	}
+
+	var winners []string
+	for caller, resp := range got {
+		if resp.SessionID != sid {
+			t.Errorf("caller %s: session_id = %v, want %v", caller, resp.SessionID, sid)
+		}
+		if resp.Restored {
+			winners = append(winners, caller)
+		}
+	}
+	if len(winners) != 1 {
+		t.Fatalf("callers answered restored=true: %v, want exactly 1 (a lost race must not claim the rebuild)", winners)
+	}
+
+	stored, ok := srv.registry.get(sid)
+	if !ok {
+		t.Fatal("registry holds no session after the race")
+	}
+	if want := sessions[winners[0]]; stored != want {
+		t.Errorf("registry holds %p, want %p — the session of the caller answered restored=true (the loser clobbered the incumbent)", stored, want)
+	}
+}
+
+// TestServerHandleRestoreRaceLoserStartsNoWatcher pins the half of the fix that a
+// putIfAbsent swap alone would lose. Registration is not a bare map write: it also starts
+// the goroutine that evicts the session when it dies, which is what keeps a dead SSE
+// stream from heartbeating forever. The loser stored NOTHING, so it must start nothing —
+// its session will never be reachable, will never be shut down by serve (LiveSession has
+// no teardown) and so will never close its Done channel, making an unconditional watcher
+// a goroutine parked until the process exits, once per lost race.
+//
+// The token guard is the second line of defence and is not what this asserts: a watcher
+// started for an unstored session would carry token 0, which names no registration, so
+// deleteMatching would decline to evict the incumbent (registry.go, and
+// TestRegistryDeleteMatching's re-registration cases). The harm of the extra watcher is
+// therefore the leak, not a wrong eviction — and the leak is what this test catches.
+func TestServerHandleRestoreRaceLoserStartsNoWatcher(t *testing.T) {
+	t.Parallel()
+
+	const sidStr = "5b5b5b5b-5b5b-5b5b-5b5b-5b5b5b5b5b5b"
+	sid := parseTestUUID(t, sidStr)
+
+	sessions := map[string]*racedSession{"a": newRacedSession(), "b": newRacedSession()}
+	rig := newGatedRig(sessions)
+	srv := newServer[*racedSession, fakeSessionOption](rig, nil, newConfig())
+
+	runRestoreRace(t, srv, rig, sidStr, "a", "b")
+
+	// The winner is defined by the REGISTRY, not by the responses: "who is being watched"
+	// is a question about what was actually stored, and deriving it from the bodies would
+	// make the assertion vacuous for any bug that answers restored=true to everyone.
+	stored, ok := srv.registry.get(sid)
+	if !ok {
+		t.Fatal("registry holds no session after the race")
+	}
+	for caller, sess := range sessions {
+		calls := sess.doneCalls.Load()
+		if LiveSession(sess) == stored {
+			if calls != 1 {
+				t.Errorf("winner %s: Done() calls = %d, want 1 (the stored session must be watched for death)", caller, calls)
+			}
+			continue
+		}
+		if calls != 0 {
+			t.Errorf("loser %s: Done() calls = %d, want 0 (a session that was never stored must not be watched: the watcher would park forever)", caller, calls)
+		}
 	}
 }
 

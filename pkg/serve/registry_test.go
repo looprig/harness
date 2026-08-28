@@ -97,9 +97,9 @@ func TestRegistryPutIfAbsent(t *testing.T) {
 			if tt.seed {
 				r.put(id, original)
 			}
-			stored := r.putIfAbsent(id, intruder)
+			token, stored := r.putIfAbsent(id, intruder)
 			if stored != tt.wantStored {
-				t.Fatalf("putIfAbsent() = %v, want %v", stored, tt.wantStored)
+				t.Fatalf("putIfAbsent() stored = %v, want %v", stored, tt.wantStored)
 			}
 			got, ok := r.get(id)
 			if !ok {
@@ -107,6 +107,24 @@ func TestRegistryPutIfAbsent(t *testing.T) {
 			}
 			if got != tt.wantVal {
 				t.Errorf("stored value = %v, want %v (no-overwrite violated)", got, tt.wantVal)
+			}
+			if tt.wantStored {
+				if token == 0 {
+					t.Fatal("putIfAbsent() token = 0 on a store, want the registration token (0 names no registration, so the stored session could never be evicted)")
+				}
+				return
+			}
+			// The rejected caller must come away unable to evict anything. Token 0 names
+			// no registration, so handing it to deleteMatching is a no-op even though the
+			// id is very much live — the incumbent cannot be evicted on the loser's behalf.
+			if token != 0 {
+				t.Errorf("putIfAbsent() token = %d on a collision, want 0", token)
+			}
+			if r.deleteMatching(id, token) {
+				t.Error("deleteMatching() with the rejected caller's token removed the incumbent")
+			}
+			if kept, ok := r.get(id); !ok || kept != tt.wantVal {
+				t.Errorf("get() after the rejected caller's eviction = %v,%v, want %v,true", kept, ok, tt.wantVal)
 			}
 		})
 	}
