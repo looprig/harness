@@ -39,6 +39,9 @@ func (d *doneSession) shutdown() { close(d.done) }
 type doneRig struct {
 	newSess     *doneSession
 	restoreSess *doneSession
+	// restoreCalls counts RestoreSession calls, so a test can assert the rig was not
+	// consulted at all (restore's attach path) rather than inferring it from a status.
+	restoreCalls int
 }
 
 func (r *doneRig) NewSession(context.Context, ...fakeSessionOption) (*doneSession, error) {
@@ -46,6 +49,7 @@ func (r *doneRig) NewSession(context.Context, ...fakeSessionOption) (*doneSessio
 }
 
 func (r *doneRig) RestoreSession(context.Context, uuid.UUID) (*doneSession, error) {
+	r.restoreCalls++
 	return r.restoreSess, nil
 }
 

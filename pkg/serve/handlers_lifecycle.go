@@ -230,12 +230,29 @@ func decodeBlocksFromBody(body []byte) ([]content.Block, error) {
 	return content.UnmarshalBlocks(req.Blocks)
 }
 
-// handleRestore serves POST /v1/sessions/{sid}/restore: rebuild a prior session
-// from its durable history and reattach it to the live registry so the live/control
-// routes resolve its id again.
+// handleRestore serves POST /v1/sessions/{sid}/restore: ATTACH-OR-RESTORE. A session
+// still live in this process is attached and returned as-is; otherwise it is rebuilt
+// from its durable history and attached to the live registry so the live/control
+// routes resolve its id again. Both are 200, distinguished on the wire by
+// restoreResponse.Restored.
+//
+// The live check comes FIRST and short-circuits before the rig is consulted, because
+// rebuilding an already-live session is never correct: the rig holds an exclusive
+// lease on the workspace root, so a second rebuild either fails (surfacing as a 500
+// for a session that is right there and healthy) or, on a permissive backend, mints a
+// SECOND runtime over the same journal — and the registration then replaces the entry,
+// orphaning every existing subscriber, whose Subscription still points at the
+// now-unreachable first runtime. Idempotence is what lets a client open a session it
+// just created, open a second tab, or double-click, all of which resolve {sid} here.
+//
+// The check is liveSession, not a bare registry lookup, and the difference is the whole
+// point: a registered session that has already begun shutting down is a corpse. The
+// probe evicts it and this route falls through to a genuine rebuild, where a bare
+// lookup would attach to the corpse and keep answering {restored:false} for a session
+// no subsequent request could drive.
 //
 // The {sid} path segment is parsed and validated at the boundary (malformed => 400)
-// before the rig is touched. RestoreSession errors are mapped generically to 500 —
+// before anything else. RestoreSession errors are mapped generically to 500 —
 // serve cannot import the session package's error types, so it has no way to tell a
 // "no journal / not found" rebuild failure from a transient backend failure. The
 // one signal it honors is a serve-level SessionNotFoundError, which a Rig may
@@ -244,6 +261,13 @@ func (s *server[S, O]) handleRestore(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("sid"))
 	if err != nil {
 		writeErrorCause(w, http.StatusBadRequest, codeInvalidParam, msgInvalidSID, false, err)
+		return
+	}
+
+	// Already live: attach. The rig is not touched and the existing runtime — with
+	// every subscription hanging off it — is preserved untouched.
+	if _, live := s.liveSession(sid); live {
+		writeJSON(w, http.StatusOK, restoreResponse{SessionID: sid, Restored: false})
 		return
 	}
 

@@ -128,6 +128,7 @@ func TestFixtures(t *testing.T) {
 		{name: "create with command", file: "create_with_command.json", produce: produceCreateWithCommand},
 		{name: "session list", file: "session_list.json", produce: produceSessionList},
 		{name: "restore", file: "restore.json", produce: produceRestore},
+		{name: "restore attached", file: "restore_attached.json", produce: produceRestoreAttached},
 		{name: "input", file: "input.json", produce: produceInput},
 		{name: "interrupt", file: "interrupt.json", produce: produceInterrupt},
 		{name: "gate accepted", file: "gate_accepted.json", produce: produceGateAccepted},
@@ -234,10 +235,22 @@ func produceRestore(t *testing.T) []byte {
 	t.Helper()
 	rig := &fakeRig{restoreSess: &fakeSession{}}
 	srv := newServer[*fakeSession, fakeSessionOption](rig, nil, newConfig())
-	req := httptest.NewRequest(http.MethodPost, "/v1/sessions/"+fixSessionID+"/restore", http.NoBody)
-	req.SetPathValue("sid", fixSessionID)
 	rec := httptest.NewRecorder()
-	srv.handleRestore(rec, req)
+	srv.handleRestore(rec, restoreRequest(fixSessionID))
+	return rec.Body.Bytes()
+}
+
+// produceRestoreAttached emits the OTHER success body of the same route: the attach,
+// where the sid was already live and the rig was never consulted. It is a separate
+// fixture because restored is the only byte that differs, and a golden file is the one
+// place that difference is checked as BYTES rather than round-tripped through the DTO
+// (where an omitted key would decode as false and pass unnoticed).
+func produceRestoreAttached(t *testing.T) []byte {
+	t.Helper()
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, newConfig())
+	srv.registry.put(parseTestUUID(t, fixSessionID), &fakeSession{})
+	rec := httptest.NewRecorder()
+	srv.handleRestore(rec, restoreRequest(fixSessionID))
 	return rec.Body.Bytes()
 }
 

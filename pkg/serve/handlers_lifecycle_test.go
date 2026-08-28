@@ -330,11 +330,8 @@ func TestServerHandleRestore(t *testing.T) {
 			rig := &fakeRig{restoreSess: sess, restoreErr: tt.restoreErr}
 			srv := newServer[*fakeSession, fakeSessionOption](rig, nil, newConfig())
 
-			req := httptest.NewRequest(http.MethodPost, "/v1/sessions/"+tt.sid+"/restore", http.NoBody)
-			req.SetPathValue("sid", tt.sid)
 			rec := httptest.NewRecorder()
-
-			srv.handleRestore(rec, req)
+			srv.handleRestore(rec, restoreRequest(tt.sid))
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tt.wantStatus, rec.Body.String())
@@ -370,6 +367,123 @@ func TestServerHandleRestore(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestServerHandleRestoreAttachesLiveSession proves the route is idempotent: a sid
+// already live in this process is attached, not rebuilt. Rebuilding it would either
+// fail on the workspace's exclusive lease (a 500 for a session that is right there and
+// healthy) or mint a second runtime over the same journal and clobber the registry
+// entry, orphaning every subscriber already hanging off the first. The assertions that
+// matter are that the rig was NEVER CALLED and that the registry still holds the
+// ORIGINAL session value — a 200 alone is what a re-restore that happened to succeed
+// would also produce.
+//
+// *fakeSession does not implement SessionDone, so this also pins the fail-open half of
+// the liveness probe: a session that cannot report its own death is never evicted and
+// therefore always attaches.
+func TestServerHandleRestoreAttachesLiveSession(t *testing.T) {
+	t.Parallel()
+
+	const sidStr = "33333333-3333-3333-3333-333333333333"
+	sid := parseTestUUID(t, sidStr)
+
+	live := &fakeSession{}
+	rig := &fakeRig{restoreSess: &fakeSession{}}
+	srv := newServer[*fakeSession, fakeSessionOption](rig, nil, newConfig())
+	srv.registry.put(sid, live)
+
+	rec := httptest.NewRecorder()
+	srv.handleRestore(rec, restoreRequest(sidStr))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body %s)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if rig.restoreCalls != 0 {
+		t.Errorf("restoreCalls = %d, want 0 (an already-live sid must not touch the rig)", rig.restoreCalls)
+	}
+
+	got, ok := srv.registry.get(sid)
+	if !ok {
+		t.Fatal("registry lost the live session")
+	}
+	if got != live {
+		t.Errorf("registry holds %p, want the original live session %p (the entry was overwritten)", got, live)
+	}
+
+	resp := decodeRestore200(t, rec)
+	if resp.SessionID != sid {
+		t.Errorf("session_id = %v, want %v", resp.SessionID, sid)
+	}
+	if resp.Restored {
+		t.Error("restored = true, want false (the session was attached, not rebuilt)")
+	}
+}
+
+// TestServerHandleRestoreRebuildsShutDownSession is the other half of the
+// short-circuit's contract, and the reason it must resolve through liveSession rather
+// than a bare registry.get: a registered-but-DEAD session is a corpse, and attaching to
+// it would answer 200/{restored:false} forever for a session no request can drive. The
+// probe must evict it and the rig must genuinely rebuild.
+//
+// The corpse is registered with a bare put, so no watcher is running for it — eviction
+// here is the lazy probe's doing alone, which is exactly the window the probe exists to
+// cover.
+func TestServerHandleRestoreRebuildsShutDownSession(t *testing.T) {
+	t.Parallel()
+
+	const sidStr = "9d9d9d9d-9d9d-9d9d-9d9d-9d9d9d9d9d9d"
+	sid := parseTestUUID(t, sidStr)
+
+	corpse := newDoneSession(&fakeSession{id: sid})
+	corpse.shutdown()
+	rebuilt := newDoneSession(&fakeSession{id: sid})
+	rig := &doneRig{restoreSess: rebuilt}
+	srv := newServer[*doneSession, fakeSessionOption](rig, nil, newConfig())
+	srv.registry.put(sid, corpse)
+
+	rec := httptest.NewRecorder()
+	srv.handleRestore(rec, restoreRequest(sidStr))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body %s)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if rig.restoreCalls != 1 {
+		t.Errorf("restoreCalls = %d, want 1 (a shut-down sid must be rebuilt, not attached to)", rig.restoreCalls)
+	}
+
+	got, ok := srv.registry.get(sid)
+	if !ok {
+		t.Fatal("registry has no session after the rebuild")
+	}
+	if got != rebuilt {
+		t.Error("registry still holds the shut-down session; the corpse was attached to instead of evicted")
+	}
+
+	resp := decodeRestore200(t, rec)
+	if resp.SessionID != sid {
+		t.Errorf("session_id = %v, want %v", resp.SessionID, sid)
+	}
+	if !resp.Restored {
+		t.Error("restored = false, want true (the session was rebuilt from durable history)")
+	}
+}
+
+// restoreRequest builds a POST /v1/sessions/{sid}/restore request with {sid} bound the
+// way the mux binds it, so a handler called directly sees the same path value.
+func restoreRequest(sid string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/v1/sessions/"+sid+"/restore", http.NoBody)
+	req.SetPathValue("sid", sid)
+	return req
+}
+
+// decodeRestore200 decodes a restore 200 body, failing the test on malformed JSON.
+func decodeRestore200(t *testing.T, rec *httptest.ResponseRecorder) restoreResponse {
+	t.Helper()
+	var resp restoreResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode 200 body: %v", err)
+	}
+	return resp
 }
 
 // TestRestoreResponseAlwaysCarriesRestored pins the wire key itself. The round-trip

@@ -166,6 +166,7 @@ func TestFixturesMatchSchemaShape(t *testing.T) {
 		{fixture: "create_with_command.json", schema: "create_response.schema.json"},
 		{fixture: "session_list.json", schema: "session_list.schema.json"},
 		{fixture: "restore.json", schema: "restore_response.schema.json"},
+		{fixture: "restore_attached.json", schema: "restore_response.schema.json"},
 		{fixture: "input.json", schema: "input_response.schema.json"},
 		{fixture: "interrupt.json", schema: "interrupt_response.schema.json"},
 		{fixture: "gate_accepted.json", schema: "gate_accepted_response.schema.json"},
