@@ -1266,6 +1266,7 @@ func buildRestoredSession(
 		sessionID:                sessionID,
 		sessionCtx:               sessionCtx,
 		sessionCancel:            sessionCancel,
+		done:                     make(chan struct{}),
 		constructionAbortTimeout: defaultConstructionAbortTimeout,
 		loops:                    make(map[uuid.UUID]*loopHandle),
 		newID:                    newID,

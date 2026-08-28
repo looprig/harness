@@ -15,6 +15,7 @@ import (
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
@@ -981,6 +982,104 @@ func TestShutdownThenMethodsExit(t *testing.T) {
 	var se *SessionError
 	if !errors.As(err, &se) || se.Kind != SessionLoopExited {
 		t.Fatalf("Submit after shutdown err = %v, want *SessionError{SessionLoopExited}", err)
+	}
+}
+
+// TestSessionDoneReportsLiveness proves Done() is a usable liveness signal for an
+// out-of-process observer (pkg/serve's registry): open while the session is usable,
+// closed once Shutdown has run, and never reopened. Without it a shut-down session is
+// indistinguishable from a live one from outside — Hub.SubscribeEvents still succeeds
+// after StopSession, so an SSE handler on a corpse heartbeats forever, pinning a
+// goroutine, a hub subscription and the whole dead Session.
+func TestSessionDoneReportsLiveness(t *testing.T) {
+	t.Parallel()
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	select {
+	case <-s.Done():
+		t.Fatal("Done() is closed on a live session; every observer would treat it as dead")
+	default:
+	}
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case <-s.Done():
+	default:
+		t.Fatal("Done() still open after Shutdown returned")
+	}
+	// A repeated Shutdown joins the same teardown owner; it must not close an
+	// already-closed channel (that panics) and must not reopen the signal.
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second Shutdown: %v", err)
+	}
+	select {
+	case <-s.Done():
+	default:
+		t.Fatal("Done() reopened after a second Shutdown")
+	}
+}
+
+// doneObservingAppender records, at each intent-log append, whether the session's
+// Done() channel was ALREADY closed. Shutdown's loop fan-out (phase 3) appends through
+// this seam, so an observation of "open" there proves Done() closes at the END of
+// teardown rather than at its start.
+type doneObservingAppender struct {
+	mu       sync.Mutex
+	session  *Session
+	shutdown []bool
+}
+
+func (a *doneObservingAppender) AppendCommand(_ context.Context, rec journal.CommandRecord) error {
+	if _, ok := rec.Command().(command.Shutdown); !ok {
+		return nil
+	}
+	closed := false
+	select {
+	case <-a.session.Done():
+		closed = true
+	default:
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.shutdown = append(a.shutdown, closed)
+	return nil
+}
+
+func (a *doneObservingAppender) observations() []bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]bool(nil), a.shutdown...)
+}
+
+// TestSessionDoneClosesAtShutdownStart proves the signal fires when teardown BEGINS,
+// not when it ends. The session already refuses new work from the closing latch
+// onward, so an observer must learn the session is dying before teardown completes —
+// otherwise an SSE stream stays open for the whole of it (loop drain, hustle audit,
+// checkpoint stop, lease release), which on a wedged loop is the full cleanup budget.
+// The probe is the shutdown-phase intent-log append, which runs in Shutdown's loop
+// fan-out, well before it returns.
+func TestSessionDoneClosesAtShutdownStart(t *testing.T) {
+	t.Parallel()
+	app := &doneObservingAppender{}
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}), WithCommandAppender(app))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	app.session = s
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	observed := app.observations()
+	if len(observed) == 0 {
+		t.Fatal("no shutdown command was appended; the probe never ran")
+	}
+	for i, closed := range observed {
+		if !closed {
+			t.Errorf("shutdown append %d observed Done() still open; the signal must close when teardown begins, not when it ends", i)
+		}
 	}
 }
 

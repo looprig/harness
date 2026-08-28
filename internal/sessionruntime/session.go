@@ -86,6 +86,17 @@ type Session struct {
 	shutdownStarted bool
 	shutdownDone    chan struct{}
 	shutdownErr     error
+	// done closes when Shutdown first begins (teardown admits no new work); never
+	// reopens. It is the session's outward liveness signal, read through Done(), and is
+	// closed under shutdownMu in the same critical section that flips shutdownStarted
+	// false->true — the one single-owner point, so the close happens exactly once.
+	// Unlike shutdownDone (which a joining caller waits on for the cleanup RESULT), this
+	// fires at the START of teardown: an observer must learn the session is dying before
+	// cleanup completes, not after. Every constructor allocates it; a struct-literal test
+	// session leaves it nil, so the close is nil-guarded and Done() then blocks forever
+	// (never observed dead), which is the safe direction for a session nobody tore down
+	// through Shutdown.
+	done chan struct{}
 	// shutdownTimeouts is a package-private test seam. Production leaves it zero
 	// and derives every phase budget from the session's already-validated loop,
 	// hustle, checkpoint, and durable-I/O bounds.
@@ -1959,6 +1970,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		sessionID:                id,
 		sessionCtx:               sessionCtx,
 		sessionCancel:            sessionCancel,
+		done:                     make(chan struct{}),
 		constructionAbortTimeout: defaultConstructionAbortTimeout,
 		loops:                    make(map[uuid.UUID]*loopHandle),
 		directChildren:           make(map[uuid.UUID]map[uuid.UUID]struct{}),
@@ -2640,6 +2652,18 @@ func (s *Session) activateProcessServiceBridge() error {
 	return nil
 }
 
+// Done reports session liveness: the returned channel is closed once Shutdown has
+// BEGUN (teardown admits no new work) and never reopens. It is the signal an
+// out-of-process observer needs, because a shut-down session is otherwise
+// indistinguishable from a live one from outside: Hub.SubscribeEvents still succeeds
+// after the hub is stopped, so an event stream over a dead session would heartbeat
+// forever, pinning its handler goroutine, its subscription and this whole Session.
+//
+// A receive on it must never be read as "cleanup finished" — it fires at the start of
+// teardown, deliberately. A session built as a bare struct literal (same-package tests)
+// has no channel and the nil result blocks forever, i.e. never reports death.
+func (s *Session) Done() <-chan struct{} { return s.done }
+
 // shutdownTarget pairs a loop with the Ack channel of the command.Shutdown the
 // session sent it, so the ack-wait phase can drain each loop's reply in turn. It
 // is Shutdown-internal: the send phase records one per loop actually reached, and
@@ -2694,6 +2718,14 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	}
 	s.shutdownStarted = true
 	s.shutdownDone = make(chan struct{})
+	// Publish liveness NOW, not after cleanup: the closing latch below already refuses
+	// new work, so an observer (pkg/serve's registry, which cannot see this session's
+	// error types) must be able to notice the session is dying while teardown runs.
+	// This is the only false->true transition of shutdownStarted and it is under
+	// shutdownMu, so the close runs exactly once however many callers race here.
+	if s.done != nil {
+		close(s.done)
+	}
 	s.shutdownMu.Unlock()
 
 	cleanupErr := s.shutdown()
