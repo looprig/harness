@@ -1083,6 +1083,46 @@ func TestSessionDoneClosesAtShutdownStart(t *testing.T) {
 	}
 }
 
+// TestRestoredSessionDoneReportsLiveness pins the SAME liveness contract on the OTHER
+// escaping constructor. buildRestoredSession assembles its Session from its own struct
+// literal, so it allocates done independently of newSessionTopology, and close(s.done)
+// is nil-guarded for the bare struct-literal sessions same-package tests build — a
+// restored session that forgot the allocation therefore has a nil channel that blocks
+// forever, silently never reporting death instead of failing loudly. Restored sessions
+// are exactly the ones a web UI's session handoff produces, so an unallocated channel
+// there means pkg/serve's registry never evicts them and their SSE streams heartbeat
+// on a corpse.
+func TestRestoredSessionDoneReportsLiveness(t *testing.T) {
+	t.Parallel()
+	sessionID, rootLoopID := mustUUID(), mustUUID()
+	bound := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineNative, "system"), sessionID, rootLoopID)
+	restoreCtx, restoreCancel := context.WithCancel(context.Background())
+	t.Cleanup(restoreCancel)
+	s, err := buildRestoredSession(
+		restoreCtx, restoreCancel, bound,
+		tool.Bindings{SessionID: sessionID, LoopID: rootLoopID},
+		sessionID, rootLoopID, "", 0, foldResult{}, restoredInference{}, nil, nil,
+		fakeSessionJournal{}, event.NewFactory(uuid.New, time.Now), uuid.New, time.Now,
+	)
+	if err != nil {
+		t.Fatalf("buildRestoredSession: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+	select {
+	case <-s.Done():
+		t.Fatal("Done() is closed on a live restored session; every observer would treat it as dead")
+	default:
+	}
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case <-s.Done():
+	default:
+		t.Fatal("restored session's Done() still open after Shutdown returned; buildRestoredSession must allocate done")
+	}
+}
+
 func TestShutdownLeaseHooksUseFreshContextsAfterCallerCancellation(t *testing.T) {
 	t.Parallel()
 
