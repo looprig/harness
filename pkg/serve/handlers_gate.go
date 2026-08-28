@@ -89,7 +89,7 @@ func (s *server[S, O]) handleGateResponse(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	sess, ok := s.registry.get(sid)
+	sess, ok := s.liveSession(sid)
 	if !ok {
 		writeErrorCause(w, http.StatusNotFound, codeNotFound, msgNotFound, false, SessionNotFoundError{SessionID: sid})
 		return

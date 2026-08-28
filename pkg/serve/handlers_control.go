@@ -37,7 +37,7 @@ func (s *server[S, O]) handleInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, ok := s.registry.get(sid)
+	sess, ok := s.liveSession(sid)
 	if !ok {
 		writeErrorCause(w, http.StatusNotFound, codeNotFound, msgNotFound, false, SessionNotFoundError{SessionID: sid})
 		return
@@ -79,7 +79,7 @@ func (s *server[S, O]) handleInterrupt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, ok := s.registry.get(sid)
+	sess, ok := s.liveSession(sid)
 	if !ok {
 		writeErrorCause(w, http.StatusNotFound, codeNotFound, msgNotFound, false, SessionNotFoundError{SessionID: sid})
 		return

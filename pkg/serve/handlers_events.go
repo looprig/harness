@@ -34,12 +34,12 @@ func allEventsFilter() event.EventFilter {
 }
 
 // handleEvents serves GET /v1/sessions/{sid}/events as a Server-Sent Events stream.
-// It resolves {sid} against the live registry (malformed => 400, unknown => 404),
-// opens a whole-session subscription (a Subscribe failure => 500 BEFORE any SSE
-// header is written, so the client gets a normal JSON error, not a half-open
-// stream), then streams each event — both Enduring and Ephemeral classes — as its
-// SSE frame until the client disconnects or the subscription ends. The subscription
-// is always closed on return.
+// It resolves {sid} against the LIVE plane (malformed => 400; unknown or already
+// shutting down => the same 404), opens a whole-session subscription (a Subscribe
+// failure => 500 BEFORE any SSE header is written, so the client gets a normal JSON
+// error, not a half-open stream), then streams each event — both Enduring and
+// Ephemeral classes — as its SSE frame until the client disconnects, the session dies,
+// or the subscription ends. The subscription is always closed on return.
 func (s *server[S, O]) handleEvents(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("sid"))
 	if err != nil {
@@ -47,7 +47,7 @@ func (s *server[S, O]) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, ok := s.registry.get(sid)
+	sess, ok := s.liveSession(sid)
 	if !ok {
 		writeErrorCause(w, http.StatusNotFound, codeNotFound, msgNotFound, false, SessionNotFoundError{SessionID: sid})
 		return
@@ -61,6 +61,16 @@ func (s *server[S, O]) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = sub.Close() }()
+
+	// done reports the session's death, when the session can report it. It stays NIL
+	// otherwise, and that is load-bearing rather than a fallback: a receive on a nil
+	// channel blocks forever, so the liveness arm of the stream select is inert and a
+	// session that does not satisfy SessionDone streams exactly as it did before this
+	// arm existed.
+	var done <-chan struct{}
+	if reporter, reportsDeath := sess.(SessionDone); reportsDeath {
+		done = reporter.Done()
+	}
 
 	w.Header().Set("Content-Type", contentTypeSSE)
 	// Never cache a live event stream, and disable proxy buffering (nginx's
@@ -78,21 +88,30 @@ func (s *server[S, O]) handleEvents(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("serve: events set write deadline", "err", err)
 	}
 
-	streamEvents(r, w, rc, sub, s.cfg.heartbeat)
+	streamEvents(r, w, rc, sub, done, s.cfg.heartbeat)
 }
 
 // streamEvents copies deliveries from sub onto w as SSE frames until the client
-// disconnects (r.Context cancelled) or the subscription ends (channel closed). Each
-// delivery is rendered by encodeDelivery into either an `event: enduring` frame (with
-// an id: line stamping d.JournalSeq) or an `event: ephemeral` frame (never sequenced);
-// a delivery encodeDelivery rejects — an Enduring event outside the sealed union, or
-// an unrecognized Ephemeral event — is SKIPPED, never aborting the stream.
+// disconnects (r.Context cancelled), the session dies (done closed), or the
+// subscription ends (channel closed). Each delivery is rendered by encodeDelivery into
+// either an `event: enduring` frame (with an id: line stamping d.JournalSeq) or an
+// `event: ephemeral` frame (never sequenced); a delivery encodeDelivery rejects — an
+// Enduring event outside the sealed union, or an unrecognized Ephemeral event — is
+// SKIPPED, never aborting the stream.
 //
 // An independent ticker emits a `: ping` SSE comment every heartbeat interval so an
 // idle stream (and any intermediary) stays alive; it fires on a fixed cadence
 // regardless of event activity (simplest correct choice — a client ignores comment
 // frames, so an occasional ping alongside real traffic is harmless).
-func streamEvents(r *http.Request, w http.ResponseWriter, rc *http.ResponseController, sub event.Subscription, heartbeat time.Duration) {
+// done ends the stream when the session it belongs to begins shutting down. It is the
+// ONLY exit a dead session offers: hub.SubscribeEvents registers unconditionally and
+// returns nil even after StopSession, and the hub never closes subscriptions on stop
+// (only a consumer Close or an overflow-fail does), so a stopped session delivers
+// nothing and closes nothing — without this arm the stream heartbeats forever, pinning
+// this goroutine, the hub subscription and the whole dead session until the process
+// exits. A NIL done (a session that cannot report death) blocks forever on receive, so
+// the arm is simply inert and the loop behaves exactly as it did before.
+func streamEvents(r *http.Request, w http.ResponseWriter, rc *http.ResponseController, sub event.Subscription, done <-chan struct{}, heartbeat time.Duration) {
 	// Clamp at the point of use: time.NewTicker panics on a non-positive interval, so
 	// a future zero-valued config{} literal (or an Option that zeroed heartbeat) can
 	// never panic deep in the request path — it falls back to the secure default,
@@ -106,6 +125,8 @@ func streamEvents(r *http.Request, w http.ResponseWriter, rc *http.ResponseContr
 	for {
 		select {
 		case <-r.Context().Done():
+			return
+		case <-done:
 			return
 		case <-ticker.C:
 			if _, err := io.WriteString(w, ssePing); err != nil {

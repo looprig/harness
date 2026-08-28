@@ -158,7 +158,7 @@ func (s *server[S, O]) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := sess.SessionID()
-	s.registry.put(id, sess)
+	s.register(id, sess)
 
 	resp := createResponse{SessionID: id}
 	if len(blocks) > 0 {
@@ -257,6 +257,6 @@ func (s *server[S, O]) handleRestore(w http.ResponseWriter, r *http.Request) {
 		writeErrorCause(w, http.StatusInternalServerError, codeInternal, msgRestoreFailed, false, err)
 		return
 	}
-	s.registry.put(sid, sess)
+	s.register(sid, sess)
 	writeJSON(w, http.StatusOK, restoreResponse{SessionID: sid, Restored: true})
 }
