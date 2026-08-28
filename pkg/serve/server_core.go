@@ -63,11 +63,14 @@ func newServer[S LiveSession, O any](rig Rig[S, O], reader Reader, cfg *config) 
 // stay pinned until the process exits. Something has to be watching.
 //
 // The goroutine costs one blocked receive per live session and ends at the first of the
-// session's death or process exit; it holds only the id and the session it was handed,
-// and its delete is identity-guarded, so a session that is replaced under the same sid
-// before it dies evicts nothing.
+// session's death or process exit. It closes over the id and the TOKEN put minted for
+// this registration — not over the session — so its delete removes only the entry it was
+// started for: a session replaced under the same sid before it dies evicts nothing.
+// Carrying the token rather than the session is also what keeps the watcher from ever
+// comparing interface values, which would panic here, on a background goroutine, for any
+// implementor whose dynamic type is uncomparable (see registry.deleteMatching).
 func (s *server[S, O]) register(id uuid.UUID, sess LiveSession) {
-	s.registry.put(id, sess)
+	token := s.registry.put(id, sess)
 	reporter, reportsDeath := sess.(SessionDone)
 	if !reportsDeath {
 		// The session cannot report death, so there is nothing to watch. It stays
@@ -77,7 +80,7 @@ func (s *server[S, O]) register(id uuid.UUID, sess LiveSession) {
 	done := reporter.Done()
 	go func() {
 		<-done
-		s.registry.deleteMatching(id, sess)
+		s.registry.deleteMatching(id, token)
 	}()
 }
 
@@ -98,7 +101,7 @@ func (s *server[S, O]) register(id uuid.UUID, sess LiveSession) {
 // reported live. That is fail-open, and deliberately so: the alternative reading of
 // "cannot ask" as "dead" would make every session a consumer registers unreachable.
 func (s *server[S, O]) liveSession(sid uuid.UUID) (LiveSession, bool) {
-	sess, registered := s.registry.get(sid)
+	sess, token, registered := s.registry.lookup(sid)
 	if !registered {
 		return nil, false
 	}
@@ -108,7 +111,7 @@ func (s *server[S, O]) liveSession(sid uuid.UUID) (LiveSession, bool) {
 	}
 	select {
 	case <-reporter.Done():
-		s.registry.deleteMatching(sid, sess)
+		s.registry.deleteMatching(sid, token)
 		return nil, false
 	default:
 		return sess, true

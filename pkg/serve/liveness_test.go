@@ -1,10 +1,14 @@
 package serve
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 )
 
 // doneFakeSession is a LiveSession that ALSO satisfies the optional SessionDone
@@ -197,5 +201,62 @@ func TestServerWatcherDeclinesToEvictAReRegisteredSession(t *testing.T) {
 	// The replacement's own watcher must still work: the guard rejects stale
 	// observations, not every observation.
 	replacement.shutdown()
+	waitAbsent(t, srv.registry, id)
+}
+
+// uncomparableSession is a LiveSession whose DYNAMIC TYPE is uncomparable: a struct
+// with a slice field, satisfying both LiveSession and SessionDone on the VALUE
+// receiver, so the value itself — not a pointer to it — is what lands in the
+// registry's interface field. Comparing two such interface values with == panics at
+// run time ("comparing uncomparable type"), which is why the eviction guard must not
+// compare interfaces at all.
+//
+// Nothing in harness ships a session like this; the point is that LiveSession is
+// exported and harness is a library, so the dynamic types reaching the registry are
+// chosen by external implementors (capstan, client, consumer fakes) and not by us.
+type uncomparableSession struct {
+	// labels makes the struct uncomparable. Any slice, map or func field would do.
+	labels []string
+	done   chan struct{}
+}
+
+func newUncomparableSession() uncomparableSession {
+	return uncomparableSession{labels: []string{"uncomparable"}, done: make(chan struct{})}
+}
+
+func (uncomparableSession) SessionID() uuid.UUID { return uuid.UUID{} }
+
+func (uncomparableSession) Submit(context.Context, []content.Block) (uuid.UUID, error) {
+	return uuid.UUID{}, nil
+}
+
+func (uncomparableSession) SubscribeEvents(event.EventFilter) (event.Subscription, error) {
+	return nil, nil
+}
+
+func (uncomparableSession) RespondGate(context.Context, gate.GateResponse) error { return nil }
+func (uncomparableSession) Interrupt(context.Context) (bool, error)              { return false, nil }
+func (u uncomparableSession) Done() <-chan struct{}                              { return u.done }
+
+// TestServerRegisterEvictsAnUncomparableSession is the panic proof. The watcher runs
+// on a background goroutine, so an eviction that compares interface values takes the
+// WHOLE PROCESS down when the dynamic type is uncomparable — not the request, and with
+// a stack naming registry internals rather than the implementor that supplied the type.
+// A recover() in the test cannot catch it: it happens in another goroutine.
+//
+// So the assertion is simply that the eviction completes. If eviction compares
+// interfaces, this test does not fail — it crashes the test binary.
+func TestServerRegisterEvictsAnUncomparableSession(t *testing.T) {
+	t.Parallel()
+	srv := testServer(t)
+	id := mustUUID(t)
+	sess := newUncomparableSession()
+
+	srv.register(id, sess)
+	if _, ok := srv.registry.get(id); !ok {
+		t.Fatal("get(): entry missing right after register")
+	}
+
+	close(sess.done)
 	waitAbsent(t, srv.registry, id)
 }

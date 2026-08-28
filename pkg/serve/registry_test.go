@@ -202,40 +202,65 @@ func TestRegistryConcurrent(t *testing.T) {
 	}
 }
 
-// TestRegistryDeleteMatching pins the identity guard. An eviction is driven by an
-// observation of one specific session's death, and that observation can be stale by
+// TestRegistryDeleteMatching pins the registration guard. An eviction is driven by an
+// observation of one specific registration's death, and that observation can be stale by
 // the time it reaches the map: a restore may already have re-registered a NEW live
 // session under the same sid. An unguarded delete would then remove the live
 // replacement on the corpse's behalf, silently 404-ing a session that is running.
+//
+// The guard is the registration token minted by put, never a comparison of the stored
+// LiveSession. Comparing interfaces would panic on an uncomparable dynamic type, and a
+// token also distinguishes two DISTINCT registrations of the same session value, which
+// identity cannot.
 func TestRegistryDeleteMatching(t *testing.T) {
 	t.Parallel()
-	id := mustUUID(t)
 	original := fakeLiveSession{id: 1}
 	replacement := fakeLiveSession{id: 2}
 
 	tests := []struct {
-		name        string
-		seed        LiveSession // nil means leave the id unregistered
-		target      LiveSession // the session the observation claims died
+		name string
+		// seed prepares the registry and returns the token the eviction claims died.
+		seed        func(r *registry, id uuid.UUID) uint64
 		wantRemoved bool
 		wantPresent LiveSession // nil means the id must be absent afterwards
 	}{
 		{
-			name:        "removes the entry it was handed",
-			seed:        original,
-			target:      original,
+			name: "removes the registration it was handed",
+			seed: func(r *registry, id uuid.UUID) uint64 {
+				return r.put(id, original)
+			},
 			wantRemoved: true,
 		},
 		{
-			name:        "declines to remove a re-registered session",
-			seed:        replacement,
-			target:      original,
+			name: "declines to remove a re-registered session",
+			seed: func(r *registry, id uuid.UUID) uint64 {
+				stale := r.put(id, original)
+				r.put(id, replacement)
+				return stale
+			},
 			wantRemoved: false,
 			wantPresent: replacement,
 		},
 		{
-			name:   "absent id reports no removal",
-			target: original,
+			// Strictly stronger than an identity comparison: the stored session is the
+			// very value the stale observation is about, so == would say "match" and
+			// evict the live re-registration. The token says these are two different
+			// registrations, which is the question actually being asked.
+			name: "declines to remove a re-registration of the same session",
+			seed: func(r *registry, id uuid.UUID) uint64 {
+				stale := r.put(id, original)
+				r.put(id, original)
+				return stale
+			},
+			wantRemoved: false,
+			wantPresent: original,
+		},
+		{
+			name: "absent id reports no removal",
+			seed: func(r *registry, id uuid.UUID) uint64 {
+				// A token minted for some other id is as stale as it gets.
+				return r.put(mustUUID(t), original)
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -243,10 +268,9 @@ func TestRegistryDeleteMatching(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			r := newRegistry()
-			if tt.seed != nil {
-				r.put(id, tt.seed)
-			}
-			if removed := r.deleteMatching(id, tt.target); removed != tt.wantRemoved {
+			id := mustUUID(t)
+			token := tt.seed(r, id)
+			if removed := r.deleteMatching(id, token); removed != tt.wantRemoved {
 				t.Fatalf("deleteMatching() = %v, want %v", removed, tt.wantRemoved)
 			}
 			got, ok := r.get(id)
@@ -260,8 +284,28 @@ func TestRegistryDeleteMatching(t *testing.T) {
 				t.Fatal("get() after deleteMatching: entry missing, want the re-registered session kept")
 			}
 			if got != tt.wantPresent {
-				t.Errorf("get() = %v, want %v (identity guard removed the wrong session)", got, tt.wantPresent)
+				t.Errorf("get() = %v, want %v (the guard removed the wrong registration)", got, tt.wantPresent)
 			}
 		})
+	}
+}
+
+// TestRegistryTokensAreUnique pins the one property the guard rests on: every put
+// mints a token no earlier put ever handed out. If tokens repeated, a stale watcher
+// could match a later registration and evict a live session — the exact bug the guard
+// exists to prevent.
+func TestRegistryTokensAreUnique(t *testing.T) {
+	t.Parallel()
+	r := newRegistry()
+	id := mustUUID(t)
+	sess := fakeLiveSession{id: 1}
+
+	seen := make(map[uint64]bool)
+	for i := 0; i < 100; i++ {
+		token := r.put(id, sess)
+		if seen[token] {
+			t.Fatalf("put() reissued token %d on registration %d", token, i)
+		}
+		seen[token] = true
 	}
 }
