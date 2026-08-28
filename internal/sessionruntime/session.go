@@ -87,10 +87,9 @@ type Session struct {
 	cleanupDone     chan struct{}
 	shutdownErr     error
 	// done closes when Shutdown first begins; Done() carries the full contract. It is
-	// distinct from cleanupDone above, which closes when cleanup FINISHES. Only the two
-	// escaping constructors allocate it (newSessionTopology, buildRestoredSession); the
-	// non-escaping &Session{} option probes they each build first leave it nil, as do
-	// same-package struct-literal test sessions, so the close is nil-guarded.
+	// distinct from cleanupDone above, which closes when cleanup FINISHES. It is
+	// allocated lazily under shutdownMu by whichever of Done or Shutdown reaches it
+	// first, so no constructor has to remember to mint it.
 	done chan struct{}
 	// shutdownTimeouts is a package-private test seam. Production leaves it zero
 	// and derives every phase budget from the session's already-validated loop,
@@ -1965,7 +1964,6 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		sessionID:                id,
 		sessionCtx:               sessionCtx,
 		sessionCancel:            sessionCancel,
-		done:                     make(chan struct{}),
 		constructionAbortTimeout: defaultConstructionAbortTimeout,
 		loops:                    make(map[uuid.UUID]*loopHandle),
 		directChildren:           make(map[uuid.UUID]map[uuid.UUID]struct{}),
@@ -2655,9 +2653,20 @@ func (s *Session) activateProcessServiceBridge() error {
 // forever, pinning its handler goroutine, its subscription and this whole Session.
 //
 // A receive on it must never be read as "cleanup finished" — it fires at the start of
-// teardown, deliberately. A session built as a bare struct literal (same-package tests)
-// has no channel and the nil result blocks forever, i.e. never reports death.
-func (s *Session) Done() <-chan struct{} { return s.done }
+// teardown, deliberately.
+//
+// The channel is minted here on first use under the same shutdownMu that Shutdown
+// closes it under, so every Session reports liveness however it was built. Done takes
+// only shutdownMu and calls nothing, and Shutdown never calls Done, so the two cannot
+// deadlock.
+func (s *Session) Done() <-chan struct{} {
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
+	if s.done == nil {
+		s.done = make(chan struct{})
+	}
+	return s.done
+}
 
 // shutdownTarget pairs a loop with the Ack channel of the command.Shutdown the
 // session sent it, so the ack-wait phase can drain each loop's reply in turn. It
@@ -2718,9 +2727,12 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	// error types) must be able to notice the session is dying while teardown runs.
 	// This is the only false->true transition of shutdownStarted and it is under
 	// shutdownMu, so the close runs exactly once however many callers race here.
-	if s.done != nil {
-		close(s.done)
+	// Mint the channel if no observer has called Done yet, so a later Done sees a
+	// closed channel rather than a fresh open one.
+	if s.done == nil {
+		s.done = make(chan struct{})
 	}
+	close(s.done)
 	s.shutdownMu.Unlock()
 
 	cleanupErr := s.shutdown()

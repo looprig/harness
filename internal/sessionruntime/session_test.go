@@ -1085,13 +1085,11 @@ func TestSessionDoneClosesAtShutdownStart(t *testing.T) {
 
 // TestRestoredSessionDoneReportsLiveness pins the SAME liveness contract on the OTHER
 // escaping constructor. buildRestoredSession assembles its Session from its own struct
-// literal, so it allocates done independently of newSessionTopology, and close(s.done)
-// is nil-guarded for the bare struct-literal sessions same-package tests build — a
-// restored session that forgot the allocation therefore has a nil channel that blocks
-// forever, silently never reporting death instead of failing loudly. Restored sessions
-// are exactly the ones a web UI's session handoff produces, so an unallocated channel
-// there means pkg/serve's registry never evicts them and their SSE streams heartbeat
-// on a corpse.
+// literal and reaches Shutdown by a different path than newSessionTopology's sessions,
+// so the contract is asserted end-to-end on a genuinely restored one rather than
+// inferred. Restored sessions are exactly the ones a web UI's session handoff produces:
+// if one failed to report death, pkg/serve's registry would never evict it and its SSE
+// stream would heartbeat on a corpse.
 func TestRestoredSessionDoneReportsLiveness(t *testing.T) {
 	t.Parallel()
 	sessionID, rootLoopID := mustUUID(), mustUUID()
@@ -1119,8 +1117,59 @@ func TestRestoredSessionDoneReportsLiveness(t *testing.T) {
 	select {
 	case <-s.Done():
 	default:
-		t.Fatal("restored session's Done() still open after Shutdown returned; buildRestoredSession must allocate done")
+		t.Fatal("restored session's Done() still open after Shutdown returned")
 	}
+}
+
+// TestSessionDoneAllocatesWithoutAConstructor pins the liveness contract on a Session
+// that NO constructor built. Allocating done in the constructors makes the contract a
+// convention every future constructor must remember; allocating it lazily inside Done()
+// and Shutdown under shutdownMu makes it unconditional. The difference is observable:
+// a session with no allocated channel hands its observer a nil channel, which blocks
+// forever, so pkg/serve's registry would hold that session live for the rest of the
+// process instead of evicting it — a corpse that never reports death is worse than a
+// loud failure. Both orders matter: Done-then-Shutdown must close the channel the
+// observer already holds, and Shutdown-then-Done must hand back an already-closed one.
+func TestSessionDoneAllocatesWithoutAConstructor(t *testing.T) {
+	t.Parallel()
+
+	t.Run("done before shutdown", func(t *testing.T) {
+		t.Parallel()
+		s := &Session{}
+		done := s.Done()
+		if done == nil {
+			t.Fatal("Done() = nil on a session no constructor allocated; a nil channel blocks forever and never reports death")
+		}
+		if again := s.Done(); again != done {
+			t.Fatal("Done() minted a second channel; an observer holding the first would never see the close")
+		}
+		select {
+		case <-done:
+			t.Fatal("Done() is closed before Shutdown; every observer would treat a live session as dead")
+		default:
+		}
+		if err := s.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+		select {
+		case <-done:
+		default:
+			t.Fatal("the channel Done() handed out before Shutdown was never closed")
+		}
+	})
+
+	t.Run("done after shutdown", func(t *testing.T) {
+		t.Parallel()
+		s := &Session{}
+		if err := s.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+		select {
+		case <-s.Done():
+		default:
+			t.Fatal("Done() first called after Shutdown reports the session live; Shutdown must allocate and close it")
+		}
+	})
 }
 
 func TestShutdownLeaseHooksUseFreshContextsAfterCallerCancellation(t *testing.T) {
