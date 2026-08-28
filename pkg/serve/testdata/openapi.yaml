@@ -388,11 +388,7 @@ components:
       required: [session_id, restored]
       properties:
         session_id: { $ref: "#/components/schemas/UUID" }
-        restored:
-          type: boolean
-          description: >
-            true when the rig rebuilt the session from durable history; false when
-            an already-live session was reused (attach). Both are 200.
+        restored: { type: boolean }
 
     InputResponse:
       type: object

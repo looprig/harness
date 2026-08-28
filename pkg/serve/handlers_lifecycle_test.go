@@ -372,6 +372,26 @@ func TestServerHandleRestore(t *testing.T) {
 	}
 }
 
+// TestRestoreResponseAlwaysCarriesRestored pins the wire key itself. The round-trip
+// assertions in TestServerHandleRestore decode the body back into restoreResponse, so
+// an omitted "restored" key decodes to false and still matches a false expectation —
+// adding `omitempty` to the tag would leave them green while silently breaking the
+// "never omitted" contract that the JSON Schema and OpenAPI both declare as required.
+func TestRestoreResponseAlwaysCarriesRestored(t *testing.T) {
+	t.Parallel()
+	b, err := json.Marshal(restoreResponse{})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(b, &keys); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := keys["restored"]; !ok {
+		t.Errorf("zero restoreResponse omitted %q; schema declares it required (body %s)", "restored", b)
+	}
+}
+
 // idemRunID / idemCmdID are the fixed ids the fake rig/session mint in the
 // idempotency handler tests.
 const (

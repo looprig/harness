@@ -75,7 +75,7 @@ type createResponse struct {
 // process: true when the rig rebuilt the session from durable history, false when an
 // already-live session was reused (attach). It is never omitted — a consumer that
 // cannot tell an attach from a rebuild cannot test that the attach path is still
-// short-circuiting the rig, which is the whole point of the route being idempotent.
+// short-circuiting the rig.
 type restoreResponse struct {
 	SessionID uuid.UUID `json:"session_id"`
 	Restored  bool      `json:"restored"`
