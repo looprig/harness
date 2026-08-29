@@ -2,6 +2,7 @@ package serve
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -81,6 +82,46 @@ type restoreResponse struct {
 	Restored  bool      `json:"restored"`
 }
 
+// detachSessionLifetime strips cancellation from the request context while keeping
+// its values, and it is what makes a session created over HTTP usable at all.
+//
+// A rig derives a session's WHOLE lifetime from the context passed to
+// NewSession/RestoreSession — the harness runtime does
+// `sessionCtx, sessionCancel := context.WithCancel(ctx)` in both constructors and
+// every loop context descends from that. net/http cancels r.Context() the moment the
+// handler returns, so handing it to the rig mints a session that is already dead when
+// its 201 reaches the client: the next POST .../input answers 500 with the loop
+// reported as exited.
+//
+// The detach belongs HERE, not in the Rig contract. serve is the only party that knows
+// the context it holds is request-scoped; a rig is also driven from a CLI, a TUI and a
+// test, where deriving the session's lifetime from the caller's context is exactly the
+// right behaviour and a rig that unilaterally ignored cancellation would strip a
+// legitimate shutdown signal. "The Rig must not honour cancellation" is also
+// unenforceable across the structural implementations serve accepts: it would be a
+// contract clause every consumer could silently violate, which is how this bug reached
+// production once already. Dropping cancellation at the one boundary that creates it is
+// enforceable and local.
+//
+// Values are preserved deliberately: trace ids, request ids and auth/identity values a
+// caller put on the request context stay visible to the rig and to everything the
+// session later logs. Only cancellation — the request-scoped half — is dropped.
+//
+// No construction deadline is imposed on top. It would be a magic timeout no Option can
+// tune, and cancelling a construction mid-flight is the one thing that strands the
+// session's workspace lease: the lease's release is owned by the session being built, so
+// an aborted construction is worse than a slow one. A consumer that wants construction
+// bounded owns that policy in its own Rig implementation, where it can also own the
+// cleanup. The request read/header timeouts and the server's shutdown still bound the
+// handler itself.
+//
+// The cost is that a client disconnecting mid-create no longer aborts the create. That is
+// the intended trade: the session's lifetime belongs to whoever owns the process, and it
+// ends at an explicit shutdown, not at a dropped TCP connection.
+func detachSessionLifetime(ctx context.Context) context.Context {
+	return context.WithoutCancel(ctx)
+}
+
 // handleCreate serves POST /v1/sessions: bring up a fresh session and, if the
 // request carried input, submit it.
 //
@@ -152,7 +193,7 @@ func (s *server[S, O]) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, err := s.rig.NewSession(r.Context())
+	sess, err := s.rig.NewSession(detachSessionLifetime(r.Context()))
 	if err != nil {
 		writeErrorCause(w, http.StatusInternalServerError, codeInternal, msgCreateFailed, false, err)
 		return
@@ -271,7 +312,7 @@ func (s *server[S, O]) handleRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, err := s.rig.RestoreSession(r.Context(), sid)
+	sess, err := s.rig.RestoreSession(detachSessionLifetime(r.Context()), sid)
 	if err != nil {
 		var notFound SessionNotFoundError
 		if errors.As(err, &notFound) {

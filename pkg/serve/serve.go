@@ -75,6 +75,13 @@ type SessionDone interface {
 //
 //   - NewSession brings up a brand-new live session that exposes its minted ID.
 //   - RestoreSession rebuilds a prior session from its durable history by id.
+//
+// LIFETIME: the context serve passes to either method carries the request's VALUES but
+// is never cancelled (see detachSessionLifetime). A rig that derives a session's
+// lifetime from this context — as the harness runtime does — therefore gets a session
+// that outlives the request that asked for it, which is the only thing that makes an
+// HTTP-created session drivable by a later request. An implementation is free to derive
+// a lifetime from it, and must not rely on it to learn that the client went away.
 type Rig[S LiveSession, O any] interface {
 	NewSession(ctx context.Context, opts ...O) (S, error)
 	RestoreSession(ctx context.Context, id uuid.UUID) (S, error)
