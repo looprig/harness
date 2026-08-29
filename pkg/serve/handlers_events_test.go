@@ -153,6 +153,7 @@ func TestHandleEventsStreamsEnduring(t *testing.T) {
 
 	rec := newFlushRecorder()
 	done := runEvents(srv, rec, eventsRequest(t, context.Background(), eventsSIDStr))
+	awaitHeadFlush(t, rec)
 
 	const seq = 42
 	sub.ch <- event.Delivery{Event: ev, JournalSeq: seq}
@@ -210,6 +211,7 @@ func TestHandleEventsZeroSeqEnduring(t *testing.T) {
 
 	rec := newFlushRecorder()
 	done := runEvents(srv, rec, eventsRequest(t, context.Background(), eventsSIDStr))
+	awaitHeadFlush(t, rec)
 
 	sub.ch <- event.Delivery{Event: ev, JournalSeq: 0}
 	select {
@@ -347,6 +349,7 @@ func TestHandleEventsStreamsEphemeral(t *testing.T) {
 
 			rec := newFlushRecorder()
 			done := runEvents(srv, rec, eventsRequest(t, context.Background(), eventsSIDStr))
+			awaitHeadFlush(t, rec)
 
 			// JournalSeq is 0 for Ephemeral deliveries; the frame must carry NO id:.
 			sub.ch <- event.Delivery{Event: tt.ev}
@@ -408,6 +411,7 @@ func TestHandleEventsChunkNoLeak(t *testing.T) {
 
 	rec := newFlushRecorder()
 	done := runEvents(srv, rec, eventsRequest(t, context.Background(), eventsSIDStr))
+	awaitHeadFlush(t, rec)
 
 	sub.ch <- event.Delivery{Event: event.TokenDelta{Chunk: &content.TextChunk{Text: "secret"}}}
 	select {
@@ -454,6 +458,7 @@ func TestHandleEventsSkipsUnrecognizedEphemeral(t *testing.T) {
 
 	rec := newFlushRecorder()
 	done := runEvents(srv, rec, eventsRequest(t, context.Background(), eventsSIDStr))
+	awaitHeadFlush(t, rec)
 
 	sub.ch <- event.Delivery{Event: eph}
 	sub.ch <- event.Delivery{Event: end, JournalSeq: 7}
@@ -495,6 +500,7 @@ func TestHandleEventsHeartbeat(t *testing.T) {
 	defer cancel()
 	rec := newFlushRecorder()
 	done := runEvents(srv, rec, eventsRequest(t, ctx, eventsSIDStr))
+	awaitHeadFlush(t, rec)
 
 	// Wait for the first heartbeat flush (bounded by the deadline backstop).
 	select {
@@ -638,5 +644,107 @@ func TestHandleEventsErrors(t *testing.T) {
 			}
 			assertErrorEnvelope(t, rec)
 		})
+	}
+}
+
+// TestHandleEventsFlushesHeadBeforeAnyBody proves the SSE response HEAD is pushed to
+// the client as soon as the stream opens, rather than sitting in net/http's write
+// buffer until the first body byte.
+//
+// The assertion is an ORDERING one, not a timing one: the session is idle and the
+// heartbeat is an hour away (quietConfig), so no frame and no `: ping` can exist. A
+// flush observed with an empty body is therefore necessarily the head, flushed before
+// any body byte was written. Without the flush the handler writes nothing at all until
+// the keep-alive ticker fires, so a browser's EventSource stays in CONNECTING for a
+// full heartbeat interval after opening a session.
+func TestHandleEventsFlushesHeadBeforeAnyBody(t *testing.T) {
+	t.Parallel()
+
+	sid := parseTestUUID(t, eventsSIDStr)
+	sub := &fakeSubscription{ch: make(chan event.Delivery)}
+	sess := &fakeSession{sub: sub}
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, quietConfig())
+	srv.registry.put(sid, sess)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := newFlushRecorder()
+	done := runEvents(srv, rec, eventsRequest(t, ctx, eventsSIDStr))
+
+	select {
+	case <-rec.flushes:
+	case <-time.After(streamDeadline):
+		t.Fatalf("the response head was never flushed (no flush within %v on an idle stream)", streamDeadline)
+	}
+	if body := rec.snapshot(); body != "" {
+		t.Fatalf("body = %q at the first flush, want empty (the head must be flushed before any body byte)", body)
+	}
+	if got := rec.statusCode(); got != http.StatusOK {
+		t.Errorf("status = %d, want %d", got, http.StatusOK)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != contentTypeSSE {
+		t.Errorf("Content-Type = %q, want %q", ct, contentTypeSSE)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(streamDeadline):
+		t.Fatalf("handler did not return within %v after cancel", streamDeadline)
+	}
+}
+
+// TestHandleEventsHeadReachesClientBeforeAnyFrame is the same property observed from
+// the far side of a real socket: an HTTP client opening the stream on an idle session
+// gets its response head back before any body byte exists.
+//
+// net/http buffers the head until the first write flushes it, and only a real server
+// exercises that buffering (an httptest.Recorder has none). The heartbeat is an hour
+// away and the session emits nothing, so the client CANNOT be receiving the head as a
+// side effect of a frame — receiving it at all is the proof. The bounded wait is a
+// failure backstop, not the assertion.
+func TestHandleEventsHeadReachesClientBeforeAnyFrame(t *testing.T) {
+	t.Parallel()
+
+	sid := parseTestUUID(t, eventsSIDStr)
+	sub := &fakeSubscription{ch: make(chan event.Delivery)}
+	sess := &fakeSession{sub: sub}
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, quietConfig())
+	srv.registry.put(sid, sess)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(routeEvents, srv.handleEvents)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), streamDeadline)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/sessions/"+eventsSIDStr+"/events", http.NoBody)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("the response head never reached the client on an idle stream: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != contentTypeSSE {
+		t.Errorf("Content-Type = %q, want %q", ct, contentTypeSSE)
+	}
+}
+
+// awaitHeadFlush consumes the response-head flush handleEvents performs as soon as the
+// stream opens, before any frame. A test that waits on the NEXT flush is then waiting
+// on its own frame rather than on the head. The bounded wait is a failure backstop.
+func awaitHeadFlush(t *testing.T, rec *flushRecorder) {
+	t.Helper()
+	select {
+	case <-rec.flushes:
+	case <-time.After(streamDeadline):
+		t.Fatalf("the response head was not flushed within %v", streamDeadline)
 	}
 }

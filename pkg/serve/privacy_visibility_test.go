@@ -246,6 +246,7 @@ func TestHandleEventsSkipsNonPublicLiveDeliveries(t *testing.T) {
 			srv.registry.put(sid, sess)
 			rec := newFlushRecorder()
 			done := runEvents(srv, rec, eventsRequest(t, context.Background(), eventsSIDStr))
+			awaitHeadFlush(t, rec)
 			for _, ev := range tt.skipped {
 				sub.ch <- event.Delivery{Event: ev, JournalSeq: 8}
 			}

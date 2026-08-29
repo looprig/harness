@@ -31,6 +31,11 @@ type config struct {
 	// heartbeat is the SSE keep-alive interval for the events stream. It is set to
 	// defaultHeartbeatInterval by newConfig and is not exposed via an Option (no
 	// caller need has surfaced); tests set it directly for deterministic assertions.
+	//
+	// It is a keep-alive cadence and nothing more: handleEvents flushes the response
+	// head as soon as the stream opens, so the interval no longer decides how long a
+	// client waits to see the stream come up. The only reason to tune it would be an
+	// intermediary whose idle timeout is under 20s.
 	heartbeat time.Duration
 }
 

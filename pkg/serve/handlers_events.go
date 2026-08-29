@@ -87,6 +87,19 @@ func (s *server[S, O]) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if err := rc.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
 		slog.Debug("serve: events set write deadline", "err", err)
 	}
+	// Push the head out NOW. net/http buffers the status line and headers until the
+	// first body write, and on an idle session that write is the keep-alive ping a whole
+	// heartbeat interval away — so without this flush a client's EventSource stays in
+	// CONNECTING for up to 20s after opening a session, unable to tell a slow connection
+	// from a broken one. Flushing here makes the stream's readiness independent of when
+	// the session next has something to say.
+	//
+	// A flush failure is terminal, exactly as it is in the stream loop below: a writer
+	// that cannot be flushed cannot carry an event stream, so there is nothing to stream.
+	if err := rc.Flush(); err != nil {
+		slog.Debug("serve: events flush head", "err", err)
+		return
+	}
 
 	streamEvents(r, w, rc, sub, done, s.cfg.heartbeat)
 }
