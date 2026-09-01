@@ -312,6 +312,31 @@ func TestProjectRejectsPermissionReviewEventsBeforeValidation(t *testing.T) {
 	}
 }
 
+func TestProjectRejectsInternalVisibilityBeforeCallerScopeValidation(t *testing.T) {
+	t.Parallel()
+	internal := event.SessionActive{Header: event.Header{EventVisibility: event.Internal}}
+	tests := []struct {
+		name      string
+		tenantID  coresessionwire.TenantID
+		sessionID coresessionwire.SessionID
+	}{
+		{name: "invalid tenant", tenantID: "", sessionID: "public-session"},
+		{name: "invalid session", tenantID: "tenant-a", sessionID: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Project(test.tenantID, test.sessionID, internal)
+			var projectionErr *ProjectionError
+			if !errors.As(err, &projectionErr) || projectionErr.Reason != ProjectionRejected {
+				t.Fatalf("Project() error = %T %v, want ProjectionRejected before caller scope validation", err, err)
+			}
+			if projectionErr.Cause != nil {
+				t.Fatalf("privacy rejection exposed unrelated validation cause: %v", projectionErr.Cause)
+			}
+		})
+	}
+}
+
 func TestProjectRejectsMalformedAndPrivateValues(t *testing.T) {
 	t.Parallel()
 	validHeader := event.Header{Coordinates: identity.Coordinates{SessionID: testUUID(1)}, EventID: testUUID(5)}

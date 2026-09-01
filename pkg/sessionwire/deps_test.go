@@ -37,13 +37,13 @@ func TestReplyProjectionCasesMatchSealedReplyUnion(t *testing.T) {
 
 func TestProjectionPolicyMatchesHarnessSealedEventUnion(t *testing.T) {
 	t.Parallel()
-	want := eventTypesInSwitch(t, filepath.Join("..", "event", "validate.go"), "classify")
+	want := methodReceiverTypesInPackage(t, filepath.Join("..", "event"), "isEvent")
 	got := eventTypesInSwitch(t, "events.go", "classify")
 	if len(want) == 0 || len(got) == 0 {
-		t.Fatalf("vacuous event switches: Harness=%d adapter=%d", len(want), len(got))
+		t.Fatalf("vacuous event sets: Harness=%d adapter=%d", len(want), len(got))
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("projection policy drifted from sealed event union\nHarness:\n%s\nadapter:\n%s", strings.Join(want, "\n"), strings.Join(got, "\n"))
+		t.Fatalf("projection policy drifted from production isEvent union\nHarness:\n%s\nadapter:\n%s", strings.Join(want, "\n"), strings.Join(got, "\n"))
 	}
 }
 
@@ -103,14 +103,7 @@ func eventTypesInSwitch(t *testing.T, path, function string) []string {
 			for _, clauseNode := range typeSwitch.Body.List {
 				clause := clauseNode.(*ast.CaseClause)
 				for _, expression := range clause.List {
-					switch value := expression.(type) {
-					case *ast.Ident:
-						names = append(names, value.Name)
-					case *ast.SelectorExpr:
-						if prefix, ok := value.X.(*ast.Ident); ok && prefix.Name == "event" {
-							names = append(names, value.Sel.Name)
-						}
-					}
+					names = append(names, switchTypeName(t, expression, path))
 				}
 			}
 			return false
@@ -119,6 +112,25 @@ func eventTypesInSwitch(t *testing.T, path, function string) []string {
 	})
 	sort.Strings(names)
 	return names
+}
+
+func switchTypeName(t *testing.T, expression ast.Expr, file string) string {
+	t.Helper()
+	switch value := expression.(type) {
+	case *ast.Ident:
+		return value.Name
+	case *ast.SelectorExpr:
+		prefix, ok := value.X.(*ast.Ident)
+		if !ok || prefix.Name != "event" {
+			t.Fatalf("unsupported type-switch selector %T in %s", value.X, file)
+		}
+		return value.Sel.Name
+	case *ast.StarExpr:
+		return "*" + switchTypeName(t, value.X, file)
+	default:
+		t.Fatalf("unsupported type-switch expression %T in %s", expression, file)
+		return ""
+	}
 }
 
 func methodReceiverTypesInPackage(t *testing.T, dir, method string) []string {
@@ -141,13 +153,31 @@ func methodReceiverTypesInPackage(t *testing.T, dir, method string) []string {
 			if !ok || function.Name.Name != method || function.Recv == nil || len(function.Recv.List) != 1 {
 				continue
 			}
-			receiver, ok := function.Recv.List[0].Type.(*ast.Ident)
-			if !ok {
-				t.Fatalf("unsupported %s receiver in %s", method, entry.Name())
-			}
-			names = append(names, receiver.Name)
+			names = append(names, methodReceiverTypeName(t, function.Recv.List[0].Type, method, entry.Name()))
 		}
 	}
 	sort.Strings(names)
+	for index := 1; index < len(names); index++ {
+		if names[index] == names[index-1] {
+			t.Fatalf("duplicate %s receiver %s", method, names[index])
+		}
+	}
 	return names
+}
+
+func methodReceiverTypeName(t *testing.T, expression ast.Expr, method, file string) string {
+	t.Helper()
+	switch receiver := expression.(type) {
+	case *ast.Ident:
+		return receiver.Name
+	case *ast.StarExpr:
+		name, ok := receiver.X.(*ast.Ident)
+		if !ok {
+			t.Fatalf("unsupported pointer %s receiver %T in %s", method, receiver.X, file)
+		}
+		return "*" + name.Name
+	default:
+		t.Fatalf("unsupported %s receiver %T in %s", method, expression, file)
+		return ""
+	}
 }

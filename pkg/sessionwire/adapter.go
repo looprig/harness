@@ -56,15 +56,15 @@ func Project(tenantID coresessionwire.TenantID, sessionID coresessionwire.Sessio
 	if class == PrivateRejected {
 		return Projection{}, &ProjectionError{Type: typeName, Reason: ProjectionRejected}
 	}
+	ev, ok := value.(event.Event)
+	if !ok || ev.Visibility() != event.Public {
+		return Projection{}, &ProjectionError{Type: typeName, Reason: ProjectionRejected}
+	}
 	if err := tenantID.Validate(); err != nil {
 		return Projection{}, &ProjectionError{Type: typeName, Reason: ProjectionMalformed, Cause: err}
 	}
 	if err := sessionID.Validate(); err != nil {
 		return Projection{}, &ProjectionError{Type: typeName, Reason: ProjectionMalformed, Cause: err}
-	}
-	ev, ok := value.(event.Event)
-	if !ok || ev.Visibility() != event.Public {
-		return Projection{}, &ProjectionError{Type: typeName, Reason: ProjectionRejected}
 	}
 	if reply, ok := ev.(event.Reply); ok && reply.ReplyTo().IsZero() {
 		cause := &event.InvalidEventError{
