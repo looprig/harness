@@ -443,13 +443,18 @@ type storedEventSummary struct {
 
 func storedStatusMetaJSON(t *testing.T, sid uuid.UUID, lastTurn, lastStep *storedEventSummary) []byte {
 	t.Helper()
+	return storedStatusMetaJSONAtTip(t, sid, 7, lastTurn, lastStep)
+}
+
+func storedStatusMetaJSONAtTip(t *testing.T, sid uuid.UUID, tip uint64, lastTurn, lastStep *storedEventSummary) []byte {
+	t.Helper()
 	raw, err := json.Marshal(struct {
 		SessionID      uuid.UUID           `json:"session_id"`
 		State          string              `json:"state"`
 		LastJournalSeq uint64              `json:"last_journal_seq"`
 		LastTurn       *storedEventSummary `json:"last_turn,omitempty"`
 		LastStep       *storedEventSummary `json:"last_step,omitempty"`
-	}{SessionID: sid, State: "idle", LastJournalSeq: 7, LastTurn: lastTurn, LastStep: lastStep})
+	}{SessionID: sid, State: "idle", LastJournalSeq: tip, LastTurn: lastTurn, LastStep: lastStep})
 	if err != nil {
 		t.Fatalf("json.Marshal(persisted SessionMeta) error = %v", err)
 	}
@@ -570,6 +575,65 @@ func TestReaderReadStatusPreservesLegitimatePersistedSummaryJSON(t *testing.T) {
 	want := []byte(`{"session_id":"91919191-9191-9191-9191-919191919191","state":"idle","last_journal_seq":7,"last_turn":{"journal_seq":6,"event":{"event_id":"95959595-9595-9595-9595-959595959595","loop_id":"92929292-9292-9292-9292-929292929292","session_id":"91919191-9191-9191-9191-919191919191","turn_id":"93939393-9393-9393-9393-939393939393","type":"TurnDone","v":1}},"last_step":{"journal_seq":5,"event":{"event_id":"96969696-9696-9696-9696-969696969696","loop_id":"92929292-9292-9292-9292-929292929292","messages":[{"role":"assistant"}],"session_id":"91919191-9191-9191-9191-919191919191","step_id":"94949494-9494-9494-9494-949494949494","turn_id":"93939393-9393-9393-9393-939393939393","type":"StepDone","v":1}}}`)
 	if !bytes.Equal(got, want) {
 		t.Errorf("legitimate persisted status JSON changed\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestReaderReadStatusEnforcesPersistedSummaryTipBounds(t *testing.T) {
+	t.Parallel()
+
+	sid := fixedUUID(0xA7)
+	loop, turn, step := fixedUUID(0xA8), fixedUUID(0xA9), fixedUUID(0xAA)
+	turnWire := persistedStatusEvent(t, event.TurnDone{
+		Header:  event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: loop, TurnID: turn}, EventID: fixedUUID(0xAB)},
+		Message: aiMsg("TOP-SECRET-FUTURE-TURN"),
+	})
+	stepWire := persistedStatusEvent(t, event.StepDone{
+		Header:   event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: loop, TurnID: turn, StepID: step}, EventID: fixedUUID(0xAC)},
+		Messages: content.AgenticMessages{aiMsg("TOP-SECRET-FUTURE-STEP")},
+	})
+	tests := []struct {
+		name     string
+		tip      uint64
+		lastTurn *storedEventSummary
+		lastStep *storedEventSummary
+		wantErr  bool
+	}{
+		{name: "last turn future sequence", tip: 7, lastTurn: &storedEventSummary{JournalSeq: 99, Event: turnWire}, wantErr: true},
+		{name: "last step future sequence", tip: 7, lastStep: &storedEventSummary{JournalSeq: 99, Event: stepWire}, wantErr: true},
+		{name: "last turn equals tip", tip: 7, lastTurn: &storedEventSummary{JournalSeq: 7, Event: turnWire}},
+		{name: "last step equals tip", tip: 7, lastStep: &storedEventSummary{JournalSeq: 7, Event: stepWire}},
+		{name: "last turn below tip", tip: 7, lastTurn: &storedEventSummary{JournalSeq: 6, Event: turnWire}},
+		{name: "last step below tip", tip: 7, lastStep: &storedEventSummary{JournalSeq: 6, Event: stepWire}},
+		{name: "last turn zero at zero tip", lastTurn: &storedEventSummary{JournalSeq: 0, Event: turnWire}},
+		{name: "last step zero at zero tip", lastStep: &storedEventSummary{JournalSeq: 0, Event: stepWire}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			raw := storedStatusMetaJSONAtTip(t, sid, test.tip, test.lastTurn, test.lastStep)
+			r := newStoredCatalogReader(t, sid, raw)
+			status, err := r.ReadStatus(context.Background(), sid)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("ReadStatus() = %+v, nil; want future-sequence rejection", status)
+				}
+				for _, forbidden := range []string{sid.String(), "TOP-SECRET", "TurnDone", "StepDone", "99"} {
+					if strings.Contains(err.Error(), forbidden) {
+						t.Errorf("ReadStatus() error exposed persisted summary detail %q: %v", forbidden, err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ReadStatus() error = %v, want legal boundary", err)
+			}
+			if test.lastTurn != nil && (status.LastTurn == nil || status.LastTurn.JournalSeq != test.lastTurn.JournalSeq) {
+				t.Errorf("LastTurn = %+v, want seq %d", status.LastTurn, test.lastTurn.JournalSeq)
+			}
+			if test.lastStep != nil && (status.LastStep == nil || status.LastStep.JournalSeq != test.lastStep.JournalSeq) {
+				t.Errorf("LastStep = %+v, want seq %d", status.LastStep, test.lastStep.JournalSeq)
+			}
+		})
 	}
 }
 

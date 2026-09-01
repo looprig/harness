@@ -221,14 +221,14 @@ func (r *Reader) ReadStatus(ctx context.Context, id uuid.UUID) (serve.SessionSta
 		UpdatedAt:      meta.LastActiveAt,
 	}
 	if meta.LastTurn != nil {
-		se, derr := reconstructStatusSummary(id, statusSummaryLastTurn, meta.LastTurn.JournalSeq, meta.LastTurn.Event)
+		se, derr := reconstructStatusSummary(id, statusSummaryLastTurn, meta.LastTurn.JournalSeq, meta.LastJournalSeq, meta.LastTurn.Event)
 		if derr != nil {
 			return serve.SessionStatus{}, serve.StoreReadError{Op: "decode", Cause: derr}
 		}
 		status.LastTurn = se
 	}
 	if meta.LastStep != nil {
-		se, derr := reconstructStatusSummary(id, statusSummaryLastStep, meta.LastStep.JournalSeq, meta.LastStep.Event)
+		se, derr := reconstructStatusSummary(id, statusSummaryLastStep, meta.LastStep.JournalSeq, meta.LastJournalSeq, meta.LastStep.Event)
 		if derr != nil {
 			return serve.SessionStatus{}, serve.StoreReadError{Op: "decode", Cause: derr}
 		}
@@ -344,7 +344,10 @@ func reconstruct(seq uint64, raw json.RawMessage) (*serve.StatusEvent, error) {
 	return &serve.StatusEvent{JournalSeq: seq, Event: ev}, nil
 }
 
-func reconstructStatusSummary(expected uuid.UUID, kind statusSummaryKind, seq uint64, raw json.RawMessage) (*serve.StatusEvent, error) {
+func reconstructStatusSummary(expected uuid.UUID, kind statusSummaryKind, seq, tip uint64, raw json.RawMessage) (*serve.StatusEvent, error) {
+	if seq > tip {
+		return nil, &statusSummaryError{summary: kind, field: "journal_seq"}
+	}
 	if len(raw) == 0 {
 		return nil, nil
 	}
