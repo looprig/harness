@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -180,6 +181,38 @@ func TestProjectJournalPageRedactsToolDataAndCarriesCoverage(t *testing.T) {
 	}
 }
 
+func TestProjectJournalPageRejectsCrossSessionAndZeroEventHeaders(t *testing.T) {
+	t.Parallel()
+
+	scope := catalogScope(0x91, coresessionwire.SessionResidencyCold)
+	base := event.SessionStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: catalogUUID(0x92)},
+		EventID:     catalogUUID(0x93), CreatedAt: time.Date(2026, 8, 29, 15, 0, 0, 0, time.UTC),
+	}, Config: event.ConfigFingerprint{AgentKind: "private-event-marker"}}
+	tests := []struct {
+		name  string
+		event event.Event
+	}{
+		{name: "cross session", event: base},
+		{name: "zero session", event: event.SessionStarted{Header: event.Header{EventID: catalogUUID(0x93), CreatedAt: base.CreatedAt}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := ProjectJournalPage(scope, []JournalRecord{{JournalSeq: 1, Event: test.event}}, 1, 1, "", "")
+			var projectionErr *ReadProjectionError
+			if err == nil || !errors.As(err, &projectionErr) {
+				t.Fatalf("ProjectJournalPage() error = %T %v, want *ReadProjectionError", err, err)
+			}
+			if projectionErr.Field != "session_id" {
+				t.Errorf("projection error field = %q, want session_id", projectionErr.Field)
+			}
+			if strings.Contains(err.Error(), catalogUUID(0x92).String()) || strings.Contains(err.Error(), "private-event-marker") {
+				t.Errorf("projection error exposed event identity: %v", err)
+			}
+		})
+	}
+}
+
 func TestProjectGatePageProjectsMultiplePresentationSafeGates(t *testing.T) {
 	t.Parallel()
 
@@ -224,5 +257,44 @@ func TestProjectGatePageProjectsMultiplePresentationSafeGates(t *testing.T) {
 		if !bytes.Contains(wire, public) {
 			t.Errorf("gate page missing %s: %s", public, wire)
 		}
+	}
+}
+
+func TestProjectGatePageRejectsCrossSessionAndZeroEventHeaders(t *testing.T) {
+	t.Parallel()
+
+	scope := catalogScope(0xA1, coresessionwire.SessionResidencyResident)
+	makeGate := func(sessionID uuid.UUID) OpenGate {
+		return OpenGate{
+			Event: event.GateOpened{
+				Header: event.Header{
+					Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: catalogUUID(0xA2), TurnID: catalogUUID(0xA3), StepID: catalogUUID(0xA4)},
+					EventID:     catalogUUID(0xA5), CreatedAt: time.Date(2026, 8, 29, 16, 0, 0, 0, time.UTC),
+				},
+				Gate: gate.Gate{ID: gate.ID(catalogUUID(0xA6)), Kind: gate.KindPermission, Resolver: gate.ResolverLoop, Prompt: gate.Prompt{Body: "private-event-marker"}},
+			},
+			JournalSeq: 1, Deadline: time.Date(2026, 8, 29, 17, 0, 0, 0, time.UTC), Answerability: coresessionwire.GateAnswerabilityResident,
+		}
+	}
+	for _, test := range []struct {
+		name string
+		gate OpenGate
+	}{
+		{name: "cross session", gate: makeGate(catalogUUID(0xA7))},
+		{name: "zero session", gate: makeGate(uuid.UUID{})},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := ProjectGatePage(scope, []OpenGate{test.gate}, 1, 1, "", "")
+			var projectionErr *ReadProjectionError
+			if err == nil || !errors.As(err, &projectionErr) {
+				t.Fatalf("ProjectGatePage() error = %T %v, want *ReadProjectionError", err, err)
+			}
+			if projectionErr.Field != "session_id" {
+				t.Errorf("projection error field = %q, want session_id", projectionErr.Field)
+			}
+			if strings.Contains(err.Error(), catalogUUID(0xA7).String()) || strings.Contains(err.Error(), "private-event-marker") {
+				t.Errorf("projection error exposed event identity: %v", err)
+			}
+		})
 	}
 }

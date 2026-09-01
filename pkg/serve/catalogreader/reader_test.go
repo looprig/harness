@@ -625,3 +625,137 @@ func TestReaderReadJournal(t *testing.T) {
 		})
 	}
 }
+
+func TestReaderJournalLegacyGoldenAndCoreRedactionParity(t *testing.T) {
+	t.Parallel()
+
+	sid, loop, turn, step := fixedUUID(0xB1), fixedUUID(0xB2), fixedUUID(0xB3), fixedUUID(0xB4)
+	st, err := sessionstore.Open(memstore.New())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	j := openJournal(t, st, sid)
+	resolved := event.GateResolved{
+		Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: sid, LoopID: loop, TurnID: turn, StepID: step},
+			EventID:     fixedUUID(0xB5), CreatedAt: time.Date(2026, 8, 29, 17, 0, 0, 0, time.UTC),
+		},
+		GateID: gate.ID(fixedUUID(0xB6)), Resolver: gate.ResolverLoop,
+		Reason: gate.CloseAnswered, Action: gate.FormActionAccept,
+		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+		Audit:  gate.FormAudit{Values: map[string]string{"password": "raw-tool-marker"}},
+	}
+	if _, err := j.Append(context.Background(), journal.NewEventRecord(resolved)); err != nil {
+		t.Fatalf("Append(GateResolved) error = %v", err)
+	}
+	r := catalogreader.NewScoped(
+		st.OpenCatalog(), st,
+		harnesssessionwire.ReadAuthority{TenantID: "tenant-a", AgentID: "fixture-agent"},
+		coresessionwire.SessionResidencyCold,
+	)
+	legacy, err := r.ReadJournal(context.Background(), sid, serve.JournalPage{Limit: 10})
+	if err != nil {
+		t.Fatalf("ReadJournal() error = %v", err)
+	}
+	legacyJSON, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("json.Marshal(legacy) error = %v", err)
+	}
+	// This is the independently specified current serve compatibility wire. Its
+	// native audit remains byte-stable; the corresponding Core body below is the
+	// public redacted representation used by the new read plane.
+	wantLegacy := []byte(`{"events":[{"journal_seq":2,"event":{"action":"accept","audit":{"kind":"form","data":{"values":{"password":"raw-tool-marker"}}},"created_at":"2026-08-29T17:00:00Z","event_id":"b5b5b5b5-b5b5-b5b5-b5b5-b5b5b5b5b5b5","gate_id":"b6b6b6b6-b6b6-b6b6-b6b6-b6b6b6b6b6b6","loop_id":"b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2","reason":"answered","resolver":"loop","session_id":"b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1","source":{"kind":"user"},"step_id":"b4b4b4b4-b4b4-b4b4-b4b4-b4b4b4b4b4b4","turn_id":"b3b3b3b3-b3b3-b3b3-b3b3-b3b3b3b3b3b3","type":"GateResolved","v":1}}],"next_journal_seq":0,"done":true}`)
+	if !bytes.Equal(legacyJSON, wantLegacy) {
+		t.Fatalf("legacy journal JSON changed\n got: %s\nwant: %s", legacyJSON, wantLegacy)
+	}
+	corePage, err := harnesssessionwire.ProjectJournalPage(
+		harnesssessionwire.ReadScope{TenantID: "tenant-a", SessionID: coresessionwire.SessionID(sid.String()), AgentID: "fixture-agent", Residency: coresessionwire.SessionResidencyCold},
+		[]harnesssessionwire.JournalRecord{{JournalSeq: legacy.Events[0].JournalSeq, Event: legacy.Events[0].Event}},
+		2, 2, "", "",
+	)
+	if err != nil {
+		t.Fatalf("ProjectJournalPage() error = %v", err)
+	}
+	if len(corePage.Events) != 1 || corePage.Events[0].JournalSeq != 2 || corePage.Events[0].EventID != coresessionwire.EventID(fixedUUID(0xB5).String()) {
+		t.Fatalf("Core journal projection = %+v", corePage)
+	}
+	if bytes.Contains(corePage.Events[0].Body, []byte("raw-tool-marker")) || bytes.Contains(corePage.Events[0].Body, []byte(`"audit"`)) {
+		t.Fatalf("Core journal body leaked redacted tool data: %s", corePage.Events[0].Body)
+	}
+}
+
+func TestReaderMultiplePublicGatesLegacyAndCoreParity(t *testing.T) {
+	t.Parallel()
+
+	sid, loop, turn := fixedUUID(0xC1), fixedUUID(0xC2), fixedUUID(0xC3)
+	st, err := sessionstore.Open(memstore.New())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	j := openJournal(t, st, sid)
+	makeOpened := func(eventSeed, gateSeed, stepSeed byte, at time.Time, body string) event.GateOpened {
+		return event.GateOpened{
+			Header: event.Header{
+				Coordinates: identity.Coordinates{SessionID: sid, LoopID: loop, TurnID: turn, StepID: fixedUUID(stepSeed)},
+				EventID:     fixedUUID(eventSeed), CreatedAt: at,
+			},
+			Gate: gate.Gate{
+				ID: gate.ID(fixedUUID(gateSeed)), Kind: gate.KindPermission, Resolver: gate.ResolverLoop,
+				Subject: gate.Subject{ToolExecutionID: gate.ID(fixedUUID(stepSeed + 1)), ToolUseID: "private-tool-marker"},
+				Prompt:  gate.Prompt{Body: body},
+			},
+		}
+	}
+	first := makeOpened(0xC6, 0xC8, 0xC4, time.Date(2026, 8, 29, 18, 0, 0, 0, time.UTC), "first")
+	second := makeOpened(0xC7, 0xC9, 0xC5, time.Date(2026, 8, 29, 18, 1, 0, 0, time.UTC), "second")
+	for _, opened := range []event.GateOpened{first, second} {
+		if _, err := j.Append(context.Background(), journal.NewEventRecord(opened)); err != nil {
+			t.Fatalf("Append(GateOpened) error = %v", err)
+		}
+	}
+	r := catalogreader.NewScoped(
+		st.OpenCatalog(), st,
+		harnesssessionwire.ReadAuthority{TenantID: "tenant-a", AgentID: "fixture-agent"},
+		coresessionwire.SessionResidencyResident,
+	)
+	legacy, err := r.ReadJournal(context.Background(), sid, serve.JournalPage{Limit: 10})
+	if err != nil {
+		t.Fatalf("ReadJournal() error = %v", err)
+	}
+	legacyJSON, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("json.Marshal(legacy) error = %v", err)
+	}
+	wantLegacy := []byte(`{"events":[{"journal_seq":2,"event":{"created_at":"2026-08-29T18:00:00Z","event_id":"c6c6c6c6-c6c6-c6c6-c6c6-c6c6c6c6c6c6","gate":{"id":"c8c8c8c8-c8c8-c8c8-c8c8-c8c8c8c8c8c8","kind":"harness.permission","resolver":"loop","subject":{"tool_execution_id":"c5c5c5c5-c5c5-c5c5-c5c5-c5c5c5c5c5c5","tool_use_id":"private-tool-marker"},"prompt":{"body":"first"}},"loop_id":"c2c2c2c2-c2c2-c2c2-c2c2-c2c2c2c2c2c2","session_id":"c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1","step_id":"c4c4c4c4-c4c4-c4c4-c4c4-c4c4c4c4c4c4","turn_id":"c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3","type":"GateOpened","v":1}},{"journal_seq":3,"event":{"created_at":"2026-08-29T18:01:00Z","event_id":"c7c7c7c7-c7c7-c7c7-c7c7-c7c7c7c7c7c7","gate":{"id":"c9c9c9c9-c9c9-c9c9-c9c9-c9c9c9c9c9c9","kind":"harness.permission","resolver":"loop","subject":{"tool_execution_id":"c6c6c6c6-c6c6-c6c6-c6c6-c6c6c6c6c6c6","tool_use_id":"private-tool-marker"},"prompt":{"body":"second"}},"loop_id":"c2c2c2c2-c2c2-c2c2-c2c2-c2c2c2c2c2c2","session_id":"c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1","step_id":"c5c5c5c5-c5c5-c5c5-c5c5-c5c5c5c5c5c5","turn_id":"c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3","type":"GateOpened","v":1}}],"next_journal_seq":0,"done":true}`)
+	if !bytes.Equal(legacyJSON, wantLegacy) {
+		t.Fatalf("legacy multi-gate journal JSON changed\n got: %s\nwant: %s", legacyJSON, wantLegacy)
+	}
+	opens := make([]harnesssessionwire.OpenGate, 0, len(legacy.Events))
+	for _, statusEvent := range legacy.Events {
+		opened, ok := statusEvent.Event.(event.GateOpened)
+		if !ok {
+			t.Fatalf("legacy event = %T, want event.GateOpened", statusEvent.Event)
+		}
+		opens = append(opens, harnesssessionwire.OpenGate{
+			Event: opened, JournalSeq: statusEvent.JournalSeq,
+			Deadline: time.Date(2026, 8, 29, 19, 0, 0, 0, time.UTC), Answerability: coresessionwire.GateAnswerabilityResident,
+		})
+	}
+	corePage, err := harnesssessionwire.ProjectGatePage(
+		harnesssessionwire.ReadScope{TenantID: "tenant-a", SessionID: coresessionwire.SessionID(sid.String()), AgentID: "fixture-agent", Residency: coresessionwire.SessionResidencyResident},
+		opens, 3, 2, "", "",
+	)
+	if err != nil {
+		t.Fatalf("ProjectGatePage() error = %v", err)
+	}
+	if len(corePage.Gates) != 2 || corePage.OpenGateCount != 2 || corePage.Gates[0].Prompt.Body != "first" || corePage.Gates[1].Prompt.Body != "second" || corePage.Gates[0].OpenedJournalSeq != 2 || corePage.Gates[1].OpenedJournalSeq != 3 {
+		t.Fatalf("Core gate projection = %+v", corePage)
+	}
+	coreJSON, err := json.Marshal(corePage)
+	if err != nil {
+		t.Fatalf("json.Marshal(corePage) error = %v", err)
+	}
+	if bytes.Contains(coreJSON, []byte("private-tool-marker")) || bytes.Contains(coreJSON, []byte("tool_execution_id")) {
+		t.Fatalf("Core gate page leaked tool subject: %s", coreJSON)
+	}
+}

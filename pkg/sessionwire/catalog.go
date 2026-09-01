@@ -3,6 +3,7 @@ package sessionwire
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"time"
 
 	coresessionwire "github.com/looprig/core/sessionwire/v1"
@@ -151,6 +152,21 @@ func validateCatalogSession(projection string, scope ReadScope, record CatalogRe
 	return nil
 }
 
+func validateEventScope(projection string, scope ReadScope, value event.Event) error {
+	if value == nil {
+		return &ReadProjectionError{Projection: projection, Field: "event"}
+	}
+	reflected := reflect.ValueOf(value)
+	if reflected.Kind() == reflect.Pointer && reflected.IsNil() {
+		return &ReadProjectionError{Projection: projection, Field: "event"}
+	}
+	header := value.EventHeader()
+	if header.SessionID.IsZero() || coresessionwire.SessionID(header.SessionID.String()) != scope.SessionID {
+		return &ReadProjectionError{Projection: projection, Field: "session_id"}
+	}
+	return nil
+}
+
 // ProjectSessionSummary converts one durable catalog entry to Core's recent
 // session record without consulting or restoring a runtime.
 func ProjectSessionSummary(scope ReadScope, record CatalogRecord) (coresessionwire.SessionSummary, error) {
@@ -246,6 +262,9 @@ func ProjectJournalPage(scope ReadScope, records []JournalRecord, capturedTip, c
 		CoveredThrough: coveredThrough, NextCursor: next, PreviousCursor: previous,
 	}
 	for _, record := range records {
+		if err := validateEventScope(projection, scope, record.Event); err != nil {
+			return coresessionwire.JournalPage{}, err
+		}
 		projected, err := Project(scope.TenantID, scope.SessionID, record.Event)
 		if err != nil {
 			return coresessionwire.JournalPage{}, &ReadProjectionError{Projection: projection, Field: "event", Cause: err}
@@ -274,6 +293,9 @@ func ProjectGatePage(scope ReadScope, gates []OpenGate, journalTip, openGateCoun
 		Gates: make([]coresessionwire.GateProjection, 0, len(gates)), NextCursor: next, PreviousCursor: previous,
 	}
 	for _, item := range gates {
+		if err := validateEventScope(projection, scope, item.Event); err != nil {
+			return coresessionwire.GatePage{}, err
+		}
 		if _, err := Project(scope.TenantID, scope.SessionID, item.Event); err != nil {
 			return coresessionwire.GatePage{}, &ReadProjectionError{Projection: projection, Field: "event", Cause: err}
 		}
