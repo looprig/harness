@@ -326,24 +326,6 @@ func (r *Reader) readScope(id uuid.UUID) harnesssessionwire.ReadScope {
 	}
 }
 
-// reconstruct rebuilds a serve.StatusEvent from a catalog eventSummary's durable wire
-// bytes and journal sequence, decoding the event via event.UnmarshalEvent (the same
-// authority that produced the summary's MarshalEvent bytes), so the round-trip is
-// lossless. Empty bytes yield a nil StatusEvent (no summary recorded yet).
-func reconstruct(seq uint64, raw json.RawMessage) (*serve.StatusEvent, error) {
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	ev, err := event.UnmarshalEvent(raw)
-	if err != nil {
-		return nil, err
-	}
-	if ev.Visibility() != event.Public {
-		return nil, &PrivateEventError{Visibility: ev.Visibility()}
-	}
-	return &serve.StatusEvent{JournalSeq: seq, Event: ev}, nil
-}
-
 func reconstructStatusSummary(expected uuid.UUID, kind statusSummaryKind, seq, tip uint64, raw json.RawMessage) (*serve.StatusEvent, error) {
 	if seq > tip {
 		return nil, &statusSummaryError{summary: kind, field: "journal_seq"}

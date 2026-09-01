@@ -2,13 +2,11 @@ package catalogreader
 
 import (
 	"errors"
+	"reflect"
 	"testing"
-	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/gate"
-	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 )
 
@@ -20,94 +18,60 @@ func readerVisibilityUUID(seed byte) uuid.UUID {
 	return id
 }
 
-func readerInternalEvent(t *testing.T) event.HustleStarted {
-	t.Helper()
-	definition, err := hustle.Define(
-		hustle.WithName("private.status"),
-		hustle.WithParticipation(hustle.ParticipationBackground),
-		hustle.WithTimeout(time.Second),
-		hustle.WithLimits(hustle.Limits{InputBytes: 1, OutputBytes: 1}),
-		hustle.WithCurrentLoopModel(),
-		hustle.WithSystemPrompt("secret", "p1"),
-		hustle.WithPolicyRevision("v1"),
-	)
-	if err != nil {
-		t.Fatalf("hustle.Define() error = %v", err)
-	}
-	return event.HustleStarted{
-		Header: event.Header{
-			Coordinates:     identity.Coordinates{SessionID: readerVisibilityUUID(1)},
-			EventID:         readerVisibilityUUID(2),
-			EventVisibility: event.Internal,
-		},
-		Run: event.HustleRunDescriptor{Definition: definition.Descriptor(), RunID: hustle.RunID(readerVisibilityUUID(3))},
-	}
-}
-
-// readerInternalPermissionReviewEvent builds a valid, Internal-visibility
-// PermissionReviewCompleted — Task 17's first real producer of this event
-// type (internal/sessionruntime/review_adapter.go). It is exercised here as
-// a SECOND example (alongside HustleStarted) of an Internal event the public
-// reconstruction boundary must refuse, directly guarding design §23's
-// "review data does not appear in durable public events" acceptance
-// criterion at this boundary.
-func readerInternalPermissionReviewEvent() event.PermissionReviewCompleted {
-	return event.PermissionReviewCompleted{
-		Header: event.Header{
-			Coordinates: identity.Coordinates{
-				SessionID: readerVisibilityUUID(5), LoopID: readerVisibilityUUID(9),
-				TurnID: readerVisibilityUUID(10), StepID: readerVisibilityUUID(11),
-			},
-			EventID:         readerVisibilityUUID(6),
-			EventVisibility: event.Internal,
-		},
-		GateID:             gate.ID(readerVisibilityUUID(7)),
-		ToolExecutionID:    readerVisibilityUUID(8),
-		Classifier:         "command-safety",
-		ClassifierRevision: "classifier-rev-1",
-		Status:             gate.ReviewStatusNotApplicable,
-	}
-}
-
-func TestReconstructRefusesNonPublicEvents(t *testing.T) {
+func TestReconstructStatusSummaryVisibilityAndDecodeBoundary(t *testing.T) {
 	t.Parallel()
-	internalWire, err := event.MarshalEvent(readerInternalEvent(t))
-	if err != nil {
-		t.Fatalf("MarshalEvent() error = %v", err)
-	}
-	internalReviewWire, err := event.MarshalEvent(readerInternalPermissionReviewEvent())
-	if err != nil {
-		t.Fatalf("MarshalEvent(review) error = %v", err)
-	}
-	publicWire, err := event.MarshalEvent(event.SessionStarted{Header: event.Header{
-		Coordinates: identity.Coordinates{SessionID: readerVisibilityUUID(1)},
+	sid, loop, turn := readerVisibilityUUID(1), readerVisibilityUUID(2), readerVisibilityUUID(3)
+	publicDone := event.TurnDone{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid, LoopID: loop, TurnID: turn},
 		EventID:     readerVisibilityUUID(4),
+	}}
+	internalDone := publicDone
+	internalDone.EventVisibility = event.Internal
+	publicDoneWire, err := event.MarshalEvent(publicDone)
+	if err != nil {
+		t.Fatalf("MarshalEvent(public TurnDone) error = %v", err)
+	}
+	internalDoneWire, err := event.MarshalEvent(internalDone)
+	if err != nil {
+		t.Fatalf("MarshalEvent(internal TurnDone) error = %v", err)
+	}
+	publicFailedWire, err := event.MarshalEvent(event.TurnFailed{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid, LoopID: loop, TurnID: turn},
+		EventID:     readerVisibilityUUID(5),
 	}})
 	if err != nil {
-		t.Fatalf("MarshalEvent(public) error = %v", err)
+		t.Fatalf("MarshalEvent(public TurnFailed) error = %v", err)
 	}
 	tests := []struct {
-		name    string
-		wire    []byte
-		wantErr bool
+		name        string
+		wire        []byte
+		wantType    string
+		wantErr     bool
+		wantPrivate bool
 	}{
-		{name: "public accepted", wire: publicWire},
-		{name: "internal refused", wire: internalWire, wantErr: true},
-		{name: "internal permission review refused", wire: internalReviewWire, wantErr: true},
-		{name: "unknown visibility refused", wire: []byte(`{"type":"SessionStarted","v":1,"session_id":"01010101-0101-0101-0101-010101010101","event_id":"04040404-0404-0404-0404-040404040404","visibility":99}`), wantErr: true},
+		{name: "public TurnDone accepted", wire: publicDoneWire, wantType: "TurnDone"},
+		{name: "public TurnFailed accepted", wire: publicFailedWire, wantType: "TurnFailed"},
+		{name: "internal allowed kind refused", wire: internalDoneWire, wantErr: true, wantPrivate: true},
+		{name: "unknown visibility sanitized", wire: []byte(`{"type":"TurnDone","v":1,"session_id":"01010101-0101-0101-0101-010101010101","loop_id":"02020202-0202-0202-0202-020202020202","turn_id":"03030303-0303-0303-0303-030303030303","event_id":"04040404-0404-0404-0404-040404040404","visibility":99}`), wantErr: true},
+		{name: "malformed event sanitized", wire: []byte(`{"type":"TurnDone"`), wantErr: true},
 	}
 	for _, tt := range tests {
 		testCase := tt
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
-			_, reconstructErr := reconstruct(1, testCase.wire)
+			got, reconstructErr := reconstructStatusSummary(sid, statusSummaryLastTurn, 1, 1, testCase.wire)
 			if (reconstructErr != nil) != testCase.wantErr {
-				t.Fatalf("reconstruct() error = %v, wantErr %v", reconstructErr, testCase.wantErr)
+				t.Fatalf("reconstructStatusSummary() error = %v, wantErr %v", reconstructErr, testCase.wantErr)
 			}
-			if testCase.name == "internal refused" || testCase.name == "internal permission review refused" {
+			if testCase.wantPrivate {
 				var private *PrivateEventError
 				if !errors.As(reconstructErr, &private) {
 					t.Fatalf("error = %T %v, want PrivateEventError", reconstructErr, reconstructErr)
+				}
+			}
+			if testCase.wantType != "" {
+				if got == nil || reflect.TypeOf(got.Event).Name() != testCase.wantType {
+					t.Errorf("event = %T, want %s", got.Event, testCase.wantType)
 				}
 			}
 		})
