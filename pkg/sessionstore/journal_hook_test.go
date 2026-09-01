@@ -283,12 +283,15 @@ func TestOpeningFenceConflictNeverRereadsTip(t *testing.T) {
 		lease,
 		journal.HookMiddleware(runner, sessionID),
 	)
+	// Deliberately Errorf, not Fatalf: a reintroduced rebase makes Open SUCCEED, and
+	// stopping here would hide the two measurements that name the defect mechanically
+	// (the second Tip read and the second CAS) behind a generic "returned a journal".
 	if opened != nil {
-		t.Fatalf("OpenJournalWithOpeningAppend returned %T after a conflicting fence", opened)
+		t.Errorf("OpenJournalWithOpeningAppend returned %T after a conflicting fence", opened)
 	}
 	var conflict *OpeningFenceConflictError
 	if !errors.As(err, &conflict) {
-		t.Fatalf("error = %v, want *OpeningFenceConflictError", err)
+		t.Errorf("error = %v, want *OpeningFenceConflictError", err)
 	}
 
 	tips, expected := counting.observed()

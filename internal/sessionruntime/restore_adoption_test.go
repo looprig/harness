@@ -790,13 +790,14 @@ func (l *openingConflictLedger) Delete(ctx context.Context, name string) error {
 	return l.inner.Delete(ctx, name)
 }
 
-// epochCountingLeaser records the epoch of every grant it hands out, so a test can
-// prove a failed ownership claim was retried under a NEW grant rather than rebased
-// under the spent one.
+// epochCountingLeaser retains every grant it hands out, so a test can prove a
+// failed ownership claim was retried under a NEW grant rather than rebased under
+// the spent one — and, since a grant's Lost() channel closes on Release, which of
+// those grants the session ended up owning and releasing.
 type epochCountingLeaser struct {
 	inner  storage.Leaser
 	mu     sync.Mutex
-	epochs []uint64
+	leases []storage.Lease
 }
 
 func (le *epochCountingLeaser) Acquire(ctx context.Context, name string) (storage.Lease, error) {
@@ -805,15 +806,25 @@ func (le *epochCountingLeaser) Acquire(ctx context.Context, name string) (storag
 		return nil, err
 	}
 	le.mu.Lock()
-	le.epochs = append(le.epochs, lease.Epoch())
+	le.leases = append(le.leases, lease)
 	le.mu.Unlock()
 	return lease, nil
 }
 
-func (le *epochCountingLeaser) granted() []uint64 {
+func (le *epochCountingLeaser) granted() []storage.Lease {
 	le.mu.Lock()
 	defer le.mu.Unlock()
-	return append([]uint64(nil), le.epochs...)
+	return append([]storage.Lease(nil), le.leases...)
+}
+
+// grantLive reports whether a grant is still held (its Lost() channel still open).
+func grantLive(lease storage.Lease) bool {
+	select {
+	case <-lease.Lost():
+		return false
+	default:
+		return true
+	}
 }
 
 // TestRestoreClaimsFreshGrantAfterOpeningFenceConflict covers the handoff boundary
@@ -874,15 +885,270 @@ func TestRestoreClaimsFreshGrantAfterOpeningFenceConflict(t *testing.T) {
 	if s == nil {
 		t.Fatal("Restore returned a nil Session")
 	}
-	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
 	granted := leaser.granted()
 	if len(granted) != 2 {
-		t.Fatalf("grants acquired = %v, want exactly 2 (the spent one and one fresh claim)", granted)
+		t.Fatalf("grants acquired = %d, want exactly 2 (the spent one and one fresh claim)", len(granted))
 	}
-	if granted[1] <= granted[0] {
-		t.Errorf("grant epochs = %v, want strictly increasing (a fresh grant, not a rebase)", granted)
+	spent, fresh := granted[0], granted[1]
+	if fresh.Epoch() <= spent.Epoch() {
+		t.Errorf("grant epochs = %d then %d, want strictly increasing (a fresh grant, not a rebase)", spent.Epoch(), fresh.Epoch())
 	}
+
+	// The session must have been handed the FRESH grant, not the spent one. Nothing
+	// downstream can tell them apart by inspection — the session keeps only a release
+	// hook — so this is asserted through the hook's one observable effect. Before
+	// Shutdown: the spent grant is dead (sessionstore released it when its fence lost)
+	// and the fresh grant, the one the journal is actually writing under, is live.
+	if grantLive(spent) {
+		t.Errorf("spent grant at epoch %d is still live; the losing fence must have released it", spent.Epoch())
+	}
+	if !grantLive(fresh) {
+		t.Fatalf("fresh grant at epoch %d is already dead before Shutdown", fresh.Epoch())
+	}
+	// After Shutdown: the FRESH grant is the one released. Wiring the spent grant into
+	// WithLeaseRelease instead would release an already-dead grant here and leak the
+	// live one until its bucket TTL expires — locking out every successor restore for
+	// the full TTL with no error reported anywhere.
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if grantLive(fresh) {
+		t.Errorf("fresh grant at epoch %d survived Shutdown; the session released some other grant and leaked the one it wrote under", fresh.Epoch())
+	}
+}
+
+// alwaysConflictLedger injects a foreign record before EVERY append on its bound
+// stream, so no opening fence can ever win — the persistent-contention case that
+// exhausts openingGrantAttempts.
+type alwaysConflictLedger struct {
+	inner storage.Ledger
+	name  string
+	racer []byte
+}
+
+func (l *alwaysConflictLedger) Append(ctx context.Context, name string, expected uint64, payload []byte) error {
+	if name == l.name {
+		if err := l.inner.Append(context.Background(), name, expected, l.racer); err != nil {
+			return err
+		}
+	}
+	return l.inner.Append(ctx, name, expected, payload)
+}
+func (l *alwaysConflictLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
+	return l.inner.Read(ctx, name, from)
+}
+func (l *alwaysConflictLedger) Tip(ctx context.Context, name string) (uint64, error) {
+	return l.inner.Tip(ctx, name)
+}
+func (l *alwaysConflictLedger) Delete(ctx context.Context, name string) error {
+	return l.inner.Delete(ctx, name)
+}
+
+// appendFailLedger fails every append on any stream with a fixed non-conflict
+// error: a wedged backend, not an ownership race.
+type appendFailLedger struct {
+	inner storage.Ledger
+	err   error
+}
+
+func (l *appendFailLedger) Append(context.Context, string, uint64, []byte) error { return l.err }
+func (l *appendFailLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
+	return l.inner.Read(ctx, name, from)
+}
+func (l *appendFailLedger) Tip(ctx context.Context, name string) (uint64, error) {
+	return l.inner.Tip(ctx, name)
+}
+func (l *appendFailLedger) Delete(ctx context.Context, name string) error {
+	return l.inner.Delete(ctx, name)
+}
+
+// TestOpenJournalUnderFreshGrantErrorPaths covers the helper's ERROR return, which
+// no restore-level test reaches. Two properties, neither of them incidental:
+//
+// The lease it returns alongside an error must be releasable. Every caller feeds it
+// straight to releaseLease, which dereferences it with no nil guard, so a nil here
+// panics the failure path of both NewSession and RestoreSession.
+//
+// A new grant is spent ONLY on an ownership conflict. A wedged backend is not a
+// contested one: retrying it would burn all openingGrantAttempts lease acquisitions
+// against a ledger that is simply down, and would report the last attempt's error
+// rather than the first.
+func TestOpenJournalUnderFreshGrantErrorPaths(t *testing.T) {
+	backendDown := errors.New("probe: ledger down")
+
+	tests := []struct {
+		name       string
+		ledger     func(inner storage.Ledger, name string, racer []byte) storage.Ledger
+		wantGrants int
+		check      func(t *testing.T, err error)
+	}{
+		{
+			name: "persistent contention exhausts the grants",
+			ledger: func(inner storage.Ledger, name string, racer []byte) storage.Ledger {
+				return &alwaysConflictLedger{inner: inner, name: name, racer: racer}
+			},
+			wantGrants: openingGrantAttempts,
+			check: func(t *testing.T, err error) {
+				var conflict *sessionstore.OpeningFenceConflictError
+				if !errors.As(err, &conflict) {
+					t.Fatalf("err = %v, want *sessionstore.OpeningFenceConflictError", err)
+				}
+			},
+		},
+		{
+			name: "a wedged backend spends no second grant",
+			ledger: func(inner storage.Ledger, _ string, _ []byte) storage.Ledger {
+				return &appendFailLedger{inner: inner, err: backendDown}
+			},
+			wantGrants: 1,
+			check: func(t *testing.T, err error) {
+				if !errors.Is(err, backendDown) {
+					t.Fatalf("err = %v, want the backend failure unwrapped", err)
+				}
+				var conflict *sessionstore.OpeningFenceConflictError
+				if errors.As(err, &conflict) {
+					t.Errorf("err = %v, want NOT classified as an ownership conflict", err)
+				}
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			backend := memstore.New()
+			sessionID, err := uuid.New()
+			if err != nil {
+				t.Fatalf("uuid.New: %v", err)
+			}
+			name := "sessions/" + sessionID.String()
+			racer, err := durablestore.EncodeEnvelope(durablestore.Envelope{
+				Kind: durablestore.EnvelopeKindOpeningFence, LeaseEpoch: 99,
+			})
+			if err != nil {
+				t.Fatalf("EncodeEnvelope(racer fence): %v", err)
+			}
+
+			leaser := &epochCountingLeaser{inner: backend.Leaser}
+			wrapped, err := storage.NewCompositeWithOrderedIndex(
+				testCase.ledger(backend.Ledger, name, racer), leaser, backend.KV, backend.Blobs, backend.OrderedIndex)
+			if err != nil {
+				t.Fatalf("storage.NewComposite: %v", err)
+			}
+			store, err := sessionstore.Open(wrapped)
+			if err != nil {
+				t.Fatalf("sessionstore.Open: %v", err)
+			}
+			lease, err := store.AcquireLease(context.Background(), sessionID)
+			if err != nil {
+				t.Fatalf("AcquireLease: %v", err)
+			}
+
+			j, got, err := openJournalUnderFreshGrant(context.Background(), store, sessionID, lease, nil)
+			if j != nil {
+				t.Fatalf("journal = %T, want nil on the error path", j)
+			}
+			if err == nil {
+				t.Fatal("err = nil, want a failure")
+			}
+			testCase.check(t, err)
+
+			if got == nil {
+				t.Fatal("returned lease = nil; releaseLease dereferences it with no nil guard, so every caller's failure path would panic")
+			}
+			releaseLease(got) // must not panic: the caller's failure path does exactly this
+
+			granted := leaser.granted()
+			if len(granted) != testCase.wantGrants {
+				t.Fatalf("grants acquired = %d, want %d", len(granted), testCase.wantGrants)
+			}
+			for i := 1; i < len(granted); i++ {
+				if granted[i].Epoch() <= granted[i-1].Epoch() {
+					t.Fatalf("grant %d epoch %d not strictly above grant %d epoch %d (each claim must be a fresh grant)",
+						i, granted[i].Epoch(), i-1, granted[i-1].Epoch())
+				}
+			}
+			if got.Epoch() != granted[len(granted)-1].Epoch() {
+				t.Errorf("returned lease epoch = %d, want the last grant's %d", got.Epoch(), granted[len(granted)-1].Epoch())
+			}
+		})
+	}
+}
+
+// acquireFailLeaser hands out grants normally until failFrom, then fails every
+// further Acquire: the successor cannot get a new grant because someone else took
+// the session (or the leaser is down).
+type acquireFailLeaser struct {
+	inner    storage.Leaser
+	failFrom int
+	err      error
+	mu       sync.Mutex
+	acquires int
+}
+
+func (le *acquireFailLeaser) Acquire(ctx context.Context, name string) (storage.Lease, error) {
+	le.mu.Lock()
+	le.acquires++
+	n := le.acquires
+	le.mu.Unlock()
+	if n >= le.failFrom {
+		return nil, le.err
+	}
+	return le.inner.Acquire(ctx, name)
+}
+
+// TestOpenJournalUnderFreshGrantSurfacesAcquireFailure covers the helper's OTHER
+// error return: the fence lost the ownership race, so the grant is gone, and the
+// fresh grant the retry needs cannot be had. The acquisition error — which names
+// the live holder — must be surfaced rather than the conflict that preceded it, and
+// the lease handed back must still be the releasable (already released) one the
+// caller passed in, since the caller's failure path releases it unconditionally.
+func TestOpenJournalUnderFreshGrantSurfacesAcquireFailure(t *testing.T) {
+	backend := memstore.New()
+	sessionID, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	name := "sessions/" + sessionID.String()
+	racer, err := durablestore.EncodeEnvelope(durablestore.Envelope{
+		Kind: durablestore.EnvelopeKindOpeningFence, LeaseEpoch: 99,
+	})
+	if err != nil {
+		t.Fatalf("EncodeEnvelope(racer fence): %v", err)
+	}
+
+	takenOver := errors.New("probe: session taken over")
+	leaser := &acquireFailLeaser{inner: backend.Leaser, failFrom: 2, err: takenOver}
+	wrapped, err := storage.NewCompositeWithOrderedIndex(
+		&alwaysConflictLedger{inner: backend.Ledger, name: name, racer: racer},
+		leaser, backend.KV, backend.Blobs, backend.OrderedIndex)
+	if err != nil {
+		t.Fatalf("storage.NewComposite: %v", err)
+	}
+	store, err := sessionstore.Open(wrapped)
+	if err != nil {
+		t.Fatalf("sessionstore.Open: %v", err)
+	}
+	lease, err := store.AcquireLease(context.Background(), sessionID) // the 1st acquire, still granted
+	if err != nil {
+		t.Fatalf("AcquireLease: %v", err)
+	}
+
+	j, got, err := openJournalUnderFreshGrant(context.Background(), store, sessionID, lease, nil)
+	if j != nil {
+		t.Fatalf("journal = %T, want nil when no fresh grant can be acquired", j)
+	}
+	if !errors.Is(err, takenOver) {
+		t.Fatalf("err = %v, want the acquisition failure that names why no fresh grant exists", err)
+	}
+	if got == nil {
+		t.Fatal("returned lease = nil; releaseLease dereferences it with no nil guard")
+	}
+	if got.Epoch() != lease.Epoch() {
+		t.Errorf("returned lease epoch = %d, want the passed-in grant's %d", got.Epoch(), lease.Epoch())
+	}
+	releaseLease(got) // the caller's failure path does exactly this; it must not panic
 }
 
 // TestRestoreAdoptionLeaseLost: a manifest-carrying session restored with an Info-level drift
