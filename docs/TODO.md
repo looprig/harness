@@ -60,6 +60,33 @@ approved design is already linked.
   When memory profiles demand it, evict an idle delegate's in-memory history and actor
   state and rehydrate from the session journal on the next `send` — identity, semantics,
   and events unchanged; a purely internal resource optimization.
+- [ ] **Reclaim orphaned session objects (blocked on released SessionStore APIs)** —
+  `pkg/sessionstore` publishes an over-threshold body through released
+  `github.com/looprig/sessionstore` `Store.PutObject` BEFORE `storage.AppendDefinite`
+  commits the envelope that references it. `PutObject` mints a random 128-bit
+  generation per call, so the physical key is `<digest>/<generation>` and RETRYING
+  the same record after an append failure (`*storage.ConflictError` from a fenced-out
+  writer or ownership handoff, or an ambiguous ack the caller retries) publishes a new,
+  permanently unreferenced object every attempt. Harness's compatibility `ObjectGC`
+  retains every non-legacy key, and `PutObject`'s own documentation assigns orphan
+  reclamation to "the store operator" over this same prefix while noting that its only
+  enumeration path (`listObjectReferences`) is unexported, so "no caller-facing GC
+  exists yet". Neither side reclaims. The pre-refactor legacy offload keyed on the
+  content SHA alone, which made a retry idempotent AND made the object reapable; both
+  properties were lost together.
+
+  This is not fixable inside Harness at sessionstore v0.1.0. It needs EITHER of two
+  released additions, and Harness should consume whichever lands first:
+  1. a caller-supplied or content-derived object generation (an `Option` for the
+     unexported `Store.objectGeneration` field, or a documented deterministic
+     generation), which restores retry idempotency at one key; or
+  2. an exported enumeration + deletion contract over a tenant/session object prefix
+     (a public form of `listObjectReferences` plus a guarded delete), which lets
+     `ObjectGC` reap the class it currently only counts.
+
+  Until then `GCResult.Unreclaimable` reports the size of the class each pass could
+  not see, so an accumulating leak is at least visible to a caller that logs it. See
+  `pkg/sessionstore/README.md`, "Object reclamation boundary".
 
 ## Safety and observability
 

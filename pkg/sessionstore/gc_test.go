@@ -172,6 +172,12 @@ func TestGCReapsOnlyLegacyObjects(t *testing.T) {
 	if result.Scanned != 1 || result.Deleted != 1 || !reflect.DeepEqual(result.DeletedKeys, []string{legacyOrphan}) {
 		t.Fatalf("GCResult = %+v, want only legacy orphan %q scanned and deleted", result, legacyOrphan)
 	}
+	// The released objects are not merely skipped: the pass reports how much of
+	// the prefix it could not cover, so a caller cannot read this as a clean
+	// sweep of the whole session.
+	if result.Unreclaimable != len(kinds) {
+		t.Fatalf("GCResult.Unreclaimable = %d, want the %d retained released objects", result.Unreclaimable, len(kinds))
+	}
 	after, err := st.backend.Blobs.List(context.Background(), gcBlobPrefix(id))
 	if err != nil {
 		t.Fatalf("Blobs.List(after GC) error = %v", err)
@@ -258,6 +264,9 @@ func TestGCReclaim(t *testing.T) {
 			}
 			if !reflect.DeepEqual(res.DeletedKeys, orphanKeys) {
 				t.Errorf("GCResult.DeletedKeys = %v, want %v (only orphans)", res.DeletedKeys, orphanKeys)
+			}
+			if res.Unreclaimable != tt.numRef {
+				t.Errorf("GCResult.Unreclaimable = %d, want the %d released objects this pass cannot see", res.Unreclaimable, tt.numRef)
 			}
 
 			// Every referenced blob still resolves.
@@ -630,7 +639,7 @@ func TestGCSweepReguardsLease(t *testing.T) {
 			}
 			g := &ObjectGC{id: id, lease: lease, ledger: mem.Ledger, blobs: mem.Blobs, name: ledgerName(id)}
 
-			res, err := g.sweep(context.Background(), map[string]struct{}{}, []string{key})
+			res, err := g.sweep(context.Background(), map[string]struct{}{}, []string{key}, 0)
 			var notHeld *GCLeaseNotHeldError
 			if !errors.As(err, &notHeld) {
 				t.Fatalf("sweep() err = %v, want *GCLeaseNotHeldError", err)
@@ -827,3 +836,51 @@ var (
 	_ storage.Ledger              = (*readFailLedger)(nil)
 	_ storage.BlobReaderLifecycle = (*deleteFailBlobs)(nil)
 )
+
+// TestGCDistinguishesNothingToReclaimFromUnseenClass is the honesty guard on
+// GCResult: a session whose blob prefix holds ONLY released SessionStore objects
+// yields Scanned == Deleted == 0 exactly like an empty session, and the
+// documented "Scanned == Referenced + Deleted" identity holds vacuously at
+// 0 == 0 + 0 in both. A caller logging the result must still be able to tell the
+// two apart, because in one case there is nothing to reclaim and in the other
+// there is a whole class this pass cannot see.
+func TestGCDistinguishesNothingToReclaimFromUnseenClass(t *testing.T) {
+	t.Parallel()
+
+	run := func(t *testing.T, releasedObjects int) GCResult {
+		t.Helper()
+		st, err := Open(memstore.New())
+		if err != nil {
+			t.Fatalf("Open() error = %v", err)
+		}
+		id := newTestUUID(t)
+		lease, _ := leaseFor(1, id)
+		for i := 0; i < releasedObjects; i++ {
+			putDurableObject(t, st, id, durablestore.ObjectKindJournalRuntime, []byte("retained-"+strconv.Itoa(i)))
+		}
+		gc, err := st.OpenObjectGC(id, lease)
+		if err != nil {
+			t.Fatalf("OpenObjectGC() error = %v", err)
+		}
+		res, err := gc.GC(context.Background())
+		if err != nil {
+			t.Fatalf("GC() error = %v", err)
+		}
+		if res.Scanned != 0 || res.Referenced != 0 || res.Deleted != 0 || res.DeletedKeys != nil {
+			t.Fatalf("GCResult = %+v, want an empty legacy sweep", res)
+		}
+		return res
+	}
+
+	empty := run(t, 0)
+	if empty.Unreclaimable != 0 {
+		t.Fatalf("empty session GCResult.Unreclaimable = %d, want 0 (nothing to reclaim)", empty.Unreclaimable)
+	}
+	unseen := run(t, 3)
+	if unseen.Unreclaimable != 3 {
+		t.Fatalf("released-only session GCResult.Unreclaimable = %d, want 3 (a class this pass cannot see)", unseen.Unreclaimable)
+	}
+	if reflect.DeepEqual(unseen, empty) {
+		t.Fatal("a pass over three unreclaimable released objects is indistinguishable from a clean empty pass")
+	}
+}

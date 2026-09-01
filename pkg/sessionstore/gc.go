@@ -80,9 +80,19 @@ func (e *GCDeleteError) Error() string {
 }
 func (e *GCDeleteError) Unwrap() error { return e.Cause }
 
-// GCResult summarizes one legacy-object GC pass. Released SessionStore objects are
-// outside this result because v0.1.0 exposes no safe public reaping API. On a fully
-// successful pass Scanned == Referenced + Deleted.
+// GCResult summarizes one legacy-object GC pass. On a fully successful pass
+// Scanned == Referenced + Deleted — but read that identity together with
+// Unreclaimable, without which it is vacuously true at 0 == 0 + 0 for a session
+// whose blob prefix holds nothing BUT released objects.
+//
+// This pass covers exactly one class: the legacy Harness offload shape. Released
+// SessionStore v0.1.0 objects are outside it, because that version exposes no
+// safe public enumeration or deletion API and Harness will not reconstruct its
+// private physical layout. Unreclaimable counts what was therefore left
+// untouched, so a caller logging a GCResult can distinguish "nothing to reclaim"
+// (Scanned == 0, Unreclaimable == 0) from "I cannot see this class"
+// (Unreclaimable > 0). A zero-valued GCResult returned alongside a non-nil error
+// means the pass failed closed before it could measure anything.
 type GCResult struct {
 	// Scanned is the number of canonical legacy blobs selected under the session prefix.
 	Scanned int
@@ -96,6 +106,15 @@ type GCResult struct {
 	// returns sorted keys and the sweep preserves that order). It lets a caller log
 	// exactly what was reclaimed without re-deriving it.
 	DeletedKeys []string
+	// Unreclaimable is the number of keys under the session's blob prefix this
+	// pass deliberately did not consider: everything outside the legacy offload
+	// shape, which today means released SessionStore objects. It mixes LIVE and
+	// ORPHANED objects — this pass cannot tell them apart without SessionStore's
+	// private layout — so it is a coverage measure, not an orphan count. Nonzero
+	// means the pass did not cover the whole prefix and reclamation of that class
+	// is still owed. See the README's "Object reclamation boundary" for the
+	// released API this waits on and for the orphans Harness itself can create.
+	Unreclaimable int
 }
 
 // WorkspaceJournalScanError reports that a retained session journal could not be scanned
@@ -202,7 +221,9 @@ func (s *Store) scanWorkspaceEvents(ctx context.Context, id uuid.UUID, visit fun
 
 // ObjectGC reaps orphaned legacy Harness offload blobs from one session's
 // content-addressed blob prefix. It deliberately retains released SessionStore
-// objects until that module publishes a safe retention/reaping API.
+// objects until that module publishes a safe retention/reaping API, and reports
+// how many keys that left untouched in GCResult.Unreclaimable so a pass over a
+// prefix it cannot fully see never reads as a clean one.
 //
 // It is lease-guarded: it deletes, so it runs only while holding a valid single-writer
 // lease and is therefore the single deleter. That lease guard is also the whole of its
@@ -261,12 +282,12 @@ func (g *ObjectGC) GC(ctx context.Context) (GCResult, error) {
 		return GCResult{}, err
 	}
 
-	keys, err := g.listBlobs(ctx)
+	keys, unreclaimable, err := g.listBlobs(ctx)
 	if err != nil {
 		return GCResult{}, err
 	}
 
-	return g.sweep(ctx, live, keys)
+	return g.sweep(ctx, live, keys, unreclaimable)
 }
 
 // leaseHeld reports whether the ownership lease is still held: both its validity flag
@@ -338,19 +359,24 @@ func (g *ObjectGC) collectLive(ctx context.Context) (map[string]struct{}, error)
 // listing/deletion API in v0.1.0, so this legacy GC retains every other key rather
 // than deriving SessionStore's private physical layout or accidentally reaping an
 // artifact, checkpoint, tool result, or journal object it cannot prove unreachable.
-func (g *ObjectGC) listBlobs(ctx context.Context) ([]string, error) {
+// It additionally returns how many listed keys were retained for that reason, so
+// the pass can report the coverage it did not have rather than an empty success.
+func (g *ObjectGC) listBlobs(ctx context.Context) ([]string, int, error) {
 	prefix := g.name + blobsInfix
 	keys, err := g.blobs.List(ctx, prefix)
 	if err != nil {
-		return nil, &GCListError{Prefix: prefix, Cause: err}
+		return nil, 0, &GCListError{Prefix: prefix, Cause: err}
 	}
 	legacy := make([]string, 0, len(keys))
+	unreclaimable := 0
 	for _, key := range keys {
 		if isLegacyBlobKey(prefix, key) {
 			legacy = append(legacy, key)
+			continue
 		}
+		unreclaimable++
 	}
-	return legacy, nil
+	return legacy, unreclaimable, nil
 }
 
 func isLegacyBlobKey(prefix, key string) bool {
@@ -369,8 +395,8 @@ func isLegacyBlobKey(prefix, key string) bool {
 // before each delete so a loss mid-pass stops further deletes at once (fail secure). A
 // delete failure fails closed as a *GCDeleteError. Because Blobs.List returns keys in
 // lexicographic order, DeletedKeys is likewise ordered.
-func (g *ObjectGC) sweep(ctx context.Context, live map[string]struct{}, keys []string) (GCResult, error) {
-	res := GCResult{Scanned: len(keys)}
+func (g *ObjectGC) sweep(ctx context.Context, live map[string]struct{}, keys []string, unreclaimable int) (GCResult, error) {
+	res := GCResult{Scanned: len(keys), Unreclaimable: unreclaimable}
 	for _, k := range keys {
 		if _, ok := live[k]; ok {
 			res.Referenced++
