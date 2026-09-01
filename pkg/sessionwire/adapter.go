@@ -65,7 +65,7 @@ func Project(tenantID coresessionwire.TenantID, sessionID coresessionwire.Sessio
 	if !ok || ev.Visibility() != event.Public {
 		return Projection{}, &ProjectionError{Type: typeName, Reason: ProjectionRejected}
 	}
-	if err := event.ValidateEvent(ev); err != nil {
+	if err := validateForProjection(ev, class); err != nil {
 		return Projection{}, &ProjectionError{Type: typeName, Reason: ProjectionMalformed, Cause: err}
 	}
 
@@ -85,6 +85,97 @@ func Project(tenantID coresessionwire.TenantID, sessionID coresessionwire.Sessio
 		return Projection{}, &ProjectionError{Type: typeName, Reason: ProjectionEncoding, Cause: err}
 	}
 	return projection, nil
+}
+
+func validateForProjection(ev event.Event, class EventClass) error {
+	if class == PublicEnduring {
+		return event.ValidateEvent(ev)
+	}
+	switch value := ev.(type) {
+	case event.TokenDelta:
+		if err := validateEphemeralHeader("TokenDelta", value.Header, ephemeralProfile{requireTurn: true, forbidStep: true}); err != nil {
+			return err
+		}
+		_, err := projectChunk(value.Chunk)
+		return err
+	case event.ToolCallStarted:
+		if err := validateEphemeralHeader("ToolCallStarted", value.Header, ephemeralProfile{requireTurn: true, requireStep: true}); err != nil {
+			return err
+		}
+		if value.ToolExecutionID.IsZero() {
+			return invalidEphemeral("ToolCallStarted", event.FieldToolExecutionID, event.RuleRequired)
+		}
+		return nil
+	case event.ToolCallCompleted:
+		if err := validateEphemeralHeader("ToolCallCompleted", value.Header, ephemeralProfile{requireTurn: true, requireStep: true}); err != nil {
+			return err
+		}
+		if value.ToolExecutionID.IsZero() {
+			return invalidEphemeral("ToolCallCompleted", event.FieldToolExecutionID, event.RuleRequired)
+		}
+		return nil
+	case event.InputQueued:
+		return validateEphemeralHeader("InputQueued", value.Header, ephemeralProfile{forbidTurn: true, forbidStep: true})
+	case event.ContextPressure:
+		if err := validateEphemeralHeader("ContextPressure", value.Header, ephemeralProfile{forbidTurn: true, forbidStep: true}); err != nil {
+			return err
+		}
+		return validateContextPressure(value)
+	default:
+		// CompactionStarted is deliberately minted because its progress identity
+		// correlates the later enduring result. IntegrationStatus has no Harness
+		// producer and retains its declared Event validation contract.
+		return event.ValidateEvent(ev)
+	}
+}
+
+type ephemeralProfile struct {
+	requireTurn bool
+	requireStep bool
+	forbidTurn  bool
+	forbidStep  bool
+}
+
+func validateEphemeralHeader(name string, header event.Header, profile ephemeralProfile) error {
+	checks := []struct {
+		bad   bool
+		field event.FieldName
+		rule  event.Rule
+	}{
+		{header.SessionID.IsZero(), event.FieldSessionID, event.RuleRequired},
+		{header.LoopID.IsZero(), event.FieldLoopID, event.RuleRequired},
+		{profile.requireTurn && header.TurnID.IsZero(), event.FieldTurnID, event.RuleRequired},
+		{profile.forbidTurn && !header.TurnID.IsZero(), event.FieldTurnID, event.RuleMustBeZero},
+		{profile.requireStep && header.StepID.IsZero(), event.FieldStepID, event.RuleRequired},
+		{profile.forbidStep && !header.StepID.IsZero(), event.FieldStepID, event.RuleMustBeZero},
+		{!header.StepID.IsZero() && header.TurnID.IsZero(), event.FieldTurnID, event.RuleRequired},
+	}
+	for _, check := range checks {
+		if check.bad {
+			return invalidEphemeral(name, check.field, check.rule)
+		}
+	}
+	return nil
+}
+
+func validateContextPressure(value event.ContextPressure) error {
+	if err := value.Measurement.Validate(); err != nil {
+		return err
+	}
+	if value.Occupancy > event.FullScaleBasisPoints {
+		return &event.ContextValidationError{Field: event.ContextField("Occupancy")}
+	}
+	if value.Previous > event.PressureHardLimit {
+		return &event.ContextValidationError{Field: event.ContextField("Previous")}
+	}
+	if value.Current < event.PressureNormal || value.Current > event.PressureHardLimit || value.Current == value.Previous {
+		return &event.ContextValidationError{Field: event.ContextField("Current")}
+	}
+	return nil
+}
+
+func invalidEphemeral(name string, field event.FieldName, rule event.Rule) error {
+	return &event.InvalidEventError{Event: event.EventName(name), Field: field, Rule: rule}
 }
 
 func projectBody(ev event.Event, class EventClass) (json.RawMessage, error) {

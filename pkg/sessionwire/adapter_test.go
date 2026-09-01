@@ -16,6 +16,8 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 type applicationPrefix struct {
@@ -375,7 +377,7 @@ func TestProjectGateResolvedOmitsRawAnswerAudit(t *testing.T) {
 func TestProjectTokenDeltaOmitsRawToolArguments(t *testing.T) {
 	t.Parallel()
 	header := event.Header{
-		Coordinates: identity.Coordinates{SessionID: testUUID(1), LoopID: testUUID(2), TurnID: testUUID(3), StepID: testUUID(4)},
+		Coordinates: identity.Coordinates{SessionID: testUUID(1), LoopID: testUUID(2), TurnID: testUUID(3)},
 		EventID:     testUUID(5),
 	}
 	ev := event.TokenDelta{
@@ -393,6 +395,98 @@ func TestProjectTokenDeltaOmitsRawToolArguments(t *testing.T) {
 		if !bytes.Contains(got.Body, []byte(marker)) {
 			t.Errorf("body missing %s: %s", marker, got.Body)
 		}
+	}
+}
+
+func TestProjectAcceptsProductionShapedZeroEventIDEphemerals(t *testing.T) {
+	t.Parallel()
+	turnHeader := event.Header{Coordinates: identity.Coordinates{
+		SessionID: testUUID(1), LoopID: testUUID(2), TurnID: testUUID(3),
+	}}
+	toolHeader := turnHeader
+	toolHeader.StepID = testUUID(4)
+	loopHeader := event.Header{Coordinates: identity.Coordinates{SessionID: testUUID(1), LoopID: testUUID(2)}}
+	measurement := validProjectionContextMeasurement()
+	tests := []struct {
+		name  string
+		value event.Event
+	}{
+		{name: "TokenDelta", value: event.TokenDelta{Header: turnHeader, TurnIndex: 2, Chunk: &content.TextChunk{Text: "partial"}}},
+		{name: "ToolCallStarted", value: event.ToolCallStarted{Header: toolHeader, ToolExecutionID: testUUID(5), ToolName: "shell", Summary: "run tests"}},
+		{name: "ToolCallCompleted", value: event.ToolCallCompleted{Header: toolHeader, ToolExecutionID: testUUID(5), ResultPreview: "done"}},
+		{name: "InputQueued", value: event.InputQueued{Header: event.Header{Coordinates: loopHeader.Coordinates, Cause: identity.Cause{CommandID: testUUID(6)}}}},
+		{name: "ContextPressure", value: event.ContextPressure{Header: loopHeader, Measurement: measurement, Occupancy: 8_000, Previous: event.PressureNormal, Current: event.PressureCompact}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			projection, err := Project("tenant-a", "public-session", test.value)
+			if err != nil {
+				var invalid *event.InvalidEventError
+				if errors.As(err, &invalid) && invalid.Field == event.FieldEventID {
+					t.Fatalf("production-shaped zero-EventID ephemeral was rejected by enduring identity validation: %v", err)
+				}
+				t.Fatalf("Project() error = %T %v", err, err)
+			}
+			if projection.Class != PublicEphemeral || projection.EventID != "" {
+				t.Fatalf("projection = %#v, want public ephemeral without envelope EventID", projection)
+			}
+			if bytes.Contains(projection.Body, []byte(`"event_id"`)) {
+				t.Fatalf("body manufactured EventID: %s", projection.Body)
+			}
+		})
+	}
+}
+
+func TestProjectStillValidatesZeroEventIDEphemerals(t *testing.T) {
+	t.Parallel()
+	turnHeader := event.Header{Coordinates: identity.Coordinates{
+		SessionID: testUUID(1), LoopID: testUUID(2), TurnID: testUUID(3),
+	}}
+	toolHeader := turnHeader
+	toolHeader.StepID = testUUID(4)
+	loopHeader := event.Header{Coordinates: identity.Coordinates{SessionID: testUUID(1), LoopID: testUUID(2)}}
+	tests := []struct {
+		name      string
+		value     event.Event
+		wantField event.FieldName
+	}{
+		{name: "TokenDelta missing session", value: event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{LoopID: testUUID(2), TurnID: testUUID(3)}}, Chunk: &content.TextChunk{Text: "partial"}}, wantField: event.FieldSessionID},
+		{name: "ToolCallStarted missing tool correlation", value: event.ToolCallStarted{Header: toolHeader, ToolName: "shell"}, wantField: event.FieldToolExecutionID},
+		{name: "ToolCallCompleted missing step", value: event.ToolCallCompleted{Header: turnHeader, ToolExecutionID: testUUID(5)}, wantField: event.FieldStepID},
+		{name: "InputQueued carries forbidden turn", value: event.InputQueued{Header: event.Header{Coordinates: identity.Coordinates{SessionID: testUUID(1), LoopID: testUUID(2), TurnID: testUUID(3)}}}, wantField: event.FieldTurnID},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Project("tenant-a", "public-session", test.value)
+			var invalid *event.InvalidEventError
+			if !errors.As(err, &invalid) {
+				t.Fatalf("error = %T %v, want *event.InvalidEventError", err, err)
+			}
+			if invalid.Field != test.wantField {
+				t.Fatalf("field = %q, want %q", invalid.Field, test.wantField)
+			}
+		})
+	}
+
+	invalidPressure := event.ContextPressure{
+		Header: loopHeader, Measurement: validProjectionContextMeasurement(), Occupancy: 8_000,
+		Previous: event.PressureCompact, Current: event.PressureCompact,
+	}
+	_, err := Project("tenant-a", "public-session", invalidPressure)
+	var contextErr *event.ContextValidationError
+	if !errors.As(err, &contextErr) || contextErr.Field != event.ContextField("Current") {
+		t.Fatalf("invalid ContextPressure error = %T %v, want Current ContextValidationError", err, err)
+	}
+}
+
+func validProjectionContextMeasurement() event.ContextMeasurement {
+	return event.ContextMeasurement{
+		Basis:              event.ContextBasis{Revision: 1, ThroughEventID: testUUID(9)},
+		Model:              model.ModelKey{Provider: "provider", Model: "model"},
+		RequestFingerprint: [32]byte{1},
+		InputTokens:        80,
+		InputLimit:         100,
+		Quality:            contextcount.CountQualityExactLocal,
 	}
 }
 
