@@ -6,11 +6,34 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
 )
+
+func TestReplyProjectionCasesMatchSealedReplyUnion(t *testing.T) {
+	t.Parallel()
+	want := methodReceiverTypesInPackage(t, filepath.Join("..", "event"), "isReply")
+	got := make([]string, 0, len(replyProjectionCases(uuid.UUID{})))
+	for _, test := range replyProjectionCases(uuid.UUID{}) {
+		if _, ok := test.value.(event.Reply); !ok {
+			t.Fatalf("fixture %T does not implement ReplyTo", test.value)
+		}
+		got = append(got, reflect.TypeOf(test.value).Name())
+	}
+	sort.Strings(got)
+	if len(want) == 0 || len(got) == 0 {
+		t.Fatalf("vacuous reply sets: Harness=%d adapter=%d", len(want), len(got))
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("reply projection fixtures drifted from sealed Reply union\nHarness:\n%s\nadapter:\n%s", strings.Join(want, "\n"), strings.Join(got, "\n"))
+	}
+}
 
 func TestProjectionPolicyMatchesHarnessSealedEventUnion(t *testing.T) {
 	t.Parallel()
@@ -94,6 +117,37 @@ func eventTypesInSwitch(t *testing.T, path, function string) []string {
 		})
 		return false
 	})
+	sort.Strings(names)
+	return names
+}
+
+func methodReceiverTypesInPackage(t *testing.T, dir, method string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), filepath.Join(dir, entry.Name()), nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", entry.Name(), err)
+		}
+		for _, declaration := range file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Name.Name != method || function.Recv == nil || len(function.Recv.List) != 1 {
+				continue
+			}
+			receiver, ok := function.Recv.List[0].Type.(*ast.Ident)
+			if !ok {
+				t.Fatalf("unsupported %s receiver in %s", method, entry.Name())
+			}
+			names = append(names, receiver.Name)
+		}
+	}
 	sort.Strings(names)
 	return names
 }

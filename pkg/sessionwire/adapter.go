@@ -4,6 +4,7 @@ package sessionwire
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 
 	"github.com/looprig/core/content"
 	coresessionwire "github.com/looprig/core/sessionwire/v1"
@@ -64,6 +65,14 @@ func Project(tenantID coresessionwire.TenantID, sessionID coresessionwire.Sessio
 	ev, ok := value.(event.Event)
 	if !ok || ev.Visibility() != event.Public {
 		return Projection{}, &ProjectionError{Type: typeName, Reason: ProjectionRejected}
+	}
+	if reply, ok := ev.(event.Reply); ok && reply.ReplyTo().IsZero() {
+		cause := &event.InvalidEventError{
+			Event: event.EventName(reflect.TypeOf(ev).Name()),
+			Field: event.FieldCommandID,
+			Rule:  event.RuleRequired,
+		}
+		return Projection{}, &ProjectionError{Type: typeName, Reason: ProjectionMalformed, Cause: cause}
 	}
 	if err := validateForProjection(ev, class); err != nil {
 		return Projection{}, &ProjectionError{Type: typeName, Reason: ProjectionMalformed, Cause: err}

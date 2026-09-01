@@ -453,7 +453,7 @@ func TestProjectStillValidatesZeroEventIDEphemerals(t *testing.T) {
 		{name: "TokenDelta missing session", value: event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{LoopID: testUUID(2), TurnID: testUUID(3)}}, Chunk: &content.TextChunk{Text: "partial"}}, wantField: event.FieldSessionID},
 		{name: "ToolCallStarted missing tool correlation", value: event.ToolCallStarted{Header: toolHeader, ToolName: "shell"}, wantField: event.FieldToolExecutionID},
 		{name: "ToolCallCompleted missing step", value: event.ToolCallCompleted{Header: turnHeader, ToolExecutionID: testUUID(5)}, wantField: event.FieldStepID},
-		{name: "InputQueued carries forbidden turn", value: event.InputQueued{Header: event.Header{Coordinates: identity.Coordinates{SessionID: testUUID(1), LoopID: testUUID(2), TurnID: testUUID(3)}}}, wantField: event.FieldTurnID},
+		{name: "InputQueued carries forbidden turn", value: event.InputQueued{Header: event.Header{Coordinates: identity.Coordinates{SessionID: testUUID(1), LoopID: testUUID(2), TurnID: testUUID(3)}, Cause: identity.Cause{CommandID: testUUID(6)}}}, wantField: event.FieldTurnID},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -476,6 +476,129 @@ func TestProjectStillValidatesZeroEventIDEphemerals(t *testing.T) {
 	var contextErr *event.ContextValidationError
 	if !errors.As(err, &contextErr) || contextErr.Field != event.ContextField("Current") {
 		t.Fatalf("invalid ContextPressure error = %T %v, want Current ContextValidationError", err, err)
+	}
+}
+
+func TestProjectRejectsEveryReplyWithoutCommandCorrelation(t *testing.T) {
+	t.Parallel()
+	for _, test := range replyProjectionCases(uuid.UUID{}) {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Project("tenant-a", "public-session", test.value)
+			var invalid *event.InvalidEventError
+			if !errors.As(err, &invalid) {
+				t.Fatalf("Project() error = %T %v, want *event.InvalidEventError", err, err)
+			}
+			if invalid.Event != event.EventName(test.name) || invalid.Field != event.FieldCommandID || invalid.Rule != event.RuleRequired {
+				t.Fatalf("invalid event = %#v, want %s CommandID required", invalid, test.name)
+			}
+		})
+	}
+}
+
+func TestProjectPreservesReplyCommandCorrelation(t *testing.T) {
+	t.Parallel()
+	commandID := testUUID(11)
+	for _, test := range replyProjectionCases(commandID) {
+		t.Run(test.name, func(t *testing.T) {
+			projection, err := Project("tenant-a", "public-session", test.value)
+			if err != nil {
+				t.Fatalf("Project() error = %T %v", err, err)
+			}
+			if !bytes.Contains(projection.Body, []byte(commandID.String())) {
+				t.Fatalf("projected body lost ReplyTo correlation %q: %s", commandID, projection.Body)
+			}
+		})
+	}
+}
+
+func replyProjectionCases(commandID uuid.UUID) []struct {
+	name  string
+	value event.Event
+} {
+	loopHeader := event.Header{
+		Coordinates: identity.Coordinates{SessionID: testUUID(1), LoopID: testUUID(2)},
+		EventID:     testUUID(7),
+		Cause:       identity.Cause{CommandID: commandID},
+	}
+	turnHeader := loopHeader
+	turnHeader.TurnID = testUUID(3)
+	attemptID := event.CompactAttemptID(testUUID(8))
+	resolvedHeader := loopHeader
+	resolvedHeader.EventID = event.CompactWaiterReplyID(attemptID, commandID, true)
+	rejectedHeader := loopHeader
+	rejectedHeader.EventID = event.CompactWaiterReplyID(attemptID, commandID, false)
+	queuedHeader := loopHeader
+	queuedHeader.EventID = uuid.UUID{}
+	return []struct {
+		name  string
+		value event.Event
+	}{
+		{name: "TurnStarted", value: event.TurnStarted{Header: turnHeader, TurnIndex: 1}},
+		{name: "InputQueued", value: event.InputQueued{Header: queuedHeader}},
+		{name: "TurnRejected", value: event.TurnRejected{Header: loopHeader, Reason: event.RejectQueueFull}},
+		{name: "TurnFoldedInto", value: event.TurnFoldedInto{Header: turnHeader, TurnIndex: 1}},
+		{name: "InputCancelled", value: event.InputCancelled{Header: loopHeader, Reason: event.CancelClientRetracted}},
+		{name: "CompactWaiterResolved", value: event.CompactWaiterResolved{Header: resolvedHeader, AttemptID: attemptID, CommittedEventID: testUUID(9)}},
+		{name: "CompactWaiterRejected", value: event.CompactWaiterRejected{Header: rejectedHeader, AttemptID: attemptID, Reason: event.CompactRejectControlLaneFull}},
+	}
+}
+
+func TestContextPressureProjectionMatchesAuthoritativeValidation(t *testing.T) {
+	t.Parallel()
+	valid := validProjectionContextMeasurement()
+	tests := []struct {
+		name   string
+		mutate func(*event.ContextPressure)
+	}{
+		{name: "valid unknown to normal", mutate: func(value *event.ContextPressure) {
+			value.Previous = event.PressureUnknown
+			value.Current = event.PressureNormal
+		}},
+		{name: "valid full scale compact to hard limit", mutate: func(value *event.ContextPressure) {
+			value.Occupancy = event.FullScaleBasisPoints
+			value.Previous = event.PressureCompact
+			value.Current = event.PressureHardLimit
+		}},
+		{name: "invalid measurement revision", mutate: func(value *event.ContextPressure) { value.Measurement.Basis.Revision = 0 }},
+		{name: "invalid measurement event identity", mutate: func(value *event.ContextPressure) { value.Measurement.Basis.ThroughEventID = uuid.UUID{} }},
+		{name: "invalid measurement model", mutate: func(value *event.ContextPressure) { value.Measurement.Model = model.ModelKey{} }},
+		{name: "invalid measurement fingerprint", mutate: func(value *event.ContextPressure) { value.Measurement.RequestFingerprint = [32]byte{} }},
+		{name: "invalid measurement input limit", mutate: func(value *event.ContextPressure) { value.Measurement.InputLimit = 0 }},
+		{name: "invalid measurement quality", mutate: func(value *event.ContextPressure) { value.Measurement.Quality = contextcount.CountQuality(255) }},
+		{name: "invalid occupancy above full scale", mutate: func(value *event.ContextPressure) { value.Occupancy = event.FullScaleBasisPoints + 1 }},
+		{name: "invalid previous level", mutate: func(value *event.ContextPressure) { value.Previous = event.PressureHardLimit + 1 }},
+		{name: "invalid current unknown", mutate: func(value *event.ContextPressure) { value.Current = event.PressureUnknown }},
+		{name: "invalid current above hard limit", mutate: func(value *event.ContextPressure) { value.Current = event.PressureHardLimit + 1 }},
+		{name: "invalid unchanged transition", mutate: func(value *event.ContextPressure) {
+			value.Previous = event.PressureCompact
+			value.Current = event.PressureCompact
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := event.ContextPressure{
+				Header:      event.Header{Coordinates: identity.Coordinates{SessionID: testUUID(1), LoopID: testUUID(2)}},
+				Measurement: valid, Occupancy: 8_000, Previous: event.PressureNormal, Current: event.PressureCompact,
+			}
+			test.mutate(&value)
+			authoritative := value
+			authoritative.EventID = testUUID(7)
+			wantErr := event.ValidateEvent(authoritative)
+			projection, gotErr := Project("tenant-a", "public-session", value)
+			if (gotErr == nil) != (wantErr == nil) {
+				t.Fatalf("Project() error = %T %v, authoritative validation error = %T %v", gotErr, gotErr, wantErr, wantErr)
+			}
+			if wantErr == nil {
+				if projection.Class != PublicEphemeral || projection.EventID != "" {
+					t.Fatalf("projection = %#v, want zero-ID public ephemeral", projection)
+				}
+				return
+			}
+			var wantContext, gotContext *event.ContextValidationError
+			if !errors.As(wantErr, &wantContext) || !errors.As(gotErr, &gotContext) || gotContext.Field != wantContext.Field {
+				t.Fatalf("Project() error = %T %v, authoritative validation error = %T %v", gotErr, gotErr, wantErr, wantErr)
+			}
+		})
 	}
 }
 
