@@ -36,6 +36,11 @@ type reportingKV struct {
 	pathReporter
 }
 
+type reportingOrderedIndex struct {
+	storage.OrderedIndex
+	pathReporter
+}
+
 type reportingBlobs struct {
 	storage.Blobs
 	pathReporter
@@ -407,6 +412,48 @@ func TestPersistencePaths(t *testing.T) {
 				t.Errorf("PersistencePaths() after caller mutation = %v, want %v", next, tt.want)
 			}
 		})
+	}
+}
+
+func TestPersistencePathsUsesOwnedOrderedIndexReporter(t *testing.T) {
+	t.Parallel()
+
+	indexPath := t.TempDir()
+	original := memstore.New()
+	backend := &storage.Composite{
+		Ledger: original.Ledger,
+		Leaser: original.Leaser,
+		KV:     original.KV,
+		Blobs:  original.Blobs,
+		OrderedIndex: reportingOrderedIndex{
+			OrderedIndex: original.OrderedIndex,
+			pathReporter: pathReporter{paths: []string{indexPath}},
+		},
+	}
+	store, err := Open(backend)
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+
+	// The facade owns the shallow snapshot made by Open, so replacing every
+	// interface in the caller's Composite cannot hide an index-only local path.
+	replacement := memstore.New()
+	backend.Ledger = replacement.Ledger
+	backend.Leaser = replacement.Leaser
+	backend.KV = replacement.KV
+	backend.OrderedIndex = replacement.OrderedIndex
+	backend.Blobs = replacement.Blobs
+
+	want, err := filepath.EvalSymlinks(indexPath)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", indexPath, err)
+	}
+	got, err := store.PersistencePaths()
+	if err != nil {
+		t.Fatalf("PersistencePaths() err = %v", err)
+	}
+	if !reflect.DeepEqual(got, []string{want}) {
+		t.Fatalf("PersistencePaths() = %v, want owned OrderedIndex path %q", got, want)
 	}
 }
 

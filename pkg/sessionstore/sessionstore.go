@@ -174,6 +174,9 @@ func (s *Store) PersistencePaths() ([]string, error) {
 	if reporter, ok := s.backend.KV.(storage.PathReporter); ok {
 		reported = append(reported, reporter.StoragePaths()...)
 	}
+	if reporter, ok := s.backend.OrderedIndex.(storage.PathReporter); ok {
+		reported = append(reported, reporter.StoragePaths()...)
+	}
 	if reporter, ok := s.backend.Blobs.(storage.PathReporter); ok {
 		reported = append(reported, reporter.StoragePaths()...)
 	}

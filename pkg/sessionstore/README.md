@@ -4,10 +4,10 @@
 `storage.Composite` backend. It is the in-tree `SessionJournal`
 implementation that a [`pkg/rig`](../rig/README.md) is configured with;
 it owns the durable event/command log, the replay-free session catalog,
-and the workspace ref → blob offload threshold. Neutral journal, object,
-keyspace, and catalog persistence delegates to released
-`github.com/looprig/sessionstore` v0.1.0; Harness retains its codecs, catalog
-fold, workspace GC, hustle, and identity semantics.
+and the workspace ref → blob offload threshold. Neutral journal, object, and
+keyspace persistence delegates to released `github.com/looprig/sessionstore`
+v0.1.0; Harness retains its codecs, catalog fold and direct catalog KV
+ownership, workspace GC, hustle, and identity semantics.
 
 The storage primitives themselves live in the sibling
 [`looprig/storage`](https://github.com/looprig/storage) module; the
