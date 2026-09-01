@@ -22,10 +22,22 @@ import (
 // maxRuntimeBodyBytes is the ceiling this package admits for one object-backed
 // runtime body on replay. It equals the fail-closed input ceiling of Harness's
 // event decoder (event.UnmarshalEvent) and command decoder
-// (command.UnmarshalCommand), so a body admitted here can still reach its codec.
+// (command.UnmarshalCommand), so a body admitted here still reaches its codec's
+// own length check rather than being cut off short of it.
 //
-// It is NOT a property the WRITE-side codecs guarantee on their own. Only
-// event.MarshalEvent caps its own output; command.MarshalCommand and
+// Reaching the codec is NOT decodability, and this ceiling must not be read as a
+// decodability guarantee. content.UnmarshalBlock enforces a nested 8 MiB
+// per-serialized-block cap that content.MarshalBlock does not, so a single text
+// block serializing to between 8388609 and 16777126 bytes fits in a command body
+// at or below this ceiling: it marshals, passes sessionJournal.frame, is
+// offloaded, appends, and is then permanently unreadable on replay with
+// content's *BlockLimitError ("block input exceeds block_bytes cap"). That
+// residual is PRE-EXISTING and out of scope here — it is a missing write-side cap
+// in a Core codec, not in this package's ceiling — and is tracked in
+// docs/TODO.md.
+//
+// This ceiling is NOT a property the WRITE-side codecs guarantee on their own.
+// Only event.MarshalEvent caps its own output; command.MarshalCommand and
 // journal.MarshalGatePreparedRecord do not (a gate-prepared body is an
 // event-capped "prepared" half PLUS an uncapped payload half PLUS JSON framing,
 // so it exceeds this ceiling by construction). Without a matching write-side

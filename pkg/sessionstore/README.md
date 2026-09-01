@@ -141,6 +141,15 @@ that session. On the read side an over-ceiling DECLARED size is reported as
 `*DurableBodyTooLargeError`, never as `*BlobIntegrityError`: it is a size
 refusal, and nothing on that path has demonstrated corruption or substitution.
 
+Admission past that 16 MiB ceiling does **not** imply decodability. A nested
+8 MiB per-serialized-block cap in Core's `content.UnmarshalBlock` — which
+`content.MarshalBlock` does not enforce — bites first: a single text block
+serializing to between 8388609 and 16777126 bytes rides inside a command body at
+or below the ceiling, so it marshals, passes the append guard, is offloaded,
+appends, and is then permanently unreadable on replay with content's
+`*BlockLimitError`. That residual is pre-existing, lives in a Core codec rather
+than here, and is tracked in [`docs/TODO.md`](../../docs/TODO.md).
+
 ### Catalog is derivable
 
 The `Catalog` is a **replay-free** projection. It is best-effort by
@@ -203,8 +212,13 @@ reapable by `ObjectGC`; both properties were lost together.
 Every public event is projected through `sessionwire.Project` on the way to the
 durable append, and `Project` imposes one rule that `event.ValidateEvent` does
 not: an `event.Reply` whose `ReplyTo()` (its `Header.Cause.CommandID`) is zero is
-rejected as malformed. The Reply set is `CompactWaiterResolved`,
-`CompactWaiterRejected`, `TurnRejected`, `TurnStarted`, and `InputQueued`.
+rejected as malformed. The Reply set is not enumerated here: it is sealed by
+`event.Reply`'s `isReply` method, `Project` matches on the interface, and
+`sessionwire`'s `TestReplyProjectionCasesMatchSealedReplyUnion` derives the union
+from `pkg/event` source. Read the members off `event.Reply` (listed in
+[`pkg/event/README.md`](../event/README.md)); a hand-maintained copy in this file
+could only drift out of the interface, and one did — it named five members while
+seven implement `isReply`.
 
 The consequence is worth stating plainly: an event Harness's own validator calls
 VALID can be refused at the durable append with a `*journal.MarshalRecordError`.

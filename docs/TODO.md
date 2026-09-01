@@ -88,6 +88,31 @@ approved design is already linked.
   not see, so an accumulating leak is at least visible to a caller that logs it. See
   `pkg/sessionstore/README.md`, "Object reclamation boundary".
 
+- [ ] **Cap a content block on marshal, not only on unmarshal (Core `content`)** —
+  `content.UnmarshalBlock` refuses a serialized block above `maxBlockBytes`
+  (8 MiB) with a `*BlockLimitError`; `content.MarshalBlock` has no matching cap.
+  A `UserInput` carrying one text block that serializes to between 8388609 and
+  16777126 bytes therefore marshals, keeps the whole command body at or below
+  `pkg/sessionstore`'s 16 MiB `maxRuntimeBodyBytes` ceiling, passes
+  `sessionJournal.frame`'s write-side refusal, is offloaded, and appends — and
+  then fails replay permanently with
+  `command: decode UserInput: content: block input exceeds block_bytes cap`.
+  Measured: text length 8388584 yields a 8388609-byte block in an 8388699-byte
+  body (one byte shorter still decodes); text length 16777101 yields a
+  16777126-byte block in a body of exactly 16777216 bytes, the largest the append
+  guard admits.
+
+  This is the same fail-closed-but-unrecoverable hazard the runtime-body ceiling
+  closed, one level down and at a lower threshold. It is **pre-existing** — the
+  identical command failed identically on replay before that guard existed — and
+  it is not fixable inside Harness: the missing cap is in Core's codec, and a
+  Harness-side block-size check would duplicate a constant Harness does not own.
+  Fix is a marshal-side cap in `github.com/looprig/core/content` (symmetric with
+  `UnmarshalBlock`, same `*BlockLimitError`), consumed here by a Core version
+  bump. Until then, admission past `maxRuntimeBodyBytes` does not imply the body
+  can be decoded; see `pkg/sessionstore/replay.go`'s `maxRuntimeBodyBytes` doc and
+  `pkg/sessionstore/README.md`.
+
 ## Safety and observability
 
 - [x] **Permission auto-review classifier and tool-using Hustles** — a bounded,

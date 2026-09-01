@@ -56,10 +56,16 @@ func (e *ProjectionError) Unwrap() error { return e.Cause }
 // append through this function, so an event Harness's own validator calls VALID
 // can be refused here. The rule is reply correlation — an event.Reply whose
 // ReplyTo() (its Header.Cause.CommandID) is zero is rejected as malformed, while
-// ValidateEvent imposes no such requirement on the Reply set
-// (CompactWaiterResolved, CompactWaiterRejected, TurnRejected, TurnStarted,
-// InputQueued). A caller sees the refusal as a *journal.MarshalRecordError from
-// the append, not as a validation failure at construction.
+// ValidateEvent imposes no such requirement on the Reply set. A caller sees the
+// refusal as a *journal.MarshalRecordError from the append, not as a validation
+// failure at construction.
+//
+// The members of that set are deliberately NOT enumerated here. The set is
+// sealed by event.Reply's isReply method, Project matches on the interface, and
+// TestReplyProjectionCasesMatchSealedReplyUnion derives the union from pkg/event
+// source — so the interface is the authority and a prose list here can only
+// drift out of it. One did: it named five members while seven implement isReply.
+// Read the members off event.Reply (pkg/event/README.md lists them).
 //
 // Every production construction site of those events sets the causing command id,
 // so no live path emits a zero today. A NEW emitter that leaves
