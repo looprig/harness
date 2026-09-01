@@ -59,8 +59,8 @@ func TestEveryHarnessEventHasExplicitProjectionPolicy(t *testing.T) {
 		{event.HustleStarted{}, PrivateRejected},
 		{event.HustleCompleted{}, PrivateRejected},
 		{event.HustleFailed{}, PrivateRejected},
-		{event.PermissionReviewStarted{}, PublicEnduring},
-		{event.PermissionReviewCompleted{}, PublicEnduring},
+		{event.PermissionReviewStarted{}, PrivateRejected},
+		{event.PermissionReviewCompleted{}, PrivateRejected},
 		{event.ProcessStarted{}, PublicEnduring},
 		{event.ProcessBackgrounded{}, PublicEnduring},
 		{event.ProcessCompleted{}, PublicEnduring},
@@ -118,9 +118,36 @@ func TestEveryHarnessEventHasExplicitProjectionPolicy(t *testing.T) {
 		if got := classify(test.value); got != test.want {
 			t.Errorf("classify(%T) = %q, want %q", test.value, got, test.want)
 		}
+		ev, isEvent := test.value.(event.Event)
+		if !isEvent || test.want == PrivateRejected {
+			continue
+		}
+		wantLifecycle := event.Enduring
+		if test.want == PublicEphemeral {
+			wantLifecycle = event.Ephemeral
+		}
+		if got := ev.Class(); got != wantLifecycle {
+			t.Errorf("classify(%T) = %q but Event.Class() = %v, want %v", test.value, test.want, got, wantLifecycle)
+		}
 	}
 	if len(tests) < 62 {
 		t.Fatalf("policy table has %d rows, want at least 62", len(tests))
+	}
+}
+
+func TestAlwaysInternalEventTypesAreRejectedByPolicy(t *testing.T) {
+	t.Parallel()
+	values := []event.Event{
+		event.HustleStarted{},
+		event.HustleCompleted{},
+		event.HustleFailed{},
+		event.PermissionReviewStarted{},
+		event.PermissionReviewCompleted{},
+	}
+	for _, value := range values {
+		if got := classify(value); got != PrivateRejected {
+			t.Errorf("classify(%T) = %q, want %q", value, got, PrivateRejected)
+		}
 	}
 }
 
@@ -228,6 +255,58 @@ func TestProjectRejectsGatePreparedBeforeValidation(t *testing.T) {
 	}
 	if projectionErr.Reason != ProjectionRejected {
 		t.Fatalf("reason = %q, want %q", projectionErr.Reason, ProjectionRejected)
+	}
+}
+
+func TestProjectRejectsPermissionReviewEventsBeforeValidation(t *testing.T) {
+	t.Parallel()
+	internalHeader := event.Header{
+		Coordinates: identity.Coordinates{
+			SessionID: testUUID(1), LoopID: testUUID(2), TurnID: testUUID(3), StepID: testUUID(4),
+		},
+		EventID: testUUID(5), EventVisibility: event.Internal,
+	}
+	validStarted := event.PermissionReviewStarted{
+		Header: internalHeader, GateID: gate.ID(testUUID(7)), ToolExecutionID: testUUID(8),
+		Classifier: hustle.Name("command-safety"), ClassifierRevision: "classifier-v1",
+	}
+	validCompleted := event.PermissionReviewCompleted{
+		Header: internalHeader, GateID: gate.ID(testUUID(7)), ToolExecutionID: testUUID(8),
+		Classifier: hustle.Name("command-safety"), ClassifierRevision: "classifier-v1",
+		Status: gate.ReviewStatusAllowed, Risk: gate.ReviewRiskLow,
+		Authorization: gate.ReviewAuthorizationUnknown,
+		Categories:    []gate.ReviewRiskCategory{gate.ReviewCategoryMutableNetwork},
+		AutoApproved:  true,
+	}
+	for name, value := range map[string]event.Event{
+		"valid internal started":   validStarted,
+		"valid internal completed": validCompleted,
+	} {
+		if err := event.ValidateEvent(value); err != nil {
+			t.Fatalf("%s fixture is not valid-shaped: %v", name, err)
+		}
+	}
+
+	tests := []struct {
+		name  string
+		value any
+	}{
+		{name: "valid internal started", value: validStarted},
+		{name: "valid internal completed", value: validCompleted},
+		{name: "malformed public started", value: event.PermissionReviewStarted{}},
+		{name: "malformed public completed", value: event.PermissionReviewCompleted{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Project("tenant-a", "public-session", test.value)
+			var projectionErr *ProjectionError
+			if !errors.As(err, &projectionErr) {
+				t.Fatalf("error = %T %v, want *ProjectionError", err, err)
+			}
+			if projectionErr.Reason != ProjectionRejected {
+				t.Fatalf("reason = %q, want rejection before event validation", projectionErr.Reason)
+			}
+		})
 	}
 }
 

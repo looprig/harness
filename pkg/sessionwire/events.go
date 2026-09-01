@@ -55,9 +55,9 @@ func classify(value any) EventClass {
 	case event.HustleFailed:
 		return PrivateRejected
 	case event.PermissionReviewStarted:
-		return PublicEnduring
+		return PrivateRejected
 	case event.PermissionReviewCompleted:
-		return PublicEnduring
+		return PrivateRejected
 	case event.ProcessStarted:
 		return PublicEnduring
 	case event.ProcessBackgrounded:
