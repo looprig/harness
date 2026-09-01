@@ -50,6 +50,22 @@ func (e *ProjectionError) Unwrap() error { return e.Cause }
 // public body. It deliberately accepts any so private persistence records and
 // live command payloads reach a typed rejection instead of a generic JSON path.
 // It never assigns a journal sequence; only a successful append may do that.
+//
+// It is deliberately NARROWER than event.ValidateEvent on one rule, and that
+// difference is load-bearing to state: every public event now reaches the durable
+// append through this function, so an event Harness's own validator calls VALID
+// can be refused here. The rule is reply correlation — an event.Reply whose
+// ReplyTo() (its Header.Cause.CommandID) is zero is rejected as malformed, while
+// ValidateEvent imposes no such requirement on the Reply set
+// (CompactWaiterResolved, CompactWaiterRejected, TurnRejected, TurnStarted,
+// InputQueued). A caller sees the refusal as a *journal.MarshalRecordError from
+// the append, not as a validation failure at construction.
+//
+// Every production construction site of those events sets the causing command id,
+// so no live path emits a zero today. A NEW emitter that leaves
+// Header.Cause.CommandID unset will pass ValidateEvent and fail the append:
+// correlate the reply with the command it answers, or relax this rule — do not
+// discover the difference from a fixture.
 func Project(tenantID coresessionwire.TenantID, sessionID coresessionwire.SessionID, value any) (Projection, error) {
 	typeName := fmt.Sprintf("%T", value)
 	class := classify(value)

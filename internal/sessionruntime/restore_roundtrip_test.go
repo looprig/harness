@@ -100,6 +100,10 @@ func (es *eventStamper) stamp(t *testing.T, ctx context.Context, h *hub.Hub, ev 
 	hdr := ev.EventHeader()
 	hdr.EventID = uuid.UUID{0xE0, es.n}
 	hdr.CreatedAt = time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	// A Reply must carry the command it answers: sessionwire.Project rejects a zero
+	// ReplyTo at the durable append even though event.ValidateEvent does not (see
+	// Project's doc). These fixtures publish replies directly rather than through a
+	// real command, so they must supply that correlation themselves.
 	if reply, correlated := ev.(event.Reply); correlated && reply.ReplyTo().IsZero() {
 		hdr.Cause.CommandID = uuid.UUID{0xD0, es.n}
 	}

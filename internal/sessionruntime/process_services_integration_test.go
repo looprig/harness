@@ -486,6 +486,15 @@ func TestProcessServicesIntegrationNewRestoreAndLease(t *testing.T) {
 	// released SessionStore contract with an honest bounded-reader blob
 	// provider. Raw fsstore.Blobs deliberately lacks BlobReaderLifecycle and is
 	// rejected by the facade's dedicated compatibility regression.
+	//
+	// KNOWN COVERAGE GAP, stated rather than skipped: this makes the "restart"
+	// below reuse the same IN-PROCESS blob store, so durability of OFFLOADED
+	// session objects across a real process restart is watched by NOTHING — not
+	// this test and not any other in the module. Harness ships no in-tree
+	// provider satisfying BlobReaderLifecycle other than memstore, so the
+	// property cannot be exercised here today; a consumer wiring a durable
+	// object store owns it. See pkg/sessionstore/README.md, "On-disk object
+	// durability is not covered by a test".
 	sessionBlobs := memstore.New().Blobs
 	sessionBackend := func(disk *fsstore.Store) *storage.Composite {
 		diskBackend := disk.Backend()
