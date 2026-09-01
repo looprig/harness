@@ -174,13 +174,25 @@ func newCatalog(t *testing.T) (*sessionstore.Store, *sessionstore.Catalog, *mutC
 // supported decoder rather than constructing a synthetic in-memory meta value.
 func newStoredCatalogReader(t *testing.T, sid uuid.UUID, raw []byte) *catalogreader.Reader {
 	t.Helper()
+	return newStoredCatalogRowsReader(t, storedCatalogRow{sid: sid, raw: raw})
+}
+
+type storedCatalogRow struct {
+	sid uuid.UUID
+	raw []byte
+}
+
+func newStoredCatalogRowsReader(t *testing.T, rows ...storedCatalogRow) *catalogreader.Reader {
+	t.Helper()
 	backend := memstore.New()
 	st, err := sessionstore.Open(backend)
 	if err != nil {
 		t.Fatalf("Open() err = %v", err)
 	}
-	if _, err := backend.KV.Put(context.Background(), "sessions/"+sid.String(), 0, raw); err != nil {
-		t.Fatalf("KV.Put(historical SessionMeta) err = %v", err)
+	for _, row := range rows {
+		if _, err := backend.KV.Put(context.Background(), "sessions/"+row.sid.String(), 0, row.raw); err != nil {
+			t.Fatalf("KV.Put(historical SessionMeta) err = %v", err)
+		}
 	}
 	return catalogreader.NewScoped(
 		st.OpenCatalog(),
@@ -351,6 +363,34 @@ func TestReaderListSessionsPreservesSupportedPreProjectionRows(t *testing.T) {
 				t.Errorf("legacy list JSON changed\n got: %s\nwant: %s", gotJSON, test.want)
 			}
 		})
+	}
+}
+
+func TestReaderListSessionsPreservesCreatedOnlyLegacyOrdering(t *testing.T) {
+	t.Parallel()
+
+	olderID, newerID := fixedUUID(0x11), fixedUUID(0x22)
+	r := newStoredCatalogRowsReader(t,
+		storedCatalogRow{
+			sid: olderID,
+			raw: []byte(`{"session_id":"11111111-1111-1111-1111-111111111111","state":"idle","title":"older","created_at":"2026-08-29T09:00:00Z","last_journal_seq":1}`),
+		},
+		storedCatalogRow{
+			sid: newerID,
+			raw: []byte(`{"session_id":"22222222-2222-2222-2222-222222222222","state":"idle","title":"newer","created_at":"2026-08-29T10:00:00Z","last_journal_seq":1}`),
+		},
+	)
+	got, err := r.ListSessions(context.Background(), serve.Page{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListSessions() error = %T %v, want nil", err, err)
+	}
+	gotJSON, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("json.Marshal(ListSessions()) error = %v", err)
+	}
+	want := []byte(`{"sessions":[{"session_id":"11111111-1111-1111-1111-111111111111","state":"idle","title":"older","created_at":"2026-08-29T09:00:00Z"},{"session_id":"22222222-2222-2222-2222-222222222222","state":"idle","title":"newer","created_at":"2026-08-29T10:00:00Z"}],"skip":0,"limit":10,"next_skip":0,"done":true}`)
+	if !bytes.Equal(gotJSON, want) {
+		t.Errorf("legacy list JSON changed\n got: %s\nwant: %s", gotJSON, want)
 	}
 }
 

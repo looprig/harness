@@ -262,7 +262,7 @@ func projectionAbsence(meta sessionstore.SessionMeta, summary bool) coreProjecti
 	if meta.State == "" {
 		absence |= coreProjectionMissingState
 	}
-	if summary && meta.CreatedAt.IsZero() && meta.LastActiveAt.IsZero() {
+	if summary && meta.LastActiveAt.IsZero() {
 		absence |= coreProjectionMissingActivity
 	}
 	return absence

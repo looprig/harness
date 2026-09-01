@@ -36,9 +36,11 @@ func TestLegacyProjectionAvailabilityBoundary(t *testing.T) {
 			meta sessionstore.SessionMeta
 			want coreProjectionAbsence
 		}{
-			{name: "fully representable", meta: sessionstore.SessionMeta{SessionID: sid, State: sessionstore.StateIdle, CreatedAt: now}, want: coreProjectionPresent},
-			{name: "legacy state only", meta: sessionstore.SessionMeta{SessionID: sid, CreatedAt: now}, want: coreProjectionMissingState},
-			{name: "activity only", meta: sessionstore.SessionMeta{SessionID: sid, State: sessionstore.StateIdle}, want: coreProjectionMissingActivity},
+			{name: "created and active timestamps", meta: sessionstore.SessionMeta{SessionID: sid, State: sessionstore.StateIdle, CreatedAt: now.Add(-time.Hour), LastActiveAt: now}, want: coreProjectionPresent},
+			{name: "last active only", meta: sessionstore.SessionMeta{SessionID: sid, State: sessionstore.StateIdle, LastActiveAt: now}, want: coreProjectionPresent},
+			{name: "created only lacks legacy activity", meta: sessionstore.SessionMeta{SessionID: sid, State: sessionstore.StateIdle, CreatedAt: now}, want: coreProjectionMissingActivity},
+			{name: "legacy state only with activity", meta: sessionstore.SessionMeta{SessionID: sid, LastActiveAt: now}, want: coreProjectionMissingState},
+			{name: "neither timestamp", meta: sessionstore.SessionMeta{SessionID: sid, State: sessionstore.StateIdle}, want: coreProjectionMissingActivity},
 			{name: "state and activity", meta: sessionstore.SessionMeta{SessionID: sid}, want: coreProjectionMissingState | coreProjectionMissingActivity},
 		}
 		for _, test := range tests {
