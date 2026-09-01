@@ -1692,11 +1692,22 @@ func (e *leaseAcquireError) Unwrap() error { return e.Cause }
 //
 // The lease returned alongside an error is the caller's to release (a second release
 // of an already-released grant is a no-op); it is nil only when no grant was ever
-// obtained, which releaseLease tolerates. There is deliberately no backoff: a
-// contending claim holds a live grant while it runs, so sleeping would block every
-// other claimant on a grant this call is not using, and contention here is resolved
-// by someone winning the CAS rather than by waiting. Each attempt is bounded by
-// sessionstore's own per-append deadline, and ctx bounds the whole loop.
+// obtained, which releaseLease tolerates.
+//
+// There is deliberately no backoff, and NOT for the reason that first suggests
+// itself — at the top of the next iteration this call holds nothing, because
+// sessionstore released the losing grant before returning the conflict, so a sleep
+// there would block no one. The reasons are that the loop is bounded at
+// openingGrantAttempts with a per-attempt deadline inside sessionstore; that each
+// attempt does real work (acquire, fence, CAS) rather than re-polling an unchanged
+// condition, so it is not a spin; that contention is resolved by someone winning the
+// CAS, which waiting does not help; and that this path is rare — an instrumented
+// probe (a counter on attempt > 0, run module-wide under `go test -v`, which is
+// required: a non-verbose run suppresses the output and reports a spurious zero)
+// fires 18 times across the module, ALL of them inside the six tests written to
+// drive this path, and zero times in every other test — including the integration
+// tests whose flaking on this exact handoff race is what put the loop here. ctx
+// bounds the whole loop.
 //
 // Each attempt is a distinct append of a distinct fence record at a distinct epoch,
 // so an installed OperationJournalAppend hook is invoked once PER GRANT rather than

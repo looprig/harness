@@ -744,11 +744,13 @@ func TestRestorePrimaryLoopNarrowing(t *testing.T) {
 		[]event.Event{event.RestoreStarted{}, event.RestoreDone{}})
 }
 
-// TestRestoreReleasesLeaseOnShutdown proves the Phase-10 lease-release-on-teardown wiring
-// for a RESTORED session: Restore holds the single-writer lease for the session lifetime,
-// and a clean Shutdown releases it so a SECOND Restore can re-acquire single-writer
-// ownership promptly (nothing else would ever free it). Without the release, the second Restore would
-// fail *LeaseHeldError until the lease expired.
+// TestRestoreReleasesLeaseOnShutdown proves the Phase-10 lease-release-on-teardown
+// wiring for a RESTORED session: Restore holds the single-writer lease for the
+// session lifetime, and a clean Shutdown releases it so a SECOND Restore can
+// re-acquire single-writer ownership. That release is the ONLY thing that frees the
+// grant — no pinned backend expires one — so without it the second Restore would
+// fail *LeaseHeldError for as long as this process lives. This test guards a
+// permanent lockout, not a latency optimisation.
 func TestRestoreReleasesLeaseOnShutdown(t *testing.T) {
 	store := newRestoreStore(t)
 	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))

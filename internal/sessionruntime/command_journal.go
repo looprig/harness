@@ -384,8 +384,9 @@ func (s *Session) appendDelegateCommand(ctx context.Context, loopID uuid.UUID, c
 
 // appendShutdownCommand is the shutdown-path intent-log write. It is identical to
 // appendCommand except that a TYPED lease-lost append failure is EXPECTED: Shutdown releases
-// the single-writer lease as part of teardown (or the heartbeat already observed the loss),
-// so a final shutdown-command append refused for lease loss is benign — not a fault. That
+// the single-writer lease as part of teardown, so a final shutdown-command append refused
+// for lease loss is benign — not a fault. (Teardown is the only way it can happen here: no
+// pinned provider ends a grant on its own — see journal.Lease.Release.) That
 // one path is logged at debug; every OTHER append failure (and an ordinary, non-shutdown
 // lease loss) still logs loudly at error. It does not change dispatch semantics.
 func (s *Session) appendShutdownCommand(ctx context.Context, loopID uuid.UUID, cmd command.Command) {

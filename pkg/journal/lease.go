@@ -17,11 +17,20 @@ type Lease interface {
 	ownershipToken
 	// SessionID is the session this lease grants single-writer ownership of.
 	SessionID() uuid.UUID
-	// Release relinquishes the lease: stops any heartbeat, marks it no longer held
-	// (firing Lost), and best-effort clears the entry so a successor can re-acquire.
-	// Release is the ONLY prompt end to a grant: an implementation may expire or hand
-	// one over, but none in this workspace does, so an unreleased grant is held for as
-	// long as its holder lives. Idempotent.
+	// Release relinquishes the lease: stops whatever the provider does to keep the
+	// grant live, marks it no longer held (firing Lost), and best-effort clears the
+	// entry so a successor can re-acquire.
+	//
+	// WHAT ENDS A GRANT, IN THIS BUILD. The upstream storage.Leaser contract calls a
+	// grant "renewable" and its storetest.TestLeaserLifecycle suite conforms
+	// providers that implement renewal and expiry, so an implementation MAY end a
+	// grant by expiry or higher-epoch takeover. Neither pinned provider does:
+	// memstore is Release-only ("no TTL, no takeover"), and fsstore's grant is an
+	// advisory lock the OS drops when the holding fd closes or the process exits. So
+	// on the backends this module is built against, Release is the only prompt end to
+	// a grant, and an unreleased one is held for as long as its holder lives. Code
+	// here must therefore treat loss as something it CAUSES, never as something that
+	// will happen on its own. Idempotent.
 	Release(ctx context.Context) error
 }
 
@@ -32,19 +41,25 @@ type ownershipToken interface {
 	// Epoch is the monotonically increasing fencing epoch this lease holds. A higher
 	// epoch always out-ranks a lower one; the journal stamps it into its LeaseFence.
 	Epoch() uint64
-	// Valid reports whether the lease is still held (not released, not lost to a
-	// higher-epoch takeover). A journal must refuse to append once this is false.
+	// Valid reports whether the lease is still held — not released, and not lost by
+	// whatever other means the provider offers (see Release: no pinned provider
+	// offers any). A journal must refuse to append once this is false.
 	Valid() bool
-	// Lost returns a channel closed when the lease is lost — released by the holder,
-	// or overtaken by a higher epoch detected on a heartbeat renewal. It never carries
-	// a value; select on it to react to loss.
+	// Lost returns a channel closed when the lease is lost. Under both pinned
+	// providers that means one thing: the holder released it (fsstore additionally
+	// loses it when the holding process exits and the OS drops its advisory lock).
+	// A provider that implements renewal may also close it on expiry or a
+	// higher-epoch takeover; none here does. It never carries a value; select on it
+	// to react to loss.
 	Lost() <-chan struct{}
 }
 
 // LeaseHeldError reports that acquiring a lease lost the single-holder race: the
-// session's lease is currently held by a live (unexpired) holder, or a concurrent
-// acquirer won the race. It carries the session and the epoch currently fenced so a
-// caller can log who holds it. It is the expected, non-fatal "someone else owns this
+// session's lease is currently held by a live holder, or a concurrent acquirer won
+// the race. "Live" is not "unexpired" — no pinned provider expires a grant, so a
+// holder stays live until it releases or its process dies, and retrying this later
+// in the same process will keep failing unless the holder acts. It carries the
+// session and the epoch currently fenced so a caller can log who holds it. It is the expected, non-fatal "someone else owns this
 // session" outcome — the loser must not write to the log.
 type LeaseHeldError struct {
 	SessionID uuid.UUID
@@ -57,7 +72,9 @@ func (e *LeaseHeldError) Error() string {
 }
 
 // LeaseLostError reports an operation attempted on a lease that is no longer held: it
-// was released, or a higher-epoch holder took over (detected on a heartbeat renewal).
+// was released, its holding process exited (fsstore), or — on a provider that
+// implements one, which neither pinned provider does — it expired or was taken over
+// by a higher epoch.
 // It carries the session and the lease's epoch. The journal returns it (wrapped in a
 // JournalLeaseLostError) when an Append is attempted after the lease is lost.
 type LeaseLostError struct {

@@ -339,8 +339,9 @@ func (e *WorkspaceSeedError) Error() string {
 func (e *WorkspaceSeedError) Unwrap() error { return e.Cause }
 
 // rootLeaseHealth reports the exclusive root lease's health to the coordinator. Healthy
-// returns a typed error once the lease's Lost channel has closed (expiry/takeover), so a
-// structured mutator refuses to commit after ownership is lost (fail-secure).
+// returns a typed error once the lease's Lost channel has closed — by release under both
+// pinned providers, or by the expiry/takeover the storage.Lease contract also permits — so
+// a structured mutator refuses to commit after ownership is lost (fail-secure).
 type rootLeaseHealth struct {
 	lost <-chan struct{}
 }

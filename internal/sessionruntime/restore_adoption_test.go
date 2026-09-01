@@ -1184,12 +1184,18 @@ func TestOpenJournalUnderFreshGrantSurfacesAcquireFailure(t *testing.T) {
 // N, one observation per grant, and the reasoning for it.
 //
 // Before the fence stopped rebasing, the retry loop lived INSIDE the closure the
-// middleware wraps, so a hook saw one append however many CAS attempts happened
-// under it — it could not see contention at all, and the single record id it
-// reported was only the first epoch's. Now each attempt is a physically distinct
-// append of a distinct fence record carrying a distinct epoch, any of which may
-// commit. An append seam that hid attempts an audit sink would want (and that a
-// replayer can see in the ledger) would be under-reporting, so N is correct.
+// middleware wraps, and — this is the part that decides the question — the fence
+// record was built ONCE, before the loop, from one grant's epoch. All eight CAS
+// attempts appended the identical record at the identical epoch, so reporting them
+// as one logical append was defensible: there was no second epoch to report.
+//
+// That is no longer true. Each attempt now carries its own grant's epoch, and WHICH
+// ONE COMMITS IS NOT KNOWABLE IN ADVANCE. Any collapse-to-one design must therefore
+// choose an epoch to report, and the natural choice — the first — would name an
+// epoch that lost while a replayer reading the ledger sees the one that landed. N
+// observations, each naming its own epoch, is the only reporting that cannot lie.
+// TestOpenJournalUnderFreshGrantObservesTheLandedEpoch pins the half that matters
+// most: the terminal that COMPLETED names the epoch actually in the ledger.
 //
 // The cost is real and belongs in the same test: a hook on OperationJournalAppend
 // runs INSIDE the tip-read-to-CAS window, and now runs once per grant, so a slow
@@ -1272,6 +1278,125 @@ func TestOpenJournalUnderFreshGrantObservesEveryFenceAttempt(t *testing.T) {
 			t.Errorf("terminal %d outcome = %v, want failed (every attempt lost its CAS)", i, result.Outcome)
 		}
 	}
+}
+
+// TestOpenJournalUnderFreshGrantObservesTheLandedEpoch is the other half of the
+// fan-out rationale, and the case the argument actually rests on: contention that
+// CLEARS. The first grant's fence loses and its terminal fails; the second grant's
+// fence commits and its terminal completes. The completing observation must name the
+// epoch that is really in the ledger — that equality is what a collapse-to-one seam
+// could not have guaranteed, since it would have had to name an epoch before knowing
+// which one would land.
+func TestOpenJournalUnderFreshGrantObservesTheLandedEpoch(t *testing.T) {
+	backend := memstore.New()
+	sessionID, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	name := "sessions/" + sessionID.String()
+	racer, err := durablestore.EncodeEnvelope(durablestore.Envelope{
+		Kind: durablestore.EnvelopeKindOpeningFence, LeaseEpoch: 99,
+	})
+	if err != nil {
+		t.Fatalf("EncodeEnvelope(racer fence): %v", err)
+	}
+	// fenceRacingLedger injects the racer ONCE, so the first fence loses and the
+	// second, under a fresh grant, wins.
+	wrapped, err := storage.NewCompositeWithOrderedIndex(
+		&fenceRacingLedger{inner: backend.Ledger, name: name, racer: racer},
+		backend.Leaser, backend.KV, backend.Blobs, backend.OrderedIndex)
+	if err != nil {
+		t.Fatalf("storage.NewComposite: %v", err)
+	}
+	store, err := sessionstore.Open(wrapped)
+	if err != nil {
+		t.Fatalf("sessionstore.Open: %v", err)
+	}
+
+	var mu sync.Mutex
+	var starts []hook.Call
+	var terminals []hook.Result
+	runner, err := hook.Compile(hook.Set{Around: []hook.Around{{
+		Operation: hook.OperationJournalAppend,
+		Begin: func(ctx context.Context, call hook.Call) (context.Context, hook.FinishFunc) {
+			mu.Lock()
+			starts = append(starts, call)
+			mu.Unlock()
+			return ctx, func(result hook.Result) {
+				mu.Lock()
+				terminals = append(terminals, result)
+				mu.Unlock()
+			}
+		},
+	}}})
+	if err != nil {
+		t.Fatalf("hook.Compile: %v", err)
+	}
+
+	j, lease, err := openJournalUnderFreshGrant(
+		context.Background(), store, sessionID, journal.HookMiddleware(runner, sessionID))
+	if err != nil || j == nil {
+		t.Fatalf("openJournalUnderFreshGrant = (%T, %v), want a journal under the second grant", j, err)
+	}
+	t.Cleanup(func() { releaseLease(lease) })
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(starts) != 2 || len(terminals) != 2 {
+		t.Fatalf("hook observations = %d begins/%d terminals, want 2/2 (one lost fence, one landed)", len(starts), len(terminals))
+	}
+	if terminals[0].Outcome != hook.OutcomeFailed {
+		t.Errorf("first terminal outcome = %v, want failed (its fence lost the race)", terminals[0].Outcome)
+	}
+	if terminals[1].Outcome != hook.OutcomeCompleted || terminals[1].Err != nil {
+		t.Fatalf("second terminal = %#v, want completed", terminals[1])
+	}
+
+	// The completing observation names the epoch the ledger really carries.
+	landed := lastFenceEpoch(t, backend.Ledger, name)
+	if starts[1].JournalAppend == nil {
+		t.Fatal("second observation carries no journal-append data")
+	}
+	observed, parseErr := strconv.ParseUint(starts[1].JournalAppend.RecordID, 10, 64)
+	if parseErr != nil {
+		t.Fatalf("second observation record id %q is not an epoch: %v", starts[1].JournalAppend.RecordID, parseErr)
+	}
+	if observed != landed {
+		t.Errorf("completing observation names epoch %d, but the ledger's last fence is epoch %d", observed, landed)
+	}
+	if observed != lease.Epoch() {
+		t.Errorf("completing observation names epoch %d, want the surviving grant's %d", observed, lease.Epoch())
+	}
+	// And it is NOT the epoch a collapse-to-one seam would have reported.
+	if first, _ := strconv.ParseUint(starts[0].JournalAppend.RecordID, 10, 64); first == observed {
+		t.Errorf("both observations name epoch %d; the fixture did not actually spend two grants", first)
+	}
+}
+
+// lastFenceEpoch reads the ledger's final record and returns the opening-fence epoch
+// it carries, failing the test if that record is not an opening fence.
+func lastFenceEpoch(t *testing.T, ledger storage.Ledger, name string) uint64 {
+	t.Helper()
+	tip, err := ledger.Tip(context.Background(), name)
+	if err != nil {
+		t.Fatalf("Tip: %v", err)
+	}
+	cur, err := ledger.Read(context.Background(), name, tip)
+	if err != nil {
+		t.Fatalf("Read(%d): %v", tip, err)
+	}
+	rec, err := cur.Next(context.Background())
+	if err != nil {
+		t.Fatalf("Next at %d: %v", tip, err)
+	}
+	env, err := durablestore.DecodeEnvelope(rec.Payload)
+	if err != nil {
+		t.Fatalf("DecodeEnvelope(record %d): %v", tip, err)
+	}
+	if env.Kind != durablestore.EnvelopeKindOpeningFence {
+		t.Fatalf("record %d kind = %v, want an opening fence", tip, env.Kind)
+	}
+	return env.LeaseEpoch
 }
 
 // TestRestoreLeaseKindSurvivesTheRetryWindow pins the publicly observable half of
