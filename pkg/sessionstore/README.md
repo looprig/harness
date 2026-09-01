@@ -4,12 +4,14 @@
 `storage.Composite` backend. It is the in-tree `SessionJournal`
 implementation that a [`pkg/rig`](../rig/README.md) is configured with;
 it owns the durable event/command log, the replay-free session catalog,
-and the workspace ref → blob offload threshold.
+and the workspace ref → blob offload threshold. Neutral journal, object,
+keyspace, and catalog persistence delegates to released
+`github.com/looprig/sessionstore` v0.1.0; Harness retains its codecs, catalog
+fold, workspace GC, hustle, and identity semantics.
 
 The storage primitives themselves live in the sibling
 [`looprig/storage`](https://github.com/looprig/storage) module; the
-concrete backend (filesystem, NATS, rclone) lives in one of
-`looprig/fsstore`, `looprig/natsstore`, `looprig/rclonestore`. This
+concrete backend lives in a sibling storage-provider module. This
 package is the **session-shaped adapter** between those generic
 primitives and the `pkg/journal` contract.
 
@@ -17,9 +19,11 @@ primitives and the `pkg/journal` contract.
 
 - **`Open(b *storage.Composite, opts...) (*Store, error)`** — the
   constructor. Validates the composite (rejects a nil composite or any
-  nil primitive — `Ledger`, `Leaser`, `KV`, `Blobs` — with a typed
-  `*InvalidBackendError`, fail-closed). Resolves the options from
-  defaults (512 KiB offload threshold) plus overrides.
+  nil primitive — `Ledger`, `Leaser`, `KV`, `OrderedIndex`, `Blobs` —
+  fail-closed). `Blobs` must also implement Storage's
+  `BlobReaderLifecycle` with a positive close bound; raw `fsstore` deliberately
+  does not and is rejected before provider I/O. Open snapshots all five
+  interfaces so later caller mutation of the composite cannot split providers.
 - **`Store`** — the facade. Holds the assembled `*storage.Composite`
   plus resolved `Options`. Construct it only via `Open`.
 - **`SessionJournal`** — `Store` satisfies `pkg/journal.SessionJournal`
@@ -36,7 +40,8 @@ primitives and the `pkg/journal` contract.
 - **`Options`** — `WithOffloadThreshold(n)` is the only knob today: the
   payload size (bytes) above which a record is stored as an out-of-line
   blob instead of inline in the ledger. Default 512 KiB; non-positive
-  values are ignored.
+  values are ignored. Larger configured values never override the released
+  codec's 512 KiB per-body or 1 MiB total-envelope ceilings.
 
 ## How to use
 
@@ -46,15 +51,14 @@ A consumer wires a `*sessionstore.Store` into a rig:
 import (
     "github.com/looprig/harness/pkg/sessionstore"
     "github.com/looprig/storage"
-    // import a backend, e.g.
-    // fsstore "github.com/looprig/fsstore"
+	// import a backend that implements BlobReaderLifecycle
 )
 
-backend, err := fsstore.Composite(rootDir)  // *storage.Composite
+backend, err := productionBackend() // *storage.Composite with all five primitives
 if err != nil { return err }
 
 store, err := sessionstore.Open(backend,
-    sessionstore.WithOffloadThreshold(1<<20),  // 1 MiB
+    sessionstore.WithOffloadThreshold(1<<20), // requested; effective inline ceiling remains 512 KiB
 )
 if err != nil { return err }
 
@@ -80,9 +84,9 @@ store for a session picker (a "recent sessions" list, a restore UI).
   placement.
 - [`pkg/rig`](../rig/README.md) — `rig.WithSessionStore` takes a
   `*sessionstore.Store`.
-- `github.com/looprig/storage` — `Ledger`, `Leaser`, `KV`, `Blobs`.
-- `github.com/looprig/fsstore` / `looprig/natsstore` / `looprig/rclonestore`
-  — the backend modules that produce a `*storage.Composite`.
+- `github.com/looprig/sessionstore` — released neutral session persistence.
+- `github.com/looprig/storage` — `Ledger`, `Leaser`, `KV`, `OrderedIndex`,
+  `Blobs`, and the optional `BlobReaderLifecycle` capability required here.
 
 ## How it is designed
 
@@ -93,16 +97,12 @@ store for a session picker (a "recent sessions" list, a restore UI).
             ▼
        *sessionstore.Store
             │
-   ┌────────┼────────────────┐
-   │        │                │
-   ▼        ▼                ▼
- Ledger   Blobs              KV
- (append) (offload ≥512KiB)  (catalog)
-   │        │                │
-   │        │                │
-   ▼        ▼                ▼
- session journal          Catalog
- (pkg/journal)         (replay-free index)
+   ┌────────┬──────────┼──────────────┬──────────────┐
+   ▼        ▼          ▼              ▼              ▼
+ Ledger   Leaser       KV        OrderedIndex      Blobs
+   └────────┴──────────┬──────────────┴──────────────┘
+                      ▼
+       released sessionstore + Harness facade
 ```
 
 ### Layout
@@ -119,11 +119,16 @@ The layout is the contract between `Open`, `Append`, `Replay`, and the
 
 ### Large-record offload
 
-A record whose payload exceeds the offload threshold (default 512 KiB,
-under storage's 1 MiB per-record ceiling) is stored as an out-of-line
-blob; the ledger carries only the envelope framing the blob key. The
-threshold sits comfortably under the per-record ceiling so envelope
-framing never pushes a record over the limit.
+Each public append can carry two independent bodies: native Harness runtime
+bytes and the canonical Core public projection. A private append carries only
+the native runtime body. The effective policy offloads a body above the smaller
+of the configured threshold and released `MaxInlineBodyBytes` (512 KiB). When
+two individually valid public bodies would exceed released `MaxEnvelopeBytes`
+(1 MiB including framing), it offloads the larger body, preferring runtime on a
+tie. Exact codec limits come from the released API rather than duplicated local
+constants. Object publication is verified before the small reference envelope
+is appended; failures retain the legacy `*journal.RecordTooLargeError`
+classification with a redacted durable cause.
 
 ### Catalog is derivable
 
@@ -138,8 +143,8 @@ the journal under its own scan timeout.
 
 ### Fail-closed validation
 
-`Open` rejects a nil composite or any nil primitive field with a typed
-`*InvalidBackendError` that names the missing piece (`"composite"`,
-`"Ledger"`, `"Leaser"`, `"KV"`, `"Blobs"`), so the composition root
-knows exactly what was not wired and never dereferences a nil
-primitive later.
+`Open` rejects incomplete composites and delegates the complete five-primitive
+and `BlobReaderLifecycle` validation to the released store. Replay and GC use
+released envelope magic as an ownership boundary: once that magic is present,
+a released decode error is authoritative and cannot fall through to legacy JSON.
+Legacy fallback remains only for records without released magic.

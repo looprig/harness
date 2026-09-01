@@ -22,9 +22,42 @@ import (
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/tool"
 	model "github.com/looprig/inference/model"
+	durablestore "github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
+
+func TestReplayDurableMagicCorruptionFailsAsReleasedEnvelopeError(t *testing.T) {
+	backend := memstore.New()
+	store, err := Open(backend)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	id := newTestUUID(t)
+	frame, err := durablestore.EncodeEnvelope(durablestore.Envelope{Kind: durablestore.EnvelopeKindOpeningFence, LeaseEpoch: 1})
+	if err != nil {
+		t.Fatalf("EncodeEnvelope() error = %v", err)
+	}
+	frame[4]++ // retain LRJE magic but corrupt the released version byte
+	if err := backend.Ledger.Append(context.Background(), ledgerName(id), 0, frame); err != nil {
+		t.Fatalf("Ledger.Append() error = %v", err)
+	}
+	replayer, err := store.OpenInternalRecordReplayer(id, ReplayRequest{FromSeq: 1})
+	if err != nil {
+		t.Fatalf("OpenInternalRecordReplayer() error = %v", err)
+	}
+	cursor, err := replayer.Open(context.Background(), journal.ReplayRequest{})
+	if err != nil {
+		t.Fatalf("RecordReplayer.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = cursor.Close() })
+	_, _, err = cursor.Next(context.Background())
+	var replayErr *ReplayDecodeError
+	var envelopeErr *durablestore.EnvelopeError
+	if !errors.As(err, &replayErr) || !errors.As(err, &envelopeErr) || envelopeErr.Code != durablestore.EnvelopeErrorVersion {
+		t.Fatalf("Next() error = %T %v, want ReplayDecodeError wrapping released version EnvelopeError", err, err)
+	}
+}
 
 // replayThreshold is a small offload threshold used across the replay tests so a
 // modestly padded record is forced down the blob-offload path while the tiny

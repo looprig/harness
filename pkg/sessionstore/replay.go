@@ -307,6 +307,8 @@ func (b *baseCursor) next(ctx context.Context) (resolved, error) {
 
 	if durable, durableErr := durablestore.DecodeEnvelope(rec.Payload); durableErr == nil {
 		return b.resolveDurable(ctx, durable, rec.Seq)
+	} else if hasReleasedEnvelopeMagic(rec.Payload) {
+		return resolved{}, &ReplayDecodeError{Seq: rec.Seq, Cause: durableErr}
 	}
 	env, err := decodeEnvelope(rec.Payload)
 	if err != nil {

@@ -71,7 +71,7 @@ type sessionJournal struct {
 	durable   *durablestore.Store
 	project   func(coresessionwire.TenantID, coresessionwire.SessionID, any) (harnesssessionwire.Projection, error)
 	name      string // the bound ledger name (ledgerName(id))
-	threshold int    // frame size (bytes) above which a record is offloaded
+	threshold int    // configured body threshold, bounded by released envelope limits
 
 	// mu serializes Append and guards ready + trackedTip. The serializer is
 	// single-writer by contract; the mutex makes that safe even if a caller fans
@@ -558,7 +558,7 @@ func (b *sessionJournal) writeEncodedLocked(ctx context.Context, rec journal.Jou
 // publication remains serialized with the append that makes it reachable.
 func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k kind, body []byte) ([]byte, error) {
 	env := durablestore.Envelope{}
-	var err error
+	var publicBody []byte
 	switch k {
 	case kindFence:
 		env.Kind = durablestore.EnvelopeKindOpeningFence
@@ -572,10 +572,7 @@ func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k
 			}
 			env.Kind = durablestore.EnvelopeKindPublicEvent
 			env.EventID = projection.EventID
-			env.Public, err = b.durableBodySlot(ctx, durablestore.ObjectKindJournalPublic, projection.Body)
-			if err != nil {
-				return nil, err
-			}
+			publicBody = projection.Body
 		} else {
 			env.Kind = durablestore.EnvelopeKindRuntimeControl
 			env.RecordID = durableRecordID(k, rec.IdempotencyID())
@@ -584,10 +581,20 @@ func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k
 		env.Kind = durablestore.EnvelopeKindRuntimeControl
 		env.RecordID = durableRecordID(k, rec.IdempotencyID())
 	}
-	if k != kindFence {
-		env.Runtime, err = b.durableBodySlot(ctx, durablestore.ObjectKindJournalRuntime, body)
+	publicOffload, runtimeOffload, err := b.effectiveOffloadPlan(env, publicBody, body, k != kindFence)
+	if err != nil {
+		return nil, err
+	}
+	if publicBody != nil {
+		env.Public, err = b.durableBodySlot(ctx, durablestore.ObjectKindJournalPublic, publicBody, publicOffload)
 		if err != nil {
-			return nil, err
+			return nil, b.mapOffloadErr(rec, len(publicBody), err)
+		}
+	}
+	if k != kindFence {
+		env.Runtime, err = b.durableBodySlot(ctx, durablestore.ObjectKindJournalRuntime, body, runtimeOffload)
+		if err != nil {
+			return nil, b.mapOffloadErr(rec, len(body), err)
 		}
 	}
 	return durablestore.EncodeEnvelope(env)
@@ -595,8 +602,41 @@ func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k
 
 func durableRecordID(k kind, id string) string { return string(k) + "|" + id }
 
-func (b *sessionJournal) durableBodySlot(ctx context.Context, objectKind durablestore.ObjectKind, body []byte) (durablestore.BodySlot, error) {
-	if len(body) <= b.threshold {
+// effectiveOffloadPlan centralizes the compatibility policy between Harness's
+// configurable threshold and the released envelope codec. Each inline body must
+// satisfy the released per-body ceiling. A public event whose two individually
+// valid bodies would exceed the released total frame ceiling offloads the larger
+// body (runtime on a tie), keeping the object count minimal and the public body
+// directly readable when either choice is equivalent.
+func (b *sessionJournal) effectiveOffloadPlan(env durablestore.Envelope, publicBody, runtimeBody []byte, hasRuntime bool) (public, runtime bool, err error) {
+	effectiveThreshold := b.threshold
+	if effectiveThreshold > durablestore.MaxInlineBodyBytes {
+		effectiveThreshold = durablestore.MaxInlineBodyBytes
+	}
+	public = publicBody != nil && len(publicBody) > effectiveThreshold
+	runtime = hasRuntime && len(runtimeBody) > effectiveThreshold
+	if publicBody == nil || public || runtime {
+		return public, runtime, nil
+	}
+	candidate := env
+	candidate.Public = durablestore.BodySlot{Inline: publicBody}
+	candidate.Runtime = durablestore.BodySlot{Inline: runtimeBody}
+	if _, encodeErr := durablestore.EncodeEnvelope(candidate); encodeErr == nil {
+		return false, false, nil
+	} else {
+		var envelopeErr *durablestore.EnvelopeError
+		if !errors.As(encodeErr, &envelopeErr) || envelopeErr.Code != durablestore.EnvelopeErrorTooLarge || envelopeErr.Field != "frame" {
+			return false, false, encodeErr
+		}
+	}
+	if len(runtimeBody) >= len(publicBody) {
+		return false, true, nil
+	}
+	return true, false, nil
+}
+
+func (b *sessionJournal) durableBodySlot(ctx context.Context, objectKind durablestore.ObjectKind, body []byte, offload bool) (durablestore.BodySlot, error) {
+	if !offload {
 		return durablestore.BodySlot{Inline: bytes.Clone(body)}, nil
 	}
 	digest := sha256.Sum256(body)
@@ -616,6 +656,10 @@ func (b *sessionJournal) durableBodySlot(ctx context.Context, objectKind durable
 		return durablestore.BodySlot{}, err
 	}
 	return durablestore.BodySlot{Reference: &reference}, nil
+}
+
+func (b *sessionJournal) mapOffloadErr(rec journal.JournalRecord, length int, err error) error {
+	return &journal.RecordTooLargeError{Subject: b.name, MsgID: rec.IdempotencyID(), Length: length, Cause: err}
 }
 
 // mapAppendErr translates a storage append failure into the journal's error

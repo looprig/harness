@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -173,6 +174,60 @@ func TestOpenBoundsReleasedLayoutMarkerIO(t *testing.T) {
 	}
 	if !kv.getSawDeadline || !kv.putSawDeadline {
 		t.Fatalf("layout marker deadlines = (Get %v, Put %v), want both true", kv.getSawDeadline, kv.putSawDeadline)
+	}
+}
+
+func TestOpenOwnsOneBackendSnapshotAcrossFacadeAndDurableOperations(t *testing.T) {
+	caller := memstore.New()
+	original := *caller
+	store, err := Open(caller, WithOffloadThreshold(1))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+
+	replacement := memstore.New()
+	caller.Ledger = replacement.Ledger
+	caller.Leaser = replacement.Leaser
+	caller.KV = replacement.KV
+	caller.OrderedIndex = replacement.OrderedIndex
+	caller.Blobs = replacement.Blobs
+
+	if store.backend.Ledger != original.Ledger || store.backend.Leaser != original.Leaser ||
+		store.backend.OrderedIndex != original.OrderedIndex || store.backend.Blobs != original.Blobs {
+		t.Fatal("Store backend interfaces changed when the caller mutated its Composite after Open")
+	}
+	bounded, ok := store.backend.KV.(boundedKV)
+	if !ok || bounded.KV != original.KV {
+		t.Fatalf("Store KV snapshot = %T, want bounded wrapper over original KV", store.backend.KV)
+	}
+
+	id := newTestUUID(t)
+	lease, err := store.AcquireLease(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AcquireLease() error = %v", err)
+	}
+	writer, err := store.OpenJournal(context.Background(), id, lease)
+	if err != nil {
+		t.Fatalf("OpenJournal() error = %v", err)
+	}
+	record := commandRecordWithEncodedSize(t, id, 1024)
+	if _, err := writer.Append(context.Background(), record); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	replayer, err := store.OpenInternalRecordReplayer(id, ReplayRequest{FromSeq: 2})
+	if err != nil {
+		t.Fatalf("OpenInternalRecordReplayer() error = %v", err)
+	}
+	cursor, err := replayer.Open(context.Background(), journal.ReplayRequest{})
+	if err != nil {
+		t.Fatalf("RecordReplayer.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = cursor.Close() })
+	if _, seq, err := cursor.Next(context.Background()); err != nil || seq != 2 {
+		t.Fatalf("snapshot replay = (seq %d, err %v), want seq 2 success", seq, err)
+	}
+	if tip, err := replacement.Ledger.Tip(context.Background(), ledgerName(id)); err != nil || tip != 0 {
+		t.Fatalf("replacement ledger tip = (tip %d, err %v), want untouched tip 0", tip, err)
 	}
 }
 

@@ -320,6 +320,8 @@ func (g *ObjectGC) collectLive(ctx context.Context) (map[string]struct{}, error)
 				live[key] = struct{}{}
 			}
 			continue
+		} else if hasReleasedEnvelopeMagic(rec.Payload) {
+			return nil, &GCScanError{Name: g.name, Cause: durableErr}
 		}
 		env, err := decodeEnvelope(rec.Payload)
 		if err != nil {

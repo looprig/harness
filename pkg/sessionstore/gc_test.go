@@ -19,6 +19,7 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/workspacestore"
+	durablestore "github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -27,6 +28,45 @@ import (
 // "sessions/<uuid>/blobs/". It mirrors the writer's key derivation (ledgerName +
 // blobsInfix), so a test never hard-codes the layout the writer owns.
 func gcBlobPrefix(id uuid.UUID) string { return ledgerName(id) + blobsInfix }
+
+func TestGCDurableMagicCorruptionFailsAsReleasedEnvelopeError(t *testing.T) {
+	backend := memstore.New()
+	store, err := Open(backend)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	id := newTestUUID(t)
+	frame, err := durablestore.EncodeEnvelope(durablestore.Envelope{Kind: durablestore.EnvelopeKindOpeningFence, LeaseEpoch: 1})
+	if err != nil {
+		t.Fatalf("EncodeEnvelope() error = %v", err)
+	}
+	frame[4]++ // retain LRJE magic but corrupt the released version byte
+	if err := backend.Ledger.Append(context.Background(), ledgerName(id), 0, frame); err != nil {
+		t.Fatalf("Ledger.Append() error = %v", err)
+	}
+	orphan := gcBlobPrefix(id) + "orphan"
+	if err := backend.Blobs.Put(context.Background(), orphan, bytes.NewReader([]byte("orphan"))); err != nil {
+		t.Fatalf("Blobs.Put(orphan) error = %v", err)
+	}
+	lease, _ := leaseFor(1, id)
+	gc, err := store.OpenObjectGC(id, lease)
+	if err != nil {
+		t.Fatalf("OpenObjectGC() error = %v", err)
+	}
+	_, err = gc.GC(context.Background())
+	var scanErr *GCScanError
+	var envelopeErr *durablestore.EnvelopeError
+	if !errors.As(err, &scanErr) || !errors.As(err, &envelopeErr) || envelopeErr.Code != durablestore.EnvelopeErrorVersion {
+		t.Fatalf("GC() error = %T %v, want GCScanError wrapping released version EnvelopeError", err, err)
+	}
+	reader, err := backend.Blobs.Get(context.Background(), orphan)
+	if err != nil {
+		t.Fatalf("orphan was deleted after corrupt durable frame: %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close retained orphan: %v", err)
+	}
+}
 
 // orphanKey builds a valid, canonical blob key under prefix that is NOT the hash of
 // any real record — a fabricated 64-hex leaf (sha256 of a distinct marker) so a Put

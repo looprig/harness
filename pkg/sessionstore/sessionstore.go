@@ -54,14 +54,21 @@ func (k boundedKV) Delete(ctx context.Context, key string) error {
 	return k.KV.Delete(ioCtx, key)
 }
 
+func (k boundedKV) StoragePaths() []string {
+	if reporter, ok := k.KV.(storage.PathReporter); ok {
+		return reporter.StoragePaths()
+	}
+	return nil
+}
+
 func harnessSessionID(id uuid.UUID) coresessionwire.SessionID {
 	return coresessionwire.SessionID(id.String())
 }
 
 // defaultOffloadThreshold is the payload size, in bytes, above which a record
-// is offloaded to the blob store rather than inlined in the ledger (512 KiB). It sits
-// comfortably under storage's 1 MiB per-record ceiling, leaving headroom for the
-// envelope framing around the payload.
+// is offloaded to the blob store rather than inlined in the ledger (512 KiB).
+// The append path also enforces the released codec's per-body and total-frame
+// limits when callers configure a larger threshold.
 const defaultOffloadThreshold = 512 * 1024
 
 // sessionsPrefix is the leading name segment every session's backend locations share:
@@ -91,10 +98,10 @@ func WithOffloadThreshold(n int) Option {
 	}
 }
 
-// InvalidBackendError reports that Open was handed a nil composite, or a composite
-// with a nil primitive field. Missing names the absent piece ("composite", or one of
-// "Ledger"/"Leaser"/"KV"/"Blobs") so the composition root knows exactly what was not
-// wired. Open fails closed on it rather than dereferencing a nil primitive later.
+// InvalidBackendError preserves Harness's legacy classification for a nil
+// composite or one of its original four primitive fields. The released store
+// subsequently validates the complete five-primitive backend and required
+// capabilities before provider I/O.
 type InvalidBackendError struct {
 	Missing string
 }
@@ -104,9 +111,9 @@ func (e *InvalidBackendError) Error() string {
 }
 
 // Store is the session-scoped facade over a storage backend. It holds the assembled
-// *storage.Composite (whose four primitives it addresses by field — they have
-// colliding method names, so there is no flattened backend interface) plus the
-// resolved Options. Construct it only via Open.
+// *storage.Composite (whose five primitives it addresses by field; their methods
+// overlap, so there is no flattened backend interface) plus the resolved Options.
+// Construct it only via Open.
 type Store struct {
 	backend *storage.Composite
 	durable *durablestore.Store
@@ -114,9 +121,10 @@ type Store struct {
 	opts    Options
 }
 
-// Open validates the backend and returns a Store over it. A nil composite or any nil
-// primitive field is rejected with a typed *InvalidBackendError (fail closed, never a
-// panic). Options are resolved from the 512 KiB default plus any overrides.
+// Open validates the backend and returns a Store over one shallow snapshot of
+// its five primitive interfaces. A nil composite, nil primitive, or missing
+// bounded blob-reader lifecycle is rejected before publication. Options are
+// resolved from the 512 KiB default plus any overrides.
 func Open(b *storage.Composite, opts ...Option) (*Store, error) {
 	if b == nil {
 		return nil, &InvalidBackendError{Missing: "composite"}
@@ -133,11 +141,11 @@ func Open(b *storage.Composite, opts ...Option) (*Store, error) {
 	if b.Blobs == nil {
 		return nil, &InvalidBackendError{Missing: "Blobs"}
 	}
-	durableBackend := *b
-	durableBackend.KV = boundedKV{KV: b.KV}
+	backend := *b
+	backend.KV = boundedKV{KV: b.KV}
 	durable, err := durablestore.Open(
 		context.Background(),
-		&durableBackend,
+		&backend,
 		durablestore.WithLegacySingleTenant(harnessTenantID),
 	)
 	if err != nil {
@@ -148,7 +156,7 @@ func Open(b *storage.Composite, opts ...Option) (*Store, error) {
 	for _, opt := range opts {
 		opt(&resolved)
 	}
-	return &Store{backend: b, durable: durable, project: sessionwire.Project, opts: resolved}, nil
+	return &Store{backend: &backend, durable: durable, project: sessionwire.Project, opts: resolved}, nil
 }
 
 // PersistencePaths returns the canonical local roots reported by the Store's
