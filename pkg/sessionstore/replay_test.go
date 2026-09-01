@@ -73,61 +73,117 @@ func (b *countingGetBlobs) BlobReaderCloseBound() time.Duration {
 	return b.Blobs.(storage.BlobReaderLifecycle).BlobReaderCloseBound()
 }
 
-func TestReplayRejectsOversizedDurableReferenceBeforeBlobGet(t *testing.T) {
-	mem := memstore.New()
-	blobs := &countingGetBlobs{Blobs: mem.Blobs}
-	backend, err := storage.NewCompositeWithOrderedIndex(mem.Ledger, mem.Leaser, mem.KV, blobs, mem.OrderedIndex)
-	if err != nil {
-		t.Fatalf("NewCompositeWithOrderedIndex() error = %v", err)
+// TestReplayDeclaredRuntimeSizeCeilingIsDrivenAtTheThreshold drives
+// resolveDurableBody's declared-size ceiling at exactly maxRuntimeBodyBytes and
+// one byte either side. Only ABOVE the ceiling may replay refuse the body, and
+// that refusal must be classified as a size refusal — never as a
+// *BlobIntegrityError, which asserts corruption or substitution this branch has
+// proved nothing about.
+//
+// The at- and below-ceiling arms prove the ceiling did NOT fire by requiring the
+// object to have been fetched (Blobs.Get called), which is the only observable
+// that separates "admitted, then failed later for another reason" from "refused
+// before the fetch". A `>` weakened to `>=` therefore fails the 16777216 arm.
+func TestReplayDeclaredRuntimeSizeCeilingIsDrivenAtTheThreshold(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		declared    uint64
+		wantRefused bool
+	}{
+		{name: "one below the ceiling is admitted", declared: maxRuntimeBodyBytes - 1},
+		{name: "exactly at the ceiling is admitted", declared: maxRuntimeBodyBytes},
+		{name: "one above the ceiling is refused", declared: maxRuntimeBodyBytes + 1, wantRefused: true},
 	}
-	store, err := Open(backend)
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	id := newTestUUID(t)
-	body := []byte(`{"type":"user_input"}`)
-	digest := sha256.Sum256(body)
-	metadata, err := store.durable.PutObject(context.Background(), durablestore.PutObjectRequest{
-		TenantID: harnessTenantID, SessionID: harnessSessionID(id), Kind: durablestore.ObjectKindJournalRuntime,
-		SizeBytes: uint64(len(body)), SHA256: digest, Body: bytes.NewReader(body),
-	})
-	if err != nil {
-		t.Fatalf("PutObject() error = %v", err)
-	}
-	reference, err := durablestore.BodyReferenceFromObjectMetadata(metadata)
-	if err != nil {
-		t.Fatalf("BodyReferenceFromObjectMetadata() error = %v", err)
-	}
-	reference.SizeBytes = (16 << 20) + 1
-	frame, err := durablestore.EncodeEnvelope(durablestore.Envelope{
-		Kind: durablestore.EnvelopeKindRuntimeControl, RecordID: "command|oversized",
-		Runtime: durablestore.BodySlot{Reference: &reference},
-	})
-	if err != nil {
-		t.Fatalf("EncodeEnvelope() error = %v", err)
-	}
-	if err := backend.Ledger.Append(context.Background(), ledgerName(id), 0, frame); err != nil {
-		t.Fatalf("Ledger.Append() error = %v", err)
-	}
-	blobs.gets.Store(0)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			mem := memstore.New()
+			blobs := &countingGetBlobs{Blobs: mem.Blobs}
+			backend, err := storage.NewCompositeWithOrderedIndex(mem.Ledger, mem.Leaser, mem.KV, blobs, mem.OrderedIndex)
+			if err != nil {
+				t.Fatalf("NewCompositeWithOrderedIndex() error = %v", err)
+			}
+			store, err := Open(backend)
+			if err != nil {
+				t.Fatalf("Open() error = %v", err)
+			}
+			id := newTestUUID(t)
+			body := []byte(`{"type":"user_input"}`)
+			digest := sha256.Sum256(body)
+			metadata, err := store.durable.PutObject(context.Background(), durablestore.PutObjectRequest{
+				TenantID: harnessTenantID, SessionID: harnessSessionID(id), Kind: durablestore.ObjectKindJournalRuntime,
+				SizeBytes: uint64(len(body)), SHA256: digest, Body: bytes.NewReader(body),
+			})
+			if err != nil {
+				t.Fatalf("PutObject() error = %v", err)
+			}
+			reference, err := durablestore.BodyReferenceFromObjectMetadata(metadata)
+			if err != nil {
+				t.Fatalf("BodyReferenceFromObjectMetadata() error = %v", err)
+			}
+			// Only the DECLARED size is forged; the object itself is untouched, so
+			// nothing here is corrupt and an integrity classification would be a
+			// claim the reader cannot demonstrate.
+			reference.SizeBytes = tt.declared
+			frame, err := durablestore.EncodeEnvelope(durablestore.Envelope{
+				Kind: durablestore.EnvelopeKindRuntimeControl, RecordID: "command|sized",
+				Runtime: durablestore.BodySlot{Reference: &reference},
+			})
+			if err != nil {
+				t.Fatalf("EncodeEnvelope() error = %v", err)
+			}
+			if err := backend.Ledger.Append(context.Background(), ledgerName(id), 0, frame); err != nil {
+				t.Fatalf("Ledger.Append() error = %v", err)
+			}
+			blobs.gets.Store(0)
 
-	replayer, err := store.OpenInternalRecordReplayer(id, ReplayRequest{FromSeq: 1})
-	if err != nil {
-		t.Fatalf("OpenInternalRecordReplayer() error = %v", err)
-	}
-	cursor, err := replayer.Open(context.Background(), journal.ReplayRequest{})
-	if err != nil {
-		t.Fatalf("RecordReplayer.Open() error = %v", err)
-	}
-	t.Cleanup(func() { _ = cursor.Close() })
-	_, _, err = cursor.Next(context.Background())
-	var replayErr *ReplayDecodeError
-	var integrityErr *BlobIntegrityError
-	if !errors.As(err, &replayErr) || !errors.As(err, &integrityErr) {
-		t.Fatalf("Next() error = %T %v, want ReplayDecodeError wrapping BlobIntegrityError", err, err)
-	}
-	if got := blobs.gets.Load(); got != 0 {
-		t.Fatalf("Blobs.Get calls = %d, want 0 for oversized declared reference", got)
+			replayer, err := store.OpenInternalRecordReplayer(id, ReplayRequest{FromSeq: 1})
+			if err != nil {
+				t.Fatalf("OpenInternalRecordReplayer() error = %v", err)
+			}
+			cursor, err := replayer.Open(context.Background(), journal.ReplayRequest{})
+			if err != nil {
+				t.Fatalf("RecordReplayer.Open() error = %v", err)
+			}
+			t.Cleanup(func() { _ = cursor.Close() })
+			_, _, err = cursor.Next(context.Background())
+
+			var tooLarge *DurableBodyTooLargeError
+			refused := errors.As(err, &tooLarge)
+			if refused != tt.wantRefused {
+				t.Fatalf("Next() error = %T %v, want declared-size refusal = %v", err, err, tt.wantRefused)
+			}
+			if tt.wantRefused {
+				var replayErr *ReplayDecodeError
+				if !errors.As(err, &replayErr) {
+					t.Fatalf("Next() error = %T %v, want ReplayDecodeError wrapping the size refusal", err, err)
+				}
+				var integrityErr *BlobIntegrityError
+				if errors.As(err, &integrityErr) {
+					t.Fatalf("declared-size refusal classified as *BlobIntegrityError (%v); nothing proved the object corrupt", err)
+				}
+				if tooLarge.DeclaredBytes != tt.declared || tooLarge.MaxBytes != maxRuntimeBodyBytes ||
+					tooLarge.Seq != 1 || tooLarge.ObjectID != reference.Reference.ObjectID {
+					t.Fatalf("DurableBodyTooLargeError = %+v, want seq 1 / object %q / declared %d / max %d",
+						tooLarge, reference.Reference.ObjectID, tt.declared, maxRuntimeBodyBytes)
+				}
+				if got := blobs.gets.Load(); got != 0 {
+					t.Fatalf("Blobs.Get calls = %d, want 0 for a refused oversized declared reference", got)
+				}
+				return
+			}
+			// Admitted: the ceiling did not fire, so the object WAS fetched. The
+			// forged length then fails downstream, which is a different (and
+			// legitimately integrity-shaped) outcome; what matters here is that the
+			// ceiling let it through.
+			if err == nil {
+				t.Fatalf("Next() error = nil, want the forged declared length to fail after the fetch")
+			}
+			if got := blobs.gets.Load(); got == 0 {
+				t.Fatalf("Blobs.Get calls = 0 at declared size %d, want the ceiling to admit it and fetch", tt.declared)
+			}
+		})
 	}
 }
 

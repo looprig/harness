@@ -45,6 +45,10 @@ const blobsInfix = "/blobs/"
 
 var errOpeningAppendMiddleware = errors.New("sessionstore: opening append middleware must delegate exactly once")
 
+// errRuntimeBodyAboveReplayCeiling is the cause carried by the append-time
+// refusal of a runtime body larger than replay's maxRuntimeBodyBytes ceiling.
+var errRuntimeBodyAboveReplayCeiling = errors.New("sessionstore: runtime body exceeds the replay ceiling")
+
 // NilLeaseError reports that a Store constructor (OpenJournal or OpenObjectGC) was
 // handed a nil lease. The lease is a required dependency (DIP): the composition root
 // acquires it via AcquireLease and passes it in. The constructor fails closed with
@@ -580,6 +584,20 @@ func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k
 	default:
 		env.Kind = durablestore.EnvelopeKindRuntimeControl
 		env.RecordID = durableRecordID(k, rec.IdempotencyID())
+	}
+	// Refuse a runtime body the READ side could never admit, before any object is
+	// published. Only event.MarshalEvent caps its own output;
+	// command.MarshalCommand and journal.MarshalGatePreparedRecord do not, so
+	// without this guard an over-ceiling body would be offloaded and appended
+	// successfully and then be permanently unreadable on replay — a fail-closed
+	// but UNRECOVERABLE restore for that session. Fail the append instead, with
+	// the same legacy *journal.RecordTooLargeError classification an oversized
+	// record has always carried.
+	if k != kindFence && len(body) > maxRuntimeBodyBytes {
+		return nil, &journal.RecordTooLargeError{
+			Subject: b.name, MsgID: rec.IdempotencyID(), Length: len(body),
+			Cause: errRuntimeBodyAboveReplayCeiling,
+		}
 	}
 	publicOffload, runtimeOffload, err := b.effectiveOffloadPlan(env, publicBody, body, k != kindFence)
 	if err != nil {

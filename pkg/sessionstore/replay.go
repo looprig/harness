@@ -19,10 +19,25 @@ import (
 	"github.com/looprig/storage"
 )
 
-// maxRuntimeBodyBytes mirrors the fail-closed ceiling enforced by Harness's
-// event and command decoders. Gate-prepared records are composed from those same
-// bounded codecs and smaller validated gate payloads. Keep the boundary test in
-// replay_test.go aligned if a codec ceiling changes.
+// maxRuntimeBodyBytes is the ceiling this package admits for one object-backed
+// runtime body on replay. It equals the fail-closed input ceiling of Harness's
+// event decoder (event.UnmarshalEvent) and command decoder
+// (command.UnmarshalCommand), so a body admitted here can still reach its codec.
+//
+// It is NOT a property the WRITE-side codecs guarantee on their own. Only
+// event.MarshalEvent caps its own output; command.MarshalCommand and
+// journal.MarshalGatePreparedRecord do not (a gate-prepared body is an
+// event-capped "prepared" half PLUS an uncapped payload half PLUS JSON framing,
+// so it exceeds this ceiling by construction). Without a matching write-side
+// refusal a record could therefore be written and offloaded successfully and be
+// permanently unreadable on replay, bricking restore for that session. The
+// refusal lives in sessionJournal.frame, which rejects an over-ceiling runtime
+// body as *journal.RecordTooLargeError before any object is published; that
+// guard, not the codecs, is what makes this ceiling honest.
+//
+// Keep TestRuntimeBodyLimitMatchesHarnessCodecs and
+// TestAppendRefusesRuntimeBodyAboveReplayCeiling aligned if a codec ceiling
+// changes.
 const maxRuntimeBodyBytes = 16 << 20
 
 var errDurableBodyLength = errors.New("sessionstore: durable body length does not match reference")
@@ -57,6 +72,33 @@ func (e *BlobIntegrityError) Error() string {
 	return "sessionstore: offloaded record at seq " + strconv.FormatUint(e.Seq, 10) +
 		" (blob " + strconv.Quote(e.Key) + ") is corrupt: fetched bytes hash " + strconv.Quote(e.Got) +
 		", pointer names " + strconv.Quote(e.Want)
+}
+
+// DurableBodyTooLargeError reports an object-backed runtime body whose DECLARED
+// size exceeds maxRuntimeBodyBytes, the ceiling replay can admit. It is a SIZE
+// refusal, not an integrity finding: nothing is known to be corrupt or
+// substituted, and the object may hash exactly as its reference names. It is
+// deliberately NOT a *BlobIntegrityError, because a caller matching on that type
+// would conclude tampering — and might raise a security response — for a
+// faithfully written record. Replay fails closed on it (the body is never
+// fetched, so an oversized declared size cannot drive a large read), and it
+// carries the record's ledger sequence, the object id, the declared size, and
+// the ceiling that refused it.
+//
+// The write side refuses to create such a record (see sessionJournal.frame), so
+// this is reachable only for a record written by some other producer or by an
+// older writer predating that guard.
+type DurableBodyTooLargeError struct {
+	Seq           uint64
+	ObjectID      string
+	DeclaredBytes uint64
+	MaxBytes      int
+}
+
+func (e *DurableBodyTooLargeError) Error() string {
+	return "sessionstore: durable runtime body at seq " + strconv.FormatUint(e.Seq, 10) +
+		" (object " + strconv.Quote(e.ObjectID) + ") declares " + strconv.FormatUint(e.DeclaredBytes, 10) +
+		" bytes, above the " + strconv.Itoa(e.MaxBytes) + " byte replay ceiling"
 }
 
 // BlobPointerIDMismatchError reports an offloaded record whose OUTER blobptr
@@ -370,11 +412,16 @@ func (b *baseCursor) resolveDurableBody(ctx context.Context, slot durablestore.B
 	if slot.Reference == nil {
 		return nil, &EnvelopeError{Reason: "missing durable runtime body"}
 	}
+	// A declared size above the ceiling is refused BEFORE any fetch, so an
+	// oversized declaration can never drive a large read. It is classified as a
+	// size refusal, never as an integrity finding: this branch has proved nothing
+	// about the object's content.
 	if slot.Reference.SizeBytes > maxRuntimeBodyBytes {
-		return nil, &BlobIntegrityError{
-			Seq: seq, Key: slot.Reference.Reference.ObjectID,
-			Want: "size <= " + strconv.Itoa(maxRuntimeBodyBytes),
-			Got:  "declared size " + strconv.FormatUint(slot.Reference.SizeBytes, 10),
+		return nil, &DurableBodyTooLargeError{
+			Seq:           seq,
+			ObjectID:      slot.Reference.Reference.ObjectID,
+			DeclaredBytes: slot.Reference.SizeBytes,
+			MaxBytes:      maxRuntimeBodyBytes,
 		}
 	}
 	metadata, err := slot.Reference.ObjectMetadata()
