@@ -1,6 +1,7 @@
 package sessionstore
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -37,6 +38,34 @@ type reportingKV struct {
 type reportingBlobs struct {
 	storage.Blobs
 	pathReporter
+}
+
+var errOpenKVDeadlineRequired = errors.New("sessionstore test: Open KV call requires a deadline")
+
+type openDeadlineKV struct {
+	storage.KV
+	getSawDeadline bool
+	putSawDeadline bool
+}
+
+func (k *openDeadlineKV) Get(ctx context.Context, key string) ([]byte, uint64, error) {
+	deadline, ok := ctx.Deadline()
+	remaining := time.Until(deadline)
+	if !ok || ctx.Done() == nil || remaining <= 0 || remaining > openTimeout {
+		return nil, 0, errOpenKVDeadlineRequired
+	}
+	k.getSawDeadline = true
+	return k.KV.Get(ctx, key)
+}
+
+func (k *openDeadlineKV) Put(ctx context.Context, key string, expectedRevision uint64, value []byte) (uint64, error) {
+	deadline, ok := ctx.Deadline()
+	remaining := time.Until(deadline)
+	if !ok || ctx.Done() == nil || remaining <= 0 || remaining > openTimeout {
+		return 0, errOpenKVDeadlineRequired
+	}
+	k.putSawDeadline = true
+	return k.KV.Put(ctx, key, expectedRevision, value)
 }
 
 func (b reportingBlobs) BlobReaderCloseBound() time.Duration {
@@ -118,6 +147,32 @@ func TestOpen(t *testing.T) {
 				t.Fatal("Open() store = nil, want non-nil on success")
 			}
 		})
+	}
+}
+
+func TestOpenBoundsReleasedLayoutMarkerIO(t *testing.T) {
+	t.Parallel()
+	base := memstore.New()
+	kv := &openDeadlineKV{KV: base.KV}
+	backend, err := storage.NewCompositeWithOrderedIndex(
+		base.Ledger,
+		base.Leaser,
+		kv,
+		base.Blobs,
+		base.OrderedIndex,
+	)
+	if err != nil {
+		t.Fatalf("NewCompositeWithOrderedIndex() error = %v", err)
+	}
+	store, err := Open(backend)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if store == nil {
+		t.Fatal("Open() store = nil")
+	}
+	if !kv.getSawDeadline || !kv.putSawDeadline {
+		t.Fatalf("layout marker deadlines = (Get %v, Put %v), want both true", kv.getSawDeadline, kv.putSawDeadline)
 	}
 }
 

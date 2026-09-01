@@ -26,6 +26,8 @@ import (
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
 	"github.com/looprig/inference/stream"
+	"github.com/looprig/storage"
+	"github.com/looprig/storage/memstore"
 )
 
 const processIntegrationIdentity = "process-integration-owner-v1"
@@ -480,12 +482,31 @@ func TestProcessServicesIntegrationNewRestoreAndLease(t *testing.T) {
 		t.Fatalf("loop.Define() error = %v", err)
 	}
 	sessionDiskRoot := t.TempDir()
+	// Keep the durable structured primitives on disk while supplying the
+	// released SessionStore contract with an honest bounded-reader blob
+	// provider. Raw fsstore.Blobs deliberately lacks BlobReaderLifecycle and is
+	// rejected by the facade's dedicated compatibility regression.
+	sessionBlobs := memstore.New().Blobs
+	sessionBackend := func(disk *fsstore.Store) *storage.Composite {
+		diskBackend := disk.Backend()
+		backend, composeErr := storage.NewCompositeWithOrderedIndex(
+			diskBackend.Ledger,
+			diskBackend.Leaser,
+			diskBackend.KV,
+			sessionBlobs,
+			diskBackend.OrderedIndex,
+		)
+		if composeErr != nil {
+			t.Fatalf("compose bounded session backend: %v", composeErr)
+		}
+		return backend
+	}
 	sessionDisk, err := fsstore.Open(fsstore.Options{Root: sessionDiskRoot})
 	if err != nil {
 		t.Fatalf("fsstore.Open(session) error = %v", err)
 	}
 	t.Cleanup(func() { _ = sessionDisk.Close() })
-	sessionStore, err := sessionstore.Open(sessionDisk.Backend())
+	sessionStore, err := sessionstore.Open(sessionBackend(sessionDisk))
 	if err != nil {
 		t.Fatalf("sessionstore.Open() error = %v", err)
 	}
@@ -609,7 +630,7 @@ func TestProcessServicesIntegrationNewRestoreAndLease(t *testing.T) {
 		t.Fatalf("reopen session fsstore: %v", err)
 	}
 	t.Cleanup(func() { _ = sessionDisk2.Close() })
-	sessionStore2, err := sessionstore.Open(sessionDisk2.Backend())
+	sessionStore2, err := sessionstore.Open(sessionBackend(sessionDisk2))
 	if err != nil {
 		t.Fatalf("reopen sessionstore: %v", err)
 	}

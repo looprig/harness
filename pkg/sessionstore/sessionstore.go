@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"time"
 
 	coresessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
@@ -14,6 +15,44 @@ import (
 )
 
 const harnessTenantID coresessionwire.TenantID = "local"
+
+// openTimeout bounds the released SessionStore layout-marker read/create. Open
+// retains its context-free compatibility facade, so it owns the same short I/O
+// deadline used by a single Harness append rather than passing an unbounded
+// background context into a provider.
+const openTimeout = 5 * time.Second
+
+// boundedKV applies Harness's provider-I/O bound at the KV boundary. The
+// released Store derives its lifecycle context from the context passed to Open,
+// so bounding that parent would also terminate the returned Store when the
+// layout initialization deadline expires.
+type boundedKV struct {
+	storage.KV
+}
+
+func (k boundedKV) Get(ctx context.Context, key string) ([]byte, uint64, error) {
+	ioCtx, cancel := context.WithTimeout(ctx, openTimeout)
+	defer cancel()
+	return k.KV.Get(ioCtx, key)
+}
+
+func (k boundedKV) Put(ctx context.Context, key string, expectedRevision uint64, value []byte) (uint64, error) {
+	ioCtx, cancel := context.WithTimeout(ctx, openTimeout)
+	defer cancel()
+	return k.KV.Put(ioCtx, key, expectedRevision, value)
+}
+
+func (k boundedKV) Keys(ctx context.Context, prefix string) ([]string, error) {
+	ioCtx, cancel := context.WithTimeout(ctx, openTimeout)
+	defer cancel()
+	return k.KV.Keys(ioCtx, prefix)
+}
+
+func (k boundedKV) Delete(ctx context.Context, key string) error {
+	ioCtx, cancel := context.WithTimeout(ctx, openTimeout)
+	defer cancel()
+	return k.KV.Delete(ioCtx, key)
+}
 
 func harnessSessionID(id uuid.UUID) coresessionwire.SessionID {
 	return coresessionwire.SessionID(id.String())
@@ -94,9 +133,11 @@ func Open(b *storage.Composite, opts ...Option) (*Store, error) {
 	if b.Blobs == nil {
 		return nil, &InvalidBackendError{Missing: "Blobs"}
 	}
+	durableBackend := *b
+	durableBackend.KV = boundedKV{KV: b.KV}
 	durable, err := durablestore.Open(
 		context.Background(),
-		b,
+		&durableBackend,
 		durablestore.WithLegacySingleTenant(harnessTenantID),
 	)
 	if err != nil {
