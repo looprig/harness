@@ -131,7 +131,7 @@ func lifecycleStore(t *testing.T) (*sessionstore.Store, *lifecycleRecordingLease
 	t.Helper()
 	backend := memstore.New()
 	leaser := &lifecycleRecordingLeaser{inner: backend.Leaser}
-	composite, err := storage.NewComposite(backend.Ledger, leaser, backend.KV, backend.Blobs)
+	composite, err := storage.NewCompositeWithOrderedIndex(backend.Ledger, leaser, backend.KV, backend.Blobs, backend.OrderedIndex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestNewSessionFailureStagesReleaseAcquiredResourcesInReverse(t *testing.T) 
 			name: "journal fence after session lease",
 			build: func(t *testing.T, sessionLeaser *lifecycleRecordingLeaser, _ func(string)) (*Rig, LifecycleErrorKind) {
 				backend := memstore.New()
-				composite, err := storage.NewComposite(lifecycleFailLedger{Ledger: backend.Ledger, err: errors.New("journal")}, sessionLeaser, backend.KV, backend.Blobs)
+				composite, err := storage.NewCompositeWithOrderedIndex(lifecycleFailLedger{Ledger: backend.Ledger, err: errors.New("journal")}, sessionLeaser, backend.KV, backend.Blobs, backend.OrderedIndex)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -284,7 +284,7 @@ func TestMapRestoreErrorPreservesExistingTaxonomy(t *testing.T) {
 func lifecycleStoreWithLeaser(t *testing.T, leaser storage.Leaser) *sessionstore.Store {
 	t.Helper()
 	backend := memstore.New()
-	composite, err := storage.NewComposite(backend.Ledger, leaser, backend.KV, backend.Blobs)
+	composite, err := storage.NewCompositeWithOrderedIndex(backend.Ledger, leaser, backend.KV, backend.Blobs, backend.OrderedIndex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -596,7 +596,7 @@ func TestNewSessionAppendFailuresAbortBeforeLeaseRelease(t *testing.T) {
 				return func() { orderMu.Lock(); releases = append(releases, label); orderMu.Unlock() }
 			}
 			sessionLeaser := &lifecycleRecordingLeaser{inner: backend.Leaser, onRelease: recordRelease("session")}
-			composite, err := storage.NewComposite(ledger, sessionLeaser, backend.KV, backend.Blobs)
+			composite, err := storage.NewCompositeWithOrderedIndex(ledger, sessionLeaser, backend.KV, backend.Blobs, backend.OrderedIndex)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -845,7 +845,7 @@ func TestRestoreDoneAppendFailureAbortsBeforeReverseLeaseRelease(t *testing.T) {
 		return func() { orderMu.Lock(); releases = append(releases, label); orderMu.Unlock() }
 	}
 	sessionLeaser := &lifecycleRecordingLeaser{inner: backend.Leaser, onRelease: recordRelease("session"), rejectCanceled: true}
-	composite, err := storage.NewComposite(ledger, sessionLeaser, backend.KV, backend.Blobs)
+	composite, err := storage.NewCompositeWithOrderedIndex(ledger, sessionLeaser, backend.KV, backend.Blobs, backend.OrderedIndex)
 	if err != nil {
 		t.Fatal(err)
 	}

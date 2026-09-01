@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -491,10 +492,11 @@ func TestReplayBlobResolution(t *testing.T) {
 			t.Parallel()
 			mem := memstore.New()
 			backend := &storage.Composite{
-				Ledger: mem.Ledger,
-				Leaser: mem.Leaser,
-				KV:     mem.KV,
-				Blobs:  &corruptGetBlobs{inner: mem.Blobs},
+				Ledger:       mem.Ledger,
+				Leaser:       mem.Leaser,
+				KV:           mem.KV,
+				OrderedIndex: mem.OrderedIndex,
+				Blobs:        &corruptGetBlobs{inner: mem.Blobs},
 			}
 			fx := buildFixture(t, backend)
 			tt.tamper(t, fx, backend)
@@ -764,7 +766,11 @@ func (b *corruptGetBlobs) List(ctx context.Context, prefix string) ([]string, er
 	return b.inner.List(ctx, prefix)
 }
 
-var _ storage.Blobs = (*corruptGetBlobs)(nil)
+func (b *corruptGetBlobs) BlobReaderCloseBound() time.Duration {
+	return b.inner.(storage.BlobReaderLifecycle).BlobReaderCloseBound()
+}
+
+var _ storage.BlobReaderLifecycle = (*corruptGetBlobs)(nil)
 
 // --- gate prepared record replay tests -----------------------------------
 

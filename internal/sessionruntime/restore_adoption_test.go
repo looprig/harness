@@ -777,7 +777,7 @@ func TestRestoreAdoptionLeaseLost(t *testing.T) {
 	// yet loses its lease after the opening fence + RestoreStarted, before the adoption append.
 	leaser := &leaseCapturingLeaser{inner: backend.Leaser}
 	ledger := &leaseLosingLedger{inner: backend.Ledger, leaser: leaser, loseAfter: 2}
-	wrapped, err := storage.NewComposite(ledger, leaser, backend.KV, backend.Blobs)
+	wrapped, err := storage.NewCompositeWithOrderedIndex(ledger, leaser, backend.KV, backend.Blobs, backend.OrderedIndex)
 	if err != nil {
 		t.Fatalf("storage.NewComposite: %v", err)
 	}

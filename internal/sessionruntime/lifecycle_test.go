@@ -81,7 +81,7 @@ func newRecordingStore(t *testing.T) (*sessionstore.Store, *recordingLeaser) {
 	t.Helper()
 	base := memstore.New()
 	rl := &recordingLeaser{inner: base.Leaser}
-	composite, err := storage.NewComposite(base.Ledger, rl, base.KV, base.Blobs)
+	composite, err := storage.NewCompositeWithOrderedIndex(base.Ledger, rl, base.KV, base.Blobs, base.OrderedIndex)
 	if err != nil {
 		t.Fatalf("NewComposite: %v", err)
 	}

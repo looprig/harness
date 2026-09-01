@@ -708,7 +708,7 @@ func runRestoreWaiterRepairAppendFailureIsFatalAndRetryable(t *testing.T) {
 	base := memstore.New()
 	sentinel := errors.New("injected repaired waiter append failure")
 	ledger := &failNthLedger{Ledger: base.Ledger}
-	backend, err := storage.NewComposite(ledger, base.Leaser, base.KV, base.Blobs)
+	backend, err := storage.NewCompositeWithOrderedIndex(ledger, base.Leaser, base.KV, base.Blobs, base.OrderedIndex)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4,16 +4,18 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"io"
 	"sync"
 	"time"
 
+	coresessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
+	harnesssessionwire "github.com/looprig/harness/pkg/sessionwire"
+	durablestore "github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 )
 
@@ -66,9 +68,10 @@ type sessionJournal struct {
 	id        uuid.UUID      // the session this journal owns (for fence + error context)
 	lease     journal.Lease  // single-writer ownership token (injected; never acquired here)
 	ledger    storage.Ledger // the append-only record log this journal is the sole writer of
-	blobs     storage.Blobs  // content-addressed offload store for over-threshold frames
-	name      string         // the bound ledger name (ledgerName(id))
-	threshold int            // frame size (bytes) above which a record is offloaded
+	durable   *durablestore.Store
+	project   func(coresessionwire.TenantID, coresessionwire.SessionID, any) (harnesssessionwire.Projection, error)
+	name      string // the bound ledger name (ledgerName(id))
+	threshold int    // frame size (bytes) above which a record is offloaded
 
 	// mu serializes Append and guards ready + trackedTip. The serializer is
 	// single-writer by contract; the mutex makes that safe even if a caller fans
@@ -152,7 +155,8 @@ func (s *Store) OpenJournalWithOpeningAppend(
 		id:                  id,
 		lease:               lease,
 		ledger:              s.backend.Ledger,
-		blobs:               s.backend.Blobs,
+		durable:             s.durable,
+		project:             s.project,
 		name:                name,
 		threshold:           s.opts.OffloadThreshold,
 		trackedTip:          tip,
@@ -256,7 +260,7 @@ func (s *Store) OpenJournalWithOpeningAppend(
 	// so the walk is skipped entirely rather than performed for no reason.
 	if tip > 0 {
 		hydrateCtx, hydrateCancel := context.WithTimeout(ctx, hydrateTimeout)
-		idx, transitions, hydrateErr := hydrateJournalIndexes(hydrateCtx, s.backend.Ledger, s.backend.Blobs, name)
+		idx, transitions, hydrateErr := hydrateJournalIndexes(hydrateCtx, s, id, name)
 		hydrateCancel()
 		if hydrateErr != nil {
 			// Accepted trade-off of hydrating after the fence: the fence above has
@@ -291,14 +295,14 @@ func (s *Store) OpenJournalWithOpeningAppend(
 	return j, nil
 }
 
-func hydrateJournalIndexes(ctx context.Context, ledger storage.Ledger, blobs storage.Blobs, name string) (*journal.IdempotencyIndex, map[uuid.UUID]deliveryTransition, error) {
+func hydrateJournalIndexes(ctx context.Context, store *Store, id uuid.UUID, name string) (*journal.IdempotencyIndex, map[uuid.UUID]deliveryTransition, error) {
 	idx := journal.NewIdempotencyIndex()
 	transitions := make(map[uuid.UUID]deliveryTransition)
-	cur, err := ledger.Read(ctx, name, 1)
+	cur, err := store.backend.Ledger.Read(ctx, name, 1)
 	if err != nil {
 		return nil, nil, &ReplayReadError{Name: name, Cause: err}
 	}
-	base := &baseCursor{name: name, blobs: blobs, cur: cur}
+	base := &baseCursor{name: name, blobs: store.backend.Blobs, durable: store.durable, sessionID: id, cur: cur}
 	defer func() { _ = base.close() }()
 	for {
 		r, nextErr := base.next(ctx)
@@ -451,7 +455,7 @@ func (b *sessionJournal) appendChecked(ctx context.Context, rec journal.JournalR
 		pendingTransition = pending
 	}
 
-	seq, err := b.writeLocked(ctx, rec)
+	seq, err := b.writeEncodedLocked(ctx, rec, k, body)
 	if err != nil {
 		return journal.AppendResult{}, err
 	}
@@ -524,10 +528,18 @@ func (b *sessionJournal) leaseHeld() bool {
 // the tracked tip via storage.AppendDefinite, and on success advances the tip and
 // returns the new sequence. On any failure the tip is left unadvanced (fail closed).
 func (b *sessionJournal) writeLocked(ctx context.Context, rec journal.JournalRecord) (uint64, error) {
+	k, body, err := b.encodeRecordBody(rec)
+	if err != nil {
+		return 0, err
+	}
+	return b.writeEncodedLocked(ctx, rec, k, body)
+}
+
+func (b *sessionJournal) writeEncodedLocked(ctx context.Context, rec journal.JournalRecord, k kind, body []byte) (uint64, error) {
 	childCtx, cancel := context.WithTimeout(ctx, appendTimeout)
 	defer cancel()
 
-	recordBytes, err := b.frame(childCtx, rec)
+	recordBytes, err := b.frame(childCtx, rec, k, body)
 	if err != nil {
 		return 0, err
 	}
@@ -538,53 +550,72 @@ func (b *sessionJournal) writeLocked(ctx context.Context, rec journal.JournalRec
 	return b.trackedTip, nil
 }
 
-// frame encodes rec into the bytes to append: its codec body wrapped in a versioned
-// envelope, and — if that envelope exceeds the offload threshold — replaced by a
-// small blobptr envelope whose real bytes were first written to Blobs
-// (blob-durable-before-pointer). It runs under mu (writeLocked holds it), so the
-// upload is serialized with the append that references it.
-func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord) ([]byte, error) {
-	k, body, err := b.encodeRecordBody(rec)
-	if err != nil {
-		return nil, err
+// frame maps one already-encoded Harness record into SessionStore's released
+// envelope. Public events carry the native replay body and one independently
+// projected canonical public body; private records carry only their native body.
+// Each over-threshold body is persisted through SessionStore's verified immutable
+// object API before the envelope reference is appended. It runs under mu, so object
+// publication remains serialized with the append that makes it reachable.
+func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k kind, body []byte) ([]byte, error) {
+	env := durablestore.Envelope{}
+	var err error
+	switch k {
+	case kindFence:
+		env.Kind = durablestore.EnvelopeKindOpeningFence
+		env.LeaseEpoch = rec.(journal.FenceRecord).Fence().Epoch
+	case kindEvent:
+		eventRecord := rec.(journal.EventRecord)
+		if eventRecord.Event().Visibility() == event.Public {
+			projection, projectErr := b.project(harnessTenantID, harnessSessionID(b.id), eventRecord.Event())
+			if projectErr != nil {
+				return nil, &journal.MarshalRecordError{Subject: b.name, Cause: projectErr}
+			}
+			env.Kind = durablestore.EnvelopeKindPublicEvent
+			env.EventID = projection.EventID
+			env.Public, err = b.durableBodySlot(ctx, durablestore.ObjectKindJournalPublic, projection.Body)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			env.Kind = durablestore.EnvelopeKindRuntimeControl
+			env.RecordID = durableRecordID(k, rec.IdempotencyID())
+		}
+	default:
+		env.Kind = durablestore.EnvelopeKindRuntimeControl
+		env.RecordID = durableRecordID(k, rec.IdempotencyID())
 	}
-	env, err := encodeEnvelope(envelope{V: envelopeVersion, Kind: string(k), ID: rec.IdempotencyID(), Body: body})
-	if err != nil {
-		return nil, err
-	}
-	if len(env) <= b.threshold {
-		return env, nil
-	}
-	return b.offload(ctx, rec, env)
-}
-
-// offload writes an over-threshold frame's full bytes to Blobs under their
-// content-addressed key BEFORE returning the small blobptr envelope that stands in
-// for it in the ledger — so a pointer can never reference a blob that is not yet
-// durable. On any Blobs failure it fails closed with a typed *journal.RecordTooLargeError
-// rather than inlining an oversized record (which would breach the 1 MiB ledger floor).
-func (b *sessionJournal) offload(ctx context.Context, rec journal.JournalRecord, env []byte) ([]byte, error) {
-	sum := sha256.Sum256(env)
-	shahex := hex.EncodeToString(sum[:])
-	// Reuse the already-validated ledger name as the blob-key prefix so the key can
-	// never diverge from the session's canonical name derivation.
-	key := b.name + blobsInfix + shahex
-
-	// Blob durable first: no dangling pointer.
-	if err := b.blobs.Put(ctx, key, bytes.NewReader(env)); err != nil {
-		return nil, &journal.RecordTooLargeError{
-			Subject: b.name,
-			MsgID:   rec.IdempotencyID(),
-			Length:  len(env),
-			Cause:   err,
+	if k != kindFence {
+		env.Runtime, err = b.durableBodySlot(ctx, durablestore.ObjectKindJournalRuntime, body)
+		if err != nil {
+			return nil, err
 		}
 	}
+	return durablestore.EncodeEnvelope(env)
+}
 
-	ptr, err := encodeBlobPointer(blobPointer{Key: key, Size: int64(len(env)), SHA256: shahex})
-	if err != nil {
-		return nil, err
+func durableRecordID(k kind, id string) string { return string(k) + "|" + id }
+
+func (b *sessionJournal) durableBodySlot(ctx context.Context, objectKind durablestore.ObjectKind, body []byte) (durablestore.BodySlot, error) {
+	if len(body) <= b.threshold {
+		return durablestore.BodySlot{Inline: bytes.Clone(body)}, nil
 	}
-	return encodeEnvelope(envelope{V: envelopeVersion, Kind: string(kindBlobPtr), ID: rec.IdempotencyID(), Body: ptr})
+	digest := sha256.Sum256(body)
+	metadata, err := b.durable.PutObject(ctx, durablestore.PutObjectRequest{
+		TenantID:  harnessTenantID,
+		SessionID: harnessSessionID(b.id),
+		Kind:      objectKind,
+		SizeBytes: uint64(len(body)),
+		SHA256:    digest,
+		Body:      bytes.NewReader(body),
+	})
+	if err != nil {
+		return durablestore.BodySlot{}, err
+	}
+	reference, err := durablestore.BodyReferenceFromObjectMetadata(metadata)
+	if err != nil {
+		return durablestore.BodySlot{}, err
+	}
+	return durablestore.BodySlot{Reference: &reference}, nil
 }
 
 // mapAppendErr translates a storage append failure into the journal's error

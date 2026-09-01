@@ -1,13 +1,23 @@
 package sessionstore
 
 import (
+	"context"
 	"errors"
 	"strconv"
 
+	coresessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/internal/pathutil"
+	"github.com/looprig/harness/pkg/sessionwire"
+	durablestore "github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 )
+
+const harnessTenantID coresessionwire.TenantID = "local"
+
+func harnessSessionID(id uuid.UUID) coresessionwire.SessionID {
+	return coresessionwire.SessionID(id.String())
+}
 
 // defaultOffloadThreshold is the payload size, in bytes, above which a record
 // is offloaded to the blob store rather than inlined in the ledger (512 KiB). It sits
@@ -60,6 +70,8 @@ func (e *InvalidBackendError) Error() string {
 // resolved Options. Construct it only via Open.
 type Store struct {
 	backend *storage.Composite
+	durable *durablestore.Store
+	project func(coresessionwire.TenantID, coresessionwire.SessionID, any) (sessionwire.Projection, error)
 	opts    Options
 }
 
@@ -82,12 +94,20 @@ func Open(b *storage.Composite, opts ...Option) (*Store, error) {
 	if b.Blobs == nil {
 		return nil, &InvalidBackendError{Missing: "Blobs"}
 	}
+	durable, err := durablestore.Open(
+		context.Background(),
+		b,
+		durablestore.WithLegacySingleTenant(harnessTenantID),
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	resolved := Options{OffloadThreshold: defaultOffloadThreshold}
 	for _, opt := range opts {
 		opt(&resolved)
 	}
-	return &Store{backend: b, opts: resolved}, nil
+	return &Store{backend: b, durable: durable, project: sessionwire.Project, opts: resolved}, nil
 }
 
 // PersistencePaths returns the canonical local roots reported by the Store's

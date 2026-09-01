@@ -74,10 +74,11 @@ func TestOpenJournalWithOpeningAppendFailureFinishesAndDoesNotExposeJournal(t *t
 	mem := memstore.New()
 	failing := &openingFailLedger{Ledger: mem.Ledger, err: appendFailure}
 	composite := &storage.Composite{
-		Ledger: failing,
-		Leaser: mem.Leaser,
-		KV:     mem.KV,
-		Blobs:  mem.Blobs,
+		Ledger:       failing,
+		Leaser:       mem.Leaser,
+		KV:           mem.KV,
+		OrderedIndex: mem.OrderedIndex,
+		Blobs:        mem.Blobs,
 	}
 	store, err := Open(composite)
 	if err != nil {

@@ -44,7 +44,7 @@ func (*gateHostStubLLM) Stream(context.Context, inference.Request) (*stream.Stre
 func gateHostSession(t *testing.T) (session.SessionController, session.GateHost) {
 	t.Helper()
 	backend := memstore.New()
-	composite, err := storage.NewComposite(backend.Ledger, backend.Leaser, backend.KV, backend.Blobs)
+	composite, err := storage.NewCompositeWithOrderedIndex(backend.Ledger, backend.Leaser, backend.KV, backend.Blobs, backend.OrderedIndex)
 	if err != nil {
 		t.Fatal(err)
 	}

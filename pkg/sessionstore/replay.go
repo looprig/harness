@@ -1,18 +1,21 @@
 package sessionstore
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"io"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
+	durablestore "github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 )
 
@@ -133,6 +136,8 @@ func (s *Store) OpenEventReplayer(id uuid.UUID, req ReplayRequest) (journal.Even
 	return &eventReplayer{
 		ledger:     s.backend.Ledger,
 		blobs:      s.backend.Blobs,
+		durable:    s.durable,
+		sessionID:  id,
 		name:       name,
 		fromSeq:    req.FromSeq,
 		publicOnly: true,
@@ -146,7 +151,7 @@ func (s *Store) OpenInternalEventReplayer(id uuid.UUID, req ReplayRequest) (jour
 	if err != nil {
 		return nil, err
 	}
-	return &eventReplayer{ledger: s.backend.Ledger, blobs: s.backend.Blobs, name: name, fromSeq: req.FromSeq}, nil
+	return &eventReplayer{ledger: s.backend.Ledger, blobs: s.backend.Blobs, durable: s.durable, sessionID: id, name: name, fromSeq: req.FromSeq}, nil
 }
 
 // OpenInternalRecordReplayer returns the privileged full read side used by restore
@@ -165,6 +170,7 @@ func (s *Store) OpenInternalRecordReplayer(id uuid.UUID, req ReplayRequest) (jou
 		id:      id,
 		ledger:  s.backend.Ledger,
 		blobs:   s.backend.Blobs,
+		durable: s.durable,
 		name:    name,
 		fromSeq: req.FromSeq,
 	}, nil
@@ -176,6 +182,8 @@ func (s *Store) OpenInternalRecordReplayer(id uuid.UUID, req ReplayRequest) (jou
 type eventReplayer struct {
 	ledger     storage.Ledger
 	blobs      storage.Blobs
+	durable    *durablestore.Store
+	sessionID  uuid.UUID
 	name       string
 	fromSeq    uint64
 	publicOnly bool
@@ -204,7 +212,7 @@ func (r *eventReplayer) Open(ctx context.Context, req journal.ReplayRequest) (jo
 	if err != nil {
 		return nil, &ReplayReadError{Name: r.name, Cause: err}
 	}
-	return &eventCursor{loopID: req.LoopID, publicOnly: r.publicOnly, base: baseCursor{name: r.name, blobs: r.blobs, cur: cur}}, nil
+	return &eventCursor{loopID: req.LoopID, publicOnly: r.publicOnly, base: baseCursor{name: r.name, blobs: r.blobs, durable: r.durable, sessionID: r.sessionID, cur: cur}}, nil
 }
 
 // recordReplayer is the concrete journal.RecordReplayer over one session's storage
@@ -215,6 +223,7 @@ type recordReplayer struct {
 	id      uuid.UUID
 	ledger  storage.Ledger
 	blobs   storage.Blobs
+	durable *durablestore.Store
 	name    string
 	fromSeq uint64
 }
@@ -231,7 +240,7 @@ func (r *recordReplayer) Open(ctx context.Context, req journal.ReplayRequest) (j
 	if err != nil {
 		return nil, &ReplayReadError{Name: r.name, Cause: err}
 	}
-	return &recordCursor{id: r.id, base: baseCursor{name: r.name, blobs: r.blobs, cur: cur}}, nil
+	return &recordCursor{id: r.id, base: baseCursor{name: r.name, blobs: r.blobs, durable: r.durable, sessionID: r.id, cur: cur}}, nil
 }
 
 // resolved is one fully-resolved ledger record: its real (post-blobptr-resolution)
@@ -251,10 +260,10 @@ type resolved struct {
 }
 
 // baseCursor is the shared read + resolve machinery both cursors wrap. It walks one
-// storage ledger cursor, decodes each envelope, and resolves a blobptr transparently
-// (fetch + sha256-verify + decode the offloaded envelope) so the caller only ever
-// sees a real record kind. A cursor is a single-reader handle — concurrent next calls
-// are not supported.
+// storage ledger cursor, decodes released SessionStore envelopes (with a legacy-frame
+// fallback), and resolves object-backed native bodies through SessionStore's verified
+// object API. A cursor is a single-reader handle — concurrent next calls are not
+// supported.
 //
 // mu guards baseCursor's OWN fields (cur, closed): it makes Close idempotent and
 // guarantees a next after Close observes closed and returns io.EOF rather than racing
@@ -266,8 +275,10 @@ type resolved struct {
 // tears down a live subscription must provide its own Next/Close safety and must not
 // rely on serialization this layer does not give.
 type baseCursor struct {
-	name  string
-	blobs storage.Blobs
+	name      string
+	blobs     storage.Blobs
+	durable   *durablestore.Store
+	sessionID uuid.UUID
 
 	mu     sync.Mutex
 	cur    storage.Cursor
@@ -294,6 +305,9 @@ func (b *baseCursor) next(ctx context.Context) (resolved, error) {
 		return resolved{}, &ReplayReadError{Name: b.name, Cause: err}
 	}
 
+	if durable, durableErr := durablestore.DecodeEnvelope(rec.Payload); durableErr == nil {
+		return b.resolveDurable(ctx, durable, rec.Seq)
+	}
 	env, err := decodeEnvelope(rec.Payload)
 	if err != nil {
 		return resolved{}, &ReplayDecodeError{Seq: rec.Seq, Cause: err}
@@ -302,6 +316,83 @@ func (b *baseCursor) next(ctx context.Context) (resolved, error) {
 		return b.resolveBlob(ctx, env, rec.Seq)
 	}
 	return resolved{kind: kind(env.Kind), body: env.Body, seq: rec.Seq, id: env.ID}, nil
+}
+
+func (b *baseCursor) resolveDurable(ctx context.Context, env durablestore.Envelope, seq uint64) (resolved, error) {
+	switch env.Kind {
+	case durablestore.EnvelopeKindOpeningFence:
+		body, err := journal.MarshalLeaseFence(journal.LeaseFence{Epoch: env.LeaseEpoch})
+		if err != nil {
+			return resolved{}, &ReplayDecodeError{Seq: seq, Cause: err}
+		}
+		return resolved{kind: kindFence, body: body, seq: seq, id: strconv.FormatUint(env.LeaseEpoch, 10)}, nil
+	case durablestore.EnvelopeKindPublicEvent:
+		body, err := b.resolveDurableBody(ctx, env.Runtime, durablestore.ObjectKindJournalRuntime, seq)
+		if err != nil {
+			return resolved{}, &ReplayDecodeError{Seq: seq, Cause: err}
+		}
+		return resolved{kind: kindEvent, body: body, seq: seq, id: string(env.EventID)}, nil
+	case durablestore.EnvelopeKindRuntimeControl:
+		name, id, ok := strings.Cut(env.RecordID, "|")
+		if !ok {
+			return resolved{}, &ReplayDecodeError{Seq: seq, Cause: &EnvelopeError{Reason: "runtime record identity has no kind"}}
+		}
+		k := kind(name)
+		switch k {
+		case kindEvent, kindCommand, kindGatePrepared:
+		default:
+			return resolved{}, &ReplayDecodeError{Seq: seq, Cause: &EnvelopeError{Reason: "unexpected runtime record kind " + strconv.Quote(name)}}
+		}
+		body, err := b.resolveDurableBody(ctx, env.Runtime, durablestore.ObjectKindJournalRuntime, seq)
+		if err != nil {
+			return resolved{}, &ReplayDecodeError{Seq: seq, Cause: err}
+		}
+		return resolved{kind: k, body: body, seq: seq, id: id}, nil
+	default:
+		return resolved{}, &ReplayDecodeError{Seq: seq, Cause: &EnvelopeError{Reason: "unexpected durable envelope kind"}}
+	}
+}
+
+func (b *baseCursor) resolveDurableBody(ctx context.Context, slot durablestore.BodySlot, objectKind durablestore.ObjectKind, seq uint64) ([]byte, error) {
+	if slot.Inline != nil {
+		return bytes.Clone(slot.Inline), nil
+	}
+	if slot.Reference == nil {
+		return nil, &EnvelopeError{Reason: "missing durable runtime body"}
+	}
+	metadata, err := slot.Reference.ObjectMetadata()
+	if err != nil {
+		return nil, err
+	}
+	reader, err := b.durable.GetObject(ctx, durablestore.GetObjectRequest{
+		TenantID: harnessTenantID, SessionID: harnessSessionID(b.sessionID), ExpectedKind: objectKind, Metadata: metadata,
+	})
+	if err != nil {
+		return nil, mapDurableObjectError(seq, slot.Reference, err)
+	}
+	body, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil {
+		return nil, mapDurableObjectError(seq, slot.Reference, readErr)
+	}
+	if closeErr != nil {
+		return nil, mapDurableObjectError(seq, slot.Reference, closeErr)
+	}
+	return body, nil
+}
+
+func mapDurableObjectError(seq uint64, reference *durablestore.BodyReference, err error) error {
+	key := "durable-object"
+	want := ""
+	if reference != nil {
+		key = reference.Reference.ObjectID
+		want = hex.EncodeToString(reference.SHA256[:])
+	}
+	var objectErr *durablestore.ObjectError
+	if errors.As(err, &objectErr) && (objectErr.Code == durablestore.ObjectErrorIntegrity || objectErr.Code == durablestore.ObjectErrorSize) {
+		return &BlobIntegrityError{Seq: seq, Key: key, Want: want, Got: "unverified"}
+	}
+	return &BlobUnavailableError{Seq: seq, Key: key, Cause: err}
 }
 
 // resolveBlob rehydrates an offloaded record: decode its pointer, fetch the named

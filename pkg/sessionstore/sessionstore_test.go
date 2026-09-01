@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/storage"
@@ -38,6 +39,10 @@ type reportingBlobs struct {
 	pathReporter
 }
 
+func (b reportingBlobs) BlobReaderCloseBound() time.Duration {
+	return b.Blobs.(storage.BlobReaderLifecycle).BlobReaderCloseBound()
+}
+
 // mustUUID parses the canonical 8-4-4-4-12 form or fails the test. It gives the
 // name-derivation tests a fixed, readable id instead of a random one.
 func mustUUID(t *testing.T, s string) uuid.UUID {
@@ -65,25 +70,25 @@ func TestOpen(t *testing.T) {
 		{name: "nil composite rejected", backend: nil, wantErr: true, wantMiss: "composite"},
 		{
 			name:     "nil ledger rejected",
-			backend:  &storage.Composite{Ledger: nil, Leaser: full.Leaser, KV: full.KV, Blobs: full.Blobs},
+			backend:  &storage.Composite{Ledger: nil, Leaser: full.Leaser, KV: full.KV, OrderedIndex: full.OrderedIndex, Blobs: full.Blobs},
 			wantErr:  true,
 			wantMiss: "Ledger",
 		},
 		{
 			name:     "nil leaser rejected",
-			backend:  &storage.Composite{Ledger: full.Ledger, Leaser: nil, KV: full.KV, Blobs: full.Blobs},
+			backend:  &storage.Composite{Ledger: full.Ledger, Leaser: nil, KV: full.KV, OrderedIndex: full.OrderedIndex, Blobs: full.Blobs},
 			wantErr:  true,
 			wantMiss: "Leaser",
 		},
 		{
 			name:     "nil kv rejected",
-			backend:  &storage.Composite{Ledger: full.Ledger, Leaser: full.Leaser, KV: nil, Blobs: full.Blobs},
+			backend:  &storage.Composite{Ledger: full.Ledger, Leaser: full.Leaser, KV: nil, OrderedIndex: full.OrderedIndex, Blobs: full.Blobs},
 			wantErr:  true,
 			wantMiss: "KV",
 		},
 		{
 			name:     "nil blobs rejected",
-			backend:  &storage.Composite{Ledger: full.Ledger, Leaser: full.Leaser, KV: full.KV, Blobs: nil},
+			backend:  &storage.Composite{Ledger: full.Ledger, Leaser: full.Leaser, KV: full.KV, OrderedIndex: full.OrderedIndex, Blobs: nil},
 			wantErr:  true,
 			wantMiss: "Blobs",
 		},
@@ -195,9 +200,10 @@ func TestPersistencePaths(t *testing.T) {
 					Ledger:       local.Ledger,
 					pathReporter: pathReporter{paths: []string{""}},
 				},
-				Leaser: local.Leaser,
-				KV:     local.KV,
-				Blobs:  local.Blobs,
+				Leaser:       local.Leaser,
+				KV:           local.KV,
+				OrderedIndex: local.OrderedIndex,
+				Blobs:        local.Blobs,
 			},
 			want: nil,
 		},
@@ -216,6 +222,7 @@ func TestPersistencePaths(t *testing.T) {
 					KV:           local.KV,
 					pathReporter: pathReporter{paths: []string{filepath.Join(base, "a", "..", "b")}},
 				},
+				OrderedIndex: local.OrderedIndex,
 				Blobs: reportingBlobs{
 					Blobs:        local.Blobs,
 					pathReporter: pathReporter{paths: []string{""}},
@@ -230,9 +237,10 @@ func TestPersistencePaths(t *testing.T) {
 					Ledger:       local.Ledger,
 					pathReporter: pathReporter{paths: []string{missingTail}},
 				},
-				Leaser: local.Leaser,
-				KV:     local.KV,
-				Blobs:  local.Blobs,
+				Leaser:       local.Leaser,
+				KV:           local.KV,
+				OrderedIndex: local.OrderedIndex,
+				Blobs:        local.Blobs,
 			},
 			want: []string{wantMissingTail},
 		},
@@ -243,9 +251,10 @@ func TestPersistencePaths(t *testing.T) {
 					Ledger:       local.Ledger,
 					pathReporter: pathReporter{paths: []string{filepath.Join(broken, "tail")}},
 				},
-				Leaser: local.Leaser,
-				KV:     local.KV,
-				Blobs:  local.Blobs,
+				Leaser:       local.Leaser,
+				KV:           local.KV,
+				OrderedIndex: local.OrderedIndex,
+				Blobs:        local.Blobs,
 			},
 			wantErr: true,
 		},

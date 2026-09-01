@@ -13,7 +13,10 @@ require (
 	golang.org/x/sys v0.47.0
 )
 
-require github.com/looprig/fsstore v0.4.0
+require (
+	github.com/looprig/fsstore v0.5.1
+	github.com/looprig/sessionstore v0.1.0
+)
 
 require (
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
@@ -44,7 +47,7 @@ require (
 	github.com/invopop/jsonschema v0.14.0 // indirect
 	github.com/looprig/core v0.7.0
 	github.com/looprig/inference v0.12.0
-	github.com/looprig/storage v0.4.0
+	github.com/looprig/storage v0.6.0
 	github.com/openai/openai-go/v3 v3.50.0 // indirect
 	github.com/securego/gosec/v2 v2.28.0 // indirect
 	github.com/standard-webhooks/standard-webhooks/libraries v0.0.1 // indirect

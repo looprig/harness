@@ -100,6 +100,9 @@ func (es *eventStamper) stamp(t *testing.T, ctx context.Context, h *hub.Hub, ev 
 	hdr := ev.EventHeader()
 	hdr.EventID = uuid.UUID{0xE0, es.n}
 	hdr.CreatedAt = time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	if reply, correlated := ev.(event.Reply); correlated && reply.ReplyTo().IsZero() {
+		hdr.Cause.CommandID = uuid.UUID{0xD0, es.n}
+	}
 	stamped := setHeader(t, ev, hdr)
 	if err := h.PublishEvent(ctx, stamped); err != nil {
 		t.Fatalf("PublishEvent(%T): %v", stamped, err)

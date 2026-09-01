@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
@@ -400,10 +401,11 @@ func TestGCFailsClosedOnScanError(t *testing.T) {
 			setup: func(t *testing.T) (*ObjectGC, storage.Blobs, string) {
 				mem := memstore.New()
 				comp := &storage.Composite{
-					Ledger: &readFailLedger{inner: mem.Ledger, readErr: errScanBoom},
-					Leaser: mem.Leaser,
-					KV:     mem.KV,
-					Blobs:  mem.Blobs,
+					Ledger:       &readFailLedger{inner: mem.Ledger, readErr: errScanBoom},
+					Leaser:       mem.Leaser,
+					KV:           mem.KV,
+					OrderedIndex: mem.OrderedIndex,
+					Blobs:        mem.Blobs,
 				}
 				st, err := Open(comp, WithOffloadThreshold(64))
 				if err != nil {
@@ -557,7 +559,7 @@ func TestGCDeleteFailsClosed(t *testing.T) {
 			t.Parallel()
 			mem := memstore.New()
 			fb := &deleteFailBlobs{inner: mem.Blobs, delErr: tt.delErr}
-			comp := &storage.Composite{Ledger: mem.Ledger, Leaser: mem.Leaser, KV: mem.KV, Blobs: fb}
+			comp := &storage.Composite{Ledger: mem.Ledger, Leaser: mem.Leaser, KV: mem.KV, OrderedIndex: mem.OrderedIndex, Blobs: fb}
 			st, err := Open(comp, WithOffloadThreshold(64))
 			if err != nil {
 				t.Fatalf("Open() err = %v", err)
@@ -712,9 +714,12 @@ func (b *deleteFailBlobs) Delete(ctx context.Context, key string) error {
 func (b *deleteFailBlobs) List(ctx context.Context, prefix string) ([]string, error) {
 	return b.inner.List(ctx, prefix)
 }
+func (b *deleteFailBlobs) BlobReaderCloseBound() time.Duration {
+	return b.inner.(storage.BlobReaderLifecycle).BlobReaderCloseBound()
+}
 
 // Compile-time proofs that the GC test doubles honor the storage contracts.
 var (
-	_ storage.Ledger = (*readFailLedger)(nil)
-	_ storage.Blobs  = (*deleteFailBlobs)(nil)
+	_ storage.Ledger              = (*readFailLedger)(nil)
+	_ storage.BlobReaderLifecycle = (*deleteFailBlobs)(nil)
 )

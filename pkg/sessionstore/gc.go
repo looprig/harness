@@ -5,11 +5,13 @@ import (
 	"errors"
 	"io"
 	"strconv"
+	"strings"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/workspacestore"
+	durablestore "github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 )
 
@@ -306,19 +308,43 @@ func (g *ObjectGC) collectLive(ctx context.Context) (map[string]struct{}, error)
 		if err != nil {
 			return nil, &GCScanError{Name: g.name, Cause: err}
 		}
+		if durable, durableErr := durablestore.DecodeEnvelope(rec.Payload); durableErr == nil {
+			for _, slot := range []durablestore.BodySlot{durable.Public, durable.Runtime} {
+				if slot.Reference == nil {
+					continue
+				}
+				key, keyErr := durableBlobKey(g.name, *slot.Reference)
+				if keyErr != nil {
+					return nil, &GCScanError{Name: g.name, Cause: keyErr}
+				}
+				live[key] = struct{}{}
+			}
+			continue
+		}
 		env, err := decodeEnvelope(rec.Payload)
 		if err != nil {
 			return nil, &GCScanError{Name: g.name, Cause: err}
 		}
-		if kind(env.Kind) != kindBlobPtr {
-			continue
+		if kind(env.Kind) == kindBlobPtr {
+			ptr, pointerErr := decodeBlobPointer(env.Body)
+			if pointerErr != nil {
+				return nil, &GCScanError{Name: g.name, Cause: pointerErr}
+			}
+			live[ptr.Key] = struct{}{}
 		}
-		ptr, err := decodeBlobPointer(env.Body)
-		if err != nil {
-			return nil, &GCScanError{Name: g.name, Cause: err}
-		}
-		live[ptr.Key] = struct{}{}
 	}
+}
+
+func durableBlobKey(name string, reference durablestore.BodyReference) (string, error) {
+	metadata, err := reference.ObjectMetadata()
+	if err != nil {
+		return "", err
+	}
+	parts := strings.Split(metadata.Reference.ObjectID, ":")
+	if len(parts) != 4 || parts[0] != "v1" {
+		return "", &EnvelopeError{Reason: "invalid durable object identity"}
+	}
+	return name + blobsInfix + parts[0] + "/" + parts[1] + "/" + parts[3] + "/" + parts[2], nil
 }
 
 // listBlobs enumerates the session's content-addressed blob prefix

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,7 @@ import (
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
+	durablestore "github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -273,10 +275,11 @@ func TestAppendOverThresholdOffloads(t *testing.T) {
 	mem := memstore.New()
 	log := &opLog{}
 	comp := &storage.Composite{
-		Ledger: &recordingLedger{inner: mem.Ledger, log: log},
-		Leaser: mem.Leaser,
-		KV:     mem.KV,
-		Blobs:  &recordingBlobs{inner: mem.Blobs, log: log},
+		Ledger:       &recordingLedger{inner: mem.Ledger, log: log},
+		Leaser:       mem.Leaser,
+		KV:           mem.KV,
+		OrderedIndex: mem.OrderedIndex,
+		Blobs:        &recordingBlobs{inner: mem.Blobs, log: log},
 	}
 	st, err := Open(comp, WithOffloadThreshold(64))
 	if err != nil {
@@ -308,42 +311,45 @@ func TestAppendOverThresholdOffloads(t *testing.T) {
 		t.Fatalf("op order = %v, want [put append] (blob before pointer)", ops)
 	}
 
-	// The appended record is a blobptr envelope pointing at the offloaded blob.
-	env := readEnvelope(t, st, id, 2)
-	if env.Kind != string(kindBlobPtr) {
-		t.Fatalf("record 2 kind = %q, want %q", env.Kind, kindBlobPtr)
-	}
-	if env.ID != cmdID.String() {
-		t.Errorf("record 2 id = %q, want %q", env.ID, cmdID.String())
-	}
-	ptr, err := decodeBlobPointer(env.Body)
+	cur, err := st.backend.Ledger.Read(context.Background(), ledgerName(id), 2)
 	if err != nil {
-		t.Fatalf("decodeBlobPointer() err = %v", err)
+		t.Fatalf("Ledger.Read() error = %v", err)
+	}
+	stored, err := cur.Next(context.Background())
+	if err != nil {
+		t.Fatalf("Cursor.Next() error = %v", err)
+	}
+	env, err := durablestore.DecodeEnvelope(stored.Payload)
+	if err != nil {
+		t.Fatalf("DecodeEnvelope() error = %v", err)
+	}
+	if env.Kind != durablestore.EnvelopeKindRuntimeControl || env.RecordID != durableRecordID(kindCommand, cmdID.String()) || env.Runtime.Reference == nil {
+		t.Fatalf("record 2 = %+v, want object-backed runtime command", env)
+	}
+	if env.Public.Inline != nil || env.Public.Reference != nil {
+		t.Fatalf("private command has public body: %+v", env.Public)
 	}
 
-	// Recompute the offloaded envelope the same way the writer does, and confirm
-	// the pointer addresses it and the blob holds exactly those bytes.
+	// The released object reference addresses the native command bytes, not a
+	// Harness-private envelope that SessionStore would have to decode.
 	body, err := command.MarshalCommand(cmd)
 	if err != nil {
 		t.Fatalf("MarshalCommand() err = %v", err)
 	}
-	inner, err := encodeEnvelope(envelope{V: envelopeVersion, Kind: string(kindCommand), ID: cmdID.String(), Body: body})
+	metadata, err := env.Runtime.Reference.ObjectMetadata()
 	if err != nil {
-		t.Fatalf("encodeEnvelope() err = %v", err)
+		t.Fatalf("ObjectMetadata() error = %v", err)
 	}
-	sum := sha256.Sum256(inner)
+	sum := sha256.Sum256(body)
 	wantHex := hex.EncodeToString(sum[:])
-	wantKey := "sessions/" + id.String() + "/blobs/" + wantHex
-	if ptr.SHA256 != wantHex {
-		t.Errorf("blobPointer.SHA256 = %q, want %q", ptr.SHA256, wantHex)
+	if metadata.Digest != "sha256:"+wantHex || metadata.SizeBytes != uint64(len(body)) {
+		t.Errorf("metadata = %+v, want digest sha256:%s and size %d", metadata, wantHex, len(body))
 	}
-	if ptr.Key != wantKey {
-		t.Errorf("blobPointer.Key = %q, want %q", ptr.Key, wantKey)
+	wantKey, err := durableBlobKey(ledgerName(id), *env.Runtime.Reference)
+	if err != nil {
+		t.Fatalf("durableBlobKey() error = %v", err)
 	}
-	if ptr.Size != int64(len(inner)) {
-		t.Errorf("blobPointer.Size = %d, want %d", ptr.Size, len(inner))
-	}
-	rc, err := st.backend.Blobs.Get(context.Background(), ptr.Key)
+	rc, err := st.backend.Blobs.Get(context.Background(), wantKey)
 	if err != nil {
 		t.Fatalf("Blobs.Get() err = %v", err)
 	}
@@ -352,8 +358,8 @@ func TestAppendOverThresholdOffloads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read blob err = %v", err)
 	}
-	if !bytes.Equal(got, inner) {
-		t.Errorf("blob bytes (%d) != offloaded envelope (%d)", len(got), len(inner))
+	if !bytes.Equal(got, body) {
+		t.Errorf("blob bytes (%d) != native command body (%d)", len(got), len(body))
 	}
 }
 
@@ -407,7 +413,7 @@ func TestAppendPerAppendDeadline(t *testing.T) {
 	t.Parallel()
 	mem := memstore.New()
 	bl := &blockingLedger{inner: mem.Ledger}
-	comp := &storage.Composite{Ledger: bl, Leaser: mem.Leaser, KV: mem.KV, Blobs: mem.Blobs}
+	comp := &storage.Composite{Ledger: bl, Leaser: mem.Leaser, KV: mem.KV, OrderedIndex: mem.OrderedIndex, Blobs: mem.Blobs}
 	st, err := Open(comp)
 	if err != nil {
 		t.Fatalf("Open() err = %v", err)
@@ -464,11 +470,16 @@ func TestAppendVerifyErrorMapsToAmbiguous(t *testing.T) {
 	id := newTestUUID(t)
 	lease, _ := leaseFor(1, id)
 	fl := &verifyFailLedger{readErr: errVerifyRead}
+	store, openErr := Open(memstore.New())
+	if openErr != nil {
+		t.Fatalf("Open() error = %v", openErr)
+	}
 	j := &sessionJournal{
 		id:         id,
 		lease:      lease,
 		ledger:     fl,
-		blobs:      memstore.New().Blobs,
+		durable:    store.durable,
+		project:    store.project,
 		name:       ledgerName(id),
 		threshold:  defaultOffloadThreshold,
 		ready:      true,
@@ -874,7 +885,7 @@ func TestOpenJournalFenceSurvivesConcurrentWriteDuringHydration(t *testing.T) {
 			t.Fatalf("racer Append() err = %v", appendErr)
 		}
 	}
-	comp := &storage.Composite{Ledger: raced, Leaser: backend.Leaser, KV: backend.KV, Blobs: backend.Blobs}
+	comp := &storage.Composite{Ledger: raced, Leaser: backend.Leaser, KV: backend.KV, OrderedIndex: backend.OrderedIndex, Blobs: backend.Blobs}
 
 	st2, err := Open(comp)
 	if err != nil {
@@ -947,7 +958,7 @@ func TestOpenJournalRetriesFenceAfterPredecessorWrite(t *testing.T) {
 	}
 
 	raced := &fenceRaceLedger{inner: backend.Ledger, name: name, racer: racerFrame}
-	comp := &storage.Composite{Ledger: raced, Leaser: backend.Leaser, KV: backend.KV, Blobs: backend.Blobs}
+	comp := &storage.Composite{Ledger: raced, Leaser: backend.Leaser, KV: backend.KV, OrderedIndex: backend.OrderedIndex, Blobs: backend.Blobs}
 	st2, err := Open(comp)
 	if err != nil {
 		t.Fatalf("Open() raced backend err = %v", err)
@@ -1067,10 +1078,38 @@ func readEnvelope(t *testing.T, st *Store, id uuid.UUID, seq uint64) envelope {
 		t.Fatalf("Next(seq=%d) err = %v", seq, err)
 	}
 	env, err := decodeEnvelope(rec.Payload)
-	if err != nil {
-		t.Fatalf("decodeEnvelope(seq=%d) err = %v", seq, err)
+	if err == nil {
+		return env
 	}
-	return env
+	durable, durableErr := durablestore.DecodeEnvelope(rec.Payload)
+	if durableErr != nil {
+		t.Fatalf("decodeEnvelope(seq=%d) errors = (%v, %v)", seq, err, durableErr)
+	}
+	switch durable.Kind {
+	case durablestore.EnvelopeKindOpeningFence:
+		body, marshalErr := journal.MarshalLeaseFence(journal.LeaseFence{Epoch: durable.LeaseEpoch})
+		if marshalErr != nil {
+			t.Fatalf("MarshalLeaseFence() error = %v", marshalErr)
+		}
+		return envelope{V: envelopeVersion, Kind: string(kindFence), ID: strconv.FormatUint(durable.LeaseEpoch, 10), Body: body}
+	case durablestore.EnvelopeKindPublicEvent:
+		if durable.Runtime.Reference != nil {
+			return envelope{V: envelopeVersion, Kind: string(kindBlobPtr), ID: string(durable.EventID)}
+		}
+		return envelope{V: envelopeVersion, Kind: string(kindEvent), ID: string(durable.EventID), Body: durable.Runtime.Inline}
+	case durablestore.EnvelopeKindRuntimeControl:
+		name, recordID, ok := strings.Cut(durable.RecordID, "|")
+		if !ok {
+			t.Fatalf("durable RecordID = %q, want kind delimiter", durable.RecordID)
+		}
+		if durable.Runtime.Reference != nil {
+			return envelope{V: envelopeVersion, Kind: string(kindBlobPtr), ID: recordID}
+		}
+		return envelope{V: envelopeVersion, Kind: name, ID: recordID, Body: durable.Runtime.Inline}
+	default:
+		t.Fatalf("durable envelope kind = %d, unsupported", durable.Kind)
+	}
+	return envelope{}
 }
 
 // opLog records the interleaving of blob and ledger operations across the two
@@ -1138,6 +1177,9 @@ func (b *recordingBlobs) Delete(ctx context.Context, key string) error {
 }
 func (b *recordingBlobs) List(ctx context.Context, prefix string) ([]string, error) {
 	return b.inner.List(ctx, prefix)
+}
+func (b *recordingBlobs) BlobReaderCloseBound() time.Duration {
+	return b.inner.(storage.BlobReaderLifecycle).BlobReaderCloseBound()
 }
 
 // blockingLedger wedges Append (blocking on ctx) once block is set, so a test can
