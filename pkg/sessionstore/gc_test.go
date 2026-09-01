@@ -44,7 +44,7 @@ func TestGCDurableMagicCorruptionFailsAsReleasedEnvelopeError(t *testing.T) {
 	if err := backend.Ledger.Append(context.Background(), ledgerName(id), 0, frame); err != nil {
 		t.Fatalf("Ledger.Append() error = %v", err)
 	}
-	orphan := gcBlobPrefix(id) + "orphan"
+	orphan := orphanKey(gcBlobPrefix(id), 0)
 	if err := backend.Blobs.Put(context.Background(), orphan, bytes.NewReader([]byte("orphan"))); err != nil {
 		t.Fatalf("Blobs.Put(orphan) error = %v", err)
 	}
@@ -122,6 +122,71 @@ func putOrphans(t *testing.T, st *Store, id uuid.UUID, m int) []string {
 	return keys
 }
 
+func putDurableObject(t *testing.T, st *Store, id uuid.UUID, objectKind durablestore.ObjectKind, body []byte) {
+	t.Helper()
+	digest := sha256.Sum256(body)
+	metadata, err := st.durable.PutObject(context.Background(), durablestore.PutObjectRequest{
+		TenantID: harnessTenantID, SessionID: harnessSessionID(id), Kind: objectKind,
+		SizeBytes: uint64(len(body)), SHA256: digest, Body: bytes.NewReader(body),
+	})
+	if err != nil {
+		t.Fatalf("PutObject(%s) error = %v", objectKind, err)
+	}
+	if metadata.Reference.ObjectID == "" {
+		t.Fatalf("PutObject(%s) returned an empty object identity", objectKind)
+	}
+}
+
+func TestGCReapsOnlyLegacyObjects(t *testing.T) {
+	st, err := Open(memstore.New())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	id := newTestUUID(t)
+	lease, _ := leaseFor(1, id)
+	legacyOrphan := putOrphans(t, st, id, 1)[0]
+
+	kinds := []durablestore.ObjectKind{
+		durablestore.ObjectKindJournalPublic,
+		durablestore.ObjectKindJournalRuntime,
+		durablestore.ObjectKindArtifact,
+		durablestore.ObjectKindToolResult,
+		durablestore.ObjectKindWorkspaceCheckpoint,
+	}
+	for _, objectKind := range kinds {
+		putDurableObject(t, st, id, objectKind, []byte("retained-"+string(objectKind)))
+	}
+	before, err := st.backend.Blobs.List(context.Background(), gcBlobPrefix(id))
+	if err != nil {
+		t.Fatalf("Blobs.List(before GC) error = %v", err)
+	}
+
+	gc, err := st.OpenObjectGC(id, lease)
+	if err != nil {
+		t.Fatalf("OpenObjectGC() error = %v", err)
+	}
+	result, err := gc.GC(context.Background())
+	if err != nil {
+		t.Fatalf("GC() error = %v", err)
+	}
+	if result.Scanned != 1 || result.Deleted != 1 || !reflect.DeepEqual(result.DeletedKeys, []string{legacyOrphan}) {
+		t.Fatalf("GCResult = %+v, want only legacy orphan %q scanned and deleted", result, legacyOrphan)
+	}
+	after, err := st.backend.Blobs.List(context.Background(), gcBlobPrefix(id))
+	if err != nil {
+		t.Fatalf("Blobs.List(after GC) error = %v", err)
+	}
+	wantAfter := make([]string, 0, len(before)-1)
+	for _, key := range before {
+		if key != legacyOrphan {
+			wantAfter = append(wantAfter, key)
+		}
+	}
+	if !reflect.DeepEqual(after, wantAfter) {
+		t.Fatalf("remaining durable objects = %v, want every released object retained from %v", after, before)
+	}
+}
+
 // assertReplayResolves drains a full record replay of session id, failing if any
 // record fails to decode or any pointer fails to resolve — the end-to-end proof that
 // no live blob was reaped (a wrongly-deleted referenced blob surfaces here as a
@@ -148,21 +213,20 @@ func assertReplayResolves(t *testing.T, st *Store, id uuid.UUID) {
 	}
 }
 
-// TestGCReclaim is the live-set-sweep core: over a session holding real blobptr
-// records (referenced blobs) plus fabricated orphan blobs, GC deletes EXACTLY the
-// orphans, keeps every referenced blob, and leaves a replay fully resolvable.
+// TestGCReclaim is the compatibility sweep core: over a session holding released
+// journal objects plus fabricated legacy orphans, GC deletes exactly the legacy
+// orphans, retains every released object, and leaves replay fully resolvable.
 func TestGCReclaim(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name       string
-		numRef     int
-		numOrphan  int
-		wantRefCnt int
+		name      string
+		numRef    int
+		numOrphan int
 	}{
-		{name: "orphans reclaimed, referenced kept", numRef: 3, numOrphan: 2, wantRefCnt: 3},
-		{name: "no orphans deletes nothing", numRef: 3, numOrphan: 0, wantRefCnt: 3},
-		{name: "only orphans, none referenced", numRef: 0, numOrphan: 2, wantRefCnt: 0},
-		{name: "empty session is a no-op", numRef: 0, numOrphan: 0, wantRefCnt: 0},
+		{name: "orphans reclaimed, referenced kept", numRef: 3, numOrphan: 2},
+		{name: "no orphans deletes nothing", numRef: 3, numOrphan: 0},
+		{name: "only orphans, none referenced", numRef: 0, numOrphan: 2},
+		{name: "empty session is a no-op", numRef: 0, numOrphan: 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -183,11 +247,11 @@ func TestGCReclaim(t *testing.T) {
 				t.Fatalf("GC() err = %v", err)
 			}
 
-			if res.Scanned != tt.numRef+tt.numOrphan {
-				t.Errorf("GCResult.Scanned = %d, want %d", res.Scanned, tt.numRef+tt.numOrphan)
+			if res.Scanned != tt.numOrphan {
+				t.Errorf("GCResult.Scanned = %d, want %d legacy candidates", res.Scanned, tt.numOrphan)
 			}
-			if res.Referenced != tt.wantRefCnt {
-				t.Errorf("GCResult.Referenced = %d, want %d", res.Referenced, tt.wantRefCnt)
+			if res.Referenced != 0 {
+				t.Errorf("GCResult.Referenced = %d, want 0 (released objects are outside legacy GC)", res.Referenced)
 			}
 			if res.Deleted != tt.numOrphan {
 				t.Errorf("GCResult.Deleted = %d, want %d", res.Deleted, tt.numOrphan)

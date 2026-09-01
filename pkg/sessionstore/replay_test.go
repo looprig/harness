@@ -59,6 +59,115 @@ func TestReplayDurableMagicCorruptionFailsAsReleasedEnvelopeError(t *testing.T) 
 	}
 }
 
+type countingGetBlobs struct {
+	storage.Blobs
+	gets atomic.Int64
+}
+
+func (b *countingGetBlobs) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	b.gets.Add(1)
+	return b.Blobs.Get(ctx, key)
+}
+
+func (b *countingGetBlobs) BlobReaderCloseBound() time.Duration {
+	return b.Blobs.(storage.BlobReaderLifecycle).BlobReaderCloseBound()
+}
+
+func TestReplayRejectsOversizedDurableReferenceBeforeBlobGet(t *testing.T) {
+	mem := memstore.New()
+	blobs := &countingGetBlobs{Blobs: mem.Blobs}
+	backend, err := storage.NewCompositeWithOrderedIndex(mem.Ledger, mem.Leaser, mem.KV, blobs, mem.OrderedIndex)
+	if err != nil {
+		t.Fatalf("NewCompositeWithOrderedIndex() error = %v", err)
+	}
+	store, err := Open(backend)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	id := newTestUUID(t)
+	body := []byte(`{"type":"user_input"}`)
+	digest := sha256.Sum256(body)
+	metadata, err := store.durable.PutObject(context.Background(), durablestore.PutObjectRequest{
+		TenantID: harnessTenantID, SessionID: harnessSessionID(id), Kind: durablestore.ObjectKindJournalRuntime,
+		SizeBytes: uint64(len(body)), SHA256: digest, Body: bytes.NewReader(body),
+	})
+	if err != nil {
+		t.Fatalf("PutObject() error = %v", err)
+	}
+	reference, err := durablestore.BodyReferenceFromObjectMetadata(metadata)
+	if err != nil {
+		t.Fatalf("BodyReferenceFromObjectMetadata() error = %v", err)
+	}
+	reference.SizeBytes = (16 << 20) + 1
+	frame, err := durablestore.EncodeEnvelope(durablestore.Envelope{
+		Kind: durablestore.EnvelopeKindRuntimeControl, RecordID: "command|oversized",
+		Runtime: durablestore.BodySlot{Reference: &reference},
+	})
+	if err != nil {
+		t.Fatalf("EncodeEnvelope() error = %v", err)
+	}
+	if err := backend.Ledger.Append(context.Background(), ledgerName(id), 0, frame); err != nil {
+		t.Fatalf("Ledger.Append() error = %v", err)
+	}
+	blobs.gets.Store(0)
+
+	replayer, err := store.OpenInternalRecordReplayer(id, ReplayRequest{FromSeq: 1})
+	if err != nil {
+		t.Fatalf("OpenInternalRecordReplayer() error = %v", err)
+	}
+	cursor, err := replayer.Open(context.Background(), journal.ReplayRequest{})
+	if err != nil {
+		t.Fatalf("RecordReplayer.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = cursor.Close() })
+	_, _, err = cursor.Next(context.Background())
+	var replayErr *ReplayDecodeError
+	var integrityErr *BlobIntegrityError
+	if !errors.As(err, &replayErr) || !errors.As(err, &integrityErr) {
+		t.Fatalf("Next() error = %T %v, want ReplayDecodeError wrapping BlobIntegrityError", err, err)
+	}
+	if got := blobs.gets.Load(); got != 0 {
+		t.Fatalf("Blobs.Get calls = %d, want 0 for oversized declared reference", got)
+	}
+}
+
+func TestReadDeclaredBodyBoundsAndVerifiesLength(t *testing.T) {
+	t.Run("exact", func(t *testing.T) {
+		got, err := readDeclaredBody(bytes.NewReader([]byte("exact")), 5)
+		if err != nil || string(got) != "exact" {
+			t.Fatalf("readDeclaredBody(exact) = (%q, %v), want exact bytes", got, err)
+		}
+	})
+	t.Run("short", func(t *testing.T) {
+		if _, err := readDeclaredBody(bytes.NewReader([]byte("short")), 6); !errors.Is(err, errDurableBodyLength) {
+			t.Fatalf("readDeclaredBody(short) error = %v, want errDurableBodyLength", err)
+		}
+	})
+	t.Run("overlong reads only declared plus one", func(t *testing.T) {
+		source := bytes.NewReader(bytes.Repeat([]byte{'x'}, 1024))
+		if _, err := readDeclaredBody(source, 8); !errors.Is(err, errDurableBodyLength) {
+			t.Fatalf("readDeclaredBody(overlong) error = %v, want errDurableBodyLength", err)
+		}
+		if got := source.Len(); got != 1024-9 {
+			t.Fatalf("source bytes remaining = %d, want %d (declared size + 1 consumed)", got, 1024-9)
+		}
+	})
+}
+
+func TestRuntimeBodyLimitMatchesHarnessCodecs(t *testing.T) {
+	oversized := make([]byte, maxRuntimeBodyBytes+1)
+	_, commandErr := command.UnmarshalCommand(oversized)
+	var commandLimit *command.CommandLimitError
+	if !errors.As(commandErr, &commandLimit) || commandLimit.Max != maxRuntimeBodyBytes {
+		t.Fatalf("command decode limit = (%T %v), want %d", commandErr, commandErr, maxRuntimeBodyBytes)
+	}
+	_, eventErr := event.UnmarshalEvent(oversized)
+	var eventLimit *event.EventLimitError
+	if !errors.As(eventErr, &eventLimit) || eventLimit.Max != maxRuntimeBodyBytes {
+		t.Fatalf("event decode limit = (%T %v), want %d", eventErr, eventErr, maxRuntimeBodyBytes)
+	}
+}
+
 // replayThreshold is a small offload threshold used across the replay tests so a
 // modestly padded record is forced down the blob-offload path while the tiny
 // header-only records stay inline.
@@ -482,7 +591,17 @@ func TestReplayBlobResolution(t *testing.T) {
 			},
 		},
 		{
-			name: "oversized blob fails closed with BlobIntegrityError (Size+1 bound)",
+			name: "short durable blob fails closed with BlobIntegrityError",
+			tamper: func(t *testing.T, fx fixture, backend *storage.Composite) {
+				backend.Blobs.(*corruptGetBlobs).short.Store(true)
+			},
+			wantErrAs: func(err error) bool {
+				var ie *BlobIntegrityError
+				return errors.As(err, &ie)
+			},
+		},
+		{
+			name: "overlong durable blob fails closed with BlobIntegrityError (Size+1 bound)",
 			tamper: func(t *testing.T, fx fixture, backend *storage.Composite) {
 				// Get returns MORE bytes than the pointer's Size: the bounded read caps
 				// at Size+1, so len(raw) != ptr.Size trips the guard without an
@@ -745,17 +864,13 @@ func TestReplayCursorCloseIdempotent(t *testing.T) {
 
 // --- test doubles ---------------------------------------------------------
 
-// corruptGetBlobs wraps a Blobs, delegating Put/Delete/List unchanged so the writer
-// stores real bytes, but tampering with every Get response once armed — so an
-// offloaded record's rehydration reads bytes that fail the integrity guard, driving
-// the *BlobIntegrityError fail-closed path. Put is never tampered (the writer's blob
-// must land intact); only replay-time Get is. Two independent tamper modes exercise
-// the two halves of the guard: corrupt flips a byte (same length → the sha256 half),
-// oversize appends bytes past the pointer's Size (→ the len(raw) != ptr.Size half,
-// the anti-OOM Size+1 bound).
+// corruptGetBlobs delegates publication unchanged, then tampers with replay-time Get
+// responses once armed. The released verifier and Harness adapter must classify
+// same-length corruption, short bodies, and overlong bodies as BlobIntegrityError.
 type corruptGetBlobs struct {
 	inner    storage.Blobs
 	corrupt  atomic.Bool
+	short    atomic.Bool
 	oversize atomic.Bool
 }
 
@@ -768,8 +883,8 @@ func (b *corruptGetBlobs) Get(ctx context.Context, key string) (io.ReadCloser, e
 	if err != nil {
 		return rc, err
 	}
-	corrupt, oversize := b.corrupt.Load(), b.oversize.Load()
-	if !corrupt && !oversize {
+	corrupt, short, oversize := b.corrupt.Load(), b.short.Load(), b.oversize.Load()
+	if !corrupt && !short && !oversize {
 		return rc, nil
 	}
 	defer rc.Close()
@@ -783,6 +898,8 @@ func (b *corruptGetBlobs) Get(ctx context.Context, key string) (io.ReadCloser, e
 		// yields Size+1 bytes, so len(raw) != ptr.Size trips the integrity guard before
 		// an unbounded read could occur.
 		data = append(data, 0xDE, 0xAD, 0xBE, 0xEF)
+	case short && len(data) > 0:
+		data = data[:len(data)-1]
 	case len(data) == 0:
 		data = []byte{0x00} // never byte-identical to an empty original
 	default:

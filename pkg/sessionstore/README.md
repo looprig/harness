@@ -148,3 +148,12 @@ and `BlobReaderLifecycle` validation to the released store. Replay and GC use
 released envelope magic as an ownership boundary: once that magic is present,
 a released decode error is authoritative and cannot fall through to legacy JSON.
 Legacy fallback remains only for records without released magic.
+
+### Object reclamation boundary
+
+The compatibility `ObjectGC` reclaims only the old Harness offload shape: a
+lowercase SHA-256 leaf directly below `sessions/<uuid>/blobs/`. Released
+SessionStore v0.1.0 deliberately exposes no public object enumeration/deletion
+API, so Harness does not reconstruct its private physical layout. Released
+journal objects and unrelated artifacts, tool results, and checkpoints are
+retained until a released retention/reaping contract exists.

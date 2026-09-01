@@ -2,6 +2,8 @@ package sessionstore
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"strconv"
@@ -78,13 +80,11 @@ func (e *GCDeleteError) Error() string {
 }
 func (e *GCDeleteError) Unwrap() error { return e.Cause }
 
-// GCResult summarizes one GC pass. It mirrors pkg/journal's GCResult shape, minus its
-// WithinGrace term: storage's Blobs.List exposes no per-blob timestamp, so there is
-// no grace window over the storage contract — GC's safety rests entirely on the
-// single-writer lease/idle serialization the caller provides (see ObjectGC). On a
-// fully successful pass Scanned == Referenced + Deleted.
+// GCResult summarizes one legacy-object GC pass. Released SessionStore objects are
+// outside this result because v0.1.0 exposes no safe public reaping API. On a fully
+// successful pass Scanned == Referenced + Deleted.
 type GCResult struct {
-	// Scanned is the number of blobs listed under the session's blob prefix.
+	// Scanned is the number of canonical legacy blobs selected under the session prefix.
 	Scanned int
 	// Referenced is the number of listed blobs still referenced by an in-ledger
 	// pointer (kept).
@@ -200,10 +200,9 @@ func (s *Store) scanWorkspaceEvents(ctx context.Context, id uuid.UUID, visit fun
 	}
 }
 
-// ObjectGC reaps orphaned offload blobs from one session's content-addressed blob
-// prefix: blobs no in-ledger pointer references. An orphan arises from the writer's
-// blob-durable-before-pointer discipline — the offload Put lands BEFORE the blobptr
-// append, so a crash in that gap leaves a durable blob with no pointer.
+// ObjectGC reaps orphaned legacy Harness offload blobs from one session's
+// content-addressed blob prefix. It deliberately retains released SessionStore
+// objects until that module publishes a safe retention/reaping API.
 //
 // It is lease-guarded: it deletes, so it runs only while holding a valid single-writer
 // lease and is therefore the single deleter. That lease guard is also the whole of its
@@ -247,12 +246,10 @@ func (s *Store) OpenObjectGC(id uuid.UUID, lease journal.Lease) (*ObjectGC, erro
 	}, nil
 }
 
-// GC runs one live-set-sweep pass under the held lease. It (1) refuses unless the lease
-// is held — GC deletes, so it must be the single writer; (2) scans the session's ledger
-// and builds the LIVE set of blob keys referenced by a blobptr record; (3) lists the
-// session's blob prefix and deletes every listed blob NOT in the live set. It returns a
-// summary of the pass. Every failure is a typed fail-closed error; on a scan or list
-// failure it deletes nothing (an incomplete live set must never drive a delete).
+// GC runs one legacy live-set-sweep pass under the held lease. It validates both
+// released frames and legacy pointers, then selects only canonical legacy blob keys
+// and deletes those absent from the legacy live set. Every failure is typed and
+// fail-closed.
 func (g *ObjectGC) GC(ctx context.Context) (GCResult, error) {
 	// Lease guard: GC is the single deleter. Refuse if the lease is not held.
 	if !g.leaseHeld() {
@@ -313,11 +310,9 @@ func (g *ObjectGC) collectLive(ctx context.Context) (map[string]struct{}, error)
 				if slot.Reference == nil {
 					continue
 				}
-				key, keyErr := durableBlobKey(g.name, *slot.Reference)
-				if keyErr != nil {
-					return nil, &GCScanError{Name: g.name, Cause: keyErr}
+				if _, metadataErr := slot.Reference.ObjectMetadata(); metadataErr != nil {
+					return nil, &GCScanError{Name: g.name, Cause: metadataErr}
 				}
-				live[key] = struct{}{}
 			}
 			continue
 		} else if hasReleasedEnvelopeMagic(rec.Payload) {
@@ -337,29 +332,37 @@ func (g *ObjectGC) collectLive(ctx context.Context) (map[string]struct{}, error)
 	}
 }
 
-func durableBlobKey(name string, reference durablestore.BodyReference) (string, error) {
-	metadata, err := reference.ObjectMetadata()
-	if err != nil {
-		return "", err
-	}
-	parts := strings.Split(metadata.Reference.ObjectID, ":")
-	if len(parts) != 4 || parts[0] != "v1" {
-		return "", &EnvelopeError{Reason: "invalid durable object identity"}
-	}
-	return name + blobsInfix + parts[0] + "/" + parts[1] + "/" + parts[3] + "/" + parts[2], nil
-}
-
-// listBlobs enumerates the session's content-addressed blob prefix
-// ("sessions/<id>/blobs/"). storage's Blobs.List treats an empty prefix as zero
-// blobs (an empty result, never an error), so an empty session needs no special case;
-// any other failure fails closed as a *GCListError.
+// listBlobs enumerates only blobs written by Harness's legacy offload codec: one
+// lowercase SHA-256 leaf directly below the session blob prefix. Released
+// SessionStore objects have their own lifecycle and intentionally expose no public
+// listing/deletion API in v0.1.0, so this legacy GC retains every other key rather
+// than deriving SessionStore's private physical layout or accidentally reaping an
+// artifact, checkpoint, tool result, or journal object it cannot prove unreachable.
 func (g *ObjectGC) listBlobs(ctx context.Context) ([]string, error) {
 	prefix := g.name + blobsInfix
 	keys, err := g.blobs.List(ctx, prefix)
 	if err != nil {
 		return nil, &GCListError{Prefix: prefix, Cause: err}
 	}
-	return keys, nil
+	legacy := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if isLegacyBlobKey(prefix, key) {
+			legacy = append(legacy, key)
+		}
+	}
+	return legacy, nil
+}
+
+func isLegacyBlobKey(prefix, key string) bool {
+	if !strings.HasPrefix(key, prefix) {
+		return false
+	}
+	leaf := strings.TrimPrefix(key, prefix)
+	if len(leaf) != sha256.Size*2 {
+		return false
+	}
+	digest, err := hex.DecodeString(leaf)
+	return err == nil && len(digest) == sha256.Size && hex.EncodeToString(digest) == leaf
 }
 
 // sweep deletes each listed blob that is NOT in the live set, re-checking the lease

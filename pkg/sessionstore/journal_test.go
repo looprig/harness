@@ -345,13 +345,12 @@ func TestAppendOverThresholdOffloads(t *testing.T) {
 	if metadata.Digest != "sha256:"+wantHex || metadata.SizeBytes != uint64(len(body)) {
 		t.Errorf("metadata = %+v, want digest sha256:%s and size %d", metadata, wantHex, len(body))
 	}
-	wantKey, err := durableBlobKey(ledgerName(id), *env.Runtime.Reference)
+	rc, err := st.durable.GetObject(context.Background(), durablestore.GetObjectRequest{
+		TenantID: harnessTenantID, SessionID: harnessSessionID(id),
+		ExpectedKind: durablestore.ObjectKindJournalRuntime, Metadata: metadata,
+	})
 	if err != nil {
-		t.Fatalf("durableBlobKey() error = %v", err)
-	}
-	rc, err := st.backend.Blobs.Get(context.Background(), wantKey)
-	if err != nil {
-		t.Fatalf("Blobs.Get() err = %v", err)
+		t.Fatalf("GetObject() err = %v", err)
 	}
 	defer rc.Close()
 	got, err := io.ReadAll(rc)

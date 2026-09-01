@@ -19,6 +19,14 @@ import (
 	"github.com/looprig/storage"
 )
 
+// maxRuntimeBodyBytes mirrors the fail-closed ceiling enforced by Harness's
+// event and command decoders. Gate-prepared records are composed from those same
+// bounded codecs and smaller validated gate payloads. Keep the boundary test in
+// replay_test.go aligned if a codec ceiling changes.
+const maxRuntimeBodyBytes = 16 << 20
+
+var errDurableBodyLength = errors.New("sessionstore: durable body length does not match reference")
+
 // ReplayRequest positions a sessionstore replay. It carries an exported inclusive
 // start sequence because journal.ReplayRequest hides its start behind a
 // package-private journal.StartPos that an out-of-package replayer cannot read: the
@@ -362,6 +370,13 @@ func (b *baseCursor) resolveDurableBody(ctx context.Context, slot durablestore.B
 	if slot.Reference == nil {
 		return nil, &EnvelopeError{Reason: "missing durable runtime body"}
 	}
+	if slot.Reference.SizeBytes > maxRuntimeBodyBytes {
+		return nil, &BlobIntegrityError{
+			Seq: seq, Key: slot.Reference.Reference.ObjectID,
+			Want: "size <= " + strconv.Itoa(maxRuntimeBodyBytes),
+			Got:  "declared size " + strconv.FormatUint(slot.Reference.SizeBytes, 10),
+		}
+	}
 	metadata, err := slot.Reference.ObjectMetadata()
 	if err != nil {
 		return nil, err
@@ -372,13 +387,28 @@ func (b *baseCursor) resolveDurableBody(ctx context.Context, slot durablestore.B
 	if err != nil {
 		return nil, mapDurableObjectError(seq, slot.Reference, err)
 	}
-	body, readErr := io.ReadAll(reader)
+	body, readErr := readDeclaredBody(reader, slot.Reference.SizeBytes)
 	closeErr := reader.Close()
 	if readErr != nil {
 		return nil, mapDurableObjectError(seq, slot.Reference, readErr)
 	}
 	if closeErr != nil {
 		return nil, mapDurableObjectError(seq, slot.Reference, closeErr)
+	}
+	return body, nil
+}
+
+// readDeclaredBody admits at most the declared bytes plus one sentinel byte.
+// The extra byte distinguishes an exact body from an overlong source without
+// allowing a provider to make allocation proportional to untrusted content.
+// Callers validate declared against maxRuntimeBodyBytes before reaching here.
+func readDeclaredBody(reader io.Reader, declared uint64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(reader, int64(declared)+1)) // #nosec G115 -- caller caps declared at 16 MiB
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(body)) != declared {
+		return nil, errDurableBodyLength
 	}
 	return body, nil
 }
@@ -393,6 +423,9 @@ func mapDurableObjectError(seq uint64, reference *durablestore.BodyReference, er
 	var objectErr *durablestore.ObjectError
 	if errors.As(err, &objectErr) && (objectErr.Code == durablestore.ObjectErrorIntegrity || objectErr.Code == durablestore.ObjectErrorSize) {
 		return &BlobIntegrityError{Seq: seq, Key: key, Want: want, Got: "unverified"}
+	}
+	if errors.Is(err, errDurableBodyLength) {
+		return &BlobIntegrityError{Seq: seq, Key: key, Want: want, Got: "size mismatch"}
 	}
 	return &BlobUnavailableError{Seq: seq, Key: key, Cause: err}
 }
