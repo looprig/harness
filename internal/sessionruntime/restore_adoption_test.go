@@ -14,6 +14,7 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/sessionstore"
+	durablestore "github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -753,6 +754,135 @@ func (lg *leaseLosingLedger) Tip(ctx context.Context, name string) (uint64, erro
 
 func (lg *leaseLosingLedger) Delete(ctx context.Context, name string) error {
 	return lg.inner.Delete(ctx, name)
+}
+
+// openingConflictLedger injects one foreign record on its bound stream immediately
+// before the FIRST append that stream sees — which, for a restoring store, is the
+// opening LeaseFence. That fence's CAS therefore conflicts deterministically,
+// modelling the real handoff window the sessionstore fence exists to catch: a
+// predecessor writer parked in I/O since before the old owner released can still
+// land a durable append between the successor's tip read and its fence.
+type openingConflictLedger struct {
+	inner storage.Ledger
+	name  string
+	racer []byte
+	once  sync.Once
+}
+
+func (l *openingConflictLedger) Append(ctx context.Context, name string, expected uint64, payload []byte) error {
+	if name == l.name {
+		l.once.Do(func() {
+			if err := l.inner.Append(context.Background(), name, expected, l.racer); err != nil {
+				panic(err)
+			}
+		})
+	}
+	return l.inner.Append(ctx, name, expected, payload)
+}
+
+func (l *openingConflictLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
+	return l.inner.Read(ctx, name, from)
+}
+func (l *openingConflictLedger) Tip(ctx context.Context, name string) (uint64, error) {
+	return l.inner.Tip(ctx, name)
+}
+func (l *openingConflictLedger) Delete(ctx context.Context, name string) error {
+	return l.inner.Delete(ctx, name)
+}
+
+// epochCountingLeaser records the epoch of every grant it hands out, so a test can
+// prove a failed ownership claim was retried under a NEW grant rather than rebased
+// under the spent one.
+type epochCountingLeaser struct {
+	inner  storage.Leaser
+	mu     sync.Mutex
+	epochs []uint64
+}
+
+func (le *epochCountingLeaser) Acquire(ctx context.Context, name string) (storage.Lease, error) {
+	lease, err := le.inner.Acquire(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	le.mu.Lock()
+	le.epochs = append(le.epochs, lease.Epoch())
+	le.mu.Unlock()
+	return lease, nil
+}
+
+func (le *epochCountingLeaser) granted() []uint64 {
+	le.mu.Lock()
+	defer le.mu.Unlock()
+	return append([]uint64(nil), le.epochs...)
+}
+
+// TestRestoreClaimsFreshGrantAfterOpeningFenceConflict covers the handoff boundary
+// from the CALLER's side. sessionstore no longer refreshes the tip and retries the
+// opening fence under one lease grant — a rebased fence can land behind a
+// higher-epoch owner's and silently launder a fenced-out writer's records into the
+// current epoch — so it fails closed with *sessionstore.OpeningFenceConflictError
+// and releases the grant. Liveness is the caller's job, and it is preserved the
+// only safe way: acquire a NEW lease, whose epoch is strictly higher, and claim
+// ownership again with a new writer. The restore must therefore still succeed
+// despite a predecessor append landing inside the fence window, and must have spent
+// two grants with strictly increasing epochs to do it.
+func TestRestoreClaimsFreshGrantAfterOpeningFenceConflict(t *testing.T) {
+	backend := memstore.New()
+	origStore, err := sessionstore.Open(backend)
+	if err != nil {
+		t.Fatalf("sessionstore.Open(orig): %v", err)
+	}
+	definition := restoreCfg(&stubLLM{}, "model-x", "be helpful")
+	fp := fingerprintFromDefinition(definition)
+	orig := buildManifestStream(t, origStore, fp, baselineManifest(), "agent")
+	handOver(t, orig.lease)
+
+	// The predecessor's would-be append: a decodable frame (a foreign owner's
+	// opening fence) so replay fails only on the invariant under test. Asserting the
+	// fixture decodes keeps every assertion below non-vacuous.
+	racer, err := durablestore.EncodeEnvelope(durablestore.Envelope{
+		Kind: durablestore.EnvelopeKindOpeningFence, LeaseEpoch: 99,
+	})
+	if err != nil {
+		t.Fatalf("EncodeEnvelope(racer fence): %v", err)
+	}
+	if env, decodeErr := durablestore.DecodeEnvelope(racer); decodeErr != nil ||
+		env.Kind != durablestore.EnvelopeKindOpeningFence || env.LeaseEpoch != 99 {
+		t.Fatalf("racer fixture decodes as (%+v, %v), want an opening fence at epoch 99", env, decodeErr)
+	}
+
+	leaser := &epochCountingLeaser{inner: backend.Leaser}
+	ledger := &openingConflictLedger{
+		inner: backend.Ledger,
+		name:  "sessions/" + orig.sessionID.String(),
+		racer: racer,
+	}
+	wrapped, err := storage.NewCompositeWithOrderedIndex(ledger, leaser, backend.KV, backend.Blobs, backend.OrderedIndex)
+	if err != nil {
+		t.Fatalf("storage.NewComposite: %v", err)
+	}
+	restoreStore, err := sessionstore.Open(wrapped)
+	if err != nil {
+		t.Fatalf("sessionstore.Open(restore): %v", err)
+	}
+
+	s, err := restoreTestSession(context.Background(), definition, orig.sessionID, restoreStore,
+		WithManifest(baselineManifest()))
+	if err != nil {
+		t.Fatalf("Restore err = %v, want success under a fresh grant after the opening-fence conflict", err)
+	}
+	if s == nil {
+		t.Fatal("Restore returned a nil Session")
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	granted := leaser.granted()
+	if len(granted) != 2 {
+		t.Fatalf("grants acquired = %v, want exactly 2 (the spent one and one fresh claim)", granted)
+	}
+	if granted[1] <= granted[0] {
+		t.Errorf("grant epochs = %v, want strictly increasing (a fresh grant, not a rebase)", granted)
+	}
 }
 
 // TestRestoreAdoptionLeaseLost: a manifest-carrying session restored with an Info-level drift

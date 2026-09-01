@@ -218,13 +218,18 @@ func restoreTopologySession(
 
 	// (1) Acquire the single-writer lease, then construct the journal (which writes the
 	// opening LeaseFence as its first append — the handover boundary) and the replayer,
-	// all through the sessionstore facade over the composition-root-wired backend.
+	// all through the sessionstore facade over the composition-root-wired backend. A
+	// fence that loses the handover race costs the grant, not the restore:
+	// openJournalUnderFreshGrant claims again under a NEW lease at a higher epoch, and
+	// the lease it returns — not the one acquired just above — is the session's from
+	// here on.
 	lease, err := store.AcquireLease(ctx, sessionID)
 	if err != nil {
 		return nil, &RestoreError{Kind: RestoreLeaseFailed, Cause: err}
 	}
-	j, err := store.OpenJournalWithOpeningAppend(
+	j, lease, err := openJournalUnderFreshGrant(
 		ctx,
+		store,
 		sessionID,
 		lease,
 		journal.HookMiddleware(probe.hooks, sessionID),
@@ -1642,6 +1647,53 @@ func openTurnCoords(events []event.Event) (uuid.UUID, event.TurnIndex) {
 		}
 	}
 	return uuid.UUID{}, 0
+}
+
+// openingGrantAttempts bounds how many successive lease GRANTS one call will spend
+// claiming journal ownership. Each attempt fences under its own freshly acquired
+// epoch: sessionstore refuses to rebase a grant onto a refreshed tip (see
+// *sessionstore.OpeningFenceConflictError), because a fence planted at a refreshed
+// tip can land behind a HIGHER-epoch owner's fence, after which every record that
+// writer appends reads to a later replayer as the higher epoch's own. Retrying with
+// a new grant keeps the handoff live without that: a predecessor append that was
+// already in flight when the old owner released simply costs one epoch. Persistent
+// contention still fails closed instead of spinning.
+const openingGrantAttempts = 8
+
+// openJournalUnderFreshGrant opens sessionID's journal under lease, and — when the
+// opening fence loses the ownership race — acquires a NEW lease and claims ownership
+// again with a new writer, up to openingGrantAttempts grants. sessionstore has
+// already released the grant that lost, so the returned lease is the one the caller
+// must use from here on: it may not be the one passed in. The lease returned
+// alongside an error is likewise the caller's to release (a second release of an
+// already-released grant is a no-op), so no failure path strands ownership.
+func openJournalUnderFreshGrant(
+	ctx context.Context,
+	store *sessionstore.Store,
+	sessionID uuid.UUID,
+	lease journal.Lease,
+	middleware journal.AppendMiddleware,
+) (journal.SessionJournal, journal.Lease, error) {
+	var lastErr error
+	for attempt := 0; attempt < openingGrantAttempts; attempt++ {
+		j, err := store.OpenJournalWithOpeningAppend(ctx, sessionID, lease, middleware)
+		if err == nil {
+			return j, lease, nil
+		}
+		lastErr = err
+		var conflict *sessionstore.OpeningFenceConflictError
+		if !errors.As(err, &conflict) || attempt == openingGrantAttempts-1 {
+			break
+		}
+		fresh, acquireErr := store.AcquireLease(ctx, sessionID)
+		if acquireErr != nil {
+			// Someone else genuinely owns the session now (or the leaser is down):
+			// fail closed on the acquisition error, which names the live holder.
+			return nil, lease, acquireErr
+		}
+		lease = fresh
+	}
+	return nil, lease, lastErr
 }
 
 // releaseLease releases the lease on a bounded context, best-effort. On a failed restore

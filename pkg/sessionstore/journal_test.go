@@ -918,16 +918,58 @@ func TestOpenJournalFenceSurvivesConcurrentWriteDuringHydration(t *testing.T) {
 	}
 }
 
-// TestOpenJournalRetriesFenceAfterPredecessorWrite tests the handoff boundary
-// separately from the hydration race above. A predecessor append can already
-// have passed its lease check when the old owner releases; if it lands between
-// the successor's Tip read and opening-fence CAS, the successor must refresh
-// the tip and claim ownership instead of failing the restore spuriously.
-func TestOpenJournalRetriesFenceAfterPredecessorWrite(t *testing.T) {
-	t.Parallel()
-	backend := memstore.New()
+// fenceFrame builds the exact ledger frame a foreign owner's opening fence at
+// epoch occupies, so a test can inject a legitimate SUCCESSOR's claim onto the
+// ledger. It asserts the fixture round-trips before any test measures against it:
+// a frame that did not decode as an opening fence at this epoch would make every
+// epoch high-water assertion below vacuous.
+func fenceFrame(t *testing.T, epoch uint64) []byte {
+	t.Helper()
+	frame, err := durablestore.EncodeEnvelope(durablestore.Envelope{
+		Kind: durablestore.EnvelopeKindOpeningFence, LeaseEpoch: epoch,
+	})
+	if err != nil {
+		t.Fatalf("EncodeEnvelope(opening fence epoch %d) err = %v", epoch, err)
+	}
+	env, err := durablestore.DecodeEnvelope(frame)
+	if err != nil || env.Kind != durablestore.EnvelopeKindOpeningFence || env.LeaseEpoch != epoch {
+		t.Fatalf("fenceFrame fixture decodes as (%+v, %v), want an opening fence at epoch %d", env, err, epoch)
+	}
+	return frame
+}
+
+// fenceEpochAt reads record seq and returns the opening-fence epoch it carries,
+// failing the test if that record is not an opening fence.
+func fenceEpochAt(t *testing.T, st *Store, id uuid.UUID, seq uint64) uint64 {
+	t.Helper()
+	cur, err := st.backend.Ledger.Read(context.Background(), ledgerName(id), seq)
+	if err != nil {
+		t.Fatalf("Ledger.Read(%d) err = %v", seq, err)
+	}
+	rec, err := cur.Next(context.Background())
+	if err != nil {
+		t.Fatalf("Cursor.Next() at %d err = %v", seq, err)
+	}
+	env, err := durablestore.DecodeEnvelope(rec.Payload)
+	if err != nil {
+		t.Fatalf("DecodeEnvelope(record %d) err = %v", seq, err)
+	}
+	if env.Kind != durablestore.EnvelopeKindOpeningFence {
+		t.Fatalf("record %d kind = %v, want an opening fence", seq, env.Kind)
+	}
+	return env.LeaseEpoch
+}
+
+// openConflicted drives one OpenJournal whose opening fence deterministically
+// conflicts with a legitimate successor's fence injected immediately before the
+// CAS, and returns the store, the spent grant, the successor's epoch and the
+// error. The shared setup for the two properties asserted separately below.
+func openConflicted(t *testing.T, backend *storage.Composite) (*Store, uuid.UUID, journal.Lease, uint64, error) {
+	t.Helper()
 	id := newTestUUID(t)
 	name := ledgerName(id)
+
+	// A legitimate prior owner seeds the ledger, leaving its fence at tip 1.
 	st1, err := Open(backend)
 	if err != nil {
 		t.Fatalf("Open() err = %v", err)
@@ -943,20 +985,7 @@ func TestOpenJournalRetriesFenceAfterPredecessorWrite(t *testing.T) {
 		t.Fatalf("Release() err = %v", err)
 	}
 
-	racerID := newTestUUID(t)
-	racer := event.SessionStarted{
-		Header: event.Header{Coordinates: identity.Coordinates{SessionID: id}, EventID: racerID},
-	}
-	body, err := event.MarshalEvent(racer)
-	if err != nil {
-		t.Fatalf("MarshalEvent() err = %v", err)
-	}
-	racerFrame, err := encodeEnvelope(envelope{V: envelopeVersion, Kind: string(kindEvent), ID: racerID.String(), Body: body})
-	if err != nil {
-		t.Fatalf("encodeEnvelope() err = %v", err)
-	}
-
-	raced := &fenceRaceLedger{inner: backend.Ledger, name: name, racer: racerFrame}
+	raced := &fenceRaceLedger{inner: backend.Ledger, name: name}
 	comp := &storage.Composite{Ledger: raced, Leaser: backend.Leaser, KV: backend.KV, OrderedIndex: backend.OrderedIndex, Blobs: backend.Blobs}
 	st2, err := Open(comp)
 	if err != nil {
@@ -966,20 +995,144 @@ func TestOpenJournalRetriesFenceAfterPredecessorWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AcquireLease() err = %v", err)
 	}
+	// The racer is a legitimate SUCCESSOR's opening fence at a strictly higher
+	// epoch than the grant under test — the case that makes rebasing unsafe rather
+	// than merely untidy.
+	successorEpoch := lease2.Epoch() + 1
+	raced.racer = fenceFrame(t, successorEpoch)
+
 	opened, err := st2.OpenJournal(context.Background(), id, lease2)
+	if opened != nil {
+		t.Fatalf("OpenJournal() = %T, want no journal after an opening-fence conflict", opened)
+	}
+	return st2, id, lease2, successorEpoch, err
+}
+
+// TestOpenJournalFenceConflictRefusesRebaseUnderOneGrant replaces the deleted
+// TestOpenJournalRetriesFenceAfterPredecessorWrite, which asserted the opposite:
+// that a conflicting opening fence refreshed the tip and retried under the same
+// grant. That retry is the defect. The injected conflict here is a legitimate
+// successor's opening fence at a strictly higher epoch; a rebasing writer would
+// plant ITS OWN lower-epoch fence after that one, so the ledger's epoch high-water
+// would fall and every record it went on to append would read, to a later
+// replayer, as belonging to the successor's epoch. Open must therefore fail
+// closed with a typed *OpeningFenceConflictError, leave the successor's fence as
+// the ledger's last record, and never CAS at anything but the tip it first read.
+// The legal path is asserted just as hard: a freshly acquired grant, at a strictly
+// higher epoch, still opens.
+func TestOpenJournalFenceConflictRefusesRebaseUnderOneGrant(t *testing.T) {
+	t.Parallel()
+	backend := memstore.New()
+	st, id, spent, successorEpoch, err := openConflicted(t, backend)
+
+	var conflict *OpeningFenceConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("OpenJournal() err = %v, want *OpeningFenceConflictError", err)
+	}
+	if conflict.SessionID != id || conflict.Epoch != spent.Epoch() {
+		t.Errorf("OpeningFenceConflictError = {%v, %d}, want {%v, %d}", conflict.SessionID, conflict.Epoch, id, spent.Epoch())
+	}
+	// The CAS cause is still reachable, and it fenced on the tip Open first read
+	// (1, the prior owner's fence) — never on a refreshed one.
+	var appendErr *journal.AppendError
+	if !errors.As(err, &appendErr) {
+		t.Fatalf("OpenJournal() err = %v, want a wrapped *journal.AppendError", err)
+	}
+	if appendErr.Expected != 1 {
+		t.Errorf("AppendError.Expected = %d, want 1 (the tip read at Open; a rebase would show 2)", appendErr.Expected)
+	}
+
+	tip, err := st.backend.Ledger.Tip(context.Background(), ledgerName(id))
 	if err != nil {
-		t.Fatalf("OpenJournal() err = %v, want retry after predecessor append", err)
+		t.Fatalf("Tip() err = %v", err)
 	}
-	idempotent, ok := opened.(journal.IdempotentJournal)
-	if !ok {
-		t.Fatalf("OpenJournal() = %T, want journal.IdempotentJournal", opened)
+	if tip != 2 {
+		t.Fatalf("Tip() = %d, want 2 (the prior fence and the successor's fence, nothing from the spent grant)", tip)
 	}
-	result, err := idempotent.AppendIdempotent(context.Background(), journal.NewEventRecord(racer))
+	if got := fenceEpochAt(t, st, id, 2); got != successorEpoch {
+		t.Errorf("last record fence epoch = %d, want %d (the epoch high-water must not fall)", got, successorEpoch)
+	}
+
+	// Legal path: a newly acquired grant carries a strictly higher epoch and opens.
+	fresh, err := st.AcquireLease(context.Background(), id)
 	if err != nil {
-		t.Fatalf("AppendIdempotent(predecessor record) err = %v", err)
+		t.Fatalf("AcquireLease() after conflict err = %v", err)
 	}
-	if result.Appended || result.Sequence != 2 {
-		t.Fatalf("AppendIdempotent(predecessor record) = %+v, want deduplicated seq 2", result)
+	if fresh.Epoch() <= spent.Epoch() {
+		t.Fatalf("fresh lease epoch = %d, want strictly greater than the spent grant's %d", fresh.Epoch(), spent.Epoch())
+	}
+	if fresh.Epoch() < successorEpoch {
+		t.Fatalf("fresh lease epoch = %d, want >= the successor's %d (high-water never falls)", fresh.Epoch(), successorEpoch)
+	}
+	j, err := st.OpenJournal(context.Background(), id, fresh)
+	if err != nil || j == nil {
+		t.Fatalf("OpenJournal(fresh grant) = (%T, %v), want a ready journal", j, err)
+	}
+	if got := fenceEpochAt(t, st, id, 3); got != fresh.Epoch() {
+		t.Errorf("reopened fence epoch = %d, want %d", got, fresh.Epoch())
+	}
+}
+
+// TestOpeningFenceFailureReleasesGrant asserts the other half of "never rebase
+// under one grant": the grant that lost the opening race is SPENT. Open releases
+// it, so the same lease value cannot be replayed into a second Open to obtain the
+// rebase the removed retry loop used to perform in-line — the ledger is quiet by
+// then, so without the release that second Open would succeed and plant the
+// spent epoch's fence after the successor's. The threshold is driven on both
+// sides: the spent epoch (equal) is refused, a newly acquired strictly higher
+// epoch is admitted.
+func TestOpeningFenceFailureReleasesGrant(t *testing.T) {
+	t.Parallel()
+	backend := memstore.New()
+	st, id, spent, successorEpoch, err := openConflicted(t, backend)
+	var conflict *OpeningFenceConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("OpenJournal() err = %v, want *OpeningFenceConflictError", err)
+	}
+
+	select {
+	case <-spent.Lost():
+	default:
+		t.Error("spent grant Lost() is still open; the conflicting Open must release it")
+	}
+	if spent.Valid() {
+		t.Error("spent grant Valid() = true, want false after the conflicting Open released it")
+	}
+
+	// Replaying the spent grant is refused at the same epoch, and nothing lands.
+	reopened, err := st.OpenJournal(context.Background(), id, spent)
+	if reopened != nil {
+		t.Fatalf("OpenJournal(spent grant) = %T, want no journal", reopened)
+	}
+	var lost *journal.JournalLeaseLostError
+	if !errors.As(err, &lost) {
+		t.Fatalf("OpenJournal(spent grant) err = %v, want *journal.JournalLeaseLostError", err)
+	}
+	if lost.SessionID != id || lost.Epoch != spent.Epoch() {
+		t.Errorf("JournalLeaseLostError = {%v, %d}, want {%v, %d}", lost.SessionID, lost.Epoch, id, spent.Epoch())
+	}
+	tip, err := st.backend.Ledger.Tip(context.Background(), ledgerName(id))
+	if err != nil {
+		t.Fatalf("Tip() err = %v", err)
+	}
+	if tip != 2 {
+		t.Fatalf("Tip() = %d, want 2 (the spent grant must not plant a fence on a second attempt)", tip)
+	}
+	if got := fenceEpochAt(t, st, id, 2); got != successorEpoch {
+		t.Errorf("last record fence epoch = %d, want %d (the epoch high-water must not fall)", got, successorEpoch)
+	}
+
+	// The release reached the leaser, not just the local flag: the name is free, so
+	// a successor can acquire it — at a strictly higher epoch — and open.
+	fresh, err := st.AcquireLease(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AcquireLease() after the conflicting Open err = %v (the spent grant was not released at the leaser)", err)
+	}
+	if fresh.Epoch() <= spent.Epoch() {
+		t.Fatalf("fresh lease epoch = %d, want strictly greater than the spent grant's %d", fresh.Epoch(), spent.Epoch())
+	}
+	if j, err := st.OpenJournal(context.Background(), id, fresh); err != nil || j == nil {
+		t.Fatalf("OpenJournal(fresh grant) = (%T, %v), want a ready journal", j, err)
 	}
 }
 
@@ -997,9 +1150,10 @@ type openRaceLedger struct {
 	fire  func()
 }
 
-// fenceRaceLedger injects one predecessor record immediately before the first
-// opening-fence append. The first fence CAS therefore conflicts deterministically;
-// a correct handoff retries against the refreshed tip.
+// fenceRaceLedger injects one foreign record immediately before the first
+// opening-fence append, so that fence's CAS conflicts deterministically. A correct
+// handoff does NOT refresh the tip and try again: the grant is spent and Open
+// fails closed.
 type fenceRaceLedger struct {
 	inner storage.Ledger
 	name  string

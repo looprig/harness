@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"io"
+	"strconv"
 	"sync"
 	"time"
 
@@ -33,12 +34,6 @@ const appendTimeout = 5 * time.Second
 // (for every offloaded record) fetch a whole session's history, not one record.
 const hydrateTimeout = 30 * time.Second
 
-// openingFenceMaxAttempts bounds ownership handoff retries. A predecessor append
-// may already have passed its lease check when the old owner releases; if that
-// append lands between this owner's Tip read and fence CAS, Open refreshes the
-// tip and retries. Persistent contention still fails closed instead of spinning.
-const openingFenceMaxAttempts = 8
-
 // blobsInfix is the name segment separating a session's ledger prefix from its
 // content-addressed offload blobs: a blob lands at "sessions/<uuid>/blobs/<sha>".
 const blobsInfix = "/blobs/"
@@ -61,6 +56,31 @@ type NilLeaseError struct {
 func (e *NilLeaseError) Error() string {
 	return "sessionstore: session " + e.SessionID.String() + ": nil lease"
 }
+
+// OpeningFenceConflictError reports that a journal's OPENING fence lost the
+// ownership race: the ledger tip moved between this Open's tip read and its fence
+// CAS, so some other writer legitimately owns the stream now. It is deliberately
+// NOT a transient failure. A lease grant is never rebased: this Open does not
+// refresh the tip and try again under the same epoch, because a fence planted at a
+// refreshed tip can land AFTER a higher-epoch owner's fence, and every record the
+// rebased writer then appends reads, to any later replayer, as though it belonged
+// to that higher epoch — the ledger's epoch high-water would fall and a fenced-out
+// writer's state would be folded in as the current owner's. The grant that hit this
+// error is spent and has been released; the caller must acquire a FRESH lease
+// (which yields a strictly higher epoch) and construct a new writer.
+type OpeningFenceConflictError struct {
+	SessionID uuid.UUID
+	Epoch     uint64 // the spent grant's epoch, already released
+	Cause     error  // the underlying *journal.AppendError
+}
+
+func (e *OpeningFenceConflictError) Error() string {
+	return "sessionstore: session " + e.SessionID.String() + ": opening fence at epoch " +
+		strconv.FormatUint(e.Epoch, 10) + " lost the ownership race; acquire a fresh lease and open a new journal: " +
+		e.Cause.Error()
+}
+
+func (e *OpeningFenceConflictError) Unwrap() error { return e.Cause }
 
 // sessionJournal is the concrete single-writer serializer over a storage ledger:
 // it frames each JournalRecord as a versioned envelope, offloads an over-threshold
@@ -124,7 +144,14 @@ var (
 // carrying the lease epoch — as an append fenced on the ledger's current tip. That
 // fence advances the tip, so any stale prior writer's next CAS append conflicts;
 // only once it commits is the journal ready to accept Appends. The lease is a
-// required dependency (DIP): a nil lease fails closed with *NilLeaseError.
+// required dependency (DIP): a nil lease fails closed with *NilLeaseError, and a
+// lease whose grant has already ended fails closed with
+// *journal.JournalLeaseLostError before any tip is read.
+//
+// The fence is attempted EXACTLY ONCE. If it loses the CAS the grant is released
+// and *OpeningFenceConflictError is returned; the caller acquires a fresh lease —
+// a strictly higher epoch — and constructs a new writer. A grant is never rebased
+// onto a refreshed tip.
 func (s *Store) OpenJournal(ctx context.Context, id uuid.UUID, lease journal.Lease) (journal.SessionJournal, error) {
 	return s.OpenJournalWithOpeningAppend(ctx, id, lease, nil)
 }
@@ -141,6 +168,16 @@ func (s *Store) OpenJournalWithOpeningAppend(
 ) (journal.SessionJournal, error) {
 	if lease == nil {
 		return nil, &NilLeaseError{SessionID: id}
+	}
+	// Refuse a grant that has already ended before touching the ledger. writeLocked
+	// has no lease guard of its own — it is the raw CAS core — so without this an
+	// ended grant (including one this very function released after losing an earlier
+	// opening race) could be replayed into a second Open and, finding the ledger
+	// quiet by then, plant its now-stale epoch's fence AFTER a higher-epoch owner's.
+	// That is the same rebase the removed retry loop performed in-line, spread over
+	// two calls. The ledger CAS is the hard backstop; this is the fast-path refusal.
+	if !leaseGrantHeld(lease) {
+		return nil, &journal.JournalLeaseLostError{SessionID: id, Epoch: lease.Epoch()}
 	}
 	name, err := sessionName(id)
 	if err != nil {
@@ -177,18 +214,17 @@ func (s *Store) OpenJournalWithOpeningAppend(
 	// journal.HookMiddleware whenever a hook handles OperationJournalAppend) still
 	// runs between the tip read and the CAS below and could itself do I/O — that
 	// gap is real but bounded by whatever the hook does, not by a full-ledger
-	// walk, and it existed in this exact position in the pre-fix code too.
+	// walk.
 	// Claiming the fence this early, BEFORE the idempotency-index hydration below,
 	// closes the window in which a still-live predecessor writer (a crash-path
 	// teardown append, or a parked goroutine unblocked by context cancellation —
 	// see handBackRequest) could land a write on this ledger and advance the tip
 	// out from under a tip value cached before a slow walk. The first append is
-	// the opening fence, stamping the lease
-	// epoch and fenced on the current tip. A predecessor append that passed its
-	// lease check before handoff may still advance the ledger here; the bounded
-	// loop refreshes the tip and retries while this lease remains valid. Any other
-	// append failure or persistent contention fails closed. Only once the fence
-	// commits is the journal ready.
+	// the opening fence, stamping the lease epoch and fenced on the tip read just
+	// above — the only tip this grant will ever fence on. If the ledger moved in
+	// between, this grant lost the ownership race and Open fails closed below; it
+	// does NOT refresh the tip and try again. Any other append failure also fails
+	// closed. Only once the fence commits is the journal ready.
 	fence := journal.NewFenceRecord(id, journal.LeaseFence{Epoch: lease.Epoch()})
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -205,30 +241,8 @@ func (s *Store) OpenJournalWithOpeningAppend(
 		// writeLocked path — never through appendChecked's idempotency gate — so
 		// even a repeated lease epoch (whose id would otherwise look like a prior
 		// duplicate) still physically advances the tip and fences out a stale
-		// writer.
-		for attempt := 0; attempt < openingFenceMaxAttempts; attempt++ {
-			fenceSeq, fenceErr = j.writeLocked(appendCtx, fence)
-			if fenceErr == nil {
-				break
-			}
-			var conflict *storage.ConflictError
-			if !errors.As(fenceErr, &conflict) || attempt == openingFenceMaxAttempts-1 {
-				break
-			}
-			if !j.leaseHeld() {
-				fenceErr = &journal.JournalLeaseLostError{SessionID: id, Epoch: lease.Epoch()}
-				break
-			}
-			refreshCtx, refreshCancel := context.WithTimeout(appendCtx, appendTimeout)
-			refreshedTip, refreshErr := s.backend.Ledger.Tip(refreshCtx, name)
-			refreshCancel()
-			if refreshErr != nil {
-				fenceErr = refreshErr
-				break
-			}
-			tip = refreshedTip
-			j.trackedTip = refreshedTip
-		}
+		// writer. One attempt, on the tracked tip as read above.
+		fenceSeq, fenceErr = j.writeLocked(appendCtx, fence)
 		return fenceSeq, fenceErr
 	})
 	if middleware != nil {
@@ -245,6 +259,24 @@ func (s *Store) OpenJournalWithOpeningAppend(
 		return nil, errOpeningAppendMiddleware
 	}
 	if fenceErr != nil {
+		var conflict *storage.ConflictError
+		if errors.As(fenceErr, &conflict) {
+			// The ledger moved between this Open's tip read and its fence CAS, so some
+			// other writer owns the stream. Retrying under this grant is exactly the
+			// rebase the fence exists to prevent: a fence planted at a refreshed tip
+			// can land after a HIGHER-epoch owner's fence, dropping the ledger's epoch
+			// high-water, and every record this writer then appended would read to a
+			// later replayer as the higher epoch's own — a fenced-out writer's state
+			// folded in as the current owner's. Surrender the grant instead. The
+			// release runs on its own background deadline, not ctx: it must happen even
+			// when Open is failing because ctx is already done, and a stale release can
+			// never free a later holder. A second release by the caller's own failure
+			// path is a no-op.
+			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), appendTimeout)
+			_ = lease.Release(releaseCtx)
+			releaseCancel()
+			return nil, &OpeningFenceConflictError{SessionID: id, Epoch: lease.Epoch(), Cause: fenceErr}
+		}
 		return nil, fenceErr
 	}
 
@@ -513,12 +545,16 @@ func (b *sessionJournal) prepareDeliveryTransition(record journal.CommandRecord)
 // leaseHeld reports whether the ownership lease is still held: both its validity
 // flag and its loss channel must say so. It is the fast-path ownership guard; the
 // ledger's CAS fence is the hard backstop that catches a loss this guard races.
-func (b *sessionJournal) leaseHeld() bool {
-	if !b.lease.Valid() {
+func (b *sessionJournal) leaseHeld() bool { return leaseGrantHeld(b.lease) }
+
+// leaseGrantHeld is leaseHeld over a bare grant, for the ownership check
+// OpenJournal makes before a journal exists to ask.
+func leaseGrantHeld(lease journal.Lease) bool {
+	if !lease.Valid() {
 		return false
 	}
 	select {
-	case <-b.lease.Lost():
+	case <-lease.Lost():
 		return false
 	default:
 		return true

@@ -216,6 +216,141 @@ func TestOpenJournalWithOpeningAppendCannotRewriteFenceResult(t *testing.T) {
 	}
 }
 
+// TestOpeningFenceConflictNeverRereadsTip is the mechanical half of the no-rebase
+// rule, measured at the ledger seam rather than through the returned error: across
+// a whole Open whose opening fence conflicts, the writer must issue exactly ONE
+// Tip read for its stream and exactly ONE CAS, at the expected tip that read
+// returned. The removed retry loop issued a second Tip and a second CAS at the
+// refreshed value — that is the rebase, and it is invisible to an error-only
+// assertion. The middleware seam is exercised at the same time: it observes the
+// single append and its terminal carries the raw CAS failure, while Open's own
+// result is the typed *OpeningFenceConflictError telling the caller to acquire a
+// fresh lease.
+func TestOpeningFenceConflictNeverRereadsTip(t *testing.T) {
+	t.Parallel()
+
+	backend := memstore.New()
+	sessionID := newTestUUID(t)
+	name := ledgerName(sessionID)
+
+	seeded, err := Open(backend)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	first, err := seeded.AcquireLease(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("AcquireLease: %v", err)
+	}
+	if _, err := seeded.OpenJournal(context.Background(), sessionID, first); err != nil {
+		t.Fatalf("seed OpenJournal: %v", err)
+	}
+	if err := first.Release(context.Background()); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	counting := &openingConflictLedger{Ledger: backend.Ledger, name: name}
+	composite := &storage.Composite{
+		Ledger:       counting,
+		Leaser:       backend.Leaser,
+		KV:           backend.KV,
+		OrderedIndex: backend.OrderedIndex,
+		Blobs:        backend.Blobs,
+	}
+	store, err := Open(composite)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	lease, err := store.AcquireLease(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("AcquireLease: %v", err)
+	}
+	counting.racer = fenceFrame(t, lease.Epoch()+1)
+
+	var results []hook.Result
+	runner, err := hook.Compile(hook.Set{Around: []hook.Around{{
+		Operation: hook.OperationJournalAppend,
+		Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+			return ctx, func(result hook.Result) { results = append(results, result) }
+		},
+	}}})
+	if err != nil {
+		t.Fatalf("hook.Compile: %v", err)
+	}
+
+	opened, err := store.OpenJournalWithOpeningAppend(
+		context.Background(),
+		sessionID,
+		lease,
+		journal.HookMiddleware(runner, sessionID),
+	)
+	if opened != nil {
+		t.Fatalf("OpenJournalWithOpeningAppend returned %T after a conflicting fence", opened)
+	}
+	var conflict *OpeningFenceConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("error = %v, want *OpeningFenceConflictError", err)
+	}
+
+	tips, expected := counting.observed()
+	if tips != 1 {
+		t.Errorf("Tip reads = %d, want 1 (a second read is a rebase of the expected tip)", tips)
+	}
+	if len(expected) != 1 || expected[0] != 1 {
+		t.Errorf("CAS expected values = %v, want exactly [1] (one attempt, on the tip first read)", expected)
+	}
+	if len(results) != 1 || results[0].Outcome != hook.OutcomeFailed {
+		t.Fatalf("opening results = %#v, want one failed terminal", results)
+	}
+	var appendErr *journal.AppendError
+	if !errors.As(results[0].Err, &appendErr) {
+		t.Fatalf("opening terminal err = %v, want a *journal.AppendError", results[0].Err)
+	}
+}
+
+// openingConflictLedger injects one foreign record immediately before the first
+// Append on its bound stream — making that Append's CAS conflict deterministically
+// — and records every Tip read and every CAS expected value the writer issues for
+// that stream, so a test can prove the writer neither rereads nor rebases its tip.
+// The injected write goes through the inner ledger and is deliberately not counted.
+type openingConflictLedger struct {
+	storage.Ledger
+	name     string
+	racer    []byte
+	once     sync.Once
+	mu       sync.Mutex
+	tips     int
+	expected []uint64
+}
+
+func (l *openingConflictLedger) Tip(ctx context.Context, name string) (uint64, error) {
+	if name == l.name {
+		l.mu.Lock()
+		l.tips++
+		l.mu.Unlock()
+	}
+	return l.Ledger.Tip(ctx, name)
+}
+
+func (l *openingConflictLedger) Append(ctx context.Context, name string, expected uint64, payload []byte) error {
+	if name == l.name {
+		l.once.Do(func() {
+			if err := l.Ledger.Append(context.Background(), name, expected, l.racer); err != nil {
+				panic(err)
+			}
+		})
+		l.mu.Lock()
+		l.expected = append(l.expected, expected)
+		l.mu.Unlock()
+	}
+	return l.Ledger.Append(ctx, name, expected, payload)
+}
+
+func (l *openingConflictLedger) observed() (int, []uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.tips, append([]uint64(nil), l.expected...)
+}
+
 type openingFailLedger struct {
 	storage.Ledger
 	err error

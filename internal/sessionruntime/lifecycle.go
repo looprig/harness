@@ -645,16 +645,18 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	}
 
 	// Per-run durable wiring, mirroring the by-hand persistence pattern: acquire the lease,
-	// open the journal fenced on it, then build the three checked appenders over that
-	// journal. The event appender carries the NewTopologyLifecycle-built catalog so the status fold stays
+	// open the journal fenced on it (under a fresh grant if the first fence loses the
+	// ownership race — the returned lease is the session's), then build the three checked
+	// appenders over that journal. The event appender carries the NewTopologyLifecycle-built catalog so the status fold stays
 	// live. On any failure past the lease, release it best-effort (releaseLease, shared with
 	// RestoreSession) so a successor can re-acquire without waiting out the TTL.
 	lease, err := r.store.AcquireLease(ctx, sid)
 	if err != nil {
 		return nil, &NewSessionError{Kind: NewSessionLeaseFailed, Cause: err}
 	}
-	j, err := r.store.OpenJournalWithOpeningAppend(
+	j, lease, err := openJournalUnderFreshGrant(
 		ctx,
+		r.store,
 		sid,
 		lease,
 		journal.HookMiddleware(r.hooks, sid),
