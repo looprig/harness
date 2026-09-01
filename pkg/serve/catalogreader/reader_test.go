@@ -169,6 +169,27 @@ func newCatalog(t *testing.T) (*sessionstore.Store, *sessionstore.Catalog, *mutC
 	return st, cat, clk
 }
 
+// newStoredCatalogReader writes the supplied historical SessionMeta JSON through
+// the real memstore KV boundary. This deliberately exercises SessionMeta's
+// supported decoder rather than constructing a synthetic in-memory meta value.
+func newStoredCatalogReader(t *testing.T, sid uuid.UUID, raw []byte) *catalogreader.Reader {
+	t.Helper()
+	backend := memstore.New()
+	st, err := sessionstore.Open(backend)
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	if _, err := backend.KV.Put(context.Background(), "sessions/"+sid.String(), 0, raw); err != nil {
+		t.Fatalf("KV.Put(historical SessionMeta) err = %v", err)
+	}
+	return catalogreader.NewScoped(
+		st.OpenCatalog(),
+		st,
+		harnesssessionwire.ReadAuthority{TenantID: "tenant-a", AgentID: "fixture-agent"},
+		coresessionwire.SessionResidencyCold,
+	)
+}
+
 // update folds ev into the catalog at seq, failing the test on error.
 func update(t *testing.T, cat *sessionstore.Catalog, ev event.Event, seq uint64) {
 	t.Helper()
@@ -290,6 +311,137 @@ func TestReaderLegacyJSONParityThroughCoreProjection(t *testing.T) {
 	if !bytes.Equal(statusJSON, wantStatus) {
 		t.Errorf("legacy status JSON changed\n got: %s\nwant: %s", statusJSON, wantStatus)
 	}
+}
+
+func TestReaderListSessionsPreservesSupportedPreProjectionRows(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		sid  uuid.UUID
+		raw  []byte
+		want []byte
+	}{
+		{
+			name: "legacy empty state and absent timestamps",
+			sid:  fixedUUID(0x61),
+			raw:  []byte(`{"session_id":"61616161-6161-6161-6161-616161616161","title":"legacy","status":"active","last_journal_seq":7}`),
+			want: []byte(`{"sessions":[{"session_id":"61616161-6161-6161-6161-616161616161","title":"legacy"}],"skip":0,"limit":10,"next_skip":0,"done":true}`),
+		},
+		{
+			name: "current state with absent activity timestamps",
+			sid:  fixedUUID(0x62),
+			raw:  []byte(`{"session_id":"62626262-6262-6262-6262-626262626262","title":"current","status":"active","state":"idle","last_journal_seq":8}`),
+			want: []byte(`{"sessions":[{"session_id":"62626262-6262-6262-6262-626262626262","state":"idle","title":"current"}],"skip":0,"limit":10,"next_skip":0,"done":true}`),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			r := newStoredCatalogReader(t, test.sid, test.raw)
+			got, err := r.ListSessions(context.Background(), serve.Page{Limit: 10})
+			if err != nil {
+				t.Fatalf("ListSessions() error = %T %v, want nil", err, err)
+			}
+			gotJSON, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("json.Marshal(ListSessions()) error = %v", err)
+			}
+			if !bytes.Equal(gotJSON, test.want) {
+				t.Errorf("legacy list JSON changed\n got: %s\nwant: %s", gotJSON, test.want)
+			}
+		})
+	}
+}
+
+func TestReaderReadStatusPreservesSupportedPreProjectionRows(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		sid  uuid.UUID
+		raw  []byte
+		want []byte
+	}{
+		{
+			name: "legacy empty state and absent timestamps",
+			sid:  fixedUUID(0x63),
+			raw:  []byte(`{"session_id":"63636363-6363-6363-6363-636363636363","status":"active","last_journal_seq":9}`),
+			want: []byte(`{"session_id":"63636363-6363-6363-6363-636363636363","last_journal_seq":9}`),
+		},
+		{
+			name: "current state with absent activity timestamps",
+			sid:  fixedUUID(0x64),
+			raw:  []byte(`{"session_id":"64646464-6464-6464-6464-646464646464","status":"active","state":"idle","last_journal_seq":10}`),
+			want: []byte(`{"session_id":"64646464-6464-6464-6464-646464646464","state":"idle","last_journal_seq":10}`),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			r := newStoredCatalogReader(t, test.sid, test.raw)
+			got, err := r.ReadStatus(context.Background(), test.sid)
+			if err != nil {
+				t.Fatalf("ReadStatus() error = %T %v, want nil", err, err)
+			}
+			gotJSON, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("json.Marshal(ReadStatus()) error = %v", err)
+			}
+			if !bytes.Equal(gotJSON, test.want) {
+				t.Errorf("legacy status JSON changed\n got: %s\nwant: %s", gotJSON, test.want)
+			}
+		})
+	}
+}
+
+func TestReaderPreProjectionCompatibilityFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		sid  uuid.UUID
+		raw  []byte
+	}{
+		{
+			name: "malformed nonempty state",
+			sid:  fixedUUID(0x65),
+			raw:  []byte(`{"session_id":"65656565-6565-6565-6565-656565656565","state":"future_state"}`),
+		},
+		{
+			name: "missing record session id",
+			sid:  fixedUUID(0x66),
+			raw:  []byte(`{"state":"idle"}`),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			r := newStoredCatalogReader(t, test.sid, test.raw)
+			_, listErr := r.ListSessions(context.Background(), serve.Page{Limit: 10})
+			var listStoreErr serve.StoreReadError
+			if listErr == nil || !errors.As(listErr, &listStoreErr) {
+				t.Fatalf("ListSessions() error = %T %v, want serve.StoreReadError", listErr, listErr)
+			}
+			_, statusErr := r.ReadStatus(context.Background(), test.sid)
+			var statusStoreErr serve.StoreReadError
+			if statusErr == nil || !errors.As(statusErr, &statusStoreErr) {
+				t.Fatalf("ReadStatus() error = %T %v, want serve.StoreReadError", statusErr, statusErr)
+			}
+		})
+	}
+
+	t.Run("status record cannot cross session scope", func(t *testing.T) {
+		t.Parallel()
+		keyID, recordID := fixedUUID(0x67), fixedUUID(0x68)
+		raw := []byte(`{"session_id":"` + recordID.String() + `"}`)
+		r := newStoredCatalogReader(t, keyID, raw)
+		_, err := r.ReadStatus(context.Background(), keyID)
+		var storeErr serve.StoreReadError
+		if err == nil || !errors.As(err, &storeErr) {
+			t.Fatalf("ReadStatus() error = %T %v, want serve.StoreReadError", err, err)
+		}
+	})
 }
 
 func TestReaderRejectsInvalidCoreReadAuthorityAtActualCallSite(t *testing.T) {

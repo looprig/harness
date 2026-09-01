@@ -38,6 +38,38 @@ type Reader struct {
 	residency coresessionwire.SessionResidency
 }
 
+// coreProjectionAbsence records why a supported catalog row has no truthful
+// representation in the stricter Core read contract. It is deliberately an
+// internal compatibility fact: legacy serve DTOs remain available, while a
+// future Core response path cannot mistake an omitted projection for a zero
+// Core value or invent state/time facts to fill the gap.
+type coreProjectionAbsence uint8
+
+const coreProjectionPresent coreProjectionAbsence = 0
+
+const (
+	coreProjectionMissingState coreProjectionAbsence = 1 << iota
+	coreProjectionMissingActivity
+)
+
+type optionalSessionSummary struct {
+	value   coresessionwire.SessionSummary
+	absence coreProjectionAbsence
+}
+
+type optionalSessionStatus struct {
+	value   coresessionwire.SessionStatus
+	absence coreProjectionAbsence
+}
+
+// compatibilityProjectionError reports an invalid source shape without
+// including catalog payload values in its error text.
+type compatibilityProjectionError struct{ field string }
+
+func (e *compatibilityProjectionError) Error() string {
+	return "catalogreader: invalid compatibility projection " + e.field
+}
+
 // PrivateEventError reports an internal event encountered at a public serve
 // reconstruction boundary. It contains no event payload.
 type PrivateEventError struct{ Visibility event.EventVisibility }
@@ -104,25 +136,26 @@ func (r *Reader) ListSessions(ctx context.Context, page serve.Page) (serve.Sessi
 		hi = total
 	}
 	window := metas[lo:hi]
-	records := make([]harnesssessionwire.CatalogRecord, 0, len(window))
-	for _, meta := range window {
-		records = append(records, catalogRecord(meta))
-	}
-	projected, err := harnesssessionwire.ProjectSessionPage(r.authority, records, "", "")
-	if err != nil {
-		return serve.SessionList{}, serve.StoreReadError{Op: "project", Cause: err}
-	}
-
 	summaries := make([]serve.SessionSummary, 0, len(window))
-	for index, m := range window {
-		coreSummary := projected.Sessions[index]
+	coreSummaries := make([]coresessionwire.SessionSummary, 0, len(window))
+	for _, m := range window {
+		projected, projectErr := projectLegacySummary(r.authority, m)
+		if projectErr != nil {
+			return serve.SessionList{}, serve.StoreReadError{Op: "project", Cause: projectErr}
+		}
+		if projected.absence == coreProjectionPresent {
+			coreSummaries = append(coreSummaries, projected.value)
+		}
 		summaries = append(summaries, serve.SessionSummary{
 			SessionID:    m.SessionID,
-			State:        string(coreSummary.State),
+			State:        string(m.State),
 			Title:        m.Title,
 			CreatedAt:    m.CreatedAt,
 			LastActiveAt: m.LastActiveAt,
 		})
+	}
+	if err := (coresessionwire.SessionPage{Sessions: coreSummaries}).Validate(); err != nil {
+		return serve.SessionList{}, serve.StoreReadError{Op: "project", Cause: err}
 	}
 
 	list := serve.SessionList{
@@ -155,14 +188,15 @@ func (r *Reader) ReadStatus(ctx context.Context, id uuid.UUID) (serve.SessionSta
 	if !found {
 		return serve.SessionStatus{}, serve.SessionNotFoundError{SessionID: id}
 	}
-	coreStatus, err := harnesssessionwire.ProjectSessionStatus(scope, catalogRecord(meta))
+	_, err = projectLegacyStatus(scope, meta)
 	if err != nil {
 		return serve.SessionStatus{}, serve.StoreReadError{Op: "project", Cause: err}
 	}
+	state := string(meta.State)
 
 	status := serve.SessionStatus{
 		SessionID:      meta.SessionID,
-		State:          string(coreStatus.State),
+		State:          state,
 		LastJournalSeq: meta.LastJournalSeq,
 		ActiveTurnID:   meta.ActiveTurnID,
 		WaitingGateID:  meta.WaitingGateID,
@@ -183,6 +217,76 @@ func (r *Reader) ReadStatus(ctx context.Context, id uuid.UUID) (serve.SessionSta
 		status.LastStep = se
 	}
 	return status, nil
+}
+
+func projectLegacySummary(authority harnesssessionwire.ReadAuthority, meta sessionstore.SessionMeta) (optionalSessionSummary, error) {
+	if err := validateCompatibilityRecord(meta, uuid.UUID{}); err != nil {
+		return optionalSessionSummary{}, err
+	}
+	absence := projectionAbsence(meta, true)
+	if absence != coreProjectionPresent {
+		return optionalSessionSummary{absence: absence}, nil
+	}
+	record := catalogRecord(meta)
+	value, err := harnesssessionwire.ProjectSessionSummary(harnesssessionwire.ReadScope{
+		TenantID: authority.TenantID, SessionID: record.SessionID,
+		AgentID: authority.AgentID, Residency: coresessionwire.SessionResidencyCold,
+	}, record)
+	if err != nil {
+		return optionalSessionSummary{}, err
+	}
+	return optionalSessionSummary{value: value}, nil
+}
+
+func projectLegacyStatus(scope harnesssessionwire.ReadScope, meta sessionstore.SessionMeta) (optionalSessionStatus, error) {
+	expected, err := uuid.Parse(string(scope.SessionID))
+	if err != nil {
+		return optionalSessionStatus{}, &compatibilityProjectionError{field: "session_id"}
+	}
+	if err := validateCompatibilityRecord(meta, expected); err != nil {
+		return optionalSessionStatus{}, err
+	}
+	absence := projectionAbsence(meta, false)
+	if absence != coreProjectionPresent {
+		return optionalSessionStatus{absence: absence}, nil
+	}
+	value, err := harnesssessionwire.ProjectSessionStatus(scope, catalogRecord(meta))
+	if err != nil {
+		return optionalSessionStatus{}, err
+	}
+	return optionalSessionStatus{value: value}, nil
+}
+
+func projectionAbsence(meta sessionstore.SessionMeta, summary bool) coreProjectionAbsence {
+	var absence coreProjectionAbsence
+	if meta.State == "" {
+		absence |= coreProjectionMissingState
+	}
+	if summary && meta.CreatedAt.IsZero() && meta.LastActiveAt.IsZero() {
+		absence |= coreProjectionMissingActivity
+	}
+	return absence
+}
+
+// validateCompatibilityRecord validates everything that must remain fail-closed
+// before the narrowly documented historical omissions may bypass Core projection.
+// expected is zero only for list rows, whose KV key is not exposed by Catalog.
+func validateCompatibilityRecord(meta sessionstore.SessionMeta, expected uuid.UUID) error {
+	if meta.SessionID.IsZero() || (!expected.IsZero() && meta.SessionID != expected) {
+		return &compatibilityProjectionError{field: "session_id"}
+	}
+	switch meta.State {
+	case "",
+		sessionstore.StateRunning,
+		sessionstore.StateWaitingOnGate,
+		sessionstore.StateIdle,
+		sessionstore.StateFailed,
+		sessionstore.StateInterrupted,
+		sessionstore.StateStopped:
+		return nil
+	default:
+		return &compatibilityProjectionError{field: "state"}
+	}
 }
 
 func catalogRecord(meta sessionstore.SessionMeta) harnesssessionwire.CatalogRecord {
