@@ -57,8 +57,8 @@ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aN
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 github.com/invopop/jsonschema v0.14.0 h1:MHQqLhvpNUZfw+hM3AZDYK7jxO8FZoQeQM77g8iyZjg=
 github.com/invopop/jsonschema v0.14.0/go.mod h1:ygm6C2EaVNMBDPpaPlnOA2pFAxBnxGjFlMZABxm9n2I=
-github.com/looprig/core v0.6.0 h1:OhR9KO/iiHZsBTrIq2bzneMlS9erT/Dx1JhgyNYO/LM=
-github.com/looprig/core v0.6.0/go.mod h1:MyDZ7z6Q03vG5mU2Cg7mvIg8bl/CzpF3oV9NDWIXcBs=
+github.com/looprig/core v0.7.0 h1:2BklsErsO06JboKhMC0IZCyOQCEIGghXYwfIvA2rzq4=
+github.com/looprig/core v0.7.0/go.mod h1:MyDZ7z6Q03vG5mU2Cg7mvIg8bl/CzpF3oV9NDWIXcBs=
 github.com/looprig/credentials v0.2.0 h1:NUoQcAdHYwC6cOzQi07q8ZJzHYpjXAsi6MlWvMmovZk=
 github.com/looprig/credentials v0.2.0/go.mod h1:D+nWToe0jrHFHPQzO3jgHW0xKZWGlJPs8MniQ+FOBQM=
 github.com/looprig/fsstore v0.4.0 h1:Ot4kKhmqNedEOj8E4588WhHL1u6E5rOgpeTVWvhy4Eo=
