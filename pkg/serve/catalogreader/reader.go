@@ -18,11 +18,13 @@ import (
 	"io"
 	"sort"
 
+	coresessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/serve"
 	"github.com/looprig/harness/pkg/sessionstore"
+	harnesssessionwire "github.com/looprig/harness/pkg/sessionwire"
 )
 
 // Reader adapts a sessionstore Catalog + Store to serve.Reader. The Catalog backs the
@@ -30,8 +32,10 @@ import (
 // journal read (OpenEventReplayer). It holds no per-request state — one Reader serves
 // every read — so it is safe for concurrent use to the extent its backends are.
 type Reader struct {
-	catalog *sessionstore.Catalog
-	store   *sessionstore.Store
+	catalog   *sessionstore.Catalog
+	store     *sessionstore.Store
+	authority harnesssessionwire.ReadAuthority
+	residency coresessionwire.SessionResidency
 }
 
 // PrivateEventError reports an internal event encountered at a public serve
@@ -47,7 +51,20 @@ var _ serve.Reader = (*Reader)(nil)
 // root. Both are required; a nil argument is a programming error the composition root
 // does not make and is not defended against here.
 func New(catalog *sessionstore.Catalog, store *sessionstore.Store) *Reader {
-	return &Reader{catalog: catalog, store: store}
+	return NewScoped(
+		catalog,
+		store,
+		harnesssessionwire.ReadAuthority{TenantID: "legacy-single-tenant-v1", AgentID: "legacy-harness"},
+		coresessionwire.SessionResidencyCold,
+	)
+}
+
+// NewScoped builds the same legacy serve.Reader while requiring the caller's
+// Core tenant/agent authority and the independently observed residency. The
+// values affect only Core validation/projection; legacy serve DTO bytes remain
+// unchanged during migration.
+func NewScoped(catalog *sessionstore.Catalog, store *sessionstore.Store, authority harnesssessionwire.ReadAuthority, residency coresessionwire.SessionResidency) *Reader {
+	return &Reader{catalog: catalog, store: store, authority: authority, residency: residency}
 }
 
 // ListSessions reads EVERY catalog entry, stable-sorts it by last-active descending
@@ -59,6 +76,9 @@ func New(catalog *sessionstore.Catalog, store *sessionstore.Store) *Reader {
 // boundary already validated Skip/Limit — but is bounds-safe against an out-of-range
 // Skip.
 func (r *Reader) ListSessions(ctx context.Context, page serve.Page) (serve.SessionList, error) {
+	if err := harnesssessionwire.ValidateReadAuthority(r.authority); err != nil {
+		return serve.SessionList{}, serve.StoreReadError{Op: "project", Cause: err}
+	}
 	metas, err := r.catalog.ListSessions(ctx)
 	if err != nil {
 		return serve.SessionList{}, serve.StoreReadError{Op: "list", Cause: err}
@@ -84,12 +104,21 @@ func (r *Reader) ListSessions(ctx context.Context, page serve.Page) (serve.Sessi
 		hi = total
 	}
 	window := metas[lo:hi]
+	records := make([]harnesssessionwire.CatalogRecord, 0, len(window))
+	for _, meta := range window {
+		records = append(records, catalogRecord(meta))
+	}
+	projected, err := harnesssessionwire.ProjectSessionPage(r.authority, records, "", "")
+	if err != nil {
+		return serve.SessionList{}, serve.StoreReadError{Op: "project", Cause: err}
+	}
 
 	summaries := make([]serve.SessionSummary, 0, len(window))
-	for _, m := range window {
+	for index, m := range window {
+		coreSummary := projected.Sessions[index]
 		summaries = append(summaries, serve.SessionSummary{
 			SessionID:    m.SessionID,
-			State:        string(m.State),
+			State:        string(coreSummary.State),
 			Title:        m.Title,
 			CreatedAt:    m.CreatedAt,
 			LastActiveAt: m.LastActiveAt,
@@ -115,6 +144,10 @@ func (r *Reader) ListSessions(ctx context.Context, page serve.Page) (serve.Sessi
 // bytes via event.UnmarshalEvent, so the DTO carries the concrete event, not a lossy
 // projection.
 func (r *Reader) ReadStatus(ctx context.Context, id uuid.UUID) (serve.SessionStatus, error) {
+	scope := r.readScope(id)
+	if err := harnesssessionwire.ValidateReadScope(scope); err != nil {
+		return serve.SessionStatus{}, serve.StoreReadError{Op: "project", Cause: err}
+	}
 	meta, found, err := r.catalog.ReadMeta(ctx, id)
 	if err != nil {
 		return serve.SessionStatus{}, serve.StoreReadError{Op: "get", Cause: err}
@@ -122,10 +155,14 @@ func (r *Reader) ReadStatus(ctx context.Context, id uuid.UUID) (serve.SessionSta
 	if !found {
 		return serve.SessionStatus{}, serve.SessionNotFoundError{SessionID: id}
 	}
+	coreStatus, err := harnesssessionwire.ProjectSessionStatus(scope, catalogRecord(meta))
+	if err != nil {
+		return serve.SessionStatus{}, serve.StoreReadError{Op: "project", Cause: err}
+	}
 
 	status := serve.SessionStatus{
 		SessionID:      meta.SessionID,
-		State:          string(meta.State),
+		State:          string(coreStatus.State),
 		LastJournalSeq: meta.LastJournalSeq,
 		ActiveTurnID:   meta.ActiveTurnID,
 		WaitingGateID:  meta.WaitingGateID,
@@ -146,6 +183,25 @@ func (r *Reader) ReadStatus(ctx context.Context, id uuid.UUID) (serve.SessionSta
 		status.LastStep = se
 	}
 	return status, nil
+}
+
+func catalogRecord(meta sessionstore.SessionMeta) harnesssessionwire.CatalogRecord {
+	record := harnesssessionwire.CatalogRecord{
+		SessionID: coresessionwire.SessionID(meta.SessionID.String()),
+		State:     harnesssessionwire.CatalogState(meta.State), Title: meta.Title,
+		CreatedAt: meta.CreatedAt, LastActiveAt: meta.LastActiveAt, LastJournalSeq: meta.LastJournalSeq,
+	}
+	if !meta.WaitingGateID.IsZero() {
+		record.WaitingGateID = coresessionwire.GateID(meta.WaitingGateID.String())
+	}
+	return record
+}
+
+func (r *Reader) readScope(id uuid.UUID) harnesssessionwire.ReadScope {
+	return harnesssessionwire.ReadScope{
+		TenantID: r.authority.TenantID, SessionID: coresessionwire.SessionID(id.String()),
+		AgentID: r.authority.AgentID, Residency: r.residency,
+	}
 }
 
 // reconstruct rebuilds a serve.StatusEvent from a catalog eventSummary's durable wire
@@ -173,6 +229,10 @@ func reconstruct(seq uint64, raw json.RawMessage) (*serve.StatusEvent, error) {
 // more may remain. GatePrepared never appears — the replayer filters it. A replayer
 // open or read failure is wrapped in a serve.StoreReadError (500).
 func (r *Reader) ReadJournal(ctx context.Context, id uuid.UUID, page serve.JournalPage) (serve.EventJournalPage, error) {
+	scope := r.readScope(id)
+	if err := harnesssessionwire.ValidateReadScope(scope); err != nil {
+		return serve.EventJournalPage{}, serve.StoreReadError{Op: "project", Cause: err}
+	}
 	replayer, err := r.store.OpenEventReplayer(id, sessionstore.ReplayRequest{FromSeq: page.From})
 	if err != nil {
 		return serve.EventJournalPage{}, serve.StoreReadError{Op: "open_replayer", Cause: err}
@@ -200,6 +260,9 @@ func (r *Reader) ReadJournal(ctx context.Context, id uuid.UUID, page serve.Journ
 		}
 		if ev.Visibility() != event.Public {
 			continue
+		}
+		if _, perr := harnesssessionwire.ProjectJournalPage(scope, []harnesssessionwire.JournalRecord{{JournalSeq: seq, Event: ev}}, seq, seq, "", ""); perr != nil {
+			return serve.EventJournalPage{}, serve.StoreReadError{Op: "project", Cause: perr}
 		}
 		events = append(events, serve.StatusEvent{JournalSeq: seq, Event: ev})
 		lastSeq = seq

@@ -54,7 +54,7 @@ func TestPackageDependencyBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	allowed := map[string]bool{
-		"bytes": true, "encoding/json": true, "errors": true, "fmt": true, "reflect": true,
+		"bytes": true, "encoding/json": true, "errors": true, "fmt": true, "reflect": true, "time": true,
 		"github.com/looprig/core/content": true, "github.com/looprig/core/sessionwire/v1": true,
 		"github.com/looprig/harness/pkg/event": true,
 	}
@@ -81,6 +81,60 @@ func TestPackageDependencyBoundary(t *testing.T) {
 	if productionFiles == 0 {
 		t.Fatal("dependency test is vacuous: zero production files")
 	}
+}
+
+func TestCatalogStateProjectionMatchesHarnessClosedStateUnion(t *testing.T) {
+	t.Parallel()
+
+	want := constStringValuesWithPrefix(t, filepath.Join("..", "sessionstore", "catalog.go"), "State")
+	got := []string{
+		string(CatalogStateRunning),
+		string(CatalogStateWaitingOnGate),
+		string(CatalogStateIdle),
+		string(CatalogStateFailed),
+		string(CatalogStateInterrupted),
+		string(CatalogStateStopped),
+	}
+	sort.Strings(got)
+	if len(want) == 0 || len(got) == 0 {
+		t.Fatalf("vacuous catalog state sets: Harness=%d adapter=%d", len(want), len(got))
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("catalog state projection drifted from Harness closed state union\nHarness:\n%s\nadapter:\n%s", strings.Join(want, "\n"), strings.Join(got, "\n"))
+	}
+}
+
+func constStringValuesWithPrefix(t *testing.T, path, prefix string) []string {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	var values []string
+	ast.Inspect(file, func(node ast.Node) bool {
+		decl, ok := node.(*ast.GenDecl)
+		if !ok || decl.Tok != token.CONST {
+			return true
+		}
+		for _, specNode := range decl.Specs {
+			spec, ok := specNode.(*ast.ValueSpec)
+			if !ok || len(spec.Names) != 1 || len(spec.Values) != 1 || !strings.HasPrefix(spec.Names[0].Name, prefix) {
+				continue
+			}
+			literal, ok := spec.Values[0].(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				continue
+			}
+			value, err := strconv.Unquote(literal.Value)
+			if err != nil {
+				t.Fatalf("unquote %s in %s: %v", spec.Names[0].Name, path, err)
+			}
+			values = append(values, value)
+		}
+		return true
+	})
+	sort.Strings(values)
+	return values
 }
 
 func eventTypesInSwitch(t *testing.T, path, function string) []string {

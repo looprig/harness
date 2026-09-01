@@ -7,12 +7,15 @@ package catalogreader_test
 // in-memory store does not, so the fast default `go test` covers this adapter.
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/looprig/core/content"
+	coresessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
@@ -22,6 +25,7 @@ import (
 	"github.com/looprig/harness/pkg/serve"
 	"github.com/looprig/harness/pkg/serve/catalogreader"
 	"github.com/looprig/harness/pkg/sessionstore"
+	harnesssessionwire "github.com/looprig/harness/pkg/sessionwire"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/storage/memstore"
 )
@@ -233,6 +237,163 @@ func TestReaderListSessions(t *testing.T) {
 			}
 			if got.Limit != tt.page.Limit {
 				t.Errorf("limit = %d, want %d", got.Limit, tt.page.Limit)
+			}
+		})
+	}
+}
+
+func TestReaderLegacyJSONParityThroughCoreProjection(t *testing.T) {
+	t.Parallel()
+
+	st, cat, clk := newCatalog(t)
+	sid := fixedUUID(0x11)
+	loop, turn := fixedUUID(0x12), fixedUUID(0x13)
+	created := time.Date(2026, 8, 29, 9, 30, 0, 0, time.UTC)
+	active := time.Date(2026, 8, 29, 9, 45, 0, 0, time.UTC)
+	started := sessionStarted(sid)
+	started.CreatedAt = created
+	started.Config.AgentKind = "fixture-agent"
+	update(t, cat, started, 1)
+	clk.t = active
+	update(t, cat, turnStarted(sid, loop, turn), 2)
+
+	r := catalogreader.NewScoped(
+		cat,
+		st,
+		harnesssessionwire.ReadAuthority{TenantID: coresessionwire.TenantID("tenant-a"), AgentID: coresessionwire.AgentID("fixture-agent")},
+		coresessionwire.SessionResidencyCold,
+	)
+	list, err := r.ListSessions(context.Background(), serve.Page{Skip: 0, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	status, err := r.ReadStatus(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("ReadStatus() error = %v", err)
+	}
+
+	listJSON, err := json.Marshal(list)
+	if err != nil {
+		t.Fatalf("json.Marshal(list) error = %v", err)
+	}
+	statusJSON, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("json.Marshal(status) error = %v", err)
+	}
+	// These bytes are independently specified legacy serve DTO goldens. They are
+	// deliberately not produced by marshaling Core records into the oracle.
+	wantList := []byte(`{"sessions":[{"session_id":"11111111-1111-1111-1111-111111111111","state":"running","title":"hello","created_at":"2026-08-29T09:30:00Z","last_active_at":"2026-08-29T09:45:00Z"}],"skip":0,"limit":100,"next_skip":0,"done":true}`)
+	wantStatus := []byte(`{"session_id":"11111111-1111-1111-1111-111111111111","state":"running","last_journal_seq":2,"active_turn_id":"13131313-1313-1313-1313-131313131313","updated_at":"2026-08-29T09:45:00Z"}`)
+	if !bytes.Equal(listJSON, wantList) {
+		t.Errorf("legacy list JSON changed\n got: %s\nwant: %s", listJSON, wantList)
+	}
+	if !bytes.Equal(statusJSON, wantStatus) {
+		t.Errorf("legacy status JSON changed\n got: %s\nwant: %s", statusJSON, wantStatus)
+	}
+}
+
+func TestReaderRejectsInvalidCoreReadAuthorityAtActualCallSite(t *testing.T) {
+	t.Parallel()
+
+	st, cat, clk := newCatalog(t)
+	sid := fixedUUID(0x21)
+	update(t, cat, sessionStarted(sid), 1)
+	clk.t = time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
+	update(t, cat, turnStarted(sid, fixedUUID(0x22), fixedUUID(0x23)), 2)
+	j := openJournal(t, st, sid)
+	if _, err := j.Append(context.Background(), journal.NewEventRecord(sessionStarted(sid))); err != nil {
+		t.Fatalf("Append(SessionStarted) error = %v", err)
+	}
+	r := catalogreader.NewScoped(
+		cat,
+		st,
+		harnesssessionwire.ReadAuthority{AgentID: coresessionwire.AgentID("fixture-agent")},
+		coresessionwire.SessionResidencyCold,
+	)
+	tests := []struct {
+		name string
+		read func() error
+	}{
+		{name: "list", read: func() error { _, err := r.ListSessions(context.Background(), serve.Page{Limit: 10}); return err }},
+		{name: "status", read: func() error { _, err := r.ReadStatus(context.Background(), sid); return err }},
+		{name: "journal", read: func() error {
+			_, err := r.ReadJournal(context.Background(), sid, serve.JournalPage{Limit: 10})
+			return err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.read()
+			var storeErr serve.StoreReadError
+			if err == nil || !errors.As(err, &storeErr) {
+				t.Fatalf("read error = %T %v, want serve.StoreReadError", err, err)
+			}
+		})
+	}
+}
+
+func TestReaderColdLegacyJSONStillOmitsMissingActivityTime(t *testing.T) {
+	t.Parallel()
+
+	st, cat, _ := newCatalog(t)
+	sid := fixedUUID(0x31)
+	started := sessionStarted(sid)
+	started.CreatedAt = time.Date(2026, 8, 29, 11, 0, 0, 0, time.UTC)
+	update(t, cat, started, 1)
+	r := catalogreader.NewScoped(
+		cat,
+		st,
+		harnesssessionwire.ReadAuthority{TenantID: "tenant-a", AgentID: "fixture-agent"},
+		coresessionwire.SessionResidencyCold,
+	)
+
+	list, err := r.ListSessions(context.Background(), serve.Page{Skip: 0, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	status, err := r.ReadStatus(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("ReadStatus() error = %v", err)
+	}
+	listJSON, _ := json.Marshal(list)
+	statusJSON, _ := json.Marshal(status)
+	wantList := []byte(`{"sessions":[{"session_id":"31313131-3131-3131-3131-313131313131","state":"idle","created_at":"2026-08-29T11:00:00Z"}],"skip":0,"limit":10,"next_skip":0,"done":true}`)
+	wantStatus := []byte(`{"session_id":"31313131-3131-3131-3131-313131313131","state":"idle","last_journal_seq":1}`)
+	if !bytes.Equal(listJSON, wantList) {
+		t.Errorf("cold legacy list JSON changed\n got: %s\nwant: %s", listJSON, wantList)
+	}
+	if !bytes.Equal(statusJSON, wantStatus) {
+		t.Errorf("cold legacy status JSON changed\n got: %s\nwant: %s", statusJSON, wantStatus)
+	}
+}
+
+func TestReaderRejectsInvalidAuthorityBeforeStorageAccess(t *testing.T) {
+	t.Parallel()
+
+	r := catalogreader.NewScoped(
+		nil,
+		nil,
+		harnesssessionwire.ReadAuthority{AgentID: "fixture-agent"},
+		coresessionwire.SessionResidencyCold,
+	)
+	sid := fixedUUID(0x39)
+	tests := []struct {
+		name string
+		read func() error
+	}{
+		{name: "list", read: func() error { _, err := r.ListSessions(context.Background(), serve.Page{Limit: 10}); return err }},
+		{name: "status", read: func() error { _, err := r.ReadStatus(context.Background(), sid); return err }},
+		{name: "journal", read: func() error {
+			_, err := r.ReadJournal(context.Background(), sid, serve.JournalPage{Limit: 10})
+			return err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.read()
+			var storeErr serve.StoreReadError
+			if err == nil || !errors.As(err, &storeErr) {
+				t.Fatalf("read error = %T %v, want serve.StoreReadError", err, err)
 			}
 		})
 	}
