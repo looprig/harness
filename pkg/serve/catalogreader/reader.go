@@ -70,6 +70,24 @@ func (e *compatibilityProjectionError) Error() string {
 	return "catalogreader: invalid compatibility projection " + e.field
 }
 
+type statusSummaryKind string
+
+const (
+	statusSummaryLastTurn statusSummaryKind = "last_turn"
+	statusSummaryLastStep statusSummaryKind = "last_step"
+)
+
+// statusSummaryError reports a corrupt persisted status-summary boundary
+// without exposing event payload, concrete event kind, or foreign identity.
+type statusSummaryError struct {
+	summary statusSummaryKind
+	field   string
+}
+
+func (e *statusSummaryError) Error() string {
+	return "catalogreader: invalid persisted status summary " + string(e.summary) + " " + e.field
+}
+
 // PrivateEventError reports an internal event encountered at a public serve
 // reconstruction boundary. It contains no event payload.
 type PrivateEventError struct{ Visibility event.EventVisibility }
@@ -203,14 +221,14 @@ func (r *Reader) ReadStatus(ctx context.Context, id uuid.UUID) (serve.SessionSta
 		UpdatedAt:      meta.LastActiveAt,
 	}
 	if meta.LastTurn != nil {
-		se, derr := reconstruct(meta.LastTurn.JournalSeq, meta.LastTurn.Event)
+		se, derr := reconstructStatusSummary(id, statusSummaryLastTurn, meta.LastTurn.JournalSeq, meta.LastTurn.Event)
 		if derr != nil {
 			return serve.SessionStatus{}, serve.StoreReadError{Op: "decode", Cause: derr}
 		}
 		status.LastTurn = se
 	}
 	if meta.LastStep != nil {
-		se, derr := reconstruct(meta.LastStep.JournalSeq, meta.LastStep.Event)
+		se, derr := reconstructStatusSummary(id, statusSummaryLastStep, meta.LastStep.JournalSeq, meta.LastStep.Event)
 		if derr != nil {
 			return serve.SessionStatus{}, serve.StoreReadError{Op: "decode", Cause: derr}
 		}
@@ -319,6 +337,37 @@ func reconstruct(seq uint64, raw json.RawMessage) (*serve.StatusEvent, error) {
 	ev, err := event.UnmarshalEvent(raw)
 	if err != nil {
 		return nil, err
+	}
+	if ev.Visibility() != event.Public {
+		return nil, &PrivateEventError{Visibility: ev.Visibility()}
+	}
+	return &serve.StatusEvent{JournalSeq: seq, Event: ev}, nil
+}
+
+func reconstructStatusSummary(expected uuid.UUID, kind statusSummaryKind, seq uint64, raw json.RawMessage) (*serve.StatusEvent, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	ev, err := event.UnmarshalEvent(raw)
+	if err != nil {
+		return nil, &statusSummaryError{summary: kind, field: "event"}
+	}
+	header := ev.EventHeader()
+	if header.SessionID != expected {
+		return nil, &statusSummaryError{summary: kind, field: "session_id"}
+	}
+	validKind := false
+	switch kind {
+	case statusSummaryLastTurn:
+		switch ev.(type) {
+		case event.TurnDone, event.TurnFailed:
+			validKind = true
+		}
+	case statusSummaryLastStep:
+		_, validKind = ev.(event.StepDone)
+	}
+	if !validKind {
+		return nil, &statusSummaryError{summary: kind, field: "event_kind"}
 	}
 	if ev.Visibility() != event.Public {
 		return nil, &PrivateEventError{Visibility: ev.Visibility()}

@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -432,6 +433,143 @@ func TestReaderReadStatusPreservesSupportedPreProjectionRows(t *testing.T) {
 				t.Errorf("legacy status JSON changed\n got: %s\nwant: %s", gotJSON, test.want)
 			}
 		})
+	}
+}
+
+type storedEventSummary struct {
+	JournalSeq uint64          `json:"journal_seq"`
+	Event      json.RawMessage `json:"event"`
+}
+
+func storedStatusMetaJSON(t *testing.T, sid uuid.UUID, lastTurn, lastStep *storedEventSummary) []byte {
+	t.Helper()
+	raw, err := json.Marshal(struct {
+		SessionID      uuid.UUID           `json:"session_id"`
+		State          string              `json:"state"`
+		LastJournalSeq uint64              `json:"last_journal_seq"`
+		LastTurn       *storedEventSummary `json:"last_turn,omitempty"`
+		LastStep       *storedEventSummary `json:"last_step,omitempty"`
+	}{SessionID: sid, State: "idle", LastJournalSeq: 7, LastTurn: lastTurn, LastStep: lastStep})
+	if err != nil {
+		t.Fatalf("json.Marshal(persisted SessionMeta) error = %v", err)
+	}
+	return raw
+}
+
+func persistedStatusEvent(t *testing.T, value event.Event) json.RawMessage {
+	t.Helper()
+	raw, err := event.MarshalEvent(value)
+	if err != nil {
+		t.Fatalf("event.MarshalEvent(%T) error = %v", value, err)
+	}
+	return raw
+}
+
+func TestReaderReadStatusRejectsForeignAndZeroSummarySessions(t *testing.T) {
+	t.Parallel()
+
+	requested, foreign := fixedUUID(0x73), fixedUUID(0x74)
+	loop, turn, step := fixedUUID(0x75), fixedUUID(0x76), fixedUUID(0x77)
+	turnWire := persistedStatusEvent(t, event.TurnDone{
+		Header:  event.Header{Coordinates: identity.Coordinates{SessionID: foreign, LoopID: loop, TurnID: turn}, EventID: fixedUUID(0x78)},
+		Message: aiMsg("TOP-SECRET-TURN-PAYLOAD"),
+	})
+	stepWire := persistedStatusEvent(t, event.StepDone{
+		Header:   event.Header{Coordinates: identity.Coordinates{SessionID: foreign, LoopID: loop, TurnID: turn, StepID: step}, EventID: fixedUUID(0x79)},
+		Messages: content.AgenticMessages{aiMsg("TOP-SECRET-STEP-PAYLOAD")},
+	})
+	zeroID := "00000000-0000-0000-0000-000000000000"
+	tests := []struct {
+		name     string
+		lastTurn *storedEventSummary
+		lastStep *storedEventSummary
+	}{
+		{name: "foreign last turn", lastTurn: &storedEventSummary{JournalSeq: 6, Event: turnWire}},
+		{name: "zero-session last turn", lastTurn: &storedEventSummary{JournalSeq: 6, Event: bytes.ReplaceAll(turnWire, []byte(foreign.String()), []byte(zeroID))}},
+		{name: "foreign last step", lastStep: &storedEventSummary{JournalSeq: 5, Event: stepWire}},
+		{name: "zero-session last step", lastStep: &storedEventSummary{JournalSeq: 5, Event: bytes.ReplaceAll(stepWire, []byte(foreign.String()), []byte(zeroID))}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			raw := storedStatusMetaJSON(t, requested, test.lastTurn, test.lastStep)
+			r := newStoredCatalogReader(t, requested, raw)
+			status, err := r.ReadStatus(context.Background(), requested)
+			if err == nil {
+				t.Fatalf("ReadStatus() = %+v, nil; want fail-closed", status)
+			}
+			var storeErr serve.StoreReadError
+			if !errors.As(err, &storeErr) {
+				t.Fatalf("ReadStatus() error = %T %v, want serve.StoreReadError", err, err)
+			}
+			for _, forbidden := range []string{foreign.String(), "TOP-SECRET", "TurnDone", "StepDone"} {
+				if strings.Contains(err.Error(), forbidden) {
+					t.Errorf("ReadStatus() error exposed persisted identity/payload %q: %v", forbidden, err)
+				}
+			}
+		})
+	}
+}
+
+func TestReaderReadStatusRejectsMisclassifiedPersistedSummaries(t *testing.T) {
+	t.Parallel()
+
+	sid := fixedUUID(0x81)
+	loop, turn, step := fixedUUID(0x82), fixedUUID(0x83), fixedUUID(0x84)
+	turnWire := persistedStatusEvent(t, event.TurnDone{
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: loop, TurnID: turn}, EventID: fixedUUID(0x85)},
+	})
+	stepWire := persistedStatusEvent(t, event.StepDone{
+		Header:   event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: loop, TurnID: turn, StepID: step}, EventID: fixedUUID(0x86)},
+		Messages: content.AgenticMessages{aiMsg("step")},
+	})
+	tests := []struct {
+		name     string
+		lastTurn *storedEventSummary
+		lastStep *storedEventSummary
+	}{
+		{name: "last turn cannot contain StepDone", lastTurn: &storedEventSummary{JournalSeq: 5, Event: stepWire}},
+		{name: "last step cannot contain TurnDone", lastStep: &storedEventSummary{JournalSeq: 6, Event: turnWire}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			r := newStoredCatalogReader(t, sid, storedStatusMetaJSON(t, sid, test.lastTurn, test.lastStep))
+			if status, err := r.ReadStatus(context.Background(), sid); err == nil {
+				t.Fatalf("ReadStatus() = %+v, nil; want summary-kind rejection", status)
+			}
+		})
+	}
+}
+
+func TestReaderReadStatusPreservesLegitimatePersistedSummaryJSON(t *testing.T) {
+	t.Parallel()
+
+	sid := fixedUUID(0x91)
+	loop, turn, step := fixedUUID(0x92), fixedUUID(0x93), fixedUUID(0x94)
+	turnWire := persistedStatusEvent(t, event.TurnDone{
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: loop, TurnID: turn}, EventID: fixedUUID(0x95)},
+	})
+	stepWire := persistedStatusEvent(t, event.StepDone{
+		Header:   event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: loop, TurnID: turn, StepID: step}, EventID: fixedUUID(0x96)},
+		Messages: content.AgenticMessages{&content.AIMessage{Message: content.Message{Role: content.RoleAssistant}}},
+	})
+	raw := storedStatusMetaJSON(t, sid,
+		&storedEventSummary{JournalSeq: 6, Event: turnWire},
+		&storedEventSummary{JournalSeq: 5, Event: stepWire},
+	)
+	r := newStoredCatalogReader(t, sid, raw)
+	status, err := r.ReadStatus(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("ReadStatus() error = %v", err)
+	}
+	got, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("json.Marshal(ReadStatus()) error = %v", err)
+	}
+	want := []byte(`{"session_id":"91919191-9191-9191-9191-919191919191","state":"idle","last_journal_seq":7,"last_turn":{"journal_seq":6,"event":{"event_id":"95959595-9595-9595-9595-959595959595","loop_id":"92929292-9292-9292-9292-929292929292","session_id":"91919191-9191-9191-9191-919191919191","turn_id":"93939393-9393-9393-9393-939393939393","type":"TurnDone","v":1}},"last_step":{"journal_seq":5,"event":{"event_id":"96969696-9696-9696-9696-969696969696","loop_id":"92929292-9292-9292-9292-929292929292","messages":[{"role":"assistant"}],"session_id":"91919191-9191-9191-9191-919191919191","step_id":"94949494-9494-9494-9494-949494949494","turn_id":"93939393-9393-9393-9393-939393939393","type":"StepDone","v":1}}}`)
+	if !bytes.Equal(got, want) {
+		t.Errorf("legitimate persisted status JSON changed\n got: %s\nwant: %s", got, want)
 	}
 }
 
