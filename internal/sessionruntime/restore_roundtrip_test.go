@@ -747,7 +747,7 @@ func TestRestorePrimaryLoopNarrowing(t *testing.T) {
 // TestRestoreReleasesLeaseOnShutdown proves the Phase-10 lease-release-on-teardown wiring
 // for a RESTORED session: Restore holds the single-writer lease for the session lifetime,
 // and a clean Shutdown releases it so a SECOND Restore can re-acquire single-writer
-// ownership without waiting out the TTL. Without the release, the second Restore would
+// ownership promptly (nothing else would ever free it). Without the release, the second Restore would
 // fail *LeaseHeldError until the lease expired.
 func TestRestoreReleasesLeaseOnShutdown(t *testing.T) {
 	store := newRestoreStore(t)
@@ -767,7 +767,8 @@ func TestRestoreReleasesLeaseOnShutdown(t *testing.T) {
 		t.Fatalf("Shutdown #1: %v", err)
 	}
 
-	// Second restore re-acquires immediately (no TTL wait) — proving the lease was released.
+	// Second restore re-acquires immediately — proving the lease was released, which is the
+	// only way it could have been freed.
 	s2, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
 		orig.sessionID, store)
 	if err != nil {

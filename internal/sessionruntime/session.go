@@ -285,7 +285,7 @@ type Session struct {
 	// via WithLeaseRelease (New) or that Restore installs from the lease it acquires. It is
 	// called ONCE at the END of Shutdown (releaseOnce) — after the loops have drained, so
 	// the journal's last append precedes the release — so a clean exit relinquishes
-	// ownership and a successor can re-acquire without waiting out the TTL. Nil (headless /
+	// ownership and a successor can re-acquire at all — no backend expires a grant. Nil (headless /
 	// no-persistence) is a no-op. The session owns this seam (DIP): it never holds the
 	// concrete lease, only the narrow release closure.
 	leaseRelease func(context.Context) error
@@ -2511,8 +2511,12 @@ func (s *Session) Interrupt(ctx context.Context) (bool, error) {
 }
 
 // releaseLease invokes the lease-release hook EXACTLY ONCE (releaseOnce) on a fresh,
-// bounded background context, swallowing the error (the bucket TTL is the backstop and Shutdown's own error is
-// the caller-facing one). It is nil-safe: a headless session (no WithLeaseRelease, no
+// bounded background context, swallowing the error (Shutdown's own error is the
+// caller-facing one). There is NO BACKSTOP behind it: no pinned backend expires a
+// lease — memstore ends a grant on Release only, and fsstore's is an advisory lock
+// the OS drops when the holding fd closes or the process exits — so a grant this
+// hook fails to release is held for the life of the process and every successor is
+// locked out until then. It is nil-safe: a headless session (no WithLeaseRelease, no
 // Restore-installed releaser) has no hook and this is a no-op. Idempotent so a second
 // Shutdown never double-releases.
 func (s *Session) releaseLease(_ context.Context) {
@@ -2523,15 +2527,18 @@ func (s *Session) releaseLease(_ context.Context) {
 		releaseCtx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
 		defer cancel()
 		if err := s.leaseRelease(releaseCtx); err != nil {
-			slog.WarnContext(releaseCtx, "session: lease release on shutdown failed (TTL is the backstop)",
+			slog.WarnContext(releaseCtx, "session: lease release on shutdown failed (no TTL backstop: held until this process exits)",
 				"session", s.sessionID, "err", err)
 		}
 	})
 }
 
 // releaseRootLease releases the EXCLUSIVE workspace root lease EXACTLY ONCE
-// (releaseRootOnce), on a fresh bounded background context, swallowing the error (the lease TTL is the
-// backstop). Nil-safe: per-session, shared, and no-placement sessions have no root lease.
+// (releaseRootOnce), on a fresh bounded background context, swallowing the error —
+// Shutdown's own error is the caller-facing one, and there is no backstop behind
+// this release either: the root lease comes from the same storage.Leaser as the
+// session lease (see resolvePlacement), which no pinned backend expires.
+// Nil-safe: per-session, shared, and no-placement sessions have no root lease.
 // Shutdown calls this BEFORE releaseLease so the root lease is relinquished before the
 // session lease (LIFO teardown), and after work/checkpoints have stopped.
 func (s *Session) releaseRootLease(_ context.Context) {
@@ -2542,7 +2549,7 @@ func (s *Session) releaseRootLease(_ context.Context) {
 		releaseCtx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
 		defer cancel()
 		if err := s.wsRootRelease(releaseCtx); err != nil {
-			slog.WarnContext(releaseCtx, "session: workspace root lease release on shutdown failed (TTL is the backstop)",
+			slog.WarnContext(releaseCtx, "session: workspace root lease release on shutdown failed (no TTL backstop: held until this process exits)",
 				"session", s.sessionID, "err", err)
 		}
 	})

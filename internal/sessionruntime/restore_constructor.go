@@ -223,20 +223,24 @@ func restoreTopologySession(
 	// openJournalUnderFreshGrant claims again under a NEW lease at a higher epoch, and
 	// the lease it returns — not the one acquired just above — is the session's from
 	// here on.
-	lease, err := store.AcquireLease(ctx, sessionID)
-	if err != nil {
-		return nil, &RestoreError{Kind: RestoreLeaseFailed, Cause: err}
-	}
 	j, lease, err := openJournalUnderFreshGrant(
 		ctx,
 		store,
 		sessionID,
-		lease,
 		journal.HookMiddleware(probe.hooks, sessionID),
 	)
 	if err != nil {
 		releaseLease(lease)
-		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
+		kind := RestoreJournalFailed
+		var acquire *leaseAcquireError
+		if errors.As(err, &acquire) {
+			// Classify by WHAT failed, not by where in the loop it failed: an
+			// ownership acquisition is a lease failure whether it was the first
+			// claim or a re-claim after a lost race. Cause stays the raw backend
+			// error, so callers matching on *journal.LeaseHeldError are unaffected.
+			kind, err = RestoreLeaseFailed, acquire.Cause
+		}
+		return nil, &RestoreError{Kind: kind, Cause: err}
 	}
 	// Offload GC (symmetric with NewSession): when the restore-forwarded policy is armed,
 	// wrap the journal with the admission gate BEFORE any appender (restore-lifecycle appends
@@ -602,7 +606,7 @@ func restoreTopologySession(
 	// rather than spawned empty. The lease Restore acquired is handed to the session as its
 	// release-on-Shutdown hook (the Phase-10 composition wiring): the journal holds the
 	// lease for the live lifetime, and a clean Shutdown releases it so a successor can
-	// re-acquire without waiting out the TTL. We append WithLeaseRelease AFTER the caller's
+	// re-acquire at all (no backend has a lease TTL). We append WithLeaseRelease AFTER the caller's
 	// opts so the restore owns the lease lifecycle (a caller cannot accidentally override
 	// the releaser with a stale one).
 	leaseOpts := append(append([]Option(nil), opts...), WithLeaseRelease(lease.Release))
@@ -1660,46 +1664,92 @@ func openTurnCoords(events []event.Event) (uuid.UUID, event.TurnIndex) {
 // contention still fails closed instead of spinning.
 const openingGrantAttempts = 8
 
-// openJournalUnderFreshGrant opens sessionID's journal under lease, and — when the
-// opening fence loses the ownership race — acquires a NEW lease and claims ownership
-// again with a new writer, up to openingGrantAttempts grants. sessionstore has
-// already released the grant that lost, so the returned lease is the one the caller
-// must use from here on: it may not be the one passed in. The lease returned
-// alongside an error is likewise the caller's to release (a second release of an
-// already-released grant is a no-op), so no failure path strands ownership.
+// leaseAcquireError marks a failure to ACQUIRE a single-writer grant, as distinct
+// from a failure to open the journal under one. openJournalUnderFreshGrant acquires
+// a grant at the top of every attempt — the first claim and every re-claim after a
+// lost ownership race are the same call — and both failures mean the same thing,
+// usually *journal.LeaseHeldError: the session is open elsewhere. The callers
+// unwrap this to stamp their LeaseFailed kind, which pkg/rig maps to
+// LifecycleLeaseFailed. An operator asking "is this session open elsewhere?" must
+// get the same answer whichever acquire failed; before this type existed, a
+// takeover during the retry window was reported as a JOURNAL failure and silently
+// missed by anything keyed on the lease kind.
+type leaseAcquireError struct{ Cause error }
+
+func (e *leaseAcquireError) Error() string {
+	return "sessionruntime: acquire single-writer grant: " + e.Cause.Error()
+}
+
+func (e *leaseAcquireError) Unwrap() error { return e.Cause }
+
+// openJournalUnderFreshGrant acquires sessionID's single-writer grant and opens its
+// journal under it, and — when the opening fence loses the ownership race — acquires
+// a NEW grant and claims ownership again with a new writer, up to
+// openingGrantAttempts grants. It owns the FIRST acquire too, so the signature is
+// lease-OUT-only: there is no passed-in lease for a caller to keep using by mistake
+// after a re-claim has superseded it, and both acquire failures are classified
+// identically as *leaseAcquireError.
+//
+// The lease returned alongside an error is the caller's to release (a second release
+// of an already-released grant is a no-op); it is nil only when no grant was ever
+// obtained, which releaseLease tolerates. There is deliberately no backoff: a
+// contending claim holds a live grant while it runs, so sleeping would block every
+// other claimant on a grant this call is not using, and contention here is resolved
+// by someone winning the CAS rather than by waiting. Each attempt is bounded by
+// sessionstore's own per-append deadline, and ctx bounds the whole loop.
+//
+// Each attempt is a distinct append of a distinct fence record at a distinct epoch,
+// so an installed OperationJournalAppend hook is invoked once PER GRANT rather than
+// once per call — see TestOpenJournalUnderFreshGrantObservesEveryFenceAttempt for
+// why that fan-out is the correct reading of an append seam, and note that the hook
+// runs inside the window each attempt is racing to close, so a slow hook makes
+// contention worse.
 func openJournalUnderFreshGrant(
 	ctx context.Context,
 	store *sessionstore.Store,
 	sessionID uuid.UUID,
-	lease journal.Lease,
 	middleware journal.AppendMiddleware,
 ) (journal.SessionJournal, journal.Lease, error) {
+	var lease journal.Lease
 	var lastErr error
 	for attempt := 0; attempt < openingGrantAttempts; attempt++ {
+		fresh, acquireErr := store.AcquireLease(ctx, sessionID)
+		if acquireErr != nil {
+			// Nobody can claim ownership: someone else holds the session, or the
+			// leaser is down. Fail closed on the acquisition error, which names the
+			// live holder. lease is the PREVIOUS grant (already released by the fence
+			// that lost) on a re-claim, and nil on the first attempt.
+			return nil, lease, &leaseAcquireError{Cause: acquireErr}
+		}
+		lease = fresh
 		j, err := store.OpenJournalWithOpeningAppend(ctx, sessionID, lease, middleware)
 		if err == nil {
 			return j, lease, nil
 		}
 		lastErr = err
 		var conflict *sessionstore.OpeningFenceConflictError
-		if !errors.As(err, &conflict) || attempt == openingGrantAttempts-1 {
+		if !errors.As(err, &conflict) {
 			break
 		}
-		fresh, acquireErr := store.AcquireLease(ctx, sessionID)
-		if acquireErr != nil {
-			// Someone else genuinely owns the session now (or the leaser is down):
-			// fail closed on the acquisition error, which names the live holder.
-			return nil, lease, acquireErr
-		}
-		lease = fresh
 	}
 	return nil, lease, lastErr
 }
 
-// releaseLease releases the lease on a bounded context, best-effort. On a failed restore
-// the lease must not be held (a successor must be able to re-acquire); a release failure
-// is swallowed (the bucket TTL is the backstop) since the restore is already failing.
+// releaseLease releases the lease on a bounded context, best-effort. On a failed
+// restore the lease must not be held: a successor must be able to re-acquire, and
+// NOTHING ELSE WILL FREE IT. No pinned backend has a lease TTL — memstore ends a
+// grant on Release only, and fsstore's grant is an advisory lock the OS drops when
+// the holding fd closes or the process exits — so a grant leaked by a live process
+// is held until that process dies. A release failure is still swallowed (the restore
+// is already failing and has no better answer), but it is a real leak, not a
+// self-healing one.
+//
+// A nil lease is a no-op: openJournalUnderFreshGrant returns one when no grant was
+// ever obtained, and there is then nothing to release.
 func releaseLease(lease journal.Lease) {
+	if lease == nil {
+		return
+	}
 	rctx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
 	defer cancel()
 	_ = lease.Release(rctx)

@@ -238,7 +238,7 @@ func TestRestoreCrashSeamAppendFailSecure(t *testing.T) {
 			}
 
 			// (d) The lease was released (cleanup + fail-secure): a successor can re-acquire
-			// it through the store without waiting out the TTL.
+			// it through the store, which nothing else would ever free.
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			successorLease, acqErr := store.AcquireLease(ctx, orig.sessionID)

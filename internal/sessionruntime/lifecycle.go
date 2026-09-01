@@ -2,6 +2,7 @@ package sessionruntime
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/looprig/core/uuid"
@@ -644,26 +645,28 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 		return nil, &NewSessionError{Kind: NewSessionIDGenerationFailed, Cause: err}
 	}
 
-	// Per-run durable wiring, mirroring the by-hand persistence pattern: acquire the lease,
-	// open the journal fenced on it (under a fresh grant if the first fence loses the
-	// ownership race — the returned lease is the session's), then build the three checked
-	// appenders over that journal. The event appender carries the NewTopologyLifecycle-built catalog so the status fold stays
+	// Per-run durable wiring, mirroring the by-hand persistence pattern: acquire the grant
+	// and open the journal fenced on it (re-claiming under a fresh grant if the first fence
+	// loses the ownership race — the returned lease is the session's), then build the three
+	// checked appenders over that journal. The event appender carries the NewTopologyLifecycle-built catalog so the status fold stays
 	// live. On any failure past the lease, release it best-effort (releaseLease, shared with
-	// RestoreSession) so a successor can re-acquire without waiting out the TTL.
-	lease, err := r.store.AcquireLease(ctx, sid)
-	if err != nil {
-		return nil, &NewSessionError{Kind: NewSessionLeaseFailed, Cause: err}
-	}
+	// RestoreSession) so a successor can re-acquire at all (no backend has a lease TTL).
 	j, lease, err := openJournalUnderFreshGrant(
 		ctx,
 		r.store,
 		sid,
-		lease,
 		journal.HookMiddleware(r.hooks, sid),
 	)
 	if err != nil {
 		releaseLease(lease)
-		return nil, &NewSessionError{Kind: NewSessionJournalFailed, Cause: err}
+		kind := NewSessionJournalFailed
+		var acquire *leaseAcquireError
+		if errors.As(err, &acquire) {
+			// Same classification rule as RestoreSession: an ownership acquisition
+			// failure is a LEASE failure whichever attempt it happened on.
+			kind, err = NewSessionLeaseFailed, acquire.Cause
+		}
+		return nil, &NewSessionError{Kind: kind, Cause: err}
 	}
 	// Offload GC: wrap the journal with the admission gate BEFORE any appender is built over
 	// it, so every append (event/command/gate/fence) serializes against a GC pass. Unconfigured

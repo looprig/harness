@@ -160,6 +160,12 @@ func (s *Store) OpenJournal(ctx context.Context, id uuid.UUID, lease journal.Lea
 // ownership fence append. The middleware sees the fence while it is still part
 // of journal construction; the journal is returned only after that append
 // commits and ready is set. Later appends are not decorated by this seam.
+//
+// The middleware runs INSIDE the tip-read-to-CAS window (see the claim comment
+// below), so its latency is added to the window this Open is racing to close. It is
+// invoked once per Open — and since a lost fence now costs the whole grant, a caller
+// re-claiming under fresh grants invokes it once per grant. A slow middleware
+// therefore makes contention worse, not merely observable.
 func (s *Store) OpenJournalWithOpeningAppend(
 	ctx context.Context,
 	id uuid.UUID,

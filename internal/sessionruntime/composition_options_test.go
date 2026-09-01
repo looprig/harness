@@ -145,7 +145,7 @@ func TestWithSessionID(t *testing.T) {
 
 // TestWithLeaseRelease proves the lease-release-on-teardown seam: a session built with a
 // release hook calls it EXACTLY ONCE at the end of Shutdown (so a clean exit relinquishes
-// single-writer ownership and a successor can re-acquire without waiting out the TTL). A
+// single-writer ownership and a successor can re-acquire at all — nothing expires a grant). A
 // second Shutdown does not call it again (idempotent). A session built WITHOUT the option
 // never references a releaser (the default is nil — a no-op), so headless mode is
 // unchanged.

@@ -18,8 +18,10 @@ type Lease interface {
 	// SessionID is the session this lease grants single-writer ownership of.
 	SessionID() uuid.UUID
 	// Release relinquishes the lease: stops any heartbeat, marks it no longer held
-	// (firing Lost), and best-effort clears the entry so a successor can re-acquire
-	// without waiting out the TTL. Idempotent.
+	// (firing Lost), and best-effort clears the entry so a successor can re-acquire.
+	// Release is the ONLY prompt end to a grant: an implementation may expire or hand
+	// one over, but none in this workspace does, so an unreleased grant is held for as
+	// long as its holder lives. Idempotent.
 	Release(ctx context.Context) error
 }
 
