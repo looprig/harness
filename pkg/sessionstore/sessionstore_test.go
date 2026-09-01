@@ -498,3 +498,47 @@ func TestSessionName(t *testing.T) {
 		})
 	}
 }
+
+// TestPersistencePathsUsesWrappedKVReporter observes the KV's local root
+// UNIQUELY: no other primitive reports a path, so the reported set is the KV's
+// contribution alone.
+//
+// KV is the one primitive Open wraps (boundedKV, to bound provider I/O), and
+// wrapping embeds the storage.KV INTERFACE, which does not promote the concrete
+// provider's optional StoragePaths. Without boundedKV's explicit forwarder,
+// PersistencePaths' storage.PathReporter assertion silently stops seeing the
+// KV — a refactor disabling a source-derived guard without touching it. The
+// shared TestPersistencePaths cannot catch that: there the KV reports a path the
+// Ledger and Leaser already report, so its contribution is never observed on its
+// own.
+func TestPersistencePathsUsesWrappedKVReporter(t *testing.T) {
+	t.Parallel()
+
+	kvPath := t.TempDir()
+	local := memstore.New()
+	backend := &storage.Composite{
+		Ledger: local.Ledger,
+		Leaser: local.Leaser,
+		KV: reportingKV{
+			KV:           local.KV,
+			pathReporter: pathReporter{paths: []string{kvPath}},
+		},
+		OrderedIndex: local.OrderedIndex,
+		Blobs:        local.Blobs,
+	}
+	store, err := Open(backend)
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	want, err := filepath.EvalSymlinks(kvPath)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", kvPath, err)
+	}
+	got, err := store.PersistencePaths()
+	if err != nil {
+		t.Fatalf("PersistencePaths() err = %v", err)
+	}
+	if !reflect.DeepEqual(got, []string{want}) {
+		t.Fatalf("PersistencePaths() = %v, want the wrapped KV's own path %q", got, want)
+	}
+}
