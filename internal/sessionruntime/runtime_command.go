@@ -171,6 +171,18 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 			return disposition, err
 		}
 	case runtimecommand.KindInterrupt:
+		// KNOWN GAP, measured and pinned by pkg/sessionstore's
+		// TestPrefixFollowedByANonEventResolvesUnresolved: this application does not
+		// settle. The released correlation resolves a prefix by the record at prefix+1,
+		// and an interrupt has no guaranteed public event there — a fan-out writes one
+		// audit intent record per target first, and an interrupt of an IDLE session is
+		// fail-quiet and appends no public event at all. The outcome is UNRESOLVED,
+		// which never licenses a rejection, so this is a liveness gap and not a
+		// correctness one; a Host adapter must not wait on an interrupt settling.
+		//
+		// Closing it needs a guaranteed durable effect record for an interrupt, which
+		// is a decision about the public event vocabulary rather than about framing,
+		// so it is deliberately not made here.
 		interrupted, err := s.Interrupt(ctx)
 		if err != nil {
 			return disposition, err

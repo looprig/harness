@@ -10,6 +10,7 @@ import (
 
 	coresessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
@@ -592,5 +593,78 @@ func TestPrefixDeduplicatesAfterIndexHydration(t *testing.T) {
 				t.Errorf("reconstructed correlation = %+v, want %+v", back, app)
 			}
 		})
+	}
+}
+
+// TestPrefixFollowedByANonEventResolvesUnresolved pins the OTHER half of the
+// adjacency contract, and records a known gap rather than leaving it implicit.
+//
+// The released correlation resolves a prefix by the record at prefix+1: a public
+// event means committed, a higher opening fence means abandoned, and ANYTHING ELSE
+// means unresolved. Unresolved is not a failure — it never licenses a rejection, so
+// it is the safe side — but an unresolved command never settles either, so it is a
+// liveness gap and not a correctness one.
+//
+// KindInterrupt is in exactly that position today, measured on the real dispatch
+// path: an interrupt of an IDLE session is fail-quiet and appends no public event at
+// all, so it has nothing to be adjacent to and can never resolve; an interrupt of a
+// busy session produces TurnInterrupted, but only after the per-loop audit intent
+// records the fan-out writes first. Giving KindInterrupt a guaranteed durable effect
+// record is a public-event-vocabulary decision, not a framing one, so it is left to
+// the Host adapter task — with this test standing in front of it so the semantics
+// cannot drift while it waits.
+func TestPrefixFollowedByANonEventResolvesUnresolved(t *testing.T) {
+	t.Parallel()
+	store, sid, lease, j := runtimeCommandStore(t)
+	commandID := coresessionwire.CommandID("v1:no-effect-event")
+	runtimeID := uuid.UUID{0x8a, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	if _, _, err := store.durable.AdmitCommand(context.Background(), durablestore.AdmitCommandRequest{
+		TenantID:                 harnessTenantID,
+		SessionID:                harnessSessionID(sid),
+		CommandID:                commandID,
+		ProposedRuntimeCommandID: durablestore.RuntimeCommandID(runtimeID.String()),
+		Kind:                     durablestore.CommandKind(runtimecommand.KindInterrupt),
+		AcceptedAt:               time.Now().UTC(),
+		ApplyDeadline:            time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("AdmitCommand: %v", err)
+	}
+	log, err := store.OpenRuntimeCommandLog(sid, j)
+	if err != nil {
+		t.Fatalf("OpenRuntimeCommandLog: %v", err)
+	}
+	res, err := log.AppendCommandApplication(context.Background(), runtimecommand.Application{
+		CommandID:        runtimecommand.CommandID(commandID),
+		RuntimeCommandID: runtimeID,
+		LeaseEpoch:       lease.Epoch(),
+		Kind:             runtimecommand.KindInterrupt,
+	})
+	if err != nil {
+		t.Fatalf("AppendCommandApplication: %v", err)
+	}
+	// A runtime-control record in the adjacent slot: an audit intent record is exactly
+	// this shape, which is what the interrupt fan-out writes before it delivers.
+	if _, err := j.Append(context.Background(), journal.NewCommandRecord(sid, uuid.UUID{}, command.Interrupt{
+		Header: command.Header{CommandID: uuid.UUID{0xC1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}},
+	})); err != nil {
+		t.Fatalf("Append(non-event): %v", err)
+	}
+
+	got, err := store.durable.FindCommandApplication(context.Background(), durablestore.FindCommandApplicationRequest{
+		TenantID: harnessTenantID, SessionID: harnessSessionID(sid), CommandID: commandID,
+	})
+	if err != nil {
+		t.Fatalf("FindCommandApplication: %v", err)
+	}
+	if got.Outcome != durablestore.CommandApplicationUnresolved {
+		t.Fatalf("released reader resolved %q, want %q", got.Outcome, durablestore.CommandApplicationUnresolved)
+	}
+	// The safe side of the gap, and the reason this is liveness rather than
+	// correctness: an unresolved command is never settled `rejected` over its effect.
+	if got.Outcome == durablestore.CommandApplicationAbsent {
+		t.Fatalf("released reader reports ABSENT; the reconciler would settle rejected")
+	}
+	if got.PrefixSeq != res.Sequence {
+		t.Errorf("located the prefix at %d, want %d", got.PrefixSeq, res.Sequence)
 	}
 }
