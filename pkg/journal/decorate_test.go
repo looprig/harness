@@ -3,6 +3,7 @@ package journal
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/looprig/harness/pkg/event"
@@ -30,11 +31,18 @@ func (c *countingAround) around(ctx context.Context, _ JournalRecord, next func(
 // capability vanishes rather than degrading), and advertising more would promise a seam
 // the delegate cannot serve.
 //
-// The reflection check at the end is what makes this maintenance-free for the failure
-// mode that actually happens — a seam added to the journal and forgotten in Decorate's
-// type switch. It requires the decorated value to carry every exported method its
-// delegate has, so a fourth seam implemented by the double below but not forwarded fails
-// here without anyone remembering to assert it.
+// The reflection check at the end makes this maintenance-free for the failure mode that
+// actually happens — a seam added to the journal and forgotten in Decorate's type switch.
+// It requires the decorated value to carry every Append* method its delegate has, so a
+// fourth seam implemented by one of these doubles but not forwarded fails here without
+// anyone remembering to assert it.
+//
+// Its reach is PROBABILISTIC, not structural, and that limit is worth stating rather
+// than assuming closed: the sweep sees exactly the three doubles this table names
+// (declared in appender_test.go). A seam added to the real *sessionstore.sessionJournal
+// AND exercised only through some new double elsewhere would fire nothing here. It caught the committed seam because that
+// seam was added to the existing committed double, which is the customary path — but
+// "customary" is the whole guarantee.
 func TestDecoratePreservesOptionalJournalContracts(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -105,10 +113,24 @@ func TestDecoratePreservesOptionalJournalContracts(t *testing.T) {
 			}
 
 			// Auto-catch for a seam added to the delegate and forgotten in Decorate.
+			//
+			// Restricted to Append* because that is what a decorator can forward, and
+			// these doubles are shared with the rest of this package's tests: an
+			// author adding an ordinary accessor to one of them would otherwise get a
+			// red test claiming the production decorator ate a method it never could
+			// carry. A guard that cries wolf gets weakened or deleted, and this one is
+			// the only thing standing between a fourth append seam and the silent
+			// amputation that shipped twice already. Every seam is Append* by
+			// construction (SessionJournal.Append, IdempotentJournal.AppendIdempotent,
+			// CommittedPublicJournal.AppendCommitted), so the narrower property is the
+			// right trade for a guard whose value is entirely in surviving to fire.
 			delegateType := reflect.TypeOf(tt.inner)
 			decoratedType := reflect.TypeOf(decorated)
 			for i := range delegateType.NumMethod() {
 				name := delegateType.Method(i).Name
+				if !strings.HasPrefix(name, "Append") {
+					continue
+				}
 				if _, exists := decoratedType.MethodByName(name); !exists {
 					t.Errorf("Decorate dropped %s: %v does not carry it", name, decoratedType)
 				}

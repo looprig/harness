@@ -182,19 +182,23 @@ type Delivery struct {
 	// offloaded is stored as an object, and the released reader refuses a public
 	// reference whose SizeBytes exceeds the envelope's inline ceiling — that read
 	// returns an error rather than these bytes. Under Harness's DEFAULT offload
-	// threshold that is the state of most offloaded public bodies, because the
-	// threshold EQUALS the ceiling and a body offloads only when strictly above it.
+	// threshold that is the state of EVERY offloaded public body, with no
+	// exception: the threshold equals the ceiling, a body offloads only when
+	// strictly above it, and that is exactly what the reader refuses.
 	//
-	// The exception is a BAND, not a point, and it sits immediately below the
-	// ceiling. The combined-envelope branch also offloads when both bodies are
-	// individually inline-legal but together overflow the frame, and it offloads
-	// the PUBLIC side only when the public body is strictly the larger of the two
-	// (equal sizes offload the runtime body instead). That confines the readable
-	// case to a narrow band just under the ceiling whose lower edge moves with
-	// envelope-field overhead — measured at [524258, 524288] for a 36-character
-	// EventID with the runtime body one byte smaller. A lower configured threshold,
-	// sessionstore.WithOffloadThreshold, likewise produces offloaded bodies under
-	// the ceiling, which the read serves byte-identically.
+	// The other offload branch cannot reach a readable case, which is why there is
+	// no exception to carve out. effectiveOffloadPlan also offloads when two
+	// individually inline-legal bodies together overflow the frame, but it selects
+	// the PUBLIC side only when the public body is strictly the larger of the two,
+	// and no real event produces that: sessionwire.projectBody returns the runtime
+	// bytes unchanged for every PublicEnduring type except GateResolved, which only
+	// deletes a key. Measured across the public enduring types, the largest
+	// public-minus-runtime delta is 0 — so the tie-break, which offloads the RUNTIME
+	// body when the sizes are equal, always wins.
+	//
+	// A lower configured threshold, sessionstore.WithOffloadThreshold, does produce
+	// offloaded public bodies under the ceiling, and the read serves those
+	// byte-identically.
 	//
 	// So the live delivery is the STRICTLY more available of the two: it always
 	// carries the committed bytes. A consumer that was CONNECTED must treat a read
