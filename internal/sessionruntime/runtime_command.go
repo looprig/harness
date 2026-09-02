@@ -7,8 +7,10 @@ import (
 
 	"github.com/looprig/core/uuid"
 
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/runtimecommand"
 )
 
@@ -121,6 +123,22 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 		}
 	}
 
+	// For an input the audit intent record is appended FIRST, so that the application
+	// prefix is the LAST append before the effect. The released settlement correlation
+	// resolves a prefix by adjacency — the record at prefix+1 must be the public event
+	// the command caused — and the intent record sitting between them resolved every
+	// input command as UNRESOLVED. Auditing first costs nothing: the intent log is
+	// audit-only and swallows its own failures, and a crash between the two leaves an
+	// orphan audit record, which is a state it already tolerates.
+	var pending *pendingInput
+	if admitted.Kind == runtimecommand.KindInput {
+		var prepErr error
+		pending, prepErr = s.prepareAdmittedInput(ctx, admitted)
+		if prepErr != nil {
+			return runtimecommand.Disposition{}, prepErr
+		}
+	}
+
 	res, err := log.AppendCommandApplication(ctx, admitted.Application())
 	if err != nil {
 		return s.resolveApplicationConflict(ctx, log, admitted, err)
@@ -149,10 +167,7 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 	// deduplicate against it.
 	switch admitted.Kind {
 	case runtimecommand.KindInput:
-		s.loopsMu.RLock()
-		active := s.activeLoopID
-		s.loopsMu.RUnlock()
-		if _, err := s.submitToLoopWithID(ctx, active, admitted.Blocks, identity.AgencyUser, false, admitted.RuntimeCommandID); err != nil {
+		if _, err := s.sendUserInput(ctx, pending.backend, pending.cmd); err != nil {
 			return disposition, err
 		}
 	case runtimecommand.KindInterrupt:
@@ -254,4 +269,46 @@ func logUnavailableRuntimeCommands(ctx context.Context, sessionID uuid.UUID, err
 	}
 	slog.ErrorContext(ctx, "session: runtime-command capability unavailable for an unexpected reason (wiring bug); admitted commands cannot be applied to this session",
 		"session", sessionID, "err", err)
+}
+
+// pendingInput is one admitted input built and audited, held until its application
+// prefix is durable and it can be sent.
+type pendingInput struct {
+	backend loop.Backend
+	cmd     command.UserInput
+}
+
+// prepareAdmittedInput resolves the target loop and builds the admitted input,
+// appending its audit-only intent record. It performs NO runtime-visible effect: the
+// command has not been handed to the loop when this returns, so a caller that then
+// fails to persist the application prefix has still applied nothing.
+//
+// The command carries the admitted RuntimeCommandID verbatim — the whole point of
+// the seam — and the loop-exited and loop-missing refusals are the same ones the
+// ordinary submit path raises, checked here so they are raised BEFORE the prefix is
+// written rather than after.
+func (s *Session) prepareAdmittedInput(ctx context.Context, admitted runtimecommand.Admitted) (*pendingInput, error) {
+	if admitted.RuntimeCommandID.IsZero() {
+		return nil, &ZeroSuppliedCommandIDError{}
+	}
+	s.loopsMu.RLock()
+	active := s.activeLoopID
+	s.loopsMu.RUnlock()
+	l, ok := s.loopFor(active)
+	if !ok {
+		return nil, &SessionError{Kind: SessionLoopNotFound}
+	}
+	if l == nil {
+		return nil, &SessionError{Kind: SessionLoopExited}
+	}
+	select {
+	case <-l.DoneChan():
+		// Refuse an exited loop BEFORE the prefix is durable. Discovering it after
+		// would strand the command: the prefix would deduplicate every redelivery of a
+		// command that was never applied.
+		return nil, &SessionError{Kind: SessionLoopExited}
+	default:
+	}
+	cmd := s.buildAndAuditUserInput(ctx, active, admitted.Blocks, identity.AgencyUser, false, admitted.RuntimeCommandID)
+	return &pendingInput{backend: l, cmd: cmd}, nil
 }

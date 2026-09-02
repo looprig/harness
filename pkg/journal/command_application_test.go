@@ -20,6 +20,7 @@ func validApplication() runtimecommand.Application {
 		CommandID:        "v1:public-command",
 		RuntimeCommandID: applicationUUID(0x41),
 		LeaseEpoch:       7,
+		Kind:             runtimecommand.KindInput,
 	}
 }
 
@@ -86,14 +87,14 @@ func TestCommandApplicationCodecFailsClosed(t *testing.T) {
 	bodies := map[string]string{
 		"empty":              ``,
 		"not an object":      `"x"`,
-		"unknown field":      `{"command_id":"c","runtime_command_id":"` + applicationUUID(1).String() + `","lease_epoch":1,"extra":1}`,
-		"trailing data":      `{"command_id":"c","runtime_command_id":"` + applicationUUID(1).String() + `","lease_epoch":1}trailing`,
-		"missing command id": `{"runtime_command_id":"` + applicationUUID(1).String() + `","lease_epoch":1}`,
-		"zero runtime id":    `{"command_id":"c","runtime_command_id":"00000000-0000-0000-0000-000000000000","lease_epoch":1}`,
-		"zero epoch":         `{"command_id":"c","runtime_command_id":"` + applicationUUID(1).String() + `","lease_epoch":0}`,
-		"bad runtime id":     `{"command_id":"c","runtime_command_id":"not-a-uuid","lease_epoch":1}`,
+		"unknown field":      `{"command_id":"c","runtime_command_id":"` + applicationUUID(1).String() + `","lease_epoch":1,"command_kind":"input","extra":1}`,
+		"trailing data":      `{"command_id":"c","runtime_command_id":"` + applicationUUID(1).String() + `","lease_epoch":1,"command_kind":"input"}trailing`,
+		"missing command id": `{"runtime_command_id":"` + applicationUUID(1).String() + `","lease_epoch":1,"command_kind":"input"}`,
+		"zero runtime id":    `{"command_id":"c","runtime_command_id":"00000000-0000-0000-0000-000000000000","lease_epoch":1,"command_kind":"input"}`,
+		"zero epoch":         `{"command_id":"c","runtime_command_id":"` + applicationUUID(1).String() + `","lease_epoch":0,"command_kind":"input"}`,
+		"bad runtime id":     `{"command_id":"c","runtime_command_id":"not-a-uuid","lease_epoch":1,"command_kind":"input"}`,
 		"command id too long": `{"command_id":"` + strings.Repeat("x", runtimecommand.MaxCommandIDBytes+1) +
-			`","runtime_command_id":"` + applicationUUID(1).String() + `","lease_epoch":1}`,
+			`","runtime_command_id":"` + applicationUUID(1).String() + `","lease_epoch":1,"command_kind":"input"}`,
 	}
 	if len(bodies) < 9 {
 		t.Fatalf("guard consumes too few bodies: %d", len(bodies))
@@ -156,11 +157,13 @@ func TestCodecCarriesAnOpaquePublicIDVerbatim(t *testing.T) {
 func TestMarshalRefusesAnInvalidCorrelation(t *testing.T) {
 	t.Parallel()
 	invalid := map[string]runtimecommand.Application{
-		"empty command id": {RuntimeCommandID: applicationUUID(1), LeaseEpoch: 1},
-		"zero runtime id":  {CommandID: "c", LeaseEpoch: 1},
-		"zero epoch":       {CommandID: "c", RuntimeCommandID: applicationUUID(1)},
+		"empty command id": {RuntimeCommandID: applicationUUID(1), LeaseEpoch: 1, Kind: runtimecommand.KindInput},
+		"zero runtime id":  {CommandID: "c", LeaseEpoch: 1, Kind: runtimecommand.KindInput},
+		"zero epoch":       {CommandID: "c", RuntimeCommandID: applicationUUID(1), Kind: runtimecommand.KindInput},
+		"unknown kind":     {CommandID: "c", RuntimeCommandID: applicationUUID(1), LeaseEpoch: 1, Kind: "reboot"},
+		"missing kind":     {CommandID: "c", RuntimeCommandID: applicationUUID(1), LeaseEpoch: 1},
 	}
-	if len(invalid) < 3 {
+	if len(invalid) < 5 {
 		t.Fatalf("guard consumes too few correlations: %d", len(invalid))
 	}
 	refused := 0

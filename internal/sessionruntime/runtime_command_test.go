@@ -818,45 +818,83 @@ func TestOpaquePublicIDsTheAdmissionAuthorityAcceptsAreApplicable(t *testing.T) 
 	}
 }
 
+// TestAnAlreadyExitedLoopIsRefusedBeforeThePrefixIsWritten pins the cheap half of
+// the persist-before-effect residual. A refusal the applier can see BEFORE it commits
+// the prefix must be raised there, because a prefix written for a command that was
+// never applied strands it: every redelivery deduplicates against it and only Host's
+// apply deadline notices. The loop lookup and the exited-loop check therefore run
+// ahead of the prefix, not inside the dispatch.
+func TestAnAlreadyExitedLoopIsRefusedBeforeThePrefixIsWritten(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	adm := f.admittedInput("v1:loop-already-gone", mustUUID(), "hello")
+	close(f.done)
+
+	disp, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
+	var sessionErr *SessionError
+	if !errors.As(err, &sessionErr) || sessionErr.Kind != SessionLoopExited {
+		t.Fatalf("ApplyRuntimeCommand err = %v, want *SessionError{SessionLoopExited}", err)
+	}
+	if disp != (runtimecommand.Disposition{}) {
+		t.Fatalf("Disposition = %+v, want zero: nothing durable may have been written", disp)
+	}
+	// The proof that nothing was written: a later delivery is a FIRST delivery, not a
+	// duplicate. Asserting only the error would pass against an implementation that
+	// wrote the prefix and stranded the command.
+	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: f.cmds, Done: make(chan struct{})}
+	again, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
+	if err != nil {
+		t.Fatalf("re-delivery after a pre-prefix refusal: %v", err)
+	}
+	if again.Duplicate {
+		t.Errorf("re-delivery Duplicate = true; the refused delivery must have written no prefix")
+	}
+	f.drainOne(t)
+}
+
 // TestEffectFailureAfterTheDurablePrefixStrandsTheCommand DOCUMENTS the residual of
-// persist-before-effect, in the direction the rest of the suite does not cover.
+// persist-before-effect that CANNOT be checked away, in the direction the rest of the
+// suite does not cover.
 //
 // TestApplyRefusesWhenThePrefixCannotBePersisted covers "append failed, so no
-// effect". This is the reverse: the prefix COMMITS and the effect then fails. The
-// caller sees the effect's error, but the prefix is durable, so every redelivery is
-// a duplicate that applies nothing — the command is silently lost to Harness, and
-// only Host's apply deadline will notice.
+// effect". The test above covers "refusable before the prefix". This is what is left:
+// the loop exits in the window BETWEEN the durable prefix and the send. The caller
+// sees the effect's error, the prefix is durable, and every redelivery is a duplicate
+// that applies nothing — the command is lost to Harness, and only Host's apply
+// deadline notices.
 //
-// This is inherent to writing the correlation before the effect and is consistent
-// with §10.4 (recovery "marks applied" from the correlation; it does not replay the
-// outcome). It is asserted here rather than left implicit so a Host adapter author
-// meets it in a test instead of in production: a non-nil error from
-// ApplyRuntimeCommand does NOT mean the command may be re-offered.
+// The window is now genuinely narrow, which is why it has to be forced here rather
+// than arranged by closing the loop up front. It is inherent to writing the
+// correlation before the effect and consistent with §10.4 (recovery "marks applied"
+// from the correlation; it does not replay the outcome). It is asserted so a Host
+// adapter author meets it in a test instead of in production: a non-nil error does
+// NOT mean the command may be re-offered — the returned Disposition says which.
 func TestEffectFailureAfterTheDurablePrefixStrandsTheCommand(t *testing.T) {
 	t.Parallel()
 	f := newRuntimeCommandFixture(t)
 	adm := f.admittedInput("v1:effect-fails", mustUUID(), "hello")
-	// The loop is gone, so the dispatch fails AFTER the prefix has been appended.
-	// The sink must be UNBUFFERED and unread: with a buffered sink the dispatch's
-	// select has two ready cases and Go picks between them at random, which is a
-	// flake, not a test. An unbuffered sink with no reader leaves exactly one ready
-	// case — the closed Done — so the failure is deterministic.
+	// Close the loop's Done at the exact instant the prefix becomes durable, which is
+	// the only window left. The sink must be UNBUFFERED and unread: with a buffered
+	// sink the send select has two ready cases and Go picks at random, which is a
+	// flake, not a test.
 	unread := make(chan command.Command)
 	f.cmds = unread
-	close(f.done)
 	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: unread, Done: f.done}
+	var exitOnce sync.Once
+	f.session.runtimeCommands = orderRecordingLog{
+		inner:   f.session.runtimeCommands,
+		observe: func() { exitOnce.Do(func() { close(f.done) }) },
+	}
 
 	stranded, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
 	var sessionErr *SessionError
 	if !errors.As(err, &sessionErr) || sessionErr.Kind != SessionLoopExited {
 		t.Fatalf("ApplyRuntimeCommand err = %v, want *SessionError{SessionLoopExited}", err)
 	}
-	f.requireNoCommand(t, "the loop had already exited")
 	// The error arrives WITH the disposition the call already earned. That is the
 	// whole signal: a caller distinguishes "nothing was written, re-offer it" from
 	// "the prefix committed, do not" by reading PrefixSequence, not by re-delivering
-	// and inferring. A zero disposition here would force the redeliver-to-learn
-	// protocol on every caller.
+	// and inferring.
 	if stranded.PrefixSequence == 0 {
 		t.Fatalf("Disposition = %+v alongside an effect failure, want the committed PrefixSequence", stranded)
 	}
@@ -867,7 +905,13 @@ func TestEffectFailureAfterTheDurablePrefixStrandsTheCommand(t *testing.T) {
 		t.Errorf("Disposition.RuntimeCommandID = %v, want the admitted %v", stranded.RuntimeCommandID, adm.RuntimeCommandID)
 	}
 
-	// The prefix is durable regardless, and that is the documented consequence.
+	// The prefix is durable regardless, and that is the documented consequence. Give
+	// the session a LIVE loop again so the redelivery reaches the duplicate check
+	// rather than being turned away by the exited-loop refusal — otherwise the
+	// assertion below would prove nothing about deduplication.
+	live := make(chan command.Command, 4)
+	f.cmds = live
+	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: live, Done: make(chan struct{})}
 	disp, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
 	if err != nil {
 		t.Fatalf("redelivery after a failed effect: %v", err)
@@ -882,6 +926,8 @@ func TestEffectFailureAfterTheDurablePrefixStrandsTheCommand(t *testing.T) {
 	if app.CommandID != adm.CommandID || app.RuntimeCommandID != adm.RuntimeCommandID {
 		t.Errorf("durable prefix = %+v, want the admitted correlation", app)
 	}
+	// And the command really is lost: the redelivery applied nothing to the live loop.
+	f.requireNoCommand(t, "redelivery of a stranded command")
 }
 
 // TestRuntimeCommandsSurvivesCompositionRootDecorators is the composition-root guard
@@ -1093,4 +1139,112 @@ func TestSuppliedZeroCommandIDIsRefusedWithoutClaimingAGenerationFailure(t *test
 		t.Errorf("returned id = %v, want zero (nothing was sent)", id)
 	}
 	f.requireNoCommand(t, "supplied zero command id")
+}
+
+// TestApplicationPrefixIsTheLastRecordBeforeItsEffect is the ordering half of the
+// released settlement correlation, observed on the REAL dispatch path.
+//
+// FindCommandApplication resolves a prefix by ADJACENCY: the record at prefix+1 must
+// be the public event the command caused. Anything else resolves UNRESOLVED, and an
+// unresolved command never settles. The audit intent record used to sit in exactly
+// that slot — deterministically, on every input, with no concurrency involved — so
+// this asserts the order rather than trusting it.
+//
+// Its counterpart is pkg/sessionstore's TestReleasedReaderSettlesHarnessApplications,
+// which proves that this order resolves `committed` when read by the released module.
+// This one proves Harness produces the order; that one proves the order is the one
+// the counterparty wants.
+func TestApplicationPrefixIsTheLastRecordBeforeItsEffect(t *testing.T) {
+	t.Parallel()
+	store := sessionstoreOverMemstore(t)
+	lifecycle, err := newTestLifecycle(cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}), store)
+	if err != nil {
+		t.Fatalf("newTestLifecycle: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	s, err := lifecycle.NewSession(ctx, "")
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+	applier, ok := s.RuntimeCommands()
+	if !ok {
+		t.Fatalf("no runtime-command capability")
+	}
+	disp, err := applier.ApplyRuntimeCommand(ctx, runtimecommand.Admitted{
+		CommandID:        "v1:adjacency",
+		RuntimeCommandID: mustUUID(),
+		Kind:             runtimecommand.KindInput,
+		LeaseEpoch:       s.runtimeCommandLease.Epoch(),
+		Blocks:           []content.Block{&content.TextBlock{Text: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("ApplyRuntimeCommand: %v", err)
+	}
+	// WaitIdle is NOT a sufficient wait here: the session can observe idle before the
+	// loop has picked the queued input up at all, and the assertion would then read an
+	// empty tail as a passing walk. Wait on the LEDGER reaching prefix+1, which is the
+	// thing under assertion.
+	sawPrefix, adjacent := recordsAroundPrefix(t, ctx, store, s.SessionID(), disp.PrefixSequence)
+	// Floor what the walk CONSUMED: without both of these the assertion below is
+	// vacuous on an empty or short ledger.
+	if !sawPrefix {
+		t.Fatalf("the walk never reached the application prefix at seq %d", disp.PrefixSequence)
+	}
+	if adjacent == nil {
+		t.Fatalf("no record follows the prefix at seq %d; the effect never landed", disp.PrefixSequence)
+	}
+	if _, isEvent := adjacent.(journal.EventRecord); !isEvent {
+		t.Fatalf("record at prefix+1 is %T, want journal.EventRecord:"+
+			" the released correlation resolves by adjacency and reads anything else as UNRESOLVED", adjacent)
+	}
+}
+
+// recordsAroundPrefix waits for the ledger to reach prefixSeq+1 and returns whether
+// the prefix itself was seen and what record follows it. It polls rather than sleeps
+// a fixed interval so a slow machine cannot turn a real ordering regression into a
+// flake, and it fails on the deadline rather than returning a nil record that would
+// read as "the effect never landed".
+func recordsAroundPrefix(t *testing.T, ctx context.Context, store *sessionstore.Store, sid uuid.UUID, prefixSeq uint64) (bool, journal.JournalRecord) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		sawPrefix := false
+		var adjacent journal.JournalRecord
+		replayer, err := store.OpenInternalRecordReplayer(sid, sessionstore.ReplayRequest{})
+		if err != nil {
+			t.Fatalf("OpenInternalRecordReplayer: %v", err)
+		}
+		cursor, err := replayer.Open(ctx, journal.ReplayRequest{SessionID: sid, From: journal.Beginning()})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		for {
+			rec, seq, err := cursor.Next(ctx)
+			if err != nil {
+				break
+			}
+			if seq == prefixSeq {
+				if _, isPrefix := rec.(journal.CommandApplicationRecord); !isPrefix {
+					_ = cursor.Close()
+					t.Fatalf("record at the reported prefix sequence %d is %T, not the prefix", seq, rec)
+				}
+				sawPrefix = true
+				continue
+			}
+			if seq == prefixSeq+1 {
+				adjacent = rec
+				break
+			}
+		}
+		_ = cursor.Close()
+		if adjacent != nil {
+			return sawPrefix, adjacent
+		}
+		if time.Now().After(deadline) {
+			return sawPrefix, nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

@@ -61,17 +61,13 @@ type CommandID string
 // (journal.CommandApplicationRecord), and the record body is JSON-encoded, so no
 // byte value is unsafe anywhere on the path.
 //
-// The LENGTH dimension is a different story and this bound does not currently own
-// it. The public id IS carried into a derived durable identity — journal namespaces
-// it, then sessionstore's durableRecordID namespaces that again — and the released
-// SessionStore validates the result against its own 256-byte identity limit. Two
-// 20-byte prefixes therefore consume the budget, and the effective ceiling for a
-// public id is 216 bytes, not the MaxCommandIDBytes 256 asserted here. An id between
-// 217 and 256 bytes is admitted by Core, accepted by Validate, and then refused at
-// the durable append with an untyped error, writing no prefix — so it is not even
-// deduplicable on redelivery. Fixing that is a pending decision (shorten this bound,
-// hash the namespace, or widen the limit in a SessionStore release); until it lands,
-// do not read this constant as the real ceiling.
+// The LENGTH dimension is enforced by the SAME authority, not by a second one, and
+// that is structural rather than test-enforced. The application prefix is persisted
+// as the released SessionStore's EnvelopeKindApplicationPrefix, whose identity field
+// carries the RAW public id and is validated by Core's own
+// sessionwire.CommandID.Validate. No prefix, namespace, or derived record id
+// consumes any of the 256-byte budget, so Harness's acceptance and the durable
+// boundary's acceptance cannot drift: they are one rule applied twice.
 func (id CommandID) Validate() error {
 	switch {
 	case id == "":
@@ -168,12 +164,22 @@ type Application struct {
 	CommandID        CommandID `json:"command_id"`
 	RuntimeCommandID uuid.UUID `json:"runtime_command_id"`
 	LeaseEpoch       uint64    `json:"lease_epoch"`
+	// Kind is the admitted command's kind. It is part of the correlation because
+	// the released SessionStore reader correlates on it: a prefix whose kind
+	// disagrees with the inbox record's resolves CONFLICTED, not applied. Omitting
+	// it would make every application unmatchable by the counterparty.
+	Kind Kind `json:"command_kind"`
 }
 
 // Application returns the durable correlation for this admitted record. It copies
 // the identities rather than deriving new ones.
 func (a Admitted) Application() Application {
-	return Application{CommandID: a.CommandID, RuntimeCommandID: a.RuntimeCommandID, LeaseEpoch: a.LeaseEpoch}
+	return Application{
+		CommandID:        a.CommandID,
+		RuntimeCommandID: a.RuntimeCommandID,
+		LeaseEpoch:       a.LeaseEpoch,
+		Kind:             a.Kind,
+	}
 }
 
 // Validate fails closed on a correlation that cannot have been produced by a valid
@@ -187,6 +193,9 @@ func (a Application) Validate() error {
 	}
 	if a.LeaseEpoch == 0 {
 		return &ValidationError{Field: "LeaseEpoch", Reason: "zero"}
+	}
+	if !a.Kind.Valid() {
+		return &ValidationError{Field: "Kind", Reason: "unknown kind " + strconv.Quote(string(a.Kind))}
 	}
 	return nil
 }

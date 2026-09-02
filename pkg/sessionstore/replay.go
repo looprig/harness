@@ -15,6 +15,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/runtimecommand"
 	durablestore "github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 )
@@ -390,6 +391,24 @@ func (b *baseCursor) resolveDurable(ctx context.Context, env durablestore.Envelo
 			return resolved{}, &ReplayDecodeError{Seq: seq, Cause: err}
 		}
 		return resolved{kind: kindFence, body: body, seq: seq, id: strconv.FormatUint(env.LeaseEpoch, 10)}, nil
+	case durablestore.EnvelopeKindApplicationPrefix:
+		// Mirror of frame()'s ApplicationPrefix arm. The record has no stored body, so
+		// the correlation is reconstructed from the envelope fields and re-encoded with
+		// the same canonical codec the write path fingerprinted. Those bytes must be
+		// byte-identical, because the idempotency index is hydrated from this path and
+		// compared against the write path's fingerprint: if they diverged, a redelivery
+		// after restart would append a SECOND prefix instead of deduplicating.
+		rec := journal.NewCommandApplicationRecord(runtimecommand.Application{
+			CommandID:        runtimecommand.CommandID(env.CommandID),
+			RuntimeCommandID: env.RuntimeCommandID,
+			LeaseEpoch:       env.LeaseEpoch,
+			Kind:             runtimecommand.Kind(env.CommandKind),
+		})
+		body, err := journal.MarshalCommandApplicationRecord(rec)
+		if err != nil {
+			return resolved{}, &ReplayDecodeError{Seq: seq, Cause: err}
+		}
+		return resolved{kind: kindCommandApplication, body: body, seq: seq, id: rec.IdempotencyID()}, nil
 	case durablestore.EnvelopeKindPublicEvent:
 		body, err := b.resolveDurableBody(ctx, env.Runtime, durablestore.ObjectKindJournalRuntime, seq)
 		if err != nil {

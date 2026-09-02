@@ -656,10 +656,38 @@ func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k
 			env.Kind = durablestore.EnvelopeKindRuntimeControl
 			env.RecordID = durableRecordID(k, rec.IdempotencyID())
 		}
+	case kindCommandApplication:
+		// The application prefix has a FIRST-CLASS released envelope kind, and using
+		// it is not a tidiness choice. The generic RuntimeControl slot carries a
+		// derived RecordID, and the released reader's settlement correlation
+		// (FindCommandApplication) matches on `Kind == EnvelopeKindApplicationPrefix
+		// && CommandID == record.CommandID`. A prefix framed as RuntimeControl can
+		// never match it, so every command Harness applies would read as ABSENT to
+		// the counterparty — and ABSENT is the single outcome that licenses the
+		// deadline reconciler to settle `rejected`. That is settling rejected over a
+		// durable effect: a writer withholding the evidence the reader exists to read.
+		//
+		// The identity field carries the RAW public id, validated by Core's own
+		// sessionwire.CommandID.Validate, so Harness's acceptance and the durable
+		// boundary's acceptance are one rule rather than two that can drift.
+		//
+		// The kind's record-shape rule forbids a body: these envelope fields ARE the
+		// record. body is still computed by encodeRecordBody, but only to fingerprint
+		// the record for idempotency; it is never persisted, and the read side
+		// reconstructs the identical bytes from these fields.
+		app := rec.(journal.CommandApplicationRecord).Application()
+		env.Kind = durablestore.EnvelopeKindApplicationPrefix
+		env.CommandID = coresessionwire.CommandID(app.CommandID)
+		env.RuntimeCommandID = app.RuntimeCommandID
+		env.LeaseEpoch = app.LeaseEpoch
+		env.CommandKind = string(app.Kind)
 	default:
 		env.Kind = durablestore.EnvelopeKindRuntimeControl
 		env.RecordID = durableRecordID(k, rec.IdempotencyID())
 	}
+	// Bodiless kinds: the fence and the application prefix are wholly described by
+	// their envelope fields, so neither publishes an object nor occupies a body slot.
+	bodiless := k == kindFence || k == kindCommandApplication
 	// Refuse a runtime body the READ side could never admit, before any object is
 	// published. Only event.MarshalEvent caps its own output;
 	// command.MarshalCommand and journal.MarshalGatePreparedRecord do not, so
@@ -668,13 +696,13 @@ func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k
 	// but UNRECOVERABLE restore for that session. Fail the append instead, with
 	// the same legacy *journal.RecordTooLargeError classification an oversized
 	// record has always carried.
-	if k != kindFence && len(body) > maxRuntimeBodyBytes {
+	if !bodiless && len(body) > maxRuntimeBodyBytes {
 		return nil, journal.CommittedPublicBody{}, &journal.RecordTooLargeError{
 			Subject: b.name, MsgID: rec.IdempotencyID(), Length: len(body),
 			Cause: errRuntimeBodyAboveReplayCeiling,
 		}
 	}
-	publicOffload, runtimeOffload, err := b.effectiveOffloadPlan(env, publicBody, body, k != kindFence)
+	publicOffload, runtimeOffload, err := b.effectiveOffloadPlan(env, publicBody, body, !bodiless)
 	if err != nil {
 		return nil, journal.CommittedPublicBody{}, err
 	}
@@ -684,7 +712,7 @@ func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k
 			return nil, journal.CommittedPublicBody{}, b.mapOffloadErr(rec, len(publicBody), err)
 		}
 	}
-	if k != kindFence {
+	if !bodiless {
 		env.Runtime, err = b.durableBodySlot(ctx, durablestore.ObjectKindJournalRuntime, body, runtimeOffload)
 		if err != nil {
 			return nil, journal.CommittedPublicBody{}, b.mapOffloadErr(rec, len(body), err)

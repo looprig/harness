@@ -2472,18 +2472,39 @@ func (s *Session) submitToLoopWithID(ctx context.Context, loopID uuid.UUID, bloc
 // the loop. Keeping it in one place is what makes the supplied-id path identical to
 // the minted-id path in every respect other than where the id came from.
 func (s *Session) dispatchUserInput(ctx context.Context, l loop.Backend, loopID uuid.UUID, blocks []content.Block, agency identity.Agency, noFold bool, id uuid.UUID) (uuid.UUID, error) {
-	// Queueable submit: Cause.CommandID is zero (root); the outcome is observed on the
-	// session fan-in. Agency is caller-chosen — AgencyUser for the interactive human
-	// Submit, AgencyMachine for the agent task submit — so a machine path never
-	// claims user agency. noFold is true only for the delegate follow-up path, which must
-	// start a distinct correlated turn rather than fold into the child's running turn.
+	return s.sendUserInput(ctx, l, s.buildAndAuditUserInput(ctx, loopID, blocks, agency, noFold, id))
+}
+
+// buildAndAuditUserInput builds the queueable UserInput and appends its AUDIT-ONLY
+// intent record. It is split from the send so a caller that must interpose its own
+// durable write between the audit append and the dispatch can do so — the
+// runtime-command applier is that caller, and the reason is ordering, not taste.
+//
+// The released settlement correlation resolves an application prefix by ADJACENCY:
+// the record at prefix+1 is the effect. The intent record is framed as generic
+// runtime control, so a prefix written before it resolves UNRESOLVED on every single
+// input command — deterministically, with no concurrency involved. Auditing first
+// and writing the prefix last leaves the loop's own public event adjacent to the
+// prefix, which is what the counterparty is looking for.
+//
+// Cause.CommandID is zero (root); the outcome is observed on the session fan-in.
+// Agency is caller-chosen — AgencyUser for the interactive human Submit,
+// AgencyMachine for the agent task submit — so a machine path never claims user
+// agency. noFold is true only for the delegate follow-up path, which must start a
+// distinct correlated turn rather than fold into the child's running turn.
+func (s *Session) buildAndAuditUserInput(ctx context.Context, loopID uuid.UUID, blocks []content.Block, agency identity.Agency, noFold bool, id uuid.UUID) command.UserInput {
 	cmd := command.UserInput{Header: command.Header{CommandID: id, Agency: agency, CreatedAt: s.stampNow()}, Blocks: blocks, NoFold: noFold}
 	// Intent log (audit-only): append BEFORE dispatch; an append failure is logged and
 	// the submit proceeds (a lost record must never block the user's input).
 	s.appendCommand(ctx, loopID, cmd)
+	return cmd
+}
+
+// sendUserInput hands one built command to its loop, with the standard escapes.
+func (s *Session) sendUserInput(ctx context.Context, l loop.Backend, cmd command.UserInput) (uuid.UUID, error) {
 	select {
 	case l.CommandSink() <- cmd:
-		return id, nil
+		return cmd.Header.CommandID, nil
 	case <-ctx.Done():
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	case <-l.DoneChan():
