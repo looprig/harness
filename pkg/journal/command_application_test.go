@@ -121,6 +121,10 @@ func TestCommandApplicationCodecFailsClosed(t *testing.T) {
 func TestCodecCarriesAnOpaquePublicIDVerbatim(t *testing.T) {
 	t.Parallel()
 	opaque := []runtimecommand.CommandID{" leading", "trailing ", "a\x00b", "a\tb", "a\x7fb"}
+	if len(opaque) < 5 {
+		t.Fatalf("guard consumes too few identities: %d", len(opaque))
+	}
+	carried := 0
 	for _, id := range opaque {
 		app := validApplication()
 		app.CommandID = id
@@ -136,7 +140,14 @@ func TestCodecCarriesAnOpaquePublicIDVerbatim(t *testing.T) {
 		}
 		if back.Application().CommandID != id {
 			t.Errorf("round trip = %q, want %q verbatim", back.Application().CommandID, id)
+			continue
 		}
+		carried++
+	}
+	// Floor the quantity the guard CONSUMES: every id must have completed the round
+	// trip, or a codec that refused most of them would still pass on the remainder.
+	if carried != len(opaque) {
+		t.Fatalf("only %d of %d identities round-tripped verbatim", carried, len(opaque))
 	}
 }
 
@@ -149,10 +160,19 @@ func TestMarshalRefusesAnInvalidCorrelation(t *testing.T) {
 		"zero runtime id":  {CommandID: "c", LeaseEpoch: 1},
 		"zero epoch":       {CommandID: "c", RuntimeCommandID: applicationUUID(1)},
 	}
+	if len(invalid) < 3 {
+		t.Fatalf("guard consumes too few correlations: %d", len(invalid))
+	}
+	refused := 0
 	for name, app := range invalid {
 		if _, err := journal.MarshalCommandApplicationRecord(journal.NewCommandApplicationRecord(app)); err == nil {
 			t.Errorf("Marshal(%s) = nil error, want a refusal", name)
+			continue
 		}
+		refused++
+	}
+	if refused != len(invalid) {
+		t.Fatalf("only %d of %d invalid correlations were refused", refused, len(invalid))
 	}
 }
 

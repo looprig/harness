@@ -3,6 +3,9 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"log/slog"
+
+	"github.com/looprig/core/uuid"
 
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
@@ -81,15 +84,21 @@ func (s *Session) RuntimeCommands() (runtimecommand.Applier, bool) {
 // Harness allocates no identity here. The dispatched command carries the admitted
 // RuntimeCommandID verbatim, and the opaque public id is never parsed as a UUID.
 //
-// A NON-NIL ERROR DOES NOT MEAN THE COMMAND MAY BE RE-OFFERED. If the prefix commits
-// and the effect then fails — an exited loop, a cancelled context — the caller gets
-// the effect's error while the prefix stays durable, so every later delivery is a
-// duplicate that applies nothing. That residual is inherent to writing the
-// correlation before the effect, and it is the safe direction: the alternative is
-// applying the command twice. A caller must distinguish a refusal that wrote nothing
-// (validation, stale epoch, mapping conflict, a failed prefix append) from one that
-// did, and the way to tell is to re-deliver and read Disposition.Duplicate rather
-// than to assume. See TestEffectFailureAfterTheDurablePrefixStrandsTheCommand.
+// A NON-NIL ERROR DOES NOT MEAN THE COMMAND MAY BE RE-OFFERED, and the RETURNED
+// DISPOSITION is how a caller tells the two apart:
+//
+//   - zero Disposition + error: nothing durable was written (validation, a lost or
+//     stale lease, a mapping conflict, an unreadable prefix, a failed prefix append).
+//     The command is untouched and may be re-offered.
+//   - non-zero PrefixSequence + error: the prefix COMMITTED and the effect then
+//     failed — an exited loop, a cancelled context. Every later delivery is a
+//     duplicate that applies nothing.
+//
+// The second case is inherent to writing the correlation before the effect, and it
+// is the safe direction: the alternative is applying the command twice. Returning
+// the earned disposition alongside the error is what keeps it observable without
+// forcing a redelivery to find out. See
+// TestEffectFailureAfterTheDurablePrefixStrandsTheCommand.
 func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecommand.Admitted) (runtimecommand.Disposition, error) {
 	log, lease := s.runtimeCommands, s.runtimeCommandLease
 	if log == nil || lease == nil {
@@ -132,24 +141,30 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 		RuntimeCommandID: admitted.RuntimeCommandID,
 		PrefixSequence:   res.Sequence,
 	}
+	// Past this point the prefix IS durable, so every return carries the disposition
+	// alongside whatever error the effect raises. That is what makes "the prefix
+	// committed" observable without a redelivery: a zero Disposition with an error
+	// means nothing was written and the command may be re-offered; a non-zero
+	// PrefixSequence with an error means it was written and every later delivery will
+	// deduplicate against it.
 	switch admitted.Kind {
 	case runtimecommand.KindInput:
 		s.loopsMu.RLock()
 		active := s.activeLoopID
 		s.loopsMu.RUnlock()
 		if _, err := s.submitToLoopWithID(ctx, active, admitted.Blocks, identity.AgencyUser, false, admitted.RuntimeCommandID); err != nil {
-			return runtimecommand.Disposition{}, err
+			return disposition, err
 		}
 	case runtimecommand.KindInterrupt:
 		interrupted, err := s.Interrupt(ctx)
 		if err != nil {
-			return runtimecommand.Disposition{}, err
+			return disposition, err
 		}
 		disposition.Interrupted = interrupted
 	default:
-		// Unreachable: Validate rejects every other kind. Fail closed rather than
-		// reporting an application that never happened.
-		return runtimecommand.Disposition{}, &runtimecommand.ValidationError{Field: "Kind", Reason: "no runtime dispatch path"}
+		// Unreachable: Validate rejects every other kind. The prefix is already
+		// durable, so this reports it rather than pretending nothing happened.
+		return disposition, &runtimecommand.ValidationError{Field: "Kind", Reason: "no runtime dispatch path"}
 	}
 	return disposition, nil
 }
@@ -206,3 +221,37 @@ var (
 	_ runtimecommand.Applier  = (*Session)(nil)
 	_ leaseEpochSource        = (journal.Lease)(nil)
 )
+
+// ZeroSuppliedCommandIDError reports that a supplied-id submit was handed the zero
+// UUID. It is deliberately NOT SessionError{SessionIDGenerationFailed}: nothing was
+// generated on that path, so that kind would send a reader looking for a crypto/rand
+// failure that never happened. Reaching it at all is a caller bug — every production
+// path validates the admitted record first — so it names the real condition.
+type ZeroSuppliedCommandIDError struct{}
+
+func (*ZeroSuppliedCommandIDError) Error() string {
+	return "sessionruntime: a supplied-id submit requires a non-zero command id"
+}
+
+// logUnavailableRuntimeCommands records why a composition root could not advertise
+// the runtime-command capability. The root cannot FAIL on this — a session whose
+// journal is not idempotent is still a perfectly good session for every other
+// consumer, and Host learns ok=false before it acknowledges anything — but it must
+// not swallow it either.
+//
+// The two causes are categorically different and the log says which. A
+// *journal.NonIdempotentJournalError is a genuine capability absence: this
+// deployment's journal cannot deduplicate, so it declines the contract. Anything
+// else — today, sessionName rejecting the session id — is a WIRING BUG that would
+// otherwise present identically, as a deployment that silently applies no commands
+// with no error anywhere to explain it.
+func logUnavailableRuntimeCommands(ctx context.Context, sessionID uuid.UUID, err error) {
+	var nonIdempotent *journal.NonIdempotentJournalError
+	if errors.As(err, &nonIdempotent) {
+		slog.InfoContext(ctx, "session: runtime-command capability unavailable (journal cannot deduplicate); admitted commands cannot be applied to this session",
+			"session", sessionID, "err", err)
+		return
+	}
+	slog.ErrorContext(ctx, "session: runtime-command capability unavailable for an unexpected reason (wiring bug); admitted commands cannot be applied to this session",
+		"session", sessionID, "err", err)
+}

@@ -15,12 +15,21 @@ func testUUID(b byte) uuid.UUID {
 	return uuid.UUID{b, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
 }
 
-// TestCommandIDValidityIsExactlyCoreRule is the ORACLE for the opacity rule. The
-// rule is restated here in primitives — non-empty, at most MaxCommandIDBytes bytes,
-// valid UTF-8 — and checked against Validate over a corpus, so a rule ADDED to
-// Validate is caught without anyone remembering to add a row for it. A table of
-// accepted/rejected literals generalises no further than its rows and would have
-// happily accommodated an extra whitespace or control-character rule.
+// TestCommandIDValidityIsExactlyCoreRule is the ORACLE for the opacity rule: the
+// rule is restated in primitives — non-empty, at most MaxCommandIDBytes bytes, valid
+// UTF-8 — and checked against Validate over a corpus.
+//
+// Be precise about what that buys, because it is easy to overclaim. THE CORPUS IS
+// THE GUARD; THE FORMULA IS ONLY AN AMPLIFIER. The formula removes the need to
+// hand-label each row as accepted or rejected, and it makes one row fail under any
+// added rule that touches it — but it cannot reach a character class the corpus does
+// not sample. A rule rejecting astral-plane runes, say, is invisible to a corpus of
+// BMP strings alone; that is why the rows below deliberately span control characters,
+// whitespace, combining marks, BiDi controls, the BOM, private-use and astral planes,
+// and both length boundaries in bytes and in runes.
+//
+// So: adding a character class here is real work, not decoration. If a future rule is
+// proposed for a class not listed below, add the row first and watch it fail.
 func TestCommandIDValidityIsExactlyCoreRule(t *testing.T) {
 	t.Parallel()
 	corpus := []runtimecommand.CommandID{
@@ -41,6 +50,19 @@ func TestCommandIDValidityIsExactlyCoreRule(t *testing.T) {
 		"a\x7fb",
 		"a\u0085b",
 		"\u200bzero-width",
+		// Character classes a filtering rule is most likely to reach for. Each is one
+		// the admission authority accepts, and each is a class the rows above do NOT
+		// sample — an added rule that touched only one of them would otherwise escape.
+		"emoji-\U0001F680",             // astral plane (beyond the BMP)
+		"\U0001D11E-musical-symbol",    // astral plane, leading
+		"combining-e\u0301-acute",      // combining mark
+		"\u0301leading-combining",      // combining mark with no base
+		"bidi-\u202Eoverride",          // BiDi control (right-to-left override)
+		"\u2066isolate\u2069",          // BiDi isolates
+		"\uFEFFbyte-order-mark",        // BOM / zero-width no-break space
+		"private-use-\U000F0000",       // private-use plane
+		"\uFFFDreplacement",            // replacement character, legitimately present
+		"surrogate-free-\uFFFF-noncha", // noncharacter
 		// Boundaries.
 		runtimecommand.CommandID(strings.Repeat("x", runtimecommand.MaxCommandIDBytes)),
 		runtimecommand.CommandID(strings.Repeat("x", runtimecommand.MaxCommandIDBytes+1)),
@@ -51,7 +73,7 @@ func TestCommandIDValidityIsExactlyCoreRule(t *testing.T) {
 		runtimecommand.CommandID([]byte{0x66, 0xff, 0x66}),
 		runtimecommand.CommandID([]byte{0xff}),
 	}
-	if len(corpus) < 20 {
+	if len(corpus) < 31 {
 		t.Fatalf("oracle consumes too few identities: %d", len(corpus))
 	}
 	accepted, rejected := 0, 0
@@ -76,7 +98,7 @@ func TestCommandIDValidityIsExactlyCoreRule(t *testing.T) {
 		}
 	}
 	// Both arms of the oracle must have been exercised, or the walk proves nothing.
-	if accepted < 14 || rejected < 5 {
+	if accepted < 24 || rejected < 5 {
 		t.Fatalf("oracle exercised %d accepted / %d rejected, want both arms populated", accepted, rejected)
 	}
 }
@@ -135,7 +157,9 @@ func TestAdmittedValidateFailsClosed(t *testing.T) {
 		"input without blocks": func(a *runtimecommand.Admitted) { a.Blocks = nil },
 		"input with nil block": func(a *runtimecommand.Admitted) { a.Blocks = []content.Block{nil} },
 		"zero lease epoch":     func(a *runtimecommand.Admitted) { a.LeaseEpoch = 0 },
-		"interrupt carrying kind": func(a *runtimecommand.Admitted) {
+		// A kind that carries no payload must not arrive holding one: Harness would
+		// silently drop the blocks, and the drop is invisible on both sides.
+		"interrupt still carrying input blocks": func(a *runtimecommand.Admitted) {
 			a.Kind = runtimecommand.KindInterrupt
 		},
 	}
@@ -146,14 +170,6 @@ func TestAdmittedValidateFailsClosed(t *testing.T) {
 		bad := valid
 		bad.Blocks = append([]content.Block(nil), blocks...)
 		apply(&bad)
-		if name == "interrupt carrying kind" {
-			// An interrupt that still carries input blocks is a malformed record:
-			// Harness would silently drop the payload.
-			if err := bad.Validate(); err == nil {
-				t.Errorf("Validate(%s) = nil, want error", name)
-			}
-			continue
-		}
 		if err := bad.Validate(); err == nil {
 			t.Errorf("Validate(%s) = nil, want error", name)
 		}

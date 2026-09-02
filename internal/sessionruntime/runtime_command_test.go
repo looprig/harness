@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/hook"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/runtimecommand"
 	"github.com/looprig/harness/pkg/sessionstore"
@@ -252,11 +254,19 @@ func TestApplyRefusesWhenThePrefixCannotBePersisted(t *testing.T) {
 	boom := errors.New("prefix append refused")
 	WithRuntimeCommands(failingRuntimeCommandLog{err: boom}, f.lease)(f.session)
 
-	_, err := f.session.ApplyRuntimeCommand(context.Background(), f.admittedInput("c1", mustUUID(), "hello"))
+	disp, err := f.session.ApplyRuntimeCommand(context.Background(), f.admittedInput("c1", mustUUID(), "hello"))
 	if !errors.Is(err, boom) {
 		t.Fatalf("ApplyRuntimeCommand err = %v, want the append failure %v", err, boom)
 	}
 	f.requireNoCommand(t, "prefix append failed")
+	// The other side of the disposition invariant: nothing was written, so the
+	// disposition is zero and the command may be re-offered. Paired with
+	// TestEffectFailureAfterTheDurablePrefixStrandsTheCommand, which asserts a
+	// NON-zero PrefixSequence alongside its error, this is what makes the two
+	// error cases distinguishable at all.
+	if disp != (runtimecommand.Disposition{}) {
+		t.Errorf("Disposition = %+v when nothing was persisted, want the zero value", disp)
+	}
 }
 
 type failingRuntimeCommandLog struct{ err error }
@@ -531,18 +541,35 @@ func TestDuplicateInterruptDeliveryDoesNotInterruptTwice(t *testing.T) {
 		Kind:             runtimecommand.KindInterrupt,
 		LeaseEpoch:       f.lease.Epoch(),
 	}
+	// The responder is bounded by a stop channel and JOINED before the test returns.
+	// Ranging over f.cmds would leak: nothing closes it, so the goroutine would
+	// outlive the test and keep reading a session the fixture has already torn down.
 	var mu sync.Mutex
 	delivered := 0
+	stop := make(chan struct{})
+	var responder sync.WaitGroup
+	responder.Add(1)
 	go func() {
-		for cmd := range f.cmds {
-			if interrupt, ok := cmd.(command.Interrupt); ok {
-				mu.Lock()
-				delivered++
-				mu.Unlock()
-				interrupt.Ack <- true
+		defer responder.Done()
+		for {
+			select {
+			case cmd := <-f.cmds:
+				if interrupt, ok := cmd.(command.Interrupt); ok {
+					mu.Lock()
+					delivered++
+					mu.Unlock()
+					interrupt.Ack <- true
+				}
+			case <-stop:
+				return
 			}
 		}
 	}()
+	t.Cleanup(func() {
+		close(stop)
+		responder.Wait()
+	})
+
 	first, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
 	if err != nil {
 		t.Fatalf("first interrupt: %v", err)
@@ -560,7 +587,10 @@ func TestDuplicateInterruptDeliveryDoesNotInterruptTwice(t *testing.T) {
 	if second.Interrupted {
 		t.Errorf("duplicate interrupt Interrupted = true; a duplicate applies nothing")
 	}
-	time.Sleep(50 * time.Millisecond)
+	// No sleep is needed and none is wanted. ApplyRuntimeCommand blocks on the
+	// interrupt's ack, so by the time the second call has RETURNED, a second delivery
+	// would already have been counted. Sleeping to "let it settle" would only make a
+	// real regression flaky instead of failing.
 	mu.Lock()
 	got := delivered
 	mu.Unlock()
@@ -816,12 +846,26 @@ func TestEffectFailureAfterTheDurablePrefixStrandsTheCommand(t *testing.T) {
 	close(f.done)
 	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: unread, Done: f.done}
 
-	_, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
+	stranded, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
 	var sessionErr *SessionError
 	if !errors.As(err, &sessionErr) || sessionErr.Kind != SessionLoopExited {
 		t.Fatalf("ApplyRuntimeCommand err = %v, want *SessionError{SessionLoopExited}", err)
 	}
 	f.requireNoCommand(t, "the loop had already exited")
+	// The error arrives WITH the disposition the call already earned. That is the
+	// whole signal: a caller distinguishes "nothing was written, re-offer it" from
+	// "the prefix committed, do not" by reading PrefixSequence, not by re-delivering
+	// and inferring. A zero disposition here would force the redeliver-to-learn
+	// protocol on every caller.
+	if stranded.PrefixSequence == 0 {
+		t.Fatalf("Disposition = %+v alongside an effect failure, want the committed PrefixSequence", stranded)
+	}
+	if stranded.Duplicate {
+		t.Errorf("Duplicate = true on the FIRST delivery")
+	}
+	if stranded.RuntimeCommandID != adm.RuntimeCommandID {
+		t.Errorf("Disposition.RuntimeCommandID = %v, want the admitted %v", stranded.RuntimeCommandID, adm.RuntimeCommandID)
+	}
 
 	// The prefix is durable regardless, and that is the documented consequence.
 	disp, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
@@ -951,4 +995,102 @@ func assertRuntimeCommandCapability(t *testing.T, s *Session, commandID runtimec
 		t.Fatalf("duplicate through the decorated journal = %+v, want the original prefix %d:"+
 			" the decorator did not delegate the idempotent append", second, first.PrefixSequence)
 	}
+}
+
+// TestUnreadableDurablePrefixFailsClosed is the guard for the ONE arm of
+// resolveApplicationConflict whose stated invariant is fail-secure and whose
+// consequence is silent: the durable prefix names a sequence the store cannot read.
+//
+// That happens for real. A corrupt or substituted frame at collision.Seq is exactly
+// what *CommandApplicationNotFoundError exists for, and
+// TestReadCommandApplicationAtFailsClosedOnAnotherKind proves the store reaches that
+// branch. When it happens, Harness knows only that SOME prefix occupies that
+// sequence — not whether it is this command's, and not which RuntimeCommandID it
+// binds. Reporting Duplicate=true there tells Host "already applied" about a command
+// that may never have been applied, or that is durably bound to a different runtime
+// id; Host acknowledges and drops it, and nothing anywhere raises an error.
+//
+// The refusal must therefore be observable, must carry the read failure as its
+// Cause, and must leave the disposition zero so no caller can mistake it for an
+// application.
+func TestUnreadableDurablePrefixFailsClosed(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	readErr := errors.New("frame at that sequence is unreadable")
+	const collidingSeq = 41
+	f.session.runtimeCommands = unreadablePrefixLog{
+		collision: &journal.IdempotencyCollisionError{ID: "command-application:v1:corrupt", Seq: collidingSeq},
+		readErr:   readErr,
+	}
+	adm := f.admittedInput("v1:corrupt", mustUUID(), "hello")
+
+	disp, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
+	var conflict *runtimecommand.MappingConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("ApplyRuntimeCommand err = %v (%T), want *runtimecommand.MappingConflictError:"+
+			" an unreadable durable prefix must never be reported as an application", err, err)
+	}
+	if !errors.Is(err, readErr) {
+		t.Errorf("refusal does not carry the read failure as its Cause: %v", err)
+	}
+	if conflict.Sequence != collidingSeq {
+		t.Errorf("MappingConflictError.Sequence = %d, want the colliding %d", conflict.Sequence, collidingSeq)
+	}
+	if !conflict.DurableRuntimeID.IsZero() {
+		t.Errorf("MappingConflictError.DurableRuntimeID = %v, want zero: nothing was read", conflict.DurableRuntimeID)
+	}
+	// The message must not assert a mapping that was never read.
+	if strings.Contains(conflict.Error(), conflict.DurableRuntimeID.String()) {
+		t.Errorf("MappingConflictError.Error() = %q; it names an all-zero mapping that was never read", conflict.Error())
+	}
+	if disp != (runtimecommand.Disposition{}) {
+		t.Errorf("Disposition = %+v on a fail-closed refusal, want the zero value", disp)
+	}
+	if disp.Duplicate {
+		t.Errorf("Duplicate = true for an unreadable prefix; Host would acknowledge and drop the command")
+	}
+	f.requireNoCommand(t, "unreadable durable prefix")
+}
+
+// unreadablePrefixLog is the injected failure the guard above needs and the real
+// store cannot be made to produce on demand: the append collides, and the read of
+// the colliding sequence fails.
+type unreadablePrefixLog struct {
+	collision *journal.IdempotencyCollisionError
+	readErr   error
+}
+
+func (l unreadablePrefixLog) AppendCommandApplication(context.Context, runtimecommand.Application) (journal.AppendResult, error) {
+	return journal.AppendResult{}, l.collision
+}
+
+func (l unreadablePrefixLog) ReadCommandApplicationAt(context.Context, uint64) (runtimecommand.Application, error) {
+	return runtimecommand.Application{}, l.readErr
+}
+
+// TestSuppliedZeroCommandIDIsRefusedWithoutClaimingAGenerationFailure pins the
+// defensive guard on the supplied-id submit path. Reaching it requires bypassing
+// Admitted.Validate, so it is a caller bug — but the error it reports must name the
+// real condition. It once reported SessionIDGenerationFailed, which sends a reader
+// hunting for a crypto/rand failure on a path that generates nothing.
+func TestSuppliedZeroCommandIDIsRefusedWithoutClaimingAGenerationFailure(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	id, err := f.session.submitToLoopWithID(
+		context.Background(), f.session.activeLoopID,
+		[]content.Block{&content.TextBlock{Text: "hi"}},
+		identity.AgencyUser, false, uuid.UUID{},
+	)
+	var zeroID *ZeroSuppliedCommandIDError
+	if !errors.As(err, &zeroID) {
+		t.Fatalf("submitToLoopWithID(zero id) err = %v (%T), want *ZeroSuppliedCommandIDError", err, err)
+	}
+	var sessionErr *SessionError
+	if errors.As(err, &sessionErr) && sessionErr.Kind == SessionIDGenerationFailed {
+		t.Errorf("refusal claims SessionIDGenerationFailed; nothing is generated on this path")
+	}
+	if !id.IsZero() {
+		t.Errorf("returned id = %v, want zero (nothing was sent)", id)
+	}
+	f.requireNoCommand(t, "supplied zero command id")
 }

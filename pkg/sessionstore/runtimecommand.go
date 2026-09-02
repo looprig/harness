@@ -69,11 +69,17 @@ func (l *RuntimeCommandLog) ReadCommandApplicationAt(ctx context.Context, seq ui
 // record. A record of any other kind at that sequence is a
 // *CommandApplicationNotFoundError.
 func (s *Store) ReadCommandApplicationAt(ctx context.Context, id uuid.UUID, seq uint64) (runtimecommand.Application, error) {
+	// ONE positioning argument. OpenInternalRecordReplayer's ReplayRequest.FromSeq is
+	// what positions the ledger cursor; the journal.ReplayRequest passed to Open is a
+	// different type whose From this backend does not read. Passing a second, inert
+	// FromSeq there would read as the positioning and invite a maintainer to delete
+	// the one that works — silently turning this O(1) read into a full scan with no
+	// test to notice. journal.Beginning() is honest about being ignored.
 	replayer, err := s.OpenInternalRecordReplayer(id, ReplayRequest{FromSeq: seq})
 	if err != nil {
 		return runtimecommand.Application{}, err
 	}
-	cursor, err := replayer.Open(ctx, journal.ReplayRequest{SessionID: id, From: journal.FromSeq(seq)})
+	cursor, err := replayer.Open(ctx, journal.ReplayRequest{SessionID: id, From: journal.Beginning()})
 	if err != nil {
 		return runtimecommand.Application{}, err
 	}

@@ -2452,7 +2452,7 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 // can reach it and no caller can pass a zero id by omission.
 func (s *Session) submitToLoopWithID(ctx context.Context, loopID uuid.UUID, blocks []content.Block, agency identity.Agency, noFold bool, id uuid.UUID) (uuid.UUID, error) {
 	if id.IsZero() {
-		return uuid.UUID{}, &SessionError{Kind: SessionIDGenerationFailed}
+		return uuid.UUID{}, &ZeroSuppliedCommandIDError{}
 	}
 	if err := s.faultIfFaulted(); err != nil {
 		return uuid.UUID{}, err

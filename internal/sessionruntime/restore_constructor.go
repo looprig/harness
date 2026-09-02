@@ -616,6 +616,8 @@ func restoreTopologySession(
 	// is the answer a Host adapter needs BEFORE it acknowledges a command.
 	if rcLog, rcErr := store.OpenRuntimeCommandLog(sessionID, j); rcErr == nil {
 		leaseOpts = append(leaseOpts, WithRuntimeCommands(rcLog, lease))
+	} else {
+		logUnavailableRuntimeCommands(ctx, sessionID, rcErr)
 	}
 	if resolved != nil {
 		// Hand the restored session the coordinator + exclusive root-lease release so its

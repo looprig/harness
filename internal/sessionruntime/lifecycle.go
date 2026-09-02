@@ -728,6 +728,8 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	// can deduplicate a redelivered append; see the same wiring in restoreTopologySession.
 	if rcLog, rcErr := r.store.OpenRuntimeCommandLog(sid, j); rcErr == nil {
 		opts = append(opts, WithRuntimeCommands(rcLog, lease))
+	} else {
+		logUnavailableRuntimeCommands(ctx, sid, rcErr)
 	}
 	if gcRunner != nil {
 		opts = append(opts, withOffloadGCRunner(gcRunner))

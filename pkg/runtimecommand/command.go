@@ -56,9 +56,22 @@ type CommandID string
 // rule here strands an already-admitted command. Everything else about the id —
 // format, meaning, structure, whitespace, control characters — belongs to Host.
 //
-// Nothing downstream needs a stricter id. The durable idempotency key namespaces the
-// public id rather than filtering it (journal.CommandApplicationRecord), the record
-// body is JSON-encoded, and no path derives a storage name or subject from it.
+// Nothing downstream needs a stricter id in the CHARACTER dimension: the durable
+// idempotency key namespaces the public id rather than filtering it
+// (journal.CommandApplicationRecord), and the record body is JSON-encoded, so no
+// byte value is unsafe anywhere on the path.
+//
+// The LENGTH dimension is a different story and this bound does not currently own
+// it. The public id IS carried into a derived durable identity — journal namespaces
+// it, then sessionstore's durableRecordID namespaces that again — and the released
+// SessionStore validates the result against its own 256-byte identity limit. Two
+// 20-byte prefixes therefore consume the budget, and the effective ceiling for a
+// public id is 216 bytes, not the MaxCommandIDBytes 256 asserted here. An id between
+// 217 and 256 bytes is admitted by Core, accepted by Validate, and then refused at
+// the durable append with an untyped error, writing no prefix — so it is not even
+// deduplicable on redelivery. Fixing that is a pending decision (shorten this bound,
+// hash the namespace, or widen the limit in a SessionStore release); until it lands,
+// do not read this constant as the real ceiling.
 func (id CommandID) Validate() error {
 	switch {
 	case id == "":
@@ -143,6 +156,14 @@ func (a Admitted) Validate() error {
 // application ran under. It is the whole content of the application prefix — no
 // payload, no user content — because its only job is to answer "was this public
 // command already applied, and under which runtime identity?".
+//
+// Known gap, recorded so it is a decision rather than an oversight: it carries no
+// loop id. KindInput dispatches to the session's ACTIVE loop, and which loop that
+// was is not recoverable from this record — neither recovery nor an audit can say
+// where an admitted command landed. Nothing in the current contract needs it (the
+// runtime id correlates the events, and the events carry the loop), but a
+// per-loop-addressed admitted command would need this field, and adding it later
+// changes the persisted body and therefore every existing record's fingerprint.
 type Application struct {
 	CommandID        CommandID `json:"command_id"`
 	RuntimeCommandID uuid.UUID `json:"runtime_command_id"`
@@ -232,15 +253,29 @@ func (e *ValidationError) Error() string {
 	return "runtimecommand: invalid " + e.Field + ": " + e.Reason
 }
 
-// MappingConflictError reports that the public CommandID is already durably bound
-// to a DIFFERENT RuntimeCommandID. It is never a legitimate retry — a retry of an
-// admitted command carries the mapping Host allocated once — so the application
-// fails closed rather than applying the command under a second runtime identity.
+// MappingConflictError reports that the public CommandID is already durable under a
+// mapping this delivery may not be applied against. It covers two situations that
+// must both fail closed, and the two are distinguishable — do not collapse them.
+//
+// A CONFLICT: the durable prefix was read and binds this public id to a DIFFERENT
+// RuntimeCommandID. That is never a legitimate retry, because a retry of an admitted
+// command carries the mapping Host allocated once. DurableRuntimeID is set.
+//
+// An UNREADABLE prefix: the durable frame at Sequence could not be read at all, so
+// the mapping is UNKNOWN. DurableRuntimeID is then zero and Cause is the read
+// failure. Reporting this as a duplicate would tell Host "already applied" about a
+// command that may never have been applied.
+//
+// Error() distinguishes them. The unreadable arm must not name a mapping: printing
+// an all-zero DurableRuntimeID as though it had been read is a message that
+// contradicts its own Cause, and it sends a reader hunting for a runtime command
+// that does not exist.
 type MappingConflictError struct {
 	CommandID CommandID
 	// RuntimeCommandID is the id the offered delivery carried.
 	RuntimeCommandID uuid.UUID
-	// DurableRuntimeID is the id the durable application prefix holds.
+	// DurableRuntimeID is the id the durable application prefix holds. It is zero
+	// when the prefix could not be read; see Cause.
 	DurableRuntimeID uuid.UUID
 	// Sequence is the journal sequence of the durable prefix.
 	Sequence uint64
@@ -248,6 +283,12 @@ type MappingConflictError struct {
 }
 
 func (e *MappingConflictError) Error() string {
+	if e.DurableRuntimeID.IsZero() {
+		return "runtimecommand: public command " + strconv.Quote(string(e.CommandID)) +
+			" collides with a durable application prefix at seq " + strconv.FormatUint(e.Sequence, 10) +
+			" that could not be read, so its mapping is unknown; refusing the offered " +
+			e.RuntimeCommandID.String()
+	}
 	return "runtimecommand: public command " + strconv.Quote(string(e.CommandID)) +
 		" is durably mapped to runtime command " + e.DurableRuntimeID.String() +
 		" at seq " + strconv.FormatUint(e.Sequence, 10) +
