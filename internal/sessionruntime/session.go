@@ -2441,36 +2441,16 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 	return s.dispatchUserInput(ctx, l, loopID, blocks, agency, noFold, id)
 }
 
-// submitToLoopWithID is submitToLoop with the command's correlation id SUPPLIED
-// rather than minted. It exists for exactly one caller: applying a Host-admitted
-// runtime command, whose RuntimeCommandID was allocated once at admission and must
-// be the id the dispatched command and its Reply events carry. Minting a second UUID
-// there would split one command's correlation across two identities, and the split
-// would be invisible — every event would still look well formed under either id.
-//
-// It is unexported and takes the id as a required argument, so no ordinary caller
-// can reach it and no caller can pass a zero id by omission.
-func (s *Session) submitToLoopWithID(ctx context.Context, loopID uuid.UUID, blocks []content.Block, agency identity.Agency, noFold bool, id uuid.UUID) (uuid.UUID, error) {
-	if id.IsZero() {
-		return uuid.UUID{}, &ZeroSuppliedCommandIDError{}
-	}
-	if err := s.faultIfFaulted(); err != nil {
-		return uuid.UUID{}, err
-	}
-	l, ok := s.loopFor(loopID)
-	if !ok {
-		return uuid.UUID{}, &SessionError{Kind: SessionLoopNotFound}
-	}
-	if l == nil {
-		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
-	}
-	return s.dispatchUserInput(ctx, l, loopID, blocks, agency, noFold, id)
-}
-
-// dispatchUserInput is the shared tail of both submit paths: build the UserInput
+// dispatchUserInput is the tail of the ordinary submit path: build the UserInput
 // under the given id, append the audit-only intent record, and hand the command to
-// the loop. Keeping it in one place is what makes the supplied-id path identical to
-// the minted-id path in every respect other than where the id came from.
+// the loop.
+//
+// The admitted-runtime-command path deliberately does NOT go through here. It needs
+// its durable application prefix written between the audit append and the send, so it
+// composes buildAndAuditUserInput and sendUserInput directly (prepareAdmittedInput in
+// runtime_command.go). A supplied-id variant of this function existed for it briefly
+// and ended up with no production caller at all — kept alive only by the test that
+// exercised it — so it is gone.
 func (s *Session) dispatchUserInput(ctx context.Context, l loop.Backend, loopID uuid.UUID, blocks []content.Block, agency identity.Agency, noFold bool, id uuid.UUID) (uuid.UUID, error) {
 	return s.sendUserInput(ctx, l, s.buildAndAuditUserInput(ctx, loopID, blocks, agency, noFold, id))
 }

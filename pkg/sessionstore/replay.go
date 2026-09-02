@@ -396,8 +396,18 @@ func (b *baseCursor) resolveDurable(ctx context.Context, env durablestore.Envelo
 		// the correlation is reconstructed from the envelope fields and re-encoded with
 		// the same canonical codec the write path fingerprinted. Those bytes must be
 		// byte-identical, because the idempotency index is hydrated from this path and
-		// compared against the write path's fingerprint: if they diverged, a redelivery
-		// after restart would append a SECOND prefix instead of deduplicating.
+		// compared against the write path's fingerprint.
+		//
+		// What a divergence actually costs, stated precisely rather than dramatically:
+		// the index keys on IdempotencyID(), which derives from the CommandID alone, so
+		// a divergence in any OTHER field is a fingerprint mismatch under a matching id
+		// — an *IdempotencyCollisionError, not a second append. The applier then reads
+		// the durable prefix, finds both identities agree, and reports Duplicate=true.
+		// The command is therefore not applied twice; it is misreported as a conflict
+		// or silently absorbed, which is a correctness bug about EVIDENCE rather than
+		// about double application. Double application would need a CommandID
+		// divergence, which MarshalCommandApplicationRecord's Validate makes
+		// unreachable.
 		rec := journal.NewCommandApplicationRecord(runtimecommand.Application{
 			CommandID:        runtimecommand.CommandID(env.CommandID),
 			RuntimeCommandID: env.RuntimeCommandID,

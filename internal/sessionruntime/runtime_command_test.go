@@ -11,12 +11,14 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hook"
-	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/runtimecommand"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/workspacestore"
+	durablestore "github.com/looprig/sessionstore"
+	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
 
@@ -44,11 +46,46 @@ func newRuntimeCommandFixture(t *testing.T) *runtimeCommandFixture {
 
 func sessionstoreOverMemstore(t *testing.T) *sessionstore.Store {
 	t.Helper()
-	store, err := sessionstore.Open(memstore.New())
+	store, _ := sessionstoreOverMemstoreWithBackend(t)
+	return store
+}
+
+// sessionstoreOverMemstoreWithBackend also hands back the raw composite, so a test
+// can read the STORED FRAME rather than Harness's decode of it. The adjacency
+// property is an envelope kind, and only the frame carries that.
+func sessionstoreOverMemstoreWithBackend(t *testing.T) (*sessionstore.Store, *storage.Composite) {
+	t.Helper()
+	backend := memstore.New()
+	store, err := sessionstore.Open(backend)
 	if err != nil {
 		t.Fatalf("sessionstore.Open: %v", err)
 	}
-	return store
+	return store, backend
+}
+
+// decodeStoredFrame reads the frame at seq with the PINNED counterparty codec. It
+// derives the ledger name from the documented "sessions/<uuid>" layout; a wrong
+// derivation yields an empty cursor and fails loudly here rather than silently
+// skipping the assertion.
+func decodeStoredFrame(t *testing.T, backend *storage.Composite, sid uuid.UUID, seq uint64) durablestore.Envelope {
+	t.Helper()
+	cur, err := backend.Ledger.Read(context.Background(), "sessions/"+sid.String(), seq)
+	if err != nil {
+		t.Fatalf("Ledger.Read(seq %d): %v", seq, err)
+	}
+	defer func() { _ = cur.Close() }()
+	rec, err := cur.Next(context.Background())
+	if err != nil {
+		t.Fatalf("no stored frame at seq %d: %v", seq, err)
+	}
+	if rec.Seq != seq {
+		t.Fatalf("read seq %d, want %d", rec.Seq, seq)
+	}
+	env, err := durablestore.DecodeEnvelope(rec.Payload)
+	if err != nil {
+		t.Fatalf("the released DecodeEnvelope rejected the frame at seq %d: %v", seq, err)
+	}
+	return env
 }
 
 func newRuntimeCommandFixtureOver(t *testing.T, store *sessionstore.Store) *runtimeCommandFixture {
@@ -1115,28 +1152,30 @@ func (l unreadablePrefixLog) ReadCommandApplicationAt(context.Context, uint64) (
 }
 
 // TestSuppliedZeroCommandIDIsRefusedWithoutClaimingAGenerationFailure pins the
-// defensive guard on the supplied-id submit path. Reaching it requires bypassing
+// defensive guard on the admitted-input path. Reaching it requires bypassing
 // Admitted.Validate, so it is a caller bug — but the error it reports must name the
 // real condition. It once reported SessionIDGenerationFailed, which sends a reader
 // hunting for a crypto/rand failure on a path that generates nothing.
+//
+// It targets prepareAdmittedInput, the production path. It used to target a
+// submitToLoopWithID wrapper that no production code called — a function kept alive
+// only by the test that exercised it, which proves nothing about anything shipped.
 func TestSuppliedZeroCommandIDIsRefusedWithoutClaimingAGenerationFailure(t *testing.T) {
 	t.Parallel()
 	f := newRuntimeCommandFixture(t)
-	id, err := f.session.submitToLoopWithID(
-		context.Background(), f.session.activeLoopID,
-		[]content.Block{&content.TextBlock{Text: "hi"}},
-		identity.AgencyUser, false, uuid.UUID{},
-	)
+	adm := f.admittedInput("v1:zero-runtime-id", mustUUID(), "hi")
+	adm.RuntimeCommandID = uuid.UUID{}
+	pending, err := f.session.prepareAdmittedInput(context.Background(), adm)
 	var zeroID *ZeroSuppliedCommandIDError
 	if !errors.As(err, &zeroID) {
-		t.Fatalf("submitToLoopWithID(zero id) err = %v (%T), want *ZeroSuppliedCommandIDError", err, err)
+		t.Fatalf("prepareAdmittedInput(zero id) err = %v (%T), want *ZeroSuppliedCommandIDError", err, err)
+	}
+	if pending != nil {
+		t.Errorf("prepareAdmittedInput returned %+v alongside its refusal, want nil", pending)
 	}
 	var sessionErr *SessionError
 	if errors.As(err, &sessionErr) && sessionErr.Kind == SessionIDGenerationFailed {
 		t.Errorf("refusal claims SessionIDGenerationFailed; nothing is generated on this path")
-	}
-	if !id.IsZero() {
-		t.Errorf("returned id = %v, want zero (nothing was sent)", id)
 	}
 	f.requireNoCommand(t, "supplied zero command id")
 }
@@ -1164,7 +1203,7 @@ func TestSuppliedZeroCommandIDIsRefusedWithoutClaimingAGenerationFailure(t *test
 // itself does not put a record of its own between the prefix and the effect.
 func TestApplicationPrefixIsTheLastRecordBeforeItsEffect(t *testing.T) {
 	t.Parallel()
-	store := sessionstoreOverMemstore(t)
+	store, backend := sessionstoreOverMemstoreWithBackend(t)
 	lifecycle, err := newTestLifecycle(cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}), store)
 	if err != nil {
 		t.Fatalf("newTestLifecycle: %v", err)
@@ -1203,9 +1242,31 @@ func TestApplicationPrefixIsTheLastRecordBeforeItsEffect(t *testing.T) {
 	if adjacent == nil {
 		t.Fatalf("no record follows the prefix at seq %d; the effect never landed", disp.PrefixSequence)
 	}
-	if _, isEvent := adjacent.(journal.EventRecord); !isEvent {
-		t.Fatalf("record at prefix+1 is %T, want journal.EventRecord:"+
+	// The property is an ENVELOPE KIND, and it is asserted as one. A Go-type check is
+	// not enough twice over: journal.EventRecord is also the type of a PRIVATE event,
+	// which frame() routes to EnvelopeKindRuntimeControl; and even a public event only
+	// reaches EnvelopeKindPublicEvent because frame() puts it there, so a regression in
+	// that routing would leave the Go type intact and the frame wrong. Decoding the
+	// stored bytes with the counterparty's own codec answers both at once.
+	eventRecord, isEvent := adjacent.(journal.EventRecord)
+	if !isEvent {
+		t.Fatalf("record at prefix+1 is %T, want a public journal.EventRecord:"+
 			" the released correlation resolves by adjacency and reads anything else as UNRESOLVED", adjacent)
+	}
+	if vis := eventRecord.Event().Visibility(); vis != event.Public {
+		t.Fatalf("record at prefix+1 is %T with visibility %v, want event.Public:"+
+			" a private event is framed as runtime control and resolves UNRESOLVED",
+			eventRecord.Event(), vis)
+	}
+	if env := decodeStoredFrame(t, backend, s.SessionID(), disp.PrefixSequence+1); env.Kind != durablestore.EnvelopeKindPublicEvent {
+		t.Fatalf("frame at prefix+1 has EnvelopeKind %d, want EnvelopeKindPublicEvent (%d):"+
+			" resolve() switches on THIS, and answers UNRESOLVED for anything else",
+			env.Kind, durablestore.EnvelopeKindPublicEvent)
+	}
+	// And the prefix itself must still be the prefix kind at the sequence reported.
+	if env := decodeStoredFrame(t, backend, s.SessionID(), disp.PrefixSequence); env.Kind != durablestore.EnvelopeKindApplicationPrefix {
+		t.Fatalf("frame at the reported prefix sequence has EnvelopeKind %d, want EnvelopeKindApplicationPrefix (%d)",
+			env.Kind, durablestore.EnvelopeKindApplicationPrefix)
 	}
 }
 
@@ -1255,4 +1316,72 @@ func recordsAroundPrefix(t *testing.T, ctx context.Context, store *sessionstore.
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// TestKindMismatchFailsClosedLikeTheReleasedReaderDoes closes the last way Harness
+// and the released reader could disagree about the same durable record.
+//
+// The released correlation compares the prefix's CommandKind against the inbox
+// record's and resolves CONFLICTED when they differ — pkg/sessionstore's
+// TestReleasedReaderSettlesHarnessApplications has the row asserting it. Harness's
+// own conflict check compared only the two identities, so a redelivery with the same
+// public id and the same runtime id but a DIFFERENT kind was reported Duplicate=true,
+// already applied, for precisely the shape the counterparty refuses. Two authorities,
+// one record, opposite answers.
+//
+// The payload is one a Host bug or a forged retry produces — the same threat model
+// MappingConflictError exists for — and it must fail closed on both sides.
+func TestKindMismatchFailsClosedLikeTheReleasedReaderDoes(t *testing.T) {
+	t.Parallel()
+	store := sessionstoreOverMemstore(t)
+	sid := mustUUID()
+	first := newRuntimeCommandFixtureForSession(t, store, sid)
+	runtimeID := mustUUID()
+	adm := first.admittedInput("v1:kind-swapped", runtimeID, "hello")
+	if _, err := first.session.ApplyRuntimeCommand(context.Background(), adm); err != nil {
+		t.Fatalf("original ApplyRuntimeCommand: %v", err)
+	}
+	first.drainOne(t)
+	if err := first.lease.Release(context.Background()); err != nil {
+		t.Fatalf("release lease: %v", err)
+	}
+
+	// A new epoch, so the append collides rather than deduplicating and the durable
+	// prefix is actually READ — which is the only path on which the kind is compared.
+	successor := newRuntimeCommandFixtureForSession(t, store, sid)
+	swapped := runtimecommand.Admitted{
+		CommandID:        adm.CommandID,
+		RuntimeCommandID: runtimeID,
+		Kind:             runtimecommand.KindInterrupt,
+		LeaseEpoch:       successor.lease.Epoch(),
+	}
+	if swapped.Kind == adm.Kind {
+		t.Fatalf("fixture precondition: the kinds must differ")
+	}
+
+	disp, err := successor.session.ApplyRuntimeCommand(context.Background(), swapped)
+	var conflict *runtimecommand.MappingConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("kind-swapped ApplyRuntimeCommand err = %v (%T), want *runtimecommand.MappingConflictError:"+
+			" the released reader resolves this shape CONFLICTED", err, err)
+	}
+	if disp.Duplicate {
+		t.Errorf("Duplicate = true for a kind the durable prefix does not hold")
+	}
+	if disp != (runtimecommand.Disposition{}) {
+		t.Errorf("Disposition = %+v on a fail-closed refusal, want the zero value", disp)
+	}
+	if conflict.DurableKind != adm.Kind || conflict.Kind != swapped.Kind {
+		t.Errorf("MappingConflictError kinds = (durable %q, offered %q), want (%q, %q)",
+			conflict.DurableKind, conflict.Kind, adm.Kind, swapped.Kind)
+	}
+	// The identities AGREE here, so a message about a runtime-id mismatch would be
+	// false — it would print the same id on both sides and send a reader hunting.
+	if strings.Contains(conflict.Error(), "not the offered "+runtimeID.String()) {
+		t.Errorf("MappingConflictError.Error() = %q; the runtime ids agree, the kinds do not", conflict.Error())
+	}
+	if !strings.Contains(conflict.Error(), string(adm.Kind)) || !strings.Contains(conflict.Error(), string(swapped.Kind)) {
+		t.Errorf("MappingConflictError.Error() = %q; it must name both kinds", conflict.Error())
+	}
+	successor.requireNoCommand(t, "kind-swapped redelivery")
 }

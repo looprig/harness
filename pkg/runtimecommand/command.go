@@ -295,22 +295,37 @@ type MappingConflictError struct {
 	// DurableRuntimeID is the id the durable application prefix holds. It is zero
 	// when the prefix could not be read; see Cause.
 	DurableRuntimeID uuid.UUID
+	// Kind is the kind the offered delivery carried, and DurableKind the kind the
+	// durable prefix holds. They are compared because the RELEASED reader compares
+	// them: a prefix whose kind disagrees with the inbox record's resolves
+	// CONFLICTED. Ignoring the kind here would have Harness report already-applied
+	// for a shape the counterparty refuses.
+	Kind        Kind
+	DurableKind Kind
 	// Sequence is the journal sequence of the durable prefix.
 	Sequence uint64
 	Cause    error
 }
 
 func (e *MappingConflictError) Error() string {
-	if e.DurableRuntimeID.IsZero() {
-		return "runtimecommand: public command " + strconv.Quote(string(e.CommandID)) +
+	prefix := "runtimecommand: public command " + strconv.Quote(string(e.CommandID))
+	switch {
+	case e.DurableRuntimeID.IsZero():
+		return prefix +
 			" collides with a durable application prefix at seq " + strconv.FormatUint(e.Sequence, 10) +
 			" that could not be read, so its mapping is unknown; refusing the offered " +
 			e.RuntimeCommandID.String()
+	case e.DurableRuntimeID != e.RuntimeCommandID:
+		return prefix +
+			" is durably mapped to runtime command " + e.DurableRuntimeID.String() +
+			" at seq " + strconv.FormatUint(e.Sequence, 10) +
+			", not the offered " + e.RuntimeCommandID.String()
+	default:
+		return prefix +
+			" is durably applied as kind " + strconv.Quote(string(e.DurableKind)) +
+			" at seq " + strconv.FormatUint(e.Sequence, 10) +
+			", not the offered " + strconv.Quote(string(e.Kind))
 	}
-	return "runtimecommand: public command " + strconv.Quote(string(e.CommandID)) +
-		" is durably mapped to runtime command " + e.DurableRuntimeID.String() +
-		" at seq " + strconv.FormatUint(e.Sequence, 10) +
-		", not the offered " + e.RuntimeCommandID.String()
 }
 
 func (e *MappingConflictError) Unwrap() error { return e.Cause }

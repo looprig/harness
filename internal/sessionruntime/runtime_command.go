@@ -235,11 +235,20 @@ func (s *Session) resolveApplicationConflict(
 			Cause:            err,
 		}
 	}
-	if durable.CommandID != admitted.CommandID || durable.RuntimeCommandID != admitted.RuntimeCommandID {
+	// Kind is part of the comparison because it is part of the CORRELATION the
+	// released reader performs: it resolves a prefix whose kind disagrees with the
+	// inbox record's as CONFLICTED. Omitting it here would leave Harness reporting
+	// Duplicate=true — already applied — for exactly the shape the counterparty fails
+	// closed on, so the two authorities would disagree about the same durable record.
+	if durable.CommandID != admitted.CommandID ||
+		durable.RuntimeCommandID != admitted.RuntimeCommandID ||
+		durable.Kind != admitted.Kind {
 		return runtimecommand.Disposition{}, &runtimecommand.MappingConflictError{
 			CommandID:        admitted.CommandID,
 			RuntimeCommandID: admitted.RuntimeCommandID,
 			DurableRuntimeID: durable.RuntimeCommandID,
+			Kind:             admitted.Kind,
+			DurableKind:      durable.Kind,
 			Sequence:         collision.Seq,
 			Cause:            appendErr,
 		}
@@ -305,6 +314,22 @@ type pendingInput struct {
 // appending its audit-only intent record. It performs NO runtime-visible effect: the
 // command has not been handed to the loop when this returns, so a caller that then
 // fails to persist the application prefix has still applied nothing.
+//
+// COST OF AUDITING FIRST, recorded because the reorder introduced it. Every refusal
+// that happens AFTER this point — a mapping conflict, a lost or stale lease, a failed
+// prefix append — leaves an intent record for a command that was never dispatched.
+// Those orphans are unbounded under repeated refusal: a Host retrying a conflicting
+// mapping appends one per attempt, and each carries a distinct runtime id, so they do
+// not deduplicate with one another. Nothing reads them as evidence of application —
+// the prefix is the evidence and none was written — so the cost is ledger volume, not
+// correctness, and it sits inside the intent log's stated audit-only tolerance. It is
+// bounded in practice only by Host's retry policy, which is worth knowing before that
+// policy is written.
+//
+// The alternative is worse. Auditing after the prefix puts a runtime-control record
+// in the slot the released settlement correlation reads as the effect, which resolved
+// EVERY input command UNRESOLVED — an always-on liveness defect traded for a
+// bounded-volume one that only a misbehaving caller triggers.
 //
 // The command carries the admitted RuntimeCommandID verbatim — the whole point of
 // the seam — and the loop-exited and loop-missing refusals are the same ones the

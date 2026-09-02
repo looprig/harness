@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/core/content"
 	coresessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
@@ -423,14 +424,17 @@ func TestReleasedReaderSettlesHarnessApplications(t *testing.T) {
 			if err != nil {
 				t.Fatalf("FindCommandApplication: %v", err)
 			}
+			// ABSENT is the outcome that licenses the deadline reconciler to settle
+			// `rejected` over a durable effect, so it must never be the answer once a
+			// prefix is on the ledger. Every tt.want below is a non-absent outcome, so
+			// this one comparison carries both claims; a separate absent check after it
+			// could never fire and would only read as if it did.
 			if got.Outcome != tt.want {
 				t.Fatalf("released reader resolved %q, want %q (PrefixSeq=%d, appended at %d)",
 					got.Outcome, tt.want, got.PrefixSeq, res.Sequence)
 			}
-			// ABSENT is the outcome that licenses a rejection over a durable effect, so
-			// it must never be the answer once a prefix is on the ledger.
-			if got.Outcome == durablestore.CommandApplicationAbsent {
-				t.Fatalf("released reader reports ABSENT for a durable prefix; the reconciler would settle rejected")
+			if tt.want == durablestore.CommandApplicationAbsent {
+				t.Fatalf("no row of this table may EXPECT absent; the comparison above would then assert nothing")
 			}
 			if got.PrefixSeq != res.Sequence {
 				t.Errorf("released reader located the prefix at %d, want %d", got.PrefixSeq, res.Sequence)
@@ -502,11 +506,26 @@ func FuzzApplicationPrefixIdentityParity(f *testing.F) {
 //
 // The application prefix stores NO body — the envelope fields are the record — so the
 // idempotency fingerprint is derived on write from a canonical encoding and on
-// HYDRATION from an encoding rebuilt out of those fields. If the two ever disagree in
-// any field, a journal reopened after a restart does not recognise the durable prefix:
-// a redelivery appends a SECOND prefix instead of deduplicating, and the command is
-// applied twice. Nothing else in the suite would notice, because the live index in the
-// first process holds the write-path fingerprint either way.
+// HYDRATION from an encoding rebuilt out of those fields. If the two disagree in any
+// field, a journal reopened after a restart does not recognise its own durable prefix.
+// Nothing else in the suite would notice, because the live index in the first process
+// holds the write-path fingerprint either way.
+//
+// What a divergence costs, stated precisely: the index keys on IdempotencyID(), which
+// derives from the CommandID alone, so a divergence in any OTHER field is a
+// fingerprint mismatch under a MATCHING id — an *IdempotencyCollisionError, not a
+// second append. The applier then reads the durable prefix, finds both identities
+// agree, and reports Duplicate=true. The command is not applied twice; the evidence
+// is wrong, not the effect. Double application would need a CommandID divergence,
+// which MarshalCommandApplicationRecord's Validate makes unreachable. The invariant is
+// still worth guarding — a store that cannot recognise its own records is broken — but
+// it is guarded for the right reason.
+//
+// The correlation comes from Admitted.Application(), the PRODUCTION constructor, and
+// not from a struct literal. A literal pins only the fields the test author thought
+// of, so a field added to Application and populated only by the constructor — the
+// loop id named as the likely future addition in Application's own doc is exactly this
+// shape — would be absent from the fixture and its round trip would never be tested.
 //
 // Both kinds are exercised deliberately. A reconstruction that pinned any field to
 // its input-command value would round-trip an input perfectly and corrupt everything
@@ -538,12 +557,19 @@ func TestPrefixDeduplicatesAfterIndexHydration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("OpenRuntimeCommandLog: %v", err)
 			}
-			app := runtimecommand.Application{
+			admitted := runtimecommand.Admitted{
 				CommandID:        runtimecommand.CommandID("v1:hydrated-" + kind),
 				RuntimeCommandID: uuid.UUID{0x2b, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
 				LeaseEpoch:       lease.Epoch(),
 				Kind:             kind,
 			}
+			if kind == runtimecommand.KindInput {
+				admitted.Blocks = []content.Block{&content.TextBlock{Text: "hello"}}
+			}
+			if err := admitted.Validate(); err != nil {
+				t.Fatalf("fixture precondition: the admitted record must be valid: %v", err)
+			}
+			app := admitted.Application()
 			first, err := log.AppendCommandApplication(context.Background(), app)
 			if err != nil {
 				t.Fatalf("AppendCommandApplication: %v", err)
@@ -576,7 +602,7 @@ func TestPrefixDeduplicatesAfterIndexHydration(t *testing.T) {
 				t.Fatalf("redelivery after hydration: %v", err)
 			}
 			if again.Appended {
-				t.Fatalf("redelivery after hydration APPENDED a second prefix at %d:"+
+				t.Fatalf("redelivery after hydration appended a NEW frame at %d:"+
 					" the hydrated fingerprint does not match the one the write path stored", again.Sequence)
 			}
 			if again.Sequence != first.Sequence {
@@ -678,14 +704,13 @@ func TestAdjacencyIsNotGuaranteedForAnyCommandKind(t *testing.T) {
 			if err != nil {
 				t.Fatalf("FindCommandApplication: %v", err)
 			}
+			// Unresolved, specifically — NOT absent. Absent is the outcome that licenses
+			// the deadline reconciler to settle `rejected` over a durable effect, and
+			// this exact comparison is what separates the liveness gap being recorded
+			// here from a correctness one. A separate absent check after this Fatalf
+			// could never fire.
 			if got.Outcome != durablestore.CommandApplicationUnresolved {
 				t.Fatalf("released reader resolved %q, want %q", got.Outcome, durablestore.CommandApplicationUnresolved)
-			}
-			// The safe side of the gap, and the reason this is liveness rather than
-			// correctness: an unresolved command is never settled `rejected` over its
-			// effect.
-			if got.Outcome == durablestore.CommandApplicationAbsent {
-				t.Fatalf("released reader reports ABSENT; the reconciler would settle rejected")
 			}
 			if got.PrefixSeq != res.Sequence {
 				t.Errorf("located the prefix at %d, want %d", got.PrefixSeq, res.Sequence)
