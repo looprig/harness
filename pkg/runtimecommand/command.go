@@ -1,0 +1,281 @@
+// Package runtimecommand is the seam between a Host-admitted public command and
+// the UUID-keyed runtime command Harness has always dispatched.
+//
+// Two identities meet here and must never be confused for one another.
+//
+// The public CommandID is Host's retry-stable identity. It is an OPAQUE bounded
+// UTF-8 string: Harness validates that it is well formed and bounded, and does
+// nothing else with it. It is never parsed as a UUID, never truncated, and never
+// substituted for the runtime id — a public id that happens to render a valid
+// UUID is still just a string here.
+//
+// The RuntimeCommandID is the core/uuid.UUID Harness stamps on command headers and
+// on the events those commands cause. Host allocates it ONCE, when it admits the
+// command, and hands it back on every delivery. Harness does not allocate a
+// replacement: a second UUID for the same admitted command would silently split
+// one command's correlation across two identities, and the split would be
+// invisible — the events would look perfectly well formed under either id.
+//
+// Application is the durable bridge between them. It is written to the session's
+// PRIVATE journal, under the lease epoch that authorizes the effect, BEFORE any
+// runtime-visible effect begins. That ordering is the crash-safety property: a
+// delivery that finds an existing prefix knows the command was already applied and
+// replays the original disposition instead of applying it a second time.
+package runtimecommand
+
+import (
+	"context"
+	"strconv"
+	"unicode/utf8"
+
+	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+)
+
+// MaxCommandIDBytes bounds a public CommandID. The id is opaque, so the only thing
+// Harness can assert about it is that it is bounded: an unbounded id would enter a
+// durable idempotency key and a journal record body.
+const MaxCommandIDBytes = 256
+
+// CommandID is the public, retry-stable command identity Host owns. It is opaque
+// to Harness; see the package doc for why it is never parsed as a UUID.
+type CommandID string
+
+// Validate reports whether id is a well-formed opaque public identity: non-empty,
+// at most MaxCommandIDBytes bytes, valid UTF-8, free of C0/C1 control characters
+// and DEL, and free of leading or trailing ASCII space. Everything else — format,
+// meaning, structure — belongs to Host.
+func (id CommandID) Validate() error {
+	if id == "" {
+		return &ValidationError{Field: "CommandID", Reason: "empty"}
+	}
+	if len(id) > MaxCommandIDBytes {
+		return &ValidationError{
+			Field:  "CommandID",
+			Reason: "longer than " + strconv.Itoa(MaxCommandIDBytes) + " bytes",
+		}
+	}
+	if !utf8.ValidString(string(id)) {
+		return &ValidationError{Field: "CommandID", Reason: "not valid UTF-8"}
+	}
+	if id[0] == ' ' || id[len(id)-1] == ' ' {
+		return &ValidationError{Field: "CommandID", Reason: "leading or trailing space"}
+	}
+	for _, r := range string(id) {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return &ValidationError{Field: "CommandID", Reason: "contains a control character"}
+		}
+	}
+	return nil
+}
+
+// Kind is the bounded set of admitted commands Harness can apply through this
+// seam. It is deliberately small: every kind here must have an existing runtime
+// dispatch path, so a new kind is a new implementation, never a new default.
+type Kind string
+
+const (
+	// KindInput applies admitted user input to the session's active loop.
+	KindInput Kind = "input"
+	// KindInterrupt applies a session-wide interrupt.
+	KindInterrupt Kind = "interrupt"
+)
+
+// Valid reports whether k is one of the known kinds.
+func (k Kind) Valid() bool { return k == KindInput || k == KindInterrupt }
+
+// Admitted is one command Host has ALREADY admitted, handed to Harness for
+// application. Harness re-validates it — an admitted record it cannot durably
+// correlate is refused rather than applied on trust — but it never re-derives an
+// identity from it.
+type Admitted struct {
+	// CommandID is Host's opaque public identity for this command.
+	CommandID CommandID
+	// RuntimeCommandID is the once-allocated UUID this command's runtime headers
+	// and events carry. Harness uses it verbatim.
+	RuntimeCommandID uuid.UUID
+	// Kind selects the runtime dispatch path.
+	Kind Kind
+	// LeaseEpoch is the session-lease epoch this command was admitted against. A
+	// record admitted under a superseded epoch is refused.
+	LeaseEpoch uint64
+	// Blocks is the input payload, required for KindInput and forbidden for every
+	// other kind (a payload a kind cannot carry would be silently dropped).
+	Blocks []content.Block
+}
+
+// Validate fails closed on any admitted record Harness cannot apply.
+func (a Admitted) Validate() error {
+	if err := a.CommandID.Validate(); err != nil {
+		return err
+	}
+	if a.RuntimeCommandID.IsZero() {
+		return &ValidationError{Field: "RuntimeCommandID", Reason: "zero"}
+	}
+	if !a.Kind.Valid() {
+		return &ValidationError{Field: "Kind", Reason: "unknown kind " + strconv.Quote(string(a.Kind))}
+	}
+	if a.LeaseEpoch == 0 {
+		return &ValidationError{Field: "LeaseEpoch", Reason: "zero"}
+	}
+	if a.Kind == KindInput && len(a.Blocks) == 0 {
+		return &ValidationError{Field: "Blocks", Reason: "input carries no content"}
+	}
+	if a.Kind != KindInput && len(a.Blocks) > 0 {
+		return &ValidationError{Field: "Blocks", Reason: string(a.Kind) + " carries no payload"}
+	}
+	for i, b := range a.Blocks {
+		if b == nil {
+			return &ValidationError{Field: "Blocks", Reason: "nil block at index " + strconv.Itoa(i)}
+		}
+	}
+	return nil
+}
+
+// Application is the private durable correlation an applier writes BEFORE the
+// effect: the public id, the one runtime id it maps to, and the lease epoch the
+// application ran under. It is the whole content of the application prefix — no
+// payload, no user content — because its only job is to answer "was this public
+// command already applied, and under which runtime identity?".
+type Application struct {
+	CommandID        CommandID `json:"command_id"`
+	RuntimeCommandID uuid.UUID `json:"runtime_command_id"`
+	LeaseEpoch       uint64    `json:"lease_epoch"`
+}
+
+// Application returns the durable correlation for this admitted record. It copies
+// the identities rather than deriving new ones.
+func (a Admitted) Application() Application {
+	return Application{CommandID: a.CommandID, RuntimeCommandID: a.RuntimeCommandID, LeaseEpoch: a.LeaseEpoch}
+}
+
+// Validate fails closed on a correlation that cannot have been produced by a valid
+// admitted record. It is the decode-side guard for a prefix read back from storage.
+func (a Application) Validate() error {
+	if err := a.CommandID.Validate(); err != nil {
+		return err
+	}
+	if a.RuntimeCommandID.IsZero() {
+		return &ValidationError{Field: "RuntimeCommandID", Reason: "zero"}
+	}
+	if a.LeaseEpoch == 0 {
+		return &ValidationError{Field: "LeaseEpoch", Reason: "zero"}
+	}
+	return nil
+}
+
+// Disposition is what an application resolved to. A duplicate delivery reports the
+// ORIGINAL disposition — the same runtime id and the same prefix sequence the first
+// delivery reported — with Duplicate set, so a caller can distinguish "applied by
+// this call" from "already applied" without being able to confuse the two.
+type Disposition struct {
+	// CommandID echoes the public id this disposition answers for.
+	CommandID CommandID
+	// RuntimeCommandID is the durable runtime identity of the application.
+	RuntimeCommandID uuid.UUID
+	// PrefixSequence is the journal sequence of the application prefix. For a
+	// duplicate it is the ORIGINAL append's sequence, never a new one.
+	PrefixSequence uint64
+	// Duplicate reports that this delivery applied nothing because the command was
+	// already applied.
+	Duplicate bool
+	// Interrupted reports, for KindInterrupt, whether a running turn was cancelled.
+	Interrupted bool
+}
+
+// Applier is the SEGREGATED runtime-command capability. It is deliberately not a
+// method on session.Session: almost every Session implementation — every test
+// double, every adapter, the TUI's view — will never apply an admitted command,
+// and widening the base contract would force all of them to grow a method they
+// cannot honor. A caller obtains one through Provider.
+type Applier interface {
+	// ApplyRuntimeCommand durably records the application prefix and then applies
+	// the command, returning the disposition. A duplicate delivery returns the
+	// original disposition and applies nothing.
+	ApplyRuntimeCommand(context.Context, Admitted) (Disposition, error)
+}
+
+// Provider is implemented by a session that MAY be able to apply admitted runtime
+// commands. RuntimeCommands reports the capability: ok is false — with a nil
+// Applier — for a session with no durable, deduplicating application-prefix log,
+// which includes a headless/no-persistence session.
+//
+// The two-result form is the point, exactly as it is for the committed-public-event
+// capability: a single-result form would hand back an applier that fails only after
+// Host has already acknowledged the command as accepted.
+type Provider interface {
+	RuntimeCommands() (Applier, bool)
+}
+
+// ValidationError reports a malformed admitted record or correlation.
+type ValidationError struct {
+	Field  string
+	Reason string
+}
+
+func (e *ValidationError) Error() string {
+	return "runtimecommand: invalid " + e.Field + ": " + e.Reason
+}
+
+// MappingConflictError reports that the public CommandID is already durably bound
+// to a DIFFERENT RuntimeCommandID. It is never a legitimate retry — a retry of an
+// admitted command carries the mapping Host allocated once — so the application
+// fails closed rather than applying the command under a second runtime identity.
+type MappingConflictError struct {
+	CommandID CommandID
+	// RuntimeCommandID is the id the offered delivery carried.
+	RuntimeCommandID uuid.UUID
+	// DurableRuntimeID is the id the durable application prefix holds.
+	DurableRuntimeID uuid.UUID
+	// Sequence is the journal sequence of the durable prefix.
+	Sequence uint64
+	Cause    error
+}
+
+func (e *MappingConflictError) Error() string {
+	return "runtimecommand: public command " + strconv.Quote(string(e.CommandID)) +
+		" is durably mapped to runtime command " + e.DurableRuntimeID.String() +
+		" at seq " + strconv.FormatUint(e.Sequence, 10) +
+		", not the offered " + e.RuntimeCommandID.String()
+}
+
+func (e *MappingConflictError) Unwrap() error { return e.Cause }
+
+// StaleLeaseEpochError reports an admitted record whose lease epoch is not the
+// epoch the applier currently holds. Applying it would let a superseded owner's
+// admission take effect under a lease it no longer holds.
+type StaleLeaseEpochError struct {
+	CommandID CommandID
+	Admitted  uint64
+	Current   uint64
+}
+
+func (e *StaleLeaseEpochError) Error() string {
+	return "runtimecommand: command " + strconv.Quote(string(e.CommandID)) +
+		" was admitted under lease epoch " + strconv.FormatUint(e.Admitted, 10) +
+		", but the applier holds epoch " + strconv.FormatUint(e.Current, 10)
+}
+
+// LeaseLostError reports that the applier's session lease is no longer held, so no
+// effect may be applied under it.
+type LeaseLostError struct {
+	CommandID CommandID
+	Epoch     uint64
+}
+
+func (e *LeaseLostError) Error() string {
+	return "runtimecommand: session lease at epoch " + strconv.FormatUint(e.Epoch, 10) +
+		" is lost; refusing command " + strconv.Quote(string(e.CommandID))
+}
+
+// CapabilityUnavailableError reports that ApplyRuntimeCommand was called on a
+// session that does not advertise the capability. A caller that went through
+// Provider.RuntimeCommands never sees it; it exists so a caller that reached the
+// method by a bare type assertion fails loudly instead of silently applying a
+// command with no durable correlation.
+type CapabilityUnavailableError struct{ CommandID CommandID }
+
+func (e *CapabilityUnavailableError) Error() string {
+	return "runtimecommand: this session has no durable application-prefix log; refusing command " +
+		strconv.Quote(string(e.CommandID))
+}

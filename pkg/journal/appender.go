@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/runtimecommand"
 )
 
 // NilJournalError reports that a JournalEventAppender was constructed over a nil
@@ -334,4 +335,49 @@ func (a *JournalGateAppender) AppendGateOpened(ctx context.Context, ev event.Gat
 func (a *JournalGateAppender) AppendGateResolved(ctx context.Context, ev event.GateResolved) error {
 	_, err := a.journal.Append(ctx, NewEventRecord(ev))
 	return err
+}
+
+// NonIdempotentJournalError reports that a runtime-command appender was asked to
+// wrap a SessionJournal that cannot deduplicate a redelivered append. It is a
+// CAPABILITY refusal, not a wiring bug: the duplicate-delivery contract is
+// implemented BY the journal's dedup, so a journal without it cannot honor the
+// contract and the seam must decline to advertise it rather than apply an admitted
+// command twice.
+type NonIdempotentJournalError struct{}
+
+func (*NonIdempotentJournalError) Error() string {
+	return "journal: runtime-command applications require an IdempotentJournal"
+}
+
+// JournalRuntimeCommandAppender adapts an IdempotentJournal to the narrow
+// "append one application prefix" seam the session's runtime-command applier
+// depends on. It is a SEPARATE appender from JournalCommandAppender on purpose:
+// the intent log is audit-only and swallows its failures, while this append is the
+// crash-safety barrier in front of a runtime-visible effect and its failure MUST
+// stop the effect.
+type JournalRuntimeCommandAppender struct {
+	journal IdempotentJournal
+}
+
+// NewJournalRuntimeCommandAppenderChecked wraps journal as a runtime-command
+// appender. It fails loud on a nil journal and fails closed on a journal that does
+// not advertise IdempotentJournal.
+func NewJournalRuntimeCommandAppenderChecked(journal SessionJournal) (*JournalRuntimeCommandAppender, error) {
+	if journal == nil {
+		return nil, &NilJournalError{}
+	}
+	idempotent, ok := journal.(IdempotentJournal)
+	if !ok {
+		return nil, &NonIdempotentJournalError{}
+	}
+	return &JournalRuntimeCommandAppender{journal: idempotent}, nil
+}
+
+// AppendCommandApplication durably appends app's correlation as a private record
+// and reports whether THIS call made it durable. Appended=false means an identical
+// prefix was already durable — the command was already applied — and Sequence is
+// the ORIGINAL append's sequence. A public CommandID already durable under a
+// DIFFERENT mapping surfaces as *IdempotencyCollisionError.
+func (a *JournalRuntimeCommandAppender) AppendCommandApplication(ctx context.Context, app runtimecommand.Application) (AppendResult, error) {
+	return a.journal.AppendIdempotent(ctx, NewCommandApplicationRecord(app))
 }

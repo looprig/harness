@@ -403,7 +403,7 @@ func (b *baseCursor) resolveDurable(ctx context.Context, env durablestore.Envelo
 		}
 		k := kind(name)
 		switch k {
-		case kindEvent, kindCommand, kindGatePrepared:
+		case kindEvent, kindCommand, kindGatePrepared, kindCommandApplication:
 		default:
 			return resolved{}, &ReplayDecodeError{Seq: seq, Cause: &EnvelopeError{Reason: "unexpected runtime record kind " + strconv.Quote(name)}}
 		}
@@ -593,7 +593,7 @@ func (c *eventCursor) Next(ctx context.Context) (event.Event, uint64, error) {
 				continue // loop-narrowed: another loop's event, dropped like the NATS filter
 			}
 			return ev, r.seq, nil
-		case kindCommand, kindFence, kindGatePrepared:
+		case kindCommand, kindFence, kindGatePrepared, kindCommandApplication:
 			continue // events only — commands, fences, and private gate-prepared records are filtered out
 		default:
 			return nil, 0, &ReplayDecodeError{Seq: r.seq, Cause: &EnvelopeError{Reason: "unexpected kind " + strconv.Quote(string(r.kind))}}
@@ -668,6 +668,12 @@ func (c *recordCursor) Next(ctx context.Context) (journal.JournalRecord, uint64,
 		return journal.NewFenceRecord(c.id, fence), r.seq, nil
 	case kindGatePrepared:
 		rec, err := journal.UnmarshalGatePreparedRecord(r.body)
+		if err != nil {
+			return nil, 0, &ReplayDecodeError{Seq: r.seq, Cause: err}
+		}
+		return rec, r.seq, nil
+	case kindCommandApplication:
+		rec, err := journal.UnmarshalCommandApplicationRecord(r.body)
 		if err != nil {
 			return nil, 0, &ReplayDecodeError{Seq: r.seq, Cause: err}
 		}

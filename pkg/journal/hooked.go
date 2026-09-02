@@ -132,6 +132,8 @@ func describeRecord(record JournalRecord) (family hook.RecordFamily, recordID st
 		family = hook.RecordGatePrepared
 	case FenceRecord, *FenceRecord:
 		family = hook.RecordFence
+	case CommandApplicationRecord, *CommandApplicationRecord:
+		family = hook.RecordCommandApplication
 	default:
 		return "", "", false
 	}

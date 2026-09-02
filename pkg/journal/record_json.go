@@ -8,6 +8,7 @@ import (
 
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/runtimecommand"
 )
 
 // FenceEncodeError wraps a failure to marshal a LeaseFence to JSON. A LeaseFence
@@ -153,4 +154,65 @@ func UnmarshalGatePreparedRecord(data []byte) (GatePreparedRecord, error) {
 		return GatePreparedRecord{}, &GatePreparedDecodeError{Stage: "payload", Cause: errors.New("embedded payload is not OpenPayload")}
 	}
 	return NewGatePreparedRecord(gp, open), nil
+}
+
+// CommandApplicationEncodeError wraps a failure to marshal a
+// CommandApplicationRecord to JSON.
+type CommandApplicationEncodeError struct{ Cause error }
+
+func (e *CommandApplicationEncodeError) Error() string {
+	return "journal: encode command application: " + e.Cause.Error()
+}
+func (e *CommandApplicationEncodeError) Unwrap() error { return e.Cause }
+
+// CommandApplicationDecodeError wraps a failure to decode CommandApplicationRecord
+// bytes at the untrusted restore boundary: malformed JSON, an unknown field,
+// trailing data, or a correlation that no valid admitted record could have
+// produced. It fails secure — a prefix that cannot be trusted must never be read
+// as "this command was already applied", because that answer suppresses the
+// application entirely.
+type CommandApplicationDecodeError struct {
+	Reason string
+	Cause  error
+}
+
+func (e *CommandApplicationDecodeError) Error() string {
+	if e.Cause == nil {
+		return "journal: decode command application: " + e.Reason
+	}
+	return "journal: decode command application: " + e.Reason + ": " + e.Cause.Error()
+}
+func (e *CommandApplicationDecodeError) Unwrap() error { return e.Cause }
+
+// MarshalCommandApplicationRecord encodes the record's correlation as the JSON body
+// the sessionstore envelope carries. It rejects a correlation that fails its own
+// validation, so a malformed prefix is never made durable.
+func MarshalCommandApplicationRecord(rec CommandApplicationRecord) ([]byte, error) {
+	if err := rec.Application().Validate(); err != nil {
+		return nil, &CommandApplicationEncodeError{Cause: err}
+	}
+	data, err := json.Marshal(rec.Application())
+	if err != nil {
+		return nil, &CommandApplicationEncodeError{Cause: err}
+	}
+	return data, nil
+}
+
+// UnmarshalCommandApplicationRecord decodes bytes produced by
+// MarshalCommandApplicationRecord, failing closed on malformed JSON, an unknown
+// field, trailing bytes, or an invalid correlation.
+func UnmarshalCommandApplicationRecord(data []byte) (CommandApplicationRecord, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var app runtimecommand.Application
+	if err := dec.Decode(&app); err != nil {
+		return CommandApplicationRecord{}, &CommandApplicationDecodeError{Reason: "invalid json", Cause: err}
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return CommandApplicationRecord{}, &CommandApplicationDecodeError{Reason: "trailing data after object"}
+	}
+	if err := app.Validate(); err != nil {
+		return CommandApplicationRecord{}, &CommandApplicationDecodeError{Reason: "invalid correlation", Cause: err}
+	}
+	return NewCommandApplicationRecord(app), nil
 }

@@ -724,6 +724,11 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 		WithGateAppender(gateAp),
 		WithLeaseRelease(lease.Release),
 	)
+	// Advertise the segregated runtime-command capability when this session's journal
+	// can deduplicate a redelivered append; see the same wiring in restoreTopologySession.
+	if rcLog, rcErr := r.store.OpenRuntimeCommandLog(sid, j); rcErr == nil {
+		opts = append(opts, WithRuntimeCommands(rcLog, lease))
+	}
 	if gcRunner != nil {
 		opts = append(opts, withOffloadGCRunner(gcRunner))
 	}

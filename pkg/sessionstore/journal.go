@@ -836,6 +836,12 @@ func (b *sessionJournal) encodeRecordBody(rec journal.JournalRecord) (kind, []by
 			return "", nil, &journal.MarshalRecordError{Subject: b.name, Cause: err}
 		}
 		return kindGatePrepared, body, nil
+	case journal.CommandApplicationRecord:
+		body, err := journal.MarshalCommandApplicationRecord(r)
+		if err != nil {
+			return "", nil, &journal.MarshalRecordError{Subject: b.name, Cause: err}
+		}
+		return kindCommandApplication, body, nil
 	default:
 		return "", nil, &journal.RecordKindError{Subject: b.name}
 	}

@@ -62,6 +62,9 @@ const (
 	RecordCommand      RecordFamily = "command"
 	RecordGatePrepared RecordFamily = "gate_prepared"
 	RecordFence        RecordFamily = "fence"
+	// RecordCommandApplication is the private prefix correlating a public CommandID
+	// with the RuntimeCommandID and lease epoch of its application.
+	RecordCommandApplication RecordFamily = "command_application"
 )
 
 // GuardFunc checks whether a guardable operation may proceed.

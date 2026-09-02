@@ -610,6 +610,13 @@ func restoreTopologySession(
 	// opts so the restore owns the lease lifecycle (a caller cannot accidentally override
 	// the releaser with a stale one).
 	leaseOpts := append(append([]Option(nil), opts...), WithLeaseRelease(lease.Release))
+	// Advertise the segregated runtime-command capability when this session's journal
+	// can deduplicate a redelivered append. A journal that cannot is left unwired
+	// rather than half-wired: RuntimeCommands then reports the capability absent, which
+	// is the answer a Host adapter needs BEFORE it acknowledges a command.
+	if rcLog, rcErr := store.OpenRuntimeCommandLog(sessionID, j); rcErr == nil {
+		leaseOpts = append(leaseOpts, WithRuntimeCommands(rcLog, lease))
+	}
 	if resolved != nil {
 		// Hand the restored session the coordinator + exclusive root-lease release so its
 		// Shutdown releases the root lease before the session lease (LIFO), and so its loops'

@@ -9,6 +9,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/runtimecommand"
 )
 
 // CommandRouteMismatchError reports disagreement between a durable delegate
@@ -250,4 +251,45 @@ func (GatePreparedRecord) isJournalRecord() {}
 // IdempotencyID is the prepared event's EventID rendered canonically.
 func (r GatePreparedRecord) IdempotencyID() string {
 	return r.prepared.EventHeader().EventID.String()
+}
+
+// commandApplicationIDPrefix namespaces an application prefix's idempotency id.
+// The other record kinds key on a UUID rendering or a decimal epoch; a public
+// CommandID is an OPAQUE string and could render either of those, so it is
+// namespaced rather than trusted to be distinct. The prefix is constant, so the
+// mapping from CommandID to idempotency id stays injective.
+const commandApplicationIDPrefix = "command-application:"
+
+// CommandApplicationRecord is the PRIVATE durable record that correlates a public
+// CommandID with the one RuntimeCommandID it maps to and the lease epoch the
+// application runs under. It is appended BEFORE the command's runtime-visible
+// effect, so a redelivery after a crash finds it and replays the original
+// disposition rather than applying the command twice.
+//
+// It is not an event and not a command: it is never projected to a public wire
+// body, never replayed as an event, and the EventReplayer never decodes it.
+// Existing Harness command headers keep their UUIDs; this record is the durable
+// bridge from Host's opaque identity to those UUIDs, nothing more.
+//
+// Its idempotency id is derived from the PUBLIC CommandID, which is what makes
+// duplicate delivery detectable at the append: an idempotent journal reports
+// Appended=false for a byte-identical retry and fails closed with an
+// *IdempotencyCollisionError when the same public id names a DIFFERENT mapping.
+type CommandApplicationRecord struct {
+	app runtimecommand.Application
+}
+
+// NewCommandApplicationRecord wraps app as the private application-prefix record.
+func NewCommandApplicationRecord(app runtimecommand.Application) CommandApplicationRecord {
+	return CommandApplicationRecord{app: app}
+}
+
+// Application returns the wrapped correlation for the serializer to marshal.
+func (r CommandApplicationRecord) Application() runtimecommand.Application { return r.app }
+
+func (CommandApplicationRecord) isJournalRecord() {}
+
+// IdempotencyID is the namespaced public CommandID.
+func (r CommandApplicationRecord) IdempotencyID() string {
+	return commandApplicationIDPrefix + string(r.app.CommandID)
 }
