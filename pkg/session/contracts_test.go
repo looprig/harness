@@ -1,6 +1,7 @@
 package session_test
 
 import (
+	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -13,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/sessionruntime"
 	"github.com/looprig/harness/pkg/session"
 )
 
@@ -37,6 +39,7 @@ var publicSessionContracts = map[string]bool{
 	"RuntimeRestoreRequest": true, "RuntimeRestoreResolver": true,
 	"DefaultPolicyDecider": true, "AcceptAllDecider": true,
 	"CommittedPublicEventSource": true, "CommittedPublicEventProvider": true,
+	"IdleWaiter": true, "Liveness": true, "Releaser": true,
 }
 
 var forbiddenSessionSurface = map[string]bool{
@@ -313,5 +316,226 @@ func TestCommittedPublicEventCapabilityIsSegregated(t *testing.T) {
 	// cannot back with committed bytes.
 	if discover.Type.NumOut() != 2 || discover.Type.Out(0) != source || discover.Type.Out(1).Kind() != reflect.Bool {
 		t.Fatalf("CommittedPublicEvents signature = %v, want (CommittedPublicEventSource, bool)", discover.Type)
+	}
+}
+
+// contractMethodSet renders an interface's method set as sorted
+// "Name(params) results" strings. It reads the SHAPE only — names and
+// signatures — so it works on a bare interface with no implementation
+// anywhere, which is how a downstream consumer pins these contracts.
+//
+// This matters for the mutation that a maintainer would actually make. A
+// coordinated rename (the interface method AND every implementation and call
+// site in one gopls edit) leaves a compile-time satisfiability assertion green,
+// because every site moved together. It does not touch the string literals
+// below, so this guard still fails.
+func contractMethodSet(contract reflect.Type) []string {
+	set := make([]string, 0, contract.NumMethod())
+	for i := range contract.NumMethod() {
+		method := contract.Method(i)
+		set = append(set, method.Name+strings.TrimPrefix(method.Type.String(), "func"))
+	}
+	sort.Strings(set)
+	return set
+}
+
+// TestSegregatedLifecycleCapabilityShapes pins the exact method set of each
+// lifecycle capability. The want values are TRANSCRIBED from runbook 03-harness
+// task H4.1, not read back from the types, so this is an oracle rather than a
+// mirror of whatever the package currently declares.
+//
+// Two of the three shapes were settled on the merits and must not drift:
+//   - Done returns a channel, not a poll. It is a broadcast a drain supervisor
+//     selects on; an Alive(ctx) error poll is a different thing in kind.
+//   - ReleaseResidency is named in full because residency release is NONTERMINAL.
+//     The bare name Release loses the distinction from Shutdown, which durably
+//     appends SessionStopped, at exactly the boundary where it matters.
+func TestSegregatedLifecycleCapabilityShapes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		contract reflect.Type
+		want     []string
+	}{
+		{
+			name:     "IdleWaiter",
+			contract: reflect.TypeFor[session.IdleWaiter](),
+			want:     []string{"WaitIdle(context.Context) error"},
+		},
+		{
+			name:     "Liveness",
+			contract: reflect.TypeFor[session.Liveness](),
+			want:     []string{"Done() <-chan struct {}"},
+		},
+		{
+			name:     "Releaser",
+			contract: reflect.TypeFor[session.Releaser](),
+			want:     []string{"ReleaseResidency(context.Context) error"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if tt.contract.Kind() != reflect.Interface {
+				t.Fatalf("session.%s kind = %v, want an interface", tt.name, tt.contract.Kind())
+			}
+			got := contractMethodSet(tt.contract)
+			if strings.Join(got, ";") != strings.Join(tt.want, ";") {
+				t.Fatalf("session.%s method set = %v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLifecycleShapeGuardDetectsDrift exercises the detector the previous test
+// relies on. Without it that guard asserts a property the subject already
+// satisfies, so its comparison would never have been observed to fail.
+//
+// The two fixtures are the two coordinated edits a maintainer would plausibly
+// make: renaming ReleaseResidency to Release everywhere at once, and changing
+// Done's shape while keeping its name. Both are invisible to the compiler once
+// coordinated; both must be visible here.
+func TestLifecycleShapeGuardDetectsDrift(t *testing.T) {
+	t.Parallel()
+	type renamedReleaser interface {
+		Release(context.Context) error
+	}
+	type polledLiveness interface {
+		Done() bool
+	}
+	type extraMethodWaiter interface {
+		WaitIdle(context.Context) error
+		WaitBusy(context.Context) error
+	}
+	tests := []struct {
+		name     string
+		fixture  reflect.Type
+		rejected string
+	}{
+		{name: "coordinated rename", fixture: reflect.TypeFor[renamedReleaser](), rejected: "ReleaseResidency(context.Context) error"},
+		{name: "channel becomes poll", fixture: reflect.TypeFor[polledLiveness](), rejected: "Done() <-chan struct {}"},
+		{name: "capability widened", fixture: reflect.TypeFor[extraMethodWaiter](), rejected: "WaitIdle(context.Context) error"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := contractMethodSet(tt.fixture)
+			if strings.Join(got, ";") == tt.rejected {
+				t.Fatalf("drift fixture %v compared equal to %q; the shape guard cannot detect this edit", got, tt.rejected)
+			}
+		})
+	}
+}
+
+// TestSessionControllerNotWidenedForLifecycleCapabilities holds step 2 of H4.1:
+// the capabilities are SEGREGATED and discovered by type assertion, exactly as
+// runtimecommand.Provider and the committed-public-event capability above are.
+// SessionController is not widened solely so a Host can reach them.
+//
+// The guard is deliberately superset-plus-exclusion rather than exact equality.
+// Exact equality would also fail on an unrelated, legitimately additive method
+// and would say nothing about WHY; what H4.1 owes is (a) nothing released is
+// lost and (b) none of the three lifecycle methods appears on either view.
+func TestSessionControllerNotWidenedForLifecycleCapabilities(t *testing.T) {
+	t.Parallel()
+	dataPlane := reflect.TypeFor[session.Session]()
+	controller := reflect.TypeFor[session.SessionController]()
+
+	// Transcribed from released harness v0.30.2 plus the current data-plane
+	// declaration; source compatibility means every one of these survives.
+	released := map[reflect.Type][]string{
+		dataPlane: {
+			"ActiveLoop", "Compact", "CompactToLoop", "Interrupt", "Loop",
+			"RespondGate", "SessionID", "Submit", "SubmitToLoop", "SubscribeEvents",
+		},
+		controller: {
+			"ActiveLoop", "CheckpointWorkspace", "Compact", "CompactToLoop",
+			"Interrupt", "Loop", "LoopController", "RespondGate", "RestoreWorkspace",
+			"SessionID", "SetActiveLoop", "Shutdown", "Submit", "SubmitToLoop",
+			"SubscribeEvents",
+		},
+	}
+	for view, names := range released {
+		for _, name := range names {
+			if _, exists := view.MethodByName(name); !exists {
+				t.Errorf("%s lost released method %s", view.Name(), name)
+			}
+		}
+	}
+
+	segregated := []string{"WaitIdle", "Done", "ReleaseResidency"}
+	for _, view := range []reflect.Type{dataPlane, controller} {
+		for _, name := range segregated {
+			if _, exists := view.MethodByName(name); exists {
+				t.Errorf("%s exposes %s; the lifecycle capability must stay segregated and be discovered by assertion", view.Name(), name)
+			}
+		}
+	}
+}
+
+// TestProductionSessionSatisfiesIdleAndLiveness asserts the capability at RUN
+// time via reflect rather than with a compile-time var _ assertion. A compile
+// error is not an assertion kill: it stops the test binary from existing, so
+// `go test -list` reports nothing and no detector is exercised. Implements
+// returning false is a real failing assertion.
+func TestProductionSessionSatisfiesIdleAndLiveness(t *testing.T) {
+	t.Parallel()
+	production := reflect.TypeFor[*sessionruntime.Session]()
+	for _, tt := range []struct {
+		name     string
+		contract reflect.Type
+	}{
+		{name: "IdleWaiter", contract: reflect.TypeFor[session.IdleWaiter]()},
+		{name: "Liveness", contract: reflect.TypeFor[session.Liveness]()},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if !production.Implements(tt.contract) {
+				t.Fatalf("production *sessionruntime.Session does not satisfy session.%s", tt.name)
+			}
+		})
+	}
+}
+
+// TestLifecycleSatisfactionGuardDetectsAMissingMethod is the negative control
+// for the test above, which would otherwise assert a property its subject
+// already has with a detector nobody has seen reject anything.
+func TestLifecycleSatisfactionGuardDetectsAMissingMethod(t *testing.T) {
+	t.Parallel()
+	notASession := reflect.TypeFor[*struct{}]()
+	for _, tt := range []struct {
+		name     string
+		contract reflect.Type
+	}{
+		{name: "IdleWaiter", contract: reflect.TypeFor[session.IdleWaiter]()},
+		{name: "Liveness", contract: reflect.TypeFor[session.Liveness]()},
+		{name: "Releaser", contract: reflect.TypeFor[session.Releaser]()},
+	} {
+		if notASession.Implements(tt.contract) {
+			t.Errorf("*struct{} reported as satisfying session.%s; the satisfaction guard cannot reject anything", tt.name)
+		}
+	}
+}
+
+// TestProductionSessionDoesNotYetReleaseResidency pins a KNOWN GAP, in the same
+// spirit as the sessionstore interrupt-settlement pin.
+//
+// H4.1 exports capability interfaces over behavior that already exists. WaitIdle
+// and Done do exist on the production Session. A nonterminal residency release
+// does NOT: the only teardown the runtime has is Shutdown, which durably appends
+// SessionStopped and is therefore terminal by construction. Building one is task
+// H4.2, and Host's O3.1 step 5 — a registry loser releasing its runtime
+// nonterminally — is blocked behind H4.2, not behind this task.
+//
+// This assertion is expected to FAIL when H4.2 lands. That is its purpose: it is
+// the reminder to promote *sessionruntime.Session into the positive test above.
+func TestProductionSessionDoesNotYetReleaseResidency(t *testing.T) {
+	t.Parallel()
+	production := reflect.TypeFor[*sessionruntime.Session]()
+	if production.Implements(reflect.TypeFor[session.Releaser]()) {
+		t.Fatal("production *sessionruntime.Session now satisfies session.Releaser; H4.2 has landed — move it into TestProductionSessionSatisfiesIdleAndLiveness and delete this gap pin")
+	}
+	if _, exists := reflect.TypeFor[session.Releaser]().MethodByName("ReleaseResidency"); !exists {
+		t.Fatal("session.Releaser lost ReleaseResidency; the gap pin above is vacuous")
 	}
 }

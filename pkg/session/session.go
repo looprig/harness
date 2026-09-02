@@ -144,3 +144,63 @@ type CommittedPublicEventSource interface {
 type CommittedPublicEventProvider interface {
 	CommittedPublicEvents() (CommittedPublicEventSource, bool)
 }
+
+// IdleWaiter is the segregated whole-session quiescence capability: WaitIdle
+// blocks until the session has no work in flight, the context is done, or the
+// session has failed or stopped, in which case it returns that terminal reason
+// rather than reporting idleness.
+//
+// It is a SEPARATE contract rather than another method on SessionController for
+// the reason segregation always applies here: almost every controller consumer —
+// the TUI, the CLI, a test harness — submits work and watches events without ever
+// waiting on whole-session quiescence, and a supervisor that waits usually does
+// not submit. It is discovered by assertion, the same way runtimecommand.Provider
+// and GateHost are:
+//
+//	waiter, ok := controller.(session.IdleWaiter)
+//
+// The contract here is the SHAPE and the fact that a live session satisfies it.
+// The idleness semantics are the runtime's existing ones, unchanged by this
+// declaration; in particular a foreign primary loop is a known gap that does not
+// reach whole-session idle, and nothing in this interface repairs that.
+type IdleWaiter interface {
+	WaitIdle(context.Context) error
+}
+
+// Liveness is the segregated teardown-broadcast capability. The channel returned
+// by Done is closed when the session begins tearing down, so an out-of-process
+// supervisor can select on it alongside its own cancellation instead of polling.
+//
+// A broadcast, not a poll, is the deliberate shape. A drain supervisor's whole job
+// is to block on whichever of several things happens first; an Alive(context.Context) error
+// poll cannot be composed into that select and would have to be wrapped in a
+// goroutine by every caller. The two are different in kind, not in style.
+//
+// A receive MUST NOT be read as "teardown finished". The channel closes at the
+// START of teardown, deliberately, so a watcher learns immediately that the
+// session is going away rather than after the last lease is released.
+type Liveness interface {
+	Done() <-chan struct{}
+}
+
+// Releaser is the segregated NONTERMINAL residency-release capability: it gives up
+// this process's resident runtime for the session — subscriptions, actors, leases,
+// local contexts — while leaving the logical session restorable elsewhere.
+//
+// The name is ReleaseResidency and not Release because the distinction from
+// Shutdown is the entire content of the contract. Shutdown durably appends
+// SessionStopped and makes the logical session terminal. This does not: after it
+// returns, the session is cold and restorable, and a registry loser that released
+// its runtime has not ended anyone's session. The bare name loses exactly that at
+// the boundary where a host is choosing between the two.
+//
+// It is declared here as a capability discovered by assertion:
+//
+//	releaser, ok := controller.(session.Releaser)
+//
+// and a caller MUST treat a false ok as "this session cannot be released
+// nonterminally", not as an error. That is not hypothetical: the live runtime does
+// not implement it yet.
+type Releaser interface {
+	ReleaseResidency(context.Context) error
+}
