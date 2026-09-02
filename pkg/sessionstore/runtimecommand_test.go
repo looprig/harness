@@ -3,6 +3,7 @@ package sessionstore
 import (
 	"context"
 	"errors"
+	"io"
 	"testing"
 
 	"github.com/looprig/core/uuid"
@@ -163,8 +164,14 @@ func TestCommandApplicationIsPrivate(t *testing.T) {
 	defer func() { _ = cursor.Close() }()
 	for {
 		ev, _, err := cursor.Next(context.Background())
-		if err != nil {
+		if errors.Is(err, io.EOF) {
 			break
+		}
+		if err != nil {
+			// The prefix must be FILTERED from the public stream, not merely rejected
+			// by it: a decode error here would break every public reader of a session
+			// that has ever applied a runtime command.
+			t.Fatalf("public event replay error = %v, want a clean drain to io.EOF", err)
 		}
 		t.Errorf("public event replay surfaced %T; the application prefix must be private", ev)
 	}
