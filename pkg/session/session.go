@@ -159,6 +159,12 @@ type CommittedPublicEventProvider interface {
 //
 //	waiter, ok := controller.(session.IdleWaiter)
 //
+// That discovery asserts on the DYNAMIC type. A wrapper around a live session
+// MUST forward WaitIdle, or it silently opts its wrapped session out and the
+// caller sees ok == false with no error anywhere — the same hazard pkg/serve
+// states for SessionDone, and it applies to all three capabilities here. Nothing
+// pins that rig keeps returning the runtime type unwrapped.
+//
 // The contract here is the SHAPE and the fact that a live session satisfies it.
 // The idleness semantics are the runtime's existing ones, unchanged by this
 // declaration; in particular a foreign primary loop is a known gap that does not
@@ -179,6 +185,12 @@ type IdleWaiter interface {
 // A receive MUST NOT be read as "teardown finished". The channel closes at the
 // START of teardown, deliberately, so a watcher learns immediately that the
 // session is going away rather than after the last lease is released.
+//
+// DUPLICATE, KNOWINGLY: pkg/serve.SessionDone is this interface — same method,
+// same semantics, same segregation argument — and neither type references the
+// other in code, because serve does not import pkg/session at all. The
+// duplication is the price of that independence, not an oversight. Change one and
+// change the other.
 type Liveness interface {
 	Done() <-chan struct{}
 }

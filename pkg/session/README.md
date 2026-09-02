@@ -17,7 +17,8 @@ to callers as `session.SessionController`.
 
 ## What is session?
 
-Three contracts live here, layered by trust:
+Two session views live here, layered by trust, plus a set of segregated
+capabilities a consumer discovers by type assertion:
 
 - **`Session`** — the ordinary data plane: identity, the active loop, the
   loop registry, submit, compact, subscribe, respond to a gate,
@@ -31,6 +32,36 @@ Three contracts live here, layered by trust:
   session and the two roles have different holders (an MCP binding
   servicing an elicitation is a `GateHost`; the client that answers is a
   `Session`).
+
+### Segregated capabilities
+
+None of these is a method on `Session` or `SessionController`. Each is
+obtained by asserting on the value `rig` returns, and a `false` result
+means "this session cannot do that", never an error. The argument for
+keeping each one out of the two views is the same one spelled out for
+`GateHost` below.
+
+- **`CommittedPublicEventSource`** / **`CommittedPublicEventProvider`** —
+  a live event stream whose every delivery carries the exact canonical
+  bytes the durable append stored. Discovered through the *provider*
+  rather than a bare assertion, because the capability is a property of
+  the session's persistence, not of its Go type.
+- **`IdleWaiter`** — `WaitIdle`, whole-session quiescence. Most
+  controller consumers submit work; a supervisor that waits usually does
+  not submit.
+- **`Liveness`** — `Done() <-chan struct{}`, closed when teardown
+  *begins*. A broadcast a drain supervisor can `select` on, deliberately
+  not an `Alive(ctx) error` poll. It is the same interface as
+  `pkg/serve.SessionDone`, duplicated because `serve` does not import
+  this package.
+- **`Releaser`** — `ReleaseResidency`, giving up this process's resident
+  runtime while leaving the logical session restorable. Named in full
+  because it is **nonterminal**: unlike `Shutdown` it appends no
+  `SessionStopped`. **The live runtime does not implement it yet**, so
+  the assertion returns `false` today; see task H4.2.
+
+Everything else exported here is an error type. `pkg/session` is
+contracts plus errors, and a test enforces exactly that.
 
 ## How to use
 

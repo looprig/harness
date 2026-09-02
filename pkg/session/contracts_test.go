@@ -2,6 +2,7 @@ package session_test
 
 import (
 	"context"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/internal/sessionruntime"
 	"github.com/looprig/harness/pkg/session"
@@ -319,32 +321,97 @@ func TestCommittedPublicEventCapabilityIsSegregated(t *testing.T) {
 	}
 }
 
-// contractMethodSet renders an interface's method set as sorted
+// renderMethodSet renders an interface's method set as sorted
 // "Name(params) results" strings. It reads the SHAPE only — names and
-// signatures — so it works on a bare interface with no implementation
-// anywhere, which is how a downstream consumer pins these contracts.
+// signatures — so it works on a bare interface with no implementation anywhere,
+// which is how a downstream consumer pins these contracts.
 //
-// This matters for the mutation that a maintainer would actually make. A
-// coordinated rename (the interface method AND every implementation and call
-// site in one gopls edit) leaves a compile-time satisfiability assertion green,
-// because every site moved together. It does not touch the string literals
-// below, so this guard still fails.
-func contractMethodSet(contract reflect.Type) []string {
+// This matters for the mutation a maintainer would actually make. A coordinated
+// rename (the interface method AND every implementation and call site in one
+// gopls edit) leaves a compile-time satisfiability assertion green, because every
+// site moved together. It does not touch the string literals below, so this still
+// fails.
+//
+// It rejects a non-interface rather than rendering one. reflect includes the
+// RECEIVER in a concrete type's method signatures, so the same want literal can
+// never match both an interface and a type that implements it — a caller passing
+// a concrete type would get a mismatch it would be tempted to fix by pasting what
+// reflect printed. The error path is exercised by TestRenderMethodSetRejectsNonInterface.
+func renderMethodSet(contract reflect.Type) ([]string, error) {
+	if contract.Kind() != reflect.Interface {
+		return nil, fmt.Errorf("renderMethodSet: %v is a %v, not an interface; its rendering would include a receiver", contract, contract.Kind())
+	}
 	set := make([]string, 0, contract.NumMethod())
 	for i := range contract.NumMethod() {
 		method := contract.Method(i)
 		set = append(set, method.Name+strings.TrimPrefix(method.Type.String(), "func"))
 	}
 	sort.Strings(set)
+	return set, nil
+}
+
+// contractMethodSet is renderMethodSet for a test that has already decided a
+// non-interface is a bug in the test itself.
+func contractMethodSet(t testing.TB, contract reflect.Type) []string {
+	t.Helper()
+	set, err := renderMethodSet(contract)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 	return set
 }
 
 // methodSetMatches is the single comparison every shape guard below runs: render
 // the contract, join it, compare against the transcribed want. It is one function
-// so that the drift test exercises the SAME comparison the real guard uses rather
-// than a lookalike that could stay green while the real one rotted.
-func methodSetMatches(contract reflect.Type, want []string) bool {
-	return strings.Join(contractMethodSet(contract), ";") == strings.Join(want, ";")
+// so the drift test exercises the SAME comparison the real guard uses rather than
+// a lookalike that could stay green while the real one rotted.
+func methodSetMatches(t testing.TB, contract reflect.Type, want []string) bool {
+	t.Helper()
+	return strings.Join(contractMethodSet(t, contract), ";") == strings.Join(want, ";")
+}
+
+// renderingFixture pins the INSTRUMENT. Every want literal in this file is
+// compared against renderMethodSet's output, and nothing else says what that
+// output looks like — so a maintainer who simplifies the renderer and updates
+// every want in the same edit turns the whole suite into a name-only oracle
+// silently. That edit now fails here, in a test whose literals describe no
+// contract and therefore have no reason to be updated alongside one.
+//
+// It deliberately covers the renderings the capability contracts depend on and a
+// few they do not: channel VARIANCE in both directions, a qualified named type, a
+// slice of one, multiple results, and a variadic.
+type renderingFixture interface {
+	Alpha() <-chan struct{}
+	Beta(context.Context, []content.Block) (uuid.UUID, bool, error)
+	Delta() (chan struct{}, chan<- int)
+	Gamma(...int) error
+}
+
+func TestRenderMethodSetFormat(t *testing.T) {
+	t.Parallel()
+	want := []string{
+		"Alpha() <-chan struct {}",
+		"Beta(context.Context, []content.Block) (uuid.UUID, bool, error)",
+		"Delta() (chan struct {}, chan<- int)",
+		"Gamma(...int) error",
+	}
+	got := contractMethodSet(t, reflect.TypeFor[renderingFixture]())
+	if strings.Join(got, ";") != strings.Join(want, ";") {
+		t.Fatalf("renderMethodSet output = %v, want %v", got, want)
+	}
+}
+
+func TestRenderMethodSetRejectsNonInterface(t *testing.T) {
+	t.Parallel()
+	// *sessionruntime.Session satisfies IdleWaiter, so a caller could plausibly
+	// pass it here expecting "WaitIdle(context.Context) error" back. reflect would
+	// render "WaitIdle(*sessionruntime.Session, context.Context) error".
+	if _, err := renderMethodSet(reflect.TypeFor[*sessionruntime.Session]()); err == nil {
+		t.Fatal("renderMethodSet accepted a concrete type; its receiver-bearing rendering can never match an interface want")
+	}
+	if _, err := renderMethodSet(reflect.TypeFor[session.IdleWaiter]()); err != nil {
+		t.Fatalf("renderMethodSet rejected an interface: %v", err)
+	}
 }
 
 // lifecycleCapabilityShape names one H4.1 capability and the method set the
@@ -353,60 +420,136 @@ type lifecycleCapabilityShape struct {
 	name     string
 	contract reflect.Type
 	want     []string
-	// drifted is a fixture with the same intent and a different shape: the edit a
-	// maintainer would coordinate across every site in one gopls action. It exists
+	// drifted are fixtures with the same intent and a different shape: the edits a
+	// maintainer would coordinate across every site in one gopls action. They exist
 	// so the guard's rejecting half is observed, not assumed.
-	drifted reflect.Type
+	//
+	// Each capability carries FOUR kinds, because a single fixture leaves the suite
+	// resting on one accident of that fixture's shape:
+	//   - renamed:         differs by name only.
+	//   - signature-only:  same name, different parameters. This is the only kind a
+	//                      name-only renderer cannot see, so every capability has one
+	//                      rather than only Liveness.
+	//   - widened-before:  an extra method sorting BEFORE the real one.
+	//   - widened-after:   an extra method sorting AFTER it. Without this, a
+	//                      comparison degraded to "first element only" passes every
+	//                      arm, because the real method is still element zero.
+	drifted []reflect.Type
 }
 
 type renamedReleaser interface {
 	Release(context.Context) error
 }
 
+type contextlessReleaser interface {
+	ReleaseResidency() error
+}
+
+type widenedBeforeReleaser interface {
+	Release(context.Context) error
+	ReleaseResidency(context.Context) error
+}
+
+type widenedAfterReleaser interface {
+	ReleaseResidency(context.Context) error
+	ReleaseWorkspace(context.Context) error
+}
+
+// polledLiveness is the exact rename the Liveness doc comment argues against, so
+// the prose and the fixture cannot drift apart.
 type polledLiveness interface {
+	Alive(context.Context) error
+}
+
+type booleanLiveness interface {
 	Done() bool
 }
 
-type widenedIdleWaiter interface {
-	WaitIdle(context.Context) error
-	WaitBusy(context.Context) error
+type widenedBeforeLiveness interface {
+	Alive() bool
+	Done() <-chan struct{}
 }
 
-// lifecycleCapabilityShapes is the H4.1 oracle: the three method sets TRANSCRIBED
+type widenedAfterLiveness interface {
+	Done() <-chan struct{}
+	Stopped() bool
+}
+
+type renamedIdleWaiter interface {
+	Idle(context.Context) error
+}
+
+type contextlessIdleWaiter interface {
+	WaitIdle() error
+}
+
+type widenedBeforeIdleWaiter interface {
+	WaitBusy(context.Context) error
+	WaitIdle(context.Context) error
+}
+
+type widenedAfterIdleWaiter interface {
+	WaitIdle(context.Context) error
+	WaitStopped(context.Context) error
+}
+
+// lifecycleCapabilityShapes is the H4.1 oracle: the three method sets transcribed
 // from runbook 03-harness ("Add separate interfaces"), not read back from the
 // declarations they check. Derived from the implementation it would agree with
 // anything.
+//
+// One honest caveat about that independence. The CONTENT — names, parameters,
+// results, and the <-chan variance — is the runbook's. The ENCODING is not: the
+// runbook writes `Done() <-chan struct{}` and this file writes
+// `Done() <-chan struct {}`, with reflect's space. So these literals cannot be
+// diffed against the runbook mechanically, and a future mismatch must be resolved
+// by re-reading the runbook, NOT by pasting what reflect printed. TestRenderMethodSetFormat
+// is what makes that discipline checkable: it pins the encoding separately, so an
+// encoding change shows up there instead of being absorbed into these wants.
 func lifecycleCapabilityShapes() []lifecycleCapabilityShape {
 	return []lifecycleCapabilityShape{
 		{
 			name:     "IdleWaiter",
 			contract: reflect.TypeFor[session.IdleWaiter](),
 			want:     []string{"WaitIdle(context.Context) error"},
-			drifted:  reflect.TypeFor[widenedIdleWaiter](),
+			drifted: []reflect.Type{
+				reflect.TypeFor[renamedIdleWaiter](),
+				reflect.TypeFor[contextlessIdleWaiter](),
+				reflect.TypeFor[widenedBeforeIdleWaiter](),
+				reflect.TypeFor[widenedAfterIdleWaiter](),
+			},
 		},
 		{
 			name:     "Liveness",
 			contract: reflect.TypeFor[session.Liveness](),
 			want:     []string{"Done() <-chan struct {}"},
-			drifted:  reflect.TypeFor[polledLiveness](),
+			drifted: []reflect.Type{
+				reflect.TypeFor[polledLiveness](),
+				reflect.TypeFor[booleanLiveness](),
+				reflect.TypeFor[widenedBeforeLiveness](),
+				reflect.TypeFor[widenedAfterLiveness](),
+			},
 		},
 		{
 			name:     "Releaser",
 			contract: reflect.TypeFor[session.Releaser](),
 			want:     []string{"ReleaseResidency(context.Context) error"},
-			drifted:  reflect.TypeFor[renamedReleaser](),
+			drifted: []reflect.Type{
+				reflect.TypeFor[renamedReleaser](),
+				reflect.TypeFor[contextlessReleaser](),
+				reflect.TypeFor[widenedBeforeReleaser](),
+				reflect.TypeFor[widenedAfterReleaser](),
+			},
 		},
 	}
 }
 
 // TestSegregatedLifecycleCapabilityShapes pins the exact method set of each
-// lifecycle capability. The want values are TRANSCRIBED from runbook 03-harness
-// task H4.1, not read back from the types, so this is an oracle rather than a
-// mirror of whatever the package currently declares.
+// lifecycle capability against the transcribed oracle above.
 //
 // Two of the three shapes were settled on the merits and must not drift:
 //   - Done returns a channel, not a poll. It is a broadcast a drain supervisor
-//     selects on; an Alive(ctx) error poll is a different thing in kind.
+//     selects on; an Alive(context.Context) error poll is a different thing in kind.
 //   - ReleaseResidency is named in full because residency release is NONTERMINAL.
 //     The bare name Release loses the distinction from Shutdown, which durably
 //     appends SessionStopped, at exactly the boundary where it matters.
@@ -415,11 +558,8 @@ func TestSegregatedLifecycleCapabilityShapes(t *testing.T) {
 	for _, tt := range lifecycleCapabilityShapes() {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if tt.contract.Kind() != reflect.Interface {
-				t.Fatalf("session.%s kind = %v, want an interface", tt.name, tt.contract.Kind())
-			}
-			if !methodSetMatches(tt.contract, tt.want) {
-				t.Fatalf("session.%s method set = %v, want %v", tt.name, contractMethodSet(tt.contract), tt.want)
+			if !methodSetMatches(t, tt.contract, tt.want) {
+				t.Fatalf("session.%s method set = %v, want %v", tt.name, contractMethodSet(t, tt.contract), tt.want)
 			}
 		})
 	}
@@ -427,28 +567,26 @@ func TestSegregatedLifecycleCapabilityShapes(t *testing.T) {
 
 // TestLifecycleShapeGuardRejectsDriftedFixtures runs the REAL comparison — the
 // same methodSetMatches, over the same rendering, against the same transcribed
-// want — on a correct subject and a drifted one, and requires opposite verdicts.
+// want — on a correct subject and every drifted one, and requires opposite
+// verdicts.
 //
 // The positive arm is not decoration. An earlier form of this test asserted only
 // that each drifted fixture compared UNEQUAL to the want, and that was
-// tautological: replacing contractMethodSet's body with a constant left every arm
-// green, because degrading the helper never makes an inequality assertion more
-// likely to trip. Measured, not assumed. The positive arm is what couples this
-// test to the helper's fidelity.
-//
-// Each drifted fixture is a coordinated edit the compiler cannot see once every
-// site moves together: renaming ReleaseResidency to Release, replacing Done's
-// broadcast channel with a poll, and widening a capability with a second method.
+// tautological: replacing the renderer's body with a constant left every arm
+// green, because degrading it never makes an inequality more likely to trip.
+// Measured, not assumed.
 func TestLifecycleShapeGuardRejectsDriftedFixtures(t *testing.T) {
 	t.Parallel()
 	for _, tt := range lifecycleCapabilityShapes() {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if !methodSetMatches(tt.contract, tt.want) {
-				t.Fatalf("the shape comparison rejected the real session.%s (%v); it cannot be trusted to accept anything", tt.name, contractMethodSet(tt.contract))
+			if !methodSetMatches(t, tt.contract, tt.want) {
+				t.Fatalf("the shape comparison rejected the real session.%s (%v); it cannot be trusted to accept anything", tt.name, contractMethodSet(t, tt.contract))
 			}
-			if methodSetMatches(tt.drifted, tt.want) {
-				t.Fatalf("drifted fixture %v compared equal to %v; the shape guard cannot detect this coordinated edit", contractMethodSet(tt.drifted), tt.want)
+			for _, drifted := range tt.drifted {
+				if methodSetMatches(t, drifted, tt.want) {
+					t.Errorf("drifted fixture %v compared equal to %v; the shape guard cannot detect this coordinated edit", contractMethodSet(t, drifted), tt.want)
+				}
 			}
 		})
 	}
@@ -457,20 +595,22 @@ func TestLifecycleShapeGuardRejectsDriftedFixtures(t *testing.T) {
 // TestSessionControllerNotWidenedForLifecycleCapabilities holds step 2 of H4.1:
 // the capabilities are SEGREGATED and discovered by type assertion, exactly as
 // runtimecommand.Provider and the committed-public-event capability above are.
-// SessionController is not widened solely so a Host can reach them.
 //
-// The guard is deliberately superset-plus-exclusion rather than exact equality.
-// Exact equality would also fail on an unrelated, legitimately additive method
-// and would say nothing about WHY; what H4.1 owes is (a) nothing released is
-// lost and (b) none of the three lifecycle methods appears on either view. An
-// ADDED implemented method is not a widening "solely for Host": it is an ordinary
-// API addition, and the segregation arm below is what rejects the widening this
-// task actually forbids.
+// The two arms pin different things and neither is exact equality.
 //
-// The released half compares full SIGNATURES, not names. Names alone let a
+// The released arm compares full SIGNATURES, not names. Names alone let a
 // source-INCOMPATIBLE change to a released method pass: narrowing
 // Interrupt(context.Context) (bool, error) to Interrupt(context.Context) error
 // leaves every name intact, and coordinated with the runtime it compiles.
+//
+// The segregation arm pins THREE LITERAL NAMES and nothing more. It is not a
+// general guard against lifecycle capability leakage and must not be described as
+// one: adding an implemented ReleaseRuntime(context.Context) error to
+// SessionController — a synonym for nonterminal residency release, precisely what
+// step 2 forbids — builds clean and passes here. Measured. Rejecting that needs a
+// reviewer, because the difference between a forbidden synonym and a legitimate
+// additive method (the H5-shaped case, for which exact equality would be a false
+// positive) is semantic and not visible to reflect.
 func TestSessionControllerNotWidenedForLifecycleCapabilities(t *testing.T) {
 	t.Parallel()
 	dataPlane := reflect.TypeFor[session.Session]()
@@ -502,12 +642,12 @@ func TestSessionControllerNotWidenedForLifecycleCapabilities(t *testing.T) {
 	released := map[reflect.Type][]string{dataPlane: sessionMethods, controller: controllerMethods}
 	for view, want := range released {
 		present := make(map[string]bool, view.NumMethod())
-		for _, signature := range contractMethodSet(view) {
+		for _, signature := range contractMethodSet(t, view) {
 			present[signature] = true
 		}
 		for _, signature := range want {
 			if !present[signature] {
-				t.Errorf("%s no longer declares released method %s; it has %v", view.Name(), signature, contractMethodSet(view))
+				t.Errorf("%s no longer declares released method %s; it has %v", view.Name(), signature, contractMethodSet(t, view))
 			}
 		}
 	}
@@ -522,12 +662,23 @@ func TestSessionControllerNotWidenedForLifecycleCapabilities(t *testing.T) {
 	}
 }
 
-// TestProductionSessionSatisfiesIdleAndLiveness asserts the capability at RUN
-// time via reflect rather than with a compile-time var _ assertion. A compile
+// TestProductionSessionSatisfiesLifecycleCapabilities asserts the capability at
+// RUN time via reflect rather than with a compile-time var _ assertion. A compile
 // error is not an assertion kill: it stops the test binary from existing, so
 // `go test -list` reports nothing and no detector is exercised. Implements
-// returning false is a real failing assertion.
-func TestProductionSessionSatisfiesIdleAndLiveness(t *testing.T) {
+// returning false is a real failing assertion, and it is the only thing in this
+// repository that catches a variance change to Done — the whole
+// internal/sessionruntime package, TestSessionDoneReportsLiveness included, is
+// blind to it.
+//
+// SCOPE: the subject is the concrete runtime type, not whatever rig hands a
+// caller. Today rig.NewSession returns *sessionruntime.Session unwrapped so the
+// two coincide, and nothing here pins that. If rig ever returns a decorator, the
+// discovery documented on these contracts starts returning ok == false while this
+// test stays green — the same hazard pkg/serve states for SessionDone: a wrapper
+// around a live session MUST forward these methods or it silently opts its
+// wrapped session out.
+func TestProductionSessionSatisfiesLifecycleCapabilities(t *testing.T) {
 	t.Parallel()
 	production := reflect.TypeFor[*sessionruntime.Session]()
 	for _, tt := range []struct {
@@ -546,20 +697,13 @@ func TestProductionSessionSatisfiesIdleAndLiveness(t *testing.T) {
 	}
 }
 
-// TestLifecycleSatisfactionGuardDetectsAMissingMethod is the negative control
-// for the test above, which would otherwise assert a property its subject
-// already has with a detector nobody has seen reject anything.
+// TestLifecycleSatisfactionGuardDetectsAMissingMethod is the negative control for
+// the test above, which would otherwise assert a property its subject already has
+// with a detector nobody has seen reject anything.
 func TestLifecycleSatisfactionGuardDetectsAMissingMethod(t *testing.T) {
 	t.Parallel()
 	notASession := reflect.TypeFor[*struct{}]()
-	for _, tt := range []struct {
-		name     string
-		contract reflect.Type
-	}{
-		{name: "IdleWaiter", contract: reflect.TypeFor[session.IdleWaiter]()},
-		{name: "Liveness", contract: reflect.TypeFor[session.Liveness]()},
-		{name: "Releaser", contract: reflect.TypeFor[session.Releaser]()},
-	} {
+	for _, tt := range lifecycleCapabilityShapes() {
 		if notASession.Implements(tt.contract) {
 			t.Errorf("*struct{} reported as satisfying session.%s; the satisfaction guard cannot reject anything", tt.name)
 		}
@@ -587,9 +731,18 @@ func TestProductionSessionDoesNotYetReleaseResidency(t *testing.T) {
 	t.Parallel()
 	production := reflect.TypeFor[*sessionruntime.Session]()
 	if production.Implements(reflect.TypeFor[session.Releaser]()) {
-		t.Fatal("production *sessionruntime.Session now declares ReleaseResidency, so it satisfies session.Releaser. If that is H4.2's nonterminal release, move the type into TestProductionSessionSatisfiesIdleAndLiveness and delete this gap pin; if it is anything else, the method name is wrong.")
+		t.Fatal("production *sessionruntime.Session now declares ReleaseResidency, so it satisfies session.Releaser. If that is H4.2's nonterminal release, add it to TestProductionSessionSatisfiesLifecycleCapabilities and delete this gap pin; if it is anything else, the method name is wrong.")
 	}
-	if _, exists := reflect.TypeFor[session.Releaser]().MethodByName("ReleaseResidency"); !exists {
-		t.Fatal("session.Releaser lost ReleaseResidency; the gap pin above is vacuous")
+	// Vacuity guard: the pin above says nothing if Releaser no longer has the shape
+	// it is pinning the absence of. It compares the full signature, not the name,
+	// so a Releaser narrowed to a context-less ReleaseResidency() error — a
+	// different contract that the production type would also fail to satisfy —
+	// cannot keep this pin looking meaningful.
+	shape := lifecycleCapabilityShapes()[2]
+	if shape.name != "Releaser" {
+		t.Fatalf("oracle table reordered: entry 2 is %s, not Releaser", shape.name)
+	}
+	if !methodSetMatches(t, reflect.TypeFor[session.Releaser](), shape.want) {
+		t.Fatalf("session.Releaser = %v, want %v; the gap pin above is vacuous", contractMethodSet(t, reflect.TypeFor[session.Releaser]()), shape.want)
 	}
 }

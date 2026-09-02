@@ -61,6 +61,11 @@ type LiveSession interface {
 // forever, which is exactly today's behaviour; only a session that opts in can be
 // evicted. A wrapper around a live session MUST forward Done, or it silently opts its
 // wrapped session out and reintroduces the corpse-pinning leak this exists to fix.
+//
+// DUPLICATE, KNOWINGLY: session.Liveness is this interface — same method, same
+// semantics, same segregation argument — declared for the Host boundary. serve
+// does not import pkg/session in production, so the two cannot be unified without
+// giving that up. Change one and change the other.
 type SessionDone interface {
 	// Done returns a channel closed once the session has begun shutting down. It never
 	// reopens, and a receive means "admits no new work", not "cleanup finished".
