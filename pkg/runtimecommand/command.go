@@ -237,6 +237,15 @@ type Applier interface {
 	// every later delivery deduplicates against it. Re-deliver and read
 	// Disposition.Duplicate to learn what happened; do not assume an error means
 	// nothing was recorded.
+	//
+	// A returned Disposition also does not mean the application will SETTLE. The
+	// durable settlement correlation resolves an application by finding the public
+	// event adjacent to its prefix, and adjacency is not guaranteed for any command
+	// kind: another writer's record in that slot leaves the application unresolved
+	// forever. Unresolved never licenses a rejection, so nothing is applied twice and
+	// nothing is settled over — but a caller that BLOCKS on an application settling
+	// blocks indefinitely. Treat the Disposition as the answer, not as a promise that
+	// a later durable query will agree.
 	ApplyRuntimeCommand(context.Context, Admitted) (Disposition, error)
 }
 

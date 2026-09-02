@@ -101,6 +101,26 @@ func (s *Session) RuntimeCommands() (runtimecommand.Applier, bool) {
 // the earned disposition alongside the error is what keeps it observable without
 // forcing a redelivery to find out. See
 // TestEffectFailureAfterTheDurablePrefixStrandsTheCommand.
+//
+// KNOWN GAP — A HOST ADAPTER MUST NOT BLOCK ON ANY APPLICATION SETTLING, of any
+// kind. The released settlement correlation resolves a prefix by ADJACENCY: the
+// record at prefix+1 must be the public event the command caused, and its resolve()
+// switches on that record's envelope kind without ever inspecting the command's
+// kind. This applier writes the prefix LAST before the effect, so adjacency holds
+// when nothing else is writing — but nothing GUARANTEES it. A concurrent legacy
+// Submit's audit intent record, another loop's event in a multi-loop session, or a
+// checkpoint landing in that slot resolves an INPUT unresolved exactly as readily as
+// an interrupt. The interrupt is merely the kind that is always in that position: it
+// has no guaranteed public event at all, and an idle interrupt is fail-quiet.
+//
+// Unresolved never licenses a rejection, so this is liveness and not correctness —
+// which is precisely why it is written down: nothing fails, the command simply never
+// settles, and a caller that waits for it waits forever. Closing it needs either a
+// guaranteed durable effect record per kind or the prefix-and-effect pair serialized
+// against every other append; both are decisions about the public event vocabulary
+// and the writer's admission rather than about this seam, so neither is made here.
+// pkg/sessionstore's TestAdjacencyIsNotGuaranteedForAnyCommandKind measures the
+// consequence for both kinds and holds the semantics still while it waits.
 func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecommand.Admitted) (runtimecommand.Disposition, error) {
 	log, lease := s.runtimeCommands, s.runtimeCommandLease
 	if log == nil || lease == nil {
@@ -171,18 +191,9 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 			return disposition, err
 		}
 	case runtimecommand.KindInterrupt:
-		// KNOWN GAP, measured and pinned by pkg/sessionstore's
-		// TestPrefixFollowedByANonEventResolvesUnresolved: this application does not
-		// settle. The released correlation resolves a prefix by the record at prefix+1,
-		// and an interrupt has no guaranteed public event there — a fan-out writes one
-		// audit intent record per target first, and an interrupt of an IDLE session is
-		// fail-quiet and appends no public event at all. The outcome is UNRESOLVED,
-		// which never licenses a rejection, so this is a liveness gap and not a
-		// correctness one; a Host adapter must not wait on an interrupt settling.
-		//
-		// Closing it needs a guaranteed durable effect record for an interrupt, which
-		// is a decision about the public event vocabulary rather than about framing,
-		// so it is deliberately not made here.
+		// The interrupt is the kind that is ALWAYS in the no-adjacency position rather
+		// than occasionally — an idle interrupt is fail-quiet and appends no public
+		// event at all — but the gap itself is general; see the method doc.
 		interrupted, err := s.Interrupt(ctx)
 		if err != nil {
 			return disposition, err

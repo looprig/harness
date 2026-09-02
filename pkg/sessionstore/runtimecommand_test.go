@@ -596,75 +596,100 @@ func TestPrefixDeduplicatesAfterIndexHydration(t *testing.T) {
 	}
 }
 
-// TestPrefixFollowedByANonEventResolvesUnresolved pins the OTHER half of the
-// adjacency contract, and records a known gap rather than leaving it implicit.
+// TestAdjacencyIsNotGuaranteedForAnyCommandKind pins the OTHER half of the adjacency
+// contract, and records a known gap rather than leaving it implicit.
 //
 // The released correlation resolves a prefix by the record at prefix+1: a public
 // event means committed, a higher opening fence means abandoned, and ANYTHING ELSE
 // means unresolved. Unresolved is not a failure — it never licenses a rejection, so
-// it is the safe side — but an unresolved command never settles either, so it is a
-// liveness gap and not a correctness one.
+// it is the safe side — but an unresolved command never settles either, so this is a
+// liveness gap, not a correctness one.
 //
-// KindInterrupt is in exactly that position today, measured on the real dispatch
-// path: an interrupt of an IDLE session is fail-quiet and appends no public event at
-// all, so it has nothing to be adjacent to and can never resolve; an interrupt of a
-// busy session produces TurnInterrupted, but only after the per-loop audit intent
-// records the fan-out writes first. Giving KindInterrupt a guaranteed durable effect
-// record is a public-event-vocabulary decision, not a framing one, so it is left to
-// the Host adapter task — with this test standing in front of it so the semantics
-// cannot drift while it waits.
-func TestPrefixFollowedByANonEventResolvesUnresolved(t *testing.T) {
+// THE GAP IS NOT INTERRUPT-SPECIFIC, and that is what this table exists to prove.
+// resolve() switches on the ADJACENT RECORD'S envelope kind and never once inspects
+// the command's kind, so the property "a public event must be adjacent to the prefix"
+// is equally fragile for an input. Harness writes the prefix last before the send, so
+// adjacency holds when nothing else is writing — but nothing GUARANTEES it. A
+// concurrent legacy Submit's audit intent record, another loop's event in a
+// multi-loop session, or a checkpoint landing in that slot resolves an INPUT
+// unresolved just as readily. Both rows below are the same interposed record; only
+// the command kind differs, and the outcome does not.
+//
+// KindInterrupt is the case that is ALWAYS in this position rather than
+// occasionally: an interrupt of an idle session is fail-quiet and appends no public
+// event at all, so it has nothing to be adjacent to and can never resolve, while a
+// busy one produces TurnInterrupted only behind the per-loop audit records the
+// fan-out writes first.
+//
+// The consequence for a Host adapter is therefore general: it must not block on ANY
+// application settling. Closing the gap means either a guaranteed durable effect
+// record per kind or serializing the prefix-and-effect pair against every other
+// append — a decision about the public event vocabulary and the writer's admission,
+// not about framing — so it is left to the Host adapter task with this test standing
+// in front of it.
+func TestAdjacencyIsNotGuaranteedForAnyCommandKind(t *testing.T) {
 	t.Parallel()
-	store, sid, lease, j := runtimeCommandStore(t)
-	commandID := coresessionwire.CommandID("v1:no-effect-event")
-	runtimeID := uuid.UUID{0x8a, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
-	if _, _, err := store.durable.AdmitCommand(context.Background(), durablestore.AdmitCommandRequest{
-		TenantID:                 harnessTenantID,
-		SessionID:                harnessSessionID(sid),
-		CommandID:                commandID,
-		ProposedRuntimeCommandID: durablestore.RuntimeCommandID(runtimeID.String()),
-		Kind:                     durablestore.CommandKind(runtimecommand.KindInterrupt),
-		AcceptedAt:               time.Now().UTC(),
-		ApplyDeadline:            time.Now().UTC().Add(time.Hour),
-	}); err != nil {
-		t.Fatalf("AdmitCommand: %v", err)
+	kinds := []runtimecommand.Kind{runtimecommand.KindInput, runtimecommand.KindInterrupt}
+	if len(kinds) < 2 {
+		t.Fatalf("the table proves kind-independence and needs both kinds, got %d", len(kinds))
 	}
-	log, err := store.OpenRuntimeCommandLog(sid, j)
-	if err != nil {
-		t.Fatalf("OpenRuntimeCommandLog: %v", err)
-	}
-	res, err := log.AppendCommandApplication(context.Background(), runtimecommand.Application{
-		CommandID:        runtimecommand.CommandID(commandID),
-		RuntimeCommandID: runtimeID,
-		LeaseEpoch:       lease.Epoch(),
-		Kind:             runtimecommand.KindInterrupt,
-	})
-	if err != nil {
-		t.Fatalf("AppendCommandApplication: %v", err)
-	}
-	// A runtime-control record in the adjacent slot: an audit intent record is exactly
-	// this shape, which is what the interrupt fan-out writes before it delivers.
-	if _, err := j.Append(context.Background(), journal.NewCommandRecord(sid, uuid.UUID{}, command.Interrupt{
-		Header: command.Header{CommandID: uuid.UUID{0xC1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}},
-	})); err != nil {
-		t.Fatalf("Append(non-event): %v", err)
-	}
+	for _, kind := range kinds {
+		t.Run(string(kind), func(t *testing.T) {
+			t.Parallel()
+			store, sid, lease, j := runtimeCommandStore(t)
+			commandID := coresessionwire.CommandID("v1:no-adjacent-event-" + kind)
+			runtimeID := uuid.UUID{0x8a, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+			if _, _, err := store.durable.AdmitCommand(context.Background(), durablestore.AdmitCommandRequest{
+				TenantID:                 harnessTenantID,
+				SessionID:                harnessSessionID(sid),
+				CommandID:                commandID,
+				ProposedRuntimeCommandID: durablestore.RuntimeCommandID(runtimeID.String()),
+				Kind:                     durablestore.CommandKind(kind),
+				AcceptedAt:               time.Now().UTC(),
+				ApplyDeadline:            time.Now().UTC().Add(time.Hour),
+			}); err != nil {
+				t.Fatalf("AdmitCommand: %v", err)
+			}
+			log, err := store.OpenRuntimeCommandLog(sid, j)
+			if err != nil {
+				t.Fatalf("OpenRuntimeCommandLog: %v", err)
+			}
+			res, err := log.AppendCommandApplication(context.Background(), runtimecommand.Application{
+				CommandID:        runtimecommand.CommandID(commandID),
+				RuntimeCommandID: runtimeID,
+				LeaseEpoch:       lease.Epoch(),
+				Kind:             kind,
+			})
+			if err != nil {
+				t.Fatalf("AppendCommandApplication: %v", err)
+			}
+			// One interposed runtime-control record, identical for both rows. This is
+			// the exact shape of an audit intent record — what a concurrent legacy
+			// Submit writes, and what the interrupt fan-out writes before it delivers.
+			if _, err := j.Append(context.Background(), journal.NewCommandRecord(sid, uuid.UUID{}, command.Interrupt{
+				Header: command.Header{CommandID: uuid.UUID{0xC1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}},
+			})); err != nil {
+				t.Fatalf("Append(interposed): %v", err)
+			}
 
-	got, err := store.durable.FindCommandApplication(context.Background(), durablestore.FindCommandApplicationRequest{
-		TenantID: harnessTenantID, SessionID: harnessSessionID(sid), CommandID: commandID,
-	})
-	if err != nil {
-		t.Fatalf("FindCommandApplication: %v", err)
-	}
-	if got.Outcome != durablestore.CommandApplicationUnresolved {
-		t.Fatalf("released reader resolved %q, want %q", got.Outcome, durablestore.CommandApplicationUnresolved)
-	}
-	// The safe side of the gap, and the reason this is liveness rather than
-	// correctness: an unresolved command is never settled `rejected` over its effect.
-	if got.Outcome == durablestore.CommandApplicationAbsent {
-		t.Fatalf("released reader reports ABSENT; the reconciler would settle rejected")
-	}
-	if got.PrefixSeq != res.Sequence {
-		t.Errorf("located the prefix at %d, want %d", got.PrefixSeq, res.Sequence)
+			got, err := store.durable.FindCommandApplication(context.Background(), durablestore.FindCommandApplicationRequest{
+				TenantID: harnessTenantID, SessionID: harnessSessionID(sid), CommandID: commandID,
+			})
+			if err != nil {
+				t.Fatalf("FindCommandApplication: %v", err)
+			}
+			if got.Outcome != durablestore.CommandApplicationUnresolved {
+				t.Fatalf("released reader resolved %q, want %q", got.Outcome, durablestore.CommandApplicationUnresolved)
+			}
+			// The safe side of the gap, and the reason this is liveness rather than
+			// correctness: an unresolved command is never settled `rejected` over its
+			// effect.
+			if got.Outcome == durablestore.CommandApplicationAbsent {
+				t.Fatalf("released reader reports ABSENT; the reconciler would settle rejected")
+			}
+			if got.PrefixSeq != res.Sequence {
+				t.Errorf("located the prefix at %d, want %d", got.PrefixSeq, res.Sequence)
+			}
+		})
 	}
 }

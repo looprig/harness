@@ -1154,6 +1154,14 @@ func TestSuppliedZeroCommandIDIsRefusedWithoutClaimingAGenerationFailure(t *test
 // which proves that this order resolves `committed` when read by the released module.
 // This one proves Harness produces the order; that one proves the order is the one
 // the counterparty wants.
+//
+// What neither proves is that the order is GUARANTEED, and this test must not be read
+// as claiming it. It holds here because this session has one loop and nothing else is
+// writing. A concurrent legacy Submit's audit record, another loop's event, or a
+// checkpoint in the adjacent slot would leave this same input application unresolved;
+// pkg/sessionstore's TestAdjacencyIsNotGuaranteedForAnyCommandKind measures that for
+// both kinds. What is asserted here is the part Harness controls: that the applier
+// itself does not put a record of its own between the prefix and the effect.
 func TestApplicationPrefixIsTheLastRecordBeforeItsEffect(t *testing.T) {
 	t.Parallel()
 	store := sessionstoreOverMemstore(t)
