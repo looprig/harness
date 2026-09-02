@@ -4,10 +4,18 @@
 // Two identities meet here and must never be confused for one another.
 //
 // The public CommandID is Host's retry-stable identity. It is an OPAQUE bounded
-// UTF-8 string: Harness validates that it is well formed and bounded, and does
-// nothing else with it. It is never parsed as a UUID, never truncated, and never
-// substituted for the runtime id — a public id that happens to render a valid
+// UTF-8 string: Harness validates exactly what Core's canonical sessionwire/v1
+// CommandID validates — non-empty, at most MaxCommandIDBytes bytes, valid UTF-8 —
+// and does nothing else with it. It is never parsed as a UUID, never truncated, and
+// never substituted for the runtime id; a public id that happens to render a valid
 // UUID is still just a string here.
+//
+// The parity with Core is a CORRECTNESS requirement, not tidiness. The admission
+// authority upstream accepts an id under those three rules; an applier that
+// additionally rejected, say, a leading space or an embedded tab would refuse a
+// command that was already durably admitted, forever. It could only sit pending to
+// its apply deadline and become rejected, with the refusal invisible on the
+// admission side. Do not add a rule here that Core does not have.
 //
 // The RuntimeCommandID is the core/uuid.UUID Harness stamps on command headers and
 // on the events those commands cause. Host allocates it ONCE, when it admits the
@@ -34,7 +42,8 @@ import (
 
 // MaxCommandIDBytes bounds a public CommandID. The id is opaque, so the only thing
 // Harness can assert about it is that it is bounded: an unbounded id would enter a
-// durable idempotency key and a journal record body.
+// durable idempotency key and a journal record body. It is Core's MaxIDBytes; the
+// two must not drift.
 const MaxCommandIDBytes = 256
 
 // CommandID is the public, retry-stable command identity Host owns. It is opaque
@@ -42,31 +51,28 @@ const MaxCommandIDBytes = 256
 type CommandID string
 
 // Validate reports whether id is a well-formed opaque public identity: non-empty,
-// at most MaxCommandIDBytes bytes, valid UTF-8, free of C0/C1 control characters
-// and DEL, and free of leading or trailing ASCII space. Everything else — format,
-// meaning, structure — belongs to Host.
+// at most MaxCommandIDBytes bytes, and valid UTF-8. That is the WHOLE rule, and it
+// is deliberately Core's rule byte for byte — see the package doc for why an extra
+// rule here strands an already-admitted command. Everything else about the id —
+// format, meaning, structure, whitespace, control characters — belongs to Host.
+//
+// Nothing downstream needs a stricter id. The durable idempotency key namespaces the
+// public id rather than filtering it (journal.CommandApplicationRecord), the record
+// body is JSON-encoded, and no path derives a storage name or subject from it.
 func (id CommandID) Validate() error {
-	if id == "" {
+	switch {
+	case id == "":
 		return &ValidationError{Field: "CommandID", Reason: "empty"}
-	}
-	if len(id) > MaxCommandIDBytes {
+	case len(id) > MaxCommandIDBytes:
 		return &ValidationError{
 			Field:  "CommandID",
 			Reason: "longer than " + strconv.Itoa(MaxCommandIDBytes) + " bytes",
 		}
-	}
-	if !utf8.ValidString(string(id)) {
+	case !utf8.ValidString(string(id)):
 		return &ValidationError{Field: "CommandID", Reason: "not valid UTF-8"}
+	default:
+		return nil
 	}
-	if id[0] == ' ' || id[len(id)-1] == ' ' {
-		return &ValidationError{Field: "CommandID", Reason: "leading or trailing space"}
-	}
-	for _, r := range string(id) {
-		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
-			return &ValidationError{Field: "CommandID", Reason: "contains a control character"}
-		}
-	}
-	return nil
 }
 
 // Kind is the bounded set of admitted commands Harness can apply through this
@@ -180,6 +186,9 @@ type Disposition struct {
 	// already applied.
 	Duplicate bool
 	// Interrupted reports, for KindInterrupt, whether a running turn was cancelled.
+	// It is the TRANSIENT outcome of an application, not part of the durable prefix,
+	// so a duplicate delivery always reports false: the prefix records the
+	// correlation, never the outcome. Read it only alongside Duplicate.
 	Interrupted bool
 }
 
@@ -192,6 +201,12 @@ type Applier interface {
 	// ApplyRuntimeCommand durably records the application prefix and then applies
 	// the command, returning the disposition. A duplicate delivery returns the
 	// original disposition and applies nothing.
+	//
+	// A non-nil error does not license a retry. The prefix is written BEFORE the
+	// effect, so an error raised by the effect leaves a durable prefix behind and
+	// every later delivery deduplicates against it. Re-deliver and read
+	// Disposition.Duplicate to learn what happened; do not assume an error means
+	// nothing was recorded.
 	ApplyRuntimeCommand(context.Context, Admitted) (Disposition, error)
 }
 

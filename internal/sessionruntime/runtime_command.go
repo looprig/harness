@@ -80,6 +80,16 @@ func (s *Session) RuntimeCommands() (runtimecommand.Applier, bool) {
 //
 // Harness allocates no identity here. The dispatched command carries the admitted
 // RuntimeCommandID verbatim, and the opaque public id is never parsed as a UUID.
+//
+// A NON-NIL ERROR DOES NOT MEAN THE COMMAND MAY BE RE-OFFERED. If the prefix commits
+// and the effect then fails — an exited loop, a cancelled context — the caller gets
+// the effect's error while the prefix stays durable, so every later delivery is a
+// duplicate that applies nothing. That residual is inherent to writing the
+// correlation before the effect, and it is the safe direction: the alternative is
+// applying the command twice. A caller must distinguish a refusal that wrote nothing
+// (validation, stale epoch, mapping conflict, a failed prefix append) from one that
+// did, and the way to tell is to re-deliver and read Disposition.Duplicate rather
+// than to assume. See TestEffectFailureAfterTheDurablePrefixStrandsTheCommand.
 func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecommand.Admitted) (runtimecommand.Disposition, error) {
 	log, lease := s.runtimeCommands, s.runtimeCommandLease
 	if log == nil || lease == nil {

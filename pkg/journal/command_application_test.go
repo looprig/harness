@@ -92,7 +92,8 @@ func TestCommandApplicationCodecFailsClosed(t *testing.T) {
 		"zero runtime id":    `{"command_id":"c","runtime_command_id":"00000000-0000-0000-0000-000000000000","lease_epoch":1}`,
 		"zero epoch":         `{"command_id":"c","runtime_command_id":"` + applicationUUID(1).String() + `","lease_epoch":0}`,
 		"bad runtime id":     `{"command_id":"c","runtime_command_id":"not-a-uuid","lease_epoch":1}`,
-		"control in id":      "{\"command_id\":\"a\\u0000b\",\"runtime_command_id\":\"" + applicationUUID(1).String() + "\",\"lease_epoch\":1}",
+		"command id too long": `{"command_id":"` + strings.Repeat("x", runtimecommand.MaxCommandIDBytes+1) +
+			`","runtime_command_id":"` + applicationUUID(1).String() + `","lease_epoch":1}`,
 	}
 	if len(bodies) < 9 {
 		t.Fatalf("guard consumes too few bodies: %d", len(bodies))
@@ -109,6 +110,32 @@ func TestCommandApplicationCodecFailsClosed(t *testing.T) {
 		}
 		if rec.Application() != (runtimecommand.Application{}) {
 			t.Errorf("Unmarshal(%s) returned a non-zero record alongside its error", name)
+		}
+	}
+}
+
+// TestCodecCarriesAnOpaquePublicIDVerbatim proves the codec is as permissive as the
+// admission authority: an id carrying a control character and surrounding space —
+// which Core accepts and Harness must therefore apply — round-trips byte for byte
+// rather than being refused at the durable boundary.
+func TestCodecCarriesAnOpaquePublicIDVerbatim(t *testing.T) {
+	t.Parallel()
+	opaque := []runtimecommand.CommandID{" leading", "trailing ", "a\x00b", "a\tb", "a\x7fb"}
+	for _, id := range opaque {
+		app := validApplication()
+		app.CommandID = id
+		body, err := journal.MarshalCommandApplicationRecord(journal.NewCommandApplicationRecord(app))
+		if err != nil {
+			t.Errorf("Marshal(%q) = %v, want nil: Core admits this id", id, err)
+			continue
+		}
+		back, err := journal.UnmarshalCommandApplicationRecord(body)
+		if err != nil {
+			t.Errorf("Unmarshal(%q) = %v, want nil", id, err)
+			continue
+		}
+		if back.Application().CommandID != id {
+			t.Errorf("round trip = %q, want %q verbatim", back.Application().CommandID, id)
 		}
 	}
 }

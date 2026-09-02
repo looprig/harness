@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -14,54 +15,89 @@ func testUUID(b byte) uuid.UUID {
 	return uuid.UUID{b, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
 }
 
-// TestCommandIDValidateAcceptsOpaqueIdentities pins the contract that a public
-// CommandID is an OPAQUE bounded UTF-8 string. The rows deliberately include ids
-// that are not UUIDs at all; a validator that parsed them as UUIDs would reject
-// every row but the last.
-func TestCommandIDValidateAcceptsOpaqueIdentities(t *testing.T) {
-	accepted := []runtimecommand.CommandID{
+// TestCommandIDValidityIsExactlyCoreRule is the ORACLE for the opacity rule. The
+// rule is restated here in primitives — non-empty, at most MaxCommandIDBytes bytes,
+// valid UTF-8 — and checked against Validate over a corpus, so a rule ADDED to
+// Validate is caught without anyone remembering to add a row for it. A table of
+// accepted/rejected literals generalises no further than its rows and would have
+// happily accommodated an extra whitespace or control-character rule.
+func TestCommandIDValidityIsExactlyCoreRule(t *testing.T) {
+	t.Parallel()
+	corpus := []runtimecommand.CommandID{
 		"v1:AAECAwQFBgcICQoLDA0ODw",
 		"command-1",
 		"tenant/session/17",
 		"héllo-cømmand",
 		"0",
-		runtimecommand.CommandID(strings.Repeat("x", runtimecommand.MaxCommandIDBytes)),
 		"6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+		// The shapes an over-strict applier would strand. Every one of these is a
+		// value the admission authority accepts, so every one must apply.
+		" x",
+		"x ",
+		"   ",
+		"a\tb",
+		"a\nb",
+		"a\x00b",
+		"a\x7fb",
+		"a\u0085b",
+		"\u200bzero-width",
+		// Boundaries.
+		runtimecommand.CommandID(strings.Repeat("x", runtimecommand.MaxCommandIDBytes)),
+		runtimecommand.CommandID(strings.Repeat("x", runtimecommand.MaxCommandIDBytes+1)),
+		// A multi-byte id whose RUNE count is under the limit but whose BYTE count is
+		// over it: the bound is on encoded bytes, so this must be rejected.
+		runtimecommand.CommandID(strings.Repeat("é", runtimecommand.MaxCommandIDBytes/2+1)),
+		"",
+		runtimecommand.CommandID([]byte{0x66, 0xff, 0x66}),
+		runtimecommand.CommandID([]byte{0xff}),
 	}
-	if len(accepted) < 7 {
-		t.Fatalf("guard consumes too few identities: %d", len(accepted))
+	if len(corpus) < 20 {
+		t.Fatalf("oracle consumes too few identities: %d", len(corpus))
 	}
-	for _, id := range accepted {
-		if err := id.Validate(); err != nil {
-			t.Errorf("Validate(%q) = %v, want nil", id, err)
-		}
-	}
-}
-
-// TestCommandIDValidateRejectsUnboundedOrIllFormed proves the bound and the
-// well-formedness rules fail closed.
-func TestCommandIDValidateRejectsUnboundedOrIllFormed(t *testing.T) {
-	rejected := map[string]runtimecommand.CommandID{
-		"empty":          "",
-		"too long":       runtimecommand.CommandID(strings.Repeat("x", runtimecommand.MaxCommandIDBytes+1)),
-		"invalid utf8":   runtimecommand.CommandID([]byte{0x66, 0xff, 0x66}),
-		"c0 control":     "a\x00b",
-		"newline":        "a\nb",
-		"del":            "a\x7fb",
-		"leading spaces": " a",
-	}
-	if len(rejected) < 7 {
-		t.Fatalf("guard consumes too few identities: %d", len(rejected))
-	}
-	for name, id := range rejected {
+	accepted, rejected := 0, 0
+	for _, id := range corpus {
+		want := id != "" && len(id) <= runtimecommand.MaxCommandIDBytes && utf8.ValidString(string(id))
 		err := id.Validate()
+		if want {
+			accepted++
+			if err != nil {
+				t.Errorf("Validate(%q) = %v, want nil: Harness must not be stricter than the admission authority", id, err)
+			}
+			continue
+		}
+		rejected++
 		if err == nil {
-			t.Errorf("Validate(%s) = nil, want error", name)
+			t.Errorf("Validate(%q) = nil, want a refusal", id)
 			continue
 		}
 		var verr *runtimecommand.ValidationError
 		if !errors.As(err, &verr) {
-			t.Errorf("Validate(%s) error = %T, want *runtimecommand.ValidationError", name, err)
+			t.Errorf("Validate(%q) error = %T, want *runtimecommand.ValidationError", id, err)
+		}
+	}
+	// Both arms of the oracle must have been exercised, or the walk proves nothing.
+	if accepted < 14 || rejected < 5 {
+		t.Fatalf("oracle exercised %d accepted / %d rejected, want both arms populated", accepted, rejected)
+	}
+}
+
+// TestCommandIDMatchesCoreValidationRules is the named regression guard for the
+// defect the oracle above generalises: Harness once rejected control characters and
+// leading/trailing ASCII space. Core's sessionwire/v1 CommandID does not, so every
+// one of these is an id Factory can durably admit — and an applier that refuses it
+// leaves the command unapplicable until its apply deadline turns it into a rejection
+// no one can explain from the admission side.
+func TestCommandIDMatchesCoreValidationRules(t *testing.T) {
+	t.Parallel()
+	admissibleButOnceRefused := []runtimecommand.CommandID{
+		" x", "x ", " x ", "a\tb", "a\nb", "a\rb", "a\x00b", "a\x1fb", "a\x7fb", "a\u009fb",
+	}
+	if len(admissibleButOnceRefused) < 10 {
+		t.Fatalf("guard consumes too few identities: %d", len(admissibleButOnceRefused))
+	}
+	for _, id := range admissibleButOnceRefused {
+		if err := id.Validate(); err != nil {
+			t.Errorf("Validate(%q) = %v; Core accepts this id, so Harness must apply it", id, err)
 		}
 	}
 }

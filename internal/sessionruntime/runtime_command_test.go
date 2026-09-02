@@ -10,6 +10,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/runtimecommand"
 	"github.com/looprig/harness/pkg/sessionstore"
@@ -729,5 +730,225 @@ func TestRuntimeCommandsSurviveCreateAndRestore(t *testing.T) {
 	}
 	if second.RuntimeCommandID != runtimeID {
 		t.Errorf("redelivered RuntimeCommandID = %v, want %v", second.RuntimeCommandID, runtimeID)
+	}
+}
+
+// TestOpaquePublicIDsTheAdmissionAuthorityAcceptsAreApplicable is the end-to-end
+// consequence of the opacity rule. Each id here is one Core's sessionwire/v1
+// CommandID accepts, so Factory can durably admit it — and an applier that refused
+// it would leave the command unapplicable until its apply deadline. Each must apply
+// on first delivery and DEDUPLICATE on the second, which is the part that proves the
+// id survived into the durable idempotency key intact rather than being mangled.
+func TestOpaquePublicIDsTheAdmissionAuthorityAcceptsAreApplicable(t *testing.T) {
+	t.Parallel()
+	ids := []runtimecommand.CommandID{
+		" leading-space",
+		"trailing-space ",
+		"embedded\ttab",
+		"embedded\nnewline",
+		"embedded\x00nul",
+		"embedded\x7fdel",
+		"zero\u200bwidth",
+	}
+	if len(ids) < 7 {
+		t.Fatalf("guard consumes too few identities: %d", len(ids))
+	}
+	f := newRuntimeCommandFixture(t)
+	seen := map[uint64]runtimecommand.CommandID{}
+	for _, id := range ids {
+		runtimeID := mustUUID()
+		adm := f.admittedInput(id, runtimeID, "hello")
+		first, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
+		if err != nil {
+			t.Errorf("ApplyRuntimeCommand(%q) = %v; Core admits this id, so Harness must apply it", id, err)
+			continue
+		}
+		if first.Duplicate {
+			t.Errorf("ApplyRuntimeCommand(%q) reported a duplicate on FIRST delivery", id)
+		}
+		if prior, collided := seen[first.PrefixSequence]; collided {
+			t.Errorf("%q and %q share prefix sequence %d", id, prior, first.PrefixSequence)
+		}
+		seen[first.PrefixSequence] = id
+		if got := f.drainOne(t).CommandHeader().CommandID; got != runtimeID {
+			t.Errorf("ApplyRuntimeCommand(%q) dispatched CommandID = %v, want %v", id, got, runtimeID)
+		}
+		second, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
+		if err != nil {
+			t.Errorf("duplicate ApplyRuntimeCommand(%q): %v", id, err)
+			continue
+		}
+		if !second.Duplicate || second.PrefixSequence != first.PrefixSequence {
+			t.Errorf("duplicate of %q = %+v, want the original prefix %d", id, second, first.PrefixSequence)
+		}
+		f.requireNoCommand(t, "duplicate of an opaque id")
+	}
+	if len(seen) != len(ids) {
+		t.Fatalf("only %d of %d identities reached a durable prefix", len(seen), len(ids))
+	}
+}
+
+// TestEffectFailureAfterTheDurablePrefixStrandsTheCommand DOCUMENTS the residual of
+// persist-before-effect, in the direction the rest of the suite does not cover.
+//
+// TestApplyRefusesWhenThePrefixCannotBePersisted covers "append failed, so no
+// effect". This is the reverse: the prefix COMMITS and the effect then fails. The
+// caller sees the effect's error, but the prefix is durable, so every redelivery is
+// a duplicate that applies nothing — the command is silently lost to Harness, and
+// only Host's apply deadline will notice.
+//
+// This is inherent to writing the correlation before the effect and is consistent
+// with §10.4 (recovery "marks applied" from the correlation; it does not replay the
+// outcome). It is asserted here rather than left implicit so a Host adapter author
+// meets it in a test instead of in production: a non-nil error from
+// ApplyRuntimeCommand does NOT mean the command may be re-offered.
+func TestEffectFailureAfterTheDurablePrefixStrandsTheCommand(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	adm := f.admittedInput("v1:effect-fails", mustUUID(), "hello")
+	// The loop is gone, so the dispatch fails AFTER the prefix has been appended.
+	// The sink must be UNBUFFERED and unread: with a buffered sink the dispatch's
+	// select has two ready cases and Go picks between them at random, which is a
+	// flake, not a test. An unbuffered sink with no reader leaves exactly one ready
+	// case — the closed Done — so the failure is deterministic.
+	unread := make(chan command.Command)
+	f.cmds = unread
+	close(f.done)
+	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: unread, Done: f.done}
+
+	_, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
+	var sessionErr *SessionError
+	if !errors.As(err, &sessionErr) || sessionErr.Kind != SessionLoopExited {
+		t.Fatalf("ApplyRuntimeCommand err = %v, want *SessionError{SessionLoopExited}", err)
+	}
+	f.requireNoCommand(t, "the loop had already exited")
+
+	// The prefix is durable regardless, and that is the documented consequence.
+	disp, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
+	if err != nil {
+		t.Fatalf("redelivery after a failed effect: %v", err)
+	}
+	if !disp.Duplicate {
+		t.Fatalf("redelivery after a failed effect = %+v, want Duplicate=true", disp)
+	}
+	app, err := f.store.ReadCommandApplicationAt(context.Background(), f.sid, disp.PrefixSequence)
+	if err != nil {
+		t.Fatalf("ReadCommandApplicationAt: %v", err)
+	}
+	if app.CommandID != adm.CommandID || app.RuntimeCommandID != adm.RuntimeCommandID {
+		t.Errorf("durable prefix = %+v, want the admitted correlation", app)
+	}
+}
+
+// TestRuntimeCommandsSurvivesCompositionRootDecorators is the composition-root guard
+// for the runtime-command capability, and the counterpart to
+// TestCommittedPublicEventsSurvivesCompositionRootDecorators.
+//
+// The capability is discovered by type-asserting the composition root's journal to
+// IdempotentJournal, and the root wraps that journal in DECORATORS — the offload-GC
+// admission gate, then the operation-hook observer. Both lifecycle.go and
+// restore_constructor.go SWALLOW OpenRuntimeCommandLog's error, so a decorator that
+// exposed only Append would leave the capability silently unadvertised: no error
+// anywhere, and RuntimeCommands() simply answers (nil, false). That is fail-closed —
+// Host learns it before acknowledging anything — but it is a deployment that cannot
+// apply a single command, and nothing would say why.
+//
+// The control row is the point of the table: every row builds the same session over
+// the same store, and the ONLY variable is which decorators are armed. A row that
+// fails while the control passes names the decorator that ate the capability.
+func TestRuntimeCommandsSurvivesCompositionRootDecorators(t *testing.T) {
+	t.Parallel()
+	policy := OffloadGCPolicy{Interval: time.Minute, Timeout: 10 * time.Second}
+	journalHooks, err := hook.Compile(hook.Set{Around: []hook.Around{{
+		Operation: hook.OperationJournalAppend,
+		Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+			return ctx, func(hook.Result) {}
+		},
+	}}})
+	if err != nil {
+		t.Fatalf("hook.Compile: %v", err)
+	}
+	tests := []struct {
+		name    string
+		options []LifecycleOption
+	}{
+		{name: "control: no decorators"},
+		{name: "offload GC armed", options: []LifecycleOption{WithLifecycleOffloadGC(policy)}},
+		{name: "journal hooks armed", options: []LifecycleOption{WithLifecycleHooks(journalHooks)}},
+		{
+			name: "offload GC and journal hooks armed",
+			options: []LifecycleOption{
+				WithLifecycleOffloadGC(policy),
+				WithLifecycleHooks(journalHooks),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store := newRestoreStore(t)
+			r, err := newTestLifecycle(cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}), store, tt.options...)
+			if err != nil {
+				t.Fatalf("NewTopologyLifecycle: %v", err)
+			}
+			s, err := r.NewSession(context.Background(), "")
+			if err != nil {
+				t.Fatalf("NewSession: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+			assertRuntimeCommandCapability(t, s, runtimecommand.CommandID("v1:new-"+tt.name))
+		})
+		t.Run(tt.name+" (restored)", func(t *testing.T) {
+			t.Parallel()
+			store := newRestoreStore(t)
+			sid := runAndShutdown(t, store, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"))
+			rr, err := newTestLifecycle(restoreCfg(&stubLLM{}, "model-x", "be helpful"), store, tt.options...)
+			if err != nil {
+				t.Fatalf("NewTopologyLifecycle (restore): %v", err)
+			}
+			s, err := rr.RestoreSession(context.Background(), sid)
+			if err != nil {
+				t.Fatalf("RestoreSession: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+			assertRuntimeCommandCapability(t, s, runtimecommand.CommandID("v1:restored-"+tt.name))
+		})
+	}
+}
+
+// assertRuntimeCommandCapability is the shared body of the composition-root rows: the
+// session must advertise the capability AND actually apply a command through whatever
+// decorators the root wrapped its journal in, then deduplicate a redelivery.
+// Discovery alone would pass on a decorator that satisfies the interface and then
+// fails to delegate, so the application and the redelivery are part of the assertion,
+// not garnish.
+func assertRuntimeCommandCapability(t *testing.T, s *Session, commandID runtimecommand.CommandID) {
+	t.Helper()
+	applier, ok := runtimecommand.Provider(s).RuntimeCommands()
+	if !ok || applier == nil {
+		t.Fatalf("RuntimeCommands() = (%v, %t), want an applier and true:"+
+			" a composition-root decorator dropped the runtime-command contract", applier, ok)
+	}
+	adm := runtimecommand.Admitted{
+		CommandID:        commandID,
+		RuntimeCommandID: mustUUID(),
+		Kind:             runtimecommand.KindInput,
+		LeaseEpoch:       s.runtimeCommandLease.Epoch(),
+		Blocks:           []content.Block{&content.TextBlock{Text: "hello"}},
+	}
+	first, err := applier.ApplyRuntimeCommand(context.Background(), adm)
+	if err != nil {
+		t.Fatalf("ApplyRuntimeCommand through the decorated journal: %v", err)
+	}
+	if first.Duplicate || first.PrefixSequence == 0 {
+		t.Fatalf("first application = %+v, want a fresh durable prefix", first)
+	}
+	second, err := applier.ApplyRuntimeCommand(context.Background(), adm)
+	if err != nil {
+		t.Fatalf("duplicate ApplyRuntimeCommand through the decorated journal: %v", err)
+	}
+	if !second.Duplicate || second.PrefixSequence != first.PrefixSequence {
+		t.Fatalf("duplicate through the decorated journal = %+v, want the original prefix %d:"+
+			" the decorator did not delegate the idempotent append", second, first.PrefixSequence)
 	}
 }
