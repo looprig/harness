@@ -1,6 +1,7 @@
 package journal
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"reflect"
@@ -413,3 +414,71 @@ func canceledContext() context.Context {
 }
 
 var _ SessionJournal = (*hookedRecordingJournal)(nil)
+
+// TestWithHooksPreservesOptionalJournalExtensions proves observation does not
+// AMPUTATE capability. A journal-append hook wraps the journal in a decorator, and a
+// decorator that exposes only Append silently demotes an idempotent, committed-bytes
+// journal to a plain one: the hub then re-broadcasts deduplicated retries (it can no
+// longer see Appended=false) and the segregated committed-public-event capability
+// disappears for every deployment that configures a journal hook. Both extensions
+// must survive the wrapping, and the hook must still observe the append.
+func TestWithHooksPreservesOptionalJournalExtensions(t *testing.T) {
+	t.Parallel()
+	sessionID := fixedUUID(0xe1)
+	record := NewEventRecord(event.SessionStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sessionID},
+		EventID:     fixedUUID(0xe2),
+	}})
+
+	var observed int
+	runner, err := hook.Compile(hook.Set{Around: []hook.Around{{
+		Operation: hook.OperationJournalAppend,
+		Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+			return ctx, func(hook.Result) { observed++ }
+		},
+	}}})
+	if err != nil {
+		t.Fatalf("hook.Compile: %v", err)
+	}
+
+	t.Run("idempotent", func(t *testing.T) {
+		wrapped := WithHooks(newIdempotentRecordingJournal(), runner, sessionID)
+		idem, ok := wrapped.(IdempotentJournal)
+		if !ok {
+			t.Fatalf("hooked journal %T does not implement IdempotentJournal", wrapped)
+		}
+		if _, err := idem.AppendIdempotent(context.Background(), record); err != nil {
+			t.Fatalf("AppendIdempotent() error = %v", err)
+		}
+		retry, err := idem.AppendIdempotent(context.Background(), record)
+		if err != nil {
+			t.Fatalf("retry AppendIdempotent() error = %v", err)
+		}
+		if retry.Appended {
+			t.Error("retry Appended = true through the hooked journal, want false")
+		}
+	})
+
+	t.Run("committed", func(t *testing.T) {
+		observed = 0
+		delegate := newCommittedRecordingJournal()
+		wrapped := WithHooks(delegate, runner, sessionID)
+		committed, ok := wrapped.(CommittedPublicJournal)
+		if !ok {
+			t.Fatalf("hooked journal %T does not implement CommittedPublicJournal", wrapped)
+		}
+		result, err := committed.AppendCommitted(context.Background(), record)
+		if err != nil {
+			t.Fatalf("AppendCommitted() error = %v", err)
+		}
+		if !result.Appended || !bytes.Equal(result.Public.Body, delegate.stored[result.Sequence]) {
+			t.Fatalf("AppendCommitted() = %+v, want the stored body %s", result, delegate.stored[result.Sequence])
+		}
+		if observed != 1 {
+			t.Errorf("hook observed %d appends through AppendCommitted, want 1", observed)
+		}
+		if !NewJournalEventAppender(wrapped).SupportsCommittedPublicBodies() {
+			t.Error("an appender over the hooked journal does not advertise committed public bodies")
+		}
+	})
+}

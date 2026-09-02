@@ -15,6 +15,47 @@ func (*NilJournalError) Error() string {
 	return "journal: JournalEventAppender requires a non-nil SessionJournal"
 }
 
+// CommittedPublicBody is what a durable journal stored, for one record, on the
+// PUBLIC side of its envelope: the canonical public event id it committed the record
+// under and the exact canonical body bytes it wrote. Both are zero for a private
+// record, for a non-event record, and for a deduplicated retry (which stored
+// nothing). Body is owned by the returned value; the journal must not retain a
+// reference it later mutates.
+type CommittedPublicBody struct {
+	EventID string
+	Body    []byte
+}
+
+// CommittedAppendResult is AppendResult widened with the committed public bytes. It
+// embeds AppendResult so every existing Sequence/Appended reading applies unchanged.
+type CommittedAppendResult struct {
+	AppendResult
+	Public CommittedPublicBody
+}
+
+// CommittedPublicJournal is the OPTIONAL extension a SessionJournal implementation
+// may satisfy to report the EXACT canonical public bytes it stored for a record. It
+// embeds IdempotentJournal, so a committed-bytes implementation is usable anywhere a
+// plain or idempotent SessionJournal is expected and the existing seams are never
+// weakened.
+//
+// The reason the bytes are reported rather than re-derived is that a second
+// projection is a second answer. A consumer joining a durable tail to a live stream
+// dedupes on (sequence, event id) and compares bodies; if the live body were
+// re-projected it could differ from the stored one — in key order, in a field a later
+// projector version adds — and the consumer would render two different things for one
+// event without any error anywhere. Only the journal that wrote the bytes can say
+// what they are.
+type CommittedPublicJournal interface {
+	IdempotentJournal
+	// AppendCommitted behaves exactly like AppendIdempotent — same fencing, same
+	// dedup, same errors — and additionally reports the public event id and the
+	// exact canonical public body it stored for a newly appended PUBLIC event
+	// record. A deduplicated retry reports Appended=false with a zero Public: this
+	// call stored nothing, so it has no stored bytes of its own to report.
+	AppendCommitted(ctx context.Context, rec JournalRecord) (CommittedAppendResult, error)
+}
+
 // catalogUpdater is the narrow seam the appender notifies AFTER a successful durable
 // append so the derived session catalog can index the event (best-effort). It is a
 // single-method interface (Interface Segregation): the appender depends on
@@ -121,28 +162,91 @@ func (a *JournalEventAppender) AppendEvent(ctx context.Context, ev event.Event) 
 // trusted publication path. Appended is true only when this call created a new
 // durable frame; an identical idempotent retry returns the original sequence and
 // Appended=false. The legacy AppendEvent method above deliberately discards only
-// this boolean so existing callers retain their API and error behavior.
+// this boolean so existing callers retain their API and error behavior; this method
+// in turn discards only the committed public fields AppendEventCommitted adds.
 func (a *JournalEventAppender) AppendEventResult(ctx context.Context, ev event.Event) (uint64, bool, error) {
+	commit, err := a.AppendEventCommitted(ctx, ev)
+	return commit.Sequence, commit.Appended, err
+}
+
+// SupportsCommittedPublicBodies reports whether this appender can report the EXACT
+// canonical public bytes a public enduring append stored. It is true only when the
+// underlying SessionJournal implements the optional CommittedPublicJournal seam.
+//
+// It exists because the capability is a property of the injected JOURNAL, not of the
+// appender type: one *JournalEventAppender always has AppendEventCommitted in its
+// method set, so a type assertion alone cannot tell a committed-bytes appender from
+// a legacy one. A consumer that requires committed bytes (the Host runtime adapter,
+// via the hub's segregated committed-public-event capability) must consult this
+// predicate; a false result means the capability is NOT advertised, not that it
+// failed.
+func (a *JournalEventAppender) SupportsCommittedPublicBodies() bool {
+	_, ok := a.journal.(CommittedPublicJournal)
+	return ok
+}
+
+// AppendEventCommitted is the committed-result event append seam. It is the single
+// core behind AppendEvent and AppendEventResult, which discard the fields they do not
+// need, so all three share one dedup/catalog decision.
+//
+// Over a CommittedPublicJournal it returns the winning sequence, whether THIS call
+// committed a new frame, and — for a newly committed PUBLIC ENDURING event — the
+// committed public EventID, the exact stored canonical body, and CoveredThrough equal
+// to that same sequence. Over any other SessionJournal it returns sequence and
+// appended state exactly as before and leaves the three committed-public fields zero:
+// bytes that were never reported back must never be invented here, because the whole
+// point of carrying them is that they are the stored ones.
+//
+// A deduplicated retry (Appended=false) returns the ORIGINAL sequence and NO body and
+// NO coverage. This call committed nothing, so it may not advertise a watermark its
+// own append did not earn; the original append already delivered its body live, and
+// the durable bytes stay durable at that sequence. (Whether a later public READ can
+// serve them back is a separate question with a size-dependent answer — see the
+// caveat on event.Delivery.PublicBody.)
+func (a *JournalEventAppender) AppendEventCommitted(ctx context.Context, ev event.Event) (event.AppendCommit, error) {
 	rec := NewEventRecord(ev)
+	if committed, ok := a.journal.(CommittedPublicJournal); ok {
+		result, err := committed.AppendCommitted(ctx, rec)
+		if err != nil {
+			return event.AppendCommit{}, err
+		}
+		if !result.Appended {
+			return event.AppendCommit{Sequence: result.Sequence}, nil
+		}
+		_ = a.catalog.UpdateOnEvent(ctx, ev, result.Sequence)
+		commit := event.AppendCommit{Sequence: result.Sequence, Appended: true}
+		// The public fields ride only a PUBLIC ENDURING event that the journal
+		// actually stored a canonical body for. The class/visibility check is made
+		// here, at the seam that publishes the bytes, rather than trusted from the
+		// backend: an ephemeral public projection carries no public EventID by
+		// contract, and a private record carries no public body at all.
+		if ev.Class() == event.Enduring && ev.Visibility() == event.Public &&
+			result.Public.EventID != "" && len(result.Public.Body) > 0 {
+			commit.EventID = result.Public.EventID
+			commit.PublicBody = result.Public.Body
+			commit.CoveredThrough = result.Sequence
+		}
+		return commit, nil
+	}
 	if idem, ok := a.journal.(IdempotentJournal); ok {
 		result, err := idem.AppendIdempotent(ctx, rec)
 		if err != nil {
-			return 0, false, err
+			return event.AppendCommit{}, err
 		}
 		if !result.Appended {
-			return result.Sequence, false, nil
+			return event.AppendCommit{Sequence: result.Sequence}, nil
 		}
 		_ = a.catalog.UpdateOnEvent(ctx, ev, result.Sequence)
-		return result.Sequence, true, nil
+		return event.AppendCommit{Sequence: result.Sequence, Appended: true}, nil
 	}
 	seq, err := a.journal.Append(ctx, rec)
 	if err != nil {
-		return 0, false, err
+		return event.AppendCommit{}, err
 	}
 	// Best-effort, post-success: UpdateOnEvent never returns a non-nil error by
 	// contract, so the catalog can never fail the append. The return is ignored.
 	_ = a.catalog.UpdateOnEvent(ctx, ev, seq)
-	return seq, true, nil
+	return event.AppendCommit{Sequence: seq, Appended: true}, nil
 }
 
 // JournalCommandAppender adapts a SessionJournal to the narrow "append one command"

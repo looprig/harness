@@ -13,21 +13,30 @@ import (
 const defaultEgressBuffer = 256
 
 // SubscriptionLossError is the typed terminal recorded on a subscription the hub
-// fails because an Enduring event would have overflowed its egress buffer. The
-// subscriber learns it lost the stream (so it can re-subscribe and re-sync)
-// rather than silently missing an authoritative event. DroppedClass is the class
-// of the event that triggered the loss; Cause is an optional underlying error.
+// fails rather than let it silently miss an authoritative event. DroppedClass is the
+// class of the event that triggered the loss; Cause names the reason when it is not
+// the default one.
+//
+// There are two reasons, and they call for OPPOSITE responses, which is why Cause
+// exists rather than one undifferentiated loss. A nil Cause is egress overflow: the
+// subscriber fell behind, and re-subscribing to re-sync is the right answer. A Cause
+// of ErrCommittedBodyMissing is a broken invariant of the committed-public-event
+// stream, where re-subscribing loops forever against a hub that cannot satisfy the
+// contract.
 type SubscriptionLossError struct {
 	DroppedClass event.Class
 	Cause        error
 }
 
 func (e *SubscriptionLossError) Error() string {
-	msg := "hub: subscription lost (egress overflow on enduring event)"
+	// Only the causeless form may name egress overflow: that is the loss the hub
+	// raises on its own, with nothing further to say. A loss WITH a cause has a
+	// different reason (see ErrCommittedBodyMissing), and repeating "egress
+	// overflow" in front of it would state a cause the hub knows to be wrong.
 	if e.Cause == nil {
-		return msg
+		return "hub: subscription lost (egress overflow on enduring event)"
 	}
-	return msg + ": " + e.Cause.Error()
+	return "hub: subscription lost: " + e.Cause.Error()
 }
 
 func (e *SubscriptionLossError) Unwrap() error { return e.Cause }
@@ -51,6 +60,17 @@ type EventSubscription struct {
 	// filter is the subscriber's declared interest, evaluated by the hub at
 	// fan-out before the bounded send.
 	filter event.EventFilter
+
+	// committedOnly marks a subscription obtained through the segregated
+	// committed-public-event capability. Such a subscription carries a stronger
+	// contract than the compatibility stream: EVERY delivery on it carries the
+	// committed canonical public body of a public enduring event. The hub honors
+	// that by skipping ephemeral events (reconstructable, never persisted, so they
+	// are not a coverage gap) and by FAILING the subscription rather than passing
+	// an enduring event with no committed bytes — a silent skip there would leave
+	// the consumer an invisible hole in the sequence coverage it is about to
+	// persist as a cursor.
+	committedOnly bool
 
 	// events is the single bounded egress channel. The hub is the sole sender
 	// (non-blocking, via trySend); the subscriber is the sole receiver. It carries
@@ -84,6 +104,16 @@ func newSubscription(filter event.EventFilter, onClose func(*EventSubscription))
 		events:  make(chan event.Delivery, defaultEgressBuffer),
 		onClose: onClose,
 	}
+}
+
+// newCommittedSubscription builds a subscription for the segregated
+// committed-public-event capability. It differs from newSubscription only in the
+// committedOnly flag; the egress channel, filter, and teardown are identical, so a
+// Host consumer and a TUI consumer are the same kind of subscriber to the hub.
+func newCommittedSubscription(filter event.EventFilter, onClose func(*EventSubscription)) *EventSubscription {
+	sub := newSubscription(filter, onClose)
+	sub.committedOnly = true
+	return sub
 }
 
 // Events is the receive end of the subscription's egress channel. It is closed on

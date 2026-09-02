@@ -1,10 +1,15 @@
 package hub
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 )
@@ -180,5 +185,422 @@ func TestPublishDeduplicatedAppendUncheckedNeverFaults(t *testing.T) {
 
 	if faults := rep.reported(); len(faults) != 0 {
 		t.Errorf("reported %d faults for a deduplicated retry, want 0", len(faults))
+	}
+}
+
+// committedAppender is a controllable eventAppenderCommitted double. It mints a
+// distinct "stored canonical body" per public enduring append and hands the SAME
+// backing array back each time it is asked, exactly as a real journal reporting the
+// bytes it wrote would — which is what makes the per-subscriber clone testable: if
+// the hub forwarded this slice directly, two subscribers would share one array.
+type committedAppender struct {
+	mu        sync.Mutex
+	supported bool
+	appended  []event.Event
+	stored    map[uint64][]byte
+	dedupe    map[int]bool // 1-based call index -> report Appended=false
+	suppress  map[int]bool // 1-based call index -> commit with no public body
+	calls     int
+	err       error
+}
+
+func newCommittedAppender() *committedAppender {
+	return &committedAppender{supported: true, stored: make(map[uint64][]byte)}
+}
+
+func (a *committedAppender) SupportsCommittedPublicBodies() bool { return a.supported }
+
+func (a *committedAppender) AppendEvent(ctx context.Context, ev event.Event) (uint64, error) {
+	commit, err := a.AppendEventCommitted(ctx, ev)
+	return commit.Sequence, err
+}
+
+func (a *committedAppender) AppendEventResult(ctx context.Context, ev event.Event) (uint64, bool, error) {
+	commit, err := a.AppendEventCommitted(ctx, ev)
+	return commit.Sequence, commit.Appended, err
+}
+
+func (a *committedAppender) AppendEventCommitted(_ context.Context, ev event.Event) (event.AppendCommit, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.calls++
+	if a.err != nil {
+		return event.AppendCommit{}, a.err
+	}
+	a.appended = append(a.appended, ev)
+	seq := uint64(a.calls)
+	if a.dedupe[a.calls] {
+		return event.AppendCommit{Sequence: seq}, nil
+	}
+	commit := event.AppendCommit{Sequence: seq, Appended: true}
+	if !a.supported || a.suppress[a.calls] || ev.Class() != event.Enduring || ev.Visibility() != event.Public {
+		return commit, nil
+	}
+	body := []byte(`{"stored":` + strconv.FormatUint(seq, 10) + `}`)
+	a.stored[seq] = body
+	commit.EventID = "public-" + strconv.FormatUint(seq, 10)
+	commit.PublicBody = body
+	commit.CoveredThrough = seq
+	return commit, nil
+}
+
+func (a *committedAppender) storedBody(seq uint64) []byte {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.stored[seq]
+}
+
+// sessionEvent builds a well-formed session-scoped enduring event for hub publishes.
+func sessionEvent(t *testing.T, sid uuid.UUID) event.SessionStarted {
+	t.Helper()
+	return event.SessionStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid},
+		EventID:     mustID(t),
+	}}
+}
+
+// TestCommittedPublicEventsCapabilityRequiresCommittedAppender proves the segregated
+// capability is advertised through the SUBSCRIBE call site — not merely by a type
+// assertion one level away — and only when the injected appender can actually report
+// stored canonical bytes. A no-persistence hub, a legacy result-only appender, and a
+// committed-shaped appender whose journal cannot report bytes all refuse, while
+// SubscribeEvents keeps working for every one of them.
+func TestCommittedPublicEventsCapabilityRequiresCommittedAppender(t *testing.T) {
+	t.Parallel()
+	unsupported := newCommittedAppender()
+	unsupported.supported = false
+	tests := []struct {
+		name string
+		opts []Option
+		want bool
+	}{
+		{name: "no persistence", want: false},
+		{name: "legacy result appender", opts: []Option{WithAppender(&resultAppender{})}, want: false},
+		{name: "committed shape without bytes", opts: []Option{WithAppender(unsupported)}, want: false},
+		{name: "committed appender", opts: []Option{WithAppender(newCommittedAppender())}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := New(mustID(t), tt.opts...)
+			if got := h.CommittedPublicEventsSupported(); got != tt.want {
+				t.Errorf("CommittedPublicEventsSupported() = %t, want %t", got, tt.want)
+			}
+			sub, err := h.SubscribeCommittedPublicEvents(allFilter())
+			if tt.want {
+				if err != nil {
+					t.Fatalf("SubscribeCommittedPublicEvents() error = %v, want nil", err)
+				}
+				_ = sub.Close()
+			} else {
+				var unavailable *CommittedPublicEventsUnavailableError
+				if !errors.As(err, &unavailable) {
+					t.Fatalf("SubscribeCommittedPublicEvents() error = %T %v, want *CommittedPublicEventsUnavailableError", err, err)
+				}
+				if sub != nil {
+					t.Errorf("SubscribeCommittedPublicEvents() subscription = %v, want nil", sub)
+				}
+			}
+			// The compatibility surface is unconditional either way.
+			compat, err := h.SubscribeEvents(allFilter())
+			if err != nil {
+				t.Fatalf("SubscribeEvents() error = %v", err)
+			}
+			_ = compat.Close()
+		})
+	}
+}
+
+// TestCommittedDeliveryCarriesStoredBodyAndCoverage proves the committed append
+// result rides onto BOTH the compatibility stream and the segregated committed
+// stream: same event, same journal sequence, the exact stored bytes, and a
+// CoveredThrough equal to — never past — this append's own sequence.
+func TestCommittedDeliveryCarriesStoredBodyAndCoverage(t *testing.T) {
+	t.Parallel()
+	sid := mustID(t)
+	app := newCommittedAppender()
+	h := New(sid, WithAppender(app))
+	compat, err := h.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeEvents() error = %v", err)
+	}
+	committed, err := h.SubscribeCommittedPublicEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeCommittedPublicEvents() error = %v", err)
+	}
+
+	ev := sessionEvent(t, sid)
+	if err := h.PublishEvent(context.Background(), ev); err != nil {
+		t.Fatalf("PublishEvent() error = %v", err)
+	}
+
+	for name, sub := range map[string]*EventSubscription{"compat": compat, "committed": committed} {
+		d := recvDelivery(t, sub)
+		if d.JournalSeq != 1 {
+			t.Errorf("%s JournalSeq = %d, want 1", name, d.JournalSeq)
+		}
+		if d.EventID != "public-1" {
+			t.Errorf("%s EventID = %q, want %q", name, d.EventID, "public-1")
+		}
+		if !bytes.Equal(d.PublicBody, app.storedBody(1)) {
+			t.Errorf("%s PublicBody = %s, want the stored body %s", name, d.PublicBody, app.storedBody(1))
+		}
+		if d.CoveredThrough != d.JournalSeq {
+			t.Errorf("%s CoveredThrough = %d, want %d (its own committed sequence)", name, d.CoveredThrough, d.JournalSeq)
+		}
+		if !d.Committed() {
+			t.Errorf("%s Committed() = false, want true", name)
+		}
+	}
+}
+
+// TestFanOutClonesPublicBodyPerSubscriber proves each subscriber receives its OWN
+// backing array: one consumer mutating its delivery in place cannot corrupt a peer's
+// bytes, nor the bytes the journal stored. A single-subscriber test cannot see this.
+func TestFanOutClonesPublicBodyPerSubscriber(t *testing.T) {
+	t.Parallel()
+	sid := mustID(t)
+	app := newCommittedAppender()
+	h := New(sid, WithAppender(app))
+	first, err := h.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeEvents(first) error = %v", err)
+	}
+	second, err := h.SubscribeCommittedPublicEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeCommittedPublicEvents(second) error = %v", err)
+	}
+
+	if err := h.PublishEvent(context.Background(), sessionEvent(t, sid)); err != nil {
+		t.Fatalf("PublishEvent() error = %v", err)
+	}
+	want := bytes.Clone(app.storedBody(1))
+
+	firstDelivery := recvDelivery(t, first)
+	secondDelivery := recvDelivery(t, second)
+	if len(firstDelivery.PublicBody) == 0 {
+		t.Fatalf("first delivery carried no public body")
+	}
+	for i := range firstDelivery.PublicBody {
+		firstDelivery.PublicBody[i] = 'X'
+	}
+	if !bytes.Equal(secondDelivery.PublicBody, want) {
+		t.Errorf("peer PublicBody = %s after an in-place edit by another subscriber, want %s", secondDelivery.PublicBody, want)
+	}
+	if !bytes.Equal(app.storedBody(1), want) {
+		t.Errorf("stored body = %s after a subscriber's in-place edit, want %s", app.storedBody(1), want)
+	}
+}
+
+// TestEphemeralDeliveryCarriesNoCommittedFields proves an ephemeral event is never
+// persisted and therefore never claims an id, bytes, or coverage on the compatibility
+// stream, and never appears at all on the segregated committed stream — whose whole
+// contract is that every delivery carries committed canonical bytes.
+func TestEphemeralDeliveryCarriesNoCommittedFields(t *testing.T) {
+	t.Parallel()
+	sid := mustID(t)
+	app := newCommittedAppender()
+	h := New(sid, WithAppender(app))
+	compat, err := h.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeEvents() error = %v", err)
+	}
+	committed, err := h.SubscribeCommittedPublicEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeCommittedPublicEvents() error = %v", err)
+	}
+
+	ephemeral := event.TokenDelta{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid, LoopID: mustID(t), TurnID: mustID(t)},
+		EventID:     mustID(t),
+	}}
+	if err := h.PublishEvent(context.Background(), ephemeral); err != nil {
+		t.Fatalf("PublishEvent(ephemeral) error = %v", err)
+	}
+	enduring := sessionEvent(t, sid)
+	if err := h.PublishEvent(context.Background(), enduring); err != nil {
+		t.Fatalf("PublishEvent(enduring) error = %v", err)
+	}
+
+	d := recvDelivery(t, compat)
+	if _, ok := d.Event.(event.TokenDelta); !ok {
+		t.Fatalf("compat first delivery = %T, want event.TokenDelta", d.Event)
+	}
+	if d.JournalSeq != 0 || d.EventID != "" || d.PublicBody != nil || d.CoveredThrough != 0 {
+		t.Errorf("ephemeral delivery = %+v, want zero journal sequence, id, body, and coverage", d)
+	}
+	if d.Committed() {
+		t.Error("ephemeral Committed() = true, want false")
+	}
+
+	// The committed stream skips the ephemeral entirely and starts at the enduring
+	// event; a skipped ephemeral is not a gap, because it is reconstructable from the
+	// authoritative event that follows it.
+	committedDelivery := recvDelivery(t, committed)
+	if _, ok := committedDelivery.Event.(event.SessionStarted); !ok {
+		t.Fatalf("committed first delivery = %T, want event.SessionStarted", committedDelivery.Event)
+	}
+	if !committedDelivery.Committed() {
+		t.Errorf("committed delivery Committed() = false, want true")
+	}
+}
+
+// TestDerivedSessionEventCarriesCommittedBody proves the derived SessionActive edge
+// — which the hub synthesizes and appends itself, with no triggering publish of its
+// own — rides its OWN committed append result, not the triggering event's.
+func TestDerivedSessionEventCarriesCommittedBody(t *testing.T) {
+	t.Parallel()
+	sid := mustID(t)
+	app := newCommittedAppender()
+	h := New(sid, WithAppender(app))
+	committed, err := h.SubscribeCommittedPublicEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeCommittedPublicEvents() error = %v", err)
+	}
+
+	start := event.TurnStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid, LoopID: mustID(t), TurnID: mustID(t)},
+		EventID:     mustID(t),
+		Cause:       identity.Cause{CommandID: mustID(t)},
+	}}
+	if err := h.PublishEvent(context.Background(), start); err != nil {
+		t.Fatalf("PublishEvent() error = %v", err)
+	}
+
+	first := recvDelivery(t, committed)
+	if _, ok := first.Event.(event.TurnStarted); !ok {
+		t.Fatalf("first committed delivery = %T, want event.TurnStarted", first.Event)
+	}
+	derived := recvDelivery(t, committed)
+	if _, ok := derived.Event.(event.SessionActive); !ok {
+		t.Fatalf("second committed delivery = %T, want event.SessionActive", derived.Event)
+	}
+	if derived.JournalSeq != 2 || derived.EventID != "public-2" {
+		t.Errorf("derived delivery seq/id = %d/%q, want 2/%q", derived.JournalSeq, derived.EventID, "public-2")
+	}
+	if !bytes.Equal(derived.PublicBody, app.storedBody(2)) {
+		t.Errorf("derived PublicBody = %s, want the stored body %s", derived.PublicBody, app.storedBody(2))
+	}
+	if derived.CoveredThrough != derived.JournalSeq {
+		t.Errorf("derived CoveredThrough = %d, want %d", derived.CoveredThrough, derived.JournalSeq)
+	}
+	if bytes.Equal(derived.PublicBody, first.PublicBody) {
+		t.Errorf("derived body equals the triggering event's body %s; each append must carry its own", first.PublicBody)
+	}
+}
+
+// TestDeduplicatedAppendDeliversNothingOnEitherStream proves a deduplicated retry
+// neither re-broadcasts nor claims coverage: the original append already delivered it.
+func TestDeduplicatedAppendDeliversNothingOnEitherStream(t *testing.T) {
+	t.Parallel()
+	sid := mustID(t)
+	app := newCommittedAppender()
+	app.dedupe = map[int]bool{2: true}
+	h := New(sid, WithAppender(app))
+	compat, err := h.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeEvents() error = %v", err)
+	}
+	committed, err := h.SubscribeCommittedPublicEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeCommittedPublicEvents() error = %v", err)
+	}
+
+	ev := sessionEvent(t, sid)
+	if err := h.PublishEvent(context.Background(), ev); err != nil {
+		t.Fatalf("first PublishEvent() error = %v", err)
+	}
+	if err := h.PublishEvent(context.Background(), ev); err != nil {
+		t.Fatalf("retry PublishEvent() error = %v", err)
+	}
+	for name, sub := range map[string]*EventSubscription{"compat": compat, "committed": committed} {
+		_ = recvDelivery(t, sub)
+		if got := len(sub.Events()); got != 0 {
+			t.Errorf("%s buffered %d deliveries after a deduplicated retry, want 0", name, got)
+		}
+	}
+}
+
+// TestCommittedSubscriptionFailsClosedWithoutStoredBytes proves the committed stream
+// never silently skips an enduring public event. If a committed-capable hub somehow
+// delivers one without stored bytes, that subscription is failed with the typed loss
+// error — the same fail-loud treatment an enduring overflow gets — rather than the
+// consumer being left with an invisible hole in its sequence coverage.
+func TestCommittedSubscriptionFailsClosedWithoutStoredBytes(t *testing.T) {
+	t.Parallel()
+	sid := mustID(t)
+	app := newCommittedAppender()
+	app.suppress = map[int]bool{1: true}
+	h := New(sid, WithAppender(app))
+	committed, err := h.SubscribeCommittedPublicEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeCommittedPublicEvents() error = %v", err)
+	}
+	if err := h.PublishEvent(context.Background(), sessionEvent(t, sid)); err != nil {
+		t.Fatalf("PublishEvent() error = %v", err)
+	}
+	// PublishEvent is synchronous on this goroutine, so the subscription's terminal
+	// state is already decided when it returns — no waiting, and no timeout standing
+	// in for an assertion.
+	var loss *SubscriptionLossError
+	if !errors.As(committed.Err(), &loss) {
+		t.Fatalf("committed Err() = %T %v, want *SubscriptionLossError", committed.Err(), committed.Err())
+	}
+	// The cause must distinguish this from congestion: a consumer that read it as
+	// backpressure would resubscribe forever against a hub that cannot satisfy the
+	// committed-bytes contract.
+	if !errors.Is(committed.Err(), ErrCommittedBodyMissing) {
+		t.Errorf("loss cause = %v, want ErrCommittedBodyMissing", committed.Err())
+	}
+	// The TEXT matters too, and nothing else pins it. errors.Is is what a program
+	// branches on, but the message is what an operator reads, and this loss is not an
+	// overflow: saying so would send them hunting a slow consumer that does not
+	// exist. A future tidy-up that re-merges the two branches of
+	// SubscriptionLossError.Error() must fail here rather than at a release.
+	message := committed.Err().Error()
+	if strings.Contains(message, "egress overflow") {
+		t.Errorf("loss message = %q, must not blame egress overflow for a missing committed body", message)
+	}
+	if got := strings.Count(message, "hub: "); got != 1 {
+		t.Errorf("loss message = %q has %d %q prefixes, want exactly 1", message, got, "hub: ")
+	}
+	select {
+	case _, open := <-committed.Events():
+		if open {
+			t.Fatal("committed stream delivered an enduring event without stored bytes")
+		}
+	default:
+		t.Fatal("committed egress channel is still open after the loss")
+	}
+}
+
+// TestCommittedSubscriptionFailsOnEnduringOverflow proves the committed stream keeps
+// the class-aware overflow policy: a full egress buffer fails the subscription on an
+// enduring event rather than dropping committed bytes silently.
+func TestCommittedSubscriptionFailsOnEnduringOverflow(t *testing.T) {
+	t.Parallel()
+	sid := mustID(t)
+	app := newCommittedAppender()
+	h := New(sid, WithAppender(app))
+	committed, err := h.SubscribeCommittedPublicEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeCommittedPublicEvents() error = %v", err)
+	}
+	for range defaultEgressBuffer + 1 {
+		if err := h.PublishEvent(context.Background(), sessionEvent(t, sid)); err != nil {
+			t.Fatalf("PublishEvent() error = %v", err)
+		}
+	}
+	var loss *SubscriptionLossError
+	if !errors.As(committed.Err(), &loss) {
+		t.Fatalf("committed Err() = %T %v, want *SubscriptionLossError", committed.Err(), committed.Err())
+	}
+	if loss.DroppedClass != event.Enduring {
+		t.Errorf("DroppedClass = %v, want Enduring", loss.DroppedClass)
+	}
+	// An overflow loss is congestion, not a broken invariant, and must NOT claim the
+	// missing-body cause.
+	if errors.Is(committed.Err(), ErrCommittedBodyMissing) {
+		t.Errorf("overflow loss reported ErrCommittedBodyMissing: %v", committed.Err())
 	}
 }

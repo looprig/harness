@@ -20,6 +20,7 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
+	sessionapi "github.com/looprig/harness/pkg/session"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 	model "github.com/looprig/inference/model"
@@ -736,6 +737,15 @@ type eventSubscriber interface {
 	SubscribeEvents(event.EventFilter) (event.Subscription, error)
 }
 
+// Compile-time proof that *Session offers the segregated committed-public-event
+// capability and its source. Discovery (CommittedPublicEvents) is unconditional in the
+// method set and conditional in its answer: the capability is a property of the
+// injected persistence, not of the type.
+var (
+	_ sessionapi.CommittedPublicEventProvider = (*Session)(nil)
+	_ sessionapi.CommittedPublicEventSource   = (*Session)(nil)
+)
+
 // Compile-time proof that *Session is the consumer-facing eventSubscriber.
 // Its publisher half (PublishEvent) is asserted by loopruntime.New accepting s as its
 // eventPublisher at the NewLoop call site.
@@ -1140,6 +1150,37 @@ func (s *Session) recordLoopMechanicalState(ev event.Event) {
 // caller must Close it when done. It delegates to the hub.
 func (s *Session) SubscribeEvents(filter event.EventFilter) (event.Subscription, error) {
 	return s.hub.SubscribeEvents(filter)
+}
+
+// CommittedPublicEvents reports the segregated committed-public-event capability
+// (sessionapi.CommittedPublicEventProvider). It is true only when this session's
+// injected event appender can report the EXACT canonical public bytes a durable
+// append stored; a headless/no-persistence session and one over a journal without
+// that seam both answer (nil, false).
+//
+// The capability is discovered rather than assumed because it is a property of the
+// injected persistence, not of *Session: the same type serves both. Returning the
+// session itself as the source once the hub confirms support keeps the refusal at
+// discovery time, before a consumer has subscribed and started advancing a cursor.
+func (s *Session) CommittedPublicEvents() (sessionapi.CommittedPublicEventSource, bool) {
+	if !s.hub.CommittedPublicEventsSupported() {
+		return nil, false
+	}
+	return s, true
+}
+
+// SubscribeCommittedPublicEvents attaches a consumer to the committed public event
+// stream, on which every delivery carries the canonical body the durable append
+// stored. It delegates to the hub, which refuses with
+// *hub.CommittedPublicEventsUnavailableError if the capability is not supported — so
+// a caller that reached this method without going through CommittedPublicEvents still
+// cannot obtain a stream the persistence cannot back.
+func (s *Session) SubscribeCommittedPublicEvents(filter event.EventFilter) (event.Subscription, error) {
+	sub, err := s.hub.SubscribeCommittedPublicEvents(filter)
+	if err != nil {
+		return nil, err
+	}
+	return sub, nil
 }
 
 func (s *Session) SessionID() uuid.UUID { return s.sessionID }

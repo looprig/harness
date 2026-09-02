@@ -1,8 +1,11 @@
 package sessionruntime
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +15,7 @@ import (
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
+	sessionapi "github.com/looprig/harness/pkg/session"
 )
 
 // allFilter delivers every event from every loop in both classes.
@@ -336,5 +340,113 @@ func TestLoopStartedPublishedOnNewLoop(t *testing.T) {
 	t.Cleanup(func() { _ = late.Close() })
 	if _, ok := firstMatching[event.LoopStarted](t, late); ok {
 		t.Fatal("late subscriber received a replayed LoopStarted, want none (no replay)")
+	}
+}
+
+// committedSessionAppender is an injected event appender that reports the exact
+// canonical body it "stored" for each public enduring event, so a Session built over
+// it can advertise the committed-public-event capability end to end.
+type committedSessionAppender struct {
+	mu     sync.Mutex
+	stored map[uint64][]byte
+	seq    uint64
+}
+
+func newCommittedSessionAppender() *committedSessionAppender {
+	return &committedSessionAppender{stored: make(map[uint64][]byte)}
+}
+
+func (a *committedSessionAppender) SupportsCommittedPublicBodies() bool { return true }
+
+func (a *committedSessionAppender) AppendEvent(ctx context.Context, ev event.Event) (uint64, error) {
+	commit, err := a.AppendEventCommitted(ctx, ev)
+	return commit.Sequence, err
+}
+
+func (a *committedSessionAppender) AppendEventResult(ctx context.Context, ev event.Event) (uint64, bool, error) {
+	commit, err := a.AppendEventCommitted(ctx, ev)
+	return commit.Sequence, commit.Appended, err
+}
+
+func (a *committedSessionAppender) AppendEventCommitted(_ context.Context, ev event.Event) (event.AppendCommit, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.seq++
+	commit := event.AppendCommit{Sequence: a.seq, Appended: true}
+	if ev.Class() != event.Enduring || ev.Visibility() != event.Public {
+		return commit, nil
+	}
+	body := []byte(`{"stored":` + strconv.FormatUint(a.seq, 10) + `}`)
+	a.stored[a.seq] = body
+	commit.EventID = "public-" + strconv.FormatUint(a.seq, 10)
+	commit.PublicBody = body
+	commit.CoveredThrough = a.seq
+	return commit, nil
+}
+
+func (a *committedSessionAppender) storedBody(seq uint64) []byte {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.stored[seq]
+}
+
+// TestSessionCommittedPublicEventsRequiresCommittedAppender asserts the capability
+// THROUGH the session call site, not one level away at the hub. A session over a
+// legacy appender answers "no capability" and still serves SubscribeEvents; a session
+// over a committed appender hands back a source whose deliveries carry the stored
+// bytes, the committed id, and a watermark equal to their own sequence.
+func TestSessionCommittedPublicEventsRequiresCommittedAppender(t *testing.T) {
+	t.Parallel()
+
+	legacy, err := newTestSession(context.Background(), cfg(&stubLLM{}), WithEventAppender(&recordingEventAppender{}))
+	if err != nil {
+		t.Fatalf("New(legacy): %v", err)
+	}
+	t.Cleanup(func() { _ = legacy.Shutdown(context.Background()) })
+	var provider sessionapi.CommittedPublicEventProvider = legacy
+	if source, ok := provider.CommittedPublicEvents(); ok || source != nil {
+		t.Fatalf("legacy session CommittedPublicEvents() = (%v, %t), want (nil, false)", source, ok)
+	}
+	if _, err := legacy.SubscribeEvents(allFilter()); err != nil {
+		t.Fatalf("legacy SubscribeEvents: %v", err)
+	}
+
+	appender := newCommittedSessionAppender()
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{}), WithEventAppender(appender))
+	if err != nil {
+		t.Fatalf("New(committed): %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+	source, ok := sessionapi.CommittedPublicEventProvider(s).CommittedPublicEvents()
+	if !ok || source == nil {
+		t.Fatalf("committed session CommittedPublicEvents() = (%v, %t), want a source and true", source, ok)
+	}
+	sub, err := source.SubscribeCommittedPublicEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeCommittedPublicEvents: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Close() })
+
+	if err := s.PublishEvent(context.Background(), event.SessionStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: s.SessionID()},
+	}}); err != nil {
+		t.Fatalf("PublishEvent: %v", err)
+	}
+	select {
+	case d, open := <-sub.Events():
+		if !open {
+			t.Fatal("committed subscription closed before delivering")
+		}
+		if !d.Committed() {
+			t.Fatalf("committed delivery = %+v, want committed bytes", d)
+		}
+		if !bytes.Equal(d.PublicBody, appender.storedBody(d.JournalSeq)) {
+			t.Errorf("PublicBody = %s, want the stored body %s", d.PublicBody, appender.storedBody(d.JournalSeq))
+		}
+		if d.CoveredThrough != d.JournalSeq {
+			t.Errorf("CoveredThrough = %d, want %d", d.CoveredThrough, d.JournalSeq)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("committed subscription delivered nothing")
 	}
 }

@@ -12,6 +12,7 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"reflect"
@@ -71,9 +72,10 @@ type Hub struct {
 	// The durable-tap trio (Dependency Inversion: all three are interfaces/seams
 	// injected via Option; the bare New installs nop/real-clock defaults so existing
 	// callers and headless mode are unchanged). They are immutable after construction
-	// and read without the lock — appender.AppendEvent is the durable write the hub
-	// runs OUTSIDE mu (no I/O under the lock); factory mints headers for synthesized
-	// session events; reporter is the fail-secure escalation seam.
+	// and read without the lock — the appender is the durable write the hub runs
+	// OUTSIDE mu (no I/O under the lock), through appendCommitted, which uses the
+	// richest seam the injected appender offers; factory mints headers for
+	// synthesized session events; reporter is the fail-secure escalation seam.
 	appender       eventAppender
 	factory        *event.Factory
 	reporter       FaultReporter
@@ -121,6 +123,58 @@ func (h *Hub) SubscribeEvents(filter event.EventFilter) (*EventSubscription, err
 	return sub, nil
 }
 
+// CommittedPublicEventsUnavailableError reports that this hub cannot serve the
+// segregated committed-public-event capability, because its injected appender does
+// not report the exact canonical public bytes a durable append stored. It is a
+// capability REFUSAL, not a runtime failure: a no-persistence hub and a hub over a
+// legacy journal are both permanently incapable, and saying so at subscribe time is
+// what stops a consumer from persisting coverage it was never actually given.
+type CommittedPublicEventsUnavailableError struct{}
+
+func (*CommittedPublicEventsUnavailableError) Error() string {
+	return "hub: committed public event delivery requires an appender that reports stored canonical bodies"
+}
+
+// committedAppender returns the injected appender's committed-bytes seam, and true
+// only when the appender both implements it and reports that its underlying journal
+// can supply the stored bytes.
+func (h *Hub) committedAppender() (eventAppenderCommitted, bool) {
+	appender, ok := h.appender.(eventAppenderCommitted)
+	if !ok || !appender.SupportsCommittedPublicBodies() {
+		return nil, false
+	}
+	return appender, true
+}
+
+// CommittedPublicEventsSupported reports whether SubscribeCommittedPublicEvents will
+// succeed on this hub.
+func (h *Hub) CommittedPublicEventsSupported() bool {
+	_, ok := h.committedAppender()
+	return ok
+}
+
+// SubscribeCommittedPublicEvents registers a subscription on the SEGREGATED
+// committed-public-event stream: every delivery it yields carries the exact canonical
+// public body the durable append stored, its committed public EventID, and a
+// CoveredThrough watermark equal to that append's own sequence.
+//
+// It is a separate call from SubscribeEvents rather than a flag on it because the two
+// contracts differ. SubscribeEvents is the compatibility stream every TUI/CLI
+// consumer already uses: it delivers ephemeral events too, works with no persistence
+// at all, and promises nothing about bytes. This one promises committed bytes on
+// every delivery and therefore cannot be offered by a hub that has none — it refuses
+// with *CommittedPublicEventsUnavailableError instead of degrading silently.
+func (h *Hub) SubscribeCommittedPublicEvents(filter event.EventFilter) (*EventSubscription, error) {
+	if !h.CommittedPublicEventsSupported() {
+		return nil, &CommittedPublicEventsUnavailableError{}
+	}
+	sub := newCommittedSubscription(filter, h.unsubscribe)
+	h.mu.Lock()
+	h.subs[sub] = struct{}{}
+	h.mu.Unlock()
+	return sub, nil
+}
+
 // unsubscribe removes a subscription from the set under the write lock. It is the
 // subscription's onClose callback, fired on the first terminal (Close or fail), so
 // a torn-down subscription does not linger in the fan-out set. Idempotent: a
@@ -138,9 +192,9 @@ func (h *Hub) unsubscribe(sub *EventSubscription) {
 // order. The precise ordering, honoring the lock rule (no I/O under the hub lock):
 //
 //  1. Ephemeral event: never persisted — fan out only (the unchanged path).
-//  2. Enduring event: appender.AppendEvent(ev) OUTSIDE the lock — via
-//     appendEventResult, which also asks an appender that implements the optional
-//     eventAppenderResult extension whether the append durably persisted a NEW frame.
+//  2. Enduring event: appendCommitted(ev) OUTSIDE the lock, which asks the injected
+//     appender both whether the append durably persisted a NEW frame and — when the
+//     appender can report them — for the exact canonical public bytes it stored.
 //     On error → ReportFault, deliver NOTHING, return (do not apply a transition for
 //     an event that did not persist). On a deduplicated retry (Appended=false) →
 //     apply NOTHING and deliver NOTHING; the event was already applied and delivered
@@ -200,11 +254,12 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 		h.activityMu.Lock()
 		defer h.activityMu.Unlock()
 	}
-	// (1)+(2) Ephemeral: no append, seq stays 0. Enduring: append before apply,
-	// fail-secure; capture the durable sequence to ride the live delivery.
-	var seq uint64
+	// (1)+(2) Ephemeral: no append, so the commit stays zero and the delivery carries
+	// no sequence, id, body, or coverage. Enduring: append before apply, fail-secure;
+	// capture the whole durable append result to ride the live delivery.
+	var commit event.AppendCommit
 	if ev.Class() == event.Enduring {
-		s, appended, err := h.appendEventResult(ctx, ev)
+		c, err := h.appendCommitted(ctx, ev)
 		if err != nil {
 			fault := &SessionPersistenceFault{Event: ev, Cause: err}
 			h.reporter.ReportFault(ctx, fault)
@@ -213,7 +268,7 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 			}
 			return false, nil
 		}
-		if !appended {
+		if !c.Appended {
 			// Deduplicated retry: the underlying journal already indexed this event's
 			// idempotency id under a genuinely new, earlier append, which already
 			// applied its state mutation and delivered it live. Report the same success
@@ -221,7 +276,7 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 			// nothing and broadcast nothing a second time.
 			return true, nil
 		}
-		seq = s
+		commit = c
 	}
 	committed := true
 
@@ -235,8 +290,9 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 
 	// (4) Mint + durably append a derived session event before it (or ev) goes live.
 	// On failure neither ev nor D is delivered, and the fault is raised. D carries its
-	// OWN append sequence.
-	var derivedSeq uint64
+	// OWN append result — its own sequence and its own committed public body, never
+	// the triggering event's.
+	var derivedCommit event.AppendCommit
 	if derived != nil {
 		stamped, err := h.factory.Stamp(derived.EventHeader())
 		if err != nil {
@@ -252,19 +308,19 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 		// the workspace permit before this append and finish its accepted snapshot before
 		// WaitIdle acknowledges. The continuation retains hub ownership of append+fanout.
 		if idle, ok := derived.(event.SessionIdle); ok {
-			commit := func() error {
-				ds, appendErr := h.appender.AppendEvent(ctx, idle)
+			commitIdle := func() error {
+				idleCommit, appendErr := h.appendCommitted(ctx, idle)
 				if appendErr != nil {
 					fault := &SessionPersistenceFault{Event: idle, Cause: appendErr}
 					h.reporter.ReportFault(ctx, fault)
 					return fault
 				}
 				h.observeCommit(ev)
-				h.deliver(subs, ev, seq)
-				h.deliver(subs, idle, ds)
+				h.deliver(subs, ev, commit)
+				h.deliver(subs, idle, idleCommit)
 				return nil
 			}
-			err = h.idleBoundary.CommitSessionIdle(ctx, idle, commit)
+			err = h.idleBoundary.CommitSessionIdle(ctx, idle, commitIdle)
 			h.completeIdleBoundary(idleGeneration, err == nil)
 			if err != nil {
 				if checked {
@@ -274,7 +330,7 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 			}
 			return committed, nil
 		}
-		ds, err := h.appender.AppendEvent(ctx, derived)
+		dc, err := h.appendCommitted(ctx, derived)
 		if err != nil {
 			fault := &SessionPersistenceFault{Event: derived, Cause: err}
 			h.reporter.ReportFault(ctx, fault)
@@ -283,15 +339,15 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 			}
 			return committed, nil
 		}
-		derivedSeq = ds
+		derivedCommit = dc
 	}
 
 	// (5) Deliver live in causal order, then wake idle waiters AFTER the durable
 	// append of the SessionIdle edge.
 	h.observeCommit(ev)
-	h.deliver(subs, ev, seq)
+	h.deliver(subs, ev, commit)
 	if derived != nil {
-		h.deliver(subs, derived, derivedSeq)
+		h.deliver(subs, derived, derivedCommit)
 		h.signalIdleIfEdge(derived)
 	}
 	return committed, nil
@@ -353,20 +409,38 @@ func isInternalAuditEventType(ev event.Event) bool {
 	}
 }
 
-// appendEventResult calls the injected appender's optional Appended-reporting
-// extension (eventAppenderResult) when h.appender implements it, and otherwise falls
-// back to the plain AppendEvent surface, treating every successful append as new
-// (appended=true) — the backward-compatible default for every appender written before
-// the extension existed, and for one that simply does not implement it.
-func (h *Hub) appendEventResult(ctx context.Context, ev event.Event) (seq uint64, appended bool, err error) {
+// appendCommitted is the hub's single durable-append call. It uses the richest seam
+// the injected appender offers and degrades additively:
+//
+//   - a committed-bytes appender (eventAppenderCommitted, and reporting that its
+//     journal can supply the stored bytes) returns sequence, appended state, and —
+//     for a newly committed public enduring event — the committed EventID, the exact
+//     stored canonical body, and CoveredThrough;
+//   - an Appended-reporting appender (eventAppenderResult) returns sequence and
+//     appended state with the three committed fields left zero;
+//   - a plain appender returns its sequence, with every successful append treated as
+//     new — exactly its pre-extension behavior.
+//
+// The hub NEVER projects a public body itself. Carrying the stored bytes is the whole
+// point: a second projection is a second answer, and a consumer joining a durable
+// tail to this live stream would then have two different bodies for one event with no
+// error raised anywhere.
+func (h *Hub) appendCommitted(ctx context.Context, ev event.Event) (event.AppendCommit, error) {
+	if committed, ok := h.committedAppender(); ok {
+		return committed.AppendEventCommitted(ctx, ev)
+	}
 	if r, ok := h.appender.(eventAppenderResult); ok {
-		return r.AppendEventResult(ctx, ev)
+		seq, appended, err := r.AppendEventResult(ctx, ev)
+		if err != nil {
+			return event.AppendCommit{}, err
+		}
+		return event.AppendCommit{Sequence: seq, Appended: appended}, nil
 	}
-	seq, err = h.appender.AppendEvent(ctx, ev)
+	seq, err := h.appender.AppendEvent(ctx, ev)
 	if err != nil {
-		return 0, false, err
+		return event.AppendCommit{}, err
 	}
-	return seq, true, nil
+	return event.AppendCommit{Sequence: seq, Appended: true}, nil
 }
 
 func validatePublicPublication(ev event.Event) error {
@@ -524,19 +598,55 @@ func activeMutation(ev event.Event) (func(*sessionState), bool) {
 }
 
 // deliver fans one event out to a snapshot of subscribers, OUTSIDE the lock, wrapping
-// it with its durable journal sequence seq (0 for Ephemeral, the append sequence for
-// Enduring) in an event.Delivery. Per subscriber it applies the declared-interest
-// filter (ShouldDeliver) to the UNWRAPPED event, then a non-blocking send into the
-// bounded egress channel. On overflow the class-aware
+// it with its durable append result in an event.Delivery: the journal sequence (0 for
+// Ephemeral, the append sequence for Enduring) and, when the append committed
+// canonical public bytes, the committed EventID, a per-subscriber CLONE of those
+// bytes, and the CoveredThrough watermark. Per subscriber it applies the
+// declared-interest filter (ShouldDeliver) to the UNWRAPPED event, then a
+// non-blocking send into the bounded egress channel. On overflow the class-aware
 // policy applies: an Ephemeral event is dropped for that subscriber; an Enduring
 // event fails that subscription with a typed loss error (never silently dropped),
 // and delivery continues to other subscribers. It never blocks.
-func (h *Hub) deliver(subs []*EventSubscription, ev event.Event, seq uint64) {
+//
+// A committed-only subscription additionally skips an Ephemeral event and is FAILED
+// on an Enduring one that carries no committed bytes — see the inline notes: its
+// contract is that every delivery carries them.
+func (h *Hub) deliver(subs []*EventSubscription, ev event.Event, commit event.AppendCommit) {
+	carriesBody := commit.PublishesPublicBody()
 	for _, sub := range subs {
 		if !event.ShouldDeliver(sub.filter, ev) {
 			continue
 		}
-		switch sub.trySend(event.Delivery{Event: ev, JournalSeq: seq}) {
+		if sub.committedOnly && !carriesBody {
+			if ev.Class() == event.Ephemeral {
+				// Not a coverage gap: an ephemeral event is never persisted, has no
+				// committed identity, and is reconstructable from the authoritative
+				// event that follows it. The committed stream simply does not carry
+				// it.
+				continue
+			}
+			// An enduring event with no committed bytes on the committed stream is a
+			// broken invariant, not a droppable delivery. Skipping it silently would
+			// leave this consumer a hole in the very coverage it is about to persist
+			// as a cursor, so it is failed with the same typed loss error an
+			// enduring overflow raises — carrying ErrCommittedBodyMissing so the
+			// consumer can tell this apart from backpressure it could retry.
+			sub.fail(&SubscriptionLossError{DroppedClass: ev.Class(), Cause: ErrCommittedBodyMissing})
+			continue
+		}
+		delivery := event.Delivery{
+			Event:          ev,
+			JournalSeq:     commit.Sequence,
+			EventID:        commit.EventID,
+			CoveredThrough: commit.CoveredThrough,
+		}
+		if carriesBody {
+			// Clone per subscriber: the appender hands back ONE backing array for
+			// the bytes it stored, and a consumer that edits its delivery in place
+			// would otherwise corrupt every peer's copy (and the stored bytes).
+			delivery.PublicBody = bytes.Clone(commit.PublicBody)
+		}
+		switch sub.trySend(delivery) {
 		case sendDelivered, sendClosed:
 			// Delivered, or the subscription is already torn down (a Close/fail
 			// racing this snapshot) — skip it either way.
@@ -736,27 +846,27 @@ func (h *Hub) appendAndDeliverDerivedChecked(ctx context.Context, subs []*EventS
 	}
 	derived = withHeader(derived, stamped)
 	if idle, ok := derived.(event.SessionIdle); ok {
-		commit := func() error {
-			seq, appendErr := h.appender.AppendEvent(ctx, idle)
+		commitIdle := func() error {
+			idleCommit, appendErr := h.appendCommitted(ctx, idle)
 			if appendErr != nil {
 				fault := &SessionPersistenceFault{Event: idle, Cause: appendErr}
 				h.reporter.ReportFault(ctx, fault)
 				return fault
 			}
-			h.deliver(subs, idle, seq)
+			h.deliver(subs, idle, idleCommit)
 			return nil
 		}
-		err := h.idleBoundary.CommitSessionIdle(ctx, idle, commit)
+		err := h.idleBoundary.CommitSessionIdle(ctx, idle, commitIdle)
 		h.completeIdleBoundary(idleGeneration, err == nil)
 		return err
 	}
-	seq, err := h.appender.AppendEvent(ctx, derived)
+	commit, err := h.appendCommitted(ctx, derived)
 	if err != nil {
 		fault := &SessionPersistenceFault{Event: derived, Cause: err}
 		h.reporter.ReportFault(ctx, fault)
 		return fault
 	}
-	h.deliver(subs, derived, seq)
+	h.deliver(subs, derived, commit)
 	h.signalIdleIfEdge(derived)
 	return nil
 }
@@ -851,7 +961,7 @@ func (h *Hub) StopSession(ctx context.Context) {
 	}
 	stopped.Coordinates = identity.Coordinates{SessionID: h.sessionID}
 	ev := event.SessionStopped{Header: stopped}
-	seq, err := h.appender.AppendEvent(ctx, ev)
+	commit, err := h.appendCommitted(ctx, ev)
 	if err != nil {
 		h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: ev, Cause: err})
 		return
@@ -873,8 +983,9 @@ func (h *Hub) StopSession(ctx context.Context) {
 	subs := h.snapshotSubsLocked()
 	h.mu.Unlock()
 
-	// (3) Deliver the durable SessionStopped live, carrying its append sequence.
-	h.deliver(subs, ev, seq)
+	// (3) Deliver the durable SessionStopped live, carrying its committed append
+	// result (sequence plus, on a committed-bytes hub, its stored canonical body).
+	h.deliver(subs, ev, commit)
 }
 
 // AbortSession tears down an unpublished/failed construction without appending or

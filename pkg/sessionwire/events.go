@@ -16,6 +16,15 @@ const (
 // classify is the explicit public-projection table. Keep every concrete type in
 // its own arm: grouping arms would make a class change less visible in review,
 // and a default marshal path would turn a newly introduced event public.
+//
+// RECORDED POLICY, not a defect report: TurnFoldedInto and InputCancelled each
+// carry a *content.UserMessage, and a PublicEnduring body is the event's full
+// marshalled form with GateResolved's audit as the ONLY redaction (see
+// projectBody). So raw user message text from those two events reaches the public
+// journal verbatim. That is measured behaviour, stated here because the next person
+// deciding what a public journal may contain should find it written down rather
+// than discover it. Changing it is a decision for whoever owns the projection
+// contract, and it would be a breaking change to the public body shape.
 func classify(value any) EventClass {
 	switch value.(type) {
 	case event.SessionStarted:

@@ -1,9 +1,11 @@
 package journal
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"testing"
 
 	"github.com/looprig/harness/pkg/command"
@@ -475,5 +477,278 @@ func TestJournalEventAppenderNilJournal(t *testing.T) {
 	var nje *NilJournalError
 	if !errors.As(err, &nje) {
 		t.Fatalf("error %v is not *NilJournalError", err)
+	}
+}
+
+// committedRecordingJournal is a SessionJournal double that implements the optional
+// CommittedPublicJournal seam: it stores a per-record "canonical public body" for
+// every PUBLIC event record and reports the exact stored bytes back to the appender.
+// A private record (or a non-event record) stores no public body, exactly like the
+// released sessionstore backend. It also deduplicates by idempotency id so the
+// committed seam's dedup arm can be driven.
+type committedRecordingJournal struct {
+	records []JournalRecord
+	stored  map[uint64][]byte // sequence -> exact stored canonical public body
+	seen    map[string]uint64
+	seq     uint64
+}
+
+func newCommittedRecordingJournal() *committedRecordingJournal {
+	return &committedRecordingJournal{stored: make(map[uint64][]byte), seen: make(map[string]uint64)}
+}
+
+func (j *committedRecordingJournal) Append(ctx context.Context, rec JournalRecord) (uint64, error) {
+	result, err := j.AppendCommitted(ctx, rec)
+	return result.Sequence, err
+}
+
+func (j *committedRecordingJournal) AppendIdempotent(ctx context.Context, rec JournalRecord) (AppendResult, error) {
+	result, err := j.AppendCommitted(ctx, rec)
+	return result.AppendResult, err
+}
+
+func (j *committedRecordingJournal) AppendCommitted(_ context.Context, rec JournalRecord) (CommittedAppendResult, error) {
+	id := rec.IdempotencyID()
+	if seq, ok := j.seen[id]; ok {
+		return CommittedAppendResult{AppendResult: AppendResult{Sequence: seq, Appended: false}}, nil
+	}
+	j.records = append(j.records, rec)
+	j.seq++
+	j.seen[id] = j.seq
+	result := CommittedAppendResult{AppendResult: AppendResult{Sequence: j.seq, Appended: true}}
+	eventRecord, isEvent := rec.(EventRecord)
+	if !isEvent || eventRecord.Event().Visibility() != event.Public {
+		return result, nil
+	}
+	body := []byte(`{"canonical":"` + id + `","seq":` + strconv.FormatUint(j.seq, 10) + `}`)
+	j.stored[j.seq] = body
+	result.Public = CommittedPublicBody{EventID: id, Body: body}
+	return result, nil
+}
+
+var _ CommittedPublicJournal = (*committedRecordingJournal)(nil)
+
+// TestJournalEventAppenderCommittedCarriesStoredPublicBody proves the committed seam
+// hands back the EXACT bytes the journal stored — not a re-derived projection — along
+// with the winning sequence, the appended state, and the committed public EventID.
+func TestJournalEventAppenderCommittedCarriesStoredPublicBody(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0xC1)
+	ev := event.SessionStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid},
+		EventID:     fixedUUID(0xC2),
+	}}
+	j := newCommittedRecordingJournal()
+	app := NewJournalEventAppender(j)
+
+	if !app.SupportsCommittedPublicBodies() {
+		t.Fatalf("SupportsCommittedPublicBodies() = false over a CommittedPublicJournal, want true")
+	}
+	commit, err := app.AppendEventCommitted(context.Background(), ev)
+	if err != nil {
+		t.Fatalf("AppendEventCommitted() error = %v", err)
+	}
+	if commit.Sequence != 1 || !commit.Appended {
+		t.Fatalf("AppendEventCommitted() = seq:%d appended:%t, want 1/true", commit.Sequence, commit.Appended)
+	}
+	if commit.EventID != ev.EventID.String() {
+		t.Errorf("committed EventID = %q, want %q", commit.EventID, ev.EventID.String())
+	}
+	if !bytes.Equal(commit.PublicBody, j.stored[1]) {
+		t.Errorf("committed PublicBody = %s, want the exact stored body %s", commit.PublicBody, j.stored[1])
+	}
+}
+
+// TestJournalEventAppenderCommittedCoveredThroughEqualsCommittedSequence drives the
+// watermark AT the threshold and on both sides. Two PRIVATE records occupy sequences
+// 1 and 2; the public event commits at 3. CoveredThrough must be exactly 3: 2 would
+// leave the private gap permanently unclosed for a public reader, and 4 would claim
+// coverage of an append that has not happened.
+func TestJournalEventAppenderCommittedCoveredThroughEqualsCommittedSequence(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0xC3)
+	j := newCommittedRecordingJournal()
+	app := NewJournalEventAppender(j)
+
+	for i := range 2 {
+		private := event.HustleStarted{Header: event.Header{
+			Coordinates:     identity.Coordinates{SessionID: sid},
+			EventID:         fixedUUID(byte(0xD0 + i)),
+			EventVisibility: event.Internal,
+		}}
+		commit, err := app.AppendEventCommitted(context.Background(), private)
+		if err != nil {
+			t.Fatalf("private AppendEventCommitted() error = %v", err)
+		}
+		if commit.CoveredThrough != 0 || commit.PublicBody != nil || commit.EventID != "" {
+			t.Fatalf("private commit = %+v, want no public coverage, body, or id", commit)
+		}
+	}
+
+	public := event.SessionStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid},
+		EventID:     fixedUUID(0xD9),
+	}}
+	commit, err := app.AppendEventCommitted(context.Background(), public)
+	if err != nil {
+		t.Fatalf("public AppendEventCommitted() error = %v", err)
+	}
+	if commit.Sequence != 3 {
+		t.Fatalf("public commit sequence = %d, want 3", commit.Sequence)
+	}
+	switch {
+	case commit.CoveredThrough < commit.Sequence:
+		t.Fatalf("CoveredThrough = %d, want %d: a lower watermark leaves the private gap at 1-2 permanently unclosed",
+			commit.CoveredThrough, commit.Sequence)
+	case commit.CoveredThrough > commit.Sequence:
+		t.Fatalf("CoveredThrough = %d, want %d: a watermark past this append claims coverage of records that do not exist",
+			commit.CoveredThrough, commit.Sequence)
+	}
+}
+
+// TestJournalEventAppenderCommittedDeduplicatedRetryCarriesNoBody proves a
+// deduplicated retry reports the ORIGINAL sequence with Appended=false and claims NO
+// coverage and NO body: this call committed nothing, so it may not advertise a
+// watermark its own append did not earn.
+func TestJournalEventAppenderCommittedDeduplicatedRetryCarriesNoBody(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0xC5)
+	ev := event.SessionStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid},
+		EventID:     fixedUUID(0xC6),
+	}}
+	j := newCommittedRecordingJournal()
+	cat := &recordingCatalog{}
+	app := NewJournalEventAppender(j, WithCatalog(cat))
+
+	first, err := app.AppendEventCommitted(context.Background(), ev)
+	if err != nil {
+		t.Fatalf("first AppendEventCommitted() error = %v", err)
+	}
+	retry, err := app.AppendEventCommitted(context.Background(), ev)
+	if err != nil {
+		t.Fatalf("retry AppendEventCommitted() error = %v", err)
+	}
+	if retry.Sequence != first.Sequence {
+		t.Errorf("retry sequence = %d, want the original %d", retry.Sequence, first.Sequence)
+	}
+	if retry.Appended {
+		t.Errorf("retry Appended = true, want false")
+	}
+	if retry.PublicBody != nil || retry.CoveredThrough != 0 {
+		t.Errorf("retry commit = %+v, want no body and no coverage claim", retry)
+	}
+	if len(j.records) != 1 {
+		t.Errorf("journal recorded %d records, want 1", len(j.records))
+	}
+	if len(cat.events) != 1 {
+		t.Errorf("catalog notified %d times, want 1", len(cat.events))
+	}
+}
+
+// TestLegacyJournalAppenderDoesNotAdvertiseCommittedPublicBodies proves an appender
+// over a journal WITHOUT the committed seam stays fully usable — same sequence, same
+// dedup outcome — but never claims the committed-public-event capability and never
+// invents bytes or a watermark it cannot source from the durable append.
+func TestLegacyJournalAppenderDoesNotAdvertiseCommittedPublicBodies(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0xC7)
+	ev := event.SessionStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid},
+		EventID:     fixedUUID(0xC8),
+	}}
+	for _, tt := range []struct {
+		name    string
+		journal SessionJournal
+	}{
+		{name: "plain", journal: &recordingJournal{}},
+		{name: "idempotent", journal: newIdempotentRecordingJournal()},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			app := NewJournalEventAppender(tt.journal)
+			if app.SupportsCommittedPublicBodies() {
+				t.Fatalf("SupportsCommittedPublicBodies() = true over a legacy journal, want false")
+			}
+			commit, err := app.AppendEventCommitted(context.Background(), ev)
+			if err != nil {
+				t.Fatalf("AppendEventCommitted() error = %v", err)
+			}
+			if commit.Sequence != 1 || !commit.Appended {
+				t.Fatalf("commit = seq:%d appended:%t, want 1/true", commit.Sequence, commit.Appended)
+			}
+			if commit.EventID != "" || commit.PublicBody != nil || commit.CoveredThrough != 0 {
+				t.Fatalf("legacy commit = %+v, want no committed public fields", commit)
+			}
+		})
+	}
+}
+
+// misreportingJournal is a backend that reports a public body for EVERY record,
+// including a private one and an ephemeral one. It is the shape a backend bug (or a
+// future backend written against a looser reading of the seam) would take.
+type misreportingJournal struct{ seq uint64 }
+
+func (j *misreportingJournal) Append(ctx context.Context, rec JournalRecord) (uint64, error) {
+	result, err := j.AppendCommitted(ctx, rec)
+	return result.Sequence, err
+}
+
+func (j *misreportingJournal) AppendIdempotent(ctx context.Context, rec JournalRecord) (AppendResult, error) {
+	result, err := j.AppendCommitted(ctx, rec)
+	return result.AppendResult, err
+}
+
+func (j *misreportingJournal) AppendCommitted(_ context.Context, rec JournalRecord) (CommittedAppendResult, error) {
+	j.seq++
+	return CommittedAppendResult{
+		AppendResult: AppendResult{Sequence: j.seq, Appended: true},
+		Public:       CommittedPublicBody{EventID: rec.IdempotencyID(), Body: []byte(`{"leaked":true}`)},
+	}, nil
+}
+
+// TestJournalEventAppenderRefusesPublicBytesForNonPublicEnduringEvents asserts the
+// class/visibility guard AT the seam that publishes the bytes, not one level away in
+// the backend. A private event and an ephemeral event have no public publication, so
+// no reported body may ride onto one — a backend that offers bytes for either is not
+// believed, and the delivery stays empty rather than leaking an internal record or
+// giving an unpersisted event a committed identity.
+func TestJournalEventAppenderRefusesPublicBytesForNonPublicEnduringEvents(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0xF1)
+	tests := []struct {
+		name  string
+		event event.Event
+	}{
+		{
+			name: "private enduring",
+			event: event.HustleStarted{Header: event.Header{
+				Coordinates:     identity.Coordinates{SessionID: sid},
+				EventID:         fixedUUID(0xF2),
+				EventVisibility: event.Internal,
+			}},
+		},
+		{
+			name: "public ephemeral",
+			event: event.TokenDelta{Header: event.Header{
+				Coordinates: identity.Coordinates{SessionID: sid, LoopID: fixedUUID(0xF3), TurnID: fixedUUID(0xF4)},
+				EventID:     fixedUUID(0xF5),
+			}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			app := NewJournalEventAppender(&misreportingJournal{})
+			commit, err := app.AppendEventCommitted(context.Background(), tt.event)
+			if err != nil {
+				t.Fatalf("AppendEventCommitted() error = %v", err)
+			}
+			if commit.EventID != "" || commit.PublicBody != nil || commit.CoveredThrough != 0 {
+				t.Fatalf("commit = %+v, want no public id, body, or coverage for a %s event", commit, tt.name)
+			}
+			if commit.PublishesPublicBody() {
+				t.Error("PublishesPublicBody() = true, want false")
+			}
+		})
 	}
 }

@@ -36,6 +36,7 @@ var publicSessionContracts = map[string]bool{
 	"RestoreDecider": true, "RestoreDecision": true,
 	"RuntimeRestoreRequest": true, "RuntimeRestoreResolver": true,
 	"DefaultPolicyDecider": true, "AcceptAllDecider": true,
+	"CommittedPublicEventSource": true, "CommittedPublicEventProvider": true,
 }
 
 var forbiddenSessionSurface = map[string]bool{
@@ -267,5 +268,50 @@ func TestSessionContractsExposeOnlyFocusedCompaction(t *testing.T) {
 				t.Fatalf("%s method %s exists=%v, want %v", tt.contract.Name(), tt.methodName, exists, tt.want)
 			}
 		})
+	}
+}
+
+// TestCommittedPublicEventCapabilityIsSegregated proves the committed-public-event
+// capability is a SEPARATE contract, not three more methods every Session
+// implementation must grow. The two session views keep exactly the compatibility
+// SubscribeEvents that every TUI/CLI consumer already depends on; the committed
+// stream — which a session without committed-bytes persistence cannot serve at all —
+// is reachable only through the narrow source, discovered through the provider.
+func TestCommittedPublicEventCapabilityIsSegregated(t *testing.T) {
+	t.Parallel()
+	dataPlane := reflect.TypeOf((*session.Session)(nil)).Elem()
+	controller := reflect.TypeOf((*session.SessionController)(nil)).Elem()
+	source := reflect.TypeOf((*session.CommittedPublicEventSource)(nil)).Elem()
+	provider := reflect.TypeOf((*session.CommittedPublicEventProvider)(nil)).Elem()
+
+	for _, view := range []reflect.Type{dataPlane, controller} {
+		if _, exists := view.MethodByName("SubscribeCommittedPublicEvents"); exists {
+			t.Errorf("%s exposes SubscribeCommittedPublicEvents; the capability must stay segregated", view.Name())
+		}
+		if _, exists := view.MethodByName("CommittedPublicEvents"); exists {
+			t.Errorf("%s exposes CommittedPublicEvents; the capability must stay segregated", view.Name())
+		}
+		if _, exists := view.MethodByName("SubscribeEvents"); !exists {
+			t.Errorf("%s lost the compatibility SubscribeEvents", view.Name())
+		}
+	}
+	if source.NumMethod() != 1 {
+		t.Errorf("CommittedPublicEventSource has %d methods, want exactly SubscribeCommittedPublicEvents", source.NumMethod())
+	}
+	if _, exists := source.MethodByName("SubscribeCommittedPublicEvents"); !exists {
+		t.Error("CommittedPublicEventSource does not expose SubscribeCommittedPublicEvents")
+	}
+	if provider.NumMethod() != 1 {
+		t.Errorf("CommittedPublicEventProvider has %d methods, want exactly CommittedPublicEvents", provider.NumMethod())
+	}
+	discover, exists := provider.MethodByName("CommittedPublicEvents")
+	if !exists {
+		t.Fatal("CommittedPublicEventProvider does not expose CommittedPublicEvents")
+	}
+	// Two results, the second a bool: the capability is DISCOVERED, never assumed.
+	// A single-result form would force every provider to hand back a source it
+	// cannot back with committed bytes.
+	if discover.Type.NumOut() != 2 || discover.Type.Out(0) != source || discover.Type.Out(1).Kind() != reflect.Bool {
+		t.Fatalf("CommittedPublicEvents signature = %v, want (CommittedPublicEventSource, bool)", discover.Type)
 	}
 }

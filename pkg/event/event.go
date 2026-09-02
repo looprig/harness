@@ -146,14 +146,94 @@ type Subscription interface {
 	Err() error
 }
 
-// Delivery is one fan-in delivery: the event plus its durable journal sequence.
+// Delivery is one fan-in delivery: the event plus what its durable append committed.
 // JournalSeq is 0 for Ephemeral deliveries (never persisted, never sequenced) and
 // the strictly-monotonic append sequence for Enduring deliveries. It rides only the
 // LIVE delivery path — it is never part of the persisted event codec, so the durable
 // envelope stays byte-compatible.
+//
+// The three committed-publication fields below are an ADDITIVE widening: every
+// existing consumer that reads Event and JournalSeq, and every keyed composite
+// literal that sets only those two, keeps compiling and keeps its old meaning.
+// They are populated ONLY on a live delivery whose durable append both committed a
+// new frame and stored a canonical public body for it; they are the zero value for
+// an Ephemeral delivery, a private (Internal-visibility) delivery, and every
+// delivery from a hub whose appender cannot report the stored bytes.
 type Delivery struct {
 	Event      Event
 	JournalSeq uint64
+
+	// EventID is the canonical PUBLIC event id (Core sessionwire/v1 EventID) the
+	// durable append committed this event under. It is empty unless PublicBody is
+	// present. It is deliberately a distinct field from Header.EventID: the header
+	// carries the runtime's own identity, while this is the identity a public
+	// reader dedupes on, and only a committed append can supply it.
+	EventID string
+
+	// PublicBody is the EXACT canonical public body the durable append stored for
+	// this event, carried forward rather than re-projected, so a consumer that
+	// joins a durable tail to this live stream can never render two different
+	// bodies for one event. The hub clones it per subscriber, so a consumer may
+	// mutate its own copy without corrupting a peer's.
+	//
+	// These are the bytes the durable public read returns for this sequence
+	// WHENEVER THAT READ CAN SERVE THEM, which is not unconditional and a
+	// tail-joining consumer must not assume it is. A body large enough to be
+	// offloaded is stored as an object, and the released reader refuses a public
+	// reference whose SizeBytes exceeds the envelope's inline ceiling — that read
+	// returns an error rather than these bytes. Under Harness's DEFAULT offload
+	// threshold that is the state of all but a boundary case at exactly the
+	// ceiling, because the threshold EQUALS the ceiling and a body offloads only
+	// when strictly above it. (The boundary case: the combined-envelope branch can
+	// also offload a body that is itself at the ceiling, when the two bodies
+	// together overflow the frame — measured reachable, and readable. A lower
+	// configured threshold, sessionstore.WithOffloadThreshold, likewise produces
+	// offloaded bodies under the ceiling, which the read serves byte-identically.)
+	//
+	// So the live delivery is the STRICTLY more available of the two: it always
+	// carries the committed bytes. A consumer must treat a read failure at a
+	// sequence it already holds live as "keep what you have", never as a reason to
+	// discard or re-fetch.
+	PublicBody []byte
+
+	// CoveredThrough is the durable sequence a public reader is caught up through
+	// once it has accepted this delivery. It equals JournalSeq exactly: the append
+	// that produced this delivery is the newest record it may claim. Because
+	// private records occupy sequences a public reader never receives, this closes
+	// those earlier gaps — but it never advances past this event's own committed
+	// sequence and never says anything about what the skipped records were.
+	CoveredThrough uint64
+}
+
+// Committed reports whether this delivery carries the committed canonical public
+// body of a public enduring event. A false result means the delivery is
+// Ephemeral, private, or came from a hub without committed-bytes persistence —
+// never that the bytes were dropped in transit.
+func (d Delivery) Committed() bool { return d.EventID != "" && len(d.PublicBody) > 0 }
+
+// AppendCommit is the outcome of one durable enduring-event append as the event
+// producer needs to see it. It is the seam type shared by the journal appender
+// (which fills it in) and the hub (which rides it onto live deliveries) — it lives
+// here in the leaf event package so the hub never has to import the journal.
+//
+// Sequence is the WINNING append's sequence: the newly assigned one when this call
+// committed a frame, and the ORIGINAL one when an idempotent retry deduplicated.
+// Appended distinguishes those two. EventID/PublicBody/CoveredThrough are set only
+// when this call itself committed a new PUBLIC ENDURING frame whose canonical body
+// the journal can report; a deduplicated retry commits nothing and therefore claims
+// no coverage, and a private or ephemeral append has no public body at all.
+type AppendCommit struct {
+	Sequence       uint64
+	Appended       bool
+	EventID        string
+	PublicBody     []byte
+	CoveredThrough uint64
+}
+
+// PublishesPublicBody reports whether this commit carries committed canonical bytes
+// to ride onto a live delivery.
+func (c AppendCommit) PublishesPublicBody() bool {
+	return c.Appended && c.EventID != "" && len(c.PublicBody) > 0
 }
 
 // ephemeral is the lifecycle mixin for a streaming delta: droppable, never

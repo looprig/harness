@@ -132,11 +132,13 @@ type deliveryTransition struct {
 	fallbackSeq uint64
 }
 
-// Compile-time proofs that *sessionJournal honors both the plain journal.SessionJournal
-// contract and its optional idempotent extension.
+// Compile-time proofs that *sessionJournal honors the plain journal.SessionJournal
+// contract and both of its optional extensions: idempotent dedup reporting, and
+// committed canonical public bytes.
 var (
-	_ journal.SessionJournal    = (*sessionJournal)(nil)
-	_ journal.IdempotentJournal = (*sessionJournal)(nil)
+	_ journal.SessionJournal         = (*sessionJournal)(nil)
+	_ journal.IdempotentJournal      = (*sessionJournal)(nil)
+	_ journal.CommittedPublicJournal = (*sessionJournal)(nil)
 )
 
 // OpenJournal binds a single-writer journal to session id's ledger and takes
@@ -423,11 +425,13 @@ func observeHydratedDeliveryTransition(transitions map[uuid.UUID]deliveryTransit
 // operation holds mu so the guard, dedup check, offload, append, tip advance, and
 // index update are one atomic step; the append carries its own per-append deadline so
 // one stuck call cannot wedge the queued writers. On success it returns the assigned
-// (or, for a deduplicated retry, the ORIGINAL) ledger sequence. Append and
-// AppendIdempotent share the same core (appendChecked); Append simply discards the
-// Appended flag for callers that only need the sequence/error — see AppendIdempotent
-// (journal.IdempotentJournal) for callers that need to distinguish a fresh append from
-// a deduplicated retry.
+// (or, for a deduplicated retry, the ORIGINAL) ledger sequence. Append,
+// AppendIdempotent, and AppendCommitted share the same core (appendChecked) and each
+// discards the part of its result it does not need: Append keeps only the
+// sequence/error — see AppendIdempotent (journal.IdempotentJournal) for callers that
+// need to distinguish a fresh append from a deduplicated retry, and AppendCommitted
+// (journal.CommittedPublicJournal) for callers that additionally need the exact
+// canonical public bytes this writer stored.
 func (b *sessionJournal) Append(ctx context.Context, rec journal.JournalRecord) (uint64, error) {
 	result, err := b.appendChecked(ctx, rec)
 	return result.Sequence, err
@@ -438,6 +442,23 @@ func (b *sessionJournal) Append(ctx context.Context, rec journal.JournalRecord) 
 // differently to a fresh append versus a deduplicated retry (e.g. skip a live
 // broadcast for a duplicate) can observe that distinction via AppendResult.Appended.
 func (b *sessionJournal) AppendIdempotent(ctx context.Context, rec journal.JournalRecord) (journal.AppendResult, error) {
+	result, err := b.appendChecked(ctx, rec)
+	return result.AppendResult, err
+}
+
+// AppendCommitted is Append's richest counterpart (journal.CommittedPublicJournal):
+// same mechanics, and it additionally reports the canonical public event id and the
+// EXACT canonical public body this writer stored for a newly appended PUBLIC event.
+// Those are the bytes the frame path projected ONCE and wrote — not a second
+// projection of the same event — because a consumer joining the durable tail to a
+// live publication compares the two, and a re-derived body that merely happens to
+// agree today is not the same guarantee.
+//
+// A deduplicated retry reports Appended=false with a zero Public: this call wrote
+// nothing, so it has no stored bytes of its own to report. The ORIGINAL append's
+// bytes remain durable at the returned sequence; whether the public READ serves them
+// back depends on size (see the caveat on event.Delivery.PublicBody).
+func (b *sessionJournal) AppendCommitted(ctx context.Context, rec journal.JournalRecord) (journal.CommittedAppendResult, error) {
 	return b.appendChecked(ctx, rec)
 }
 
@@ -454,21 +475,21 @@ func (b *sessionJournal) AppendIdempotent(ctx context.Context, rec journal.Journ
 //     frame is written, and the ORIGINAL sequence is returned with Appended=false;
 //   - an id seen before with a DIFFERENT fingerprint fails closed with a typed
 //     *journal.IdempotencyCollisionError.
-func (b *sessionJournal) appendChecked(ctx context.Context, rec journal.JournalRecord) (journal.AppendResult, error) {
+func (b *sessionJournal) appendChecked(ctx context.Context, rec journal.JournalRecord) (journal.CommittedAppendResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if !b.ready {
-		return journal.AppendResult{}, &journal.JournalNotReadyError{SessionID: b.id}
+		return journal.CommittedAppendResult{}, &journal.JournalNotReadyError{SessionID: b.id}
 	}
 	if !b.leaseHeld() {
-		return journal.AppendResult{}, &journal.JournalLeaseLostError{SessionID: b.id, Epoch: b.lease.Epoch()}
+		return journal.CommittedAppendResult{}, &journal.JournalLeaseLostError{SessionID: b.id, Epoch: b.lease.Epoch()}
 	}
 	var commandRecord journal.CommandRecord
 	var hasPhasedCommand bool
 	if candidate, ok := rec.(journal.CommandRecord); ok && candidate.DeliveryPhase() != "" {
 		if err := journal.ValidateCommandRecordRoute(candidate); err != nil {
-			return journal.AppendResult{}, err
+			return journal.CommittedAppendResult{}, err
 		}
 		commandRecord = candidate
 		hasPhasedCommand = true
@@ -476,14 +497,14 @@ func (b *sessionJournal) appendChecked(ctx context.Context, rec journal.JournalR
 
 	k, body, err := b.encodeRecordBody(rec)
 	if err != nil {
-		return journal.AppendResult{}, err
+		return journal.CommittedAppendResult{}, err
 	}
 	id := rec.IdempotencyID()
 	fp := journal.NewFingerprint(string(k), body)
 	if seq, duplicate, checkErr := b.idx.Check(id, fp); checkErr != nil {
-		return journal.AppendResult{}, checkErr
+		return journal.CommittedAppendResult{}, checkErr
 	} else if duplicate {
-		return journal.AppendResult{Sequence: seq, Appended: false}, nil
+		return journal.CommittedAppendResult{AppendResult: journal.AppendResult{Sequence: seq, Appended: false}}, nil
 	}
 
 	var transitionRecord *journal.CommandRecord
@@ -491,15 +512,15 @@ func (b *sessionJournal) appendChecked(ctx context.Context, rec journal.JournalR
 	if hasPhasedCommand && commandRecord.DeliveryPhase().Valid() {
 		pending, err := b.prepareDeliveryTransition(commandRecord)
 		if err != nil {
-			return journal.AppendResult{}, err
+			return journal.CommittedAppendResult{}, err
 		}
 		transitionRecord = &commandRecord
 		pendingTransition = pending
 	}
 
-	seq, err := b.writeEncodedLocked(ctx, rec, k, body)
+	seq, public, err := b.writeEncodedLocked(ctx, rec, k, body)
 	if err != nil {
-		return journal.AppendResult{}, err
+		return journal.CommittedAppendResult{}, err
 	}
 	b.idx.Observe(id, seq, fp)
 	if transitionRecord != nil {
@@ -513,7 +534,10 @@ func (b *sessionJournal) appendChecked(ctx context.Context, rec journal.JournalR
 		}
 		b.deliveryTransitions[transitionRecord.LogicalCommandID()] = pendingTransition
 	}
-	return journal.AppendResult{Sequence: seq, Appended: true}, nil
+	return journal.CommittedAppendResult{
+		AppendResult: journal.AppendResult{Sequence: seq, Appended: true},
+		Public:       public,
+	}, nil
 }
 
 func (b *sessionJournal) prepareDeliveryTransition(record journal.CommandRecord) (deliveryTransition, error) {
@@ -578,22 +602,27 @@ func (b *sessionJournal) writeLocked(ctx context.Context, rec journal.JournalRec
 	if err != nil {
 		return 0, err
 	}
-	return b.writeEncodedLocked(ctx, rec, k, body)
+	seq, _, err := b.writeEncodedLocked(ctx, rec, k, body)
+	return seq, err
 }
 
-func (b *sessionJournal) writeEncodedLocked(ctx context.Context, rec journal.JournalRecord, k kind, body []byte) (uint64, error) {
+// writeEncodedLocked additionally returns the canonical public identity and body the
+// framing step stored for a public event record (zero for every other record). It is
+// the ONLY place those bytes are produced, so returning them here is what lets a
+// caller publish the stored bytes rather than a second projection of the same event.
+func (b *sessionJournal) writeEncodedLocked(ctx context.Context, rec journal.JournalRecord, k kind, body []byte) (uint64, journal.CommittedPublicBody, error) {
 	childCtx, cancel := context.WithTimeout(ctx, appendTimeout)
 	defer cancel()
 
-	recordBytes, err := b.frame(childCtx, rec, k, body)
+	recordBytes, public, err := b.frame(childCtx, rec, k, body)
 	if err != nil {
-		return 0, err
+		return 0, journal.CommittedPublicBody{}, err
 	}
 	if err := storage.AppendDefinite(childCtx, b.ledger, b.name, b.trackedTip, recordBytes); err != nil {
-		return 0, b.mapAppendErr(rec, err)
+		return 0, journal.CommittedPublicBody{}, b.mapAppendErr(rec, err)
 	}
 	b.trackedTip++
-	return b.trackedTip, nil
+	return b.trackedTip, public, nil
 }
 
 // frame maps one already-encoded Harness record into SessionStore's released
@@ -602,7 +631,11 @@ func (b *sessionJournal) writeEncodedLocked(ctx context.Context, rec journal.Jou
 // Each over-threshold body is persisted through SessionStore's verified immutable
 // object API before the envelope reference is appended. It runs under mu, so object
 // publication remains serialized with the append that makes it reachable.
-func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k kind, body []byte) ([]byte, error) {
+//
+// It returns that canonical public identity and body alongside the framed bytes. The
+// projection runs exactly ONCE, here, and the caller publishes what was stored rather
+// than projecting a second time — a second projection is a second answer.
+func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k kind, body []byte) ([]byte, journal.CommittedPublicBody, error) {
 	env := durablestore.Envelope{}
 	var publicBody []byte
 	switch k {
@@ -614,7 +647,7 @@ func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k
 		if eventRecord.Event().Visibility() == event.Public {
 			projection, projectErr := b.project(harnessTenantID, harnessSessionID(b.id), eventRecord.Event())
 			if projectErr != nil {
-				return nil, &journal.MarshalRecordError{Subject: b.name, Cause: projectErr}
+				return nil, journal.CommittedPublicBody{}, &journal.MarshalRecordError{Subject: b.name, Cause: projectErr}
 			}
 			env.Kind = durablestore.EnvelopeKindPublicEvent
 			env.EventID = projection.EventID
@@ -636,28 +669,45 @@ func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k
 	// the same legacy *journal.RecordTooLargeError classification an oversized
 	// record has always carried.
 	if k != kindFence && len(body) > maxRuntimeBodyBytes {
-		return nil, &journal.RecordTooLargeError{
+		return nil, journal.CommittedPublicBody{}, &journal.RecordTooLargeError{
 			Subject: b.name, MsgID: rec.IdempotencyID(), Length: len(body),
 			Cause: errRuntimeBodyAboveReplayCeiling,
 		}
 	}
 	publicOffload, runtimeOffload, err := b.effectiveOffloadPlan(env, publicBody, body, k != kindFence)
 	if err != nil {
-		return nil, err
+		return nil, journal.CommittedPublicBody{}, err
 	}
 	if publicBody != nil {
 		env.Public, err = b.durableBodySlot(ctx, durablestore.ObjectKindJournalPublic, publicBody, publicOffload)
 		if err != nil {
-			return nil, b.mapOffloadErr(rec, len(publicBody), err)
+			return nil, journal.CommittedPublicBody{}, b.mapOffloadErr(rec, len(publicBody), err)
 		}
 	}
 	if k != kindFence {
 		env.Runtime, err = b.durableBodySlot(ctx, durablestore.ObjectKindJournalRuntime, body, runtimeOffload)
 		if err != nil {
-			return nil, b.mapOffloadErr(rec, len(body), err)
+			return nil, journal.CommittedPublicBody{}, b.mapOffloadErr(rec, len(body), err)
 		}
 	}
-	return durablestore.EncodeEnvelope(env)
+	frameBytes, err := durablestore.EncodeEnvelope(env)
+	if err != nil {
+		return nil, journal.CommittedPublicBody{}, err
+	}
+	if publicBody == nil {
+		return frameBytes, journal.CommittedPublicBody{}, nil
+	}
+	// The bytes handed back are the ones just written — inline in this frame or
+	// uploaded as this frame's public object — cloned so no caller can reach back
+	// into the projector's buffer. The CONTENT is identical either way, which is the
+	// whole point; note that the read side is not symmetric, because it refuses a
+	// public reference above the released inline ceiling (see the caveat on
+	// event.Delivery.PublicBody). That asymmetry is a boundary condition of the
+	// released reader, not of these bytes: a live delivery carries them regardless.
+	return frameBytes, journal.CommittedPublicBody{
+		EventID: string(env.EventID),
+		Body:    bytes.Clone(publicBody),
+	}, nil
 }
 
 func durableRecordID(k kind, id string) string { return string(k) + "|" + id }

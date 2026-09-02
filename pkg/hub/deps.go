@@ -41,6 +41,27 @@ type eventAppenderResult interface {
 	AppendEventResult(ctx context.Context, ev event.Event) (seq uint64, appended bool, err error)
 }
 
+// eventAppenderCommitted is the FURTHER optional extension an injected appender may
+// satisfy to report, for a public enduring event it just committed, the canonical
+// public event id, the EXACT canonical body the durable journal stored, and the
+// coverage watermark that append earned. It is what backs the hub's segregated
+// committed-public-event capability.
+//
+// It is two-part on purpose. The method set alone cannot answer the question: one
+// appender type serves every journal, and whether the bytes are reportable is a
+// property of the JOURNAL underneath it. So an appender advertises the static shape
+// here and answers the dynamic question through SupportsCommittedPublicBodies. The
+// hub requires BOTH before it will hand out a committed-public-event subscription —
+// a no-persistence hub (nopEventAppender, which does not implement this interface at
+// all) and an appender over a legacy journal (which implements it but answers false)
+// are equally incapable, and neither may advertise a capability whose whole contract
+// is that every delivery carries committed bytes.
+type eventAppenderCommitted interface {
+	eventAppenderResult
+	SupportsCommittedPublicBodies() bool
+	AppendEventCommitted(ctx context.Context, ev event.Event) (event.AppendCommit, error)
+}
+
 // nopEventAppender is the default appender wired into a hub built without an injected
 // one. It persists nothing and never fails, so the hub's fail-secure branch is never
 // taken in no-persistence mode — every Enduring event is delivered exactly as before

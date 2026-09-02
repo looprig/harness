@@ -1,12 +1,15 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 )
@@ -470,5 +473,157 @@ func TestPostStopNoDerivedAppend(t *testing.T) {
 	expectNoMore(t, sub) // no derived SessionIdle
 	if got := len(app.events()) - before; got != 1 {
 		t.Errorf("post-stop appended %d events, want 1 (the LoopIdle only, no derived)", got)
+	}
+}
+
+// idleTrigger builds the two publishes that drive a hub from idle to active and back:
+// a TurnStarted that adds loopID to the active set, then the LoopIdle that removes it
+// and so derives the SessionIdle edge.
+func idleTrigger(t *testing.T, sessionID, loopID uuid.UUID) (event.TurnStarted, event.LoopIdle) {
+	t.Helper()
+	coords := identity.Coordinates{SessionID: sessionID, LoopID: loopID}
+	turnCoords := coords
+	turnCoords.TurnID = mustID(t)
+	return event.TurnStarted{
+			Header: event.Header{
+				Coordinates: turnCoords,
+				EventID:     mustID(t),
+				Cause:       identity.Cause{CommandID: mustID(t)},
+			},
+			TurnIndex: 1,
+		}, event.LoopIdle{
+			Header: event.Header{Coordinates: coords, EventID: mustID(t)},
+		}
+}
+
+// TestDerivedSessionIdleCarriesItsOwnCommittedBody covers the SessionIdle edge derived
+// INSIDE a publish — the hub's most common derived transition, and the one committed
+// under the idle boundary rather than on the ordinary derived path. It must carry its
+// OWN append result: its own sequence, its own committed EventID, its own stored body,
+// and a watermark equal to its own sequence.
+//
+// Two distinct defects hide here and each is asserted separately. Delivering the
+// TRIGGERING event's commit alongside the idle event gives two deliveries the same
+// (sequence, EventID), so a consumer keying on that pair either drops the idle edge as
+// a duplicate or renders the trigger twice. Delivering the idle event with its bytes
+// stripped makes it carry no committed body at all, which — on the committed stream,
+// whose contract is that every delivery carries them — FAILS the subscription: every
+// Host runtime subscription would die the first time a turn went idle.
+func TestDerivedSessionIdleCarriesItsOwnCommittedBody(t *testing.T) {
+	t.Parallel()
+	sessionID, loopID := mustID(t), mustID(t)
+	app := newCommittedAppender()
+	h := New(sessionID, WithAppender(app))
+	committed, err := h.SubscribeCommittedPublicEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeCommittedPublicEvents() error = %v", err)
+	}
+
+	start, idle := idleTrigger(t, sessionID, loopID)
+	if err := h.PublishEvent(context.Background(), start); err != nil {
+		t.Fatalf("PublishEvent(TurnStarted) error = %v", err)
+	}
+	if err := h.PublishEvent(context.Background(), idle); err != nil {
+		t.Fatalf("PublishEvent(LoopIdle) error = %v", err)
+	}
+	// Publication is synchronous on this goroutine, so the subscription's terminal
+	// state is already decided. Checking it HERE names the failure precisely: a
+	// SessionIdle delivered without its committed bytes fails the committed stream,
+	// and read from the channel alone that surfaces only as an unexplained close.
+	if err := committed.Err(); err != nil {
+		t.Fatalf("committed subscription failed during publication: %v"+
+			" (an enduring delivery carried no committed public body)", err)
+	}
+
+	wants := []struct {
+		name string
+		is   func(event.Event) bool
+		seq  uint64
+	}{
+		{name: "TurnStarted", is: func(e event.Event) bool { _, ok := e.(event.TurnStarted); return ok }, seq: 1},
+		{name: "SessionActive", is: func(e event.Event) bool { _, ok := e.(event.SessionActive); return ok }, seq: 2},
+		{name: "LoopIdle", is: func(e event.Event) bool { _, ok := e.(event.LoopIdle); return ok }, seq: 3},
+		{name: "SessionIdle", is: func(e event.Event) bool { _, ok := e.(event.SessionIdle); return ok }, seq: 4},
+	}
+	bodies := make(map[string][]byte, len(wants))
+	for _, want := range wants {
+		d := recvDelivery(t, committed)
+		if !want.is(d.Event) {
+			t.Fatalf("delivery = %T, want %s", d.Event, want.name)
+		}
+		if d.JournalSeq != want.seq {
+			t.Errorf("%s JournalSeq = %d, want %d", want.name, d.JournalSeq, want.seq)
+		}
+		wantID := "public-" + strconv.FormatUint(want.seq, 10)
+		if d.EventID != wantID {
+			t.Errorf("%s EventID = %q, want %q", want.name, d.EventID, wantID)
+		}
+		if !bytes.Equal(d.PublicBody, app.storedBody(want.seq)) {
+			t.Errorf("%s PublicBody = %s, want the stored body %s", want.name, d.PublicBody, app.storedBody(want.seq))
+		}
+		if d.CoveredThrough != d.JournalSeq {
+			t.Errorf("%s CoveredThrough = %d, want %d", want.name, d.CoveredThrough, d.JournalSeq)
+		}
+		if !d.Committed() {
+			t.Errorf("%s Committed() = false, want true", want.name)
+		}
+		bodies[want.name] = d.PublicBody
+	}
+	if bytes.Equal(bodies["SessionIdle"], bodies["LoopIdle"]) {
+		t.Errorf("SessionIdle carried the triggering LoopIdle's body %s; each append must carry its own",
+			bodies["LoopIdle"])
+	}
+	if err := committed.Err(); err != nil {
+		t.Fatalf("committed subscription failed: %v", err)
+	}
+}
+
+// TestCancelExpectTurnDerivedSessionIdleCarriesItsOwnCommittedBody covers the OTHER
+// SessionIdle site: the edge derived with no triggering event of its own, committed
+// through appendAndDeliverDerivedChecked. It is a separate closure from the in-publish
+// idle commit and fails independently, so it needs its own driver.
+func TestCancelExpectTurnDerivedSessionIdleCarriesItsOwnCommittedBody(t *testing.T) {
+	t.Parallel()
+	sessionID, subagentLoopID := mustID(t), mustID(t)
+	app := newCommittedAppender()
+	h := New(sessionID, WithAppender(app))
+	committed, err := h.SubscribeCommittedPublicEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeCommittedPublicEvents() error = %v", err)
+	}
+
+	h.ExpectTurn(context.Background(), subagentLoopID)
+	h.CancelExpectTurn(context.Background(), subagentLoopID)
+	// Both calls are synchronous, so a failed committed stream is already visible.
+	if err := committed.Err(); err != nil {
+		t.Fatalf("committed subscription failed during the derived edges: %v"+
+			" (an enduring delivery carried no committed public body)", err)
+	}
+
+	active := recvDelivery(t, committed)
+	if _, ok := active.Event.(event.SessionActive); !ok {
+		t.Fatalf("first delivery = %T, want event.SessionActive", active.Event)
+	}
+	idle := recvDelivery(t, committed)
+	if _, ok := idle.Event.(event.SessionIdle); !ok {
+		t.Fatalf("second delivery = %T, want event.SessionIdle", idle.Event)
+	}
+	if idle.JournalSeq != 2 || idle.EventID != "public-2" {
+		t.Errorf("SessionIdle seq/id = %d/%q, want 2/%q", idle.JournalSeq, idle.EventID, "public-2")
+	}
+	if !bytes.Equal(idle.PublicBody, app.storedBody(2)) {
+		t.Errorf("SessionIdle PublicBody = %s, want the stored body %s", idle.PublicBody, app.storedBody(2))
+	}
+	if idle.CoveredThrough != idle.JournalSeq {
+		t.Errorf("SessionIdle CoveredThrough = %d, want %d", idle.CoveredThrough, idle.JournalSeq)
+	}
+	if !idle.Committed() {
+		t.Error("SessionIdle Committed() = false, want true")
+	}
+	if bytes.Equal(idle.PublicBody, active.PublicBody) {
+		t.Errorf("SessionIdle carried SessionActive's body %s; each append must carry its own", active.PublicBody)
+	}
+	if err := committed.Err(); err != nil {
+		t.Fatalf("committed subscription failed: %v", err)
 	}
 }

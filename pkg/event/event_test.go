@@ -120,3 +120,84 @@ var (
 	_ event.Reply = event.CompactWaiterResolved{}
 	_ event.Reply = event.CompactWaiterRejected{}
 )
+
+// TestDeliveryWidensAdditivelyForExistingConsumers drives the LEGAL case as hard as
+// the illegal ones: a consumer written before the committed-publication fields
+// existed — keyed literal with only Event and JournalSeq, reading only those two —
+// must still compile and still mean exactly what it meant. The new fields read as
+// their zero value, and Committed() reports false rather than "unknown".
+func TestDeliveryWidensAdditivelyForExistingConsumers(t *testing.T) {
+	t.Parallel()
+	legacy := func(d event.Delivery) (event.Event, uint64) { return d.Event, d.JournalSeq }
+
+	ev := event.SessionStarted{Header: event.Header{EventID: mustID(t)}}
+	d := event.Delivery{Event: ev, JournalSeq: 7}
+	gotEvent, gotSeq := legacy(d)
+	if _, isStarted := gotEvent.(event.SessionStarted); !isStarted || gotSeq != 7 {
+		t.Fatalf("legacy consumer read (%T, %d), want (event.SessionStarted, 7)", gotEvent, gotSeq)
+	}
+	if d.EventID != "" || d.PublicBody != nil || d.CoveredThrough != 0 {
+		t.Errorf("widened Delivery = %+v, want zero committed fields for a legacy literal", d)
+	}
+	if d.Committed() {
+		t.Error("Committed() = true for a delivery with no committed bytes, want false")
+	}
+}
+
+// TestDeliveryCommittedRequiresBothIdentityAndBytes proves Committed() is not a
+// partial-credit predicate: an id without bytes, or bytes without an id, is not a
+// committed publication and must not be read as one.
+func TestDeliveryCommittedRequiresBothIdentityAndBytes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		delivery event.Delivery
+		want     bool
+	}{
+		{name: "id and bytes", delivery: event.Delivery{EventID: "e1", PublicBody: []byte(`{}`)}, want: true},
+		{name: "id only", delivery: event.Delivery{EventID: "e1"}},
+		{name: "bytes only", delivery: event.Delivery{PublicBody: []byte(`{}`)}},
+		{name: "empty bytes", delivery: event.Delivery{EventID: "e1", PublicBody: []byte{}}},
+		{name: "neither"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.delivery.Committed(); got != tt.want {
+				t.Errorf("Committed() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAppendCommitPublishesPublicBodyRequiresItsOwnCommit proves a commit that did
+// not append — a deduplicated retry — never advertises bytes to publish, even if a
+// backend were to hand some back. Only the append that actually committed may
+// publish, because only it earned the coverage its delivery would carry.
+func TestAppendCommitPublishesPublicBodyRequiresItsOwnCommit(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		commit event.AppendCommit
+		want   bool
+	}{
+		{
+			name:   "committed public",
+			commit: event.AppendCommit{Sequence: 3, Appended: true, EventID: "e1", PublicBody: []byte(`{}`), CoveredThrough: 3},
+			want:   true,
+		},
+		{
+			name:   "deduplicated retry",
+			commit: event.AppendCommit{Sequence: 3, EventID: "e1", PublicBody: []byte(`{}`)},
+		},
+		{name: "committed private", commit: event.AppendCommit{Sequence: 3, Appended: true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.commit.PublishesPublicBody(); got != tt.want {
+				t.Errorf("PublishesPublicBody() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}

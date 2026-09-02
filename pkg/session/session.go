@@ -86,3 +86,55 @@ type SessionController interface {
 	RestoreWorkspace(context.Context, workspacestore.Ref) error
 	Shutdown(context.Context) error
 }
+
+// CommittedPublicEventSource is the segregated committed-public-event capability: a
+// live event stream on which EVERY delivery carries the exact canonical public body
+// the durable append stored, the public EventID it committed under, and a
+// CoveredThrough watermark equal to that append's own sequence.
+//
+// It is a SEPARATE contract from Session.SubscribeEvents, and the difference is not
+// cosmetic. SubscribeEvents is the compatibility stream: it serves a TUI/CLI on a
+// headless session with no persistence at all, it carries ephemeral events, and it
+// promises nothing about bytes. This one promises committed bytes on every delivery,
+// which a session whose persistence cannot report the stored bytes is unable to keep.
+// Folding it into Session would force every implementation to advertise a guarantee
+// only some of them can honor — and a consumer that joins a durable tail to a live
+// stream would have no way to learn, before it starts persisting cursors, that this
+// session was not one of them.
+//
+// A consumer obtains one through CommittedPublicEventProvider rather than a bare type
+// assertion, because the capability is a property of the session's persistence, not
+// of its Go type.
+// Two notes for a consumer building tail-join logic on this stream.
+//
+// First, the live delivery is the more available of the two sources. It always
+// carries the committed bytes; the durable public read does not, for a body large
+// enough to be offloaded above the released reader's inline ceiling (see the caveat
+// on event.Delivery.PublicBody, which states the exact condition). Join by taking the
+// live bytes as authoritative for any sequence you already hold, and never discard a
+// held body because a read of the same sequence failed.
+//
+// Second, a subscription on this stream can terminate with *hub.SubscriptionLossError
+// for two DIFFERENT reasons, and they call for opposite responses. Egress overflow is
+// congestion: resubscribe and resync. A loss wrapping hub.ErrCommittedBodyMissing is a
+// broken invariant — the hub delivered an enduring public event with no committed
+// body — and resubscribing loops forever against a hub that cannot satisfy the
+// contract. Check errors.Is before retrying.
+type CommittedPublicEventSource interface {
+	// SubscribeCommittedPublicEvents attaches a consumer to the committed public
+	// stream with the given filter. The caller must Close the returned subscription.
+	SubscribeCommittedPublicEvents(event.EventFilter) (event.Subscription, error)
+}
+
+// CommittedPublicEventProvider is implemented by a session that MAY be able to serve
+// committed public events. CommittedPublicEvents reports the capability: ok is false
+// — with a nil source — when this session's persistence cannot report the exact
+// canonical bytes it stored, which includes a headless/no-persistence session and one
+// over a journal that predates the committed-bytes seam.
+//
+// The two-result form is the point. A single-result form would hand back a source
+// that fails only once the consumer is already subscribed and already advancing a
+// cursor, which is exactly the shape of failure this capability exists to prevent.
+type CommittedPublicEventProvider interface {
+	CommittedPublicEvents() (CommittedPublicEventSource, bool)
+}

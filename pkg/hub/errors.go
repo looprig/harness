@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/looprig/core/uuid"
@@ -86,3 +87,15 @@ type TurnStartReservationError struct {
 func (e *TurnStartReservationError) Error() string {
 	return fmt.Sprintf("hub: turn-start activity reservation denied: %s", e.Reason)
 }
+
+// ErrCommittedBodyMissing is the cause recorded on a committed-public-event
+// subscription the hub failed because an ENDURING public event reached its fan-out
+// without the canonical bytes its durable append was supposed to report. It is a
+// broken invariant of the committed stream, not congestion, and naming it separately
+// is what keeps the loss legible: without a cause, this failure is indistinguishable
+// from an egress overflow, and a Host consumer that treated it as backpressure would
+// resubscribe forever against a hub that can never satisfy the contract.
+//
+// Its text carries no "hub:" prefix because it is always surfaced through
+// *SubscriptionLossError, which supplies one; prefixing here would double it.
+var ErrCommittedBodyMissing = errors.New("enduring public event carried no committed public body")
