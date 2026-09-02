@@ -613,6 +613,22 @@ func TestApplyValidatesBeforeAnyDurableWrite(t *testing.T) {
 		t.Fatalf("ApplyRuntimeCommand with a zero RuntimeCommandID = nil error, want a refusal")
 	}
 	f.requireNoCommand(t, "zero runtime command id")
+	// The two rows above are ALSO caught by the record codec, which validates the
+	// correlation before it is made durable. These are not: their correlation is
+	// perfectly valid, so only Admitted.Validate stands between them and a dispatched
+	// command with no content (or a silently dropped payload).
+	emptyInput := f.admittedInput("c2", mustUUID(), "hello")
+	emptyInput.Blocks = nil
+	if _, err := f.session.ApplyRuntimeCommand(context.Background(), emptyInput); err == nil {
+		t.Fatalf("ApplyRuntimeCommand with an input carrying no content = nil error, want a refusal")
+	}
+	f.requireNoCommand(t, "input with no content")
+	interruptWithPayload := f.admittedInput("c3", mustUUID(), "hello")
+	interruptWithPayload.Kind = runtimecommand.KindInterrupt
+	if _, err := f.session.ApplyRuntimeCommand(context.Background(), interruptWithPayload); err == nil {
+		t.Fatalf("ApplyRuntimeCommand with an interrupt carrying input blocks = nil error, want a refusal")
+	}
+	f.requireNoCommand(t, "interrupt carrying a payload")
 }
 
 // TestApplyDoesNotParseThePublicIDAsAUUID is the oracle for the opacity rule: two
