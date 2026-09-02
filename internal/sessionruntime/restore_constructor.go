@@ -1701,13 +1701,27 @@ func (e *leaseAcquireError) Unwrap() error { return e.Cause }
 // openingGrantAttempts with a per-attempt deadline inside sessionstore; that each
 // attempt does real work (acquire, fence, CAS) rather than re-polling an unchanged
 // condition, so it is not a spin; that contention is resolved by someone winning the
-// CAS, which waiting does not help; and that this path is rare — an instrumented
-// probe (a counter on attempt > 0, run module-wide under `go test -v`, which is
-// required: a non-verbose run suppresses the output and reports a spurious zero)
-// fires 18 times across the module, ALL of them inside the six tests written to
-// drive this path, and zero times in every other test — including the integration
-// tests whose flaking on this exact handoff race is what put the loop here. ctx
-// bounds the whole loop.
+// CAS, which waiting does not help; and that this path is rarely reached but NOT
+// unreached.
+//
+// Measured with a counter on attempt > 0. Run it under `go test -v`: a
+// non-verbose run suppresses a passing package's output and reports a spurious
+// zero, which is how this comment previously came to claim the path was never
+// reached at all. Module-wide it fires 16 times deterministically, every one of
+// them inside the tests written to drive it — 14 from the two permanent-contention
+// fixtures walking attempts 1 through 7, plus one each from the two single-retry
+// tests. On top of that baseline sits the real one:
+// TestAgentRestoreReconcilesDurableEdges, an ordinary restore integration test
+// that genuinely reaches this handoff race, measured here at 5 firings in 30 runs
+// (~17%; an independent probe put it near 9%). That is the flake this loop exists
+// for, and it is still live.
+//
+// Every organic firing was attempt=1 — one predecessor append lands in the window
+// and the very next re-claim wins. Contention here is single-shot and
+// self-clearing (the 2-and-above firings above come only from fixtures that
+// contend forever by construction), which is precisely why immediate retry is
+// right: backoff would add latency to a restore that is about to succeed and would
+// change no outcome. ctx bounds the whole loop.
 //
 // Each attempt is a distinct append of a distinct fence record at a distinct epoch,
 // so an installed OperationJournalAppend hook is invoked once PER GRANT rather than
