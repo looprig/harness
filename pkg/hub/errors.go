@@ -99,3 +99,17 @@ func (e *TurnStartReservationError) Error() string {
 // Its text carries no "hub:" prefix because it is always surfaced through
 // *SubscriptionLossError, which supplies one; prefixing here would double it.
 var ErrCommittedBodyMissing = errors.New("enduring public event carried no committed public body")
+
+// ErrCommitEventMismatch is the cause recorded when a delivery's committed append
+// result belongs to a DIFFERENT event than the one being delivered. It is a hub
+// programming error, not a runtime condition: sessionwire.Project stamps a public
+// EventID from the event's own header, so a committed result and its event always agree
+// unless a delivery path paired the wrong two values.
+//
+// It is guarded rather than trusted because the failure is silent where it lands. A
+// consumer joining a durable tail to this stream dedupes on (sequence, EventID); two
+// deliveries carrying one identity make it either drop an event as a duplicate or
+// render another twice, with nothing anywhere reporting an error. The compiler cannot
+// help — every append result is the same type — so the pairing is checked at the one
+// place every delivery passes through.
+var ErrCommitEventMismatch = errors.New("committed append result does not belong to the delivered event")

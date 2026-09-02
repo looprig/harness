@@ -17,12 +17,13 @@ const defaultEgressBuffer = 256
 // class of the event that triggered the loss; Cause names the reason when it is not
 // the default one.
 //
-// There are two reasons, and they call for OPPOSITE responses, which is why Cause
-// exists rather than one undifferentiated loss. A nil Cause is egress overflow: the
-// subscriber fell behind, and re-subscribing to re-sync is the right answer. A Cause
-// of ErrCommittedBodyMissing is a broken invariant of the committed-public-event
-// stream, where re-subscribing loops forever against a hub that cannot satisfy the
-// contract.
+// The reasons call for OPPOSITE responses, which is why Cause exists rather than one
+// undifferentiated loss. A nil Cause is egress overflow: the subscriber fell behind,
+// and re-subscribing to re-sync is the right answer. ErrCommittedBodyMissing and
+// ErrCommitEventMismatch are both broken invariants — an enduring public event that
+// arrived without its committed bytes, and a delivery whose committed append belongs to
+// a different event — where re-subscribing loops forever against a hub that cannot
+// satisfy the contract.
 type SubscriptionLossError struct {
 	DroppedClass event.Class
 	Cause        error

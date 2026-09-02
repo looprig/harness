@@ -15,7 +15,10 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hook"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
+	sessionapi "github.com/looprig/harness/pkg/session"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
 )
@@ -666,5 +669,121 @@ func TestProcessShutdownConcurrentCallersShareResult(t *testing.T) {
 	}
 	if got := resource.shutdownCalls.Load(); got != 1 {
 		t.Fatalf("resource Shutdown calls across %d concurrent Shutdown() callers = %d, want 1 (single teardown owner)", callers, got)
+	}
+}
+
+// TestCommittedPublicEventsSurvivesCompositionRootDecorators is the composition-root
+// guard for the committed-public-event capability. The capability is discovered from
+// the appender, the appender is built over whatever the composition root hands it, and
+// the composition root wraps the real journal in DECORATORS — the offload-GC admission
+// gate, then the operation-hook observer. A decorator that exposes only Append silently
+// demotes the journal to a plain one, and the capability then does not degrade, it
+// VANISHES: CommittedPublicEvents() answers (nil, false) and the deployment looks
+// headless to a Host adapter. There is no error anywhere to notice.
+//
+// The control row is the point of the table: every row builds the same session over the
+// same store with the same appender, and the ONLY variable is which decorators are
+// armed. A row that fails while the control passes names the decorator that ate the
+// capability.
+func TestCommittedPublicEventsSurvivesCompositionRootDecorators(t *testing.T) {
+	t.Parallel()
+	policy := OffloadGCPolicy{Interval: time.Minute, Timeout: 10 * time.Second}
+	journalHooks, err := hook.Compile(hook.Set{Around: []hook.Around{{
+		Operation: hook.OperationJournalAppend,
+		Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+			return ctx, func(hook.Result) {}
+		},
+	}}})
+	if err != nil {
+		t.Fatalf("hook.Compile: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		options []LifecycleOption
+	}{
+		{name: "control: no decorators"},
+		{name: "offload GC armed", options: []LifecycleOption{WithLifecycleOffloadGC(policy)}},
+		{name: "journal hooks armed", options: []LifecycleOption{WithLifecycleHooks(journalHooks)}},
+		{
+			name: "offload GC and journal hooks armed",
+			options: []LifecycleOption{
+				WithLifecycleOffloadGC(policy),
+				WithLifecycleHooks(journalHooks),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store := newRestoreStore(t)
+			r, err := newTestLifecycle(cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}), store, tt.options...)
+			if err != nil {
+				t.Fatalf("NewTopologyLifecycle: %v", err)
+			}
+			s, err := r.NewSession(context.Background(), "")
+			if err != nil {
+				t.Fatalf("NewSession: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+			assertCommittedCapability(t, s)
+		})
+		t.Run(tt.name+" (restored)", func(t *testing.T) {
+			t.Parallel()
+			store := newRestoreStore(t)
+			sid := runAndShutdown(t, store, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"))
+			rr, err := newTestLifecycle(restoreCfg(&stubLLM{}, "model-x", "be helpful"), store, tt.options...)
+			if err != nil {
+				t.Fatalf("NewTopologyLifecycle (restore): %v", err)
+			}
+			s, err := rr.RestoreSession(context.Background(), sid)
+			if err != nil {
+				t.Fatalf("RestoreSession: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+			assertCommittedCapability(t, s)
+		})
+	}
+}
+
+// assertCommittedCapability is the shared body of the composition-root capability rows:
+// the session must advertise the capability AND actually deliver committed bytes
+// through whatever decorators the root wrapped its journal in. Subscribe-time discovery
+// alone would pass on a decorator that satisfies the interface and then fails to
+// delegate, so the publish is part of the assertion, not garnish.
+func assertCommittedCapability(t *testing.T, s *Session) {
+	t.Helper()
+	source, ok := sessionapi.CommittedPublicEventProvider(s).CommittedPublicEvents()
+	if !ok || source == nil {
+		t.Fatalf("CommittedPublicEvents() = (%v, %t), want a source and true:"+
+			" a composition-root decorator dropped the committed-bytes contract", source, ok)
+	}
+	sub, err := source.SubscribeCommittedPublicEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeCommittedPublicEvents: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Close() })
+
+	if err := s.PublishEvent(context.Background(), event.SessionStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: s.SessionID()},
+		EventID:     mustSessionID(t),
+		CreatedAt:   time.Now().UTC(),
+	}}); err != nil {
+		t.Fatalf("PublishEvent: %v", err)
+	}
+	select {
+	case d, open := <-sub.Events():
+		if !open {
+			t.Fatalf("committed subscription closed: %v", sub.Err())
+		}
+		if !d.Committed() {
+			t.Fatalf("delivery = %+v, want committed canonical bytes", d)
+		}
+		if d.CoveredThrough != d.JournalSeq {
+			t.Errorf("CoveredThrough = %d, want %d", d.CoveredThrough, d.JournalSeq)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("committed subscription delivered nothing")
 	}
 }

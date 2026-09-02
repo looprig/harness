@@ -613,6 +613,24 @@ func activeMutation(ev event.Event) (func(*sessionState), bool) {
 // contract is that every delivery carries them.
 func (h *Hub) deliver(subs []*EventSubscription, ev event.Event, commit event.AppendCommit) {
 	carriesBody := commit.PublishesPublicBody()
+	// Pairing guard. deliver's signature forces a caller to supply A commit, never the
+	// RIGHT one: h.deliver(subs, derived, commit) compiles as readily as the correct
+	// call, and two of the three ways to get it wrong announce themselves (a body-less
+	// commit and a failed append both fail the committed stream). Pairing a DIFFERENT
+	// append's commit is the silent one, and it is precisely the double-identity a
+	// tail-joining consumer cannot survive. The invariant is exact — a public
+	// projection stamps its EventID from the event's own header — so the check is an
+	// equality, and it fails closed for every subscriber rather than describing the
+	// delivery wrongly to any of them.
+	if carriesBody && commit.EventID != ev.EventHeader().EventID.String() {
+		for _, sub := range subs {
+			if !event.ShouldDeliver(sub.filter, ev) {
+				continue
+			}
+			sub.fail(&SubscriptionLossError{DroppedClass: ev.Class(), Cause: ErrCommitEventMismatch})
+		}
+		return
+	}
 	for _, sub := range subs {
 		if !event.ShouldDeliver(sub.filter, ev) {
 			continue

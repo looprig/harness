@@ -45,28 +45,31 @@ func (g *journalAdmissionGate) exitAppend()  { g.mu.RUnlock() }
 func (g *journalAdmissionGate) enterGC()     { g.mu.Lock() }
 func (g *journalAdmissionGate) exitGC()      { g.mu.Unlock() }
 
-// gatedJournal decorates a journal.SessionJournal so every Append acquires the shared
-// admission gate as a reader for the full delegated call. It is wired at the composition
-// root over the one j returned by store.OpenJournal, BEFORE any appender (hub event tap,
-// command intent log, gate-record appender) is built over it — so all of them funnel
-// through this single reader admission (Open/Closed: the journal is not modified; it is
-// wrapped).
-type gatedJournal struct {
-	inner journal.SessionJournal
-	gate  *journalAdmissionGate
+// newGatedJournal decorates a journal.SessionJournal so EVERY append seam acquires the
+// shared admission gate as a reader for the full delegated call. It is wired at the
+// composition root over the one j returned by store.OpenJournal, BEFORE any appender
+// (hub event tap, command intent log, gate-record appender) is built over it — so all of
+// them funnel through this single reader admission (Open/Closed: the journal is not
+// modified; it is wrapped).
+//
+// It delegates the wrapping to journal.Decorate rather than declaring its own type, and
+// that is load-bearing rather than tidiness. This decorator previously exposed Append
+// alone, so arming offload GC silently demoted the real journal to a plain one: the hub
+// lost the deduplication signal and re-broadcast idempotent retries, and the
+// committed-public-event capability did not degrade but VANISHED — a Host adapter asked
+// for it, was told no, and the deployment read as headless. Decorate advertises exactly
+// the contracts the delegate advertises, so the gate cannot amputate one again.
+func newGatedJournal(inner journal.SessionJournal, gate *journalAdmissionGate) journal.SessionJournal {
+	return journal.Decorate(inner, gate.aroundAppend)
 }
 
-// Compile-time proof that the decorator honors the SessionJournal contract.
-var _ journal.SessionJournal = (*gatedJournal)(nil)
-
-func newGatedJournal(inner journal.SessionJournal, gate *journalAdmissionGate) *gatedJournal {
-	return &gatedJournal{inner: inner, gate: gate}
-}
-
-func (g *gatedJournal) Append(ctx context.Context, rec journal.JournalRecord) (uint64, error) {
-	g.gate.enterAppend()
-	defer g.gate.exitAppend()
-	return g.inner.Append(ctx, rec)
+// aroundAppend is the gate's journal.AroundAppend: hold the reader for the whole
+// delegated call, and pass the caller's context through untouched (unlike the hook
+// decorator, the gate has no context of its own to impose).
+func (g *journalAdmissionGate) aroundAppend(ctx context.Context, _ journal.JournalRecord, next func(context.Context) error) error {
+	g.enterAppend()
+	defer g.exitAppend()
+	return next(ctx)
 }
 
 // offloadScanner is the runner's narrow view of the offload GC (Interface Segregation):

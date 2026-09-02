@@ -378,7 +378,9 @@ func (a *committedSessionAppender) AppendEventCommitted(_ context.Context, ev ev
 	}
 	body := []byte(`{"stored":` + strconv.FormatUint(a.seq, 10) + `}`)
 	a.stored[a.seq] = body
-	commit.EventID = "public-" + strconv.FormatUint(a.seq, 10)
+	// Minted from the event's OWN header, as sessionwire.Project does; the hub's
+	// pairing guard rejects a commit whose id belongs to another event.
+	commit.EventID = ev.EventHeader().EventID.String()
 	commit.PublicBody = body
 	commit.CoveredThrough = a.seq
 	return commit, nil

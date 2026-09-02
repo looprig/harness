@@ -114,11 +114,17 @@ type SessionController interface {
 // live bytes as authoritative for any sequence you already hold, and never discard a
 // held body because a read of the same sequence failed.
 //
+// That covers a consumer that was connected. It does NOT cover a cold start or a
+// reconnect: such a consumer never held those bytes, and the reader fails the whole
+// PAGE rather than the one record, so its durable tail is unreadable at that page.
+// Surface it as a bounded gap rather than retrying the same page forever.
+//
 // Second, a subscription on this stream can terminate with *hub.SubscriptionLossError
-// for two DIFFERENT reasons, and they call for opposite responses. Egress overflow is
-// congestion: resubscribe and resync. A loss wrapping hub.ErrCommittedBodyMissing is a
-// broken invariant — the hub delivered an enduring public event with no committed
-// body — and resubscribing loops forever against a hub that cannot satisfy the
+// for DIFFERENT reasons that call for opposite responses. Egress overflow (a nil cause)
+// is congestion: resubscribe and resync. A loss wrapping hub.ErrCommittedBodyMissing or
+// hub.ErrCommitEventMismatch is a broken invariant — an enduring public event delivered
+// without its committed body, or one whose committed append belongs to a different
+// event — and resubscribing loops forever against a hub that cannot satisfy the
 // contract. Check errors.Is before retrying.
 type CommittedPublicEventSource interface {
 	// SubscribeCommittedPublicEvents attaches a consumer to the committed public

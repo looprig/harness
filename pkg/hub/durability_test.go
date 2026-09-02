@@ -200,6 +200,7 @@ type committedAppender struct {
 	stored    map[uint64][]byte
 	dedupe    map[int]bool // 1-based call index -> report Appended=false
 	suppress  map[int]bool // 1-based call index -> commit with no public body
+	foreignID map[int]bool // 1-based call index -> commit carrying ANOTHER event's id
 	calls     int
 	err       error
 }
@@ -238,7 +239,14 @@ func (a *committedAppender) AppendEventCommitted(_ context.Context, ev event.Eve
 	}
 	body := []byte(`{"stored":` + strconv.FormatUint(seq, 10) + `}`)
 	a.stored[seq] = body
-	commit.EventID = "public-" + strconv.FormatUint(seq, 10)
+	// Mint the public id from the event's OWN header, exactly as sessionwire.Project
+	// does. A double that minted an unrelated id (this one used to mint "public-N")
+	// would make every delivery look mis-paired to the hub's pairing guard — and,
+	// worse, would let a real mis-pairing pass unnoticed here.
+	commit.EventID = ev.EventHeader().EventID.String()
+	if a.foreignID[a.calls] {
+		commit.EventID = "00000000-0000-0000-0000-00000000ffff"
+	}
 	commit.PublicBody = body
 	commit.CoveredThrough = seq
 	return commit, nil
@@ -339,8 +347,8 @@ func TestCommittedDeliveryCarriesStoredBodyAndCoverage(t *testing.T) {
 		if d.JournalSeq != 1 {
 			t.Errorf("%s JournalSeq = %d, want 1", name, d.JournalSeq)
 		}
-		if d.EventID != "public-1" {
-			t.Errorf("%s EventID = %q, want %q", name, d.EventID, "public-1")
+		if d.EventID != ev.EventID.String() {
+			t.Errorf("%s EventID = %q, want the event's own committed id %q", name, d.EventID, ev.EventID)
 		}
 		if !bytes.Equal(d.PublicBody, app.storedBody(1)) {
 			t.Errorf("%s PublicBody = %s, want the stored body %s", name, d.PublicBody, app.storedBody(1))
@@ -475,8 +483,15 @@ func TestDerivedSessionEventCarriesCommittedBody(t *testing.T) {
 	if _, ok := derived.Event.(event.SessionActive); !ok {
 		t.Fatalf("second committed delivery = %T, want event.SessionActive", derived.Event)
 	}
-	if derived.JournalSeq != 2 || derived.EventID != "public-2" {
-		t.Errorf("derived delivery seq/id = %d/%q, want 2/%q", derived.JournalSeq, derived.EventID, "public-2")
+	if derived.JournalSeq != 2 {
+		t.Errorf("derived delivery seq = %d, want 2", derived.JournalSeq)
+	}
+	if derived.EventID != derived.Event.EventHeader().EventID.String() {
+		t.Errorf("derived EventID = %q, want its own header id %q",
+			derived.EventID, derived.Event.EventHeader().EventID)
+	}
+	if derived.EventID == first.EventID {
+		t.Errorf("derived carried the triggering event's committed id %q", first.EventID)
 	}
 	if !bytes.Equal(derived.PublicBody, app.storedBody(2)) {
 		t.Errorf("derived PublicBody = %s, want the stored body %s", derived.PublicBody, app.storedBody(2))
@@ -602,5 +617,48 @@ func TestCommittedSubscriptionFailsOnEnduringOverflow(t *testing.T) {
 	// missing-body cause.
 	if errors.Is(committed.Err(), ErrCommittedBodyMissing) {
 		t.Errorf("overflow loss reported ErrCommittedBodyMissing: %v", committed.Err())
+	}
+}
+
+// TestDeliveryFailsClosedOnMispairedCommit pins the pairing guard. deliver takes a
+// commit, and the type system cannot say whether it is the RIGHT commit: pairing a
+// different append's result compiles, and it is the one mis-delivery that announces
+// nothing — the consumer simply receives two deliveries under one (sequence, EventID)
+// and renders one event twice or drops the other as a duplicate.
+//
+// Both streams must fail, not just the committed one. A compatibility subscriber stamps
+// its SSE ids from JournalSeq, so handing it another append's sequence corrupts it too;
+// there is no subscriber the hub may describe a delivery wrongly to.
+func TestDeliveryFailsClosedOnMispairedCommit(t *testing.T) {
+	t.Parallel()
+	sid := mustID(t)
+	app := newCommittedAppender()
+	app.foreignID = map[int]bool{1: true}
+	h := New(sid, WithAppender(app))
+	compat, err := h.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeEvents() error = %v", err)
+	}
+	committed, err := h.SubscribeCommittedPublicEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeCommittedPublicEvents() error = %v", err)
+	}
+
+	if err := h.PublishEvent(context.Background(), sessionEvent(t, sid)); err != nil {
+		t.Fatalf("PublishEvent() error = %v", err)
+	}
+
+	for name, sub := range map[string]*EventSubscription{"compat": compat, "committed": committed} {
+		if !errors.Is(sub.Err(), ErrCommitEventMismatch) {
+			t.Errorf("%s Err() = %v, want ErrCommitEventMismatch", name, sub.Err())
+		}
+		select {
+		case _, open := <-sub.Events():
+			if open {
+				t.Errorf("%s received a delivery carrying another append's identity", name)
+			}
+		default:
+			t.Errorf("%s egress channel is still open after a mis-paired commit", name)
+		}
 	}
 }

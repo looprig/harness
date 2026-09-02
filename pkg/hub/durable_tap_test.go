@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -532,7 +531,7 @@ func TestDerivedSessionIdleCarriesItsOwnCommittedBody(t *testing.T) {
 	// and read from the channel alone that surfaces only as an unexplained close.
 	if err := committed.Err(); err != nil {
 		t.Fatalf("committed subscription failed during publication: %v"+
-			" (an enduring delivery carried no committed public body)", err)
+			" (an enduring delivery was not describable from its own committed append)", err)
 	}
 
 	wants := []struct {
@@ -554,9 +553,9 @@ func TestDerivedSessionIdleCarriesItsOwnCommittedBody(t *testing.T) {
 		if d.JournalSeq != want.seq {
 			t.Errorf("%s JournalSeq = %d, want %d", want.name, d.JournalSeq, want.seq)
 		}
-		wantID := "public-" + strconv.FormatUint(want.seq, 10)
-		if d.EventID != wantID {
-			t.Errorf("%s EventID = %q, want %q", want.name, d.EventID, wantID)
+		if d.EventID != d.Event.EventHeader().EventID.String() {
+			t.Errorf("%s EventID = %q, want its own header id %q",
+				want.name, d.EventID, d.Event.EventHeader().EventID)
 		}
 		if !bytes.Equal(d.PublicBody, app.storedBody(want.seq)) {
 			t.Errorf("%s PublicBody = %s, want the stored body %s", want.name, d.PublicBody, app.storedBody(want.seq))
@@ -597,7 +596,7 @@ func TestCancelExpectTurnDerivedSessionIdleCarriesItsOwnCommittedBody(t *testing
 	// Both calls are synchronous, so a failed committed stream is already visible.
 	if err := committed.Err(); err != nil {
 		t.Fatalf("committed subscription failed during the derived edges: %v"+
-			" (an enduring delivery carried no committed public body)", err)
+			" (an enduring delivery was not describable from its own committed append)", err)
 	}
 
 	active := recvDelivery(t, committed)
@@ -608,8 +607,15 @@ func TestCancelExpectTurnDerivedSessionIdleCarriesItsOwnCommittedBody(t *testing
 	if _, ok := idle.Event.(event.SessionIdle); !ok {
 		t.Fatalf("second delivery = %T, want event.SessionIdle", idle.Event)
 	}
-	if idle.JournalSeq != 2 || idle.EventID != "public-2" {
-		t.Errorf("SessionIdle seq/id = %d/%q, want 2/%q", idle.JournalSeq, idle.EventID, "public-2")
+	if idle.JournalSeq != 2 {
+		t.Errorf("SessionIdle seq = %d, want 2", idle.JournalSeq)
+	}
+	if idle.EventID != idle.Event.EventHeader().EventID.String() {
+		t.Errorf("SessionIdle EventID = %q, want its own header id %q",
+			idle.EventID, idle.Event.EventHeader().EventID)
+	}
+	if idle.EventID == active.EventID {
+		t.Errorf("SessionIdle carried SessionActive's committed id %q", active.EventID)
 	}
 	if !bytes.Equal(idle.PublicBody, app.storedBody(2)) {
 		t.Errorf("SessionIdle PublicBody = %s, want the stored body %s", idle.PublicBody, app.storedBody(2))
