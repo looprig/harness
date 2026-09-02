@@ -339,6 +339,66 @@ func contractMethodSet(contract reflect.Type) []string {
 	return set
 }
 
+// methodSetMatches is the single comparison every shape guard below runs: render
+// the contract, join it, compare against the transcribed want. It is one function
+// so that the drift test exercises the SAME comparison the real guard uses rather
+// than a lookalike that could stay green while the real one rotted.
+func methodSetMatches(contract reflect.Type, want []string) bool {
+	return strings.Join(contractMethodSet(contract), ";") == strings.Join(want, ";")
+}
+
+// lifecycleCapabilityShape names one H4.1 capability and the method set the
+// runbook says it has.
+type lifecycleCapabilityShape struct {
+	name     string
+	contract reflect.Type
+	want     []string
+	// drifted is a fixture with the same intent and a different shape: the edit a
+	// maintainer would coordinate across every site in one gopls action. It exists
+	// so the guard's rejecting half is observed, not assumed.
+	drifted reflect.Type
+}
+
+type renamedReleaser interface {
+	Release(context.Context) error
+}
+
+type polledLiveness interface {
+	Done() bool
+}
+
+type widenedIdleWaiter interface {
+	WaitIdle(context.Context) error
+	WaitBusy(context.Context) error
+}
+
+// lifecycleCapabilityShapes is the H4.1 oracle: the three method sets TRANSCRIBED
+// from runbook 03-harness ("Add separate interfaces"), not read back from the
+// declarations they check. Derived from the implementation it would agree with
+// anything.
+func lifecycleCapabilityShapes() []lifecycleCapabilityShape {
+	return []lifecycleCapabilityShape{
+		{
+			name:     "IdleWaiter",
+			contract: reflect.TypeFor[session.IdleWaiter](),
+			want:     []string{"WaitIdle(context.Context) error"},
+			drifted:  reflect.TypeFor[widenedIdleWaiter](),
+		},
+		{
+			name:     "Liveness",
+			contract: reflect.TypeFor[session.Liveness](),
+			want:     []string{"Done() <-chan struct {}"},
+			drifted:  reflect.TypeFor[polledLiveness](),
+		},
+		{
+			name:     "Releaser",
+			contract: reflect.TypeFor[session.Releaser](),
+			want:     []string{"ReleaseResidency(context.Context) error"},
+			drifted:  reflect.TypeFor[renamedReleaser](),
+		},
+	}
+}
+
 // TestSegregatedLifecycleCapabilityShapes pins the exact method set of each
 // lifecycle capability. The want values are TRANSCRIBED from runbook 03-harness
 // task H4.1, not read back from the types, so this is an oracle rather than a
@@ -352,76 +412,43 @@ func contractMethodSet(contract reflect.Type) []string {
 //     appends SessionStopped, at exactly the boundary where it matters.
 func TestSegregatedLifecycleCapabilityShapes(t *testing.T) {
 	t.Parallel()
-	tests := []struct {
-		name     string
-		contract reflect.Type
-		want     []string
-	}{
-		{
-			name:     "IdleWaiter",
-			contract: reflect.TypeFor[session.IdleWaiter](),
-			want:     []string{"WaitIdle(context.Context) error"},
-		},
-		{
-			name:     "Liveness",
-			contract: reflect.TypeFor[session.Liveness](),
-			want:     []string{"Done() <-chan struct {}"},
-		},
-		{
-			name:     "Releaser",
-			contract: reflect.TypeFor[session.Releaser](),
-			want:     []string{"ReleaseResidency(context.Context) error"},
-		},
-	}
-	for _, tt := range tests {
+	for _, tt := range lifecycleCapabilityShapes() {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			if tt.contract.Kind() != reflect.Interface {
 				t.Fatalf("session.%s kind = %v, want an interface", tt.name, tt.contract.Kind())
 			}
-			got := contractMethodSet(tt.contract)
-			if strings.Join(got, ";") != strings.Join(tt.want, ";") {
-				t.Fatalf("session.%s method set = %v, want %v", tt.name, got, tt.want)
+			if !methodSetMatches(tt.contract, tt.want) {
+				t.Fatalf("session.%s method set = %v, want %v", tt.name, contractMethodSet(tt.contract), tt.want)
 			}
 		})
 	}
 }
 
-// TestLifecycleShapeGuardDetectsDrift exercises the detector the previous test
-// relies on. Without it that guard asserts a property the subject already
-// satisfies, so its comparison would never have been observed to fail.
+// TestLifecycleShapeGuardRejectsDriftedFixtures runs the REAL comparison — the
+// same methodSetMatches, over the same rendering, against the same transcribed
+// want — on a correct subject and a drifted one, and requires opposite verdicts.
 //
-// The two fixtures are the two coordinated edits a maintainer would plausibly
-// make: renaming ReleaseResidency to Release everywhere at once, and changing
-// Done's shape while keeping its name. Both are invisible to the compiler once
-// coordinated; both must be visible here.
-func TestLifecycleShapeGuardDetectsDrift(t *testing.T) {
+// The positive arm is not decoration. An earlier form of this test asserted only
+// that each drifted fixture compared UNEQUAL to the want, and that was
+// tautological: replacing contractMethodSet's body with a constant left every arm
+// green, because degrading the helper never makes an inequality assertion more
+// likely to trip. Measured, not assumed. The positive arm is what couples this
+// test to the helper's fidelity.
+//
+// Each drifted fixture is a coordinated edit the compiler cannot see once every
+// site moves together: renaming ReleaseResidency to Release, replacing Done's
+// broadcast channel with a poll, and widening a capability with a second method.
+func TestLifecycleShapeGuardRejectsDriftedFixtures(t *testing.T) {
 	t.Parallel()
-	type renamedReleaser interface {
-		Release(context.Context) error
-	}
-	type polledLiveness interface {
-		Done() bool
-	}
-	type extraMethodWaiter interface {
-		WaitIdle(context.Context) error
-		WaitBusy(context.Context) error
-	}
-	tests := []struct {
-		name     string
-		fixture  reflect.Type
-		rejected string
-	}{
-		{name: "coordinated rename", fixture: reflect.TypeFor[renamedReleaser](), rejected: "ReleaseResidency(context.Context) error"},
-		{name: "channel becomes poll", fixture: reflect.TypeFor[polledLiveness](), rejected: "Done() <-chan struct {}"},
-		{name: "capability widened", fixture: reflect.TypeFor[extraMethodWaiter](), rejected: "WaitIdle(context.Context) error"},
-	}
-	for _, tt := range tests {
+	for _, tt := range lifecycleCapabilityShapes() {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := contractMethodSet(tt.fixture)
-			if strings.Join(got, ";") == tt.rejected {
-				t.Fatalf("drift fixture %v compared equal to %q; the shape guard cannot detect this edit", got, tt.rejected)
+			if !methodSetMatches(tt.contract, tt.want) {
+				t.Fatalf("the shape comparison rejected the real session.%s (%v); it cannot be trusted to accept anything", tt.name, contractMethodSet(tt.contract))
+			}
+			if methodSetMatches(tt.drifted, tt.want) {
+				t.Fatalf("drifted fixture %v compared equal to %v; the shape guard cannot detect this coordinated edit", contractMethodSet(tt.drifted), tt.want)
 			}
 		})
 	}
@@ -435,30 +462,52 @@ func TestLifecycleShapeGuardDetectsDrift(t *testing.T) {
 // The guard is deliberately superset-plus-exclusion rather than exact equality.
 // Exact equality would also fail on an unrelated, legitimately additive method
 // and would say nothing about WHY; what H4.1 owes is (a) nothing released is
-// lost and (b) none of the three lifecycle methods appears on either view.
+// lost and (b) none of the three lifecycle methods appears on either view. An
+// ADDED implemented method is not a widening "solely for Host": it is an ordinary
+// API addition, and the segregation arm below is what rejects the widening this
+// task actually forbids.
+//
+// The released half compares full SIGNATURES, not names. Names alone let a
+// source-INCOMPATIBLE change to a released method pass: narrowing
+// Interrupt(context.Context) (bool, error) to Interrupt(context.Context) error
+// leaves every name intact, and coordinated with the runtime it compiles.
 func TestSessionControllerNotWidenedForLifecycleCapabilities(t *testing.T) {
 	t.Parallel()
 	dataPlane := reflect.TypeFor[session.Session]()
 	controller := reflect.TypeFor[session.SessionController]()
 
 	// Transcribed from released harness v0.30.2 plus the current data-plane
-	// declaration; source compatibility means every one of these survives.
-	released := map[reflect.Type][]string{
-		dataPlane: {
-			"ActiveLoop", "Compact", "CompactToLoop", "Interrupt", "Loop",
-			"RespondGate", "SessionID", "Submit", "SubmitToLoop", "SubscribeEvents",
-		},
-		controller: {
-			"ActiveLoop", "CheckpointWorkspace", "Compact", "CompactToLoop",
-			"Interrupt", "Loop", "LoopController", "RespondGate", "RestoreWorkspace",
-			"SessionID", "SetActiveLoop", "Shutdown", "Submit", "SubmitToLoop",
-			"SubscribeEvents",
-		},
+	// declaration; source compatibility means every one of these survives with the
+	// signature it shipped with.
+	sessionMethods := []string{
+		"ActiveLoop() loop.Handle",
+		"Compact(context.Context) (uuid.UUID, error)",
+		"CompactToLoop(context.Context, uuid.UUID) (uuid.UUID, error)",
+		"Interrupt(context.Context) (bool, error)",
+		"Loop(uuid.UUID) (loop.Handle, bool)",
+		"RespondGate(context.Context, gate.GateResponse) error",
+		"SessionID() uuid.UUID",
+		"Submit(context.Context, []content.Block) (uuid.UUID, error)",
+		"SubmitToLoop(context.Context, uuid.UUID, []content.Block) (uuid.UUID, error)",
+		"SubscribeEvents(event.EventFilter) (event.Subscription, error)",
 	}
-	for view, names := range released {
-		for _, name := range names {
-			if _, exists := view.MethodByName(name); !exists {
-				t.Errorf("%s lost released method %s", view.Name(), name)
+	controllerMethods := append([]string{
+		"CheckpointWorkspace(context.Context) (workspacestore.Ref, error)",
+		"LoopController(uuid.UUID) (loop.Controller, bool)",
+		"RestoreWorkspace(context.Context, workspacestore.Ref) error",
+		"SetActiveLoop(context.Context, uuid.UUID) error",
+		"Shutdown(context.Context) error",
+	}, sessionMethods...)
+
+	released := map[reflect.Type][]string{dataPlane: sessionMethods, controller: controllerMethods}
+	for view, want := range released {
+		present := make(map[string]bool, view.NumMethod())
+		for _, signature := range contractMethodSet(view) {
+			present[signature] = true
+		}
+		for _, signature := range want {
+			if !present[signature] {
+				t.Errorf("%s no longer declares released method %s; it has %v", view.Name(), signature, contractMethodSet(view))
 			}
 		}
 	}
@@ -527,13 +576,18 @@ func TestLifecycleSatisfactionGuardDetectsAMissingMethod(t *testing.T) {
 // H4.2, and Host's O3.1 step 5 — a registry loser releasing its runtime
 // nonterminally — is blocked behind H4.2, not behind this task.
 //
-// This assertion is expected to FAIL when H4.2 lands. That is its purpose: it is
-// the reminder to promote *sessionruntime.Session into the positive test above.
+// This assertion is expected to FAIL when H4.2 lands. That is its purpose, and the
+// failure MESSAGE carries the instruction, not this comment: a maintainer meeting a
+// red test reads the string the test printed, not the prose above the function.
+//
+// The observation is only that the method now exists. The message says so rather
+// than asserting H4.2 as the cause, because any future type gaining that name
+// would trip it identically.
 func TestProductionSessionDoesNotYetReleaseResidency(t *testing.T) {
 	t.Parallel()
 	production := reflect.TypeFor[*sessionruntime.Session]()
 	if production.Implements(reflect.TypeFor[session.Releaser]()) {
-		t.Fatal("production *sessionruntime.Session now satisfies session.Releaser; H4.2 has landed — move it into TestProductionSessionSatisfiesIdleAndLiveness and delete this gap pin")
+		t.Fatal("production *sessionruntime.Session now declares ReleaseResidency, so it satisfies session.Releaser. If that is H4.2's nonterminal release, move the type into TestProductionSessionSatisfiesIdleAndLiveness and delete this gap pin; if it is anything else, the method name is wrong.")
 	}
 	if _, exists := reflect.TypeFor[session.Releaser]().MethodByName("ReleaseResidency"); !exists {
 		t.Fatal("session.Releaser lost ReleaseResidency; the gap pin above is vacuous")
