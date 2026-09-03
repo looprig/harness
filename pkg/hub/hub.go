@@ -232,22 +232,37 @@ func (h *Hub) publishEvent(ctx context.Context, ev event.Event, checked bool) er
 }
 
 func (h *Hub) publishEventWithActivity(ctx context.Context, ev event.Event, checked, activityReserved bool) error {
-	_, err := h.publishEventWithActivityResult(ctx, ev, checked, activityReserved)
+	_, _, err := h.publishEventWithActivityResult(ctx, ev, checked, activityReserved)
 	return err
+}
+
+// PublishEventCommitted is PublishEventChecked that ALSO reports the primary event's
+// own durable append result. It exists for one caller shape: a publisher that must
+// durably record WHICH record its event committed as — the session's nonterminal
+// residency release, whose SessionResidencyReleased carries the sequence of the
+// workspace checkpoint it is anchored to.
+//
+// The commit describes the PRIMARY event only. A derived SessionActive/SessionIdle
+// carries its own separate append and is never reported here. On a deduplicated
+// retry the commit reports the sequence of the ORIGINAL append with Appended false,
+// so a caller records the same anchor it would have recorded the first time.
+func (h *Hub) PublishEventCommitted(ctx context.Context, ev event.Event) (event.AppendCommit, error) {
+	commit, _, err := h.publishEventWithActivityResult(ctx, ev, true, false)
+	return commit, err
 }
 
 // publishEventWithActivityResult reports whether the primary event reached its
 // durable append independently from any later failure stamping or appending the
 // derived session activity edge.
-func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event, checked, activityReserved bool) (bool, error) {
+func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event, checked, activityReserved bool) (event.AppendCommit, bool, error) {
 	if err := validatePublicPublication(ev); err != nil {
-		return false, err
+		return event.AppendCommit{}, false, err
 	}
 	if err := h.beginPublish(); err != nil {
 		if checked {
-			return false, err
+			return event.AppendCommit{}, false, err
 		}
-		return false, nil
+		return event.AppendCommit{}, false, nil
 	}
 	defer h.finishPublish()
 	if _, mutatesActivity := activeMutation(ev); mutatesActivity && !activityReserved {
@@ -264,9 +279,9 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 			fault := &SessionPersistenceFault{Event: ev, Cause: err}
 			h.reporter.ReportFault(ctx, fault)
 			if checked {
-				return false, fault
+				return event.AppendCommit{}, false, fault
 			}
-			return false, nil
+			return event.AppendCommit{}, false, nil
 		}
 		if !c.Appended {
 			// Deduplicated retry: the underlying journal already indexed this event's
@@ -274,7 +289,7 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 			// applied its state mutation and delivered it live. Report the same success
 			// this call would have reported had it been the original — but apply
 			// nothing and broadcast nothing a second time.
-			return true, nil
+			return c, true, nil
 		}
 		commit = c
 	}
@@ -299,9 +314,9 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 			fault := &SessionPersistenceFault{Event: derived, Cause: err}
 			h.reporter.ReportFault(ctx, fault)
 			if checked {
-				return committed, fault
+				return commit, committed, fault
 			}
-			return committed, nil
+			return commit, committed, nil
 		}
 		derived = withHeader(derived, stamped)
 		// SessionIdle is committed through the narrow native boundary so it can acquire
@@ -324,20 +339,20 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 			h.completeIdleBoundary(idleGeneration, err == nil)
 			if err != nil {
 				if checked {
-					return committed, err
+					return commit, committed, err
 				}
-				return committed, nil
+				return commit, committed, nil
 			}
-			return committed, nil
+			return commit, committed, nil
 		}
 		dc, err := h.appendCommitted(ctx, derived)
 		if err != nil {
 			fault := &SessionPersistenceFault{Event: derived, Cause: err}
 			h.reporter.ReportFault(ctx, fault)
 			if checked {
-				return committed, fault
+				return commit, committed, fault
 			}
-			return committed, nil
+			return commit, committed, nil
 		}
 		derivedCommit = dc
 	}
@@ -350,7 +365,7 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 		h.deliver(subs, derived, derivedCommit)
 		h.signalIdleIfEdge(derived)
 	}
-	return committed, nil
+	return commit, committed, nil
 }
 
 func (h *Hub) observeCommit(ev event.Event) {
@@ -1006,8 +1021,20 @@ func (h *Hub) StopSession(ctx context.Context) {
 	h.deliver(subs, ev, commit)
 }
 
-// AbortSession tears down an unpublished/failed construction without appending or
-// delivering the normal durable SessionStopped lifecycle event.
+// AbortSession closes the hub LOCALLY — clearing activity, forcing the in-memory
+// phase to SessionStopped, waking WaitIdle waiters and failing every subscription
+// with cause — WITHOUT appending or delivering the durable SessionStopped lifecycle
+// event.
+//
+// Two callers need exactly that, and the shared "no append" is why they share this
+// method rather than each growing their own copy:
+//
+//   - an unpublished/failed construction, which must not journal a stop for a
+//     session that never started;
+//   - a NONTERMINAL residency release (cause ErrResidencyReleased), which must not
+//     journal a stop for a session that is still restorable elsewhere.
+//
+// The cause is what tells them apart at a subscriber.
 func (h *Hub) AbortSession(cause error) <-chan struct{} {
 	if cause == nil {
 		cause = ErrSessionStopped

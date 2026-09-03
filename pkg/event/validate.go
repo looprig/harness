@@ -939,6 +939,10 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "SessionIdle", sessionProfile(), true
 	case SessionStopped:
 		return "SessionStopped", sessionProfile(), true
+	case SessionResidencyReleased:
+		// Session-scoped, same shape as SessionStopped: only SessionID set. The
+		// nonterminal counterpart, distinguished by type alone.
+		return "SessionResidencyReleased", sessionProfile(), true
 	case RestoreStarted:
 		// Session-scoped, same shape as SessionStarted: only SessionID set.
 		return "RestoreStarted", sessionProfile(), true

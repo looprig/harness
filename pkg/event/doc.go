@@ -23,6 +23,7 @@ var (
 	_ Event = SessionActive{}
 	_ Event = SessionIdle{}
 	_ Event = SessionStopped{}
+	_ Event = SessionResidencyReleased{}
 	_ Event = HustleStarted{}
 	_ Event = HustleCompleted{}
 	_ Event = HustleFailed{}

@@ -262,7 +262,18 @@ func (s *Session) stopSessionResources(root context.Context, timeout time.Durati
 	}
 }
 
+// stopHub is the TERMINAL hub close: it drains the workflow-activity bridge and then
+// durably appends SessionStopped, making the logical session terminal.
 func (s *Session) stopHub(root context.Context, timeout time.Duration) error {
+	return s.stopHubWith(root, timeout, s.hub.StopSession)
+}
+
+// stopHubWith is the shared hub-close phase. Everything around the close — the bridge
+// drain, the single bounded deadline, the "attempt the transition anyway when the
+// bridge is wedged" rule, and the ShutdownCleanupHubStop reporting — is identical for
+// both teardown modes; close is the only difference, and it is passed in rather than
+// branched on so neither mode can drift away from the other.
+func (s *Session) stopHubWith(root context.Context, timeout time.Duration, close func(context.Context)) error {
 	if s.hub == nil {
 		return nil
 	}
@@ -274,13 +285,13 @@ func (s *Session) stopHub(root context.Context, timeout time.Duration) error {
 			// caller needs the normal teardown attempt even when a retained resource
 			// is ignoring its publication context and blocks the bridge drain.
 			if ctx.Err() != nil {
-				s.hub.StopSession(ctx)
+				close(ctx)
 				return cleanupTimeoutError(ShutdownCleanupHubStop, timeout, ctx.Err())
 			}
 			return err
 		}
 	}
-	s.hub.StopSession(ctx)
+	close(ctx)
 	if err := ctx.Err(); err != nil {
 		return cleanupTimeoutError(ShutdownCleanupHubStop, timeout, err)
 	}

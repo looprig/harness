@@ -211,8 +211,9 @@ type Liveness interface {
 //	releaser, ok := controller.(session.Releaser)
 //
 // and a caller MUST treat a false ok as "this session cannot be released
-// nonterminally", not as an error. That is not hypothetical: the live runtime does
-// not implement it yet.
+// nonterminally", not as an error. The live runtime satisfies it; a wrapper that does
+// not forward the method silently opts its wrapped session out, which is why the
+// discovery result is a capability answer rather than an error.
 type Releaser interface {
 	ReleaseResidency(context.Context) error
 }

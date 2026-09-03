@@ -687,6 +687,7 @@ func TestProductionSessionSatisfiesLifecycleCapabilities(t *testing.T) {
 	}{
 		{name: "IdleWaiter", contract: reflect.TypeFor[session.IdleWaiter]()},
 		{name: "Liveness", contract: reflect.TypeFor[session.Liveness]()},
+		{name: "Releaser", contract: reflect.TypeFor[session.Releaser]()},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -710,39 +711,37 @@ func TestLifecycleSatisfactionGuardDetectsAMissingMethod(t *testing.T) {
 	}
 }
 
-// TestProductionSessionDoesNotYetReleaseResidency pins a KNOWN GAP, in the same
-// spirit as the sessionstore interrupt-settlement pin.
+// TestProductionSessionReleasesResidencyWithTheExactReviewedShape is the successor
+// to the H4.1 gap pin. That pin asserted the production Session did NOT satisfy
+// session.Releaser, and named H4.2 as the task that would make it fail; H4.2 landed,
+// so the assertion is inverted rather than deleted.
 //
-// H4.1 exports capability interfaces over behavior that already exists. WaitIdle
-// and Done do exist on the production Session. A nonterminal residency release
-// does NOT: the only teardown the runtime has is Shutdown, which durably appends
-// SessionStopped and is therefore terminal by construction. Building one is task
-// H4.2, and Host's O3.1 step 5 — a registry loser releasing its runtime
-// nonterminally — is blocked behind H4.2, not behind this task.
-//
-// This assertion is expected to FAIL when H4.2 lands. That is its purpose, and the
-// failure MESSAGE carries the instruction, not this comment: a maintainer meeting a
-// red test reads the string the test printed, not the prose above the function.
-//
-// The observation is only that the method now exists. The message says so rather
-// than asserting H4.2 as the cause, because any future type gaining that name
-// would trip it identically.
-func TestProductionSessionDoesNotYetReleaseResidency(t *testing.T) {
+// TestProductionSessionSatisfiesLifecycleCapabilities already checks satisfaction for
+// all three capabilities. What is kept HERE is the part that test does not do: the
+// vacuity guard. Implements() is only worth reading if session.Releaser still has the
+// shape the oracle table pins, because a Releaser narrowed to a context-less
+// ReleaseResidency() error would be a different contract that a *different* method
+// could satisfy.
+func TestProductionSessionReleasesResidencyWithTheExactReviewedShape(t *testing.T) {
 	t.Parallel()
-	production := reflect.TypeFor[*sessionruntime.Session]()
-	if production.Implements(reflect.TypeFor[session.Releaser]()) {
-		t.Fatal("production *sessionruntime.Session now declares ReleaseResidency, so it satisfies session.Releaser. If that is H4.2's nonterminal release, add it to TestProductionSessionSatisfiesLifecycleCapabilities and delete this gap pin; if it is anything else, the method name is wrong.")
-	}
-	// Vacuity guard: the pin above says nothing if Releaser no longer has the shape
-	// it is pinning the absence of. It compares the full signature, not the name,
-	// so a Releaser narrowed to a context-less ReleaseResidency() error — a
-	// different contract that the production type would also fail to satisfy —
-	// cannot keep this pin looking meaningful.
 	shape := lifecycleCapabilityShapes()[2]
 	if shape.name != "Releaser" {
 		t.Fatalf("oracle table reordered: entry 2 is %s, not Releaser", shape.name)
 	}
 	if !methodSetMatches(t, reflect.TypeFor[session.Releaser](), shape.want) {
-		t.Fatalf("session.Releaser = %v, want %v; the gap pin above is vacuous", contractMethodSet(t, reflect.TypeFor[session.Releaser]()), shape.want)
+		t.Fatalf("session.Releaser = %v, want %v; the satisfaction assertion below would be vacuous", contractMethodSet(t, reflect.TypeFor[session.Releaser]()), shape.want)
+	}
+	production := reflect.TypeFor[*sessionruntime.Session]()
+	if !production.Implements(reflect.TypeFor[session.Releaser]()) {
+		t.Fatalf("production *sessionruntime.Session does not satisfy session.Releaser; it has %v", contractMethodSet(t, production))
+	}
+	// The release must remain SEGREGATED: a caller discovers it by assertion, so it
+	// must not have been folded onto the base contracts. That is what makes a session
+	// that cannot release nonterminally reportable as ok == false rather than as a
+	// method that returns an error.
+	for _, view := range []reflect.Type{reflect.TypeFor[session.Session](), reflect.TypeFor[session.SessionController]()} {
+		if _, exists := view.MethodByName("ReleaseResidency"); exists {
+			t.Errorf("%s exposes ReleaseResidency; it must stay segregated", view.Name())
+		}
 	}
 }

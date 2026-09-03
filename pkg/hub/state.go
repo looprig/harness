@@ -23,6 +23,12 @@ const (
 // with no additional context fields.
 var ErrSessionStopped = errors.New("hub: session stopped")
 
+// ErrResidencyReleased is the AbortSession cause a session passes when it gives up
+// its residency NONTERMINALLY. It reaches subscribers as the subscription loss cause,
+// so a consumer can tell "this process released the session" apart from
+// "construction failed" and from the terminal ErrSessionStopped.
+var ErrResidencyReleased = errors.New("hub: session residency released")
+
 // activityKind distinguishes outstanding work so a busy loop, a pending hand-back,
 // and a blocking hustle with the same uuid coexist as distinct set entries.
 type activityKind uint8

@@ -35,6 +35,8 @@ func classify(value any) EventClass {
 		return PublicEnduring
 	case event.SessionStopped:
 		return PublicEnduring
+	case event.SessionResidencyReleased:
+		return PublicEnduring
 	case event.RestoreStarted:
 		return PublicEnduring
 	case event.RestoreDone:

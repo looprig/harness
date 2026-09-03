@@ -106,5 +106,6 @@ func (r *TurnStartReservation) publishTurnStarted(ctx context.Context, started e
 		r.mu.Unlock()
 		r.hub.activityMu.Unlock()
 	}()
-	return r.hub.publishEventWithActivityResult(ctx, started, mode == turnStartPublicationChecked, true)
+	_, committed, err := r.hub.publishEventWithActivityResult(ctx, started, mode == turnStartPublicationChecked, true)
+	return committed, err
 }

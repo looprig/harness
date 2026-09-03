@@ -80,6 +80,24 @@ const (
 	StateStopped SessionState = "stopped"
 )
 
+// SessionResidency is the catalog's record of whether some process currently holds
+// this session's runtime. It is an axis INDEPENDENT of SessionStatus/SessionState:
+// an idle session may be resident or cold, and a cold session may be either
+// restorable or terminal. Reading residency as terminality is the exact confusion
+// SessionResidencyReleased exists to prevent.
+type SessionResidency string
+
+const (
+	// ResidencyResident marks a session some process holds the runtime for (set by
+	// SessionStarted and by RestoreDone).
+	ResidencyResident SessionResidency = "resident"
+	// ResidencyCold marks a session no process is resident for. BOTH a nonterminal
+	// SessionResidencyReleased and a terminal SessionStopped set it, so residency
+	// alone never distinguishes a released session from a stopped one — Status/State
+	// carry that.
+	ResidencyCold SessionResidency = "cold"
+)
+
 // SessionMeta is the derived per-session catalog entry: the small, replay-free record the
 // session picker reads to list sessions without opening a single ledger cursor. It is
 // JSON (snake_case) stored one-per-session in storage.KV, keyed by the session's ledger
@@ -111,6 +129,10 @@ type SessionMeta struct {
 	// ConfigFingerprint is the config identity the session started under, for the picker
 	// to surface a config change on restore.
 	ConfigFingerprint event.ConfigFingerprint `json:"config_fingerprint,omitzero"`
+	// Residency records whether a process holds this session's runtime. Empty until
+	// the fold sees its first residency-bearing event, so an entry written before the
+	// field existed reads as the empty residency rather than claiming either value.
+	Residency SessionResidency `json:"residency,omitempty"`
 	// State is the status-fold lifecycle state (running/waiting_on_gate/idle/failed/
 	// interrupted/stopped). It supersedes Status for richer callers; Status is retained
 	// for back-compat. Empty until the fold sees its first state-bearing event.
@@ -524,7 +546,10 @@ type EventReplayerOpener interface {
 //   - StepDone: records LastStep, bumps LastActiveAt.
 //   - RestoreDone: bump LastActiveAt.
 //   - LoopStarted: increment LoopCount.
-//   - SessionStopped: flip Status to stopped, State=stopped (the terminal state wins).
+//   - SessionStopped: flip Status to stopped, State=stopped (the terminal state wins),
+//     Residency=cold.
+//   - SessionResidencyReleased: Residency=cold ONLY — nonterminal, so Status/State are
+//     left exactly as they were.
 //   - anything else: no-op (returns changed=false).
 //
 // Every event that changes the entry also advances LastJournalSeq to max(current, seq) —
@@ -541,6 +566,7 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 		meta.AgentKind = e.Config.AgentKind
 		meta.Status = StatusActive
 		meta.State = StateIdle
+		meta.Residency = ResidencyResident
 		if meta.LoopCount < 1 {
 			meta.LoopCount = 1
 		}
@@ -604,6 +630,7 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 	case event.RestoreDone:
 		meta.SessionID = e.SessionID
 		meta.LastActiveAt = now()
+		meta.Residency = ResidencyResident
 	case event.LoopStarted:
 		meta.SessionID = e.SessionID
 		meta.LoopCount++
@@ -628,6 +655,13 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 		meta.SessionID = e.SessionID
 		meta.Status = StatusStopped
 		meta.State = StateStopped
+		meta.Residency = ResidencyCold
+	case event.SessionResidencyReleased:
+		// Residency ONLY. Status and State are deliberately untouched: the releasing
+		// process gave up the runtime, it did not end the session, and a projection
+		// that also moved Status here would make a restorable session unopenable.
+		meta.SessionID = e.SessionID
+		meta.Residency = ResidencyCold
 	case event.WorkspaceCheckpointed:
 		meta.SessionID = e.SessionID
 		if meta.LastCheckpoint.EventID.IsZero() || seq > meta.LastCheckpoint.Seq {

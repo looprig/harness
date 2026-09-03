@@ -474,6 +474,8 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"SessionActive", SessionActive{Header: fullHeaderSession()}},
 		{"SessionIdle", SessionIdle{Header: fullHeaderSession()}},
 		{"SessionStopped", SessionStopped{Header: fullHeaderSession()}},
+		{"SessionResidencyReleased", SessionResidencyReleased{Header: fullHeaderSession(), CheckpointSeq: 4242, LeaseEpoch: 9}},
+		{"SessionResidencyReleased zero payload", SessionResidencyReleased{Header: fullHeaderSession()}},
 		{"HustleStarted", HustleStarted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(ModelRuntime{})}},
 		{"HustleCompleted", HustleCompleted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Duration: time.Second, Usage: &content.Usage{InputTokens: 2, OutputTokens: 1}}},
 		{"HustleFailed", HustleFailed{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Duration: time.Second, Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference, Usage: &content.Usage{InputTokens: 2, OutputTokens: 1}}},

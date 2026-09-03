@@ -909,13 +909,23 @@ func (s *Session) PublishEvent(ctx context.Context, ev event.Event) error {
 // acceptance, public gate open/resolve transitions, and native checkpoint boundaries
 // use it to receive append failures directly while retaining durable-first fan-out.
 func (s *Session) PublishEventChecked(ctx context.Context, ev event.Event) error {
-	if err := s.hub.PublishEventChecked(ctx, ev); err != nil {
-		return err
+	_, err := s.publishCheckedCommitted(ctx, ev)
+	return err
+}
+
+// publishCheckedCommitted is PublishEventChecked that also reports the durable append
+// result. Only a caller that must record WHICH record its event committed as needs it —
+// today the nonterminal residency release, whose SessionResidencyReleased carries the
+// sequence of the workspace checkpoint it is anchored to.
+func (s *Session) publishCheckedCommitted(ctx context.Context, ev event.Event) (event.AppendCommit, error) {
+	commit, err := s.hub.PublishEventCommitted(ctx, ev)
+	if err != nil {
+		return event.AppendCommit{}, err
 	}
 	s.recordForeignDeliveryFold(ev)
 	s.recordLoopMechanicalState(ev)
 	s.clearReviewTurnState(ev)
-	return nil
+	return commit, nil
 }
 
 func (s *Session) foreignServicesForTrackedWithController(loopID uuid.UUID, controller tool.DelegateController) (foreign.Services, *foreignDeliveryHook) {
@@ -2784,15 +2794,21 @@ type shutdownTarget struct {
 //     rather than aborting the whole Shutdown. A loop already exited is skipped.
 //  4. Wait for every recorded ack, then join hustle terminal audit, finalizers,
 //     and blocking activity release through Controller.Drained.
-//  5. Stop/join checkpoints and offload GC, append SessionStopped/stop the hub,
-//     release root/session leases, and cancel sessionCtx last.
+//  5. Stop/join checkpoints and offload GC, terminate session resources, append
+//     SessionStopped/stop the hub, release root/session leases, and cancel sessionCtx
+//     last.
 //  6. Loop/checkpoint/hub phases have private deadlines derived from validated
 //     component bounds. Hustle audit, finalization, and worker drain use their own
 //     trusted inner bounds and are always joined; an outer deadline never detaches
 //     owned cleanup. Caller cancellation is diagnostic only.
 //
 // Concurrent and repeated calls join one teardown owner and receive the same cleanup
-// result, augmented with each caller's own context error after cleanup completes.
+// result, augmented with each caller's own context error after cleanup completes. That
+// owner is shared with ReleaseResidency, so a session is either stopped or released,
+// never both.
+//
+// Steps 1-5 are Session.teardown, the sequence both teardown modes run; Shutdown
+// supplies only the terminal plan (terminalTeardown).
 func (s *Session) Shutdown(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -2800,15 +2816,84 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	if hustleFinalizerOwnsSession(ctx, s) {
 		return &HustleShutdownReentryError{}
 	}
+	owner, wait, err := s.beginTeardown(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if !owner {
+		return shutdownResult(wait(), ctx.Err())
+	}
+	cleanupErr := s.teardown(terminalTeardown(s))
+	s.finishTeardown(cleanupErr)
+	return shutdownResult(cleanupErr, ctx.Err())
+}
+
+// teardownPlan is the parameterization of the ONE teardown sequence (Session.teardown)
+// across its two modes: the terminal Shutdown and the nonterminal residency release.
+// There is deliberately no second copy of the sequence — the two modes differ only at
+// the seams below, and every other phase, ordering and deadline is shared.
+//
+// The fields are unexported AND the only way to build one is newTeardownPlan, which
+// takes every seam positionally with no defaults. That is the point, and it is a
+// mechanism rather than a convention: adding a seam changes newTeardownPlan's
+// signature, so BOTH modes stop compiling until each has stated what it does there. A
+// struct literal with omittable fields would instead let a new seam default to nil in
+// whichever mode the author was not thinking about — which is exactly how two copies
+// of a sequence start drifting.
+type teardownPlan struct {
+	// beforeHubClose runs after the loops, hustles, checkpoint controller and session
+	// resources have stopped and BEFORE the hub closes, so it is the last point at
+	// which this session can durably append. The residency release takes and records
+	// its anchoring checkpoint here; the terminal shutdown has nothing to do.
+	beforeHubClose func(context.Context) error
+	// closeHub closes the hub on the session-owned deadline. This is the ONE place the
+	// two modes genuinely diverge: the terminal shutdown appends SessionStopped, the
+	// residency release closes locally and appends nothing.
+	closeHub func(context.Context, time.Duration) error
+}
+
+// newTeardownPlan is the ONLY constructor for a teardown plan. Every seam is required;
+// a mode that does nothing at a seam passes noTeardownStep and thereby says so.
+func newTeardownPlan(
+	beforeHubClose func(context.Context) error,
+	closeHub func(context.Context, time.Duration) error,
+) teardownPlan {
+	return teardownPlan{beforeHubClose: beforeHubClose, closeHub: closeHub}
+}
+
+// noTeardownStep is the explicit "this mode has nothing to do here" seam value. It is a
+// real function rather than nil so a plan is never partially specified by omission.
+func noTeardownStep(context.Context) error { return nil }
+
+// terminalTeardown is Shutdown's plan: nothing to append before the close, and a hub
+// stop that durably appends SessionStopped and makes the logical session terminal.
+func terminalTeardown(s *Session) teardownPlan {
+	return newTeardownPlan(noTeardownStep, s.stopHub)
+}
+
+// beginTeardown elects the single teardown owner. admit (nil for Shutdown, which is
+// unconditional) runs OUTSIDE the election, before it: a refused admission must leave
+// the session exactly as it was, so it must not have latched anything. A caller that
+// arrives once teardown is already underway joins the elected owner and never runs
+// admit at all — a session being torn down is not idle-admissible, and re-checking
+// would turn "someone else already released this" into a spurious refusal.
+//
+// The owner gets (true, nil, nil) and MUST call finishTeardown. Every other caller gets
+// (false, wait, nil) and reports the owner's result.
+func (s *Session) beginTeardown(ctx context.Context, admit func(context.Context) error) (bool, func() error, error) {
+	if wait, joined := s.joinTeardown(); joined {
+		return false, wait, nil
+	}
+	if admit != nil {
+		if err := admit(ctx); err != nil {
+			return false, nil, err
+		}
+	}
 	s.shutdownMu.Lock()
 	if s.shutdownStarted {
-		cleanupDone := s.cleanupDone
+		wait := s.joinTeardownLocked()
 		s.shutdownMu.Unlock()
-		<-cleanupDone
-		s.shutdownMu.Lock()
-		cleanupErr := s.shutdownErr
-		s.shutdownMu.Unlock()
-		return shutdownResult(cleanupErr, ctx.Err())
+		return false, wait, nil
 	}
 	s.shutdownStarted = true
 	s.cleanupDone = make(chan struct{})
@@ -2824,20 +2909,50 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	}
 	close(s.done)
 	s.shutdownMu.Unlock()
+	return true, nil, nil
+}
 
-	cleanupErr := s.shutdown()
+func (s *Session) joinTeardown() (func() error, bool) {
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
+	if !s.shutdownStarted {
+		return nil, false
+	}
+	return s.joinTeardownLocked(), true
+}
+
+func (s *Session) joinTeardownLocked() func() error {
+	cleanupDone := s.cleanupDone
+	return func() error {
+		<-cleanupDone
+		s.shutdownMu.Lock()
+		defer s.shutdownMu.Unlock()
+		return s.shutdownErr
+	}
+}
+
+// finishTeardown publishes the owner's cleanup result to every joined caller.
+func (s *Session) finishTeardown(cleanupErr error) {
 	s.shutdownMu.Lock()
 	s.shutdownErr = cleanupErr
 	close(s.cleanupDone)
 	s.shutdownMu.Unlock()
-	return shutdownResult(cleanupErr, ctx.Err())
 }
 
-func (s *Session) shutdown() error {
-	shutdownRoot := context.Background()
-	if s.sessionCtx != nil {
-		shutdownRoot = context.WithoutCancel(s.sessionCtx)
-	}
+// teardownRoot is the FRESH internal context every teardown phase runs under. It is
+// deliberately not context.WithoutCancel(s.sessionCtx): that retained every value the
+// construction caller happened to attach — a request scope, an auth principal — for as
+// long as teardown ran, including inside the background cleanup goroutine
+// stopSessionResources leaves running past its own reporting deadline. The approved
+// carry set is empty today, so nothing is forwarded; this function is the one place a
+// field would be added if one were ever approved.
+func (s *Session) teardownRoot() context.Context {
+	return context.Background()
+}
+
+// teardown is the single session teardown sequence, parameterized by plan.
+func (s *Session) teardown(plan teardownPlan) error {
+	cleanupRoot := s.teardownRoot()
 	// Serialize the closing latch with SetActiveLoop's durable append→visibility
 	// transaction. Once closing is visible, no active-loop change may start.
 	s.activeMu.Lock()
@@ -2864,31 +2979,34 @@ func (s *Session) shutdown() error {
 	// runtime begins its own drain, so in-flight classifier calls observe
 	// cancellation as early as possible.
 	s.shutdownPermissionReviews()
-	failures := make([]error, 0, 7)
-	failures = append(failures, s.closeHustles(shutdownRoot, timeouts.hustle))
-	targets, sendErr := s.sendLoopShutdowns(shutdownRoot, snapshot, timeouts.loopSend)
+	failures := make([]error, 0, 9)
+	failures = append(failures, s.closeHustles(cleanupRoot, timeouts.hustle))
+	targets, sendErr := s.sendLoopShutdowns(cleanupRoot, snapshot, timeouts.loopSend)
 	failures = append(failures, sendErr)
-	failures = append(failures, s.waitLoopShutdowns(shutdownRoot, snapshot, targets, timeouts.loopDrain))
+	failures = append(failures, s.waitLoopShutdowns(cleanupRoot, snapshot, targets, timeouts.loopDrain))
 	s.waitHustlesDrained()
 	// The broker waits for already-admitted calls to release before its endpoint
 	// is removed. Its admission/I/O deadlines are separate from MessageAgent's
 	// response observation deadline.
-	failures = append(failures, s.closeCollabBrokerWithTimeout(shutdownRoot, timeouts.collabBroker))
+	failures = append(failures, s.closeCollabBrokerWithTimeout(cleanupRoot, timeouts.collabBroker))
 
 	// From here onward every phase gets a fresh private deadline. A timeout in one
 	// component therefore cannot suppress checkpoint, durable-stop, or lease cleanup.
 	s.stopOffloadGC()
-	failures = append(failures, s.stopCheckpoints(shutdownRoot, timeouts.checkpoint))
+	failures = append(failures, s.stopCheckpoints(cleanupRoot, timeouts.checkpoint))
 	// Session resources (including the process registry) must fully terminate and
 	// confirm before the hub stops and the leases/session context release: their own
 	// Shutdown is where a live supervised process is actually stopped and its final
 	// lifecycle/completion record durably published, and that publication still needs
 	// a live hub to reach durably (see stopHub below, which only runs after this
 	// returns).
-	failures = append(failures, s.stopSessionResources(shutdownRoot, timeouts.sessionResources))
-	failures = append(failures, s.stopHub(shutdownRoot, timeouts.hub))
-	s.releaseRootLease(shutdownRoot)
-	s.releaseLease(shutdownRoot)
+	failures = append(failures, s.stopSessionResources(cleanupRoot, timeouts.sessionResources))
+	// The last point at which this session may durably append: the hub is still open
+	// and every producer of new work has stopped.
+	failures = append(failures, plan.beforeHubClose(cleanupRoot))
+	failures = append(failures, plan.closeHub(cleanupRoot, timeouts.hub))
+	s.releaseRootLease(cleanupRoot)
+	s.releaseLease(cleanupRoot)
 	if s.sessionCancel != nil {
 		s.sessionCancel()
 	}

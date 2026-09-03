@@ -40,6 +40,23 @@ func (s *Session) CheckpointWorkspace(ctx context.Context) (workspacestore.Ref, 
 	if s.checkpoints != nil {
 		return s.checkpoints.manual(ctx)
 	}
+	ref, _, err := s.snapshotWorkspaceDirect(ctx, false)
+	return ref, err
+}
+
+// snapshotWorkspaceDirect is the controller-free manual checkpoint: acquire the
+// workspace permit, snapshot, stamp, publish. It is shared by CheckpointWorkspace's
+// no-controller branch (checked=false — the historic behaviour) and by the nonterminal
+// residency release (checked=true), which runs AFTER the checkpoint controller has
+// already been stopped and therefore cannot go through it.
+//
+// checked selects the publication contract, and the difference matters to exactly one
+// caller. The unchecked path is the hub's fault-and-continue tap: an append failure
+// faults the session and returns nil, so no sequence is reported and the returned
+// sequence is always zero. The checked path returns the append failure to the caller
+// and reports the sequence the record committed as — which is what the release needs
+// to anchor its SessionResidencyReleased to a checkpoint that actually exists.
+func (s *Session) snapshotWorkspaceDirect(ctx context.Context, checked bool) (workspacestore.Ref, uint64, error) {
 	// When a placement coordinator is wired, hold the exclusive checkpoint permit around
 	// the snapshot so no managed mutation overlaps the walk — that is what makes the
 	// recorded ref honestly quiescent for exclusive/per-session roots. The bare
@@ -47,11 +64,11 @@ func (s *Session) CheckpointWorkspace(ctx context.Context) (workspacestore.Ref, 
 	if s.wsCoordinator != nil {
 		permit, err := s.wsCoordinator.Acquire(ctx, tool.WorkspaceOperationCheckpoint, "")
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
 		defer permit.Release()
 		if err := s.wsCoordinator.Healthy(); err != nil {
-			return "", err
+			return "", 0, err
 		}
 	}
 	// Snapshot first: on success the archive bytes are durable in Blobs before we append
@@ -59,14 +76,14 @@ func (s *Session) CheckpointWorkspace(ctx context.Context) (workspacestore.Ref, 
 	// error (e.g. *SnapshotError), returned unwrapped so the caller can errors.As it.
 	ref, err := s.ws.Snapshot(ctx, s.wsRoot)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	// Stamp the event's EventID + CreatedAt through the session Factory (same seam as
 	// SessionStarted/LoopStarted). A crypto/rand failure fails the checkpoint cleanly
 	// before publishing a zero-EventID event — mirrors newLoop's stamp-failure mapping.
 	stamped, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{SessionID: s.sessionID}})
 	if err != nil {
-		return "", &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
+		return "", 0, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 	}
 	// A manual checkpoint carries Trigger=Manual (zero Cause). Consistency reflects the
 	// placement: shared roots admit external writers, so they are honestly fuzzy; exclusive
@@ -78,15 +95,23 @@ func (s *Session) CheckpointWorkspace(ctx context.Context) (workspacestore.Ref, 
 	// Publish on the passed ctx (this method has a real caller ctx, unlike newLoop which
 	// publishes on the session lifetime). The Enduring event takes the hub's durable-tap
 	// branch: appended before fan-out, faulting the session on append failure.
-	if err := s.PublishEvent(ctx, event.WorkspaceCheckpointed{
+	checkpointed := event.WorkspaceCheckpointed{
 		Header:      stamped,
 		Ref:         string(ref),
 		Consistency: consistency,
 		Trigger:     event.SnapshotTriggerManual,
-	}); err != nil {
-		return "", &SessionError{Kind: SessionContextDone, Cause: err}
 	}
-	return ref, nil
+	if !checked {
+		if err := s.PublishEvent(ctx, checkpointed); err != nil {
+			return "", 0, &SessionError{Kind: SessionContextDone, Cause: err}
+		}
+		return ref, 0, nil
+	}
+	commit, err := s.publishCheckedCommitted(ctx, checkpointed)
+	if err != nil {
+		return "", 0, err
+	}
+	return ref, commit.Sequence, nil
 }
 
 // recordSeedCheckpoint journals a WorkspaceCheckpointed for the materialized seed ref as
