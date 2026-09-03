@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/looprig/core/content"
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/tool"
@@ -1080,16 +1081,55 @@ const (
 	maxToolResultCapturesPerStep = maxMessagesPerStep - 1
 )
 
-// UnmarshalJSON keeps each capture entry a closed privacy boundary. New public
-// metadata must be added deliberately; unknown siblings such as signed_url,
-// raw_output, credentials, or backend_key are rejected rather than retained or
-// proxied into a later public journal write. ObjectReference applies Core's
-// narrower redaction-boundary decoder to the nested logical reference itself.
+// toolResultCaptureWire is the explicit allowlist for capture metadata that may
+// enter the public journal. New exported fields on ToolResultCapture are not
+// relayed unless they are deliberately added here.
+type toolResultCaptureWire struct {
+	ToolExecutionID         uuid.UUID                    `json:"tool_execution_id"`
+	ToolUseID               string                       `json:"tool_use_id"`
+	Reference               *sessionwire.ObjectReference `json:"reference,omitempty"`
+	CapturedBytes           uint64                       `json:"captured_bytes"`
+	OriginalBytes           json.RawMessage              `json:"original_bytes"`
+	OriginalBytesLowerBound uint64                       `json:"original_bytes_lower_bound,omitempty"`
+	Truncated               bool                         `json:"truncated"`
+	TruncationReason        ToolResultTruncationReason   `json:"truncation_reason,omitempty"`
+	Encoding                ToolResultEncoding           `json:"encoding"`
+}
+
+// MarshalJSON is an explicit allowlist for the public durable capture shape.
+// Adding an exported field to ToolResultCapture cannot make it public without a
+// deliberate corresponding edit here.
+func (c ToolResultCapture) MarshalJSON() ([]byte, error) {
+	originalBytes := json.RawMessage("null")
+	if c.OriginalBytes != nil {
+		encoded, err := json.Marshal(*c.OriginalBytes)
+		if err != nil {
+			return nil, err
+		}
+		originalBytes = encoded
+	}
+	return json.Marshal(toolResultCaptureWire{
+		ToolExecutionID:         c.ToolExecutionID,
+		ToolUseID:               c.ToolUseID,
+		Reference:               c.Reference,
+		CapturedBytes:           c.CapturedBytes,
+		OriginalBytes:           originalBytes,
+		OriginalBytesLowerBound: c.OriginalBytesLowerBound,
+		Truncated:               c.Truncated,
+		TruncationReason:        c.TruncationReason,
+		Encoding:                c.Encoding,
+	})
+}
+
+// UnmarshalJSON keeps each capture entry a closed privacy boundary. Unknown
+// siblings such as signed_url, raw_output, credentials, or backend_key are
+// rejected rather than retained or proxied into a later public journal write.
+// ObjectReference applies Core's narrower redaction-boundary decoder to the
+// nested logical reference itself.
 func (c *ToolResultCapture) UnmarshalJSON(data []byte) error {
-	type captureWire ToolResultCapture
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
-	var decoded captureWire
+	var decoded toolResultCaptureWire
 	if err := decoder.Decode(&decoded); err != nil {
 		return err
 	}
@@ -1099,7 +1139,28 @@ func (c *ToolResultCapture) UnmarshalJSON(data []byte) error {
 		}
 		return err
 	}
-	*c = ToolResultCapture(decoded)
+	if len(decoded.OriginalBytes) == 0 {
+		return errors.New("missing required field original_bytes")
+	}
+	var originalBytes *uint64
+	if !bytes.Equal(bytes.TrimSpace(decoded.OriginalBytes), []byte("null")) {
+		var exact uint64
+		if err := json.Unmarshal(decoded.OriginalBytes, &exact); err != nil {
+			return err
+		}
+		originalBytes = &exact
+	}
+	*c = ToolResultCapture{
+		ToolExecutionID:         decoded.ToolExecutionID,
+		ToolUseID:               decoded.ToolUseID,
+		Reference:               decoded.Reference,
+		CapturedBytes:           decoded.CapturedBytes,
+		OriginalBytes:           originalBytes,
+		OriginalBytesLowerBound: decoded.OriginalBytesLowerBound,
+		Truncated:               decoded.Truncated,
+		TruncationReason:        decoded.TruncationReason,
+		Encoding:                decoded.Encoding,
+	}
 	return nil
 }
 

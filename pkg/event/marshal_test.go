@@ -482,12 +482,15 @@ func TestStepDoneCaptureStrictDecodeAndValidation(t *testing.T) {
 		{name: "invalid empty reference", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","reference":{},"captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`},
 		{name: "invalid original count", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":9,"original_bytes":8,"encoding":"utf-8"}]`},
 		{name: "missing lower bound for unknown original", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`},
+		{name: "absent original count is not explicit null", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","reference":{"object_id":"logical-object"},"captured_bytes":8,"original_bytes_lower_bound":9,"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`},
 		{name: "unknown original lower bound must exceed capture", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":null,"original_bytes_lower_bound":8,"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`},
+		{name: "truncated capture requires object", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":9,"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`},
 		{name: "reason without truncation", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"truncation_reason":"capture_ceiling","encoding":"utf-8"}]`},
 		{name: "unknown reason without truncation", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"truncation_reason":"other","encoding":"utf-8"}]`},
 		{name: "truncation without reason", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":9,"truncated":true,"encoding":"utf-8"}]`},
 		{name: "unknown encoding", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"rot13"}]`},
 		{name: "unknown capture member", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8","raw_output":"secret"}]`},
+		{name: "future signed URL member", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8","signed_url":"https://object.invalid/secret"}]`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -548,25 +551,91 @@ func TestStepDoneCaptureWriteValidation(t *testing.T) {
 		name     string
 		messages content.AgenticMessages
 		captures []ToolResultCapture
+		wantErr  bool
 	}{
+		{name: "full inline capture needs no object", messages: sampleMessages(), captures: []ToolResultCapture{valid}},
+		{name: "truncated capture requires object", messages: sampleMessages(), captures: func() []ToolResultCapture {
+			capture := valid
+			larger := exact + 1
+			capture.OriginalBytes = &larger
+			capture.Truncated = true
+			capture.TruncationReason = ToolResultTruncatedCaptureCeiling
+			return []ToolResultCapture{capture}
+		}(), wantErr: true},
 		{name: "zero tool execution ID", messages: sampleMessages(), captures: func() []ToolResultCapture {
 			capture := valid
 			capture.ToolExecutionID = uuid.UUID{}
 			return []ToolResultCapture{capture}
-		}()},
+		}(), wantErr: true},
 		{name: "invalid reference", messages: sampleMessages(), captures: func() []ToolResultCapture {
 			capture := valid
 			capture.Reference = &sessionwire.ObjectReference{}
 			return []ToolResultCapture{capture}
-		}()},
+		}(), wantErr: true},
 		{name: "missing entry for second result", messages: append(sampleMessages(),
-			&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: "tu-2"}), captures: []ToolResultCapture{valid}},
+			&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: "tu-2"}), captures: []ToolResultCapture{valid}, wantErr: true},
 		{name: "duplicate tool execution ID", messages: append(sampleMessages(),
 			&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: "tu-2"}), captures: func() []ToolResultCapture {
 			duplicate := valid
 			duplicate.ToolUseID = "tu-2"
 			return []ToolResultCapture{valid, duplicate}
-		}()},
+		}(), wantErr: true},
+		{name: "duplicate provider tool use ID with matching cardinality", messages: content.AgenticMessages{
+			aiMsg("two results"),
+			&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: "tu-1"},
+			&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: "tu-2"},
+		}, captures: func() []ToolResultCapture {
+			second := valid
+			second.ToolExecutionID = seededUUID(0x78)
+			return []ToolResultCapture{valid, second}
+		}(), wantErr: true},
+		{name: "lower bound forbidden alongside exact original", messages: sampleMessages(), captures: func() []ToolResultCapture {
+			capture := valid
+			capture.OriginalBytesLowerBound = exact + 1
+			return []ToolResultCapture{capture}
+		}(), wantErr: true},
+		{name: "exact larger than captured requires truncated", messages: sampleMessages(), captures: func() []ToolResultCapture {
+			capture := valid
+			larger := exact + 1
+			capture.OriginalBytes = &larger
+			capture.Reference = &sessionwire.ObjectReference{ObjectID: "logical-object"}
+			return []ToolResultCapture{capture}
+		}(), wantErr: true},
+		{name: "exact equal to captured forbids truncated", messages: sampleMessages(), captures: func() []ToolResultCapture {
+			capture := valid
+			capture.Reference = &sessionwire.ObjectReference{ObjectID: "logical-object"}
+			capture.Truncated = true
+			capture.TruncationReason = ToolResultTruncatedCaptureCeiling
+			return []ToolResultCapture{capture}
+		}(), wantErr: true},
+		{name: "unknown original requires truncated", messages: sampleMessages(), captures: func() []ToolResultCapture {
+			capture := valid
+			capture.OriginalBytes = nil
+			capture.OriginalBytesLowerBound = exact + 1
+			capture.Reference = &sessionwire.ObjectReference{ObjectID: "logical-object"}
+			return []ToolResultCapture{capture}
+		}(), wantErr: true},
+		{name: "empty provider ID", messages: content.AgenticMessages{
+			aiMsg("result"), &content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}},
+		}, captures: func() []ToolResultCapture {
+			capture := valid
+			capture.ToolUseID = ""
+			return []ToolResultCapture{capture}
+		}(), wantErr: true},
+		{name: "invalid UTF-8 provider ID", messages: content.AgenticMessages{
+			aiMsg("result"), &content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: string([]byte{0xff})},
+		}, captures: func() []ToolResultCapture {
+			capture := valid
+			capture.ToolUseID = string([]byte{0xff})
+			return []ToolResultCapture{capture}
+		}(), wantErr: true},
+		{name: "overlimit provider ID", messages: content.AgenticMessages{
+			aiMsg("result"), &content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: strings.Repeat("x", maxToolResultCaptureIDBytes+1)},
+		}, captures: func() []ToolResultCapture {
+			capture := valid
+			capture.ToolUseID = strings.Repeat("x", maxToolResultCaptureIDBytes+1)
+			return []ToolResultCapture{capture}
+		}(), wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -579,12 +648,60 @@ func TestStepDoneCaptureWriteValidation(t *testing.T) {
 					return err
 				}(),
 			} {
+				if !tt.wantErr {
+					if err != nil {
+						t.Errorf("%s error = %v, want nil", operation, err)
+					}
+					continue
+				}
 				var invalid *InvalidEventError
 				if !errors.As(err, &invalid) || invalid.Event != "StepDone" || invalid.Field != FieldCaptures {
 					t.Errorf("%s error = %T %v, want StepDone/Captures invalid", operation, err, err)
 				}
 			}
 		})
+	}
+}
+
+func TestToolResultCaptureHasExplicitMarshalAllowlist(t *testing.T) {
+	t.Parallel()
+	var value any = ToolResultCapture{}
+	if _, ok := value.(json.Marshaler); !ok {
+		t.Error("ToolResultCapture does not implement json.Marshaler; exported future fields would enter the public journal")
+	}
+	capture := ToolResultCapture{
+		ToolExecutionID:         seededUUID(0x77),
+		ToolUseID:               "tu-1",
+		Reference:               &sessionwire.ObjectReference{ObjectID: "logical-object"},
+		CapturedBytes:           8,
+		OriginalBytes:           nil,
+		OriginalBytesLowerBound: 9,
+		Truncated:               true,
+		TruncationReason:        ToolResultTruncatedCaptureCeiling,
+		Encoding:                ToolResultEncodingBinary,
+	}
+	// A controlled mutation adds this hypothetical exported field. Reflection
+	// lets the committed test populate it without making the baseline fail to
+	// compile when the field is absent.
+	if futureUnsafe := reflect.ValueOf(&capture).Elem().FieldByName("SignedURL"); futureUnsafe.IsValid() {
+		futureUnsafe.SetString("future-unsafe-marker")
+	}
+	raw, err := json.Marshal(capture)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	fields := topLevelKeys(t, raw)
+	want := []string{"tool_execution_id", "tool_use_id", "reference", "captured_bytes", "original_bytes", "original_bytes_lower_bound", "truncated", "truncation_reason", "encoding"}
+	if len(fields) != len(want) {
+		t.Fatalf("capture keys = %v, want exactly %v", keysOf(fields), want)
+	}
+	if bytes.Contains(raw, []byte("future-unsafe-marker")) || hasKey(fields, "signed_url") {
+		t.Fatalf("future unsafe exported field entered capture wire: %s", raw)
+	}
+	for _, key := range want {
+		if !hasKey(fields, key) {
+			t.Errorf("capture missing safe key %q: %s", key, raw)
+		}
 	}
 }
 

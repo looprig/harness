@@ -771,6 +771,9 @@ func validateStepDoneCaptures(messages content.AgenticMessages, captures []ToolR
 		if capture.Reference != nil && capture.Reference.Validate() != nil {
 			return invalidStepDoneCaptures()
 		}
+		if capture.Truncated && capture.Reference == nil {
+			return invalidStepDoneCaptures()
+		}
 		if !capture.Encoding.valid() {
 			return invalidStepDoneCaptures()
 		}

@@ -219,20 +219,24 @@ func TestProjectStepDoneCaptureUsesCoreLogicalReference(t *testing.T) {
 	header := event.Header{Coordinates: identity.Coordinates{
 		SessionID: testUUID(1), LoopID: testUUID(2), TurnID: testUUID(3), StepID: testUUID(4),
 	}, EventID: testUUID(5)}
+	capture := event.ToolResultCapture{
+		ToolExecutionID: testUUID(6),
+		ToolUseID:       "call-1",
+		Reference:       &coresessionwire.ObjectReference{ObjectID: "logical-capture-1"},
+		CapturedBytes:   exact,
+		OriginalBytes:   &exact,
+		Encoding:        event.ToolResultEncodingUTF8,
+	}
+	if futureUnsafe := reflect.ValueOf(&capture).Elem().FieldByName("SignedURL"); futureUnsafe.IsValid() {
+		futureUnsafe.SetString("future-unsafe-marker")
+	}
 	step := event.StepDone{
 		Header: header,
 		Messages: content.AgenticMessages{
 			&content.AIMessage{Message: content.Message{Role: content.RoleAssistant}},
 			&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: "call-1"},
 		},
-		Captures: []event.ToolResultCapture{{
-			ToolExecutionID: testUUID(6),
-			ToolUseID:       "call-1",
-			Reference:       &coresessionwire.ObjectReference{ObjectID: "logical-capture-1"},
-			CapturedBytes:   exact,
-			OriginalBytes:   &exact,
-			Encoding:        event.ToolResultEncodingUTF8,
-		}},
+		Captures: []event.ToolResultCapture{capture},
 	}
 	got, err := Project("tenant-a", "public-session", step)
 	if err != nil {
@@ -252,7 +256,7 @@ func TestProjectStepDoneCaptureUsesCoreLogicalReference(t *testing.T) {
 	if objectID := body.Captures[0].Reference["object_id"]; string(objectID) != `"logical-capture-1"` {
 		t.Fatalf("projected object_id = %s", objectID)
 	}
-	for _, forbidden := range []string{"signed_url", "backend_key", "credential", "raw_output"} {
+	for _, forbidden := range []string{"signed_url", "backend_key", "credential", "raw_output", "future-unsafe-marker"} {
 		if bytes.Contains(got.Body, []byte(forbidden)) {
 			t.Errorf("public StepDone capture contains forbidden field %q: %s", forbidden, got.Body)
 		}
