@@ -2840,22 +2840,39 @@ func (s *Session) Shutdown(ctx context.Context) error {
 // struct literal with omittable fields would instead let a new seam default to nil in
 // whichever mode the author was not thinking about — which is exactly how two copies
 // of a sequence start drifting.
+//
+// The two seams take DIFFERENT budget types on purpose. Both are a duration in
+// substance, so an all-positional list of two identically-shaped funcs could be
+// transposed silently — and a transposed plan would append into a closed hub and close
+// the hub twice. checkpointBudget is a distinct named type, so the mistake does not
+// compile. Keep any future seam's budget distinct for the same reason.
 type teardownPlan struct {
 	// beforeHubClose runs after the loops, hustles, checkpoint controller and session
 	// resources have stopped and BEFORE the hub closes, so it is the last point at
 	// which this session can durably append. The residency release takes and records
 	// its anchoring checkpoint here; the terminal shutdown has nothing to do.
-	beforeHubClose func(context.Context) error
+	//
+	// It takes a budget because it is a PHASE like every other one below the
+	// "fresh private deadline" comment in teardown, and the work behind it — a
+	// workspace permit acquire, a snapshot, and a durable append — is unbounded
+	// otherwise. A seam that could not be bounded would make that comment false.
+	beforeHubClose func(context.Context, checkpointBudget) error
 	// closeHub closes the hub on the session-owned deadline. This is the ONE place the
 	// two modes genuinely diverge: the terminal shutdown appends SessionStopped, the
 	// residency release closes locally and appends nothing.
 	closeHub func(context.Context, time.Duration) error
 }
 
+// checkpointBudget is the private deadline the teardown kernel gives its pre-close
+// seam. It is a named type distinct from the hub-close timeout ONLY so the two
+// same-shaped seams cannot be transposed in newTeardownPlan's positional argument
+// list; it carries a plain duration.
+type checkpointBudget time.Duration
+
 // newTeardownPlan is the ONLY constructor for a teardown plan. Every seam is required;
 // a mode that does nothing at a seam passes noTeardownStep and thereby says so.
 func newTeardownPlan(
-	beforeHubClose func(context.Context) error,
+	beforeHubClose func(context.Context, checkpointBudget) error,
 	closeHub func(context.Context, time.Duration) error,
 ) teardownPlan {
 	return teardownPlan{beforeHubClose: beforeHubClose, closeHub: closeHub}
@@ -2863,7 +2880,7 @@ func newTeardownPlan(
 
 // noTeardownStep is the explicit "this mode has nothing to do here" seam value. It is a
 // real function rather than nil so a plan is never partially specified by omission.
-func noTeardownStep(context.Context) error { return nil }
+func noTeardownStep(context.Context, checkpointBudget) error { return nil }
 
 // terminalTeardown is Shutdown's plan: nothing to append before the close, and a hub
 // stop that durably appends SessionStopped and makes the logical session terminal.
@@ -2886,6 +2903,16 @@ func (s *Session) beginTeardown(ctx context.Context, admit func(context.Context)
 	}
 	if admit != nil {
 		if err := admit(ctx); err != nil {
+			// The admission may have LOST A RACE it was blocked inside: WaitIdle is
+			// also the required-checkpoint barrier, so it can be in flight for a long
+			// time, and a Shutdown that latches during it fails the wait with
+			// ErrSessionStopped. The election is the more recent fact. Re-check it and
+			// join, because a refusal here would tell the caller the session is
+			// untouched and still theirs to use while it is in fact already being torn
+			// down — and would decline a join that is available.
+			if wait, joined := s.joinTeardown(); joined {
+				return false, wait, nil
+			}
 			return false, nil, err
 		}
 	}
@@ -3003,7 +3030,7 @@ func (s *Session) teardown(plan teardownPlan) error {
 	failures = append(failures, s.stopSessionResources(cleanupRoot, timeouts.sessionResources))
 	// The last point at which this session may durably append: the hub is still open
 	// and every producer of new work has stopped.
-	failures = append(failures, plan.beforeHubClose(cleanupRoot))
+	failures = append(failures, plan.beforeHubClose(cleanupRoot, checkpointBudget(timeouts.checkpoint)))
 	failures = append(failures, plan.closeHub(cleanupRoot, timeouts.hub))
 	s.releaseRootLease(cleanupRoot)
 	s.releaseLease(cleanupRoot)

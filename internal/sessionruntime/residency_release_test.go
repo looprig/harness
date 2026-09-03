@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/runtimecommand"
@@ -545,5 +547,274 @@ func TestReleaseResidencyRefusesAFaultedSession(t *testing.T) {
 	case <-f.session.Done():
 		t.Error("Done closed by a refused release")
 	default:
+	}
+}
+
+// blockingUntilContextBlobs is a WELL-BEHAVED slow provider: every Put honors its
+// context and returns as soon as that context is done. It stands for a remote blob
+// backend that has stopped responding — the wedged-middlebox case, not a buggy
+// provider — so a test built on it measures the release's own bound rather than a
+// provider's misbehaviour.
+type blockingUntilContextBlobs struct {
+	storage.Blobs
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingUntilContextBlobs) Put(ctx context.Context, _ string, _ io.Reader) error {
+	b.once.Do(func() { close(b.entered) })
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestReleaseResidencyAnchorIsBoundedByTheSnapshotBudget proves the pre-close seam
+// runs on a private deadline like every other phase from the checkpoint stop onward.
+//
+// Unbounded, this is not a slow release but a permanently wedged session in TWO
+// processes: the teardown owner never returns, so the leases are never released and a
+// successor can never restore, while Done is already closed so a supervisor believes
+// the session is going away — and every joined caller, including a Shutdown fallback,
+// blocks on the owner forever. The assertions below check each of those consequences,
+// not merely that the call returned.
+func TestReleaseResidencyAnchorIsBoundedByTheSnapshotBudget(t *testing.T) {
+	t.Parallel()
+	blobs := &blockingUntilContextBlobs{Blobs: memstore.New().Blobs, entered: make(chan struct{})}
+	f := newReleaseFixture(t, blobs, cfg(&stubLLM{}),
+		withConstructionAbortTimeout(50*time.Millisecond),
+		WithSnapshotPolicy(SnapshotPolicy{Trigger: SnapshotOnIdle, Priority: SnapshotRequired, Timeout: 100 * time.Millisecond}),
+	)
+
+	released := make(chan error, 1)
+	go func() { released <- f.session.ReleaseResidency(context.Background()) }()
+	select {
+	case <-blobs.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the release never reached its anchoring checkpoint: the probe is vacuous")
+	}
+
+	// The budget is constructionAbortTimeout + SnapshotPolicy.Timeout = 150ms. Five
+	// seconds is a generous, race-enabled watchdog that is still far below "never".
+	var err error
+	select {
+	case err = <-released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ReleaseResidency never returned while the blob backend was unresponsive: the anchoring seam has no deadline, and the teardown owner is wedged")
+	}
+	if err == nil {
+		t.Fatal("ReleaseResidency = nil, want the anchor failure reported")
+	}
+	var timeoutErr *ShutdownCleanupTimeoutError
+	if !errors.As(err, &timeoutErr) || timeoutErr.Phase != ShutdownCleanupResidencyAnchor {
+		t.Errorf("err = %v, want a *ShutdownCleanupTimeoutError in phase %q", err, ShutdownCleanupResidencyAnchor)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want it to unwrap to context.DeadlineExceeded", err)
+	}
+
+	// The teardown ran to completion past the wedged phase: this is what makes the
+	// session recoverable elsewhere rather than stranded.
+	if order := f.leaseOrder(); len(order) != 2 || order[0] != "root" || order[1] != "session" {
+		t.Errorf("lease release order = %v, want [root session]: a wedged anchor must not strand the leases", order)
+	}
+	select {
+	case <-f.session.sessionCtx.Done():
+	default:
+		t.Error("session context still live: the wedged anchor suppressed the rest of teardown")
+	}
+	// A joined caller must not inherit the wedge either.
+	joined := make(chan error, 1)
+	go func() { joined <- f.session.Shutdown(context.Background()) }()
+	select {
+	case <-joined:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a Shutdown joining the completed release never returned")
+	}
+	assertNoTerminalStop(t, f.recorder.snapshot())
+	if recorded, _ := countResidencyEvents(f.recorder.snapshot()); len(recorded) != 0 {
+		t.Errorf("SessionResidencyReleased count = %d, want 0 when the anchor never committed", len(recorded))
+	}
+}
+
+// TestReleaseResidencyRacingShutdownReportsTheOwnersResult is the INTEGRATION-level
+// half of the race contract: a release that overlaps a Shutdown reports the elected
+// owner's result rather than an error of its own.
+//
+// It deliberately does NOT claim to cover the post-admission race — it cannot. Once
+// Shutdown cancels the blocked turn the session reaches idle, so this release's
+// WaitIdle succeeds and the join happens at beginTeardown's pre-check. The admission
+// FAILING after the election is won is a different interleaving, and
+// TestAdmissionThatLosesTheElectionJoinsRatherThanRefusing drives it directly.
+func TestReleaseResidencyRacingShutdownReportsTheOwnersResult(t *testing.T) {
+	t.Parallel()
+	for range 8 {
+		f := newReleaseFixture(t, memstore.New().Blobs, cfg(&stubLLM{blockUntilCancel: true}))
+		sub, err := f.session.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.session.Submit(context.Background(), []content.Block{&content.TextBlock{Text: "hi"}}); err != nil {
+			t.Fatal(err)
+		}
+		// The turn blocks until cancelled, so the release's WaitIdle can only be woken
+		// by the Shutdown below. That makes the race deterministic rather than timed.
+		awaitTurnStarted(t, sub)
+		_ = sub.Close()
+
+		released := make(chan error, 1)
+		go func() { released <- f.session.ReleaseResidency(context.Background()) }()
+		if err := f.session.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+		releaseErr := <-released
+
+		if releaseErr != nil {
+			t.Fatalf("ReleaseResidency = %v, want the elected owner's result (nil): a caller overlapping a teardown joins it", releaseErr)
+		}
+		recorded, stopped := countResidencyEvents(f.recorder.snapshot())
+		if len(recorded)+stopped != 1 {
+			t.Fatalf("released=%d stopped=%d, want exactly one teardown owner's record", len(recorded), stopped)
+		}
+	}
+}
+
+// TestAdmissionThatLosesTheElectionJoinsRatherThanRefusing drives the post-admission
+// race directly, because no integration fixture reaches it reliably: the admission has
+// to still be in flight when another teardown wins, and then FAIL — which is exactly
+// what WaitIdle does when the teardown that won is the thing that woke it
+// (ErrSessionStopped rather than idle).
+//
+// Refusing there would be wrong twice over. ResidencyReleaseRefusedError promises the
+// session is "untouched: still resident, still admitting work, still the caller's to
+// Shutdown or to release again later" — false in every clause once teardown owns the
+// session — and beginTeardown separately promises that a caller arriving after
+// teardown is underway joins the owner. The election is the more recent fact, so it
+// wins over the stale admission result.
+func TestAdmissionThatLosesTheElectionJoinsRatherThanRefusing(t *testing.T) {
+	t.Parallel()
+	s := &Session{}
+	admitted := false
+	owner, wait, err := s.beginTeardown(context.Background(), func(context.Context) error {
+		admitted = true
+		// The interleaving under test: another teardown wins the election while this
+		// admission is still running, completes, and is the reason the admission fails.
+		elected, _, electErr := s.beginTeardown(context.Background(), nil)
+		if electErr != nil || !elected {
+			t.Fatalf("fixture precondition: the racing teardown did not win the election (elected=%v err=%v)", elected, electErr)
+		}
+		s.finishTeardown(nil)
+		return hub.ErrSessionStopped
+	})
+	if !admitted {
+		t.Fatal("admission never ran: the probe is vacuous")
+	}
+	if err != nil {
+		t.Fatalf("beginTeardown err = %v, want nil: the caller must join the elected owner, not be refused", err)
+	}
+	if owner {
+		t.Fatal("beginTeardown elected a SECOND owner after one had already won")
+	}
+	if wait == nil {
+		t.Fatal("beginTeardown returned no waiter, so the caller has no way to observe the owner's result")
+	}
+	if got := wait(); got != nil {
+		t.Errorf("joined result = %v, want the owner's nil", got)
+	}
+	select {
+	case <-s.Done():
+	default:
+		t.Error("Done is open after the racing teardown was elected; the refusal's 'still resident' claim would have been checkable here")
+	}
+}
+
+// TestReleaseResidencyFailsLiveSubscriptionsWithTheResidencyCause pins the reason a
+// live subscriber reads when its stream ends. hub.AbortSession serves two callers — a
+// failed construction and this nonterminal release — and the CAUSE is the only thing
+// that tells them apart, so a subscriber that sees the terminal ErrSessionStopped
+// would conclude the session ended when it is merely cold and restorable.
+func TestReleaseResidencyFailsLiveSubscriptionsWithTheResidencyCause(t *testing.T) {
+	t.Parallel()
+	f := newIdleReleaseFixture(t)
+	sub, err := f.session.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
+	if err != nil {
+		t.Fatalf("SubscribeEvents: %v", err)
+	}
+	if err := f.session.ReleaseResidency(context.Background()); err != nil {
+		t.Fatalf("ReleaseResidency: %v", err)
+	}
+	// Drain to the close so Err() is the recorded terminal rather than a live nil.
+	for range sub.Events() { //nolint:revive // draining to termination is the point
+	}
+	got := sub.Err()
+	if !errors.Is(got, hub.ErrResidencyReleased) {
+		t.Fatalf("subscription Err() = %v, want it to carry hub.ErrResidencyReleased", got)
+	}
+	if errors.Is(got, hub.ErrSessionStopped) {
+		t.Error("subscription Err() carries ErrSessionStopped: a released session is cold, not ended")
+	}
+}
+
+// checkpointAppendFailingAppender fails the durable append of WorkspaceCheckpointed
+// only, so a test can separate the checkpoint's publication contract from every other
+// event the session appends.
+type checkpointAppendFailingAppender struct {
+	err error
+	mu  sync.Mutex
+	n   int
+}
+
+func (a *checkpointAppendFailingAppender) AppendEvent(_ context.Context, ev event.Event) (uint64, error) {
+	if _, isCheckpoint := ev.(event.WorkspaceCheckpointed); isCheckpoint {
+		return 0, a.err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.n++
+	return uint64(a.n), nil
+}
+
+// TestCheckpointWorkspacePublishesUnchecked pins the OTHER side of
+// snapshotWorkspaceDirect's checked parameter. H4.2 turned a hard-coded publication
+// contract into a parameter, and a parameter with only one pinned value invites a
+// silent flip: the release needs checked=true, while CheckpointWorkspace's
+// no-controller branch has always been the hub's fault-and-continue tap and must stay
+// that way — it returns the snapshot Ref with a nil error and faults the session,
+// rather than returning the append failure.
+func TestCheckpointWorkspacePublishesUnchecked(t *testing.T) {
+	t.Parallel()
+	boom := errors.New("journal down")
+	appender := &checkpointAppendFailingAppender{err: boom}
+	ws, err := workspacestore.Open(memstore.New().Blobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "work.txt"), []byte("work"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// No SnapshotPolicy, so there is no checkpoint controller and CheckpointWorkspace
+	// takes the direct branch this test is about.
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{}),
+		WithEventAppender(appender),
+		withResolvedPlacement(&resolvedPlacement{mode: PlacementSession, store: ws, root: root, coordinator: newWorkspaceCoordinator(nil)}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+	if s.checkpoints != nil {
+		t.Fatal("fixture precondition: a checkpoint controller was wired, so the direct branch is not exercised")
+	}
+
+	ref, err := s.CheckpointWorkspace(context.Background())
+	if err != nil {
+		t.Fatalf("CheckpointWorkspace = %v, want nil: the direct branch publishes UNCHECKED, so an append failure faults the session rather than returning", err)
+	}
+	if ref == "" {
+		t.Error("CheckpointWorkspace returned an empty Ref despite reporting success")
+	}
+	// The failure is not swallowed — it is escalated as a session fault, which is what
+	// "unchecked" means here rather than "ignored".
+	if faultErr := s.FaultErr(); !errors.Is(faultErr, boom) {
+		t.Errorf("FaultErr() = %v, want it to chain %v: the unchecked path must still escalate", faultErr, boom)
 	}
 }

@@ -15,6 +15,7 @@ const (
 	ShutdownCleanupLoopSend         ShutdownCleanupPhase = "loop_send"
 	ShutdownCleanupLoopDrain        ShutdownCleanupPhase = "loop_drain"
 	ShutdownCleanupCheckpointDrain  ShutdownCleanupPhase = "checkpoint_drain"
+	ShutdownCleanupResidencyAnchor  ShutdownCleanupPhase = "residency_anchor"
 	ShutdownCleanupCollabBroker     ShutdownCleanupPhase = "collab_broker"
 	ShutdownCleanupSessionResources ShutdownCleanupPhase = "session_resources"
 	ShutdownCleanupHubStop          ShutdownCleanupPhase = "hub_stop"

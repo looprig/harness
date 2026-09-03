@@ -93,3 +93,37 @@ type refusingAppender struct{ err error }
 func (a *refusingAppender) AppendEvent(context.Context, event.Event) (uint64, error) {
 	return 0, a.err
 }
+
+// dedupAppender reports a deduplicated retry: the frame is already durable under an
+// earlier append, so it returns that ORIGINAL sequence with appended=false.
+type dedupAppender struct{ seq uint64 }
+
+func (a *dedupAppender) AppendEvent(context.Context, event.Event) (uint64, error) {
+	return a.seq, nil
+}
+
+func (a *dedupAppender) AppendEventResult(context.Context, event.Event) (uint64, bool, error) {
+	return a.seq, false, nil
+}
+
+// TestPublishEventCommittedReportsTheOriginalSequenceOnADeduplicatedRetry pins the
+// dedup clause of PublishEventCommitted's contract. Reporting a ZERO sequence there
+// would be worse than an error: the caller records "no anchor" for a checkpoint that
+// is in fact durable, so a successor reads the release as unanchored.
+func TestPublishEventCommittedReportsTheOriginalSequenceOnADeduplicatedRetry(t *testing.T) {
+	t.Parallel()
+	sid := mustID(t)
+	h := New(sid, WithAppender(&dedupAppender{seq: 41}))
+	commit, err := h.PublishEventCommitted(context.Background(), event.WorkspaceCheckpointed{
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: mustID(t)},
+	})
+	if err != nil {
+		t.Fatalf("PublishEventCommitted on a deduplicated retry = %v, want nil (the original append succeeded)", err)
+	}
+	if commit.Sequence != 41 {
+		t.Errorf("commit.Sequence = %d, want 41: the original append's sequence, not zero", commit.Sequence)
+	}
+	if commit.Appended {
+		t.Error("commit.Appended = true, want false: this call appended nothing")
+	}
+}

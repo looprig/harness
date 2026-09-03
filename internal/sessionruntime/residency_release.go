@@ -57,6 +57,16 @@ func (e *ResidencyReleaseRefusedError) Unwrap() error { return e.Cause }
 // stream therefore carries either a SessionResidencyReleased or a SessionStopped,
 // never both.
 //
+// WHICH one it carries is not in this call's return value — a joined caller gets the
+// owner's result, and nil means "teardown succeeded" under either mode. A caller that
+// needs to know reads the session catalog, which projects the two apart on purpose
+// (sessionstore.applyEvent): a release leaves Status/State untouched and sets
+// Residency=cold, so the session reads cold AND restorable, while a stop sets
+// Residency=cold together with Status=stopped/State=stopped. Residency alone never
+// distinguishes them — no process is resident after either — so a caller deciding
+// whether a session can still be restored must read the terminality axis, not
+// residency.
+//
 // The idle admission is not a lock: a Submit to an already-registered loop may still be
 // accepted between the admission check and the closing latch. It is not lost and it does
 // not corrupt the anchor — step 2 sends every loop a Shutdown command and waits for the
@@ -108,20 +118,48 @@ func nonterminalTeardown(s *Session) teardownPlan {
 // anchorAndRecordRelease takes the release's anchoring checkpoint and, only if it
 // durably committed, appends the residency record. It runs at the teardown seam where
 // the hub is still open and every producer of new work has already stopped.
-func (s *Session) anchorAndRecordRelease(ctx context.Context) error {
+//
+// It runs on its OWN private deadline, like every other phase from the checkpoint
+// stop onward, derived from the session's already-validated SnapshotPolicy.Timeout —
+// the same budget the checkpoint CONTROLLER runs its boundary snapshots on. Without
+// it the three blocking operations behind this seam (the workspace permit acquire,
+// the snapshot, and the durable append) are unbounded, and a wedged blob backend
+// would hold the teardown owner forever: Done is already closed, so a supervisor
+// believes the session is going away, while the leases are never released and every
+// joined caller — including a Shutdown fallback — blocks on cleanupDone. One stuck
+// blob write would wedge the session in both the releasing and the restoring process.
+//
+// The bound is a CONTEXT deadline, so it depends on the provider honoring ctx —
+// exactly the trust boundary stopHub already accepts for the hub transition. Going
+// further and abandoning the snapshot on a goroutine (as stopSessionResources does)
+// would be worse here, not better: an abandoned snapshot keeps reading the workspace
+// after the root lease has been released to a successor.
+func (s *Session) anchorAndRecordRelease(root context.Context, budget checkpointBudget) error {
+	timeout := time.Duration(budget)
+	ctx, cancel := cleanupContext(root, timeout)
+	defer cancel()
 	seq, err := s.checkpointForRelease(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return cleanupTimeoutError(ShutdownCleanupResidencyAnchor, timeout, ctx.Err())
+		}
 		return err
 	}
 	stamped, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{SessionID: s.sessionID}})
 	if err != nil {
 		return &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 	}
-	return s.PublishEventChecked(ctx, event.SessionResidencyReleased{
+	if err := s.PublishEventChecked(ctx, event.SessionResidencyReleased{
 		Header:        stamped,
 		CheckpointSeq: seq,
 		LeaseEpoch:    s.leaseEpoch(),
-	})
+	}); err != nil {
+		if ctx.Err() != nil {
+			return cleanupTimeoutError(ShutdownCleanupResidencyAnchor, timeout, ctx.Err())
+		}
+		return err
+	}
+	return nil
 }
 
 // checkpointForRelease commits the workspace checkpoint the release is anchored to and
