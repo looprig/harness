@@ -59,6 +59,7 @@ const (
 	FieldEffort             FieldName = "Effort"
 	FieldUsage              FieldName = "Usage"
 	FieldMessages           FieldName = "Messages"
+	FieldCaptures           FieldName = "Captures"
 	FieldVisibility         FieldName = "Visibility"
 	FieldDefinition         FieldName = "Definition"
 	FieldRunID              FieldName = "RunID"
@@ -314,7 +315,10 @@ func validateEventBody(ev Event) error {
 	case ProcessLost:
 		return validateProcessLifecycleEvent("ProcessLost", e.Header, e.Process, tool.ProcessLifecycleLost)
 	case StepDone:
-		return validateStepDoneMessages(e.Messages)
+		if err := validateStepDoneMessages(e.Messages); err != nil {
+			return err
+		}
+		return validateStepDoneCaptures(e.Messages, e.Captures)
 	case TurnDone:
 		// Usage is not validated. TurnDone is the record that a turn FINISHED,
 		// and a provider whose reasoning count disagrees with its output count
@@ -729,6 +733,80 @@ func validateStepDoneMessages(messages content.AgenticMessages) error {
 		}
 	}
 	return nil
+}
+
+func validateStepDoneCaptures(messages content.AgenticMessages, captures []ToolResultCapture) error {
+	if len(captures) == 0 {
+		return nil
+	}
+	if len(captures) > maxToolResultCapturesPerStep || len(captures) != len(messages)-1 {
+		return invalidStepDoneCaptures()
+	}
+
+	resultIDs := make(map[string]int, len(messages)-1)
+	for _, message := range messages[1:] {
+		result := message.(*content.ToolResultMessage) // message shape was validated first
+		resultIDs[result.ToolUseID]++
+	}
+	toolExecutionIDs := make(map[uuid.UUID]struct{}, len(captures))
+	toolUseIDs := make(map[string]struct{}, len(captures))
+	for _, capture := range captures {
+		if capture.ToolExecutionID.IsZero() || capture.ToolUseID == "" ||
+			!utf8.ValidString(capture.ToolUseID) || len(capture.ToolUseID) > maxToolResultCaptureIDBytes {
+			return invalidStepDoneCaptures()
+		}
+		if _, duplicate := toolExecutionIDs[capture.ToolExecutionID]; duplicate {
+			return invalidStepDoneCaptures()
+		}
+		toolExecutionIDs[capture.ToolExecutionID] = struct{}{}
+		if _, duplicate := toolUseIDs[capture.ToolUseID]; duplicate {
+			return invalidStepDoneCaptures()
+		}
+		toolUseIDs[capture.ToolUseID] = struct{}{}
+		// A provider ID must select exactly one committed result. This makes the
+		// association stable even if capture and message arrays are reordered.
+		if resultIDs[capture.ToolUseID] != 1 {
+			return invalidStepDoneCaptures()
+		}
+		if capture.Reference != nil && capture.Reference.Validate() != nil {
+			return invalidStepDoneCaptures()
+		}
+		if !capture.Encoding.valid() {
+			return invalidStepDoneCaptures()
+		}
+		if capture.OriginalBytes != nil {
+			if capture.OriginalBytesLowerBound != 0 || *capture.OriginalBytes < capture.CapturedBytes {
+				return invalidStepDoneCaptures()
+			}
+			if capture.Truncated != (*capture.OriginalBytes > capture.CapturedBytes) {
+				return invalidStepDoneCaptures()
+			}
+		} else if !capture.Truncated || capture.OriginalBytesLowerBound <= capture.CapturedBytes {
+			return invalidStepDoneCaptures()
+		}
+		if capture.Truncated {
+			if !capture.TruncationReason.valid() {
+				return invalidStepDoneCaptures()
+			}
+		} else if capture.TruncationReason != "" {
+			return invalidStepDoneCaptures()
+		}
+	}
+	return nil
+}
+
+const maxToolResultCaptureIDBytes = 1024
+
+func (e ToolResultEncoding) valid() bool {
+	return e == ToolResultEncodingUTF8 || e == ToolResultEncodingBinary
+}
+
+func (r ToolResultTruncationReason) valid() bool {
+	return r == ToolResultTruncatedCaptureCeiling || r == ToolResultTruncatedSourceLimit
+}
+
+func invalidStepDoneCaptures() *InvalidEventError {
+	return &InvalidEventError{Event: "StepDone", Field: FieldCaptures, Rule: RuleInvalid}
 }
 
 // Bounds for LoopExternalToolsetChanged. External toolsets are third-party supplied,

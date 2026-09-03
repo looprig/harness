@@ -213,6 +213,56 @@ func TestProjectEnduringDoesNotManufactureJournalSequence(t *testing.T) {
 	}
 }
 
+func TestProjectStepDoneCaptureUsesCoreLogicalReference(t *testing.T) {
+	t.Parallel()
+	exact := uint64(6)
+	header := event.Header{Coordinates: identity.Coordinates{
+		SessionID: testUUID(1), LoopID: testUUID(2), TurnID: testUUID(3), StepID: testUUID(4),
+	}, EventID: testUUID(5)}
+	step := event.StepDone{
+		Header: header,
+		Messages: content.AgenticMessages{
+			&content.AIMessage{Message: content.Message{Role: content.RoleAssistant}},
+			&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: "call-1"},
+		},
+		Captures: []event.ToolResultCapture{{
+			ToolExecutionID: testUUID(6),
+			ToolUseID:       "call-1",
+			Reference:       &coresessionwire.ObjectReference{ObjectID: "logical-capture-1"},
+			CapturedBytes:   exact,
+			OriginalBytes:   &exact,
+			Encoding:        event.ToolResultEncodingUTF8,
+		}},
+	}
+	got, err := Project("tenant-a", "public-session", step)
+	if err != nil {
+		t.Fatalf("Project() error = %v", err)
+	}
+	var body struct {
+		Captures []struct {
+			Reference map[string]json.RawMessage `json:"reference"`
+		} `json:"captures"`
+	}
+	if err := json.Unmarshal(got.Body, &body); err != nil {
+		t.Fatalf("json.Unmarshal(projected body): %v", err)
+	}
+	if len(body.Captures) != 1 || len(body.Captures[0].Reference) != 1 {
+		t.Fatalf("projected references = %#v, want one single-field logical reference", body.Captures)
+	}
+	if objectID := body.Captures[0].Reference["object_id"]; string(objectID) != `"logical-capture-1"` {
+		t.Fatalf("projected object_id = %s", objectID)
+	}
+	for _, forbidden := range []string{"signed_url", "backend_key", "credential", "raw_output"} {
+		if bytes.Contains(got.Body, []byte(forbidden)) {
+			t.Errorf("public StepDone capture contains forbidden field %q: %s", forbidden, got.Body)
+		}
+	}
+	canonical := coresessionwire.JournalEvent{EventID: got.EventID, JournalSeq: 1, Body: got.Body}
+	if err := canonical.Validate(); err != nil {
+		t.Fatalf("Core JournalEvent.Validate() = %v; body=%s", err, got.Body)
+	}
+}
+
 func TestProjectRelayBytesAreStable(t *testing.T) {
 	t.Parallel()
 	header := event.Header{Coordinates: identity.Coordinates{SessionID: testUUID(1)}, EventID: testUUID(5)}

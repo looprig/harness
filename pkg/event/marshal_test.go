@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/looprig/core/content"
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
@@ -364,6 +366,275 @@ func sampleMessages() content.AgenticMessages {
 			ToolUseID: "tu-1",
 			IsError:   false,
 		},
+	}
+}
+
+func stepDoneCaptureEnvelope(t *testing.T, captures string) []byte {
+	t.Helper()
+	raw, err := MarshalEvent(StepDone{Header: fullHeader(), Messages: sampleMessages()})
+	if err != nil {
+		t.Fatalf("MarshalEvent(StepDone): %v", err)
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("json.Unmarshal(StepDone envelope): %v", err)
+	}
+	envelope["captures"] = json.RawMessage(captures)
+	raw, err = json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("json.Marshal(StepDone capture envelope): %v", err)
+	}
+	return raw
+}
+
+// TestStepDoneCaptureWireRoundTrips was written against the pre-H5.1 decoder.
+// It deliberately exercises the wire boundary without naming the then-missing Go
+// fields, so its RED is an assertion that the decoder dropped capture metadata,
+// not a compile failure.
+func TestStepDoneCaptureWireRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	toolExecutionID := seededUUID(0x77).String()
+	tests := []struct {
+		name     string
+		captures string
+		want     map[string]any
+	}{
+		{
+			name: "full capture",
+			captures: `[{"tool_execution_id":"` + toolExecutionID + `","tool_use_id":"tu-1",` +
+				`"reference":{"object_id":"v1:artifact:g:d"},"captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`,
+			want: map[string]any{"captured_bytes": float64(8), "original_bytes": float64(8), "truncated": false, "encoding": "utf-8"},
+		},
+		{
+			name: "capture ceiling truncation",
+			captures: `[{"tool_execution_id":"` + toolExecutionID + `","tool_use_id":"tu-1",` +
+				`"reference":{"object_id":"v1:artifact:g:d"},"captured_bytes":8,"original_bytes":21,` +
+				`"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`,
+			want: map[string]any{"captured_bytes": float64(8), "original_bytes": float64(21), "truncated": true, "truncation_reason": "capture_ceiling", "encoding": "binary"},
+		},
+		{
+			name: "no object",
+			captures: `[{"tool_execution_id":"` + toolExecutionID + `","tool_use_id":"tu-1",` +
+				`"captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`,
+			want: map[string]any{"captured_bytes": float64(8), "original_bytes": float64(8), "truncated": false, "encoding": "utf-8"},
+		},
+		{
+			name: "nullable exact original count",
+			captures: `[{"tool_execution_id":"` + toolExecutionID + `","tool_use_id":"tu-1",` +
+				`"reference":{"object_id":"v1:artifact:g:d"},"captured_bytes":8,"original_bytes":null,"original_bytes_lower_bound":9,` +
+				`"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`,
+			want: map[string]any{"captured_bytes": float64(8), "original_bytes": nil, "original_bytes_lower_bound": float64(9), "truncated": true, "truncation_reason": "capture_ceiling", "encoding": "binary"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			decoded, err := UnmarshalEvent(stepDoneCaptureEnvelope(t, tt.captures))
+			if err != nil {
+				t.Fatalf("UnmarshalEvent() error = %v", err)
+			}
+			roundTrip, err := MarshalEvent(decoded)
+			if err != nil {
+				t.Fatalf("MarshalEvent(decoded) error = %v", err)
+			}
+			var envelope map[string]any
+			if err := json.Unmarshal(roundTrip, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			captures, ok := envelope["captures"].([]any)
+			if !ok || len(captures) != 1 {
+				t.Fatalf("round-trip captures = %#v, want one capture", envelope["captures"])
+			}
+			capture, ok := captures[0].(map[string]any)
+			if !ok {
+				t.Fatalf("round-trip capture = %#v", captures[0])
+			}
+			for key, want := range tt.want {
+				if got := capture[key]; !reflect.DeepEqual(got, want) {
+					t.Errorf("capture[%q] = %#v, want %#v", key, got, want)
+				}
+			}
+			if got, present := capture["original_bytes"]; tt.name == "nullable exact original count" && (!present || got != nil) {
+				t.Errorf("nullable exact count = %#v, present=%v; want explicit null", got, present)
+			}
+			if _, present := capture["reference"]; tt.name == "no object" && present {
+				t.Errorf("no-object capture gained reference: %#v", capture)
+			}
+		})
+	}
+}
+
+func TestStepDoneCaptureStrictDecodeAndValidation(t *testing.T) {
+	t.Parallel()
+
+	id := seededUUID(0x77).String()
+	otherID := seededUUID(0x78).String()
+	valid := `{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}`
+	tests := []struct {
+		name     string
+		captures string
+	}{
+		{name: "duplicate tool execution IDs", captures: `[` + valid + `,{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`},
+		{name: "duplicate provider tool use IDs", captures: `[` + valid + `,{"tool_execution_id":"` + otherID + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`},
+		{name: "capture does not align to result message", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"another-call","captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`},
+		{name: "zero tool execution ID", captures: `[{"tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`},
+		{name: "invalid empty reference", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","reference":{},"captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`},
+		{name: "invalid original count", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":9,"original_bytes":8,"encoding":"utf-8"}]`},
+		{name: "missing lower bound for unknown original", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`},
+		{name: "unknown original lower bound must exceed capture", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":null,"original_bytes_lower_bound":8,"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`},
+		{name: "reason without truncation", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"truncation_reason":"capture_ceiling","encoding":"utf-8"}]`},
+		{name: "unknown reason without truncation", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"truncation_reason":"other","encoding":"utf-8"}]`},
+		{name: "truncation without reason", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":9,"truncated":true,"encoding":"utf-8"}]`},
+		{name: "unknown encoding", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"rot13"}]`},
+		{name: "unknown capture member", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8","raw_output":"secret"}]`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if decoded, err := UnmarshalEvent(stepDoneCaptureEnvelope(t, tt.captures)); err == nil {
+				t.Fatalf("UnmarshalEvent() = %#v, nil error; want capture rejection", decoded)
+			}
+		})
+	}
+}
+
+// The direct typed construction tests below were added after the wire-first RED
+// tests had failed. They are characterization of the exported Go API and its
+// count ceiling; the wire retention and rejection claims above are test-first.
+func TestStepDoneCaptureTypedRoundTrip(t *testing.T) {
+	t.Parallel()
+	originalBytes := uint64(21)
+	original := StepDone{
+		Header:   fullHeader(),
+		Messages: sampleMessages(),
+		Captures: []ToolResultCapture{{
+			ToolExecutionID: seededUUID(0x77),
+			ToolUseID:       "tu-1",
+			Reference: &sessionwire.ObjectReference{
+				ObjectID: "v1:artifact:g:d",
+			},
+			CapturedBytes:    8,
+			OriginalBytes:    &originalBytes,
+			Truncated:        true,
+			TruncationReason: ToolResultTruncatedCaptureCeiling,
+			Encoding:         ToolResultEncodingBinary,
+		}},
+	}
+	raw, err := MarshalEvent(original)
+	if err != nil {
+		t.Fatalf("MarshalEvent() error = %v", err)
+	}
+	decoded, err := UnmarshalEvent(raw)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent() error = %v", err)
+	}
+	if !reflect.DeepEqual(decoded, original) {
+		t.Fatalf("round trip mismatch:\n got  %#v\n want %#v", decoded, original)
+	}
+}
+
+func TestStepDoneCaptureWriteValidation(t *testing.T) {
+	t.Parallel()
+	exact := uint64(8)
+	valid := ToolResultCapture{
+		ToolExecutionID: seededUUID(0x77),
+		ToolUseID:       "tu-1",
+		CapturedBytes:   exact,
+		OriginalBytes:   &exact,
+		Encoding:        ToolResultEncodingUTF8,
+	}
+	tests := []struct {
+		name     string
+		messages content.AgenticMessages
+		captures []ToolResultCapture
+	}{
+		{name: "zero tool execution ID", messages: sampleMessages(), captures: func() []ToolResultCapture {
+			capture := valid
+			capture.ToolExecutionID = uuid.UUID{}
+			return []ToolResultCapture{capture}
+		}()},
+		{name: "invalid reference", messages: sampleMessages(), captures: func() []ToolResultCapture {
+			capture := valid
+			capture.Reference = &sessionwire.ObjectReference{}
+			return []ToolResultCapture{capture}
+		}()},
+		{name: "missing entry for second result", messages: append(sampleMessages(),
+			&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: "tu-2"}), captures: []ToolResultCapture{valid}},
+		{name: "duplicate tool execution ID", messages: append(sampleMessages(),
+			&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: "tu-2"}), captures: func() []ToolResultCapture {
+			duplicate := valid
+			duplicate.ToolUseID = "tu-2"
+			return []ToolResultCapture{valid, duplicate}
+		}()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ev := StepDone{Header: fullHeader(), Messages: tt.messages, Captures: tt.captures}
+			for operation, err := range map[string]error{
+				"ValidateEvent": ValidateEvent(ev),
+				"MarshalEvent": func() error {
+					_, err := MarshalEvent(ev)
+					return err
+				}(),
+			} {
+				var invalid *InvalidEventError
+				if !errors.As(err, &invalid) || invalid.Event != "StepDone" || invalid.Field != FieldCaptures {
+					t.Errorf("%s error = %T %v, want StepDone/Captures invalid", operation, err, err)
+				}
+			}
+		})
+	}
+}
+
+func TestStepDoneCaptureNestedReferenceDropsPrivateExtensions(t *testing.T) {
+	t.Parallel()
+	id := seededUUID(0x77).String()
+	raw := stepDoneCaptureEnvelope(t, `[{"tool_execution_id":"`+id+`","tool_use_id":"tu-1",`+
+		`"reference":{"object_id":"logical-object","signed_url":"signed-url-secret","backend_key":"backend-key-secret","credential":"credential-secret","raw_output":"raw-output-secret"},`+
+		`"captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`)
+	decoded, err := UnmarshalEvent(raw)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent() error = %v", err)
+	}
+	public, err := MarshalEvent(decoded)
+	if err != nil {
+		t.Fatalf("MarshalEvent(decoded) error = %v", err)
+	}
+	if !bytes.Contains(public, []byte(`"object_id":"logical-object"`)) {
+		t.Fatalf("public capture lost logical reference: %s", public)
+	}
+	for _, forbidden := range []string{"signed-url-secret", "backend-key-secret", "credential-secret", "raw-output-secret", "signed_url", "backend_key", "credential", "raw_output"} {
+		if bytes.Contains(public, []byte(forbidden)) {
+			t.Errorf("public capture retained forbidden %q: %s", forbidden, public)
+		}
+	}
+}
+
+func TestStepDoneCaptureListIsBounded(t *testing.T) {
+	t.Parallel()
+	messages := make(content.AgenticMessages, maxToolResultCapturesPerStep+2)
+	messages[0] = aiMsg("many tools")
+	captures := make([]ToolResultCapture, maxToolResultCapturesPerStep+1)
+	for i := range captures {
+		toolUseID := fmt.Sprintf("tu-%d", i)
+		messages[i+1] = &content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: toolUseID}
+		toolExecutionID := seededUUID(1)
+		toolExecutionID[14] = byte(i >> 8)
+		toolExecutionID[15] = byte(i)
+		exact := uint64(0)
+		captures[i] = ToolResultCapture{
+			ToolExecutionID: toolExecutionID,
+			ToolUseID:       toolUseID,
+			OriginalBytes:   &exact,
+			Encoding:        ToolResultEncodingUTF8,
+		}
+	}
+	err := ValidateEvent(StepDone{Header: fullHeader(), Messages: messages, Captures: captures})
+	var invalid *InvalidEventError
+	if !errors.As(err, &invalid) || invalid.Event != "StepDone" || invalid.Field != FieldCaptures {
+		t.Fatalf("ValidateEvent() error = %T %v, want StepDone/Captures invalid", err, err)
 	}
 }
 

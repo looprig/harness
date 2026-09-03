@@ -2,6 +2,8 @@ package event
 
 import (
 	"github.com/looprig/core/content"
+	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/core/uuid"
 	model "github.com/looprig/inference/model"
 )
 
@@ -86,6 +88,49 @@ type TurnStarted struct {
 	Message   *content.UserMessage `json:"message,omitzero"`
 }
 
+// ToolResultEncoding describes the bytes retained for one tool result. It says
+// whether a reader may interpret the captured bytes directly as UTF-8 text or
+// must treat them as opaque binary data.
+type ToolResultEncoding string
+
+const (
+	ToolResultEncodingUTF8   ToolResultEncoding = "utf-8"
+	ToolResultEncodingBinary ToolResultEncoding = "binary"
+)
+
+// ToolResultTruncationReason explains why a capture is shorter than the
+// original result. CaptureCeiling is the generic Harness retention ceiling;
+// SourceLimit means the producer itself supplied an already-bounded result.
+type ToolResultTruncationReason string
+
+const (
+	ToolResultTruncatedCaptureCeiling ToolResultTruncationReason = "capture_ceiling"
+	ToolResultTruncatedSourceLimit    ToolResultTruncationReason = "source_limit"
+)
+
+// ToolResultCapture is the durable, privacy-safe locator and size description
+// for one committed ToolResultMessage. ToolExecutionID correlates Harness tool
+// lifecycle events; ToolUseID correlates the provider message. Reference is a
+// SessionObjectStore logical reference, never a URL, credential, backend key,
+// or byte payload. It is nil when the complete result is already represented by
+// the committed message and no separate object was retained.
+//
+// OriginalBytes is non-nil when the exact producer byte count is known. When it
+// is nil, OriginalBytesLowerBound records what was observed before capture
+// stopped. The pointer deliberately encodes as JSON null rather than disappearing
+// so exact-unknown cannot be confused with an old or incomplete capture shape.
+type ToolResultCapture struct {
+	ToolExecutionID         uuid.UUID                    `json:"tool_execution_id"`
+	ToolUseID               string                       `json:"tool_use_id"`
+	Reference               *sessionwire.ObjectReference `json:"reference,omitempty"`
+	CapturedBytes           uint64                       `json:"captured_bytes"`
+	OriginalBytes           *uint64                      `json:"original_bytes"`
+	OriginalBytesLowerBound uint64                       `json:"original_bytes_lower_bound,omitempty"`
+	Truncated               bool                         `json:"truncated"`
+	TruncationReason        ToolResultTruncationReason   `json:"truncation_reason,omitempty"`
+	Encoding                ToolResultEncoding           `json:"encoding"`
+}
+
 // StepDone is the enduring event emitted when a step's finalized group is
 // committed: the step's single AIMessage followed by its ToolResultMessages. It is
 // emitted at the actor-owned commit point, once the commit handshake lands, so it
@@ -105,6 +150,7 @@ type StepDone struct {
 	loopScoped
 	Header
 	Messages content.AgenticMessages `json:"messages,omitempty"`
+	Captures []ToolResultCapture     `json:"captures,omitempty"`
 }
 
 // TurnFoldedInto is emitted when queued input folds into a mandatory

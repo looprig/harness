@@ -226,7 +226,8 @@ func marshalPlain(ev Event) ([]byte, error) {
 // interface with no general struct codec, so it cannot ride as a plain field).
 type stepDoneWire struct {
 	Header
-	Messages json.RawMessage `json:"messages,omitempty"`
+	Messages json.RawMessage     `json:"messages,omitempty"`
+	Captures []ToolResultCapture `json:"captures,omitempty"`
 }
 
 func marshalStepDone(e StepDone) ([]byte, error) {
@@ -238,7 +239,7 @@ func marshalStepDone(e StepDone) ([]byte, error) {
 		}
 		msgs = m
 	}
-	out, err := json.Marshal(stepDoneWire{Header: e.Header, Messages: msgs})
+	out, err := json.Marshal(stepDoneWire{Header: e.Header, Messages: msgs, Captures: e.Captures})
 	if err != nil {
 		return nil, &EventEncodeError{Type: "StepDone", Cause: err}
 	}
@@ -966,7 +967,7 @@ func decodeStepDone(data []byte) (Event, error) {
 		}
 		msgs = m
 	}
-	return StepDone{Header: w.Header, Messages: msgs}, nil
+	return StepDone{Header: w.Header, Messages: msgs, Captures: w.Captures}, nil
 }
 
 func decodePermissionRequested(data []byte) (Event, error) {
@@ -1074,7 +1075,33 @@ func decodeGateResolved(data []byte) (Event, error) {
 // the untrusted restore boundary. A step group is one AIMessage plus its tool
 // results, so a generous cap still fails closed on absurd input. Each message's
 // blocks are independently capped by the content block codec.
-const maxMessagesPerStep = 10_000
+const (
+	maxMessagesPerStep           = 10_000
+	maxToolResultCapturesPerStep = maxMessagesPerStep - 1
+)
+
+// UnmarshalJSON keeps each capture entry a closed privacy boundary. New public
+// metadata must be added deliberately; unknown siblings such as signed_url,
+// raw_output, credentials, or backend_key are rejected rather than retained or
+// proxied into a later public journal write. ObjectReference applies Core's
+// narrower redaction-boundary decoder to the nested logical reference itself.
+func (c *ToolResultCapture) UnmarshalJSON(data []byte) error {
+	type captureWire ToolResultCapture
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var decoded captureWire
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = errors.New("trailing JSON value")
+		}
+		return err
+	}
+	*c = ToolResultCapture(decoded)
+	return nil
+}
 
 // UnknownMessageRoleError is returned by the message-slice decoder when a message's
 // "role" names no concrete Conversation type (including an empty/missing role). The
