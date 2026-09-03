@@ -26,23 +26,30 @@ type restoredPreparedGate struct {
 // preserving ledger order. Restore uses record replay, not event replay, because
 // the private journal.GatePreparedRecord is intentionally invisible to event
 // consumers but is required to recover gate state fail-securely.
-func drainRecordReplay(ctx context.Context, replayer journal.RecordReplayer, req journal.ReplayRequest) ([]journal.JournalRecord, error) {
+//
+// It returns each record's JOURNAL SEQUENCE alongside it, index-aligned. The sequence is
+// not recoverable from a record — an event payload cannot carry the number the append
+// that encodes it assigns — and the workspace-residency fold needs it to report which
+// checkpoint a restored tree came from.
+func drainRecordReplay(ctx context.Context, replayer journal.RecordReplayer, req journal.ReplayRequest) ([]journal.JournalRecord, []uint64, error) {
 	cursor, err := replayer.Open(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = cursor.Close() }()
 
 	var out []journal.JournalRecord
+	var seqs []uint64
 	for {
-		rec, _, err := cursor.Next(ctx)
+		rec, seq, err := cursor.Next(ctx)
 		if errors.Is(err, io.EOF) {
-			return out, nil
+			return out, seqs, nil
 		}
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		out = append(out, rec)
+		seqs = append(seqs, seq)
 	}
 }
 

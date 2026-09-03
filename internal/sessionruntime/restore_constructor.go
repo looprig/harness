@@ -310,7 +310,7 @@ func restoreTopologySession(
 	// the event projection UNNARROWED — every loop's events — so findRootLoopStarted and
 	// countSpawnedLoops see the agent LoopStarted events, not just the root's. Fail
 	// closed on any error.
-	allRecords, err := drainRecordReplay(ctx, replayer, journal.ReplayRequest{Follow: false})
+	allRecords, allSeqs, err := drainRecordReplay(ctx, replayer, journal.ReplayRequest{Follow: false})
 	if err != nil {
 		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
@@ -507,6 +507,13 @@ func restoreTopologySession(
 	// the SAME unnarrowed discovery drain; both checkpoint and restore transitions are
 	// session-scoped. Consumed at the pre-RestoreDone seam below.
 	wsRef, hasWorkspacePointer := effectiveCurrentWorkspace(all)
+	// The same durable transition, read as a BOUNDARY rather than as a ref: the journal
+	// sequence the live tree will be materialized from, plus the loop work recorded after
+	// it. §11.1 requires a restore to report that boundary instead of presenting the
+	// journal as though the uncheckpointed files survived; the session carries it as
+	// WorkspaceStatus. It is folded from the records (which have sequences), not from
+	// `all` (which does not).
+	residency := foldWorkspaceResidency(allRecords, allSeqs)
 
 	// Gate recovery folds the same record replay so private GatePreparedRecord payloads are
 	// visible. Unsupported or payload-less open gates are durably closed below, after
@@ -609,7 +616,7 @@ func restoreTopologySession(
 	// re-acquire at all (no backend has a lease TTL). We append WithLeaseRelease AFTER the caller's
 	// opts so the restore owns the lease lifecycle (a caller cannot accidentally override
 	// the releaser with a stale one).
-	leaseOpts := append(append([]Option(nil), opts...), WithLeaseRelease(lease.Release))
+	leaseOpts := append(append([]Option(nil), opts...), WithLeaseRelease(lease.Release), withWorkspaceResidency(residency))
 	// Advertise the segregated runtime-command capability when this session's journal
 	// can deduplicate a redelivered append. A journal that cannot is left unwired
 	// rather than half-wired: RuntimeCommands then reports the capability absent, which

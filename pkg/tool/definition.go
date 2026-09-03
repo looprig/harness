@@ -237,7 +237,14 @@ type DelegateController interface {
 // present it is created once per loop binding so independent file definitions and
 // Bash share exactly the same state.
 type WorkspaceBinding struct {
-	Root         string
+	// Root is THIS process's physical location of the workspace tree. It varies with
+	// the Host's runtime root and is the path every filesystem operation goes through.
+	Root string
+	// LogicalRoot is the session-derived path the same tree is exposed at inside the
+	// agent/tool namespace. It is derived from session identity alone, so it is stable
+	// across Hosts and across residency handovers even when Root is not. A binding with
+	// no session identity carries an empty LogicalRoot.
+	LogicalRoot  string
 	Coordinator  WorkspaceCoordinator
 	Observations WorkspaceObservations
 }

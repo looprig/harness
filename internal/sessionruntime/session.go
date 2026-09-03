@@ -332,8 +332,12 @@ type Session struct {
 	// capability unconfigured, so CheckpointWorkspace fails closed with a typed
 	// *WorkspaceNotConfiguredError. The session depends only on the narrow *Store
 	// (Dependency Inversion): it never sees the Blobs backend beneath it.
-	ws                         *workspacestore.Store // nil unless WithWorkspaceCheckpointing wired it; gates CheckpointWorkspace
-	wsRoot                     string                // the workspace directory Snapshot archives
+	ws     *workspacestore.Store // nil unless WithWorkspaceCheckpointing wired it; gates CheckpointWorkspace
+	wsRoot string                // the workspace directory Snapshot archives
+	// wsResidency is the checkpoint boundary this session came up on, folded from the
+	// durable stream by Restore. It is written once, before the session is handed to a
+	// caller, and read-only afterwards.
+	wsResidency                WorkspaceResidencyStatus
 	initialWorkspaceCheckpoint workspacestore.Ref
 
 	// placementSpec is the UNRESOLVED managed-workspace placement carried into the restore
@@ -2708,7 +2712,32 @@ func (s *Session) newWorkspaceBinding() *tool.WorkspaceBinding {
 	if s.wsCoordinator == nil {
 		return nil
 	}
-	return &tool.WorkspaceBinding{Root: s.wsRoot, Coordinator: s.wsCoordinator, Observations: tool.NewWorkspaceObservations()}
+	return &tool.WorkspaceBinding{
+		Root:         s.wsRoot,
+		LogicalRoot:  logicalWorkspaceRoot(s.sessionID),
+		Coordinator:  s.wsCoordinator,
+		Observations: tool.NewWorkspaceObservations(),
+	}
+}
+
+// WorkspaceStatus reports what this session knows about the workspace it came up on: the
+// model-visible path (stable across Hosts), this process's physical root, the journal
+// sequence of the durable transition the live tree was materialized from, and the count
+// of journalled loop work that follows it.
+//
+// A session with no managed workspace reports the zero value. On a fresh session the
+// residency fold is zero because there is no prior stream to fold; the boundary fields
+// are populated by Restore, which is the only caller that has one.
+//
+// It is a REPORT. Nothing in it recovers a lost mutation or bounds how much was lost.
+func (s *Session) WorkspaceStatus() WorkspaceResidencyStatus {
+	if s.ws == nil {
+		return WorkspaceResidencyStatus{}
+	}
+	status := s.wsResidency
+	status.Root = s.wsRoot
+	status.LogicalRoot = logicalWorkspaceRoot(s.sessionID)
+	return status
 }
 
 // activateProcessServiceBridge attaches Task 24B's checked durable lifecycle

@@ -548,7 +548,7 @@ func messageAgentRestoreRecords(t *testing.T, store *sessionstore.Store, session
 	if err != nil {
 		t.Fatalf("OpenInternalRecordReplayer: %v", err)
 	}
-	records, err := drainRecordReplay(context.Background(), replayer, journal.ReplayRequest{Follow: false})
+	records, _, err := drainRecordReplay(context.Background(), replayer, journal.ReplayRequest{Follow: false})
 	if err != nil {
 		t.Fatalf("drainRecordReplay: %v", err)
 	}

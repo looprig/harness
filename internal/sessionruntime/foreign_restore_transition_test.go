@@ -608,7 +608,7 @@ func TestRealJournalRejectsFallbackTerminalCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	all, err := drainRecordReplay(context.Background(), replayer, journal.ReplayRequest{Follow: false})
+	all, _, err := drainRecordReplay(context.Background(), replayer, journal.ReplayRequest{Follow: false})
 	if err != nil {
 		t.Fatal(err)
 	}

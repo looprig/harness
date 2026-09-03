@@ -429,7 +429,7 @@ func TestRestoreWiresGateAppenderForNewGates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenInternalRecordReplayer: %v", err)
 	}
-	records, err := drainRecordReplay(context.Background(), replayer, journal.ReplayRequest{From: journal.Beginning()})
+	records, _, err := drainRecordReplay(context.Background(), replayer, journal.ReplayRequest{From: journal.Beginning()})
 	if err != nil {
 		t.Fatalf("drainRecordReplay: %v", err)
 	}

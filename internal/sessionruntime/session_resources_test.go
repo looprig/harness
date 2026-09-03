@@ -1184,3 +1184,92 @@ func assertResourceErrors(t *testing.T, got error, want ...error) {
 		}
 	}
 }
+
+// TestResourceStorageAdmitsASiblingSharingAPathPrefixWithTheWorkspace is the
+// counterweight to TestResourceStorageRejectsWorkspaceIdentityOverlap: the containment
+// check must be over path COMPONENTS, not string prefixes. "<base>/ws-objects" shares the
+// textual prefix "<base>/ws" with the workspace and is nonetheless outside it, so a
+// prefix-based check would refuse a legal layout. It is a separate test rather than a row
+// in the rejection table because its expected outcome is the opposite one, and a row that
+// opted out of that table's shared assertion would silently drop every clause it passes.
+func TestResourceStorageAdmitsASiblingSharingAPathPrefixWithTheWorkspace(t *testing.T) {
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New() error = %v", err)
+	}
+	base := t.TempDir()
+	workspace := filepath.Join(base, "ws")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatalf("Mkdir(workspace) error = %v", err)
+	}
+	resourceRoot := filepath.Join(base, "ws-objects")
+
+	resources, err := resolveSessionResources(
+		context.Background(),
+		id,
+		func(context.Context, uuid.UUID) (string, string, error) { return resourceRoot, "owner", nil },
+		workspace,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("resolveSessionResources() error = %T %v, want a sibling sharing a path prefix to be admitted", err, err)
+	}
+	if resources == nil {
+		t.Fatal("resolveSessionResources() returned no registry")
+	}
+	if _, statErr := os.Stat(filepath.Join(resourceRoot, sessionResourceAnchorName)); statErr != nil {
+		t.Fatalf("admitted resource root has no identity anchor: %v", statErr)
+	}
+}
+
+// TestWorkspaceCheckpointDoesNotCaptureSessionResourceStorage is step 3's other half: the
+// overlap refusal exists so a checkpoint cannot recursively archive the session's own
+// persistence storage. This drives the actual snapshot — the refusal alone proves only
+// that a resolution was rejected, not that the archive is clean — and asserts the
+// resource root's identity anchor is absent from the materialized tree.
+func TestWorkspaceCheckpointDoesNotCaptureSessionResourceStorage(t *testing.T) {
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New() error = %v", err)
+	}
+	base := t.TempDir()
+	workspace := filepath.Join(base, "ws")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatalf("Mkdir(workspace) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "work.txt"), []byte("work"), 0o600); err != nil {
+		t.Fatalf("WriteFile(work.txt) error = %v", err)
+	}
+	resourceRoot := filepath.Join(base, "objects")
+	if _, err := resolveSessionResources(
+		context.Background(),
+		id,
+		func(context.Context, uuid.UUID) (string, string, error) { return resourceRoot, "owner", nil },
+		workspace,
+		false,
+	); err != nil {
+		t.Fatalf("resolveSessionResources() error = %T %v", err, err)
+	}
+
+	ws := mustWorkspaceStore(t, memstore.New().Blobs)
+	ref, err := ws.Snapshot(context.Background(), workspace)
+	if err != nil {
+		t.Fatalf("Snapshot(workspace) error = %v", err)
+	}
+	materialized := t.TempDir()
+	if err := ws.Materialize(context.Background(), ref, materialized); err != nil {
+		t.Fatalf("Materialize error = %v", err)
+	}
+	captured, err := relRegularFiles(materialized)
+	if err != nil {
+		t.Fatalf("relRegularFiles error = %v", err)
+	}
+	for _, rel := range captured {
+		if filepath.Base(rel) == sessionResourceAnchorName {
+			t.Fatalf("checkpoint captured session resource storage: %q", rel)
+		}
+	}
+	if len(captured) != 1 || captured[0] != "work.txt" {
+		t.Fatalf("captured files = %v, want exactly [work.txt]", captured)
+	}
+}

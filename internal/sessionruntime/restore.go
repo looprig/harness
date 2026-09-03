@@ -316,6 +316,44 @@ func effectiveCurrentWorkspace(events []event.Event) (string, bool) {
 	return ref, ok
 }
 
+// foldWorkspaceResidency folds the replayed journal into the two facts a restored session
+// must be able to report about its workspace (design §11.1): which durable transition the
+// live tree was materialized from, and how much journalled work follows it.
+//
+// It takes RECORDS and their journal sequences rather than events because the boundary a
+// restore must report is a journal sequence, and an event payload cannot carry its own —
+// the sequence is assigned by the append that encodes it. WorkspaceCheckpointed therefore
+// still carries no sequence of its own; the journal's is read here instead, which is also
+// why this works after a crash, where no SessionResidencyReleased was ever written.
+//
+// The count is over LOOP-scoped events only. Session-scoped records — the residency
+// release itself, the restore lifecycle, a configuration adoption — are not work against
+// the workspace, and counting them would report loss on every clean handover. The rule is
+// the scope, not a list of exempt types, so a loop-scoped event added later counts by
+// default rather than being silently exempt.
+func foldWorkspaceResidency(records []journal.JournalRecord, seqs []uint64) WorkspaceResidencyStatus {
+	var status WorkspaceResidencyStatus
+	for i, rec := range records {
+		evRec, ok := rec.(journal.EventRecord)
+		if !ok {
+			continue
+		}
+		var seq uint64
+		if i < len(seqs) {
+			seq = seqs[i]
+		}
+		switch ev := evRec.Event(); ev.(type) {
+		case event.WorkspaceCheckpointed, event.WorkspaceRestored:
+			status.CheckpointSeq, status.HasCheckpoint, status.PostCheckpointEvents = seq, true, 0
+		default:
+			if ev.Scope() != event.ScopeSession {
+				status.PostCheckpointEvents++
+			}
+		}
+	}
+	return status
+}
+
 // restoredInference is the fold of one loop's selected mode and latest resolved
 // runtime. Every lifecycle event replaces Runtime, matching the actor's live
 // precedence, so restore does not consult a mutable model catalog for identity,

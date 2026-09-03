@@ -367,3 +367,57 @@ type PlacementResolutionError struct {
 func (e *PlacementResolutionError) Error() string {
 	return "sessionruntime: invalid workspace placement: " + e.Reason
 }
+
+// --- model-visible workspace identity (design §11.1) --------------------------------
+
+// logicalWorkspacePrefix is the namespace the session-derived workspace path hangs off.
+// The design writes it as /sessions/{tenant}/{sid}/workspace; harness has no tenant
+// concept, so it derives the {sid}/workspace tail and a Host that runs multiple tenants
+// prefixes its own segment. Nothing here parses the result — it is an identity, not a
+// path this process opens.
+const logicalWorkspacePrefix = "/sessions/"
+
+// logicalWorkspaceRoot is the path the session's managed workspace is exposed at inside
+// the agent/tool namespace. It is a function of the session id and of NOTHING else, which
+// is the whole point: a session released by one Host and restored by another lands on a
+// different physical root (WorkspacePlacement.rootFor derives that from BaseDir or from a
+// fixed Root), and a journalled instruction naming a file must still resolve. A zero
+// session id has no identity to derive from and yields the empty string.
+func logicalWorkspaceRoot(sid uuid.UUID) string {
+	if sid.IsZero() {
+		return ""
+	}
+	return logicalWorkspacePrefix + sid.String() + "/workspace"
+}
+
+// WorkspaceResidencyStatus is what a session reports about the workspace it came up on.
+// It exists because §11.1 requires a restore to REPORT the checkpoint boundary rather
+// than present the journal as though uncheckpointed files survived — this type is that
+// report, and every field is a detection claim, never a repair.
+//
+// A session with no managed workspace reports the zero value: there is no boundary to
+// name and no tree to have lost anything from.
+type WorkspaceResidencyStatus struct {
+	// LogicalRoot is the session-derived model-visible path (logicalWorkspaceRoot).
+	LogicalRoot string
+	// Root is THIS process's physical workspace root.
+	Root string
+	// CheckpointSeq is the JOURNAL sequence of the workspace transition the live tree was
+	// materialized from — the last WorkspaceCheckpointed or WorkspaceRestored in the
+	// replayed stream. It is read from the journal's own sequence for that record, so it
+	// is available after a crash too, not only after a clean release (whose
+	// SessionResidencyReleased carries the same number).
+	CheckpointSeq uint64
+	// HasCheckpoint distinguishes "anchored at sequence 0" from "never checkpointed".
+	// CheckpointSeq is meaningless when it is false.
+	HasCheckpoint bool
+	// PostCheckpointEvents counts the loop-scoped durable events recorded AFTER that
+	// transition: journalled work whose workspace mutations are not in the materialized
+	// tree. It is a DETECTION count. Nothing here prevents the loss, recovers the bytes,
+	// or bounds how much was lost per event.
+	PostCheckpointEvents int
+}
+
+// PostCheckpointLoss reports whether the journal records work after the transition the
+// live tree was materialized from — the divergence §11.1 forbids presenting silently.
+func (s WorkspaceResidencyStatus) PostCheckpointLoss() bool { return s.PostCheckpointEvents > 0 }

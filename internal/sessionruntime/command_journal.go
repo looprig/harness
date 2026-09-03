@@ -644,3 +644,10 @@ func (s *Session) notifyProcessCompletion(ctx context.Context, n tool.ProcessCom
 }
 
 var _ tool.ProcessCompletionNotifier = (*Session)(nil)
+
+// withWorkspaceResidency carries the checkpoint boundary Restore folded from the durable
+// stream into the session it is building, so WorkspaceStatus can report it. NewSession
+// never sets it: a fresh session has no prior stream and therefore no boundary to name.
+func withWorkspaceResidency(status WorkspaceResidencyStatus) Option {
+	return func(s *Session) { s.wsResidency = status }
+}

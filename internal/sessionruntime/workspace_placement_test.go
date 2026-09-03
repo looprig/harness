@@ -317,3 +317,80 @@ func mustWriteFile(t *testing.T, path, content string) {
 		t.Fatalf("WriteFile %s: %v", path, err)
 	}
 }
+
+// TestLogicalWorkspaceRootIsDerivedFromSessionIdentityAlone pins the identity half of
+// spec §11.1: the model-visible workspace path is a function of the session id and of
+// NOTHING else, so two Hosts whose runtime roots differ still expose one path. It is a
+// derivation test on purpose — a derivation that consulted the physical root would be
+// indistinguishable in an end-to-end probe that happened to reuse a root.
+func TestLogicalWorkspaceRootIsDerivedFromSessionIdentityAlone(t *testing.T) {
+	t.Parallel()
+	first, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	second, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	if got, want := logicalWorkspaceRoot(first), "/sessions/"+first.String()+"/workspace"; got != want {
+		t.Errorf("logicalWorkspaceRoot = %q, want %q", got, want)
+	}
+	if logicalWorkspaceRoot(first) == logicalWorkspaceRoot(second) {
+		t.Error("two distinct sessions share one logical workspace root: the path is not session-derived")
+	}
+	if got := logicalWorkspaceRoot(uuid.UUID{}); got != "" {
+		t.Errorf("logicalWorkspaceRoot(zero id) = %q, want empty: a session with no identity has no logical path", got)
+	}
+}
+
+// TestWorkspaceBindingCarriesTheLogicalRootOnEveryRuntimeRoot proves the binding every
+// loop bind site receives separates the two paths: Root is THIS process's physical root
+// and varies with the runtime root, while LogicalRoot is the same on both. The two
+// clauses are asserted together because either alone is satisfiable by collapsing the
+// fields onto each other.
+func TestWorkspaceBindingCarriesTheLogicalRootOnEveryRuntimeRoot(t *testing.T) {
+	t.Parallel()
+	sid, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	roots := []string{filepath.FromSlash("/hostA/runtime/") + sid.String(), filepath.FromSlash("/hostB/elsewhere/") + sid.String()}
+	logical := make([]string, 0, len(roots))
+	for _, root := range roots {
+		s := &Session{sessionID: sid, wsRoot: root, wsCoordinator: newWorkspaceCoordinator(nil)}
+		binding := s.newWorkspaceBinding()
+		if binding == nil {
+			t.Fatalf("newWorkspaceBinding() = nil for root %q", root)
+		}
+		if binding.Root != root {
+			t.Errorf("binding.Root = %q, want the physical root %q", binding.Root, root)
+		}
+		if binding.LogicalRoot == binding.Root {
+			t.Errorf("binding.LogicalRoot = binding.Root = %q: the model-visible path collapsed onto the physical one", binding.Root)
+		}
+		logical = append(logical, binding.LogicalRoot)
+	}
+	if logical[0] != logical[1] {
+		t.Errorf("LogicalRoot differs across runtime roots: %q vs %q", logical[0], logical[1])
+	}
+	if logical[0] != logicalWorkspaceRoot(sid) {
+		t.Errorf("binding.LogicalRoot = %q, want %q", logical[0], logicalWorkspaceRoot(sid))
+	}
+}
+
+// TestWorkspaceStatusIsZeroWithoutAManagedWorkspace pins the fail-quiet edge: a session
+// with no workspace store has no boundary to name and no tree to have lost anything from,
+// so it must report the zero value rather than a logical path for a workspace that does
+// not exist. Asserting the WHOLE struct means a field added later is covered by default.
+func TestWorkspaceStatusIsZeroWithoutAManagedWorkspace(t *testing.T) {
+	t.Parallel()
+	sid, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	s := &Session{sessionID: sid, wsResidency: WorkspaceResidencyStatus{CheckpointSeq: 9, HasCheckpoint: true, PostCheckpointEvents: 3}}
+	if got := s.WorkspaceStatus(); got != (WorkspaceResidencyStatus{}) {
+		t.Errorf("WorkspaceStatus() = %+v on a session with no managed workspace, want the zero value", got)
+	}
+}

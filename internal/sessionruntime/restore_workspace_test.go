@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/storage"
@@ -572,6 +574,288 @@ func TestRestoreWorkspaceMaterializeFailsClosed(t *testing.T) {
 				defer rcancel()
 				_ = successor.Release(rctx)
 			})
+		})
+	}
+}
+
+// --- workspace identity across residency (H4.3) --------------------------------------
+
+// canonicalTempDir returns a temporary directory with every symlink resolved. A managed
+// per-session placement refuses a base parent that does not equal its own canonical form
+// (establishCanonicalDirectory), and on darwin t.TempDir() lives under the /var -> /private/var
+// symlink, so the raw value would be rejected before any of these assertions ran.
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks(TempDir): %v", err)
+	}
+	return resolved
+}
+
+// crossRootLifecycle builds a lifecycle whose per-session placement hangs off baseDir —
+// one "Host" runtime root. Two of them over the SAME sessionstore and workspacestore are
+// the warm handover this task is about. The snapshot policy is Manual so the only
+// checkpoints in the journal are the ones a test asked for.
+func crossRootLifecycle(t *testing.T, store *sessionstore.Store, ws *workspacestore.Store, baseDir string) *Lifecycle {
+	t.Helper()
+	lifecycle, err := newTestLifecycle(cfg(&stubLLM{}), store,
+		WithLifecyclePlacement(WorkspacePlacement{Mode: PlacementSession, Store: ws, BaseDir: baseDir}),
+		WithLifecycleSnapshotPolicy(SnapshotPolicy{Trigger: SnapshotManual, Priority: SnapshotBestEffort, Timeout: 10 * time.Second}),
+	)
+	if err != nil {
+		t.Fatalf("NewTopologyLifecycle(baseDir=%q): %v", baseDir, err)
+	}
+	return lifecycle
+}
+
+// replaySessionStream reads the whole durable stream for sid, returning each event with
+// the journal sequence the store assigned it. Assertions about "the checkpoint's journal
+// sequence" need the sequence the JOURNAL knows, not a position in a recorder slice.
+func replaySessionStream(t *testing.T, store *sessionstore.Store, sid uuid.UUID) ([]event.Event, []uint64) {
+	t.Helper()
+	replayer, err := store.OpenEventReplayer(sid, sessionstore.ReplayRequest{FromSeq: 0})
+	if err != nil {
+		t.Fatalf("OpenEventReplayer: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cursor, err := replayer.Open(ctx, journal.ReplayRequest{Follow: false})
+	if err != nil {
+		t.Fatalf("replay Open: %v", err)
+	}
+	defer func() { _ = cursor.Close() }()
+	var events []event.Event
+	var seqs []uint64
+	for {
+		ev, seq, err := cursor.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			return events, seqs
+		}
+		if err != nil {
+			t.Fatalf("replay Next: %v", err)
+		}
+		events = append(events, ev)
+		seqs = append(seqs, seq)
+	}
+}
+
+// TestRestoreOnADifferentRuntimeRootPreservesTheModelVisibleWorkspacePath is the H4.3
+// end-to-end: create, checkpoint, release residency on Host A, restore on Host B whose
+// runtime root is a DIFFERENT directory. The physical roots must differ (otherwise the
+// test proves nothing about stability) while the model-visible path and the workspace
+// contents are the same, and the restored session must report the journal sequence of the
+// checkpoint it came up on with no post-checkpoint loss.
+func TestRestoreOnADifferentRuntimeRootPreservesTheModelVisibleWorkspacePath(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	store := newRestoreStore(t)
+	ws := mustWorkspaceStore(t, memstore.New().Blobs)
+	baseA, baseB := canonicalTempDir(t), canonicalTempDir(t)
+
+	first, err := crossRootLifecycle(t, store, ws, baseA).NewSession(ctx, "")
+	if err != nil {
+		t.Fatalf("NewSession on host A: %v", err)
+	}
+	sid := first.SessionID()
+	rootA := first.wsRoot
+	// The LIVE binding host A's loops were bound with, captured before the release, so the
+	// comparison below is between two real bindings rather than one real and one synthesized.
+	bindingA := first.newWorkspaceBinding()
+	if bindingA == nil {
+		t.Fatal("host-A session has no workspace binding")
+	}
+	wsBuildTree(t, rootA, "alpha")
+	if _, err := first.CheckpointWorkspace(ctx); err != nil {
+		t.Fatalf("CheckpointWorkspace: %v", err)
+	}
+	if err := first.ReleaseResidency(ctx); err != nil {
+		t.Fatalf("ReleaseResidency: %v", err)
+	}
+
+	second, err := crossRootLifecycle(t, store, ws, baseB).RestoreSession(ctx, sid)
+	if err != nil {
+		t.Fatalf("RestoreSession on host B: %v", err)
+	}
+	t.Cleanup(func() { _ = second.Shutdown(context.Background()) })
+	rootB := second.wsRoot
+
+	if rootA == rootB {
+		t.Fatalf("both hosts resolved the same physical root %q: the fixture does not cross a runtime root", rootA)
+	}
+	bindingB := second.newWorkspaceBinding()
+	if bindingB == nil {
+		t.Fatal("restored session has no workspace binding")
+	}
+	if bindingA.Root == bindingB.Root {
+		t.Errorf("binding.Root = %q on both hosts: the binding did not follow the runtime root", bindingA.Root)
+	}
+	if bindingA.LogicalRoot != bindingB.LogicalRoot {
+		t.Errorf("model-visible workspace path changed across the handover: %q -> %q", bindingA.LogicalRoot, bindingB.LogicalRoot)
+	}
+	if bindingB.LogicalRoot == "" || bindingB.LogicalRoot == bindingB.Root {
+		t.Errorf("restored LogicalRoot = %q (Root = %q): the model-visible path is empty or collapsed onto the physical one", bindingB.LogicalRoot, bindingB.Root)
+	}
+	wsAssertTreesEqual(t, rootA, rootB)
+
+	// The restored status reports the journal sequence of the checkpoint it materialized,
+	// and it agrees with the sequence the release record independently anchored to.
+	events, seqs := replaySessionStream(t, store, sid)
+	var wantSeq uint64
+	for i, ev := range events {
+		if _, ok := ev.(event.WorkspaceCheckpointed); ok {
+			wantSeq = seqs[i]
+		}
+	}
+	if wantSeq == 0 {
+		t.Fatal("no WorkspaceCheckpointed in the durable stream")
+	}
+	released, _ := countResidencyEvents(events)
+	if len(released) != 1 {
+		t.Fatalf("SessionResidencyReleased count = %d, want 1", len(released))
+	}
+	if released[0].CheckpointSeq != wantSeq {
+		t.Errorf("SessionResidencyReleased.CheckpointSeq = %d, want the journal sequence %d", released[0].CheckpointSeq, wantSeq)
+	}
+	status := second.WorkspaceStatus()
+	if !status.HasCheckpoint {
+		t.Error("restored WorkspaceStatus reports no checkpoint after a clean release")
+	}
+	if status.CheckpointSeq != wantSeq {
+		t.Errorf("restored CheckpointSeq = %d, want %d", status.CheckpointSeq, wantSeq)
+	}
+	if status.PostCheckpointLoss() {
+		t.Errorf("restored status reports post-checkpoint loss after a clean release: %d events after the checkpoint", status.PostCheckpointEvents)
+	}
+	if status.LogicalRoot != bindingB.LogicalRoot || status.Root != rootB {
+		t.Errorf("status roots = (%q, %q), want (%q, %q)", status.LogicalRoot, status.Root, bindingB.LogicalRoot, rootB)
+	}
+}
+
+// TestRestoredWorkspaceStatusSurfacesPostCheckpointLoss is the DETECTION claim: work that
+// the journal records after the last workspace checkpoint did not survive into the
+// materialized tree, and the restored session says so rather than presenting the journal
+// as though the uncheckpointed files were there. It is the crash shape — a checkpoint,
+// then a turn, then no release at all.
+func TestRestoredWorkspaceStatusSurfacesPostCheckpointLoss(t *testing.T) {
+	t.Parallel()
+	store := newRestoreStore(t)
+	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+	ws := mustWorkspaceStore(t, memstore.New().Blobs)
+	src := t.TempDir()
+	wsBuildTree(t, src, "alpha")
+	ref, err := ws.Snapshot(context.Background(), src)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	h, sid, rootLoopID, lease, es := newOriginalHub(t, store, fp)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	es.stamp(t, ctx, h, event.WorkspaceCheckpointed{
+		Header:      event.Header{Coordinates: identity.Coordinates{SessionID: sid}},
+		Ref:         string(ref),
+		Consistency: event.SnapshotQuiescent,
+		Trigger:     event.SnapshotTriggerManual,
+	})
+	// One loop-scoped record AFTER the checkpoint: the workspace mutations that turn made
+	// are not in the snapshot the restore materializes.
+	es.stamp(t, ctx, h, event.LoopIdle{
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: rootLoopID}},
+	})
+	handOver(t, lease)
+
+	restored, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
+		sid, store, WithWorkspaceCheckpointing(ws, t.TempDir()))
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	t.Cleanup(func() { _ = restored.Shutdown(context.Background()) })
+
+	status := restored.WorkspaceStatus()
+	if !status.HasCheckpoint {
+		t.Fatal("restored status reports no checkpoint boundary at all")
+	}
+	if !status.PostCheckpointLoss() {
+		t.Error("restored status reports no post-checkpoint loss, but a loop-scoped record follows the checkpoint")
+	}
+	if status.PostCheckpointEvents != 1 {
+		t.Errorf("PostCheckpointEvents = %d, want 1", status.PostCheckpointEvents)
+	}
+}
+
+// TestFoldWorkspaceResidency pins the fold the restored status is computed by, including
+// the cases the end-to-end fixtures cannot cheaply reach: a stream with no checkpoint at
+// all, a rewind that moves the pointer forward, and session-scoped records (the release
+// itself, the restore lifecycle) that must NOT be counted as lost work.
+func TestFoldWorkspaceResidency(t *testing.T) {
+	t.Parallel()
+	rec := func(ev event.Event) journal.JournalRecord { return journal.NewEventRecord(ev) }
+	tests := []struct {
+		name      string
+		records   []journal.JournalRecord
+		seqs      []uint64
+		wantSeq   uint64
+		wantHas   bool
+		wantAfter int
+	}{
+		{
+			name:      "no checkpoint: every loop record is unaccounted work",
+			records:   []journal.JournalRecord{rec(event.SessionStarted{}), rec(event.LoopStarted{}), rec(event.LoopIdle{})},
+			seqs:      []uint64{1, 2, 3},
+			wantAfter: 2,
+		},
+		{
+			name:      "checkpoint at its journal sequence, nothing after",
+			records:   []journal.JournalRecord{rec(event.SessionStarted{}), rec(event.LoopIdle{}), rec(event.WorkspaceCheckpointed{})},
+			seqs:      []uint64{7, 8, 9},
+			wantSeq:   9,
+			wantHas:   true,
+			wantAfter: 0,
+		},
+		{
+			name:      "loop work after the checkpoint counts",
+			records:   []journal.JournalRecord{rec(event.WorkspaceCheckpointed{}), rec(event.LoopIdle{}), rec(event.LoopIdle{})},
+			seqs:      []uint64{4, 5, 6},
+			wantSeq:   4,
+			wantHas:   true,
+			wantAfter: 2,
+		},
+		{
+			name:      "a rewind moves the boundary and clears the count",
+			records:   []journal.JournalRecord{rec(event.WorkspaceCheckpointed{}), rec(event.LoopIdle{}), rec(event.WorkspaceRestored{})},
+			seqs:      []uint64{2, 3, 4},
+			wantSeq:   4,
+			wantHas:   true,
+			wantAfter: 0,
+		},
+		{
+			name:      "session-scoped tail is not lost work",
+			records:   []journal.JournalRecord{rec(event.WorkspaceCheckpointed{}), rec(event.SessionResidencyReleased{}), rec(event.RestoreStarted{}), rec(event.RestoreDone{})},
+			seqs:      []uint64{11, 12, 13, 14},
+			wantSeq:   11,
+			wantHas:   true,
+			wantAfter: 0,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := foldWorkspaceResidency(tt.records, tt.seqs)
+			if got.CheckpointSeq != tt.wantSeq {
+				t.Errorf("CheckpointSeq = %d, want %d", got.CheckpointSeq, tt.wantSeq)
+			}
+			if got.HasCheckpoint != tt.wantHas {
+				t.Errorf("HasCheckpoint = %v, want %v", got.HasCheckpoint, tt.wantHas)
+			}
+			if got.PostCheckpointEvents != tt.wantAfter {
+				t.Errorf("PostCheckpointEvents = %d, want %d", got.PostCheckpointEvents, tt.wantAfter)
+			}
+			if want := tt.wantAfter > 0; got.PostCheckpointLoss() != want {
+				t.Errorf("PostCheckpointLoss() = %v, want %v", got.PostCheckpointLoss(), want)
+			}
 		})
 	}
 }
