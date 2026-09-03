@@ -42,6 +42,7 @@ var publicSessionContracts = map[string]bool{
 	"DefaultPolicyDecider": true, "AcceptAllDecider": true,
 	"CommittedPublicEventSource": true, "CommittedPublicEventProvider": true,
 	"IdleWaiter": true, "Liveness": true, "Releaser": true,
+	"WorkspaceReporter": true, "WorkspaceStatus": true,
 }
 
 var forbiddenSessionSurface = map[string]bool{
@@ -603,7 +604,7 @@ func TestLifecycleShapeGuardRejectsDriftedFixtures(t *testing.T) {
 // Interrupt(context.Context) (bool, error) to Interrupt(context.Context) error
 // leaves every name intact, and coordinated with the runtime it compiles.
 //
-// The segregation arm pins THREE LITERAL NAMES and nothing more. It is not a
+// The segregation arm pins FOUR LITERAL NAMES and nothing more. It is not a
 // general guard against lifecycle capability leakage and must not be described as
 // one: adding an implemented ReleaseRuntime(context.Context) error to
 // SessionController — a synonym for nonterminal residency release, precisely what
@@ -652,7 +653,7 @@ func TestSessionControllerNotWidenedForLifecycleCapabilities(t *testing.T) {
 		}
 	}
 
-	segregated := []string{"WaitIdle", "Done", "ReleaseResidency"}
+	segregated := []string{"WaitIdle", "Done", "ReleaseResidency", "WorkspaceStatus"}
 	for _, view := range []reflect.Type{dataPlane, controller} {
 		for _, name := range segregated {
 			if _, exists := view.MethodByName(name); exists {
@@ -743,5 +744,137 @@ func TestProductionSessionReleasesResidencyWithTheExactReviewedShape(t *testing.
 		if _, exists := view.MethodByName("ReleaseResidency"); exists {
 			t.Errorf("%s exposes ReleaseResidency; it must stay segregated", view.Name())
 		}
+	}
+}
+
+// --- H4.3: the workspace-boundary reporting capability -------------------------------
+
+// The four drift kinds for WorkspaceReporter, matching the discipline
+// lifecycleCapabilityShapes documents: a rename, a signature-only change (the only kind a
+// name-only renderer cannot see), and a widening on each side of the real method so a
+// comparison degraded to "first element only" fails on one of them.
+//
+// renamedWorkspaceReporter is the rename the contract's own doc comment argues against:
+// Status() drops "Workspace" at the boundary where a caller is choosing which of several
+// statuses a session can report.
+type renamedWorkspaceReporter interface {
+	Status() session.WorkspaceStatus
+}
+
+// mutableWorkspaceReporter is the signature-only drift that matters most here: a reporter
+// that takes a context reads as something that may do I/O or block, and this capability is
+// a field read of already-folded state. It is also the shape a "refresh the boundary"
+// redesign would arrive as, which is a different contract, not this one.
+type mutableWorkspaceReporter interface {
+	WorkspaceStatus(context.Context) session.WorkspaceStatus
+}
+
+type widenedBeforeWorkspaceReporter interface {
+	CheckpointSeq() uint64
+	WorkspaceStatus() session.WorkspaceStatus
+}
+
+type widenedAfterWorkspaceReporter interface {
+	WorkspaceStatus() session.WorkspaceStatus
+	WorkspaceStatusRefresh() session.WorkspaceStatus
+}
+
+// workspaceReporterShape is the H4.3 oracle. It is kept OUT of
+// lifecycleCapabilityShapes() because that table's comment states it is the three H4.1
+// method sets transcribed from runbook 03-harness, and appending a fourth from a different
+// task would make that sentence false — and because TestProductionSessionReleasesResidency-
+// WithTheExactReviewedShape indexes that slice positionally.
+//
+// The same encoding caveat applies: TestRenderMethodSetFormat pins how renderMethodSet
+// prints a signature, so a mismatch here is resolved by re-reading the task text, never by
+// pasting what reflect printed.
+func workspaceReporterShape() lifecycleCapabilityShape {
+	return lifecycleCapabilityShape{
+		name:     "WorkspaceReporter",
+		contract: reflect.TypeFor[session.WorkspaceReporter](),
+		want:     []string{"WorkspaceStatus() session.WorkspaceStatus"},
+		drifted: []reflect.Type{
+			reflect.TypeFor[renamedWorkspaceReporter](),
+			reflect.TypeFor[mutableWorkspaceReporter](),
+			reflect.TypeFor[widenedBeforeWorkspaceReporter](),
+			reflect.TypeFor[widenedAfterWorkspaceReporter](),
+		},
+	}
+}
+
+// TestWorkspaceReporterShape pins the exact method set, then proves the guard rejects each
+// drifted shape — so the accepting half is not asserted by a comparison nobody has seen
+// say no.
+func TestWorkspaceReporterShape(t *testing.T) {
+	t.Parallel()
+	shape := workspaceReporterShape()
+	if !methodSetMatches(t, shape.contract, shape.want) {
+		t.Fatalf("session.WorkspaceReporter = %v, want %v", contractMethodSet(t, shape.contract), shape.want)
+	}
+	for _, drifted := range shape.drifted {
+		if methodSetMatches(t, drifted, shape.want) {
+			t.Errorf("drifted shape %v matched the pinned want; the guard cannot reject anything", drifted)
+		}
+	}
+}
+
+// TestProductionSessionReportsTheWorkspaceBoundary is the reachability claim H4.3 owes:
+// the boundary is useless to a Host that cannot get at it. The runtime satisfies the
+// contract, the contract still has the shape the oracle pins (so Implements is not
+// vacuous), and the capability stays SEGREGATED — discovered by assertion, exactly like
+// Releaser, so a session composed without a managed workspace answers ok == false rather
+// than returning an error from a method every controller is forced to carry.
+//
+// SCOPE, inherited from TestProductionSessionSatisfiesLifecycleCapabilities: the subject is
+// the concrete runtime type, not whatever rig hands a caller. rig returns the runtime
+// unwrapped today and nothing pins that; a future decorator that does not forward
+// WorkspaceStatus would silently answer ok == false while this stays green.
+func TestProductionSessionReportsTheWorkspaceBoundary(t *testing.T) {
+	t.Parallel()
+	contract := reflect.TypeFor[session.WorkspaceReporter]()
+	shape := workspaceReporterShape()
+	if !methodSetMatches(t, contract, shape.want) {
+		t.Fatalf("session.WorkspaceReporter = %v, want %v; the satisfaction assertion below would be vacuous", contractMethodSet(t, contract), shape.want)
+	}
+	production := reflect.TypeFor[*sessionruntime.Session]()
+	if !production.Implements(contract) {
+		t.Fatalf("production *sessionruntime.Session does not satisfy session.WorkspaceReporter; it has %v", contractMethodSet(t, production))
+	}
+	if reflect.TypeFor[*struct{}]().Implements(contract) {
+		t.Error("*struct{} reported as satisfying session.WorkspaceReporter; the satisfaction guard cannot reject anything")
+	}
+	for _, view := range []reflect.Type{reflect.TypeFor[session.Session](), reflect.TypeFor[session.SessionController]()} {
+		if _, exists := view.MethodByName("WorkspaceStatus"); exists {
+			t.Errorf("%s exposes WorkspaceStatus; it must stay segregated and be discovered by assertion", view.Name())
+		}
+	}
+}
+
+// TestWorkspaceStatusLossPredicateRequiresACheckpoint pins the predicate's gate at the
+// CONTRACT, where a consumer reads it, not only at the fold that produces it. With no
+// checkpoint there is no transition to have lost anything since, so a never-checkpointed
+// session must not raise the alarm however many records are counted — and the count itself
+// must survive, because zeroing it instead would hide the crash-shape signal.
+func TestWorkspaceStatusLossPredicateRequiresACheckpoint(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		status session.WorkspaceStatus
+		want   bool
+	}{
+		{name: "no checkpoint, records counted", status: session.WorkspaceStatus{PostCheckpointEvents: 4}, want: false},
+		{name: "checkpoint, no records", status: session.WorkspaceStatus{HasCheckpoint: true, CheckpointSeq: 9}, want: false},
+		{name: "checkpoint and records", status: session.WorkspaceStatus{HasCheckpoint: true, CheckpointSeq: 9, PostCheckpointEvents: 1}, want: true},
+		{name: "checkpoint at sequence zero is a real checkpoint", status: session.WorkspaceStatus{HasCheckpoint: true, PostCheckpointEvents: 2}, want: true},
+		{name: "zero value", status: session.WorkspaceStatus{}, want: false},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.status.PostCheckpointLoss(); got != tt.want {
+				t.Errorf("PostCheckpointLoss() = %v, want %v (%+v)", got, tt.want, tt.status)
+			}
+		})
 	}
 }

@@ -217,3 +217,87 @@ type Liveness interface {
 type Releaser interface {
 	ReleaseResidency(context.Context) error
 }
+
+// WorkspaceStatus is what a session reports about the managed workspace it came up
+// on: where the workspace is, and which durable checkpoint the live tree was
+// materialized from.
+//
+// It is a REPORT, never a repair. Nothing on it recovers a mutation, bounds how much
+// any record lost, or prevents anything. A session with no managed workspace reports
+// the zero value — there is no boundary to name and no tree to have lost anything
+// from.
+//
+// The two roots answer different questions and must not be collapsed. Root is THIS
+// process's physical location and varies with the Host's runtime root. LogicalRoot is
+// the session-derived path the same tree is exposed at inside the agent/tool
+// namespace; it is derived from session identity alone, so a session released by one
+// Host and restored by another keeps it, which is what makes a previously journalled
+// "read this file" still resolve.
+//
+// FRESHNESS IS NOT UNIFORM ACROSS THESE FIELDS. Root and LogicalRoot are live. The
+// boundary fields — CheckpointSeq, HasCheckpoint, PostCheckpointEvents — are AS OF
+// RESTORE and never refresh: a session that checkpoints again after coming up still
+// reports the boundary it came up on. A caller polling this for a live checkpoint
+// position is reading the wrong thing.
+type WorkspaceStatus struct {
+	// LogicalRoot is the session-derived, model-visible workspace path. Empty when the
+	// session has no managed workspace or no session identity.
+	LogicalRoot string
+	// Root is this process's physical workspace root.
+	Root string
+	// CheckpointSeq is the JOURNAL sequence of the workspace transition the live tree
+	// was materialized from — the last checkpoint or rewind in the replayed stream. It
+	// is read from the journal's own sequence, so it is available after a crash and not
+	// only after a clean release. Meaningless when HasCheckpoint is false.
+	CheckpointSeq uint64
+	// HasCheckpoint distinguishes "anchored at sequence 0" from "never checkpointed".
+	HasCheckpoint bool
+	// PostCheckpointEvents counts the loop-scoped durable records that follow that
+	// transition: journalled loop work that MAY have mutated the workspace after the
+	// tree the restore materialized. Nothing inspects a record for whether it actually
+	// touched the workspace, so this is a deliberate OVER-APPROXIMATION — it is a count
+	// of records, not of losses, and it is the input to PostCheckpointLoss rather than a
+	// measure of how much was lost.
+	PostCheckpointEvents int
+}
+
+// PostCheckpointLoss reports whether the journal records loop work after the
+// transition the live tree was materialized from — the divergence a restore must not
+// present silently.
+//
+// It requires HasCheckpoint. With no checkpoint in the stream there is no such
+// transition: the restore materializes nothing and leaves the live tree exactly as it
+// found it, so a never-checkpointed warm restart has lost nothing and must not raise
+// an alarm, however much loop work the journal holds. Reading PostCheckpointEvents
+// without this gate is the false positive that would fire on every such restart.
+//
+// A true result is a MAY, not a DID: see PostCheckpointEvents.
+func (s WorkspaceStatus) PostCheckpointLoss() bool {
+	return s.HasCheckpoint && s.PostCheckpointEvents > 0
+}
+
+// WorkspaceReporter is the segregated workspace-boundary reporting capability: it
+// answers where the session's managed workspace is and which checkpoint it came up
+// on.
+//
+// It exists because the two facts have no other route out of the runtime. A Host in
+// another module holds a SessionController; the boundary lives on the concrete
+// runtime type, so without a contract here a caller could not even NAME the return
+// type to declare a local interface for it.
+//
+// Like Releaser it is discovered by assertion:
+//
+//	reporter, ok := controller.(session.WorkspaceReporter)
+//
+// and a caller MUST treat a false ok as "this session does not report a workspace
+// boundary", not as an error — a session composed without a managed workspace is a
+// legitimate configuration, not a failure. It is segregated rather than folded onto
+// SessionController for the same reason Releaser is: a wrapper that does not forward
+// the method opts its wrapped session out, and that is a capability answer.
+//
+// It is deliberately READ-ONLY and deliberately separate from CheckpointWorkspace /
+// RestoreWorkspace, which are workspace CONTROL and already live on SessionController.
+// Reporting a boundary and moving one are different authorities.
+type WorkspaceReporter interface {
+	WorkspaceStatus() WorkspaceStatus
+}

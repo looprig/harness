@@ -131,13 +131,20 @@ func resolveSessionResources(
 		return nil, err
 	}
 	if workspaceRoot != "" {
-		workspace, canonicalErr := filepath.Abs(workspaceRoot)
+		// Both sides go through the SAME canonicalization, and it fails CLOSED. The
+		// workspace side used to try EvalSymlinks and, on any error — including the
+		// ordinary "the root does not exist yet" — fall back to the unresolved path,
+		// silently degrading this to a lexical comparison. That is a guard failing for
+		// the wrong reason, and it is escapable: "<base>/link/ws" and "<base>/real/ws"
+		// are lexically disjoint and the same directory when link -> real, so the
+		// admission would have created the resource root INSIDE the managed workspace.
+		// Sharing one function is also what keeps the two sides from drifting apart
+		// again; its stricter clauses (length, UTF-8, control runes, surrounding space)
+		// now apply to the workspace root too, which through rig arrives already
+		// canonical and is refused rather than guessed at when it does not.
+		workspace, canonicalErr := canonicalSessionResourceRoot(workspaceRoot)
 		if canonicalErr != nil {
-			return nil, &SessionResourceStorageError{Kind: SessionResourceStorageInvalid, Path: workspaceRoot, Cause: canonicalErr}
-		}
-		workspace = filepath.Clean(workspace)
-		if evaluated, evaluateErr := filepath.EvalSymlinks(workspace); evaluateErr == nil {
-			workspace = filepath.Clean(evaluated)
+			return nil, canonicalErr
 		}
 		if pathsOverlap(root, workspace) {
 			return nil, &SessionResourceStorageError{Kind: SessionResourceStorageWorkspaceOverlap, Path: root}

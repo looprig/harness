@@ -390,34 +390,7 @@ func logicalWorkspaceRoot(sid uuid.UUID) string {
 	return logicalWorkspacePrefix + sid.String() + "/workspace"
 }
 
-// WorkspaceResidencyStatus is what a session reports about the workspace it came up on.
-// It exists because §11.1 requires a restore to REPORT the checkpoint boundary rather
-// than present the journal as though uncheckpointed files survived — this type is that
-// report, and every field is a detection claim, never a repair.
-//
-// A session with no managed workspace reports the zero value: there is no boundary to
-// name and no tree to have lost anything from.
-type WorkspaceResidencyStatus struct {
-	// LogicalRoot is the session-derived model-visible path (logicalWorkspaceRoot).
-	LogicalRoot string
-	// Root is THIS process's physical workspace root.
-	Root string
-	// CheckpointSeq is the JOURNAL sequence of the workspace transition the live tree was
-	// materialized from — the last WorkspaceCheckpointed or WorkspaceRestored in the
-	// replayed stream. It is read from the journal's own sequence for that record, so it
-	// is available after a crash too, not only after a clean release (whose
-	// SessionResidencyReleased carries the same number).
-	CheckpointSeq uint64
-	// HasCheckpoint distinguishes "anchored at sequence 0" from "never checkpointed".
-	// CheckpointSeq is meaningless when it is false.
-	HasCheckpoint bool
-	// PostCheckpointEvents counts the loop-scoped durable events recorded AFTER that
-	// transition: journalled work whose workspace mutations are not in the materialized
-	// tree. It is a DETECTION count. Nothing here prevents the loss, recovers the bytes,
-	// or bounds how much was lost per event.
-	PostCheckpointEvents int
-}
-
-// PostCheckpointLoss reports whether the journal records work after the transition the
-// live tree was materialized from — the divergence §11.1 forbids presenting silently.
-func (s WorkspaceResidencyStatus) PostCheckpointLoss() bool { return s.PostCheckpointEvents > 0 }
+// The status a session reports about that workspace is sessionapi.WorkspaceStatus, the
+// segregated contract in pkg/session, not a type declared here: a Host in another module
+// holds a SessionController and could not otherwise name the return type. See
+// Session.WorkspaceStatus (session.go) and foldWorkspaceResidency (restore.go).

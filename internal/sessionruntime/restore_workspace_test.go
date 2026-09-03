@@ -799,12 +799,17 @@ func TestFoldWorkspaceResidency(t *testing.T) {
 		wantSeq   uint64
 		wantHas   bool
 		wantAfter int
+		// wantLoss is stated per case rather than derived from wantAfter>0, because the
+		// two are deliberately NOT the same predicate: with no checkpoint there is no
+		// transition to have lost anything since, however many loop records follow.
+		wantLoss bool
 	}{
 		{
-			name:      "no checkpoint: every loop record is unaccounted work",
+			name:      "no checkpoint: loop records counted, but nothing was lost",
 			records:   []journal.JournalRecord{rec(event.SessionStarted{}), rec(event.LoopStarted{}), rec(event.LoopIdle{})},
 			seqs:      []uint64{1, 2, 3},
 			wantAfter: 2,
+			wantLoss:  false,
 		},
 		{
 			name:      "checkpoint at its journal sequence, nothing after",
@@ -821,6 +826,7 @@ func TestFoldWorkspaceResidency(t *testing.T) {
 			wantSeq:   4,
 			wantHas:   true,
 			wantAfter: 2,
+			wantLoss:  true,
 		},
 		{
 			name:      "a rewind moves the boundary and clears the count",
@@ -853,9 +859,70 @@ func TestFoldWorkspaceResidency(t *testing.T) {
 			if got.PostCheckpointEvents != tt.wantAfter {
 				t.Errorf("PostCheckpointEvents = %d, want %d", got.PostCheckpointEvents, tt.wantAfter)
 			}
-			if want := tt.wantAfter > 0; got.PostCheckpointLoss() != want {
-				t.Errorf("PostCheckpointLoss() = %v, want %v", got.PostCheckpointLoss(), want)
+			if got.PostCheckpointLoss() != tt.wantLoss {
+				t.Errorf("PostCheckpointLoss() = %v, want %v", got.PostCheckpointLoss(), tt.wantLoss)
 			}
 		})
+	}
+}
+
+// TestNeverCheckpointedRestoreReportsNoLossAndLeavesTheTreeIntact is the false-positive
+// guard on the detection predicate. With no workspace transition in the stream the restore
+// materializes NOTHING — the fixed/per-session root is left exactly as it was found — so a
+// warm restart of a never-checkpointed session has lost nothing, however much loop work the
+// journal holds. Reporting loss there would fire an operator alert on every such restart.
+//
+// The count is still asserted non-zero: the fix is the PREDICATE's gate, not suppressing
+// the records, and a fix that zeroed the count instead would hide the crash-shape signal
+// this test's sibling depends on. The intact-tree clause is asserted on a file written
+// BEFORE the restore and read AFTER it, so it is a real observation of the tree the restore
+// left behind rather than a negative assertion after a destructive step.
+func TestNeverCheckpointedRestoreReportsNoLossAndLeavesTheTreeIntact(t *testing.T) {
+	t.Parallel()
+	store := newRestoreStore(t)
+	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+	ws := mustWorkspaceStore(t, memstore.New().Blobs)
+
+	h, sid, rootLoopID, lease, es := newOriginalHub(t, store, fp)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// Loop work and NO checkpoint at all.
+	es.stamp(t, ctx, h, event.LoopIdle{
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: rootLoopID}},
+	})
+	handOver(t, lease)
+
+	// A warm root the previous residency left behind, written before the restore runs.
+	warm := t.TempDir()
+	const payload = "uncheckpointed but entirely present\n"
+	if err := os.WriteFile(filepath.Join(warm, "work.txt"), []byte(payload), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	restored, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
+		sid, store, WithWorkspaceCheckpointing(ws, warm))
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	t.Cleanup(func() { _ = restored.Shutdown(context.Background()) })
+
+	// The tree the restore left behind, read after it ran.
+	got, err := os.ReadFile(filepath.Join(warm, "work.txt")) // #nosec G304 -- test-controlled tree under t.TempDir
+	if err != nil {
+		t.Fatalf("warm root file is gone after restore: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("warm root file changed: %q, want %q", got, payload)
+	}
+
+	status := restored.WorkspaceStatus()
+	if status.HasCheckpoint {
+		t.Fatalf("HasCheckpoint = true with no workspace transition in the stream (seq %d)", status.CheckpointSeq)
+	}
+	if status.PostCheckpointEvents == 0 {
+		t.Error("PostCheckpointEvents = 0: the count was suppressed rather than the predicate gated")
+	}
+	if status.PostCheckpointLoss() {
+		t.Errorf("PostCheckpointLoss() = true on a never-checkpointed restore whose tree is intact (%d records counted)", status.PostCheckpointEvents)
 	}
 }

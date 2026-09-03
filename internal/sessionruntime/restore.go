@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
+	sessionapi "github.com/looprig/harness/pkg/session"
 	"github.com/looprig/harness/pkg/tool"
 	model "github.com/looprig/inference/model"
 )
@@ -326,22 +327,37 @@ func effectiveCurrentWorkspace(events []event.Event) (string, bool) {
 // still carries no sequence of its own; the journal's is read here instead, which is also
 // why this works after a crash, where no SessionResidencyReleased was ever written.
 //
-// The count is over LOOP-scoped events only. Session-scoped records — the residency
-// release itself, the restore lifecycle, a configuration adoption — are not work against
-// the workspace, and counting them would report loss on every clean handover. The rule is
-// the scope, not a list of exempt types, so a loop-scoped event added later counts by
-// default rather than being silently exempt.
-func foldWorkspaceResidency(records []journal.JournalRecord, seqs []uint64) WorkspaceResidencyStatus {
-	var status WorkspaceResidencyStatus
+// The count is over LOOP-scoped events only, and it is a deliberate OVER-APPROXIMATION:
+// no record is inspected for whether it actually touched the workspace, so it counts
+// records that MAY have mutated it, not losses. Session-scoped records — the residency
+// release itself, the restore lifecycle, a configuration adoption — are not loop work and
+// counting them would report divergence on every clean handover. The rule is the scope,
+// not a list of exempt types, so a loop-scoped event added later counts by default rather
+// than being silently exempt.
+//
+// seqs is index-aligned with records by construction: drainRecordReplay appends to both in
+// one lockstep loop, so len(seqs) == len(records) always and there is no bounds guard here
+// on purpose. A guard would substitute CheckpointSeq = 0 for a misalignment, which is
+// indistinguishable from "sequence zero" — the wrong quiet in the one field whose whole job
+// is to name a boundary. A misalignment panics instead.
+//
+// UNTESTABLE TODAY, AND WHY. Substituting a synthetic 1-based counter for seqs[i] passes
+// every test in this package, and that is an EQUIVALENT MUTANT rather than a coverage gap:
+// storage.Ledger specifies sequences as 1-based, contiguous and immutable; recordCursor is
+// 1:1 with the ledger cursor with no skips; every record kind consumes both a sequence and
+// an index; and the one production caller opens with Follow:false from sequence zero. So
+// index+1 == seq is forced by contract and no reader of the difference exists. It stops
+// being forced the moment replay POSITIONING or FILTERING changes (a non-zero start, a
+// server-side filter, a skip); such a change breaks CheckpointSeq silently, and nothing
+// here would catch it.
+func foldWorkspaceResidency(records []journal.JournalRecord, seqs []uint64) sessionapi.WorkspaceStatus {
+	var status sessionapi.WorkspaceStatus
 	for i, rec := range records {
 		evRec, ok := rec.(journal.EventRecord)
 		if !ok {
 			continue
 		}
-		var seq uint64
-		if i < len(seqs) {
-			seq = seqs[i]
-		}
+		seq := seqs[i]
 		switch ev := evRec.Event(); ev.(type) {
 		case event.WorkspaceCheckpointed, event.WorkspaceRestored:
 			status.CheckpointSeq, status.HasCheckpoint, status.PostCheckpointEvents = seq, true, 0

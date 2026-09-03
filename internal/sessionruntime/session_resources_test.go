@@ -1273,3 +1273,64 @@ func TestWorkspaceCheckpointDoesNotCaptureSessionResourceStorage(t *testing.T) {
 		t.Fatalf("captured files = %v, want exactly [work.txt]", captured)
 	}
 }
+
+// TestResourceStorageRefusesAWorkspacePathThatOnlyResolvesThroughASymlink is the
+// fail-CLOSED clause for the workspace side of the containment check. The resource root
+// has always been canonicalized over its longest existing prefix; the workspace side used
+// to try EvalSymlinks and, on any error — including the ordinary "the root does not exist
+// yet" — silently fall back to the unresolved path, degrading to a lexical comparison.
+//
+// The fixture is the escape that degradation permits: "<base>/link/ws" and "<base>/real/ws"
+// are lexically disjoint and are the SAME directory, so the admission would create the
+// resource root and make it identical to the managed workspace — precisely what the check
+// exists to prevent. The post-refusal SameFile assertion is stated as a property of the
+// fixture (it holds before resolveSessionResources runs, on the parents), not as an
+// after-the-fact check on state the refusal has already prevented from existing.
+func TestResourceStorageRefusesAWorkspacePathThatOnlyResolvesThroughASymlink(t *testing.T) {
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New() error = %v", err)
+	}
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks(TempDir) error = %v", err)
+	}
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o700); err != nil {
+		t.Fatalf("Mkdir(real) error = %v", err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("Symlink error = %v", err)
+	}
+	// The fixture's premise, asserted before the subject runs: the two parents are one
+	// directory, so the two "ws" children below name one path.
+	realInfo, err := os.Stat(real)
+	if err != nil {
+		t.Fatalf("Stat(real) error = %v", err)
+	}
+	linkInfo, err := os.Stat(link)
+	if err != nil {
+		t.Fatalf("Stat(link) error = %v", err)
+	}
+	if !os.SameFile(realInfo, linkInfo) {
+		t.Fatalf("fixture premise failed: %q and %q are not the same directory", real, link)
+	}
+
+	workspace := filepath.Join(link, "ws")    // reachable only through the symlink
+	resourceRoot := filepath.Join(real, "ws") // lexically disjoint, physically identical
+	_, err = resolveSessionResources(
+		context.Background(),
+		id,
+		func(context.Context, uuid.UUID) (string, string, error) { return resourceRoot, "owner", nil },
+		workspace,
+		false,
+	)
+	var storageErr *SessionResourceStorageError
+	if !errors.As(err, &storageErr) || storageErr.Kind != SessionResourceStorageWorkspaceOverlap {
+		t.Fatalf("resolveSessionResources() error = %T %v, want workspace_overlap", err, err)
+	}
+	if _, statErr := os.Lstat(resourceRoot); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("refused resolution still created the resource root: Lstat(%q) error = %v", resourceRoot, statErr)
+	}
+}

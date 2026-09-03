@@ -13,6 +13,7 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
+	sessionapi "github.com/looprig/harness/pkg/session"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
@@ -648,6 +649,6 @@ var _ tool.ProcessCompletionNotifier = (*Session)(nil)
 // withWorkspaceResidency carries the checkpoint boundary Restore folded from the durable
 // stream into the session it is building, so WorkspaceStatus can report it. NewSession
 // never sets it: a fresh session has no prior stream and therefore no boundary to name.
-func withWorkspaceResidency(status WorkspaceResidencyStatus) Option {
+func withWorkspaceResidency(status sessionapi.WorkspaceStatus) Option {
 	return func(s *Session) { s.wsResidency = status }
 }

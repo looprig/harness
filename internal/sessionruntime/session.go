@@ -337,7 +337,7 @@ type Session struct {
 	// wsResidency is the checkpoint boundary this session came up on, folded from the
 	// durable stream by Restore. It is written once, before the session is handed to a
 	// caller, and read-only afterwards.
-	wsResidency                WorkspaceResidencyStatus
+	wsResidency                sessionapi.WorkspaceStatus
 	initialWorkspaceCheckpoint workspacestore.Ref
 
 	// placementSpec is the UNRESOLVED managed-workspace placement carried into the restore
@@ -2720,19 +2720,24 @@ func (s *Session) newWorkspaceBinding() *tool.WorkspaceBinding {
 	}
 }
 
-// WorkspaceStatus reports what this session knows about the workspace it came up on: the
-// model-visible path (stable across Hosts), this process's physical root, the journal
-// sequence of the durable transition the live tree was materialized from, and the count
-// of journalled loop work that follows it.
+// WorkspaceStatus reports what this session knows about the workspace it came up on. It
+// satisfies sessionapi.WorkspaceReporter, the segregated capability a Host discovers by
+// assertion; the contract's doc comment is authoritative for what each field means.
 //
 // A session with no managed workspace reports the zero value. On a fresh session the
-// residency fold is zero because there is no prior stream to fold; the boundary fields
-// are populated by Restore, which is the only caller that has one.
+// boundary fields are zero because there is no prior stream to fold; Restore is the only
+// caller that has one.
+//
+// FRESHNESS: Root and LogicalRoot are read live, the boundary fields are AS OF RESTORE and
+// never refresh. A session that checkpoints again after coming up still reports the
+// boundary it came up on, so a caller polling this for a live checkpoint position gets a
+// mix of live and frozen fields. Refreshing it would mean folding the stream again on
+// every call; the report exists for the restore decision, not as a checkpoint cursor.
 //
 // It is a REPORT. Nothing in it recovers a lost mutation or bounds how much was lost.
-func (s *Session) WorkspaceStatus() WorkspaceResidencyStatus {
+func (s *Session) WorkspaceStatus() sessionapi.WorkspaceStatus {
 	if s.ws == nil {
-		return WorkspaceResidencyStatus{}
+		return sessionapi.WorkspaceStatus{}
 	}
 	status := s.wsResidency
 	status.Root = s.wsRoot

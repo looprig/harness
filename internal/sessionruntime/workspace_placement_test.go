@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/looprig/core/uuid"
+	sessionapi "github.com/looprig/harness/pkg/session"
 )
 
 func TestPlacementRootFor(t *testing.T) {
@@ -389,8 +390,8 @@ func TestWorkspaceStatusIsZeroWithoutAManagedWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("uuid.New: %v", err)
 	}
-	s := &Session{sessionID: sid, wsResidency: WorkspaceResidencyStatus{CheckpointSeq: 9, HasCheckpoint: true, PostCheckpointEvents: 3}}
-	if got := s.WorkspaceStatus(); got != (WorkspaceResidencyStatus{}) {
+	s := &Session{sessionID: sid, wsResidency: sessionapi.WorkspaceStatus{CheckpointSeq: 9, HasCheckpoint: true, PostCheckpointEvents: 3}}
+	if got := s.WorkspaceStatus(); got != (sessionapi.WorkspaceStatus{}) {
 		t.Errorf("WorkspaceStatus() = %+v on a session with no managed workspace, want the zero value", got)
 	}
 }
