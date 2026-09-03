@@ -417,10 +417,11 @@ func TestStepDoneCaptureWireRoundTrips(t *testing.T) {
 
 	toolExecutionID := seededUUID(0x77).String()
 	reference := map[string]any{"object_id": "v1:artifact:g:d"}
-	// Each row carries its own distinguishing expectation. Selecting an assertion
-	// by comparing tt.name would let a rename silently disable it, and would leave
-	// "full capture" asserting nothing "no object" does not, since want is a subset
-	// match that never checks a key is present.
+	// Each row carries its own distinguishing expectation. Selecting an assertion by
+	// comparing tt.name would let a rename silently disable it. want is a subset match:
+	// keys it does not list go unchecked, so a key a row cares about must be listed.
+	// Every want value is non-nil, so DeepEqual already fails on an absent key; an
+	// expected JSON null goes in wantExplicitNull, which checks presence itself.
 	tests := []struct {
 		name             string
 		captures         string
@@ -500,11 +501,6 @@ func TestStepDoneCaptureWireRoundTrips(t *testing.T) {
 			for _, key := range tt.wantAbsent {
 				if got, present := capture[key]; present {
 					t.Errorf("capture gained %q = %#v, want absent", key, got)
-				}
-			}
-			for key := range tt.want {
-				if _, present := capture[key]; !present {
-					t.Errorf("capture missing expected key %q: %#v", key, capture)
 				}
 			}
 		})
@@ -669,7 +665,7 @@ func TestToolResultCaptureOriginalSize(t *testing.T) {
 		},
 		{
 			name:      "exact count wins over a zero lower bound",
-			capture:   ToolResultCapture{CapturedBytes: 8, OriginalBytes: new(uint64)},
+			capture:   ToolResultCapture{CapturedBytes: 0, OriginalBytes: new(uint64)},
 			wantExact: true,
 		},
 	} {
@@ -797,16 +793,15 @@ func TestStepDoneCaptureWriteValidation(t *testing.T) {
 					return err
 				}()},
 			} {
-				operation, err := operation.name, operation.err
 				if !tt.wantErr {
-					if err != nil {
-						t.Errorf("%s error = %v, want nil", operation, err)
+					if operation.err != nil {
+						t.Errorf("%s error = %v, want nil", operation.name, operation.err)
 					}
 					continue
 				}
 				var invalid *InvalidEventError
-				if !errors.As(err, &invalid) || invalid.Event != "StepDone" || invalid.Field != FieldCaptures {
-					t.Errorf("%s error = %T %v, want StepDone/Captures invalid", operation, err, err)
+				if !errors.As(operation.err, &invalid) || invalid.Event != "StepDone" || invalid.Field != FieldCaptures {
+					t.Errorf("%s error = %T %v, want StepDone/Captures invalid", operation.name, operation.err, operation.err)
 				}
 			}
 		})

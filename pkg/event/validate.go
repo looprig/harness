@@ -739,9 +739,14 @@ func validateStepDoneCaptures(messages content.AgenticMessages, captures []ToolR
 	if len(captures) == 0 {
 		return nil
 	}
-	// Captures are all-or-nothing per step: an empty list means the step recorded
-	// none, but a partial list would make "this result was not captured" and "the
-	// capture list was itself truncated" indistinguishable to every reader.
+	// Two conjuncts. The cardinality one, len(captures) == len(messages)-1, is one
+	// capture per committed tool result: it makes captures all-or-nothing per step,
+	// since an empty list means the step recorded none, but a partial list would
+	// make "this result was not captured" and "the capture list was itself
+	// truncated" indistinguishable to any reader. The ceiling conjunct interacts
+	// with that: a step holding more results than maxToolResultCapturesPerStep can
+	// record no capture at all, because a partial list fails cardinality and a
+	// complete one exceeds the ceiling.
 	if len(captures) > maxToolResultCapturesPerStep || len(captures) != len(messages)-1 {
 		return invalidStepDoneCaptures()
 	}
