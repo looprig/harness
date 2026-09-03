@@ -1121,11 +1121,14 @@ func (c ToolResultCapture) MarshalJSON() ([]byte, error) {
 	})
 }
 
-// UnmarshalJSON keeps each capture entry a closed privacy boundary. Unknown
-// siblings such as signed_url, raw_output, credentials, or backend_key are
-// rejected rather than retained or proxied into a later public journal write.
-// ObjectReference applies Core's narrower redaction-boundary decoder to the
-// nested logical reference itself.
+// UnmarshalJSON keeps each capture entry a closed privacy boundary, but the two
+// levels fail differently and the asymmetry matters. An unknown SIBLING of the
+// capture's own members — signed_url, raw_output, credentials, backend_key — is
+// rejected, because DisallowUnknownFields applies to this decode. A member nested
+// inside "reference" is not reached by that flag at all: ObjectReference has its
+// own UnmarshalJSON, so Core's redaction-boundary decoder accepts the object and
+// silently DISCARDS the undeclared member rather than rejecting it. Either way it
+// cannot be retained or proxied into a later public journal write.
 func (c *ToolResultCapture) UnmarshalJSON(data []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()

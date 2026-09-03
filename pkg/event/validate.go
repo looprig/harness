@@ -739,6 +739,9 @@ func validateStepDoneCaptures(messages content.AgenticMessages, captures []ToolR
 	if len(captures) == 0 {
 		return nil
 	}
+	// Captures are all-or-nothing per step: an empty list means the step recorded
+	// none, but a partial list would make "this result was not captured" and "the
+	// capture list was itself truncated" indistinguishable to every reader.
 	if len(captures) > maxToolResultCapturesPerStep || len(captures) != len(messages)-1 {
 		return invalidStepDoneCaptures()
 	}

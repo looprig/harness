@@ -110,15 +110,22 @@ const (
 
 // ToolResultCapture is the durable, privacy-safe locator and size description
 // for one committed ToolResultMessage. ToolExecutionID correlates Harness tool
-// lifecycle events; ToolUseID correlates the provider message. Reference is a
-// SessionObjectStore logical reference, never a URL, credential, backend key,
-// or byte payload. It is nil when the complete result is already represented by
-// the committed message and no separate object was retained.
+// lifecycle events; ToolUseID correlates the provider message.
+//
+// Reference is a SessionObjectStore logical reference. Core declares the identity
+// opaque and its decoder drops members this version does not declare, but
+// ObjectReference.Validate checks only bounded non-empty UTF-8: keeping object_id
+// free of URLs, credentials, backend keys and byte payloads is the producer's
+// obligation, not a property this codec can check. Reference is nil when the
+// complete result is already represented by the committed message and no separate
+// object was retained; a truncated capture without one is rejected, because a
+// truncation that names no object leaves the elided bytes unreachable.
 //
 // OriginalBytes is non-nil when the exact producer byte count is known. When it
 // is nil, OriginalBytesLowerBound records what was observed before capture
 // stopped. The pointer deliberately encodes as JSON null rather than disappearing
 // so exact-unknown cannot be confused with an old or incomplete capture shape.
+// Read the pair through OriginalSize rather than either field alone.
 type ToolResultCapture struct {
 	ToolExecutionID         uuid.UUID                    `json:"tool_execution_id"`
 	ToolUseID               string                       `json:"tool_use_id"`
@@ -129,6 +136,15 @@ type ToolResultCapture struct {
 	Truncated               bool                         `json:"truncated"`
 	TruncationReason        ToolResultTruncationReason   `json:"truncation_reason,omitempty"`
 	Encoding                ToolResultEncoding           `json:"encoding"`
+}
+
+// OriginalSize reports the producer byte count and whether it is exact.
+// When exact is false the count is a lower bound observed before capture stopped.
+func (c ToolResultCapture) OriginalSize() (n uint64, exact bool) {
+	if c.OriginalBytes != nil {
+		return *c.OriginalBytes, true
+	}
+	return c.OriginalBytesLowerBound, false
 }
 
 // StepDone is the enduring event emitted when a step's finalized group is

@@ -369,9 +369,30 @@ func sampleMessages() content.AgenticMessages {
 	}
 }
 
+// sampleMessagesTwoResults is sampleMessages with a second committed result, for
+// rows whose rule can only be reached at a capture count of two.
+func sampleMessagesTwoResults() content.AgenticMessages {
+	return append(sampleMessages(), &content.ToolResultMessage{
+		Message: content.Message{
+			Role:   content.RoleTool,
+			Blocks: []content.Block{&content.TextBlock{Text: "other.txt"}},
+		},
+		ToolUseID: "tu-2",
+	})
+}
+
 func stepDoneCaptureEnvelope(t *testing.T, captures string) []byte {
 	t.Helper()
-	raw, err := MarshalEvent(StepDone{Header: fullHeader(), Messages: sampleMessages()})
+	return stepDoneCaptureEnvelopeFor(t, sampleMessages(), captures)
+}
+
+// stepDoneCaptureEnvelopeFor builds the wire envelope over a caller-chosen
+// committed group. Captures are validated all-or-nothing against the result
+// count, so a row exercising a per-entry rule at two captures must supply a group
+// with two results or it is killed by cardinality before its own rule runs.
+func stepDoneCaptureEnvelopeFor(t *testing.T, messages content.AgenticMessages, captures string) []byte {
+	t.Helper()
+	raw, err := MarshalEvent(StepDone{Header: fullHeader(), Messages: messages})
 	if err != nil {
 		t.Fatalf("MarshalEvent(StepDone): %v", err)
 	}
@@ -395,43 +416,52 @@ func TestStepDoneCaptureWireRoundTrips(t *testing.T) {
 	t.Parallel()
 
 	toolExecutionID := seededUUID(0x77).String()
+	reference := map[string]any{"object_id": "v1:artifact:g:d"}
+	// Each row carries its own distinguishing expectation. Selecting an assertion
+	// by comparing tt.name would let a rename silently disable it, and would leave
+	// "full capture" asserting nothing "no object" does not, since want is a subset
+	// match that never checks a key is present.
 	tests := []struct {
-		name     string
-		captures string
-		want     map[string]any
+		name             string
+		captures         string
+		want             map[string]any
+		wantAbsent       []string
+		wantExplicitNull []string
 	}{
 		{
 			name: "full capture",
 			captures: `[{"tool_execution_id":"` + toolExecutionID + `","tool_use_id":"tu-1",` +
 				`"reference":{"object_id":"v1:artifact:g:d"},"captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`,
-			want: map[string]any{"captured_bytes": float64(8), "original_bytes": float64(8), "truncated": false, "encoding": "utf-8"},
+			want: map[string]any{"captured_bytes": float64(8), "original_bytes": float64(8), "truncated": false, "encoding": "utf-8", "reference": reference},
 		},
 		{
 			name: "capture ceiling truncation",
 			captures: `[{"tool_execution_id":"` + toolExecutionID + `","tool_use_id":"tu-1",` +
 				`"reference":{"object_id":"v1:artifact:g:d"},"captured_bytes":8,"original_bytes":21,` +
 				`"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`,
-			want: map[string]any{"captured_bytes": float64(8), "original_bytes": float64(21), "truncated": true, "truncation_reason": "capture_ceiling", "encoding": "binary"},
+			want: map[string]any{"captured_bytes": float64(8), "original_bytes": float64(21), "truncated": true, "truncation_reason": "capture_ceiling", "encoding": "binary", "reference": reference},
 		},
 		{
 			name: "source limit truncation",
 			captures: `[{"tool_execution_id":"` + toolExecutionID + `","tool_use_id":"tu-1",` +
 				`"reference":{"object_id":"v1:artifact:g:d"},"captured_bytes":8,"original_bytes":21,` +
 				`"truncated":true,"truncation_reason":"source_limit","encoding":"binary"}]`,
-			want: map[string]any{"captured_bytes": float64(8), "original_bytes": float64(21), "truncated": true, "truncation_reason": "source_limit", "encoding": "binary"},
+			want: map[string]any{"captured_bytes": float64(8), "original_bytes": float64(21), "truncated": true, "truncation_reason": "source_limit", "encoding": "binary", "reference": reference},
 		},
 		{
 			name: "no object",
 			captures: `[{"tool_execution_id":"` + toolExecutionID + `","tool_use_id":"tu-1",` +
 				`"captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`,
-			want: map[string]any{"captured_bytes": float64(8), "original_bytes": float64(8), "truncated": false, "encoding": "utf-8"},
+			want:       map[string]any{"captured_bytes": float64(8), "original_bytes": float64(8), "truncated": false, "encoding": "utf-8"},
+			wantAbsent: []string{"reference"},
 		},
 		{
 			name: "nullable exact original count",
 			captures: `[{"tool_execution_id":"` + toolExecutionID + `","tool_use_id":"tu-1",` +
 				`"reference":{"object_id":"v1:artifact:g:d"},"captured_bytes":8,"original_bytes":null,"original_bytes_lower_bound":9,` +
 				`"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`,
-			want: map[string]any{"captured_bytes": float64(8), "original_bytes": nil, "original_bytes_lower_bound": float64(9), "truncated": true, "truncation_reason": "capture_ceiling", "encoding": "binary"},
+			want:             map[string]any{"captured_bytes": float64(8), "original_bytes_lower_bound": float64(9), "truncated": true, "truncation_reason": "capture_ceiling", "encoding": "binary", "reference": reference},
+			wantExplicitNull: []string{"original_bytes"},
 		},
 	}
 	for _, tt := range tests {
@@ -462,11 +492,20 @@ func TestStepDoneCaptureWireRoundTrips(t *testing.T) {
 					t.Errorf("capture[%q] = %#v, want %#v", key, got, want)
 				}
 			}
-			if got, present := capture["original_bytes"]; tt.name == "nullable exact original count" && (!present || got != nil) {
-				t.Errorf("nullable exact count = %#v, present=%v; want explicit null", got, present)
+			for _, key := range tt.wantExplicitNull {
+				if got, present := capture[key]; !present || got != nil {
+					t.Errorf("capture[%q] = %#v, present=%v; want explicit null", key, got, present)
+				}
 			}
-			if _, present := capture["reference"]; tt.name == "no object" && present {
-				t.Errorf("no-object capture gained reference: %#v", capture)
+			for _, key := range tt.wantAbsent {
+				if got, present := capture[key]; present {
+					t.Errorf("capture gained %q = %#v, want absent", key, got)
+				}
+			}
+			for key := range tt.want {
+				if _, present := capture[key]; !present {
+					t.Errorf("capture missing expected key %q: %#v", key, capture)
+				}
 			}
 		})
 	}
@@ -480,10 +519,19 @@ func TestStepDoneCaptureStrictDecodeAndValidation(t *testing.T) {
 	valid := `{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}`
 	tests := []struct {
 		name     string
+		messages content.AgenticMessages // nil selects sampleMessages
 		captures string
 	}{
-		{name: "duplicate tool execution IDs", captures: `[` + valid + `,{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`},
-		{name: "duplicate provider tool use IDs", captures: `[` + valid + `,{"tool_execution_id":"` + otherID + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`},
+		{
+			name:     "duplicate tool execution IDs",
+			messages: sampleMessagesTwoResults(),
+			captures: `[` + valid + `,{"tool_execution_id":"` + id + `","tool_use_id":"tu-2","captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`,
+		},
+		{
+			name:     "duplicate provider tool use IDs",
+			messages: sampleMessagesTwoResults(),
+			captures: `[` + valid + `,{"tool_execution_id":"` + otherID + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`,
+		},
 		{name: "capture does not align to result message", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"another-call","captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`},
 		{name: "zero tool execution ID", captures: `[{"tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`},
 		{name: "invalid empty reference", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","reference":{},"captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`},
@@ -503,7 +551,11 @@ func TestStepDoneCaptureStrictDecodeAndValidation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if decoded, err := UnmarshalEvent(stepDoneCaptureEnvelope(t, tt.captures)); err == nil {
+			messages := tt.messages
+			if messages == nil {
+				messages = sampleMessages()
+			}
+			if decoded, err := UnmarshalEvent(stepDoneCaptureEnvelopeFor(t, messages, tt.captures)); err == nil {
 				t.Fatalf("UnmarshalEvent() = %#v, nil error; want capture rejection", decoded)
 			}
 		})
@@ -589,6 +641,45 @@ func TestStepDoneCaptureTypedRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(decoded, original) {
 		t.Fatalf("round trip mismatch:\n got  %#v\n want %#v", decoded, original)
+	}
+}
+
+// TestToolResultCaptureOriginalSize pins the accessor that keeps a consumer from
+// hand-rolling the OriginalBytes nil test: reading OriginalBytesLowerBound alone on
+// an exactly-known capture yields 0, a plausible-looking wrong size.
+func TestToolResultCaptureOriginalSize(t *testing.T) {
+	t.Parallel()
+	exact := uint64(21)
+	for _, tt := range []struct {
+		name      string
+		capture   ToolResultCapture
+		wantSize  uint64
+		wantExact bool
+	}{
+		{
+			name:      "exact count",
+			capture:   ToolResultCapture{CapturedBytes: 8, OriginalBytes: &exact},
+			wantSize:  21,
+			wantExact: true,
+		},
+		{
+			name:     "lower bound when exact is unknown",
+			capture:  ToolResultCapture{CapturedBytes: 8, OriginalBytesLowerBound: 9},
+			wantSize: 9,
+		},
+		{
+			name:      "exact count wins over a zero lower bound",
+			capture:   ToolResultCapture{CapturedBytes: 8, OriginalBytes: new(uint64)},
+			wantExact: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			size, exact := tt.capture.OriginalSize()
+			if size != tt.wantSize || exact != tt.wantExact {
+				t.Errorf("OriginalSize() = (%d, %v), want (%d, %v)", size, exact, tt.wantSize, tt.wantExact)
+			}
+		})
 	}
 }
 
@@ -696,13 +787,17 @@ func TestStepDoneCaptureWriteValidation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			ev := StepDone{Header: fullHeader(), Messages: tt.messages, Captures: tt.captures}
-			for operation, err := range map[string]error{
-				"ValidateEvent": ValidateEvent(ev),
-				"MarshalEvent": func() error {
+			for _, operation := range []struct {
+				name string
+				err  error
+			}{
+				{name: "ValidateEvent", err: ValidateEvent(ev)},
+				{name: "MarshalEvent", err: func() error {
 					_, err := MarshalEvent(ev)
 					return err
-				}(),
+				}()},
 			} {
+				operation, err := operation.name, operation.err
 				if !tt.wantErr {
 					if err != nil {
 						t.Errorf("%s error = %v, want nil", operation, err)
