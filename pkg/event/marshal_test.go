@@ -414,6 +414,13 @@ func TestStepDoneCaptureWireRoundTrips(t *testing.T) {
 			want: map[string]any{"captured_bytes": float64(8), "original_bytes": float64(21), "truncated": true, "truncation_reason": "capture_ceiling", "encoding": "binary"},
 		},
 		{
+			name: "source limit truncation",
+			captures: `[{"tool_execution_id":"` + toolExecutionID + `","tool_use_id":"tu-1",` +
+				`"reference":{"object_id":"v1:artifact:g:d"},"captured_bytes":8,"original_bytes":21,` +
+				`"truncated":true,"truncation_reason":"source_limit","encoding":"binary"}]`,
+			want: map[string]any{"captured_bytes": float64(8), "original_bytes": float64(21), "truncated": true, "truncation_reason": "source_limit", "encoding": "binary"},
+		},
+		{
 			name: "no object",
 			captures: `[{"tool_execution_id":"` + toolExecutionID + `","tool_use_id":"tu-1",` +
 				`"captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`,
@@ -481,13 +488,14 @@ func TestStepDoneCaptureStrictDecodeAndValidation(t *testing.T) {
 		{name: "zero tool execution ID", captures: `[{"tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`},
 		{name: "invalid empty reference", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","reference":{},"captured_bytes":8,"original_bytes":8,"encoding":"utf-8"}]`},
 		{name: "invalid original count", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":9,"original_bytes":8,"encoding":"utf-8"}]`},
-		{name: "missing lower bound for unknown original", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`},
+		{name: "missing lower bound for unknown original", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","reference":{"object_id":"logical-object"},"captured_bytes":8,"original_bytes":null,"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`},
 		{name: "absent original count is not explicit null", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","reference":{"object_id":"logical-object"},"captured_bytes":8,"original_bytes_lower_bound":9,"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`},
-		{name: "unknown original lower bound must exceed capture", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":null,"original_bytes_lower_bound":8,"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`},
+		{name: "unknown original lower bound must exceed capture", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","reference":{"object_id":"logical-object"},"captured_bytes":8,"original_bytes":null,"original_bytes_lower_bound":8,"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`},
 		{name: "truncated capture requires object", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":9,"truncated":true,"truncation_reason":"capture_ceiling","encoding":"binary"}]`},
 		{name: "reason without truncation", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"truncation_reason":"capture_ceiling","encoding":"utf-8"}]`},
 		{name: "unknown reason without truncation", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"truncation_reason":"other","encoding":"utf-8"}]`},
-		{name: "truncation without reason", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":9,"truncated":true,"encoding":"utf-8"}]`},
+		{name: "truncation without reason", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","reference":{"object_id":"logical-object"},"captured_bytes":8,"original_bytes":9,"truncated":true,"encoding":"utf-8"}]`},
+		{name: "truncation with unknown reason", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","reference":{"object_id":"logical-object"},"captured_bytes":8,"original_bytes":9,"truncated":true,"truncation_reason":"other","encoding":"utf-8"}]`},
 		{name: "unknown encoding", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"rot13"}]`},
 		{name: "unknown capture member", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8","raw_output":"secret"}]`},
 		{name: "future signed URL member", captures: `[{"tool_execution_id":"` + id + `","tool_use_id":"tu-1","captured_bytes":8,"original_bytes":8,"encoding":"utf-8","signed_url":"https://object.invalid/secret"}]`},
@@ -497,6 +505,53 @@ func TestStepDoneCaptureStrictDecodeAndValidation(t *testing.T) {
 			t.Parallel()
 			if decoded, err := UnmarshalEvent(stepDoneCaptureEnvelope(t, tt.captures)); err == nil {
 				t.Fatalf("UnmarshalEvent() = %#v, nil error; want capture rejection", decoded)
+			}
+		})
+	}
+}
+
+func TestStepDoneCaptureAlignmentUsesIDsNotPosition(t *testing.T) {
+	t.Parallel()
+	exact := uint64(8)
+	messages := content.AgenticMessages{
+		aiMsg("two results"),
+		&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: "a"},
+		&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: "b"},
+	}
+	captureA := ToolResultCapture{
+		ToolExecutionID: seededUUID(0x77),
+		ToolUseID:       "a",
+		CapturedBytes:   exact,
+		OriginalBytes:   &exact,
+		Encoding:        ToolResultEncodingUTF8,
+	}
+	captureB := captureA
+	captureB.ToolExecutionID = seededUUID(0x78)
+	captureB.ToolUseID = "b"
+
+	for _, tt := range []struct {
+		name     string
+		captures []ToolResultCapture
+	}{
+		{name: "ordered control", captures: []ToolResultCapture{captureA, captureB}},
+		{name: "reordered captures", captures: []ToolResultCapture{captureB, captureA}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			event := StepDone{Header: fullHeader(), Messages: messages, Captures: tt.captures}
+			if err := ValidateEvent(event); err != nil {
+				t.Fatalf("ValidateEvent() error = %v, want nil", err)
+			}
+			raw, err := MarshalEvent(event)
+			if err != nil {
+				t.Fatalf("MarshalEvent() error = %v, want nil", err)
+			}
+			decodedEvent, err := UnmarshalEvent(raw)
+			if err != nil {
+				t.Fatalf("UnmarshalEvent() error = %v, want nil", err)
+			}
+			decoded := decodedEvent.(StepDone)
+			if !reflect.DeepEqual(decoded.Captures, tt.captures) {
+				t.Fatalf("decoded captures = %#v, want ID associations %#v", decoded.Captures, tt.captures)
 			}
 		})
 	}
