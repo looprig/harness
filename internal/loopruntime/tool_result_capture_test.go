@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -38,6 +40,11 @@ type fakeObjectStore struct {
 	statSize   *uint64
 	statDigest *string
 
+	// storeDespitePutErr models the ambiguous upload: the Put reports an error
+	// but the object is stored anyway, which is what a timed-out write that
+	// actually landed looks like to the caller.
+	storeDespitePutErr bool
+
 	// failFor, when non-nil, restricts all four arrangements above to the
 	// objects whose stored bytes it selects. Without it a failure is global,
 	// which makes every other result in the step fail too; with it a step can
@@ -63,6 +70,9 @@ func (f *fakeObjectStore) PutToolResultObject(_ context.Context, objectID string
 	defer f.mu.Unlock()
 	f.puts = append(f.puts, objectID)
 	if f.putErr != nil && f.selected(content) {
+		if f.storeDespitePutErr {
+			f.objects[objectID] = append([]byte(nil), content...)
+		}
 		return f.putErr
 	}
 	stored := append([]byte(nil), content...)
@@ -760,4 +770,520 @@ func TestToolResultRetentionTruncatedCaptureAlwaysKeepsAnObject(t *testing.T) {
 		t.Fatal("a truncated capture recorded no object; the elided bytes are unreachable")
 	}
 	requireValidStepDone(t, commit)
+}
+
+// --- session-workspace streaming capture (H5.3) ---
+
+// streamingObjectStore is a fakeObjectStore that ALSO implements the optional
+// ToolResultObjectStreamStore. It records the concrete reader type it was handed
+// so a test can tell a stream off the local spill from a stream over a
+// materialized copy — the difference the "never buffers the capture in Host
+// memory" requirement is actually about.
+type streamingObjectStore struct {
+	*fakeObjectStore
+
+	mu          sync.Mutex
+	streamed    int
+	readerTypes []string
+	declared    []uint64
+	streamErr   error
+}
+
+func newStreamingObjectStore() *streamingObjectStore {
+	return &streamingObjectStore{fakeObjectStore: newFakeObjectStore()}
+}
+
+func (s *streamingObjectStore) PutToolResultObjectStream(_ context.Context, objectID string, content io.Reader, size uint64) error {
+	s.mu.Lock()
+	s.streamed++
+	s.readerTypes = append(s.readerTypes, fmt.Sprintf("%T", content))
+	s.declared = append(s.declared, size)
+	streamErr := s.streamErr
+	s.mu.Unlock()
+	if streamErr != nil {
+		return streamErr
+	}
+	buf, err := io.ReadAll(content)
+	if err != nil {
+		return err
+	}
+	if uint64(len(buf)) != size {
+		return fmt.Errorf("stream delivered %d bytes, declared %d", len(buf), size)
+	}
+	// Stored directly rather than through PutToolResultObject so putCount stays
+	// a count of MATERIALIZED puts alone: a delegating fake would make "the
+	// streaming path was preferred" untestable.
+	s.fakeObjectStore.mu.Lock()
+	defer s.fakeObjectStore.mu.Unlock()
+	s.fakeObjectStore.objects[objectID] = buf
+	return nil
+}
+
+func (s *streamingObjectStore) streamCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.streamed
+}
+
+func (s *streamingObjectStore) readerType(i int) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readerTypes[i]
+}
+
+// spillConfig is captureConfig plus a session spill directory, which is what a
+// composition root that wired a spill base produces.
+func spillConfig(t *testing.T, store ToolResultObjectStore, modelBytes, captureCeiling, materializedMax int) (turnConfig, *captureSpillDirectory) {
+	t.Helper()
+	session, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	dir, err := newCaptureSpillDirectory(t.TempDir(), session)
+	if err != nil {
+		t.Fatalf("newCaptureSpillDirectory: %v", err)
+	}
+	t.Cleanup(func() { _ = dir.Release() })
+	cfg := captureConfig(store, modelBytes, captureCeiling, materializedMax)
+	cfg.toolResultSpills = dir
+	return cfg, dir
+}
+
+// TestToolResultRetentionPrefersTheStreamingUploadAndStreamsOffTheSpill covers
+// both halves of the upload seam in one property. A store that implements the
+// optional streaming capability must receive the capture as a stream READ BACK
+// FROM THE LOCAL SPILL FILE — proven by the concrete reader type, which is the
+// only thing that distinguishes streaming from copying a materialized buffer —
+// and PutToolResultObject must not be called at all. A store without the
+// capability must get the materialized Put instead.
+func TestToolResultRetentionPrefersTheStreamingUploadAndStreamsOffTheSpill(t *testing.T) {
+	t.Parallel()
+	const payload = 4096
+	streaming := newStreamingObjectStore()
+	cfg, _ := spillConfig(t, streaming, 64, payload*2, payload*2)
+	text := strings.Repeat("s", payload)
+	commit, err := retainToolResults(context.Background(), cfg, []result{textResult(t, "call-1", text)})
+	if err != nil {
+		t.Fatalf("retainToolResults: %v", err)
+	}
+	if commit.retention != nil {
+		t.Fatalf("retention failed: %+v", commit.retention)
+	}
+	if streaming.streamCount() != 1 {
+		t.Fatalf("stream uploads = %d, want 1", streaming.streamCount())
+	}
+	if got := streaming.fakeObjectStore.putCount(); got != 0 {
+		t.Fatalf("materialized puts = %d, want 0 when the store streams", got)
+	}
+	if got := streaming.readerType(0); got != "*os.File" {
+		t.Fatalf("streamed reader = %s, want *os.File: the upload must read the local spill, not a materialized copy", got)
+	}
+	stored, ok := streaming.fakeObjectStore.get(commit.captures[0].Reference.ObjectID)
+	if !ok || string(stored) != text {
+		t.Fatalf("stored object = %d bytes, want the complete %d-byte capture", len(stored), len(text))
+	}
+
+	plain := newFakeObjectStore()
+	plainCfg, _ := spillConfig(t, plain, 64, payload*2, payload*2)
+	plainCommit, err := retainToolResults(context.Background(), plainCfg, []result{textResult(t, "call-1", text)})
+	if err != nil || plainCommit.retention != nil {
+		t.Fatalf("plain store retention: err=%v retention=%+v", err, plainCommit.retention)
+	}
+	if plain.putCount() != 1 {
+		t.Fatalf("materialized puts = %d, want 1 for a store without the streaming capability", plain.putCount())
+	}
+}
+
+// TestToolResultRetentionDeletesTheLocalSpill pins step 3's cleanup on BOTH
+// outcomes. After a verified upload the local copy has served its purpose; after
+// a failed one the turn ends, so the local copy has no reader either. Leaving
+// either behind would grow a session's disk without bound across a long run.
+func TestToolResultRetentionDeletesTheLocalSpill(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		arrange   func(*fakeObjectStore)
+		wantStage ToolResultRetentionStage
+	}{
+		{name: "verified upload", arrange: func(*fakeObjectStore) {}},
+		{name: "put failure", arrange: func(s *fakeObjectStore) { s.putErr = errors.New("put failed") }, wantStage: ToolResultRetentionStagePut},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store := newFakeObjectStore()
+			tt.arrange(store)
+			cfg, dir := spillConfig(t, store, 16, 4096, 4096)
+			commit, err := retainToolResults(context.Background(), cfg, []result{textResult(t, "call-1", strings.Repeat("y", 1024))})
+			if err != nil {
+				t.Fatalf("retainToolResults: %v", err)
+			}
+			if tt.wantStage == "" && commit.retention != nil {
+				t.Fatalf("retention failed: %+v", commit.retention)
+			}
+			if tt.wantStage != "" && (commit.retention == nil || commit.retention.Stage != tt.wantStage) {
+				t.Fatalf("retention = %+v, want stage %q", commit.retention, tt.wantStage)
+			}
+			entries, readErr := os.ReadDir(dir.root)
+			if readErr != nil {
+				t.Fatalf("read spill root: %v", readErr)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("spill root still holds %d files after retention", len(entries))
+			}
+		})
+	}
+}
+
+// TestToolResultRetentionFailsAtTheSpillStage covers the two ways the local
+// spill can be unusable — it could not be opened at all (the session released its
+// spill root), and it accepted the producer's bytes but the backing failed
+// (a full disk, a short write). Both must fail the step at the SPILL stage
+// rather than uploading a prefix the counts and digest do not describe.
+func TestToolResultRetentionFailsAtTheSpillStage(t *testing.T) {
+	t.Parallel()
+	t.Run("spill cannot be opened", func(t *testing.T) {
+		t.Parallel()
+		store := newFakeObjectStore()
+		cfg, dir := spillConfig(t, store, 16, 4096, 4096)
+		if err := dir.Release(); err != nil {
+			t.Fatalf("Release: %v", err)
+		}
+		commit, err := retainToolResults(context.Background(), cfg, []result{textResult(t, "call-1", strings.Repeat("z", 1024))})
+		if err != nil {
+			t.Fatalf("retainToolResults: %v", err)
+		}
+		if commit.retention == nil || commit.retention.Stage != ToolResultRetentionStageSpill {
+			t.Fatalf("retention = %+v, want stage %q", commit.retention, ToolResultRetentionStageSpill)
+		}
+		if store.putCount() != 0 {
+			t.Fatalf("puts = %d, want 0: nothing may be uploaded for a capture that was never spilled", store.putCount())
+		}
+	})
+	t.Run("spill write failed", func(t *testing.T) {
+		t.Parallel()
+		store := newFakeObjectStore()
+		cfg := captureConfig(store, 16, 4096, 4096)
+		streamed := textResult(t, "call-1", strings.Repeat("w", 1024))
+		// The backing accepts a PREFIX and then short-writes, and its prefix reads
+		// back cleanly. That is what a disk filling up mid-write leaves behind, and
+		// it is the arrangement in which the counts and digest would otherwise
+		// AGREE with the stored object: without the sink's latched failure the
+		// pipeline would upload two bytes and record them as a successful capture
+		// truncated at the ceiling.
+		streamed.capture = newCaptureSinkWithBacking(4096, &faultyBacking{shortAfter: 2})
+		if _, err := streamed.capture.Write([]byte("partial")); err != nil {
+			t.Fatalf("sink Write: %v", err)
+		}
+		commit, err := retainToolResults(context.Background(), cfg, []result{streamed})
+		if err != nil {
+			t.Fatalf("retainToolResults: %v", err)
+		}
+		if commit.retention == nil || commit.retention.Stage != ToolResultRetentionStageSpill {
+			t.Fatalf("retention = %+v, want stage %q", commit.retention, ToolResultRetentionStageSpill)
+		}
+		if !errors.Is(commit.retention, io.ErrShortWrite) {
+			t.Fatalf("retention cause = %v, want the latched short write", commit.retention.Cause)
+		}
+		if store.putCount() != 0 {
+			t.Fatalf("puts = %d, want 0", store.putCount())
+		}
+	})
+}
+
+// TestToolResultRetentionUsesAStreamedCaptureRatherThanReEncodingTheResult is
+// the streaming path's defining property: when the tool already wrote its
+// complete raw stream to the sink, the retained object is THAT stream — not the
+// bounded ToolResult the tool also returned. A pipeline that re-encoded the
+// returned result would retain the preview and silently lose the tail, which is
+// the exact loss the capability exists to prevent.
+func TestToolResultRetentionUsesAStreamedCaptureRatherThanReEncodingTheResult(t *testing.T) {
+	t.Parallel()
+	store := newFakeObjectStore()
+	cfg, dir := spillConfig(t, store, 16, 4096, 4096)
+	full := strings.Repeat("F", 2048)
+	streamed := textResult(t, "call-1", "bounded model preview")
+	sink, err := dir.openSink(streamed.ToolExecutionID, 4096)
+	if err != nil {
+		t.Fatalf("openSink: %v", err)
+	}
+	if _, err := sink.Write([]byte(full)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	streamed.capture = sink
+	commit, err := retainToolResults(context.Background(), cfg, []result{streamed})
+	if err != nil {
+		t.Fatalf("retainToolResults: %v", err)
+	}
+	if commit.retention != nil {
+		t.Fatalf("retention failed: %+v", commit.retention)
+	}
+	capture := commit.captures[0]
+	if capture.CapturedBytes != uint64(len(full)) {
+		t.Fatalf("CapturedBytes = %d, want %d", capture.CapturedBytes, len(full))
+	}
+	stored, ok := store.get(capture.Reference.ObjectID)
+	if !ok || string(stored) != full {
+		t.Fatalf("stored object = %q..., want the streamed bytes", string(stored[:min(len(stored), 16)]))
+	}
+	if got := committedText(t, commit.messages[0]); !strings.HasPrefix(got, "bounded") && !strings.Contains(got, "shaped") {
+		t.Fatalf("committed text = %q, want the tool's own bounded preview", got)
+	}
+}
+
+// TestStreamedCaptureRecordsTheCeilingTruncation pins what a STREAMING producer
+// that ran past the ceiling records. The sink kept counting after it stopped
+// retaining, so the original size is exact even though the capture is truncated,
+// and the reason is capture_ceiling — a Harness ceiling, not a producer that
+// bounded itself.
+func TestStreamedCaptureRecordsTheCeilingTruncation(t *testing.T) {
+	t.Parallel()
+	store := newFakeObjectStore()
+	const ceiling = 128
+	cfg, dir := spillConfig(t, store, 16, ceiling, ceiling)
+	streamed := textResult(t, "call-1", "preview")
+	sink, err := dir.openSink(streamed.ToolExecutionID, ceiling)
+	if err != nil {
+		t.Fatalf("openSink: %v", err)
+	}
+	if _, err := sink.Write([]byte(strings.Repeat("T", 1000))); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	streamed.capture = sink
+	commit, err := retainToolResults(context.Background(), cfg, []result{streamed})
+	if err != nil || commit.retention != nil {
+		t.Fatalf("retention: err=%v retention=%+v", err, commit.retention)
+	}
+	capture := commit.captures[0]
+	if !capture.Truncated || capture.TruncationReason != event.ToolResultTruncatedCaptureCeiling {
+		t.Fatalf("capture = %+v, want a capture_ceiling truncation", capture)
+	}
+	if capture.CapturedBytes != ceiling {
+		t.Fatalf("CapturedBytes = %d, want %d", capture.CapturedBytes, ceiling)
+	}
+	original, exact := capture.OriginalSize()
+	if original != 1000 || !exact {
+		t.Fatalf("OriginalSize = (%d, %v), want (1000, true)", original, exact)
+	}
+	requireValidStepDone(t, commit)
+}
+
+// TestToolResultRetentionTreatsAnAmbiguousUploadAsAFailure covers the upload whose
+// outcome the loop cannot know: the store reported an error but stored the object
+// anyway — a timed-out write that landed, the classic ambiguous PUT. The loop must
+// treat it as a failure, because the only alternative is to record a capture on the
+// strength of an error. What is left behind is an object no committed StepDone
+// references, which is precisely the orphan a safe garbage collector reclaims.
+func TestToolResultRetentionTreatsAnAmbiguousUploadAsAFailure(t *testing.T) {
+	t.Parallel()
+	store := newFakeObjectStore()
+	store.putErr = errAmbiguousUpload
+	store.storeDespitePutErr = true
+	cfg, _ := spillConfig(t, store, 16, 4096, 4096)
+	text := strings.Repeat("A", 1024)
+	commit, err := retainToolResults(context.Background(), cfg, []result{textResult(t, "call-1", text)})
+	if err != nil {
+		t.Fatalf("retainToolResults: %v", err)
+	}
+	if commit.retention == nil || commit.retention.Stage != ToolResultRetentionStagePut {
+		t.Fatalf("retention = %+v, want a put-stage failure", commit.retention)
+	}
+	if len(commit.captures) != 0 {
+		t.Fatalf("captures = %d, want none: an ambiguous upload may not be recorded as retained", len(commit.captures))
+	}
+	if store.putCount() != 1 {
+		t.Fatalf("puts = %d, want exactly 1: an ambiguous upload is not retried", store.putCount())
+	}
+	sum := sha256.Sum256([]byte(text))
+	if _, ok := store.get(captureObjectID(hex.EncodeToString(sum[:]))); !ok {
+		t.Fatal("the ambiguously-stored object is absent; this test no longer exercises the ambiguous case")
+	}
+}
+
+var errAmbiguousUpload = errors.New("upload timed out")
+
+// TestToolResultRetentionCancellationReleasesEveryStreamedSpill pins the local
+// cleanup on the one path that commits nothing at all. A cancelled step discards
+// its results, so nothing will ever read their spills; leaving them behind would
+// let an interrupted session accumulate files with no owner.
+func TestToolResultRetentionCancellationReleasesEveryStreamedSpill(t *testing.T) {
+	t.Parallel()
+	store := newFakeObjectStore()
+	store.putErr = errors.New("store unavailable")
+	cfg, dir := spillConfig(t, store, 16, 4096, 4096)
+	ctx, cancel := context.WithCancel(context.Background())
+	results := make([]result, 0, 3)
+	for i := 0; i < 3; i++ {
+		r := textResult(t, fmt.Sprintf("call-%d", i), strings.Repeat("C", 1024))
+		sink, err := dir.openSink(r.ToolExecutionID, 4096)
+		if err != nil {
+			t.Fatalf("openSink: %v", err)
+		}
+		if _, err := sink.Write([]byte(strings.Repeat("C", 1024))); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		r.capture = sink
+		results = append(results, r)
+	}
+	entries, err := os.ReadDir(dir.root)
+	if err != nil || len(entries) != 3 {
+		t.Fatalf("spill root holds %d files before retention (err=%v), want 3", len(entries), err)
+	}
+	cancel()
+	if _, err := retainToolResults(ctx, cfg, results); !errors.Is(err, context.Canceled) {
+		t.Fatalf("retainToolResults = %v, want context.Canceled", err)
+	}
+	entries, err = os.ReadDir(dir.root)
+	if err != nil {
+		t.Fatalf("read spill root: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("spill root holds %d files after a cancelled step, want 0", len(entries))
+	}
+}
+
+// TestRunTurnStreamsACapturingToolThroughTheSessionSpill is the whole-turn half
+// of the streaming contract, and it is where turnCaptureSinks has its reader.
+// Everything below the turn can be proved with a hand-built sink; only a real
+// turn shows that the loop's own config is what opens one, that a capturing tool
+// reaches the streaming entry point through runTurn, and that the committed
+// StepDone describes the STREAMED bytes rather than the bounded result the tool
+// also returned.
+func TestRunTurnStreamsACapturingToolThroughTheSessionSpill(t *testing.T) {
+	t.Parallel()
+	const maxBytes = 128
+	raw := strings.Repeat("S", 4096)
+	streaming := &turnStreamingTool{name: "Streamer", raw: raw, preview: "short preview"}
+	client := &scriptedLLM{scripts: [][]content.Chunk{
+		{toolUseChunk(0, "id-stream", "Streamer", `{}`)},
+		{textChunk("done")},
+	}}
+	ts := agenticToolSet([]tool.InvokableTool{streaming}, 25, 100)
+	ts.MaxToolResultBytes = maxBytes
+	store := newFakeObjectStore()
+	cfg, st, rec := newTurnFixture(nil, nil, ts, client, noGateReg())
+	cfg.toolResultObjects = store
+	session, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	dir, err := newCaptureSpillDirectory(t.TempDir(), session)
+	if err != nil {
+		t.Fatalf("newCaptureSpillDirectory: %v", err)
+	}
+	defer func() { _ = dir.Release() }()
+	cfg.toolResultSpills = dir
+	streaming.spillRoot = dir.root
+
+	if terminal := runTurn(context.Background(), cfg, st); terminal == nil {
+		t.Fatal("runTurn returned no terminal")
+	}
+	if got := streaming.capturedRuns(); got != 1 {
+		t.Fatalf("streaming entry point runs = %d, want 1: the turn did not prefer the capability", got)
+	}
+	if got := streaming.liveSpillFiles(); got != 1 {
+		t.Fatalf("spill files present while the tool was streaming = %d, want 1: the turn wired a sink that does not use the session spill", got)
+	}
+	sds := stepDones(rec.events())
+	// Two steps: the tool step, then the final-answer step the model produces
+	// once it has seen the tool result. Only the first carries a capture.
+	if len(sds) != 2 {
+		t.Fatalf("StepDone count = %d, want 2", len(sds))
+	}
+	if len(sds[1].Captures) != 0 {
+		t.Fatalf("the final-answer step carries %d captures, want none", len(sds[1].Captures))
+	}
+	if len(sds[0].Captures) != 1 {
+		t.Fatalf("Captures = %d, want 1", len(sds[0].Captures))
+	}
+	capture := sds[0].Captures[0]
+	if capture.CapturedBytes != uint64(len(raw)) {
+		t.Fatalf("CapturedBytes = %d, want the streamed %d", capture.CapturedBytes, len(raw))
+	}
+	if capture.Reference == nil {
+		t.Fatal("the committed capture has no object reference")
+	}
+	stored, ok := store.get(capture.Reference.ObjectID)
+	if !ok || string(stored) != raw {
+		t.Fatalf("stored object = %d bytes, want the streamed %d", len(stored), len(raw))
+	}
+	trm, ok := sds[0].Messages[1].(*content.ToolResultMessage)
+	if !ok {
+		t.Fatalf("StepDone.Messages[1] = %T, want *content.ToolResultMessage", sds[0].Messages[1])
+	}
+	if got := committedText(t, trm); len(got) > maxBytes || !strings.Contains(got, "short preview") {
+		t.Fatalf("committed tool result = %q (%d bytes), want the tool's bounded preview within the model budget", got, len(got))
+	}
+	entries, err := os.ReadDir(dir.root)
+	if err != nil {
+		t.Fatalf("read spill root: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("spill root holds %d files after a committed turn", len(entries))
+	}
+}
+
+// turnStreamingTool is a capturing tool usable in a whole-turn fixture: it
+// implements the preparation boundary the runner requires and streams raw bytes
+// that are deliberately NOT the bytes it returns.
+type turnStreamingTool struct {
+	name    string
+	raw     string
+	preview string
+
+	// spillRoot, when set, is read from INSIDE the streaming call. It is the only
+	// place the difference between a file-backed sink and a memory-backed one is
+	// observable: by the time the turn ends the spill has been released either
+	// way, so an after-the-fact directory listing cannot tell them apart.
+	spillRoot string
+
+	mu        sync.Mutex
+	captured  int
+	liveFiles int
+}
+
+func (s *turnStreamingTool) Info(context.Context) (*tool.ToolInfo, error) {
+	return &tool.ToolInfo{Name: s.name}, nil
+}
+
+func (s *turnStreamingTool) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{}, nil, nil
+}
+
+func (s *turnStreamingTool) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
+	return tool.TextResult(s.preview), nil
+}
+
+func (s *turnStreamingTool) InvokableRunCaptured(_ context.Context, _ string, sink tool.ResultCaptureSink) (*tool.ToolResult, error) {
+	s.mu.Lock()
+	s.captured++
+	s.mu.Unlock()
+	if _, err := io.WriteString(sink, s.raw); err != nil {
+		return nil, err
+	}
+	if s.spillRoot != "" {
+		entries, err := os.ReadDir(s.spillRoot)
+		if err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		s.liveFiles = len(entries)
+		s.mu.Unlock()
+	}
+	return tool.TextResult(s.preview), nil
+}
+
+func (s *turnStreamingTool) capturedRuns() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.captured
+}
+
+// liveSpillFiles is how many files existed under the session spill root while
+// the tool was still writing to its sink.
+func (s *turnStreamingTool) liveSpillFiles() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.liveFiles
 }

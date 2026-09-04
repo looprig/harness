@@ -11,41 +11,31 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/loop"
 )
 
-// ToolResultObjectStat is what a SessionObjectStore reports back about an object
-// the loop has just written: the stored byte count and the lowercase-hex SHA-256
-// of the stored bytes. Both are compared against what the capture sink computed
-// before the referencing StepDone is allowed to commit, so a store that silently
-// truncated or rewrote the payload cannot be recorded as a successful retention.
-type ToolResultObjectStat struct {
-	SizeBytes uint64
-	Digest    string
-}
-
-// ToolResultObjectStore is the narrow SessionObjectStore surface the loop runtime
-// needs in order to retain a tool result that the committed model message cannot
-// carry in full. It is deliberately two methods wide: the loop mints the opaque
-// object identity itself (see captureObjectID) and never asks the store for a
-// name, a URL, a credential or a backend path, so no such value can reach the
-// public journal through this seam.
-//
-// A nil store means retention is not configured: the loop then commits exactly
-// what it committed before this seam existed. Requiring durable retention is the
-// composition root's decision, taken by wiring a store.
-type ToolResultObjectStore interface {
-	// PutToolResultObject stores content under the caller-minted opaque objectID.
-	// The object is immutable: writing the same identity twice must either be a
-	// no-op or store identical bytes.
-	PutToolResultObject(ctx context.Context, objectID string, content []byte) error
-	// StatToolResultObject reports the size and digest of a stored object.
-	StatToolResultObject(ctx context.Context, objectID string) (ToolResultObjectStat, error)
-}
+// ToolResultObjectStat, ToolResultObjectStore and ToolResultObjectStreamStore are
+// ALIASES of the public declarations in pkg/loop, not distinct types. The seam is
+// public because a composition root outside this module has to name the store it
+// wires, and internal/ types cannot be named from outside github.com/looprig/harness;
+// it is aliased rather than re-declared so there is exactly one type in each case
+// and no conversion — or divergence — at the boundary.
+type (
+	ToolResultObjectStat        = loop.ToolResultObjectStat
+	ToolResultObjectStore       = loop.ToolResultObjectStore
+	ToolResultObjectStreamStore = loop.ToolResultObjectStreamStore
+)
 
 // toolResultRetainedMarkerPrefix opens every model-visible retention marker. It
 // is a distinct literal from toolResultTruncatedMarker so a reader (and a test)
 // can tell "the preview was shaped and the rest is retained" from "the preview
 // was shaped and nothing else exists".
+// It is PROMPT TEXT, and no consumer may parse it. Its wording, its punctuation
+// and its very presence are model-facing choices that will change; the
+// machine-readable channel for a retained capture is StepDone.Captures, which
+// carries the object reference, the byte counts and the truncation reason as
+// typed fields. A downstream reader that matched this string would be reading a
+// prompt.
 const toolResultRetainedMarkerPrefix = "\n[tool output shaped"
 
 // materializedCaptureCeiling is the byte bound the materialized fallback's sink
@@ -115,6 +105,13 @@ func newCaptureReference(digestHex string) sessionwire.ObjectReference {
 type ToolResultRetentionStage string
 
 const (
+	// ToolResultRetentionStageSpill means the local session spill could not be
+	// established or could not hold what the producer supplied — it was never
+	// opened, or its backing failed or short-wrote part way through. Nothing is
+	// uploaded for such a capture: the counts and the digest the sink recorded no
+	// longer describe anything that exists, so a Put would store bytes the
+	// verification stages would then reject for the wrong reason.
+	ToolResultRetentionStageSpill ToolResultRetentionStage = "spill"
 	// ToolResultRetentionStagePut means the object write itself failed.
 	ToolResultRetentionStagePut ToolResultRetentionStage = "put"
 	// ToolResultRetentionStageStat means the object was written but could not be
@@ -178,6 +175,12 @@ type toolResultCommit struct {
 // it truncates one capture rather than removing it. Retention failure is the one
 // path that drops the list, and it drops all of it.
 func retainToolResults(ctx context.Context, cfg turnConfig, results []result) (toolResultCommit, error) {
+	// Every streamed capture's local spill is discarded when this returns,
+	// whatever it returns: after a verified upload it has served its purpose,
+	// after a failure the turn ends, and after cancellation nothing is committed.
+	// retainOneToolResult releases its own sink too; release is idempotent, so
+	// the two owners need not coordinate.
+	defer releaseCaptures(results)
 	if cfg.toolResultObjects == nil {
 		return toolResultCommit{messages: plainToolResultMessages(cfg, results)}, nil
 	}
@@ -211,12 +214,23 @@ func retainToolResults(ctx context.Context, cfg turnConfig, results []result) (t
 // reference-free when the committed preview already carries the complete
 // retained bytes verbatim — the "below threshold" case, where a separate object
 // would hold nothing the journal does not already hold.
+//
+// The sink is EITHER the one a capturing tool already streamed into while it ran
+// (r.capture, opened by the runner before the call) or one built here from the
+// materialized ToolResult. Both are captureSinks over the same session spill, so
+// the ceiling, the counts, the digest and the encoding are decided in one place
+// whichever producer the tool was. The local spill is released on every path:
+// after a verified upload it has served its purpose, and after a failed one the
+// turn ends, so it has no reader either.
 func retainOneToolResult(ctx context.Context, cfg turnConfig, r result) (*content.ToolResultMessage, event.ToolResultCapture, *ToolResultRetentionError) {
-	sink := newCaptureSink(materializedCaptureCeiling(cfg.tools))
-	// A materialized producer hands back a complete ToolResult, so it is written
-	// to the sink in one call; the sink, not this caller, decides what survives
-	// the ceiling.
-	_, _ = sink.Write(rawToolResultBytes(r.Content))
+	sink := r.capture
+	if sink == nil {
+		sink = materializedCaptureSink(cfg, r)
+	}
+	defer func() { _ = sink.release() }()
+	if err := sink.spillErr(); err != nil {
+		return nil, event.ToolResultCapture{}, retentionFailure(r, ToolResultRetentionStageSpill, err)
+	}
 	original := sink.offeredBytes()
 	capture := event.ToolResultCapture{
 		ToolExecutionID: r.ToolExecutionID,
@@ -230,13 +244,23 @@ func retainOneToolResult(ctx context.Context, cfg turnConfig, r result) (*conten
 		capture.TruncationReason = event.ToolResultTruncatedCaptureCeiling
 	}
 	preview := shapeToolResultText(flattenToText(r.Content), cfg.tools.MaxToolResultBytes)
-	if !capture.Truncated && preview == string(sink.bytes()) {
-		return toolResultMessageWithText(r, preview), capture, nil
+	// The retained prefix is only read back when it could possibly EQUAL the
+	// preview, which requires the two to be the same length. That keeps the
+	// below-threshold check from materializing a large spill merely to discover
+	// it is large.
+	if !capture.Truncated && sink.capturedBytes() == uint64(len(preview)) {
+		retained, err := sink.materialize()
+		if err != nil {
+			return nil, event.ToolResultCapture{}, retentionFailure(r, ToolResultRetentionStageSpill, err)
+		}
+		if preview == string(retained) {
+			return toolResultMessageWithText(r, preview), capture, nil
+		}
 	}
 	reference := newCaptureReference(sink.digestHex())
 	objectID := reference.ObjectID
-	if err := cfg.toolResultObjects.PutToolResultObject(ctx, objectID, sink.bytes()); err != nil {
-		return nil, event.ToolResultCapture{}, retentionFailure(r, ToolResultRetentionStagePut, err)
+	if stage, err := putCapturedObject(ctx, cfg.toolResultObjects, objectID, sink); err != nil {
+		return nil, event.ToolResultCapture{}, retentionFailure(r, stage, err)
 	}
 	stat, err := cfg.toolResultObjects.StatToolResultObject(ctx, objectID)
 	if err != nil {
@@ -251,6 +275,64 @@ func retainOneToolResult(ctx context.Context, cfg turnConfig, r result) (*conten
 	capture.Reference = &reference
 	shaped := shapeCapturedToolResultText(flattenToText(r.Content), cfg.tools.MaxToolResultBytes, toolResultRetainedMarker(capture))
 	return toolResultMessageWithText(r, shaped), capture, nil
+}
+
+// materializedCaptureSink is the fallback producer path: a materialized tool
+// hands back a complete ToolResult, so the whole encoding is written to the sink
+// in one call and the sink, not this caller, decides what survives the ceiling.
+//
+// With a session spill directory configured the retained prefix goes to disk like
+// a streamed one; without one it stays in memory, bounded by the same ceiling.
+// The memory backing is not a second policy — it is what a composition that never
+// wired a spill base gets, and pkg/rig's public option refuses to build one.
+// A spill that cannot be opened produces a sink that still accepts and counts
+// every byte, so the tool's own outcome is unchanged and the failure surfaces as
+// a retention failure at the spill stage rather than as a tool error.
+func materializedCaptureSink(cfg turnConfig, r result) *captureSink {
+	ceiling := materializedCaptureCeiling(cfg.tools)
+	sink := newCaptureSink(ceiling)
+	if cfg.toolResultSpills != nil {
+		spilled, err := cfg.toolResultSpills.openSink(r.ToolExecutionID, ceiling)
+		if err != nil {
+			sink = newFailedCaptureSink(ceiling, err)
+		} else {
+			sink = spilled
+		}
+	}
+	_, _ = sink.Write(rawToolResultBytes(r.Content))
+	return sink
+}
+
+// putCapturedObject writes the retained prefix to the object store, preferring
+// the optional streaming capability. The returned stage distinguishes a failure
+// reading the LOCAL spill from a failure in the STORE, because they are different
+// faults with different operator responses and an identical error code is the
+// most common mask for a survivor.
+//
+// The streaming path hands the store a rewound reader over the spill and never
+// materializes the capture, which is what keeps a large result out of host
+// memory. A store without the capability gets the bounded materialized Put; the
+// bound is the capture ceiling, so the fallback is resident but never unbounded.
+func putCapturedObject(ctx context.Context, store ToolResultObjectStore, objectID string, sink *captureSink) (ToolResultRetentionStage, error) {
+	if streamer, ok := store.(ToolResultObjectStreamStore); ok {
+		reader, err := sink.reader()
+		if err != nil {
+			return ToolResultRetentionStageSpill, err
+		}
+		defer func() { _ = reader.Close() }()
+		if err := streamer.PutToolResultObjectStream(ctx, objectID, reader, sink.capturedBytes()); err != nil {
+			return ToolResultRetentionStagePut, err
+		}
+		return "", nil
+	}
+	retained, err := sink.materialize()
+	if err != nil {
+		return ToolResultRetentionStageSpill, err
+	}
+	if err := store.PutToolResultObject(ctx, objectID, retained); err != nil {
+		return ToolResultRetentionStagePut, err
+	}
+	return "", nil
 }
 
 func retentionFailure(r result, stage ToolResultRetentionStage, cause error) *ToolResultRetentionError {
@@ -377,4 +459,23 @@ func appendRawToolResultBytes(buf *bytes.Buffer, blocks []content.Block) {
 			buf.Write(encoded)
 		}
 	}
+}
+
+// turnCaptureSinks builds the per-call capture sink factory for one turn, or nil
+// when this loop has no retention configured — the runner then keeps every tool
+// on the ordinary InvokableRun path, so a composition without a store behaves
+// exactly as it did before the streaming capability existed.
+//
+// Without a spill directory the sink is memory-backed: still bounded by the same
+// ceiling, but resident. That is the honest cost of wiring a store without a
+// spill base, which pkg/rig's public option does not allow.
+func turnCaptureSinks(cfg turnConfig) func(uuid.UUID) *captureSink {
+	if cfg.toolResultObjects == nil {
+		return nil
+	}
+	ceiling := materializedCaptureCeiling(cfg.tools)
+	if cfg.toolResultSpills == nil {
+		return func(uuid.UUID) *captureSink { return newCaptureSink(ceiling) }
+	}
+	return spillCaptureSinks(cfg.toolResultSpills, ceiling)
 }

@@ -73,7 +73,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 				s,
 				bound,
 				restoredStateFrom(folded, ri, notifications),
-				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext(), ToolResultObjects: s.toolResultObjects},
+				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext(), ToolResultObjects: s.toolResultObjects, ToolResultSpills: s.toolResultSpillDirectory()},
 			)
 		}
 	default:
@@ -1403,7 +1403,7 @@ func buildRestoredSession(
 				s,
 				cfg,
 				restoredStateFrom(folded, ri, notifications),
-				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext(), ToolResultObjects: s.toolResultObjects},
+				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext(), ToolResultObjects: s.toolResultObjects, ToolResultSpills: s.toolResultSpillDirectory()},
 			)
 		}
 	default:

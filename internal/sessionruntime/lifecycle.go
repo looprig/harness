@@ -507,10 +507,10 @@ func WithLifecycleWorkspaceCheckpointing(ws *workspacestore.Store, root string) 
 // RestoreSession as WithToolResultCapture. A nil store is ignored, which leaves
 // retention unconfigured rather than installing a store the loop would
 // nil-deref on.
-func WithLifecycleToolResultCapture(objects loopruntime.ToolResultObjectStore) LifecycleOption {
+func WithLifecycleToolResultCapture(objects loopruntime.ToolResultObjectStore, spillBase string) LifecycleOption {
 	return func(r *Lifecycle) {
 		if objects != nil {
-			r.baseOpts = append(r.baseOpts, WithToolResultCapture(objects))
+			r.baseOpts = append(r.baseOpts, WithToolResultCapture(objects, spillBase))
 		}
 	}
 }

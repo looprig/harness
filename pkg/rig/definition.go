@@ -36,6 +36,13 @@ type definitionState struct {
 	// one; more than one is a typed rejection.
 	placements     []pendingPlacement
 	snapshotPolicy *SnapshotPolicy
+
+	// toolResultObjects and toolResultSpillBase are wired together by
+	// WithToolResultCapture; see its doc comment for why neither is meaningful
+	// alone. The base is raw here and canonicalized at Define, where the
+	// workspace region it must not overlap is known.
+	toolResultObjects   loop.ToolResultObjectStore
+	toolResultSpillBase string
 }
 
 // Rig is an immutable design-time assembly that creates and restores sessions.
@@ -43,6 +50,7 @@ type Rig struct {
 	lifecycle               *sessionruntime.Lifecycle
 	hooks                   *hook.Runner
 	resourceStorageProvider SessionResourceStorageProvider
+	captureSafety           tool.CaptureSafetyDescriptor
 }
 
 func Define(options ...Option) (*Rig, error) {
@@ -172,6 +180,10 @@ func Define(options ...Option) (*Rig, error) {
 			return nil, err
 		}
 	}
+	spillBase, err := resolveToolResultCapture(state, placement.Configured(), region)
+	if err != nil {
+		return nil, err
+	}
 
 	fields := state.fingerprintFields
 	if placement.Configured() {
@@ -229,6 +241,9 @@ func Define(options ...Option) (*Rig, error) {
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleFingerprint(fingerprint))
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleManifest(manifest))
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleHooks(state.compiledHooks))
+	if captureOption := toolResultCaptureLifecycleOption(state, spillBase); captureOption != nil {
+		lifecycleOptions = append(lifecycleOptions, captureOption)
+	}
 	if state.resourceStorageProvider != nil {
 		provider := state.resourceStorageProvider
 		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleSessionResourceStorage(
@@ -250,6 +265,7 @@ func Define(options ...Option) (*Rig, error) {
 		lifecycle:               lifecycle,
 		hooks:                   state.compiledHooks,
 		resourceStorageProvider: state.resourceStorageProvider,
+		captureSafety:           projectCaptureSafety(state.loops),
 	}, nil
 }
 

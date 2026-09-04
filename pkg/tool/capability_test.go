@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"io"
 	"testing"
 
 	"github.com/looprig/core/uuid"
@@ -21,6 +22,12 @@ func (capableTool) AuditSummary(argsJSON string) string { return "summary" }
 func (capableTool) WriteTarget(argsJSON string) (string, bool, error) {
 	return "/tmp/x", true, nil
 }
+func (capableTool) InvokableRunCaptured(ctx context.Context, argsJSON string, sink ResultCaptureSink) (*ToolResult, error) {
+	if _, err := io.WriteString(sink, "ok"); err != nil {
+		return nil, err
+	}
+	return TextResult("ok"), nil
+}
 func (capableTool) PrepareCall(ctx context.Context, executionID uuid.UUID, argsJSON string) (Request, PreparedArtifact, error) {
 	return Request{}, TokenArtifact{Token: executionID.String()}, nil
 }
@@ -28,12 +35,13 @@ func (capableTool) PrepareCall(ctx context.Context, executionID uuid.UUID, argsJ
 // Compile-time assertions: a tool implementing each optional capability is
 // assignable to that interface.
 var (
-	_ InvokableTool    = capableTool{}
-	_ Sequential       = capableTool{}
-	_ Auditable        = capableTool{}
-	_ WriteTarget      = capableTool{}
-	_ CallPreparer     = capableTool{}
-	_ PreparedArtifact = TokenArtifact{}
+	_ InvokableTool          = capableTool{}
+	_ Sequential             = capableTool{}
+	_ Auditable              = capableTool{}
+	_ WriteTarget            = capableTool{}
+	_ CallPreparer           = capableTool{}
+	_ CapturingInvokableTool = capableTool{}
+	_ PreparedArtifact       = TokenArtifact{}
 )
 
 // TestCapabilityInterfaces verifies, via type assertion (the runner's real
@@ -69,6 +77,9 @@ func TestCapabilityInterfaces(t *testing.T) {
 			}
 			if _, ok := tt.tool.(CallPreparer); ok != tt.wantOptionals {
 				t.Errorf("CallPreparer assertion = %v, want %v", ok, tt.wantOptionals)
+			}
+			if _, ok := tt.tool.(CapturingInvokableTool); ok != tt.wantOptionals {
+				t.Errorf("CapturingInvokableTool assertion = %v, want %v", ok, tt.wantOptionals)
 			}
 		})
 	}

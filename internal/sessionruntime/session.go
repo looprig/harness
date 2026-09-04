@@ -343,6 +343,21 @@ type Session struct {
 	// at each of the three loop-construction sites; the session itself never
 	// reads or writes an object.
 	toolResultObjects loopruntime.ToolResultObjectStore
+
+	// toolResultSpillBase is the directory this session's spill root is created
+	// under, wired together with toolResultObjects by WithToolResultCapture. It
+	// is a base rather than the root itself because the root is session-scoped:
+	// two sessions sharing a base never share a root.
+	//
+	// The root is established lazily, once, at the first loop construction that
+	// needs it: the session id is known by then, and a session that never builds
+	// a loop never creates a directory. A base that cannot be established yields
+	// an UNAVAILABLE directory rather than a nil one, so a session wired for
+	// durable retention fails its turn at the spill stage instead of silently
+	// retaining nothing.
+	toolResultSpillBase string
+	toolResultSpillOnce sync.Once
+	toolResultSpills    *loopruntime.ToolResultSpillDirectory
 	// wsResidency is the checkpoint boundary this session came up on, folded from the
 	// durable stream by Restore. It is written once, before the session is handed to a
 	// caller, and read-only afterwards.
@@ -515,6 +530,7 @@ func (s *Session) abortConstructionAfter(cause error, appendTerminal func(contex
 	// Stop the offload-GC runner (nil/no-op unless it was installed and started). On a
 	// construction abort it is typically unstarted, so this only stops the ticker.
 	s.stopOffloadGC()
+	s.releaseToolResultSpills()
 	// Seal durable publication before cancellation can make a backend emit a late
 	// terminal. Already-admitted publishes are the first cleanup phase.
 	var hubDrain <-chan struct{}
@@ -1657,7 +1673,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 				eventTarget,
 				bound,
 				startedMode,
-				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext(), ToolResultObjects: s.toolResultObjects},
+				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext(), ToolResultObjects: s.toolResultObjects, ToolResultSpills: s.toolResultSpillDirectory()},
 			)
 		}
 	case loop.EngineAdapter:
@@ -2712,6 +2728,34 @@ func (s *Session) faultWorkspaceInconsistent(cause error) {
 	s.latchSessionFault(cause)
 }
 
+// toolResultSpillDirectory returns this session's spill root, establishing it on
+// first use. It returns nil when no spill base was wired, which leaves the
+// retained prefix of each capture in memory — bounded by the same ceiling, and
+// the behaviour of every composition that predates the spill.
+func (s *Session) toolResultSpillDirectory() *loopruntime.ToolResultSpillDirectory {
+	if s.toolResultSpillBase == "" {
+		return nil
+	}
+	s.toolResultSpillOnce.Do(func() {
+		dir, err := loopruntime.NewToolResultSpillDirectory(s.toolResultSpillBase, s.sessionID)
+		if err != nil {
+			s.toolResultSpills = loopruntime.UnavailableToolResultSpillDirectory(err)
+			return
+		}
+		s.toolResultSpills = dir
+	})
+	return s.toolResultSpills
+}
+
+// releaseToolResultSpills removes every local capture spill this session wrote.
+// It runs at shutdown, after the loops have stopped: a spill outlives its own
+// turn only when that turn was torn down, so nothing readable is being discarded.
+func (s *Session) releaseToolResultSpills() {
+	if s.toolResultSpills != nil {
+		_ = s.toolResultSpills.Release()
+	}
+}
+
 // newWorkspaceBinding returns the tool.WorkspaceBinding to populate at a loop bind site, or
 // nil when the session has no managed workspace (leaving tool.Bindings.Workspace nil, the
 // no-placement default). Each loop gets a FRESH per-loop observation set so a Bash run
@@ -3063,6 +3107,9 @@ func (s *Session) teardown(plan teardownPlan) error {
 	// From here onward every phase gets a fresh private deadline. A timeout in one
 	// component therefore cannot suppress checkpoint, durable-stop, or lease cleanup.
 	s.stopOffloadGC()
+	// The loops have stopped, so every capture spill either reached its object or
+	// belonged to a turn that was torn down. Neither has a local reader left.
+	s.releaseToolResultSpills()
 	failures = append(failures, s.stopCheckpoints(cleanupRoot, timeouts.checkpoint))
 	// Session resources (including the process registry) must fully terminate and
 	// confirm before the hub stops and the leases/session context release: their own

@@ -95,6 +95,14 @@ type result struct {
 	ToolUseID       string
 	Content         []content.Block
 	IsError         bool
+
+	// capture is the sink a CAPTURING tool streamed its complete raw result into
+	// while it ran. It is nil for every materialized tool, and for a capturing
+	// tool in a loop with no retention configured: the retention pipeline then
+	// builds its own sink from Content. It is package-private because it is a
+	// live, single-owner handle to an open spill file, not a value: the retention
+	// pipeline releases it, and nothing else may.
+	capture *captureSink
 }
 
 type toolExecutionHookError struct{}
@@ -164,6 +172,17 @@ type BatchRuntime struct {
 	Coordinates       identity.Coordinates
 	AgentName         identity.AgentName
 	Cause             identity.Cause
+
+	// captureSinks, when non-nil, opens the capture sink for one tool call. It is
+	// non-nil exactly when durable tool-result retention is configured for this
+	// loop, which is what makes the streaming capability worth preferring: with
+	// no store to retain into, a streamed capture would have nowhere to go and
+	// the ordinary InvokableRun path is the cheaper one. It always returns a
+	// usable sink — a spill that could not be opened yields one that counts every
+	// producer byte and reports the failure, so a storage problem never becomes a
+	// tool failure. It is unexported because the sink is a live handle to an open
+	// spill file rather than a value, and only this package may hand one out.
+	captureSinks func(uuid.UUID) *captureSink
 }
 
 // RunBatch executes a batch of tool calls. It mints a ToolExecutionID per call via runtime.IDGen
@@ -932,6 +951,19 @@ func runOne(
 			ArgsJSON:        append([]byte(nil), r.block.Input...),
 		},
 	}
+	// The capture sink is opened — and its release deferred — BEFORE the hook
+	// span starts, so the release defer is registered ahead of the panic-recovery
+	// defer and therefore runs after it, when res is final. A call that produces
+	// no retainable result (an error, an empty result, a panic, a hook refusal)
+	// never reaches the retention pipeline, so the runner is the only layer that
+	// can delete its spill.
+	exec, sink := captureExecutor(r, ts, runtime)
+	defer func() {
+		if sink != nil && res.capture == nil {
+			_ = sink.release()
+		}
+	}()
+
 	execCtx, finishExecution, startErr := runtime.Hooks.Start(ctx2, executionCall)
 	if startErr != nil {
 		res = errResult(r, errToolHookFailure)
@@ -955,7 +987,6 @@ func runOne(
 		finishExecutionHook(finishExecution, executionCall, res, executionErr)
 	}()
 
-	exec := chain(r.t, ts.Middlewares)
 	tr, err := exec(execCtx, r.argsstr)
 	if err != nil {
 		executionErr = err
@@ -973,6 +1004,57 @@ func runOne(
 		ToolUseID:       r.block.ID,
 		Content:         tr.Content,
 		IsError:         isErrorResult(tr),
+		capture:         sink,
+	}
+}
+
+// captureExecutor picks the tool entry point for this call and, on the streaming
+// path, opens the capture sink the tool writes into. The streaming capability is
+// preferred whenever BOTH a sink factory is configured and the tool implements
+// it; every other combination is the unchanged materialized fallback, whose
+// returned sink is nil.
+//
+// The middleware chain wraps whichever entry point was chosen, so a consumer's
+// middleware applies identically to a streaming tool and a materialized one —
+// exempting exactly the tools that produce the most output would be the worst
+// possible place to drop it.
+func captureExecutor(r *resolved, ts ToolSet, runtime BatchRuntime) (tool.ToolExecuteFunc, *captureSink) {
+	if runtime.captureSinks == nil {
+		return chain(r.t, r.t.InvokableRun, ts.Middlewares), nil
+	}
+	capturing, ok := r.t.(tool.CapturingInvokableTool)
+	if !ok {
+		return chain(r.t, r.t.InvokableRun, ts.Middlewares), nil
+	}
+	sink := runtime.captureSinks(r.callID)
+	base := func(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+		return capturing.InvokableRunCaptured(ctx, argsJSON, sink)
+	}
+	return chain(r.t, base, ts.Middlewares), sink
+}
+
+// spillCaptureSinks builds the sink factory for a session that has a spill
+// directory: one owner-only file per ToolExecutionID, bounded by ceiling.
+func spillCaptureSinks(dir *captureSpillDirectory, ceiling int) func(uuid.UUID) *captureSink {
+	return func(executionID uuid.UUID) *captureSink {
+		sink, err := dir.openSink(executionID, ceiling)
+		if err != nil {
+			return newFailedCaptureSink(ceiling, err)
+		}
+		return sink
+	}
+}
+
+// releaseCaptures discards the local spill of every result in a batch. It is
+// called on the paths that DROP a batch's results — a cancelled step, and the
+// retention pipeline's own exit — so a discarded result never leaves a file
+// behind. Releasing a sink twice is a no-op, which is what lets both the runner
+// and the pipeline own the same guarantee without coordinating.
+func releaseCaptures(results []result) {
+	for _, r := range results {
+		if r.capture != nil {
+			_ = r.capture.release()
+		}
 	}
 }
 
@@ -1010,10 +1092,12 @@ func isErrorResult(tr *tool.ToolResult) bool {
 	return false
 }
 
-// chain composes the middleware chain around the tool's InvokableRun. The
-// first-listed middleware is the OUTERMOST wrapper.
-func chain(t tool.InvokableTool, mws []tool.ToolMiddleware) tool.ToolExecuteFunc {
-	next := t.InvokableRun
+// chain composes the middleware chain around next, the chosen tool entry point
+// (InvokableRun, or the streaming InvokableRunCaptured bound to this call's
+// sink). The first-listed middleware is the OUTERMOST wrapper. t is passed to
+// each middleware as the tool being wrapped and is not called here, so the entry
+// point and the identity a middleware sees stay independent.
+func chain(t tool.InvokableTool, next tool.ToolExecuteFunc, mws []tool.ToolMiddleware) tool.ToolExecuteFunc {
 	for i := len(mws) - 1; i >= 0; i-- {
 		mw := mws[i]
 		inner := next

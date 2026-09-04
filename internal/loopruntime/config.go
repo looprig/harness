@@ -248,6 +248,13 @@ type runtimeConfig struct {
 	// ToolLimits.CaptureBytes (the ceiling) is the agent's. nil turns retention
 	// off, leaving every committed step byte-identical to what it was before.
 	ToolResultObjects ToolResultObjectStore
+
+	// ToolResultSpills is the session-scoped spill directory captures stream
+	// through on their way to ToolResultObjects. Like the store it is runtime
+	// wiring rather than declarative policy — where a host may write local
+	// bytes is its own placement decision. nil keeps the retained prefix in
+	// memory, bounded by the same capture ceiling.
+	ToolResultSpills *ToolResultSpillDirectory
 }
 
 // RuntimeDependencies carries native runtime collaborators that are not part
@@ -265,4 +272,9 @@ type RuntimeDependencies struct {
 	// ReviewContext it is optional: nil leaves the loop with no retention, which
 	// is the behaviour of every caller that predates the capture pipeline.
 	ToolResultObjects ToolResultObjectStore
+
+	// ToolResultSpills wires the session-scoped spill directory. It is meaningful
+	// only alongside ToolResultObjects: with no store there is nothing to upload
+	// a spill to, and the runner keeps every tool on the materialized path.
+	ToolResultSpills *ToolResultSpillDirectory
 }

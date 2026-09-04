@@ -74,6 +74,20 @@ const (
 	// verifyPermissionReviewObservations) if that ever turns out to matter
 	// for a given session.
 	DefinitionUnusedPermissionReviewObservations DefinitionErrorKind = "unused_permission_review_observations"
+
+	// DefinitionInvalidToolResultCapture: WithToolResultCapture was called with a
+	// nil object store, or with a spill base that is empty, all-whitespace, or
+	// relative. Name carries which half was wrong ("objects", "spill_base", or
+	// the rejected path). Rejected at Define rather than at the first oversized
+	// tool result, because the failure mode otherwise is a turn that ends on a
+	// retention error long after the misconfiguration.
+	DefinitionInvalidToolResultCapture DefinitionErrorKind = "invalid_tool_result_capture"
+	// DefinitionToolResultSpillOverlapsWorkspace: the capture spill base is equal
+	// to, inside, or an ancestor of the configured workspace region. A workspace
+	// checkpoint archives the whole region, so a spill inside it would be
+	// captured into every checkpoint — and a region inside the spill base would
+	// be deleted with it at session shutdown. Name carries the canonical base.
+	DefinitionToolResultSpillOverlapsWorkspace DefinitionErrorKind = "tool_result_spill_overlaps_workspace"
 )
 
 type DefinitionError struct {

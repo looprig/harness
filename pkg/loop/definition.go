@@ -362,6 +362,37 @@ func (d Definition) ToolRequirements() tool.Requirements {
 	return req
 }
 
+// ToolDefinitions returns every tool definition this loop can build, across the
+// base tool set and all declared modes, deduplicated by definition NAME and
+// ordered base-first then mode-by-mode. It reads immutable design-time state, so
+// like ToolRequirements it needs no runtime binding.
+//
+// It exists so a composition can project a capture-safety descriptor
+// (tool.ProjectCaptureSafety) BEFORE any session binds: binding is what builds
+// concrete tools, and a placement decision has to be takeable without one. Nil
+// definitions are skipped, matching ToolRequirements.
+func (d Definition) ToolDefinitions() []tool.Definition {
+	if d.state == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var all []tool.Definition
+	collect := func(defs []tool.Definition) {
+		for _, t := range defs {
+			if nilLike(t) || seen[t.Name()] {
+				continue
+			}
+			seen[t.Name()] = true
+			all = append(all, t)
+		}
+	}
+	collect(d.state.tools)
+	for _, mode := range d.state.modes {
+		collect(mode.Tools)
+	}
+	return all
+}
+
 // InitialMode returns the explicitly selected mode, or empty for the base mode.
 func (d Definition) InitialMode() ModeName {
 	if d.state == nil {

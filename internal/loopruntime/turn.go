@@ -193,6 +193,14 @@ type turnConfig struct {
 	// default for every caller that does not wire a store) leaves the committed
 	// group byte-identical to what it was before this field existed.
 	toolResultObjects ToolResultObjectStore
+
+	// toolResultSpills is the session-scoped spill directory each capture is
+	// streamed through on its way to the object store. nil keeps the retained
+	// prefix in memory, bounded by the same capture ceiling — the behaviour of
+	// every composition that wires a store but no spill base. It is separate from
+	// toolResultObjects because the two are different placements: the spill is
+	// local and per-session, the object store is durable and shared.
+	toolResultSpills *captureSpillDirectory
 }
 
 // turnCommit is one commit request: the finalized step group to append to
@@ -546,12 +554,16 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 				TurnID:    turnIDs.turnID,
 				StepID:    st.id,
 			},
-			AgentName: cfg.agentName,
-			Cause:     cfg.cause,
+			AgentName:    cfg.agentName,
+			Cause:        cfg.cause,
+			captureSinks: turnCaptureSinks(cfg),
 		})
 		if stepCtx.Err() != nil {
 			// A cancelled batch's results are discarded; the step never completes, so
-			// it is not appended/committed and emits no StepDone.
+			// it is not appended/committed and emits no StepDone. Their local spills
+			// are discarded with them: the retention pipeline, which normally owns
+			// that release, is never reached on this path.
+			releaseCaptures(results)
 			finishStepWith(stepCtx.Err())
 			return event.TurnInterrupted{TurnIndex: ts.index}
 		}
@@ -562,6 +574,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// never opened a gate reports attempted=false here and falls through
 		// exactly as if review context were never configured.
 		if reviewErr, attempted := reviewCapture.failed(); attempted && reviewErr != nil {
+			releaseCaptures(results)
 			return event.TurnFailed{TurnIndex: ts.index, Err: reviewErr}
 		}
 		// Durable retention runs BEFORE the model preview is committed: every

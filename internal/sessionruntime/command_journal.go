@@ -305,10 +305,15 @@ func WithWorkspaceCheckpointing(ws *workspacestore.Store, root string) Option {
 // "no layer may silently discard the tail of a tool result" from a policy into an
 // enforced one. A nil store is ignored, so a wiring slip leaves the default
 // unconfigured state rather than installing a store the loop would nil-deref on.
-func WithToolResultCapture(objects loopruntime.ToolResultObjectStore) Option {
+// spillBase is the directory this session's spill root is created under. An
+// empty base keeps each capture's retained prefix in memory, bounded by the same
+// ceiling; pkg/rig's public option refuses to build one, so an empty base here
+// means an internal caller that predates the spill.
+func WithToolResultCapture(objects loopruntime.ToolResultObjectStore, spillBase string) Option {
 	return func(s *Session) {
 		if objects != nil {
 			s.toolResultObjects = objects
+			s.toolResultSpillBase = spillBase
 		}
 	}
 }

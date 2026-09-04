@@ -43,14 +43,19 @@ const (
 )
 
 // defaultMaxMaterializedToolResultBytes is the declared hard maximum for one
-// materialized tool result: 32 MiB. It is a MEMORY figure, not a retention one —
-// a materialized result is resident in full before the loop can bound it, so
-// this multiplied by MaxParallelToolCalls (8 by default) is the 256 MiB a pooled
-// Host must budget for one loop's tool batch. It sits above
-// loop.DefaultToolResultCaptureBytes so the retention ceiling, not the memory
-// declaration, is what ordinarily bounds a capture; both remain reachable
-// because the retention ceiling is configurable per definition.
-const defaultMaxMaterializedToolResultBytes = 32 << 20
+// materialized tool result. It is the package-local name for
+// loop.DefaultMaterializedToolResultBytes, which is public because the
+// capture-safety descriptor a placement decision reads is projected against it;
+// the two must not be able to drift, so this is a reference rather than a copy.
+//
+// It is a MEMORY figure, not a retention one — a materialized result is resident
+// in full before the loop can bound it, so this multiplied by
+// MaxParallelToolCalls (8 by default) is the 256 MiB a pooled Host must budget
+// for one loop's tool batch. It sits above loop.DefaultToolResultCaptureBytes so
+// the retention ceiling, not the memory declaration, is what ordinarily bounds a
+// capture; both remain reachable because the retention ceiling is configurable
+// per definition.
+const defaultMaxMaterializedToolResultBytes = loop.DefaultMaterializedToolResultBytes
 
 func resolveMaxToolIterations(n int) int {
 	if n <= 0 {
