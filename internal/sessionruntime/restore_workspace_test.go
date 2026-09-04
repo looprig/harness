@@ -2,22 +2,30 @@ package sessionruntime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
@@ -924,5 +932,707 @@ func TestNeverCheckpointedRestoreReportsNoLossAndLeavesTheTreeIntact(t *testing.
 	}
 	if status.PostCheckpointLoss() {
 		t.Errorf("PostCheckpointLoss() = true on a never-checkpointed restore whose tree is intact (%d records counted)", status.PostCheckpointEvents)
+	}
+}
+
+// --- eviction-safe tool-result retrieval (H5.4) --------------------------------------
+
+// evictionCaptureCeiling is the per-result retention ceiling every fixture below
+// declares, and the ONLY thing that decides which side of the truncation boundary a
+// payload lands on. The two payload sizes are derived from it rather than picked:
+// one strictly under it and one strictly over it, so the pair spans both arms of the
+// sink's ceiling branch instead of sampling one of them twice.
+const evictionCaptureCeiling = 4096
+
+// evictionPreviewBytes bounds the model-visible preview. It is far below the ceiling
+// so a capture is never the "below threshold" case in which the committed message
+// already carries the whole retained prefix and no separate object is written: every
+// arm here must actually produce an object, or the retrieval assertion would be
+// asserting nothing.
+const evictionPreviewBytes = 512
+
+// evictionPayload builds n bytes of ASCII whose value varies with position. A repeated
+// single byte would make every prefix of the payload equal to every other prefix of
+// the same length, so a store that returned the WRONG 4096 bytes would still compare
+// equal; this payload makes the retrieved bytes identify their own offset.
+func evictionPayload(n int) string {
+	buf := make([]byte, n)
+	for i := range buf {
+		buf[i] = byte('a' + i%26)
+	}
+	return string(buf)
+}
+
+// evictionObjectStore is the SessionObjectStore fake the loop retains into.
+//
+// Harness ships NO implementation of loop.ToolResultObjectStore — every implementation
+// in the tree is a test fake — so this one stands in for something with no in-tree
+// referent and is written against the INTERFACE CONTRACT in pkg/loop/tool_capture.go,
+// audited in both directions:
+//
+//   - Put's content slice is "owned by the loop and valid only for the duration of the
+//     call", so this copies it. A fake that retained the slice would be LOOSER than the
+//     contract and would silently pass for a producer that reused its buffer.
+//   - "The object is immutable: writing the same identity twice must either be a no-op
+//     or store identical bytes." A second Put with different bytes is a producer defect,
+//     so this records it rather than overwriting — a fake that just overwrote would hide
+//     it. It is not STRICTER than the contract: it accepts the repeat, it only refuses
+//     to let differing bytes pass unnoticed.
+//   - Stat's size and digest are COMPUTED from the stored bytes, never echoed from what
+//     Put was told. A fake that echoed would make the loop's size/digest verification
+//     stages unfalsifiable: a store that truncated would still verify.
+//   - The streaming variant reads through a plain io.Reader only. The contract forbids a
+//     store from type-asserting io.ReaderAt, io.Seeker, io.WriterTo or a Size method,
+//     because the dynamic type varies with the host's spill configuration; this fake
+//     therefore uses io.ReadFull and one extra Read to prove the stream ended, which is
+//     also what "a store that reads fewer than size bytes must report an error" requires.
+//
+// What it deliberately does NOT model is latency, partial durability or an ambiguous
+// Put. Those are H5.3's fault tests; this fixture is about what survives eviction.
+type evictionObjectStore struct {
+	// streaming makes the store advertise loop.ToolResultObjectStreamStore. It is a
+	// FIELD rather than a second type so the two arms differ in exactly one bit.
+	streaming bool
+	// forgetful accepts and verifies exactly like the retaining store but keeps no
+	// bytes. It is the control that makes the retrieval assertion falsifiable: see
+	// TestToolResultObjectsAreUnreachableWithoutAStoreThatKeptTheBytes.
+	forgetful bool
+
+	mu        sync.Mutex
+	objects   map[string][]byte
+	sizes     map[string]uint64
+	digests   map[string]string
+	puts      int
+	streams   int
+	conflicts []string
+}
+
+func (s *evictionObjectStore) record(id string, body []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.objects == nil {
+		s.objects = map[string][]byte{}
+		s.sizes = map[string]uint64{}
+		s.digests = map[string]string{}
+	}
+	sum := sha256.Sum256(body)
+	digest := hex.EncodeToString(sum[:])
+	if prior, ok := s.digests[id]; ok && prior != digest {
+		s.conflicts = append(s.conflicts, id)
+	}
+	s.sizes[id] = uint64(len(body))
+	s.digests[id] = digest
+	if !s.forgetful {
+		s.objects[id] = append([]byte(nil), body...)
+	}
+}
+
+func (s *evictionObjectStore) PutToolResultObject(_ context.Context, objectID string, body []byte) error {
+	s.mu.Lock()
+	s.puts++
+	s.mu.Unlock()
+	s.record(objectID, body)
+	return nil
+}
+
+func (s *evictionObjectStore) StatToolResultObject(_ context.Context, objectID string) (loopruntime.ToolResultObjectStat, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	size, ok := s.sizes[objectID]
+	if !ok {
+		return loopruntime.ToolResultObjectStat{}, fmt.Errorf("no object %q", objectID)
+	}
+	return loopruntime.ToolResultObjectStat{SizeBytes: size, Digest: s.digests[objectID]}, nil
+}
+
+// get returns the stored bytes. A forgetful store always reports absent, which is the
+// whole point of it.
+func (s *evictionObjectStore) get(objectID string) ([]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	body, ok := s.objects[objectID]
+	return body, ok
+}
+
+func (s *evictionObjectStore) counts() (puts, streams int, conflicts []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.puts, s.streams, append([]string(nil), s.conflicts...)
+}
+
+// ids returns every identity the store holds bytes for, sorted, so a test can assert
+// what the store contains rather than only whether one expected identity is present.
+func (s *evictionObjectStore) ids() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.objects))
+	for id := range s.objects {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// evictionStreamStore is the streaming half. It is a separate type because a Go value
+// either implements the optional capability or does not, and the loop selects the path
+// by type assertion; evictionObjectStore.streaming records which one a fixture built so
+// an arm cannot silently take the other path.
+type evictionStreamStore struct{ *evictionObjectStore }
+
+func (s evictionStreamStore) PutToolResultObjectStream(_ context.Context, objectID string, body io.Reader, size uint64) error {
+	s.mu.Lock()
+	s.streams++
+	s.mu.Unlock()
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(body, buf); err != nil {
+		return fmt.Errorf("stream %q: %w", objectID, err)
+	}
+	// The contract says the store is handed exactly size bytes. Proving the stream is
+	// exhausted here is what makes "a store that reads fewer than size bytes must report
+	// an error" a two-sided check rather than a truncating read that always succeeds.
+	var overflow [1]byte
+	if n, err := body.Read(overflow[:]); n != 0 || !errors.Is(err, io.EOF) {
+		return fmt.Errorf("stream %q offered more than the declared %d bytes", objectID, size)
+	}
+	s.record(objectID, buf)
+	return nil
+}
+
+// evictionTool is the large fake tool. It is materialized (a plain InvokableTool), which
+// is the fallback producer path — the one a host has no control over, and therefore the
+// one whose bytes most need to survive.
+type evictionTool struct{ payload string }
+
+func (e *evictionTool) Info(context.Context) (*tool.ToolInfo, error) {
+	return &tool.ToolInfo{Name: "Big", Desc: "produces a large result", Schema: []byte(`{"type":"object"}`)}, nil
+}
+
+func (e *evictionTool) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{ToolName: "Big", Summary: "produce a large result"}, nil, nil
+}
+
+func (e *evictionTool) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
+	return tool.TextResult(e.payload), nil
+}
+
+// evictionRun is one whole lifecycle: a journal-backed session with a materialized
+// workspace root and a capture spill base, one turn that runs the large tool, and the
+// facts needed to interrogate what survived.
+type evictionRun struct {
+	session    *Session
+	store      *sessionstore.Store
+	sessionID  uuid.UUID
+	rootLoopID uuid.UUID
+	wsRoot     string
+	spillBase  string
+	spillRoot  string
+	payload    string
+	// stepDoneRefusals counts the durable StepDone appends the fixture refused, or is
+	// zero for a fixture that refuses none.
+	stepDoneRefusals atomic.Int64
+}
+
+// newEvictionRun builds the session and drives one turn to its terminal. The session is
+// wired to a REAL sessionstore journal rather than an in-memory recorder because the
+// claim under test is about what survives the process's local state: a capture list held
+// only in this process's memory would still be there after the roots are deleted, so
+// reading it back through the store's replayer is the layer that has the reader.
+func newEvictionRun(t *testing.T, objects *evictionObjectStore, payloadBytes int) *evictionRun {
+	t.Helper()
+	run := buildEvictionRunWith(t, objects, evictionOptions{payloadBytes: payloadBytes})
+	run.drive(t)
+	return run
+}
+
+// evictionOptions carries the one thing an arm may vary beyond the payload: a durable
+// append that refuses the StepDone, which is how the commit is failed AFTER a fully
+// verified retention.
+type evictionOptions struct {
+	payloadBytes   int
+	refuseStepDone error
+}
+
+// stepDoneRefusingAppender fails the durable append of a StepDone and passes everything
+// else through. It sits at the session's REQUIRED durable event tap, which is the layer
+// the loop's commit handshake actually reports from: the actor calls the durable commit
+// and acks its error, so a refusal here is a commitStep failure at the one production
+// cause the ordering exists to survive — the append.
+type stepDoneRefusingAppender struct {
+	inner eventAppender
+	err   error
+	// refusals counts the StepDone appends actually refused. Without it a run in which
+	// no StepDone was ever attempted — a tool that never ran, a step that never
+	// completed — would satisfy every "nothing was committed" assertion for the wrong
+	// reason.
+	refusals *atomic.Int64
+}
+
+func (a stepDoneRefusingAppender) AppendEvent(ctx context.Context, ev event.Event) (uint64, error) {
+	switch ev.(type) {
+	case event.StepDone, *event.StepDone:
+		a.refusals.Add(1)
+		return 0, a.err
+	}
+	return a.inner.AppendEvent(ctx, ev)
+}
+
+func buildEvictionRunWith(t *testing.T, objects *evictionObjectStore, opts evictionOptions) *evictionRun {
+	t.Helper()
+	ctx := context.Background()
+	store := newRestoreStore(t)
+	sessionID := mustSessionID(t)
+	lease := mustAcquireLease(t, store, sessionID)
+	j, err := store.OpenJournal(ctx, sessionID, lease)
+	if err != nil {
+		t.Fatalf("OpenJournal: %v", err)
+	}
+	ws := mustWorkspaceStore(t, memstore.New().Blobs)
+	wsRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wsRoot, "work.txt"), []byte("work"), 0o600); err != nil {
+		t.Fatalf("seed workspace root: %v", err)
+	}
+	spillBase := t.TempDir()
+	payload := evictionPayload(opts.payloadBytes)
+
+	var wired loopruntime.ToolResultObjectStore = objects
+	if objects.streaming {
+		wired = evictionStreamStore{evictionObjectStore: objects}
+	}
+
+	definition := mustDefine(
+		loop.WithName("agent"),
+		loop.WithInference(&scriptedToolLLM{toolName: "Big"}, validModel("base")),
+		loop.WithSystem("base"),
+		loop.WithTools(tool.NewDefinition("Big", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+			return []tool.InvokableTool{&evictionTool{payload: payload}}, nil
+		})),
+		loop.WithAccessGate(allowAllAccessGate{}),
+		loop.WithPolicyRevision("eviction"),
+		loop.WithToolLimits(loop.ToolLimits{ResultBytes: evictionPreviewBytes, CaptureBytes: evictionCaptureCeiling}),
+		loop.WithDrainTimeout(200*time.Millisecond),
+	)
+	run := &evictionRun{
+		store:     store,
+		sessionID: sessionID,
+		wsRoot:    wsRoot,
+		spillBase: spillBase,
+		spillRoot: filepath.Join(spillBase, sessionID.String()),
+		payload:   payload,
+	}
+	var appender eventAppender = journal.NewJournalEventAppender(j)
+	if opts.refuseStepDone != nil {
+		appender = stepDoneRefusingAppender{inner: appender, err: opts.refuseStepDone, refusals: &run.stepDoneRefusals}
+	}
+	s, err := newTestSession(ctx, definition,
+		WithSessionID(sessionID),
+		WithEventAppender(appender),
+		WithLeaseRelease(lease.Release),
+		WithWorkspaceCheckpointing(ws, wsRoot),
+		WithSnapshotPolicy(SnapshotPolicy{Trigger: SnapshotOnIdle, Priority: SnapshotRequired, Timeout: 30 * time.Second}),
+		WithToolResultCapture(wired, spillBase),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	run.session = s
+	run.rootLoopID = s.ActiveLoopID()
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+	return run
+}
+
+// drive submits the one turn that calls the large tool and waits for its terminal.
+func (r *evictionRun) drive(t *testing.T) {
+	t.Helper()
+	submitAndDrain(t, r.session, []content.Block{&content.TextBlock{Text: "run the big tool"}})
+}
+
+// driveForTerminal is drive plus the turn terminal it ended on. A test that arranges a
+// failure part way through a turn has to name WHICH ending it produced: "the object is an
+// orphan" reads the same whether the commit was interrupted or the tool never ran.
+func (r *evictionRun) driveForTerminal(t *testing.T) event.Event {
+	t.Helper()
+	sub, err := r.session.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
+	if err != nil {
+		t.Fatalf("SubscribeEvents: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := r.session.Submit(ctx, []content.Block{&content.TextBlock{Text: "run the big tool"}}); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	timeout := time.After(30 * time.Second)
+	for {
+		select {
+		case delivery, ok := <-sub.Events():
+			if !ok {
+				t.Fatal("subscription closed before a turn terminal")
+			}
+			switch delivery.Event.(type) {
+			case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
+				return delivery.Event
+			}
+		case <-timeout:
+			t.Fatal("no turn terminal within deadline")
+		}
+	}
+}
+
+// evict is the state-destroying action the task names: release this process's residency,
+// then delete the materialized workspace root and the whole capture spill base. It
+// asserts both are really gone, because every assertion after it is a claim about
+// retrievability WITHOUT them and would be vacuous if either survived.
+func (r *evictionRun) evict(t *testing.T) {
+	t.Helper()
+	if _, err := os.Lstat(r.spillRoot); err != nil {
+		t.Fatalf("lstat session spill root before eviction = %v, want the root a loop established", err)
+	}
+	if err := r.session.ReleaseResidency(context.Background()); err != nil {
+		t.Fatalf("ReleaseResidency: %v", err)
+	}
+	// Giving up residency gives up the local capture spill: the release runs the same
+	// teardown Shutdown does, and that teardown removes this session's whole spill root.
+	// This is asserted here rather than assumed because ReleaseResidency is a DIFFERENT
+	// public entry point from Shutdown — the nonterminal one a pooled host actually calls
+	// — and the existing spill-release readers only ever drove Shutdown. The deletions
+	// below would mask it: they would remove the root whether the release had or not.
+	if _, err := os.Lstat(r.spillRoot); !os.IsNotExist(err) {
+		t.Fatalf("lstat session spill root after ReleaseResidency = %v, want not-exist: a released session left its complete tool output on local disk", err)
+	}
+	for _, root := range []string{r.wsRoot, r.spillBase} {
+		if err := os.RemoveAll(root); err != nil {
+			t.Fatalf("delete %q: %v", root, err)
+		}
+		if _, err := os.Lstat(root); !os.IsNotExist(err) {
+			t.Fatalf("lstat %q after deletion = %v, want not-exist: the eviction did not happen", root, err)
+		}
+	}
+}
+
+// replayCaptures reads the tool-result captures back out of the DURABLE journal, after
+// the session has given up residency. Nothing in this process's memory is consulted.
+func (r *evictionRun) replayCaptures(t *testing.T) []event.ToolResultCapture {
+	t.Helper()
+	replayer, err := r.store.OpenEventReplayer(r.sessionID, sessionstore.ReplayRequest{FromSeq: 0})
+	if err != nil {
+		t.Fatalf("OpenEventReplayer: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cursor, err := replayer.Open(ctx, journal.ReplayRequest{LoopID: r.rootLoopID, Follow: false})
+	if err != nil {
+		t.Fatalf("replay Open: %v", err)
+	}
+	defer func() { _ = cursor.Close() }()
+	var captures []event.ToolResultCapture
+	for {
+		ev, _, err := cursor.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			return captures
+		}
+		if err != nil {
+			t.Fatalf("replay Next: %v", err)
+		}
+		if done, ok := ev.(event.StepDone); ok {
+			captures = append(captures, done.Captures...)
+		}
+	}
+}
+
+// onlyCapture fails unless the replayed journal carries exactly one capture. One tool
+// ran, so one capture is the whole list; "the first of several" would let a second,
+// contradictory record pass unread.
+func (r *evictionRun) onlyCapture(t *testing.T) event.ToolResultCapture {
+	t.Helper()
+	captures := r.replayCaptures(t)
+	if len(captures) != 1 {
+		t.Fatalf("replayed captures = %d, want exactly 1", len(captures))
+	}
+	return captures[0]
+}
+
+// TestToolResultObjectsSurviveResidencyReleaseAndRootDeletion is step 1 of H5.4: a large
+// tool runs, the step commits, this process releases residency, the materialized
+// workspace root and the whole capture spill base are DELETED, and the complete captured
+// bytes plus the declared truncation metadata are still retrievable — the metadata from
+// the durable journal, the bytes from the SessionObjectStore.
+//
+// The space is derived from the two mechanisms that decide the outcome rather than
+// picked: the sink's ceiling branch (a payload under it and one over it) and
+// putCapturedObject's type assertion (a store that implements the optional streaming
+// capability and one that does not). Every arm asserts which path was actually taken, so
+// an arm cannot silently collapse into another.
+func TestToolResultObjectsSurviveResidencyReleaseAndRootDeletion(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		streaming     bool
+		payloadBytes  int
+		wantCaptured  int
+		wantTruncated bool
+		wantReason    event.ToolResultTruncationReason
+	}{
+		{name: "under the ceiling, materialized put", payloadBytes: evictionCaptureCeiling / 2, wantCaptured: evictionCaptureCeiling / 2},
+		{name: "over the ceiling, materialized put", payloadBytes: evictionCaptureCeiling * 4, wantCaptured: evictionCaptureCeiling, wantTruncated: true, wantReason: event.ToolResultTruncatedCaptureCeiling},
+		{name: "under the ceiling, streaming put", streaming: true, payloadBytes: evictionCaptureCeiling / 2, wantCaptured: evictionCaptureCeiling / 2},
+		{name: "over the ceiling, streaming put", streaming: true, payloadBytes: evictionCaptureCeiling * 4, wantCaptured: evictionCaptureCeiling, wantTruncated: true, wantReason: event.ToolResultTruncatedCaptureCeiling},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			objects := &evictionObjectStore{streaming: tt.streaming}
+			run := newEvictionRun(t, objects, tt.payloadBytes)
+			run.evict(t)
+
+			capture := run.onlyCapture(t)
+
+			// The declared metadata, read back from the journal after eviction.
+			if capture.Reference == nil {
+				t.Fatal("the replayed capture carries no object reference: the elided bytes are named by nothing")
+			}
+			if got, want := capture.CapturedBytes, uint64(tt.wantCaptured); got != want {
+				t.Errorf("CapturedBytes = %d, want %d", got, want)
+			}
+			original, exact := capture.OriginalSize()
+			if !exact {
+				t.Error("OriginalSize is a lower bound: a materialized producer's total is exactly known")
+			}
+			if got, want := original, uint64(tt.payloadBytes); got != want {
+				t.Errorf("OriginalBytes = %d, want the producer's %d", got, want)
+			}
+			if capture.Truncated != tt.wantTruncated {
+				t.Errorf("Truncated = %v, want %v", capture.Truncated, tt.wantTruncated)
+			}
+			if capture.TruncationReason != tt.wantReason {
+				t.Errorf("TruncationReason = %q, want %q", capture.TruncationReason, tt.wantReason)
+			}
+			if capture.Encoding != event.ToolResultEncodingUTF8 {
+				t.Errorf("Encoding = %q, want %q for an ASCII payload cut on a byte boundary", capture.Encoding, event.ToolResultEncodingUTF8)
+			}
+
+			// The bytes, reopened through the SessionObjectStore with every local root gone.
+			body, ok := objects.get(capture.Reference.ObjectID)
+			if !ok {
+				t.Fatalf("object %q is absent after eviction", capture.Reference.ObjectID)
+			}
+			if uint64(len(body)) != capture.CapturedBytes {
+				t.Fatalf("retrieved %d bytes, want the declared CapturedBytes %d", len(body), capture.CapturedBytes)
+			}
+			if want := run.payload[:tt.wantCaptured]; string(body) != want {
+				t.Errorf("retrieved bytes are not the producer's prefix (first difference at %d)", evictionFirstDifference(string(body), want))
+			}
+			// The identity is content-addressed, so the retrieved bytes must reproduce it.
+			// This is what makes the object reference usable by a reader that has only the
+			// journal: it can verify what it fetched without trusting the store.
+			sum := sha256.Sum256(body)
+			if want := "v1:sha256:" + hex.EncodeToString(sum[:]); capture.Reference.ObjectID != want {
+				t.Errorf("ObjectID = %q, want the content address of the retrieved bytes %q", capture.Reference.ObjectID, want)
+			}
+
+			puts, streams, conflicts := objects.counts()
+			if len(conflicts) != 0 {
+				t.Errorf("the same object identity was written with different bytes: %v", conflicts)
+			}
+			if tt.streaming && (streams != 1 || puts != 0) {
+				t.Errorf("streaming store saw %d streams / %d materialized puts, want 1/0: this arm did not exercise the streaming path", streams, puts)
+			}
+			if !tt.streaming && (puts != 1 || streams != 0) {
+				t.Errorf("materialized store saw %d puts / %d streams, want 1/0", puts, streams)
+			}
+		})
+	}
+}
+
+// evictionFirstDifference reports the index of the first differing byte, for a failure
+// message that says WHERE two 4 KiB strings diverge instead of printing both.
+func evictionFirstDifference(got, want string) int {
+	for i := 0; i < len(got) && i < len(want); i++ {
+		if got[i] != want[i] {
+			return i
+		}
+	}
+	return min(len(got), len(want))
+}
+
+// TestToolResultObjectsAreUnreachableWithoutAStoreThatKeptTheBytes is the reason the test
+// above is not vacuous, and it is a §5-class-9 obligation: an assertion made AFTER a
+// state-destroying action asserts nothing unless the probe can observe the failure.
+//
+// It runs the identical sequence against a store that accepts and VERIFIES exactly like
+// the retaining one — Put succeeds, Stat answers with the size and digest it computed at
+// Put time, so every stage of the retention pipeline passes and the committed capture is
+// byte-identical — but keeps no bytes. After the same eviction the bytes are reachable
+// from nowhere: not from the store, and not from any surviving file on disk.
+//
+// The two claims together are what make the previous test meaningful. The metadata is
+// identical, so the difference between the runs is ONLY whether the store retained the
+// bytes; and the byte sweep shows no local copy is quietly satisfying the retrieval.
+func TestToolResultObjectsAreUnreachableWithoutAStoreThatKeptTheBytes(t *testing.T) {
+	t.Parallel()
+	const payloadBytes = evictionCaptureCeiling * 4
+
+	retaining := &evictionObjectStore{}
+	kept := newEvictionRun(t, retaining, payloadBytes)
+	kept.evict(t)
+	keptCapture := kept.onlyCapture(t)
+
+	forgetful := &evictionObjectStore{forgetful: true}
+	lost := newEvictionRun(t, forgetful, payloadBytes)
+	// The parent of both roots is swept for the payload after the eviction, so the
+	// sweep must start from paths that still exist: capture them first.
+	sweepRoots := []string{filepath.Dir(lost.wsRoot), filepath.Dir(lost.spillBase)}
+	lost.evict(t)
+	lostCapture := lost.onlyCapture(t)
+
+	// Same committed metadata: the runs differ in one property only.
+	if keptCapture.Reference == nil || lostCapture.Reference == nil {
+		t.Fatal("a run committed no object reference")
+	}
+	if keptCapture.Reference.ObjectID != lostCapture.Reference.ObjectID {
+		t.Fatalf("object identities differ (%q vs %q): the two runs are not comparable",
+			keptCapture.Reference.ObjectID, lostCapture.Reference.ObjectID)
+	}
+	if keptCapture.CapturedBytes != lostCapture.CapturedBytes || keptCapture.Truncated != lostCapture.Truncated ||
+		keptCapture.TruncationReason != lostCapture.TruncationReason || keptCapture.Encoding != lostCapture.Encoding {
+		t.Fatalf("committed capture metadata differs between the runs: %+v vs %+v", keptCapture, lostCapture)
+	}
+
+	// The retaining run yields the bytes; the forgetful one cannot.
+	if _, ok := retaining.get(keptCapture.Reference.ObjectID); !ok {
+		t.Fatal("the retaining store lost the object: the control has nothing to contrast with")
+	}
+	if body, ok := forgetful.get(lostCapture.Reference.ObjectID); ok {
+		t.Fatalf("the forgetful store returned %d bytes: the control is not a control", len(body))
+	}
+
+	// And nothing on disk is standing in for it. The prefix is long enough that a match
+	// could not be coincidental and short enough to scan cheaply.
+	needle := lost.payload[:256]
+	for _, root := range sweepRoots {
+		if path, found := evictionFindPayload(t, root, needle); found {
+			t.Fatalf("the captured bytes are still on local disk at %q after eviction: the retrieval assertion could be satisfied without the object store", path)
+		}
+	}
+
+	// The sweep is itself a negative assertion, so it is proved in both directions: over
+	// a directory holding the payload it must find it, and over one that does not it must
+	// not. A sweep that silently found nothing anywhere would report success for a run
+	// whose bytes were sitting in plain view. It runs AFTER the sweep above, because the
+	// planted copy would otherwise be inside the swept tree.
+	planted := t.TempDir()
+	if err := os.WriteFile(filepath.Join(planted, "leaked.capture"), []byte("prefix"+needle+"suffix"), 0o600); err != nil {
+		t.Fatalf("plant a payload copy: %v", err)
+	}
+	if _, found := evictionFindPayload(t, planted, needle); !found {
+		t.Fatal("the on-disk sweep did not find a planted copy of the payload: it cannot observe the failure it asserts the absence of")
+	}
+	if _, found := evictionFindPayload(t, t.TempDir(), needle); found {
+		t.Fatal("the on-disk sweep found the payload in an empty directory")
+	}
+}
+
+// evictionFindPayload walks root for a file containing needle. A missing root is not a
+// failure — it is the expected state of a deleted one — but any other walk error is,
+// because a walk that silently gave up would report "not found" for the wrong reason.
+func evictionFindPayload(t *testing.T, root, needle string) (string, bool) {
+	t.Helper()
+	var hit string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() || !d.Type().IsRegular() {
+			return nil
+		}
+		data, readErr := os.ReadFile(path) // #nosec G304 -- test-controlled tree under t.TempDir
+		if readErr != nil {
+			if os.IsNotExist(readErr) {
+				return nil
+			}
+			return readErr
+		}
+		if strings.Contains(string(data), needle) {
+			hit = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("sweep %q: %v", root, err)
+	}
+	return hit, hit != ""
+}
+
+// TestCommitFailureAfterVerifiedRetentionLeavesOnlyAnUnreferencedObject closes the
+// conjunction H5.3 left open: the ORDER "retain, then commit" is correct by construction,
+// but nothing had ever failed the commit AFTER a successful retention, so the sentence
+// "an append failure leaves only an object-store orphan eligible for safe GC" described a
+// state no test had ever produced.
+//
+// It is failed at the append, which is the cause that sentence names. The session's
+// required durable event tap refuses the StepDone; the loop actor's commit is the durable
+// commit, so it commits nothing and acks the error, and the turn ends on it. Retention has
+// already run to completion by then — Put, Stat, size and digest all verified — and the
+// deferred release has already deleted the local spill.
+//
+// An interrupt was tried first and rejected as a mechanism: cfg.commit selects on the
+// actor channel AND the cancelled context, and Go picks a ready case uniformly at random,
+// so a cancelled step commits its StepDone about half the time. A test built on it passes
+// or fails by coin flip — measured directly, one run of this scenario reported zero
+// captures and the next reported one.
+//
+// The state that must hold is a conjunction, and each half is worthless alone:
+//   - the object EXISTS, with exactly the bytes and the content-addressed identity the
+//     capture would have referenced; and
+//   - NOTHING references it — no StepDone reached the durable journal, so no committed
+//     record names the identity, which is what "eligible for safe GC" means; and
+//   - the local spill is gone, so the bytes exist in exactly one place.
+func TestCommitFailureAfterVerifiedRetentionLeavesOnlyAnUnreferencedObject(t *testing.T) {
+	t.Parallel()
+	const payloadBytes = evictionCaptureCeiling * 4
+	refused := errors.New("durable append refused")
+	objects := &evictionObjectStore{}
+	run := buildEvictionRunWith(t, objects, evictionOptions{payloadBytes: payloadBytes, refuseStepDone: refused})
+
+	terminal := run.driveForTerminal(t)
+	if got := run.stepDoneRefusals.Load(); got != 1 {
+		t.Fatalf("refused StepDone appends = %d, want exactly 1: the commit this test fails must have been attempted", got)
+	}
+	if _, ok := terminal.(event.TurnInterrupted); !ok {
+		t.Fatalf("turn terminal = %T, want event.TurnInterrupted: the commit handshake is what had to fail here", terminal)
+	}
+
+	// The object was written and verified: the retention pipeline ran to completion
+	// before the commit was attempted. Its identity is the content address of the
+	// retained prefix, computed here from the payload rather than read from the store,
+	// so a store that wrote the wrong bytes could not satisfy it.
+	wantBytes := run.payload[:evictionCaptureCeiling]
+	sum := sha256.Sum256([]byte(wantBytes))
+	wantID := "v1:sha256:" + hex.EncodeToString(sum[:])
+	if got := objects.ids(); len(got) != 1 || got[0] != wantID {
+		t.Fatalf("stored object identities = %v, want exactly [%s]", got, wantID)
+	}
+	if body, _ := objects.get(wantID); string(body) != wantBytes {
+		t.Errorf("the orphaned object holds the wrong bytes (first difference at %d)", evictionFirstDifference(string(body), wantBytes))
+	}
+
+	// Nothing references it. The durable journal carries no capture at all — not one
+	// naming this identity, and not one naming any other.
+	if captures := run.replayCaptures(t); len(captures) != 0 {
+		t.Fatalf("the journal carries %d captures after a refused StepDone append: %+v", len(captures), captures)
+	}
+
+	// And the local spill is gone, so the orphan is the only copy: the retention
+	// pipeline releases every sink on the way out, including this path.
+	entries, err := os.ReadDir(run.spillRoot)
+	if err != nil {
+		t.Fatalf("read session spill root: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("session spill root still holds %d entries after a failed commit: the capture was left on local disk", len(entries))
 	}
 }

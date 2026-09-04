@@ -2,16 +2,19 @@ package sessionruntime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
@@ -1332,5 +1335,134 @@ func TestResourceStorageRefusesAWorkspacePathThatOnlyResolvesThroughASymlink(t *
 	}
 	if _, statErr := os.Lstat(resourceRoot); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("refused resolution still created the resource root: Lstat(%q) error = %v", resourceRoot, statErr)
+	}
+}
+
+// --- H5.4 step 2: durable retention names no local or spool path ---------------------
+
+// evictionLocalPathReferences reports which of roots the payload names, and whether it
+// carries a filesystem path separator at all. It is the detector both directions of the
+// negative assertion below run through: the real capture metadata must produce nothing,
+// and a deliberately path-carrying capture must produce something. A detector only ever
+// run over the passing case would be indistinguishable from one that always returns nil.
+func evictionLocalPathReferences(payload string, roots []string) []string {
+	var hits []string
+	for _, root := range roots {
+		if root != "" && strings.Contains(payload, root) {
+			hits = append(hits, root)
+		}
+	}
+	if strings.ContainsAny(payload, `/\`) {
+		hits = append(hits, "path separator")
+	}
+	return hits
+}
+
+// TestRetainedToolResultMetadataNamesNoLocalOrSpoolPath is step 2 of H5.4: the durable
+// capture metadata must reference no temporary, spill or spool path — the elided bytes
+// are addressed by a content identity, and a journal that named a host path would be
+// both a leak and a reference to something eviction destroys.
+//
+// The path set is DERIVED from the mechanism rather than picked. The retention pipeline
+// has exactly three local placements: the session spill base wired by
+// WithToolResultCapture, the session-scoped root it creates inside it, and the
+// materialized workspace root the session checkpoints. Above those sits the
+// process-global temp directory, which is what a tool-owned spool (tools/process) and
+// workspacestore's snapshot spool default to, and which the spill deliberately does not
+// use. Every path that actually exists under the two test-owned roots after the turn is
+// added to the set as well, so a name the run invented is covered without being listed
+// here.
+//
+// The claim is then made in its strongest mechanism-derived form: capture metadata
+// consists of identifiers, byte counts, a closed truncation-reason domain and a
+// digest-derived object identity, so it cannot legitimately carry a path SEPARATOR at
+// all — a much sharper statement than "does not contain these particular strings", and
+// one that also covers a path this test never enumerated.
+//
+// The other half of the step — that no such path is needed to retrieve the bytes — is
+// TestToolResultObjectsSurviveResidencyReleaseAndRootDeletion, which deletes them.
+func TestRetainedToolResultMetadataNamesNoLocalOrSpoolPath(t *testing.T) {
+	t.Parallel()
+	run := newEvictionRun(t, &evictionObjectStore{}, evictionCaptureCeiling*4)
+
+	// The local footprint of one retained capture, observed rather than assumed. The
+	// spill base holds exactly one entry — this session's root — and that root is EMPTY:
+	// the spill is deleted after the verified upload, so retention leaves no local spool
+	// behind at all. `tools/process` keeps a spool because a live process needs one;
+	// generic retention does not, and this is where that difference is visible.
+	baseEntries, err := os.ReadDir(run.spillBase)
+	if err != nil {
+		t.Fatalf("read spill base: %v", err)
+	}
+	if len(baseEntries) != 1 || baseEntries[0].Name() != run.sessionID.String() {
+		names := make([]string, 0, len(baseEntries))
+		for _, entry := range baseEntries {
+			names = append(names, entry.Name())
+		}
+		t.Fatalf("spill base entries = %v, want exactly the session root %q", names, run.sessionID.String())
+	}
+	spillEntries, err := os.ReadDir(run.spillRoot)
+	if err != nil {
+		t.Fatalf("read session spill root: %v", err)
+	}
+	if len(spillEntries) != 0 {
+		t.Errorf("session spill root holds %d entries after a verified upload, want none: a retained capture must not become a local spool", len(spillEntries))
+	}
+
+	// The derived path set: the mechanism's own roots, the process-global temp directory
+	// no part of retention may use, and everything that exists under the two roots now.
+	roots := []string{run.wsRoot, run.spillBase, run.spillRoot, os.TempDir()}
+	for _, root := range []string{run.wsRoot, run.spillBase} {
+		walkErr := filepath.WalkDir(root, func(path string, _ os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			roots = append(roots, path)
+			return nil
+		})
+		if walkErr != nil {
+			t.Fatalf("walk %q: %v", root, walkErr)
+		}
+	}
+
+	run.evict(t)
+	capture := run.onlyCapture(t)
+	if capture.Reference == nil {
+		t.Fatal("the replayed capture carries no object reference: there is no identity to check")
+	}
+	encoded, err := json.Marshal(capture)
+	if err != nil {
+		t.Fatalf("marshal capture: %v", err)
+	}
+	if hits := evictionLocalPathReferences(string(encoded), roots); len(hits) != 0 {
+		t.Errorf("the durable capture names local paths %v:\n%s", hits, encoded)
+	}
+
+	// The identity is opaque and path-shaped by construction: a fixed version/algorithm
+	// prefix and a lowercase-hex SHA-256. Asserting the whole string rules out anything
+	// the separator check alone would miss — a bare relative name, say.
+	objectID := capture.Reference.ObjectID
+	if !strings.HasPrefix(objectID, "v1:sha256:") {
+		t.Fatalf("ObjectID = %q, want the minted content-address form", objectID)
+	}
+	if digest := strings.TrimPrefix(objectID, "v1:sha256:"); len(digest) != 64 || strings.TrimLeft(digest, "0123456789abcdef") != "" {
+		t.Errorf("ObjectID digest = %q, want 64 lowercase hex characters", digest)
+	}
+
+	// The other direction: the detector must FAIL a capture that does carry the spill
+	// path, or the assertion above would hold for a metadata shape that leaked one.
+	leaking := capture
+	leakingID := filepath.Join(run.spillRoot, capture.ToolExecutionID.String()+".capture")
+	leaking.Reference = &sessionwire.ObjectReference{ObjectID: leakingID}
+	leakingEncoded, err := json.Marshal(leaking)
+	if err != nil {
+		t.Fatalf("marshal leaking capture: %v", err)
+	}
+	hits := evictionLocalPathReferences(string(leakingEncoded), roots)
+	if len(hits) == 0 {
+		t.Fatalf("the detector reported nothing for a capture whose object id IS the spill path %q: it cannot observe the failure it is asserting the absence of", leakingID)
+	}
+	if !slices.Contains(hits, run.spillRoot) || !slices.Contains(hits, "path separator") {
+		t.Errorf("detector hits for a leaked spill path = %v, want both the spill root and the separator clause", hits)
 	}
 }
