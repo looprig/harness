@@ -179,13 +179,28 @@ func TestCaptureSpillDirectoryRejectsAnUnusableBase(t *testing.T) {
 	}
 	groupWritable := filepath.Join(existing, "group")
 	worldWritable := filepath.Join(existing, "world")
-	for path, mode := range map[string]os.FileMode{groupWritable: 0o770, worldWritable: 0o707} {
+	// fsGroup models the mount the doc comment on verifySpillBase names: a
+	// Kubernetes fsGroup volume is 0770 WITH the setgid bit. It is the only
+	// fixture that distinguishes Mode().Perm() from Mode() in the rendered
+	// reason — Perm() masks the setgid bit away and still reports 0770, while
+	// Mode() would render a FileMode whose %04o is nothing an operator could chmod.
+	fsGroup := filepath.Join(existing, "fsgroup")
+	for path, mode := range map[string]os.FileMode{
+		groupWritable: 0o770,
+		worldWritable: 0o707,
+		fsGroup:       0o770 | os.ModeSetgid,
+	} {
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatalf("mkdir %s: %v", path, err)
 		}
 		if err := os.Chmod(path, mode); err != nil {
 			t.Fatalf("chmod %s: %v", path, err)
 		}
+	}
+	if info, err := os.Lstat(fsGroup); err != nil {
+		t.Fatalf("lstat fsgroup: %v", err)
+	} else if info.Mode()&os.ModeSetgid == 0 {
+		t.Skipf("this filesystem did not keep the setgid bit on %s; the Perm() reader cannot run here", fsGroup)
 	}
 	tests := []struct {
 		base   string
@@ -200,6 +215,9 @@ func TestCaptureSpillDirectoryRejectsAnUnusableBase(t *testing.T) {
 		{base: deepMissing, reason: "stat spill base"},
 		{base: regularFile, reason: "spill base is not a directory"},
 		{base: groupWritable, reason: "spill base is writable by group or other (mode=0770, want no group/other write)"},
+		// The setgid mount reports the SAME mode, which is the point: the reason
+		// renders permission bits an operator can act on, not the whole FileMode.
+		{base: fsGroup, reason: "spill base is writable by group or other (mode=0770, want no group/other write)"},
 		{base: worldWritable, reason: "spill base is writable by group or other (mode=0707, want no group/other write)"},
 	}
 	for _, tt := range tests {
@@ -278,7 +296,8 @@ func TestCaptureSpillDirectoryRejectsASymlinkedRoot(t *testing.T) {
 
 	plain := t.TempDir()
 	session := uuid.UUID{2}
-	if err := os.Symlink(real, filepath.Join(plain, session.String())); err != nil {
+	linked := filepath.Join(plain, session.String())
+	if err := os.Symlink(real, linked); err != nil {
 		t.Fatalf("symlink session root: %v", err)
 	}
 	assertSpillRejection(t, "symlinked session root", func() error {
@@ -293,13 +312,33 @@ func TestCaptureSpillDirectoryRejectsASymlinkedRoot(t *testing.T) {
 	// tell an operator the wrong path is at fault.
 	notADirectory := t.TempDir()
 	fileSession := uuid.UUID{3}
-	if err := os.WriteFile(filepath.Join(notADirectory, fileSession.String()), []byte("x"), 0o600); err != nil {
+	blocking := filepath.Join(notADirectory, fileSession.String())
+	if err := os.WriteFile(blocking, []byte("x"), 0o600); err != nil {
 		t.Fatalf("write blocking file: %v", err)
 	}
 	assertSpillRejection(t, "file where the root belongs", func() error {
 		_, err := newCaptureSpillDirectory(notADirectory, fileSession)
 		return err
 	}, "spill root is not a directory")
+
+	// This is the reader for the created flag, and these two arms are the only
+	// place that reaches it. Both refusals come from verifySpillRoot, so both run
+	// the removal branch below the Mkdir — with created == false, because Mkdir
+	// found something already at the path and returned ErrExist. The flag is the
+	// only thing stopping that removal from unlinking an entry establishment FOUND
+	// rather than made, and the path is real rather than hypothetical: a resumed
+	// session reuses its sessionID, so it establishes over a root it did not
+	// create every time.
+	//
+	// Asserting the refusal alone cannot see this: with the flag weakened, both
+	// arms still return exactly the same typed error, having silently deleted the
+	// operator's file or symlink on the way out.
+	if _, err := os.Lstat(blocking); err != nil {
+		t.Fatalf("blocking entry after refusal: %v; establishment removed an entry it did not create", err)
+	}
+	if _, err := os.Lstat(linked); err != nil {
+		t.Fatalf("symlinked root after refusal: %v; establishment removed an entry it did not create", err)
+	}
 }
 
 // assertSpillRejection requires a typed *captureSpillError carrying exactly the
@@ -354,10 +393,16 @@ func TestCaptureSpillDirectoryReestablishmentPreservesAnExistingRoot(t *testing.
 }
 
 // TestSpillErrorRendersTheCauseThatDistinguishesTwoFailures is the reader for
-// rendering the wrapped cause, and it is written over the pair that shares
-// everything else. A missing base and an unreadable base both reach "stat spill
-// base"; the errno is the entire diagnosis, and an operator who cannot tell
-// ENOENT from EACCES has been told to check a path they can already see.
+// rendering the wrapped cause. A missing base and an unreadable base both reach
+// "stat spill base"; the errno is the entire diagnosis, and an operator who cannot
+// tell ENOENT from EACCES has been told to check a path they can already see.
+//
+// The assertion that carries this is the Contains loop at the end: each rendered
+// message must include its own cause. The two messages ALSO differ from each
+// other, and that difference is deliberately not the load-bearing check — the two
+// bases are different paths, so the messages differed before the cause was
+// rendered at all. It is asserted only as a guard that the two arrangements have
+// not collapsed into one.
 func TestSpillErrorRendersTheCauseThatDistinguishesTwoFailures(t *testing.T) {
 	t.Parallel()
 	parent := t.TempDir()
@@ -395,8 +440,10 @@ func TestSpillErrorRendersTheCauseThatDistinguishesTwoFailures(t *testing.T) {
 		t.Fatalf("reasons differ (%q vs %q); this test no longer exercises two failures that share a reason",
 			missingSpill.Reason, deniedSpill.Reason)
 	}
+	// Not the load-bearing assertion — see this test's doc comment. The two bases
+	// are different paths, so this held before the cause was rendered.
 	if missingErr.Error() == deniedErr.Error() {
-		t.Fatalf("both failures render identically as %q; the cause is not in the message", missingErr.Error())
+		t.Fatalf("the two arrangements render identically as %q; they are no longer two distinct failures", missingErr.Error())
 	}
 	for _, err := range []error{missingErr, deniedErr} {
 		var spillErr *captureSpillError

@@ -414,14 +414,24 @@ func newCaptureSpillDirectory(base string, sessionID uuid.UUID) (*captureSpillDi
 		// the created flag is for, since removing a root belonging to an existing
 		// session would be far worse than leaving an empty one.
 		//
-		// No test drives this branch, and the reason is the same shape as the
-		// chmods above. The window is between two syscalls on a directory this
-		// process created a moment earlier under a base it has already checked, so
-		// the only reachable cause is another process mutating the root in that
-		// window, or an I/O error. Neither is arrangeable in-process without adding
-		// an injection seam to production code. The reachable half of the created
-		// flag — never removing a root this call did not make — IS driven, by
-		// TestCaptureSpillDirectoryReestablishmentPreservesAnExistingRoot.
+		// The flag's own behaviour IS driven, by
+		// TestCaptureSpillDirectoryRejectsASymlinkedRoot: its "symlinked session
+		// root" and "file where the root belongs" arms are the only tests that
+		// reach this branch, both do so with created == false — Mkdir found
+		// something already there and returned ErrExist — and both assert the entry
+		// SURVIVED the refusal. Weakening the flag makes them fail, because
+		// establishment would unlink an operator's file or symlink on its way out
+		// while still returning the same typed error. That path is reachable in
+		// production rather than hypothetical: a resumed session reuses its
+		// sessionID, so it establishes over a root it did not create every time.
+		//
+		// What is NOT driven is the other half — created == true AND verifySpillRoot
+		// then failing — and the reason is the same shape as the chmods above. That
+		// window is between two syscalls on a directory this process created a
+		// moment earlier under a base it has already checked, so the only reachable
+		// cause is another process mutating the root inside it, or an I/O error.
+		// Neither is arrangeable in-process without adding an injection seam to
+		// production code.
 		if created {
 			_ = os.Remove(root)
 		}
