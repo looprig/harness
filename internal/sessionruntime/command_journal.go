@@ -290,6 +290,15 @@ func WithRuntimeCatalogProvider(provider RuntimeCatalogProvider) Option {
 // quiescence point); looprig only exposes the capability. A nil store is ignored (the
 // default unconfigured state stays), so a wiring slip can never install a store the
 // capability would nil-deref on.
+func WithWorkspaceCheckpointing(ws *workspacestore.Store, root string) Option {
+	return func(s *Session) {
+		if ws != nil {
+			s.ws = ws
+			s.wsRoot = root
+		}
+	}
+}
+
 // WithToolResultCapture wires the SessionObjectStore that every loop in this
 // session retains oversized tool results into. Without it retention is off and a
 // loop commits only the shaped model preview, so wiring this option is what turns
@@ -300,15 +309,6 @@ func WithToolResultCapture(objects loopruntime.ToolResultObjectStore) Option {
 	return func(s *Session) {
 		if objects != nil {
 			s.toolResultObjects = objects
-		}
-	}
-}
-
-func WithWorkspaceCheckpointing(ws *workspacestore.Store, root string) Option {
-	return func(s *Session) {
-		if ws != nil {
-			s.ws = ws
-			s.wsRoot = root
 		}
 	}
 }

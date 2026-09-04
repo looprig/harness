@@ -73,8 +73,19 @@ func materializedCaptureCeiling(ts ToolSet) int {
 // grammar over payloads that ARE signed URLs, credentials, bucket keys and
 // filesystem paths. Second,
 // TestToolResultCaptureObjectIDIsMintedOnlyByCaptureObjectID walks the module's
-// own production files and fails on any other construction, so the first
-// mechanism cannot be bypassed by a second mint site added later.
+// own production files and fails on any other construction, so a second mint
+// site added later cannot bypass the first mechanism silently.
+//
+// The second mechanism is syntactic, and its limit is worth stating because it
+// is what the guard would have to be rewritten to exceed. It flags a keyed field,
+// an unkeyed element and a post-construction assignment, and it resolves the
+// type by bare name against ObjectReference plus every alias or defined type
+// declared over it in the files it scans. It therefore does NOT see a value
+// whose type reaches ObjectReference only through a declaration outside those
+// files — an embedded field, a generic instantiation, or an alias published by a
+// dependency — nor a reference this module never constructs at all, such as one
+// received already built from another module. Closing those needs a full type
+// resolution, which this module does nowhere today.
 const captureObjectIDPrefix = "v1:sha256:"
 
 // captureObjectIDHexLen is the exact number of lowercase hex characters a
@@ -92,7 +103,8 @@ func captureObjectID(digestHex string) string {
 // newCaptureReference builds the reference recorded on a capture. It takes a
 // digest rather than an identity, so no caller-shaped string can be placed in
 // object_id through this signature; see captureObjectIDPrefix for the guard that
-// holds it to being the module's only construction.
+// holds it to being the module's only mint site, and for what that guard does
+// and does not reach.
 func newCaptureReference(digestHex string) sessionwire.ObjectReference {
 	return sessionwire.ObjectReference{ObjectID: captureObjectID(digestHex)}
 }

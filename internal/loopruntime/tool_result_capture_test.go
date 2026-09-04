@@ -1,6 +1,7 @@
 package loopruntime
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -37,7 +38,18 @@ type fakeObjectStore struct {
 	statSize   *uint64
 	statDigest *string
 
+	// failFor, when non-nil, restricts all four arrangements above to the
+	// objects whose stored bytes it selects. Without it a failure is global,
+	// which makes every other result in the step fail too; with it a step can
+	// hold a result that is retained SUCCESSFULLY alongside one that is not.
+	failFor func(content []byte) bool
+
 	puts []string
+}
+
+// selected reports whether the arranged failure applies to these stored bytes.
+func (f *fakeObjectStore) selected(content []byte) bool {
+	return f.failFor == nil || f.failFor(content)
 }
 
 func newFakeObjectStore() *fakeObjectStore {
@@ -50,7 +62,7 @@ func (f *fakeObjectStore) PutToolResultObject(_ context.Context, objectID string
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.puts = append(f.puts, objectID)
-	if f.putErr != nil {
+	if f.putErr != nil && f.selected(content) {
 		return f.putErr
 	}
 	stored := append([]byte(nil), content...)
@@ -64,12 +76,21 @@ func (f *fakeObjectStore) PutToolResultObject(_ context.Context, objectID string
 func (f *fakeObjectStore) StatToolResultObject(_ context.Context, objectID string) (ToolResultObjectStat, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.statErr != nil {
-		return ToolResultObjectStat{}, f.statErr
-	}
 	stored, ok := f.objects[objectID]
 	if !ok {
+		// A Stat before any Put is a defect in the pipeline whatever else is
+		// arranged, so it is reported ahead of the arranged failure.
+		if f.statErr != nil && f.failFor == nil {
+			return ToolResultObjectStat{}, f.statErr
+		}
 		return ToolResultObjectStat{}, errors.New("fake object store: no such object")
+	}
+	if !f.selected(stored) {
+		sum := sha256.Sum256(stored)
+		return ToolResultObjectStat{SizeBytes: uint64(len(stored)), Digest: hex.EncodeToString(sum[:])}, nil
+	}
+	if f.statErr != nil {
+		return ToolResultObjectStat{}, f.statErr
 	}
 	sum := sha256.Sum256(stored)
 	stat := ToolResultObjectStat{SizeBytes: uint64(len(stored)), Digest: hex.EncodeToString(sum[:])}
@@ -471,6 +492,14 @@ func TestToolResultRetentionCancellationDiscardsTheWholeStep(t *testing.T) {
 // load-bearing for the all-or-nothing assertion: with the failure first, the
 // capture list is empty when it happens, so "captures is empty" would hold even
 // for an implementation that returned whatever it had accumulated.
+//
+// Every case also runs with the surviving result both BELOW and ABOVE the model
+// budget, because only the second size makes the marker assertion mean anything.
+// A survivor below the budget carries no marker in a successful step either, so
+// "the survivor carries no marker" holds for an implementation that never
+// rebuilt the messages at all; a survivor above it WOULD carry one, so the
+// assertion then reads the rebuild. The large survivor is retained successfully
+// alongside the failing one, which is what fakeObjectStore.failFor exists for.
 func TestToolResultRetentionFailureStages(t *testing.T) {
 	t.Parallel()
 	wrongSize := uint64(1)
@@ -488,69 +517,89 @@ func TestToolResultRetentionFailureStages(t *testing.T) {
 		{"stored size disagrees", func(f *fakeObjectStore) { f.statSize = &wrongSize }, ToolResultRetentionStageSize, nil},
 		{"stored content disagrees", func(f *fakeObjectStore) { f.statDigest = &wrongDigest }, ToolResultRetentionStageDigest, nil},
 	}
+	const failingText = "wwwwwwww"
 	for _, tt := range tests {
 		for _, failingFirst := range []bool{true, false} {
-			tt, failingFirst := tt, failingFirst
-			name := tt.name + "/failing result last"
-			if failingFirst {
-				name = tt.name + "/failing result first"
-			}
-			t.Run(name, func(t *testing.T) {
-				t.Parallel()
-				store := newFakeObjectStore()
-				tt.arrange(store)
-				cfg := captureConfig(store, 128, 1<<20, 1<<20)
-				// "short" is below the model budget, so it needs no object and its
-				// capture is recorded without touching the store — which is what
-				// makes it a survivor that can only differ by ordering.
-				failing := textResult(t, "tu-big", strings.Repeat("w", 4096))
-				survivor := textResult(t, "tu-small", "short")
-				results := []result{survivor, failing}
-				failingIndex, survivorIndex := 1, 0
+			for _, largeSurvivor := range []bool{false, true} {
+				tt, failingFirst, largeSurvivor := tt, failingFirst, largeSurvivor
+				name := tt.name + "/failing result last"
 				if failingFirst {
-					results = []result{failing, survivor}
-					failingIndex, survivorIndex = 0, 1
+					name = tt.name + "/failing result first"
 				}
-				commit, err := retainToolResults(context.Background(), cfg, results)
-				if err != nil {
-					t.Fatalf("retainToolResults returned a cancellation error %v", err)
+				if largeSurvivor {
+					name += "/survivor above the model budget"
+				} else {
+					name += "/survivor below the model budget"
 				}
-				if commit.retention == nil {
-					t.Fatal("retention failure was not reported")
-				}
-				if commit.retention.Stage != tt.wantStage {
-					t.Fatalf("stage = %q, want %q", commit.retention.Stage, tt.wantStage)
-				}
-				if commit.retention.ToolUseID != failing.ToolUseID || commit.retention.ToolExecutionID != failing.ToolExecutionID {
-					t.Fatalf("retention names %v/%q, want the failing result %v/%q",
-						commit.retention.ToolExecutionID, commit.retention.ToolUseID, failing.ToolExecutionID, failing.ToolUseID)
-				}
-				if tt.wantCause != nil && !errors.Is(commit.retention, tt.wantCause) {
-					t.Fatalf("cause = %v, want %v", commit.retention.Cause, tt.wantCause)
-				}
-				if len(commit.captures) != 0 {
-					t.Fatalf("captures = %d, want none: a partial list cannot be told from a truncated one", len(commit.captures))
-				}
-				requireValidStepDone(t, commit)
-				if len(commit.messages) != 2 {
-					t.Fatalf("messages = %d, want 2", len(commit.messages))
-				}
-				notice := committedText(t, commit.messages[failingIndex])
-				if notice != toolResultRetentionNoticeText {
-					t.Fatalf("failing result committed %q, want the retention notice", notice)
-				}
-				if !commit.messages[failingIndex].IsError {
-					t.Fatal("the retention notice is not flagged as an error, so the model reads it as output")
-				}
-				// The surviving result keeps its ordinary text and must NOT claim a
-				// retention that this step did not record.
-				if got := committedText(t, commit.messages[survivorIndex]); got != "short" {
-					t.Fatalf("surviving result committed %q, want %q", got, "short")
-				}
-				if strings.Contains(committedText(t, commit.messages[survivorIndex]), toolResultRetainedMarkerPrefix) {
-					t.Fatal("a surviving result carries a retention marker although no capture was recorded")
-				}
-			})
+				t.Run(name, func(t *testing.T) {
+					t.Parallel()
+					store := newFakeObjectStore()
+					tt.arrange(store)
+					// Only the failing result's bytes are failed, so a survivor above
+					// the model budget is retained SUCCESSFULLY and reaches the
+					// discarded-messages path carrying a marker.
+					store.failFor = func(content []byte) bool { return bytes.Contains(content, []byte(failingText)) }
+					cfg := captureConfig(store, 128, 1<<20, 1<<20)
+					// "short" is below the model budget, so it needs no object and its
+					// capture is recorded without touching the store — which is what
+					// makes it a survivor that can only differ by ordering.
+					failing := textResult(t, "tu-big", strings.Repeat(failingText, 512))
+					survivorText := "short"
+					if largeSurvivor {
+						survivorText = strings.Repeat("s", 4096)
+					}
+					survivor := textResult(t, "tu-small", survivorText)
+					results := []result{survivor, failing}
+					failingIndex, survivorIndex := 1, 0
+					if failingFirst {
+						results = []result{failing, survivor}
+						failingIndex, survivorIndex = 0, 1
+					}
+					commit, err := retainToolResults(context.Background(), cfg, results)
+					if err != nil {
+						t.Fatalf("retainToolResults returned a cancellation error %v", err)
+					}
+					if commit.retention == nil {
+						t.Fatal("retention failure was not reported")
+					}
+					if commit.retention.Stage != tt.wantStage {
+						t.Fatalf("stage = %q, want %q", commit.retention.Stage, tt.wantStage)
+					}
+					if commit.retention.ToolUseID != failing.ToolUseID || commit.retention.ToolExecutionID != failing.ToolExecutionID {
+						t.Fatalf("retention names %v/%q, want the failing result %v/%q",
+							commit.retention.ToolExecutionID, commit.retention.ToolUseID, failing.ToolExecutionID, failing.ToolUseID)
+					}
+					if tt.wantCause != nil && !errors.Is(commit.retention, tt.wantCause) {
+						t.Fatalf("cause = %v, want %v", commit.retention.Cause, tt.wantCause)
+					}
+					if len(commit.captures) != 0 {
+						t.Fatalf("captures = %d, want none: a partial list cannot be told from a truncated one", len(commit.captures))
+					}
+					requireValidStepDone(t, commit)
+					if len(commit.messages) != 2 {
+						t.Fatalf("messages = %d, want 2", len(commit.messages))
+					}
+					notice := committedText(t, commit.messages[failingIndex])
+					if notice != toolResultRetentionNoticeText {
+						t.Fatalf("failing result committed %q, want the retention notice", notice)
+					}
+					if !commit.messages[failingIndex].IsError {
+						t.Fatal("the retention notice is not flagged as an error, so the model reads it as output")
+					}
+					// The surviving result keeps exactly the text an unretained result
+					// would carry, and must NOT claim a retention that this step did
+					// not record. The expectation is the plain shaped message, so a
+					// large survivor's marker shows up as a difference here as well as
+					// in the prefix check below.
+					wantSurvivor := committedText(t, toolResultMessage(survivor, cfg.tools.MaxToolResultBytes))
+					if got := committedText(t, commit.messages[survivorIndex]); got != wantSurvivor {
+						t.Fatalf("surviving result committed %q, want %q", got, wantSurvivor)
+					}
+					if strings.Contains(committedText(t, commit.messages[survivorIndex]), toolResultRetainedMarkerPrefix) {
+						t.Fatal("a surviving result carries a retention marker although no capture was recorded")
+					}
+				})
+			}
 		}
 	}
 }
