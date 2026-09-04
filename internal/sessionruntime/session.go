@@ -2732,6 +2732,12 @@ func (s *Session) faultWorkspaceInconsistent(cause error) {
 // first use. It returns nil when no spill base was wired, which leaves the
 // retained prefix of each capture in memory — bounded by the same ceiling, and
 // the behaviour of every composition that predates the spill.
+//
+// It is called from loop construction, which runs WITHOUT loopsMu held, so it can
+// race a teardown. The sync.Once is the only synchronization: releaseToolResultSpills
+// claims the same Once, so a construction that wins it gets a real directory teardown
+// will then remove, and one that loses it gets an unavailable directory and never
+// creates anything on disk.
 func (s *Session) toolResultSpillDirectory() *loopruntime.ToolResultSpillDirectory {
 	if s.toolResultSpillBase == "" {
 		return nil
@@ -2748,9 +2754,29 @@ func (s *Session) toolResultSpillDirectory() *loopruntime.ToolResultSpillDirecto
 }
 
 // releaseToolResultSpills removes every local capture spill this session wrote.
-// It runs at shutdown, after the loops have stopped: a spill outlives its own
-// turn only when that turn was torn down, so nothing readable is being discarded.
+// It runs at shutdown, after the loops have stopped, and on a construction abort:
+// a spill outlives its own turn only when that turn was torn down, so nothing
+// readable is being discarded.
+//
+// It CLAIMS the same sync.Once the establishing accessor uses, which is what makes
+// it correct against a concurrent loop construction. A sync.Once orders only the
+// goroutines that call Do, so reading toolResultSpills without calling Do would be
+// unordered against the accessor's write — a real data race. Claiming the Once also
+// closes the worse half: a Session.NewLoop or a delegate spawn that passed the
+// closing gate before teardown latched it reaches the accessor AFTER this ran, and
+// without the claim it would create <base>/<sessionID> on disk after teardown
+// finished, with nothing left to remove it. Whichever side wins the Once, the other
+// sees its result: if this side wins, the accessor returns an already-unavailable
+// directory and retention fails visibly at the spill stage — the right outcome for a
+// closing session; if the accessor wins, this side sees the real directory and
+// removes it.
 func (s *Session) releaseToolResultSpills() {
+	if s.toolResultSpillBase == "" {
+		return
+	}
+	s.toolResultSpillOnce.Do(func() {
+		s.toolResultSpills = loopruntime.UnavailableToolResultSpillDirectory(&SessionError{Kind: SessionClosing})
+	})
 	if s.toolResultSpills != nil {
 		_ = s.toolResultSpills.Release()
 	}

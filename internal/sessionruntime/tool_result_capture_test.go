@@ -2,17 +2,22 @@ package sessionruntime
 
 import (
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/internal/loopruntime"
+	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hub"
 )
 
 type stubToolResultObjects struct{}
@@ -217,5 +222,120 @@ func TestSessionShutdownReleasesTheToolResultSpillRoot(t *testing.T) {
 	}
 	if _, err := os.Lstat(root); !os.IsNotExist(err) {
 		t.Fatalf("lstat spill root after Shutdown = %v, want not-exist", err)
+	}
+}
+
+// TestSessionSpillEstablishmentAndReleaseAreOrderedUnderConcurrency is the
+// Session-layer test the two single-goroutine tests above cannot stand in for.
+// Loop construction calls toolResultSpillDirectory WITHOUT loopsMu held
+// (session.go's newLoopWithAdmission unlocks before building the runtime), while
+// teardown calls releaseToolResultSpills under a different path, so the two
+// really can run concurrently on a live session: a Session.NewLoop or a delegate
+// spawn that passes the closing gate before teardown latches it lands here.
+//
+// Two properties, and the second is the one that leaks. The pair must be free of
+// data races — a sync.Once orders only the goroutines that CALL Do, so a bare read
+// of the field would be unordered against the establishing write. And whichever
+// side wins, the session's spill base must be EMPTY afterwards: a construction
+// that reaches the accessor after teardown must create nothing, because nothing is
+// left to remove it.
+func TestSessionSpillEstablishmentAndReleaseAreOrderedUnderConcurrency(t *testing.T) {
+	t.Parallel()
+	for trial := 0; trial < 64; trial++ {
+		base := t.TempDir()
+		id, err := uuid.New()
+		if err != nil {
+			t.Fatalf("uuid.New: %v", err)
+		}
+		session := &Session{sessionID: id, toolResultSpillBase: base}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			session.toolResultSpillDirectory()
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			session.releaseToolResultSpills()
+		}()
+		close(start)
+		wg.Wait()
+		entries, readErr := os.ReadDir(base)
+		if readErr != nil {
+			t.Fatalf("trial %d: read base: %v", trial, readErr)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("trial %d: spill base holds %d entries after a raced teardown; a root was created with nothing left to remove it", trial, len(entries))
+		}
+	}
+}
+
+// TestSessionSpillDirectoryAfterReleaseCreatesNothing pins the same property
+// deterministically, in the order that leaks: the release runs FIRST, and the
+// later loop construction must get a directory that establishes nothing on disk.
+// The concurrent probe above can only sample this ordering; this one guarantees it.
+func TestSessionSpillDirectoryAfterReleaseCreatesNothing(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	session := &Session{sessionID: id, toolResultSpillBase: base}
+	session.releaseToolResultSpills()
+	dir := session.toolResultSpillDirectory()
+	if dir == nil {
+		t.Fatal("a wired spill base produced no directory after release; retention would silently fall back to memory")
+	}
+	entries, readErr := os.ReadDir(base)
+	if readErr != nil {
+		t.Fatalf("read base: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("spill base holds %d entries after a post-teardown construction, want none", len(entries))
+	}
+	if _, err := os.Lstat(filepath.Join(base, id.String())); !os.IsNotExist(err) {
+		t.Fatalf("lstat session root = %v, want not-exist", err)
+	}
+}
+
+// TestAbortConstructionReleasesTheToolResultSpillRoot is the reader for the
+// second release call site. A session that fails during construction never
+// reaches teardown, so abortConstruction is the only thing that can remove a spill
+// root a loop built before the failure — and a construction abort is exactly when
+// a half-built session is most likely to have one.
+func TestAbortConstructionReleasesTheToolResultSpillRoot(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	session := &Session{
+		sessionID:           id,
+		sessionCtx:          ctx,
+		sessionCancel:       cancel,
+		hub:                 hub.New(id),
+		checkpointAdmission: newCheckpointAdmissionGate(),
+		loops:               map[uuid.UUID]*loopHandle{},
+		gates:               map[gate.ID]gateEntry{},
+		gateTimers:          map[gate.ID]*time.Timer{},
+		toolResultSpillBase: base,
+	}
+	// A loop built before the failure is what puts a root on disk.
+	if session.toolResultSpillDirectory() == nil {
+		t.Fatal("no spill directory was established")
+	}
+	root := filepath.Join(base, id.String())
+	if _, err := os.Lstat(root); err != nil {
+		t.Fatalf("lstat spill root before abort: %v", err)
+	}
+	session.abortConstruction(errors.New("construction failed"))
+	if _, err := os.Lstat(root); !os.IsNotExist(err) {
+		t.Fatalf("lstat spill root after abortConstruction = %v, want not-exist", err)
 	}
 }

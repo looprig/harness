@@ -12,7 +12,9 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 )
 
 // capturingRunTool is a fakeRunTool that ALSO implements
@@ -264,4 +266,134 @@ func TestRunBatchSurvivesASpillThatCannotBeOpened(t *testing.T) {
 	if sink.offeredBytes() != uint64(len("raw bytes")) {
 		t.Fatalf("offeredBytes = %d, want %d: a failed spill still counts the producer's bytes", sink.offeredBytes(), len("raw bytes"))
 	}
+}
+
+// --- turn-level spill release on the paths that discard a batch (H5.3 fix round) ---
+
+// turnCaptureFixture wires a turn for the streaming path: a real session spill
+// directory, a store so retention is configured at all, and the toolset the
+// caller supplies. It returns the spill root so a test can assert what is left on
+// disk.
+func turnCaptureFixture(t *testing.T, ts ToolSet, client inference.Client, gateReg chan<- gateRegistration) (turnConfig, turnState, *turnRecorder, *captureSpillDirectory) {
+	t.Helper()
+	session, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	dir, err := newCaptureSpillDirectory(t.TempDir(), session)
+	if err != nil {
+		t.Fatalf("newCaptureSpillDirectory: %v", err)
+	}
+	t.Cleanup(func() { _ = dir.Release() })
+	cfg, state, rec := newTurnFixture([]content.Block{&content.TextBlock{Text: "go"}}, nil, ts, client, gateReg)
+	cfg.toolResultObjects = newFakeObjectStore()
+	cfg.toolResultSpills = dir
+	return cfg, state, rec, dir
+}
+
+func requireEmptySpillRoot(t *testing.T, dir *captureSpillDirectory, when string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir.root)
+	if err != nil {
+		t.Fatalf("read spill root: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("spill root holds %d files after %s; nothing downstream will ever remove them", len(entries), when)
+	}
+}
+
+// TestRunTurnReleasesSpillsWhenTheBatchIsCancelled is the reader for the release
+// on turn.go's cancellation path. TestToolResultRetentionCancellationReleasesEveryStreamedSpill
+// sounds like it covers this and does not: it proves the property inside
+// retainToolResults, which is exactly the function this path never reaches — the
+// turn returns TurnInterrupted before retention is called at all.
+func TestRunTurnReleasesSpillsWhenTheBatchIsCancelled(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	// The tool cancels the turn from inside its own streaming call, AFTER it has
+	// written to the sink: the spill therefore exists on disk at the moment the
+	// turn decides to discard the batch.
+	streaming := &turnStreamingTool{name: "Streamer", raw: strings.Repeat("C", 2048), preview: "preview", onCaptured: cancel}
+	ts := agenticToolSet([]tool.InvokableTool{streaming}, 25, 100)
+	client := &scriptedLLM{scripts: [][]content.Chunk{{toolUseChunk(0, "id-stream", "Streamer", `{}`)}}}
+	cfg, state, _, dir := turnCaptureFixture(t, ts, client, noGateReg())
+
+	terminal := runTurn(ctx, cfg, state)
+	if _, ok := terminal.(event.TurnInterrupted); !ok {
+		t.Fatalf("terminal = %T, want TurnInterrupted", terminal)
+	}
+	if streaming.capturedRuns() != 1 {
+		t.Fatalf("streaming runs = %d, want 1: the spill under test was never written", streaming.capturedRuns())
+	}
+	requireEmptySpillRoot(t, dir, "a cancelled batch")
+}
+
+// TestReviewCaptureFailureCannotLeaveASpillIsGuaranteedByRunBatch measures what
+// actually protects turn.go's review-capture-failure path, which is NOT the
+// releaseCaptures call on that line.
+//
+// The gates asked for a reader for that call. There cannot be one, and the reason
+// is a mechanism rather than a gap: RunBatch resolves access SEQUENTIALLY before
+// any execution, and a *reviewContextCaptureError returns collectResults(rs)
+// immediately — before the emit-Started phase and before any call runs — precisely
+// so a non-gated call ahead of the failing one cannot execute while the turn fails
+// closed. No call executes, so no result can carry a capture sink, so the release
+// is a no-op by construction and deleting it is an EQUIVALENT mutation.
+//
+// What is worth pinning is the premise, which is what would change if RunBatch
+// ever grew an execute-before-review path: with a batch mixing a gated call and a
+// non-gated CAPTURING call over an over-bound conversation, no tool runs, no
+// result carries a capture, and the session spill root is untouched.
+func TestReviewCaptureFailureCannotLeaveASpillIsGuaranteedByRunBatch(t *testing.T) {
+	t.Parallel()
+	gated := &fakeRunTool{name: "T", output: "must not run"}
+	gated.prepareFn = func(executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+		return commandRequest(executionID, "git status", false), nil, nil
+	}
+	streaming := &turnStreamingTool{name: "Streamer", raw: strings.Repeat("R", 2048), preview: "preview"}
+	ts := resolveToolSetCaps(ToolSet{
+		Access:   interactiveEvaluator(t, gate.AccessGated, &recordingRuleWriter{}, &recordingIssuer{}),
+		Registry: []tool.InvokableTool{gated, streaming},
+	})
+	client := &scriptedLLM{scripts: [][]content.Chunk{{
+		toolUseChunk(0, "gated", "T", `{}`),
+		toolUseChunk(1, "streamed", "Streamer", `{}`),
+	}}}
+	gateReg := make(chan gateRegistration, 1)
+	cfg, state, rec, dir := turnCaptureFixture(t, ts, client, gateReg)
+	cfg.base = content.AgenticMessages{
+		reviewUserMessage(strings.Repeat("x", gate.MaxReviewContextEntryInputBytes+1)),
+	}
+	cfg.reviewContext = &reviewContextConfiguration{
+		Metadata: reviewContextMetadata{
+			WorkspaceRoot:      "/workspace",
+			WorkingDirectory:   "/workspace",
+			SecurityCeiling:    "workspace-write; unmet-requirements=true",
+			GatePolicyRevision: "gate-policy-v1",
+		},
+		Policy: testReviewContextPolicy(),
+	}
+
+	terminal := runTurn(context.Background(), cfg, state)
+	failed, ok := terminal.(event.TurnFailed)
+	if !ok {
+		t.Fatalf("terminal = %T, want TurnFailed on the review-capture failure", terminal)
+	}
+	var captureErr *reviewContextCaptureError
+	if !errors.As(failed.Err, &captureErr) {
+		t.Fatalf("TurnFailed.Err = %v, want *reviewContextCaptureError", failed.Err)
+	}
+	if got := streaming.capturedRuns(); got != 0 {
+		t.Fatalf("streaming runs = %d, want 0: RunBatch must abort the whole batch before the execute phase", got)
+	}
+	// The phase boundary itself, which is the premise the equivalence rests on:
+	// RunBatch emits a ToolCallStarted for EVERY requested call immediately before
+	// the execute phase, so zero Started events is the observable form of "the
+	// batch was abandoned before any call could open a spill".
+	for _, ev := range rec.events() {
+		if _, started := ev.(event.ToolCallStarted); started {
+			t.Fatal("a ToolCallStarted was emitted, so the batch reached its execute phase and turn.go's release is no longer a no-op")
+		}
+	}
+	requireEmptySpillRoot(t, dir, "a turn that failed on review capture")
 }

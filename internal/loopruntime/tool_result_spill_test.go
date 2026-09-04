@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
@@ -157,15 +158,66 @@ func TestToolResultCaptureBoundsAreDefaulted(t *testing.T) {
 // --- session-workspace spill (H5.3) ---
 
 // TestCaptureSpillDirectoryRejectsAnUnusableBase enumerates the base paths that
-// cannot be a session-scoped spill root. A relative base resolves against the
+// cannot be a session-scoped spill root, each with the reason that refused it —
+// a shared "err != nil" would let any one branch stand in for the others.
+//
+// The cases divide into three mechanisms. A relative base resolves against the
 // process working directory, which is neither session-scoped nor stable across a
-// pooled Host's lifetime, so it is refused rather than silently anchored.
+// pooled Host's lifetime. A MISSING base is refused rather than created, because
+// creating it means creating through intermediate components os.MkdirAll would
+// follow symlinks into. And a base writable by group or other is refused rather
+// than repaired, because anyone who can write to it can plant the session root.
 func TestCaptureSpillDirectoryRejectsAnUnusableBase(t *testing.T) {
 	t.Parallel()
-	for _, base := range []string{"", " ", "relative/spills", "./spills", "../spills"} {
-		if _, err := newCaptureSpillDirectory(base, uuid.UUID{1}); err == nil {
-			t.Errorf("base %q was accepted, want a typed rejection", base)
+	existing := t.TempDir()
+	missing := filepath.Join(existing, "absent")
+	deepMissing := filepath.Join(existing, "a", "b", "c")
+	regularFile := filepath.Join(existing, "file")
+	if err := os.WriteFile(regularFile, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	groupWritable := filepath.Join(existing, "group")
+	worldWritable := filepath.Join(existing, "world")
+	for path, mode := range map[string]os.FileMode{groupWritable: 0o770, worldWritable: 0o707} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
 		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatalf("chmod %s: %v", path, err)
+		}
+	}
+	tests := []struct {
+		base   string
+		reason string
+	}{
+		{base: "", reason: "spill base is empty"},
+		{base: " ", reason: "spill base is empty"},
+		{base: "relative/spills", reason: "spill base is not an absolute path"},
+		{base: "./spills", reason: "spill base is not an absolute path"},
+		{base: "../spills", reason: "spill base is not an absolute path"},
+		{base: missing, reason: "stat spill directory"},
+		{base: deepMissing, reason: "stat spill directory"},
+		{base: regularFile, reason: "spill directory is not a directory"},
+		{base: groupWritable, reason: "spill base is writable by group or other"},
+		{base: worldWritable, reason: "spill base is writable by group or other"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		assertSpillRejection(t, "base "+tt.base, func() error {
+			_, err := newCaptureSpillDirectory(tt.base, uuid.UUID{1})
+			return err
+		}, tt.reason)
+	}
+	if _, err := os.Lstat(missing); !os.IsNotExist(err) {
+		t.Fatalf("lstat missing base = %v, want not-exist: a refused base must not have been created", err)
+	}
+	if _, err := os.Lstat(filepath.Join(existing, "a")); !os.IsNotExist(err) {
+		t.Fatalf("an intermediate component of a refused base was created")
+	}
+	// The neighbouring accepted case: an existing, owner-only base works, so the
+	// refusals above are not simply "every base is refused".
+	if _, err := newCaptureSpillDirectory(existing, uuid.UUID{1}); err != nil {
+		t.Fatalf("an existing owner-only base was refused: %v", err)
 	}
 }
 
@@ -385,7 +437,10 @@ func TestSpillBackedSinkMatchesTheMemorySinkExactly(t *testing.T) {
 		t.Fatalf("newCaptureSpillDirectory: %v", err)
 	}
 	defer dir.Release()
-	payloads := []string{"", "a", "hello world", "界界界", "\xff\xfe\x00", strings.Repeat("x", 300)}
+	// A 4-byte rune is included deliberately: it is the only payload that can
+	// leave THREE bytes pending in the incremental UTF-8 scanner, which is the
+	// bound the scanner's own doc comment states.
+	payloads := []string{"", "a", "hello world", "界界界", "😀😀", "a😀", "\xff\xfe\x00", strings.Repeat("x", 300)}
 	execution := 0
 	for _, ceiling := range []int{1, 4, 7, 64, 4096} {
 		for _, payload := range payloads {
@@ -450,6 +505,64 @@ func TestSpillBackedSinkMatchesTheMemorySinkExactly(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestUTF8ScannerAgreesWithUTF8ValidOnEveryShortString is the differential test
+// the sink's encoding contract actually needs.
+// TestSpillBackedSinkMatchesTheMemorySinkExactly cannot serve: both of its sinks
+// run the SAME scanner and differ only in backing, so it compares the scanner to
+// itself and cannot fail for any scanner bug.
+//
+// The space is derived from the mechanism rather than picked. UTF-8 decoding is
+// decided by a byte's class, so the alphabet holds one representative of each:
+// ASCII, the ASCII/continuation boundary, low and high continuation bytes, the
+// smallest and largest 2-byte leaders, the 3-byte leaders that bracket the
+// surrogate range, the 3- and 4-byte leaders, an invalid leader, a never-valid
+// byte, and two more continuation values. Every string of length 1..3 over that
+// alphabet is checked, in every chunking, against utf8.Valid — which is exactly
+// what the incremental scanner claims to compute.
+func TestUTF8ScannerAgreesWithUTF8ValidOnEveryShortString(t *testing.T) {
+	t.Parallel()
+	alphabet := []byte{'a', 0x7f, 0x80, 0x90, 0xa0, 0xbf, 0xc2, 0xdf, 0xe0, 0xed, 0xf0, 0xf4, 0xf5, 0xff}
+	checked := 0
+	var payloads [][]byte
+	var build func(prefix []byte, depth int)
+	build = func(prefix []byte, depth int) {
+		if len(prefix) > 0 {
+			payloads = append(payloads, append([]byte(nil), prefix...))
+		}
+		if depth == 0 {
+			return
+		}
+		for _, b := range alphabet {
+			// A fresh slice per branch: reusing prefix's backing array would let
+			// one sibling overwrite another's bytes.
+			next := make([]byte, len(prefix)+1)
+			copy(next, prefix)
+			next[len(prefix)] = b
+			build(next, depth-1)
+		}
+	}
+	build(nil, 4)
+	for _, payload := range payloads {
+		want := utf8.Valid(payload)
+		// Every chunking matters: the scanner's whole point is that a rune split
+		// across two writes is not seen as invalid, and a chunk size of 1 splits
+		// every multi-byte rune.
+		for chunk := 1; chunk <= len(payload); chunk++ {
+			scanner := newUTF8Scanner()
+			for offset := 0; offset < len(payload); offset += chunk {
+				scanner.write(payload[offset:min(offset+chunk, len(payload))])
+			}
+			checked++
+			if got := scanner.valid(); got != want {
+				t.Fatalf("payload %x chunk %d: valid = %v, want utf8.Valid = %v", payload, chunk, got, want)
+			}
+		}
+	}
+	if checked < 100000 {
+		t.Fatalf("checked %d (payload, chunking) pairs; the sweep is too small to be a differential", checked)
 	}
 }
 

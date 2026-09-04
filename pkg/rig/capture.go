@@ -2,7 +2,6 @@ package rig
 
 import (
 	"path/filepath"
-	"strings"
 
 	"github.com/looprig/harness/internal/sessionruntime"
 	"github.com/looprig/harness/pkg/loop"
@@ -14,6 +13,15 @@ import (
 // named here comes from pkg/loop or pkg/tool, never from an internal package, so
 // a composition root outside github.com/looprig/harness can write the call —
 // which is the whole reason the store types are not declared in the loop runtime.
+
+// captureFieldObjects and captureFieldSpillBase are the only two values
+// DefinitionError.Name takes for an invalid capture wiring. They are field labels,
+// so a caller can branch on which half of the option was wrong without the error
+// ever carrying a value the caller supplied.
+const (
+	captureFieldObjects   = "objects"
+	captureFieldSpillBase = "spill_base"
+)
 
 // WithToolResultCapture wires durable tool-result retention: the session object
 // store each loop retains an oversized tool result into, and the ABSOLUTE base
@@ -27,6 +35,14 @@ import (
 // is neither session-scoped nor stable for a pooled host, and because it must be
 // comparable against the workspace region at Define time.
 //
+// The base must ALREADY EXIST, be owner-writable only, and be a directory rather
+// than a symlink, by the time a session is created — harness refuses to create it,
+// because creating it would mean creating through whatever intermediate components
+// the path has, and os.MkdirAll follows a symlinked one silently. Define checks
+// only that the path is absolute, since the base may legitimately be created after
+// the rig is defined; the session's own establishment is the authoritative check
+// and a failure there ends the turn at the spill stage.
+//
 // The base is a BASE, not a root: each session creates <base>/<sessionID>,
 // owner-only, and removes it at shutdown. Define refuses a base that overlaps the
 // configured workspace region in either direction, which is what keeps a capture
@@ -39,13 +55,17 @@ func WithToolResultCapture(objects loop.ToolResultObjectStore, spillBase string)
 			return &DefinitionError{Kind: DefinitionDuplicateOption, Name: string(keyToolResultCapture)}
 		}
 		if objects == nil {
-			return &DefinitionError{Kind: DefinitionInvalidToolResultCapture, Name: "objects"}
+			return &DefinitionError{Kind: DefinitionInvalidToolResultCapture, Name: captureFieldObjects}
 		}
-		if strings.TrimSpace(spillBase) == "" {
-			return &DefinitionError{Kind: DefinitionInvalidToolResultCapture, Name: "spill_base"}
-		}
+		// One check, not two. filepath.IsAbs is false for the empty string and for
+		// a whitespace-only or leading-whitespace path, so "empty", "blank" and
+		// "relative" are the same rejection to a caller; splitting them would leave
+		// a branch nothing reads and a Name nothing distinguishes. Name is a FIELD
+		// LABEL in both branches and never the caller's path: an error value that
+		// sometimes carries a filesystem path is one a log or an API response has to
+		// treat as sensitive.
 		if !filepath.IsAbs(spillBase) {
-			return &DefinitionError{Kind: DefinitionInvalidToolResultCapture, Name: spillBase}
+			return &DefinitionError{Kind: DefinitionInvalidToolResultCapture, Name: captureFieldSpillBase}
 		}
 		state.seen[keyToolResultCapture] = true
 		state.toolResultObjects = objects

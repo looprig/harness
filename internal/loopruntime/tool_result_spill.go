@@ -209,9 +209,19 @@ func (f failedBacking) release() error { return nil }
 // utf8Scanner decides UTF-8 validity of a byte stream incrementally, holding back
 // at most the three bytes that could still be the start of a longer rune. It
 // answers exactly what utf8.Valid would answer over the concatenation of every
-// byte written, which is the property the sink's encoding contract needs and
-// which TestSpillBackedSinkMatchesTheMemorySinkExactly compares directly against
-// a memory-backed sink over the same payloads.
+// byte written, which is the property the sink's encoding contract needs.
+//
+// That equivalence is measured by TestUTF8ScannerAgreesWithUTF8ValidOnEveryShortString,
+// which runs every string of length 1..4 over a byte alphabet covering each UTF-8
+// byte class, in every chunking, against utf8.Valid itself.
+// TestSpillBackedSinkMatchesTheMemorySinkExactly deliberately does NOT establish
+// it: both of its sinks run this scanner, so it compares the scanner to itself and
+// could not fail for a scanner bug. What that test measures is that the BACKING
+// makes no difference.
+//
+// The incremental form is chosen over validating a materialized copy because the
+// retained prefix may be a file: this keeps the classification to O(1) retained
+// state and no second pass over the capture.
 type utf8Scanner struct {
 	ok      bool
 	pending []byte
@@ -324,8 +334,24 @@ func (e *captureSpillError) Error() string {
 func (e *captureSpillError) Unwrap() error { return e.Cause }
 
 // newCaptureSpillDirectory establishes <base>/<sessionID> as this session's spill
-// root. The base is created if missing; both it and the root are then verified to
-// be real, owner-only directories rather than symlinks.
+// root. It does NOT create the base: where a host may write local bytes is the
+// host's placement decision, and creating it would mean creating THROUGH whatever
+// intermediate components the path happens to have. os.MkdirAll follows a
+// symlinked interior component silently, so a link planted anywhere above the
+// final component would be traversed and the final Lstat would then see a
+// perfectly real directory inside somebody else's tree. Requiring the base to
+// exist removes that step entirely: harness creates exactly one component, the
+// session root, directly inside a directory it has already lstat-checked.
+//
+// What is and is not checked, precisely. The BASE must be an absolute path, must
+// already exist, must be a directory rather than a symlink AS ITS FINAL COMPONENT,
+// and must not be writable by group or other — a base anyone else can write to is
+// a base anyone else can plant the session root in. Harness does not resolve the
+// base's interior components and does not repair its permissions; pkg/rig's public
+// option canonicalizes the base with EvalSymlinks before wiring it, which is the
+// layer that owns the whole path. The ROOT is created by harness, so it is held to
+// the full property: one component, created 0700, then lstat-checked as a
+// non-symlink directory.
 func newCaptureSpillDirectory(base string, sessionID uuid.UUID) (*captureSpillDirectory, error) {
 	if strings.TrimSpace(base) == "" {
 		return nil, &captureSpillError{Reason: "spill base is empty"}
@@ -333,43 +359,73 @@ func newCaptureSpillDirectory(base string, sessionID uuid.UUID) (*captureSpillDi
 	if !filepath.IsAbs(base) {
 		return nil, &captureSpillError{Path: base, Reason: "spill base is not an absolute path"}
 	}
-	if err := os.MkdirAll(base, 0o700); err != nil {
-		return nil, &captureSpillError{Path: base, Reason: "create spill base", Cause: err}
-	}
-	if err := verifyOwnerOnlyDirectory(base); err != nil {
+	if err := verifySpillBase(base); err != nil {
 		return nil, err
 	}
 	root := filepath.Join(base, sessionID.String())
 	if err := os.Mkdir(root, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, &captureSpillError{Path: root, Reason: "create spill root", Cause: err}
 	}
-	if err := verifyOwnerOnlyDirectory(root); err != nil {
+	if err := verifySpillRoot(root); err != nil {
 		return nil, err
 	}
 	return &captureSpillDirectory{root: root}, nil
 }
 
-// verifyOwnerOnlyDirectory rejects a path that is a symlink or not a directory,
-// and forces owner-only permissions regardless of the process umask. Mkdir's mode
-// argument is masked by the umask, so the chmod is what actually establishes the
-// permission rather than requesting it.
-func verifyOwnerOnlyDirectory(path string) error {
-	info, err := os.Lstat(path)
+// verifySpillBase checks the operator-supplied base WITHOUT mutating it. It is a
+// pure check by design: the base may be a long-lived directory shared by every
+// session on a host, so silently re-permissioning it would change something
+// harness does not own — and a group- or world-writable base is a condition to
+// refuse, not to repair, because by the time the repair ran an entry could already
+// have been planted.
+func verifySpillBase(base string) error {
+	info, err := lstatDirectory(base)
 	if err != nil {
-		return &captureSpillError{Path: path, Reason: "stat spill directory", Cause: err}
+		return err
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return &captureSpillError{Path: path, Reason: "spill directory is a symlink"}
+	if info.Mode().Perm()&0o022 != 0 {
+		return &captureSpillError{Path: base, Reason: "spill base is writable by group or other"}
 	}
-	if !info.IsDir() {
-		return &captureSpillError{Path: path, Reason: "spill directory is not a directory"}
+	return nil
+}
+
+// verifySpillRoot checks the session root harness just created and restores the
+// owner bits a restrictive umask cleared.
+//
+// The chmod is a USABILITY fix, not a security control, and the distinction
+// matters because the opposite claim would be a false one: a umask can only REMOVE
+// permission bits, so os.Mkdir(root, 0o700) can never produce a mode wider than
+// 0700 and this call can never narrow anything. What it can do is repair the
+// unusable case — under a umask of 0700 the new directory is mode 0000 and its own
+// owner cannot traverse it. No test drives that path, because the umask is
+// process-global and setting it would race every parallel test in the package.
+func verifySpillRoot(root string) error {
+	if _, err := lstatDirectory(root); err != nil {
+		return err
 	}
 	// #nosec G302 -- 0700 is owner-only for a DIRECTORY: the execute bit is what
 	// permits traversal, so 0600 would make the directory unusable by its owner.
-	if err := os.Chmod(path, 0o700); err != nil {
-		return &captureSpillError{Path: path, Reason: "restrict spill directory", Cause: err}
+	if err := os.Chmod(root, 0o700); err != nil {
+		return &captureSpillError{Path: root, Reason: "restrict spill directory", Cause: err}
 	}
 	return nil
+}
+
+// lstatDirectory rejects a path that does not exist, is a symlink, or is not a
+// directory. It lstats rather than stats, so a symlink is seen as a symlink
+// instead of as whatever it points at.
+func lstatDirectory(path string) (os.FileInfo, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, &captureSpillError{Path: path, Reason: "stat spill directory", Cause: err}
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, &captureSpillError{Path: path, Reason: "spill directory is a symlink"}
+	}
+	if !info.IsDir() {
+		return nil, &captureSpillError{Path: path, Reason: "spill directory is not a directory"}
+	}
+	return info, nil
 }
 
 // spillPath derives the file path for one ToolExecutionID and re-checks
@@ -417,6 +473,10 @@ func (d *captureSpillDirectory) openSink(executionID uuid.UUID, ceiling int) (*c
 	if err != nil {
 		return nil, &captureSpillError{Path: path, Reason: "create spill file", Cause: err}
 	}
+	// The chmod restores owner bits a restrictive umask cleared; it can never
+	// widen the mode, because a umask only removes bits from the 0o600 requested
+	// above. Like verifySpillRoot's, it is a usability repair rather than a
+	// security control, and no test drives it for the same process-global reason.
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
 		_ = os.Remove(path)
@@ -442,14 +502,27 @@ func (d *captureSpillDirectory) Release() error {
 }
 
 // fileBacking keeps the retained prefix in one owner-only file. Writes append at
-// the file's own offset; reader rewinds a SEPARATE descriptor so a read cannot
-// disturb the write position or race a concurrent writer's offset.
+// the file's own offset; reader hands out an io.SectionReader over the SAME
+// descriptor, which reads with ReadAt and therefore never disturbs the write
+// offset.
+//
+// Reading through the open descriptor rather than reopening the path is what makes
+// this correct as well as cheap: a reopen would need the path to still resolve to
+// the same file, and it would need a flush to look coherent even though a second
+// open on the same host already reads through the page cache. A SectionReader
+// needs neither, so there is no fsync per capture upload and no second variable
+// path for gosec to flag.
 type fileBacking struct {
-	file *os.File
-	path string
+	file    *os.File
+	path    string
+	written int64
 }
 
-func (f *fileBacking) write(p []byte) (int, error) { return f.file.Write(p) }
+func (f *fileBacking) write(p []byte) (int, error) {
+	n, err := f.file.Write(p)
+	f.written += int64(n)
+	return n, err
+}
 
 func (f *fileBacking) materialize() ([]byte, error) {
 	reader, err := f.reader()
@@ -460,18 +533,26 @@ func (f *fileBacking) materialize() ([]byte, error) {
 	return io.ReadAll(reader)
 }
 
+// reader returns a rewound stream over exactly the bytes this backing ACCEPTED.
+// The bound is the backing's own running count of accepted bytes, which is the
+// same quantity the sink reports as capturedBytes and digests — so the section's
+// length, the recorded size and the digest cannot disagree, whatever the file on
+// disk happens to be. That equality is what
+// TestSpillBackedSinkMatchesTheMemorySinkExactly measures, by comparing the
+// streamed bytes against a memory-backed sink over the same 90 payload/chunking
+// pairs.
 func (f *fileBacking) reader() (io.ReadCloser, error) {
-	if err := f.file.Sync(); err != nil {
-		return nil, &captureSpillError{Path: f.path, Reason: "flush spill file", Cause: err}
-	}
-	// #nosec G304 -- f.path is the spill this backing itself created under the
-	// session-scoped root; it is never derived from tool input.
-	file, err := os.OpenFile(f.path, os.O_RDONLY, 0)
-	if err != nil {
-		return nil, &captureSpillError{Path: f.path, Reason: "reopen spill file", Cause: err}
-	}
-	return file, nil
+	return spillSection{SectionReader: io.NewSectionReader(f.file, 0, f.written)}, nil
 }
+
+// spillSection is a read-only view of the bytes a spill file accepted. It is a
+// NAMED type rather than an io.NopCloser so that "the upload streamed off the
+// local spill" is observable: a materialized copy comes back as a reader over a
+// byte slice, and the two are otherwise indistinguishable to a caller. Close is a
+// no-op because the section borrows the backing's descriptor, which release owns.
+type spillSection struct{ *io.SectionReader }
+
+func (spillSection) Close() error { return nil }
 
 // release closes and deletes the spill. It is idempotent: a second call finds the
 // descriptor already closed and the path already gone, and reports neither.

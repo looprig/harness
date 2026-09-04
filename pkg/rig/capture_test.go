@@ -43,18 +43,21 @@ func TestWithToolResultCaptureRejectsAnUnusableWiring(t *testing.T) {
 	t.Parallel()
 	absolute := t.TempDir()
 	tests := []struct {
-		name    string
-		options []Option
-		want    DefinitionErrorKind
+		name     string
+		options  []Option
+		want     DefinitionErrorKind
+		wantName string
 	}{
-		{name: "nil store", options: []Option{WithToolResultCapture(nil, absolute)}, want: DefinitionInvalidToolResultCapture},
-		{name: "empty spill base", options: []Option{WithToolResultCapture(newExternalStore(), "")}, want: DefinitionInvalidToolResultCapture},
-		{name: "blank spill base", options: []Option{WithToolResultCapture(newExternalStore(), "   ")}, want: DefinitionInvalidToolResultCapture},
-		{name: "relative spill base", options: []Option{WithToolResultCapture(newExternalStore(), "spills")}, want: DefinitionInvalidToolResultCapture},
+		{name: "nil store", options: []Option{WithToolResultCapture(nil, absolute)}, want: DefinitionInvalidToolResultCapture, wantName: "objects"},
+		{name: "empty spill base", options: []Option{WithToolResultCapture(newExternalStore(), "")}, want: DefinitionInvalidToolResultCapture, wantName: "spill_base"},
+		{name: "blank spill base", options: []Option{WithToolResultCapture(newExternalStore(), "   ")}, want: DefinitionInvalidToolResultCapture, wantName: "spill_base"},
+		{name: "leading whitespace spill base", options: []Option{WithToolResultCapture(newExternalStore(), " "+absolute)}, want: DefinitionInvalidToolResultCapture, wantName: "spill_base"},
+		{name: "relative spill base", options: []Option{WithToolResultCapture(newExternalStore(), "spills")}, want: DefinitionInvalidToolResultCapture, wantName: "spill_base"},
 		{
-			name:    "duplicate option",
-			options: []Option{WithToolResultCapture(newExternalStore(), absolute), WithToolResultCapture(newExternalStore(), absolute)},
-			want:    DefinitionDuplicateOption,
+			name:     "duplicate option",
+			options:  []Option{WithToolResultCapture(newExternalStore(), absolute), WithToolResultCapture(newExternalStore(), absolute)},
+			want:     DefinitionDuplicateOption,
+			wantName: string(keyToolResultCapture),
 		},
 	}
 	for _, tt := range tests {
@@ -65,6 +68,15 @@ func TestWithToolResultCaptureRejectsAnUnusableWiring(t *testing.T) {
 			var definitionErr *DefinitionError
 			if !errors.As(err, &definitionErr) || definitionErr.Kind != tt.want {
 				t.Fatalf("Define error = %v, want kind %q", err, tt.want)
+			}
+			// Name is asserted, not merely observed: it is the only thing telling
+			// a caller WHICH half of the option was wrong, and it must never be
+			// the path the caller passed.
+			if definitionErr.Name != tt.wantName {
+				t.Fatalf("Define error Name = %q, want the field label %q", definitionErr.Name, tt.wantName)
+			}
+			if strings.Contains(definitionErr.Name, string(filepath.Separator)) {
+				t.Fatalf("Define error Name = %q, which leaks a caller filesystem path", definitionErr.Name)
 			}
 		})
 	}

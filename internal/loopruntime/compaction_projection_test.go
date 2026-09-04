@@ -2,6 +2,7 @@ package loopruntime
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"runtime"
 	"strings"
@@ -218,12 +219,12 @@ func TestProjectCompactionTranscriptLargeToolResultUsesBoundedAllocation(t *test
 		}}},
 	}, ToolUseID: "large"}}
 
-	smallAllocs := testing.AllocsPerRun(3, func() {
+	smallAllocs := minAllocsPerRun(func() {
 		if _, err := projectCompactionTranscript(small); err != nil {
 			t.Fatalf("small projection error = %v", err)
 		}
 	})
-	largeAllocs := testing.AllocsPerRun(3, func() {
+	largeAllocs := minAllocsPerRun(func() {
 		if _, err := projectCompactionTranscript(large); err != nil {
 			t.Fatalf("large projection error = %v", err)
 		}
@@ -343,14 +344,51 @@ func referenceCompactionBlock(block content.Block, depth int) (string, error) {
 
 func projectionTotalAllocBytes(t *testing.T, messages content.AgenticMessages) uint64 {
 	t.Helper()
-	runtime.GC()
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
-	if _, err := projectCompactionTranscript(messages); err != nil {
-		t.Fatalf("projection error = %v", err)
+	best := ^uint64(0)
+	for attempt := 0; attempt < allocationMeasurementAttempts; attempt++ {
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		if _, err := projectCompactionTranscript(messages); err != nil {
+			t.Fatalf("projection error = %v", err)
+		}
+		runtime.ReadMemStats(&after)
+		best = min(best, after.TotalAlloc-before.TotalAlloc)
 	}
-	runtime.ReadMemStats(&after)
-	return after.TotalAlloc - before.TotalAlloc
+	return best
+}
+
+// allocationMeasurementAttempts is how many independent measurements the two
+// helpers above take before reporting the minimum.
+const allocationMeasurementAttempts = 5
+
+// minAllocsPerRun is testing.AllocsPerRun with the contamination taken out.
+//
+// AllocsPerRun measures the delta of runtime.MemStats.Mallocs, which is
+// PROCESS-GLOBAL: every allocation made by every live goroutine in the test
+// binary during the window lands in the result. That does not matter for a
+// microsecond-long f, and it matters a great deal for this one — projecting a
+// 16 MiB tool result takes roughly 200ms, and any background goroutine still
+// running from an earlier test in the package allocates freely during it.
+// Measured directly: a fixed 2-alloc function measured over a 200ms window reads
+// 2 in a quiet process and 322 with one background allocator alive. In this
+// package the large projection reads 77 with zero variance across six isolated
+// runs, and 82 on roughly one run in four inside the full package — four
+// allocations of slack against an unbounded contaminant.
+//
+// The estimator therefore takes the MINIMUM of several measurements rather than
+// one. Contamination is strictly one-sided: a foreign goroutine can only ADD to
+// the malloc counter, never subtract, and the projection's own allocation count
+// is deterministic. The minimum of independent samples converges on the true
+// value from above, so this tightens the measurement without touching the bound
+// the test asserts — widening the bound would only move the flake's threshold,
+// since the contaminant has no upper limit.
+func minAllocsPerRun(f func()) float64 {
+	best := math.Inf(1)
+	for attempt := 0; attempt < allocationMeasurementAttempts; attempt++ {
+		best = math.Min(best, testing.AllocsPerRun(3, f))
+	}
+	return best
 }
 
 func TestProjectCompactionTranscriptUsesTypedPlaceholders(t *testing.T) {

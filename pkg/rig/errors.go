@@ -76,11 +76,13 @@ const (
 	DefinitionUnusedPermissionReviewObservations DefinitionErrorKind = "unused_permission_review_observations"
 
 	// DefinitionInvalidToolResultCapture: WithToolResultCapture was called with a
-	// nil object store, or with a spill base that is empty, all-whitespace, or
-	// relative. Name carries which half was wrong ("objects", "spill_base", or
-	// the rejected path). Rejected at Define rather than at the first oversized
-	// tool result, because the failure mode otherwise is a turn that ends on a
-	// retention error long after the misconfiguration.
+	// nil object store, or with a spill base that is not an absolute path (which
+	// includes empty and all-whitespace). Name is a FIELD LABEL — exactly
+	// "objects" or "spill_base" — and never the rejected value, so the error can
+	// be logged or returned without treating it as caller-supplied data.
+	// Rejected at Define rather than at the first oversized tool result, because
+	// the failure mode otherwise is a turn that ends on a retention error long
+	// after the misconfiguration.
 	DefinitionInvalidToolResultCapture DefinitionErrorKind = "invalid_tool_result_capture"
 	// DefinitionToolResultSpillOverlapsWorkspace: the capture spill base is equal
 	// to, inside, or an ancestor of the configured workspace region. A workspace

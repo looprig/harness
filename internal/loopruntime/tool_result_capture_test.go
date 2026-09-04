@@ -875,8 +875,11 @@ func TestToolResultRetentionPrefersTheStreamingUploadAndStreamsOffTheSpill(t *te
 	if got := streaming.fakeObjectStore.putCount(); got != 0 {
 		t.Fatalf("materialized puts = %d, want 0 when the store streams", got)
 	}
-	if got := streaming.readerType(0); got != "*os.File" {
-		t.Fatalf("streamed reader = %s, want *os.File: the upload must read the local spill, not a materialized copy", got)
+	// The reader's concrete type is the observable that separates "streamed off
+	// the local spill" from "copied into memory and streamed back": a materialized
+	// copy arrives as a reader over a byte slice.
+	if got := streaming.readerType(0); got != "loopruntime.spillSection" {
+		t.Fatalf("streamed reader = %s, want loopruntime.spillSection: the upload must read the local spill, not a materialized copy", got)
 	}
 	stored, ok := streaming.fakeObjectStore.get(commit.captures[0].Reference.ObjectID)
 	if !ok || string(stored) != text {
@@ -1238,6 +1241,11 @@ type turnStreamingTool struct {
 	// way, so an after-the-fact directory listing cannot tell them apart.
 	spillRoot string
 
+	// onCaptured runs after the raw stream has been written, while the sink is
+	// still open. It is how a test makes something happen — a cancellation — at
+	// the exact moment a spill exists on disk.
+	onCaptured func()
+
 	mu        sync.Mutex
 	captured  int
 	liveFiles int
@@ -1270,6 +1278,9 @@ func (s *turnStreamingTool) InvokableRunCaptured(_ context.Context, _ string, si
 		s.mu.Lock()
 		s.liveFiles = len(entries)
 		s.mu.Unlock()
+	}
+	if s.onCaptured != nil {
+		s.onCaptured()
 	}
 	return tool.TextResult(s.preview), nil
 }

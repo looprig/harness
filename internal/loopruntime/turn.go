@@ -574,6 +574,13 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// never opened a gate reports attempted=false here and falls through
 		// exactly as if review context were never configured.
 		if reviewErr, attempted := reviewCapture.failed(); attempted && reviewErr != nil {
+			// A no-op today, kept as defence in depth. RunBatch resolves access
+			// sequentially BEFORE its execute phase and returns collectResults on a
+			// *reviewContextCaptureError, so no call in this batch ever ran and no
+			// result can carry a capture sink — deleting this line is an equivalent
+			// mutation, and TestReviewCaptureFailureCannotLeaveASpillIsGuaranteedByRunBatch
+			// pins that premise (no ToolCallStarted, empty spill root) rather than
+			// pretending this line is what holds it.
 			releaseCaptures(results)
 			return event.TurnFailed{TurnIndex: ts.index, Err: reviewErr}
 		}
