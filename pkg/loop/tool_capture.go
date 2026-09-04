@@ -83,5 +83,15 @@ type ToolResultObjectStreamStore interface {
 	// rather than storing a short object; the loop verifies the result either
 	// way, so a store that does not will be caught at the size or digest stage
 	// instead.
+	//
+	// content is io.Reader and NOTHING MORE. Its dynamic type varies with how the
+	// loop was composed — a session with a spill directory hands over a view of an
+	// open file, one without hands over a view of a byte slice — and those two
+	// carry different optional capabilities. A store must therefore not type-assert
+	// io.ReaderAt, io.Seeker, io.WriterTo or a Size method and take a different
+	// path when it succeeds: that path would be selected by the host's spill
+	// configuration rather than by anything about the object, and would go
+	// untested in whichever composition the author did not have in mind. A
+	// multipart uploader that needs random access must buffer or chunk it itself.
 	PutToolResultObjectStream(ctx context.Context, objectID string, content io.Reader, size uint64) error
 }

@@ -530,7 +530,9 @@ func (s *Session) abortConstructionAfter(cause error, appendTerminal func(contex
 	// Stop the offload-GC runner (nil/no-op unless it was installed and started). On a
 	// construction abort it is typically unstarted, so this only stops the ticker.
 	s.stopOffloadGC()
-	s.releaseToolResultSpills()
+	// A construction abort has no failure list: it is already unwinding a session
+	// that will never become reachable, and there is nobody to report to.
+	_ = s.releaseToolResultSpills()
 	// Seal durable publication before cancellation can make a backend emit a late
 	// terminal. Already-admitted publishes are the first cleanup phase.
 	var hubDrain <-chan struct{}
@@ -2758,6 +2760,14 @@ func (s *Session) toolResultSpillDirectory() *loopruntime.ToolResultSpillDirecto
 // a spill outlives its own turn only when that turn was torn down, so nothing
 // readable is being discarded.
 //
+// It RETURNS its failure rather than swallowing it, and the shutdown call site
+// folds that into the same failure list every other cleanup phase reports through.
+// A RemoveAll that fails leaves <base>/<sessionID> holding this session's complete
+// tool output; on a pooled host that is a disk-fill vector, and it was the one
+// teardown phase with no signal at all. The construction-abort site still drops it
+// deliberately: that path is already unwinding a session that failed to exist and
+// has no failure list to add to.
+//
 // It CLAIMS the same sync.Once the establishing accessor uses, which is what makes
 // it correct against a concurrent loop construction. A sync.Once orders only the
 // goroutines that call Do, so reading toolResultSpills without calling Do would be
@@ -2770,16 +2780,17 @@ func (s *Session) toolResultSpillDirectory() *loopruntime.ToolResultSpillDirecto
 // directory and retention fails visibly at the spill stage — the right outcome for a
 // closing session; if the accessor wins, this side sees the real directory and
 // removes it.
-func (s *Session) releaseToolResultSpills() {
+func (s *Session) releaseToolResultSpills() error {
 	if s.toolResultSpillBase == "" {
-		return
+		return nil
 	}
 	s.toolResultSpillOnce.Do(func() {
 		s.toolResultSpills = loopruntime.UnavailableToolResultSpillDirectory(&SessionError{Kind: SessionClosing})
 	})
-	if s.toolResultSpills != nil {
-		_ = s.toolResultSpills.Release()
+	if s.toolResultSpills == nil {
+		return nil
 	}
+	return s.toolResultSpills.Release()
 }
 
 // newWorkspaceBinding returns the tool.WorkspaceBinding to populate at a loop bind site, or
@@ -3135,7 +3146,7 @@ func (s *Session) teardown(plan teardownPlan) error {
 	s.stopOffloadGC()
 	// The loops have stopped, so every capture spill either reached its object or
 	// belonged to a turn that was torn down. Neither has a local reader left.
-	s.releaseToolResultSpills()
+	failures = append(failures, s.releaseToolResultSpills())
 	failures = append(failures, s.stopCheckpoints(cleanupRoot, timeouts.checkpoint))
 	// Session resources (including the process registry) must fully terminate and
 	// confirm before the hub stops and the leases/session context release: their own

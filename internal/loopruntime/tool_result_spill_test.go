@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -195,11 +196,11 @@ func TestCaptureSpillDirectoryRejectsAnUnusableBase(t *testing.T) {
 		{base: "relative/spills", reason: "spill base is not an absolute path"},
 		{base: "./spills", reason: "spill base is not an absolute path"},
 		{base: "../spills", reason: "spill base is not an absolute path"},
-		{base: missing, reason: "stat spill directory"},
-		{base: deepMissing, reason: "stat spill directory"},
-		{base: regularFile, reason: "spill directory is not a directory"},
-		{base: groupWritable, reason: "spill base is writable by group or other"},
-		{base: worldWritable, reason: "spill base is writable by group or other"},
+		{base: missing, reason: "stat spill base"},
+		{base: deepMissing, reason: "stat spill base"},
+		{base: regularFile, reason: "spill base is not a directory"},
+		{base: groupWritable, reason: "spill base is writable by group or other (mode=0770, want no group/other write)"},
+		{base: worldWritable, reason: "spill base is writable by group or other (mode=0707, want no group/other write)"},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -273,7 +274,7 @@ func TestCaptureSpillDirectoryRejectsASymlinkedRoot(t *testing.T) {
 	assertSpillRejection(t, "symlinked base", func() error {
 		_, err := newCaptureSpillDirectory(base, uuid.UUID{1})
 		return err
-	}, "spill directory is a symlink")
+	}, "spill base is a symlink")
 
 	plain := t.TempDir()
 	session := uuid.UUID{2}
@@ -283,11 +284,13 @@ func TestCaptureSpillDirectoryRejectsASymlinkedRoot(t *testing.T) {
 	assertSpillRejection(t, "symlinked session root", func() error {
 		_, err := newCaptureSpillDirectory(plain, session)
 		return err
-	}, "spill directory is a symlink")
+	}, "spill root is a symlink")
 
 	// A plain FILE where the root belongs is the neighbouring refusal, and it must
 	// carry a DIFFERENT reason: if both arrangements reported the same cause the
-	// symlink branch would have no reader and could be deleted unnoticed.
+	// symlink branch would have no reader and could be deleted unnoticed. The base
+	// and root arms likewise carry different subjects, so one shared check cannot
+	// tell an operator the wrong path is at fault.
 	notADirectory := t.TempDir()
 	fileSession := uuid.UUID{3}
 	if err := os.WriteFile(filepath.Join(notADirectory, fileSession.String()), []byte("x"), 0o600); err != nil {
@@ -296,11 +299,13 @@ func TestCaptureSpillDirectoryRejectsASymlinkedRoot(t *testing.T) {
 	assertSpillRejection(t, "file where the root belongs", func() error {
 		_, err := newCaptureSpillDirectory(notADirectory, fileSession)
 		return err
-	}, "spill directory is not a directory")
+	}, "spill root is not a directory")
 }
 
 // assertSpillRejection requires a typed *captureSpillError carrying exactly the
-// expected reason, which is what gives each refusal branch its own reader.
+// expected reason, which is what gives each refusal branch its own reader. It
+// also requires that a wrapped cause, when there is one, appears in the RENDERED
+// message: an operator reads Error(), not the struct.
 func assertSpillRejection(t *testing.T, name string, call func() error, reason string) {
 	t.Helper()
 	err := call()
@@ -311,6 +316,94 @@ func assertSpillRejection(t *testing.T, name string, call func() error, reason s
 	}
 	if spillErr.Reason != reason {
 		t.Errorf("%s: reason = %q, want %q", name, spillErr.Reason, reason)
+	}
+	if spillErr.Cause != nil && !strings.Contains(err.Error(), spillErr.Cause.Error()) {
+		t.Errorf("%s: Error() = %q, which does not render its cause %q", name, err.Error(), spillErr.Cause)
+	}
+}
+
+// TestCaptureSpillDirectoryReestablishmentPreservesAnExistingRoot is the reader
+// for the "created" flag that guards the failure-path removal. The flag exists so
+// establishment never removes a root this call did not make; the reachable half of
+// that property is re-establishing over an existing root, which must leave its
+// contents alone. Removing another session's spills would be far worse than
+// leaving an empty directory behind.
+func TestCaptureSpillDirectoryReestablishmentPreservesAnExistingRoot(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	session := uuid.UUID{12}
+	first, err := newCaptureSpillDirectory(base, session)
+	if err != nil {
+		t.Fatalf("first establishment: %v", err)
+	}
+	prior := filepath.Join(first.root, "prior.capture")
+	if err := os.WriteFile(prior, []byte("earlier work"), 0o600); err != nil {
+		t.Fatalf("write prior spill: %v", err)
+	}
+	second, err := newCaptureSpillDirectory(base, session)
+	if err != nil {
+		t.Fatalf("re-establishment over an existing root: %v", err)
+	}
+	if second.root != first.root {
+		t.Fatalf("root = %q, want the same root %q", second.root, first.root)
+	}
+	kept, err := os.ReadFile(prior)
+	if err != nil || string(kept) != "earlier work" {
+		t.Fatalf("prior spill = %q / %v, want it untouched by re-establishment", kept, err)
+	}
+}
+
+// TestSpillErrorRendersTheCauseThatDistinguishesTwoFailures is the reader for
+// rendering the wrapped cause, and it is written over the pair that shares
+// everything else. A missing base and an unreadable base both reach "stat spill
+// base"; the errno is the entire diagnosis, and an operator who cannot tell
+// ENOENT from EACCES has been told to check a path they can already see.
+func TestSpillErrorRendersTheCauseThatDistinguishesTwoFailures(t *testing.T) {
+	t.Parallel()
+	parent := t.TempDir()
+	missing := filepath.Join(parent, "absent")
+
+	sealed := filepath.Join(parent, "sealed")
+	if err := os.Mkdir(sealed, 0o700); err != nil {
+		t.Fatalf("mkdir sealed: %v", err)
+	}
+	unreadable := filepath.Join(sealed, "base")
+	if err := os.Mkdir(unreadable, 0o700); err != nil {
+		t.Fatalf("mkdir unreadable base: %v", err)
+	}
+	if err := os.Chmod(sealed, 0o000); err != nil {
+		t.Fatalf("chmod sealed: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sealed, 0o700) })
+
+	_, missingErr := newCaptureSpillDirectory(missing, uuid.UUID{1})
+	_, deniedErr := newCaptureSpillDirectory(unreadable, uuid.UUID{1})
+	if missingErr == nil || deniedErr == nil {
+		t.Fatalf("both bases must be refused: missing=%v denied=%v", missingErr, deniedErr)
+	}
+	var missingSpill, deniedSpill *captureSpillError
+	if !errors.As(missingErr, &missingSpill) || !errors.As(deniedErr, &deniedSpill) {
+		t.Fatalf("both errors must be *captureSpillError: %v / %v", missingErr, deniedErr)
+	}
+	if !errors.Is(missingErr, fs.ErrNotExist) {
+		t.Fatalf("missing base error = %v, want a wrapped fs.ErrNotExist", missingErr)
+	}
+	if !errors.Is(deniedErr, fs.ErrPermission) {
+		t.Skipf("this environment does not produce EACCES for an unreadable parent (running as root?): %v", deniedErr)
+	}
+	if missingSpill.Reason != deniedSpill.Reason {
+		t.Fatalf("reasons differ (%q vs %q); this test no longer exercises two failures that share a reason",
+			missingSpill.Reason, deniedSpill.Reason)
+	}
+	if missingErr.Error() == deniedErr.Error() {
+		t.Fatalf("both failures render identically as %q; the cause is not in the message", missingErr.Error())
+	}
+	for _, err := range []error{missingErr, deniedErr} {
+		var spillErr *captureSpillError
+		_ = errors.As(err, &spillErr)
+		if !strings.Contains(err.Error(), spillErr.Cause.Error()) {
+			t.Errorf("Error() = %q does not render its cause %q", err.Error(), spillErr.Cause)
+		}
 	}
 }
 
@@ -519,9 +612,12 @@ func TestSpillBackedSinkMatchesTheMemorySinkExactly(t *testing.T) {
 // ASCII, the ASCII/continuation boundary, low and high continuation bytes, the
 // smallest and largest 2-byte leaders, the 3-byte leaders that bracket the
 // surrogate range, the 3- and 4-byte leaders, an invalid leader, a never-valid
-// byte, and two more continuation values. Every string of length 1..3 over that
-// alphabet is checked, in every chunking, against utf8.Valid — which is exactly
-// what the incremental scanner claims to compute.
+// byte, and two more continuation values. Every string of length 1..4 over that
+// alphabet is checked — length 4 because that is the longest UTF-8 sequence and
+// the only length that can leave the scanner's stated maximum of three bytes
+// pending — in every chunking, against utf8.Valid, which is exactly what the
+// incremental scanner claims to compute. That is 14+14²+14³+14⁴ = 41,370 payloads
+// and 162,302 (payload, chunking) pairs, held above a floor by the check below.
 func TestUTF8ScannerAgreesWithUTF8ValidOnEveryShortString(t *testing.T) {
 	t.Parallel()
 	alphabet := []byte{'a', 0x7f, 0x80, 0x90, 0xa0, 0xbf, 0xc2, 0xdf, 0xe0, 0xed, 0xf0, 0xf4, 0xf5, 0xff}
@@ -578,7 +674,13 @@ func TestSpillWriteFailureLatchesAndStillLetsTheProducerFinish(t *testing.T) {
 		name    string
 		backing *faultyBacking
 	}{
-		{name: "short write", backing: &faultyBacking{shortAfter: 2}},
+		{name: "short write reported as an error", backing: &faultyBacking{shortAfter: 2}},
+		// io.Writer permits returning a short count with a NIL error only by
+		// violating its own contract, but os.File on some platforms and any
+		// wrapping writer can do it — and it is the only arrangement that reaches
+		// the sink's own "n < len(kept)" synthesis. A fake that always paired the
+		// short count with io.ErrShortWrite would leave that line unexecuted.
+		{name: "short write reported silently", backing: &faultyBacking{shortAfter: 2, silent: true}},
 		{name: "disk full", backing: &faultyBacking{err: errFakeDiskFull}},
 	}
 	for _, tt := range tests {
@@ -599,10 +701,35 @@ func TestSpillWriteFailureLatchesAndStillLetsTheProducerFinish(t *testing.T) {
 			if sink.offeredBytes() != 12 {
 				t.Fatalf("offeredBytes = %d, want 12: every producer byte is counted", sink.offeredBytes())
 			}
+			// The latch is probed by WRITING AGAIN after healing the backing.
+			// Re-reading spillErr without a further write could not fail for any
+			// implementation, so it would not distinguish "latches the FIRST cause"
+			// from "last cause wins".
+			//
+			// And the observable that separates them is NOT spillErr, which stays
+			// equal either way: it is what the sink RETAINED. A sink that kept
+			// writing after a latched failure would append the healthy bytes to a
+			// prefix that is already short, so capturedBytes would no longer
+			// describe a contiguous prefix and the digest would cover a payload no
+			// reader could reconstruct.
 			tt.backing.err = nil
 			tt.backing.shortAfter = -1
-			if sink.spillErr() == nil {
-				t.Fatal("a later healthy write cleared the latched failure")
+			first := sink.spillErr()
+			capturedBefore, digestBefore := sink.capturedBytes(), sink.digestHex()
+			if _, err := sink.Write([]byte("healthy")); err != nil {
+				t.Fatalf("healthy Write = %v, want nil", err)
+			}
+			if got := sink.spillErr(); got != first {
+				t.Fatalf("spillErr = %v after a healthy write, want the first cause %v", got, first)
+			}
+			if got := sink.capturedBytes(); got != capturedBefore {
+				t.Fatalf("capturedBytes = %d after a healthy write, want %d: a failed sink must stop retaining", got, capturedBefore)
+			}
+			if got := sink.digestHex(); got != digestBefore {
+				t.Fatal("the digest changed after a healthy write on a failed sink; the stored prefix is no longer what the digest covers")
+			}
+			if got := sink.offeredBytes(); got != 19 {
+				t.Fatalf("offeredBytes = %d, want 19: every producer byte is still counted after a latched failure", got)
 			}
 		})
 	}
@@ -636,9 +763,13 @@ func TestCaptureSpillDirectoryReleaseRemovesEveryLocalSpill(t *testing.T) {
 	if err := dir.Release(); err != nil {
 		t.Fatalf("second Release = %v, want nil", err)
 	}
-	if _, err := dir.openSink(uuid.UUID{9}, 64); err == nil {
-		t.Error("a spill was opened after the session's spill root was released")
-	}
+	// The reason is asserted, not merely the error: after Release the root is gone,
+	// so an unguarded openSink would fail with ENOENT from the O_EXCL create and an
+	// "err != nil" assertion could not tell the guard from its absence.
+	assertSpillRejection(t, "openSink after Release", func() error {
+		_, err := dir.openSink(uuid.UUID{9}, 64)
+		return err
+	}, "spill root was released")
 	entries, err := os.ReadDir(base)
 	if err != nil {
 		t.Fatalf("read base: %v", err)
@@ -655,9 +786,12 @@ var errFakeDiskFull = errors.New("no space left on device")
 // write outright or accepts a prefix. shortAfter < 0 disables the short write.
 type faultyBacking struct {
 	shortAfter int
-	err        error
-	written    int
-	accepted   []byte
+	// silent makes a short write return (n, nil) rather than (n, io.ErrShortWrite),
+	// which is what forces the sink to synthesize the error itself.
+	silent   bool
+	err      error
+	written  int
+	accepted []byte
 }
 
 func (f *faultyBacking) write(p []byte) (int, error) {
@@ -668,6 +802,9 @@ func (f *faultyBacking) write(p []byte) (int, error) {
 		room := max(f.shortAfter-f.written, 0)
 		f.accepted = append(f.accepted, p[:room]...)
 		f.written += room
+		if f.silent {
+			return room, nil
+		}
 		return room, io.ErrShortWrite
 	}
 	f.accepted = append(f.accepted, p...)

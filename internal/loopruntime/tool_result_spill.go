@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"hash"
 	"io"
 	"os"
@@ -316,22 +317,45 @@ func UnavailableToolResultSpillDirectory(cause error) *ToolResultSpillDirectory 
 }
 
 // captureSpillError is the typed cause when a spill directory or file cannot be
-// established. It never carries tool output or argument text — only the path the
-// loop itself derived.
+// established. It never carries tool output or argument text — only paths the
+// loop itself derived or the composition root supplied.
+//
+// Subject names WHICH path is at fault, because one check runs over two of them:
+// an operator whose base is wrong and an operator whose session root is wrong
+// take different actions, and "spill directory" alone tells them apart from
+// neither.
 type captureSpillError struct {
-	Path   string
-	Reason string
-	Cause  error
+	Subject string
+	Path    string
+	Reason  string
+	Cause   error
 }
 
+// Error renders the wrapped cause. Every reason this type carries is a syscall
+// outcome whose ERRNO is the whole diagnosis — a missing base, an unreadable one
+// and a base that is a file all reach "stat spill base", and an operator who
+// cannot tell ENOENT from EACCES from ENOTDIR has been told nothing actionable.
+// The cause is a filesystem error, never tool output or argument text, so
+// rendering it leaks nothing the Path did not already.
 func (e *captureSpillError) Error() string {
-	if e.Path == "" {
-		return "loop: tool result spill: " + e.Reason
+	message := "loop: tool result spill: " + e.Reason
+	if e.Path != "" {
+		message += ": " + e.Path
 	}
-	return "loop: tool result spill: " + e.Reason + ": " + e.Path
+	if e.Cause != nil {
+		message += ": " + e.Cause.Error()
+	}
+	return message
 }
 
 func (e *captureSpillError) Unwrap() error { return e.Cause }
+
+// ToolResultSpillError is the exported name for the typed cause above. Release is
+// the one spill operation whose error crosses a package boundary — internal/sessionruntime
+// folds a failed removal into the shutdown failure list every other teardown phase
+// reports through — and that caller must be able to match it by TYPE rather than
+// by message text.
+type ToolResultSpillError = captureSpillError
 
 // newCaptureSpillDirectory establishes <base>/<sessionID> as this session's spill
 // root. It does NOT create the base: where a host may write local bytes is the
@@ -345,13 +369,23 @@ func (e *captureSpillError) Unwrap() error { return e.Cause }
 //
 // What is and is not checked, precisely. The BASE must be an absolute path, must
 // already exist, must be a directory rather than a symlink AS ITS FINAL COMPONENT,
-// and must not be writable by group or other — a base anyone else can write to is
-// a base anyone else can plant the session root in. Harness does not resolve the
-// base's interior components and does not repair its permissions; pkg/rig's public
-// option canonicalizes the base with EvalSymlinks before wiring it, which is the
-// layer that owns the whole path. The ROOT is created by harness, so it is held to
-// the full property: one component, created 0700, then lstat-checked as a
-// non-symlink directory.
+// and must not be writable by group or other by MODE (see verifySpillBase for what
+// that does and does not establish). Harness checks the FINAL COMPONENT only and
+// repairs nothing.
+//
+// Above that component the guarantee is pkg/rig's, and it is narrower than
+// "canonicalized": rig's canonicalPath resolves the whole path with EvalSymlinks
+// only when the base EXISTS at Define time. When it does not — which
+// WithToolResultCapture explicitly permits, since a host may create the base after
+// the rig is defined — canonicalizeNonexistent resolves the longest existing
+// ancestor and rejoins the remainder lexically. So the whole-path property holds
+// for a base that existed at Define time and has not been re-linked since; a
+// symlink planted at an interior component created afterwards is resolved by
+// nobody, and would need write access to an ancestor.
+//
+// The ROOT is created by harness, so it is held to the full property: one
+// component, created 0700 inside an already-checked directory, then lstat-checked
+// as a non-symlink directory.
 func newCaptureSpillDirectory(base string, sessionID uuid.UUID) (*captureSpillDirectory, error) {
 	if strings.TrimSpace(base) == "" {
 		return nil, &captureSpillError{Reason: "spill base is empty"}
@@ -363,10 +397,34 @@ func newCaptureSpillDirectory(base string, sessionID uuid.UUID) (*captureSpillDi
 		return nil, err
 	}
 	root := filepath.Join(base, sessionID.String())
-	if err := os.Mkdir(root, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-		return nil, &captureSpillError{Path: root, Reason: "create spill root", Cause: err}
+	created := true
+	if err := os.Mkdir(root, 0o700); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return nil, &captureSpillError{Subject: spillRootSubject, Path: root, Reason: "create spill root", Cause: err}
+		}
+		// The root already existed, so this call did not create it and must not
+		// remove it on a later failure.
+		created = false
 	}
 	if err := verifySpillRoot(root); err != nil {
+		// This is the one path on which a root can be created and then abandoned:
+		// the caller receives an error, so it holds no directory, and the
+		// Unavailable directory a session substitutes has an empty root and removes
+		// nothing. Undo exactly what this call did — and only that, which is what
+		// the created flag is for, since removing a root belonging to an existing
+		// session would be far worse than leaving an empty one.
+		//
+		// No test drives this branch, and the reason is the same shape as the
+		// chmods above. The window is between two syscalls on a directory this
+		// process created a moment earlier under a base it has already checked, so
+		// the only reachable cause is another process mutating the root in that
+		// window, or an I/O error. Neither is arrangeable in-process without adding
+		// an injection seam to production code. The reachable half of the created
+		// flag — never removing a root this call did not make — IS driven, by
+		// TestCaptureSpillDirectoryReestablishmentPreservesAnExistingRoot.
+		if created {
+			_ = os.Remove(root)
+		}
 		return nil, err
 	}
 	return &captureSpillDirectory{root: root}, nil
@@ -378,13 +436,30 @@ func newCaptureSpillDirectory(base string, sessionID uuid.UUID) (*captureSpillDi
 // harness does not own — and a group- or world-writable base is a condition to
 // refuse, not to repair, because by the time the repair ran an entry could already
 // have been planted.
+//
+// The check is PARTIAL and worth stating exactly, because the mode bits are the
+// only thing it looks at. It rejects group- and other-write; it does not check
+// ownership, so a 0755 base owned by another uid passes, and it does not check
+// anything above the final component. What it buys is the common misconfiguration,
+// not a proof that only this process can write there.
+//
+// Two ordinary Kubernetes mounts fail it and the message has to say so plainly:
+// an emptyDir is created 0777 by the kubelet and an fsGroup mount is 0770 setgid.
+// Rejecting them is deliberate — a spill root holds complete tool output — but the
+// failure surfaces at the first oversized tool result, because Define validates
+// only that the base is absolute. The reason therefore carries the observed mode
+// and the requirement, so the fix is a chmod rather than a support ticket.
 func verifySpillBase(base string) error {
-	info, err := lstatDirectory(base)
+	info, err := lstatDirectory(spillBaseSubject, base)
 	if err != nil {
 		return err
 	}
-	if info.Mode().Perm()&0o022 != 0 {
-		return &captureSpillError{Path: base, Reason: "spill base is writable by group or other"}
+	if perm := info.Mode().Perm(); perm&0o022 != 0 {
+		return &captureSpillError{
+			Subject: spillBaseSubject,
+			Path:    base,
+			Reason:  fmt.Sprintf("spill base is writable by group or other (mode=%04o, want no group/other write)", perm),
+		}
 	}
 	return nil
 }
@@ -400,30 +475,40 @@ func verifySpillBase(base string) error {
 // owner cannot traverse it. No test drives that path, because the umask is
 // process-global and setting it would race every parallel test in the package.
 func verifySpillRoot(root string) error {
-	if _, err := lstatDirectory(root); err != nil {
+	if _, err := lstatDirectory(spillRootSubject, root); err != nil {
 		return err
 	}
 	// #nosec G302 -- 0700 is owner-only for a DIRECTORY: the execute bit is what
 	// permits traversal, so 0600 would make the directory unusable by its owner.
 	if err := os.Chmod(root, 0o700); err != nil {
-		return &captureSpillError{Path: root, Reason: "restrict spill directory", Cause: err}
+		return &captureSpillError{Subject: spillRootSubject, Path: root, Reason: "restrict spill root", Cause: err}
 	}
 	return nil
 }
 
+// spillBaseSubject and spillRootSubject label the two paths lstatDirectory runs
+// over. The base is supplied by the composition root and the root is created by
+// harness, so the same failing check means different things and calls for
+// different action.
+const (
+	spillBaseSubject = "spill base"
+	spillRootSubject = "spill root"
+)
+
 // lstatDirectory rejects a path that does not exist, is a symlink, or is not a
 // directory. It lstats rather than stats, so a symlink is seen as a symlink
-// instead of as whatever it points at.
-func lstatDirectory(path string) (os.FileInfo, error) {
+// instead of as whatever it points at. subject names which of the two paths is
+// being checked and appears in every reason it produces.
+func lstatDirectory(subject, path string) (os.FileInfo, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return nil, &captureSpillError{Path: path, Reason: "stat spill directory", Cause: err}
+		return nil, &captureSpillError{Subject: subject, Path: path, Reason: "stat " + subject, Cause: err}
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, &captureSpillError{Path: path, Reason: "spill directory is a symlink"}
+		return nil, &captureSpillError{Subject: subject, Path: path, Reason: subject + " is a symlink"}
 	}
 	if !info.IsDir() {
-		return nil, &captureSpillError{Path: path, Reason: "spill directory is not a directory"}
+		return nil, &captureSpillError{Subject: subject, Path: path, Reason: subject + " is not a directory"}
 	}
 	return info, nil
 }

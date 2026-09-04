@@ -225,6 +225,46 @@ func TestSessionShutdownReleasesTheToolResultSpillRoot(t *testing.T) {
 	}
 }
 
+// TestSessionShutdownReportsAFailedSpillRelease is the reader for the release
+// error reaching Shutdown's failure list rather than being dropped. Every other
+// teardown phase reports through that list; a discarded RemoveAll would leave the
+// session's complete tool output on disk with no signal at all, which on a pooled
+// host is a disk-fill vector nobody can see.
+func TestSessionShutdownReportsAFailedSpillRelease(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	session, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}),
+		WithToolResultCapture(stubToolResultObjects{}, base))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	root := filepath.Join(base, session.sessionID.String())
+	if _, err := os.Lstat(root); err != nil {
+		t.Fatalf("lstat spill root after construction: %v", err)
+	}
+	// Removing an entry needs write permission on its PARENT, so a read-and-execute
+	// base makes RemoveAll fail while leaving the root itself perfectly readable.
+	if err := os.Chmod(base, 0o500); err != nil {
+		t.Fatalf("chmod base: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(base, 0o700) })
+
+	shutdownErr := session.Shutdown(context.Background())
+	if _, statErr := os.Lstat(root); statErr != nil {
+		t.Skipf("this environment removed the root from a read-only parent (running as root?): %v", statErr)
+	}
+	if shutdownErr == nil {
+		t.Fatal("Shutdown reported success while the spill root it could not remove is still on disk")
+	}
+	var spillErr *loopruntime.ToolResultSpillError
+	if !errors.As(shutdownErr, &spillErr) {
+		t.Fatalf("Shutdown error = %v, want it to carry the spill release failure", shutdownErr)
+	}
+	if spillErr.Reason != "remove spill root" {
+		t.Fatalf("spill failure reason = %q, want %q", spillErr.Reason, "remove spill root")
+	}
+}
+
 // TestSessionSpillEstablishmentAndReleaseAreOrderedUnderConcurrency is the
 // Session-layer test the two single-goroutine tests above cannot stand in for.
 // Loop construction calls toolResultSpillDirectory WITHOUT loopsMu held
@@ -303,10 +343,15 @@ func TestSessionSpillDirectoryAfterReleaseCreatesNothing(t *testing.T) {
 }
 
 // TestAbortConstructionReleasesTheToolResultSpillRoot is the reader for the
-// second release call site. A session that fails during construction never
-// reaches teardown, so abortConstruction is the only thing that can remove a spill
-// root a loop built before the failure — and a construction abort is exactly when
-// a half-built session is most likely to have one.
+// SECOND release call site, and for that alone. A session that fails during
+// construction never reaches teardown, so abortConstruction is the only thing that
+// can remove a spill root a loop built before the failure — and a construction
+// abort is exactly when a half-built session is most likely to have one.
+//
+// It is deliberately NOT a reader for the sync.Once claim: it is single-goroutine,
+// so it passes with the Once claim removed. The two readers for that are
+// TestSessionSpillEstablishmentAndReleaseAreOrderedUnderConcurrency and
+// TestSessionSpillDirectoryAfterReleaseCreatesNothing.
 func TestAbortConstructionReleasesTheToolResultSpillRoot(t *testing.T) {
 	t.Parallel()
 	base := t.TempDir()

@@ -574,13 +574,19 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// never opened a gate reports attempted=false here and falls through
 		// exactly as if review context were never configured.
 		if reviewErr, attempted := reviewCapture.failed(); attempted && reviewErr != nil {
-			// A no-op today, kept as defence in depth. RunBatch resolves access
-			// sequentially BEFORE its execute phase and returns collectResults on a
-			// *reviewContextCaptureError, so no call in this batch ever ran and no
-			// result can carry a capture sink — deleting this line is an equivalent
-			// mutation, and TestReviewCaptureFailureCannotLeaveASpillIsGuaranteedByRunBatch
-			// pins that premise (no ToolCallStarted, empty spill root) rather than
-			// pretending this line is what holds it.
+			// This line is a NO-OP, and not merely because of the current phase
+			// ordering: RunBatch returns collectResults on a
+			// *reviewContextCaptureError, and collectResults builds every element as
+			// result{ToolExecutionID, ToolUseID} with no capture field at all. No
+			// reordering of RunBatch could make this line release anything while
+			// collectResults stays as it is, so deleting it is an equivalent mutation
+			// and it must not be read as defence in depth.
+			//
+			// What actually holds the property is two other things: the phase boundary
+			// TestReviewCaptureFailureCannotLeaveASpillIsGuaranteedByRunBatch pins (no
+			// ToolCallStarted is emitted, so no call opened a spill), and runOne's
+			// deferred sink.release(), which discards the spill of any call that DOES
+			// run and returns no retainable result.
 			releaseCaptures(results)
 			return event.TurnFailed{TurnIndex: ts.index, Err: reviewErr}
 		}
