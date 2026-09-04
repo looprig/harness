@@ -486,6 +486,12 @@ func TestToolResultMessage(t *testing.T) {
 	}
 }
 
+// TestRunTurnToolResultShaping is the H5.2 retention regression. Before H5.2 it
+// asserted only that the COMMITTED model message was the shaped preview, which a
+// loop that flattened and then discarded the original bytes satisfied. It now
+// asserts both halves of the property that made shaping safe: the model message
+// stays bounded AND the complete result bytes are retrievable afterwards through
+// the durable capture recorded on the same StepDone.
 func TestRunTurnToolResultShaping(t *testing.T) {
 	t.Parallel()
 
@@ -509,7 +515,9 @@ func TestRunTurnToolResultShaping(t *testing.T) {
 	}}
 	ts := agenticToolSet([]tool.InvokableTool{rawTool}, 25, 100)
 	ts.MaxToolResultBytes = maxBytes
+	objects := newFakeObjectStore()
 	cfg, st, rec := newTurnFixture(nil, nil, ts, client, noGateReg())
+	cfg.toolResultObjects = objects
 	var executionResult *tool.ToolResult
 	cfg.hooks = compileRuntimeHooks(t, hook.Set{Around: []hook.Around{{
 		Operation: hook.OperationToolExecution,
@@ -533,7 +541,6 @@ func TestRunTurnToolResultShaping(t *testing.T) {
 		t.Fatalf("execution hook result = %#v, want raw graph %#v", executionResult.Content, wantRaw)
 	}
 
-	wantShaped := shapeToolResultText(rawText, maxBytes)
 	sds := stepDones(rec.events())
 	if len(sds) != 2 {
 		t.Fatalf("StepDone count = %d, want 2", len(sds))
@@ -552,13 +559,58 @@ func TestRunTurnToolResultShaping(t *testing.T) {
 	if !ok {
 		t.Fatalf("StepDone tool result block = %T, want *content.TextBlock", trm.Blocks[0])
 	}
-	if stepText.Text != wantShaped {
-		t.Fatalf("StepDone tool result text = %q, want %q", stepText.Text, wantShaped)
-	}
+
+	// Half one: the committed model message is still bounded, and is strictly
+	// smaller than the result the tool produced (otherwise "bounded" would be
+	// satisfied by a result that never needed shaping).
 	if len(stepText.Text) > maxBytes {
 		t.Fatalf("StepDone tool result bytes = %d, want <= %d", len(stepText.Text), maxBytes)
 	}
+	if len(rawText) <= maxBytes {
+		t.Fatalf("fixture is vacuous: raw result is %d bytes, want > %d", len(rawText), maxBytes)
+	}
+	if stepText.Text == rawText {
+		t.Fatal("StepDone tool result carries the unshaped text; the fixture no longer exercises shaping")
+	}
 
+	// Half two: the complete bytes are retrievable through the durable capture
+	// committed on the SAME StepDone.
+	if len(sds[0].Captures) != 1 {
+		t.Fatalf("StepDone.Captures len = %d, want 1", len(sds[0].Captures))
+	}
+	capture := sds[0].Captures[0]
+	if capture.ToolUseID != trm.ToolUseID {
+		t.Fatalf("capture ToolUseID = %q, want %q", capture.ToolUseID, trm.ToolUseID)
+	}
+	if capture.ToolExecutionID.IsZero() {
+		t.Fatal("capture ToolExecutionID is zero")
+	}
+	if capture.Reference == nil {
+		t.Fatal("capture carries no object reference; the elided bytes are unreachable")
+	}
+	stored, ok := objects.get(capture.Reference.ObjectID)
+	if !ok {
+		t.Fatalf("object %q was never written to the store", capture.Reference.ObjectID)
+	}
+	if string(stored) != rawText {
+		t.Fatalf("retained object = %q, want the complete result %q", stored, rawText)
+	}
+	original, exact := capture.OriginalSize()
+	if !exact || original != uint64(len(rawText)) {
+		t.Fatalf("capture OriginalSize() = (%d, %v), want (%d, true)", original, exact, len(rawText))
+	}
+	if capture.CapturedBytes != uint64(len(rawText)) {
+		t.Fatalf("capture CapturedBytes = %d, want %d", capture.CapturedBytes, len(rawText))
+	}
+	if capture.Truncated {
+		t.Fatal("capture reports truncation, but the whole result fit under the capture ceiling")
+	}
+
+	// The model is told the result was elided and can be retrieved; the committed
+	// message and the next request stay identical.
+	if !strings.Contains(stepText.Text, toolResultRetainedMarkerPrefix) {
+		t.Fatalf("StepDone tool result text %q carries no retention marker", stepText.Text)
+	}
 	reqs := client.requests()
 	if len(reqs) != 2 {
 		t.Fatalf("inference request count = %d, want 2", len(reqs))
@@ -569,9 +621,6 @@ func TestRunTurnToolResultShaping(t *testing.T) {
 			requestText = flattenToText(candidate.Blocks)
 			break
 		}
-	}
-	if requestText != wantShaped {
-		t.Fatalf("next inference tool result text = %q, want %q", requestText, wantShaped)
 	}
 	if requestText != stepText.Text {
 		t.Fatalf("StepDone tool result text %q differs from next request %q", stepText.Text, requestText)

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/looprig/harness/pkg/event"
 )
 
 func TestShapeToolResultTextUnderLimitIsIdentity(t *testing.T) {
@@ -191,5 +193,96 @@ func TestResolveToolSetCapsResultBytes(t *testing.T) {
 				t.Fatalf("MaxToolResultBytes = %d, want %d", got.MaxToolResultBytes, tt.want)
 			}
 		})
+	}
+}
+
+// TestToolResultRetainedMarkerRendersInexactSizeAsLowerBound is the direct
+// coverage toolResultRetainedMarker's doc comment points at. The materialized
+// path always knows the producer's exact length, so this branch is reached only
+// through a capture whose OriginalBytes is nil — which is why it is exercised
+// here rather than through a turn.
+func TestToolResultRetainedMarkerRendersInexactSizeAsLowerBound(t *testing.T) {
+	t.Parallel()
+	exact := uint64(900)
+	tests := []struct {
+		name    string
+		capture event.ToolResultCapture
+		want    string
+	}{
+		{
+			name:    "exact and complete",
+			capture: event.ToolResultCapture{ToolUseID: "tu-1", CapturedBytes: 900, OriginalBytes: &exact},
+			want:    "\n[tool output shaped; all 900 bytes retained for tool_use_id \"tu-1\"]\n",
+		},
+		{
+			name:    "exact and truncated",
+			capture: event.ToolResultCapture{ToolUseID: "tu-1", CapturedBytes: 100, OriginalBytes: &exact, Truncated: true},
+			want:    "\n[tool output shaped; 100 of 900 bytes retained for tool_use_id \"tu-1\"]\n",
+		},
+		{
+			name:    "inexact reports a lower bound",
+			capture: event.ToolResultCapture{ToolUseID: "tu-1", CapturedBytes: 100, OriginalBytesLowerBound: 900, Truncated: true},
+			want:    "\n[tool output shaped; 100 of at least 900 bytes retained for tool_use_id \"tu-1\"]\n",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := toolResultRetainedMarker(tt.capture); got != tt.want {
+				t.Fatalf("marker = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestToolResultRetainedMarkerNamesTheCallNotTheObject pins that the identity of
+// the retained object never reaches the model prompt. The identity is opaque, so
+// leaking it would not disclose a backend path, but the marker is prompt text and
+// the model has no use for an identity it cannot resolve.
+func TestToolResultRetainedMarkerNamesTheCallNotTheObject(t *testing.T) {
+	t.Parallel()
+	size := uint64(1200)
+	reference := newCaptureReference(strings.Repeat("ab", 32))
+	marker := toolResultRetainedMarker(event.ToolResultCapture{
+		ToolUseID: "tu-7", CapturedBytes: 1200, OriginalBytes: &size, Reference: &reference,
+	})
+	if !strings.Contains(marker, `"tu-7"`) {
+		t.Fatalf("marker %q does not name the call it describes", marker)
+	}
+	if strings.Contains(marker, reference.ObjectID) || strings.Contains(marker, captureObjectIDPrefix) {
+		t.Fatalf("marker %q carries the object identity", marker)
+	}
+}
+
+// TestToolResultCapturePreviewFitsTheModelBudget enumerates limits either side
+// of the marker length rather than pinning one, because the function's bound is
+// stated conditionally: at most limit whenever limit exceeds len(marker), and the
+// marker alone otherwise.
+func TestToolResultCapturePreviewFitsTheModelBudget(t *testing.T) {
+	t.Parallel()
+	const marker = "\n[marker]\n"
+	text := strings.Repeat("s", 4096)
+	for _, limit := range []int{1, len(marker) - 1, len(marker), len(marker) + 1, 64, 256, 4096, 8192} {
+		got := shapeCapturedToolResultText(text, limit, marker)
+		if !strings.HasSuffix(got, marker) {
+			t.Fatalf("limit=%d: result %q does not end with the marker", limit, got)
+		}
+		switch {
+		case limit > len(marker):
+			if len(got) > limit {
+				t.Errorf("limit=%d: result is %d bytes, want <= %d", limit, len(got), limit)
+			}
+			if len(got) <= len(marker) {
+				t.Errorf("limit=%d: result is marker-only although the budget allows a preview", limit)
+			}
+		default:
+			if got != marker {
+				t.Errorf("limit=%d: result = %q, want the marker alone", limit, got)
+			}
+		}
+	}
+	if got := shapeCapturedToolResultText(text, 0, marker); got != text+marker {
+		t.Fatal("a zero limit must leave the preview unbounded, matching shapeToolResultText")
 	}
 }

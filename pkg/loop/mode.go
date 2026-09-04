@@ -14,6 +14,30 @@ const (
 	minToolResultBytes          = 256
 )
 
+// DefaultToolResultCaptureBytes is the per-result durable retention ceiling a
+// loop applies when ToolLimits.CaptureBytes is left zero: 8 MiB.
+//
+// It is deliberately NOT derived from ToolLimits.ResultBytes, whose zero means
+// "do not bound the model-visible text at all". A retention ceiling that
+// defaulted to unbounded would make an oversized tool result an unbounded
+// durable object, and a retention ceiling that defaulted to the model budget
+// would retain no more than the preview it exists to complete.
+//
+// 8 MiB is chosen against what a retained object is FOR: it holds a complete
+// build log, test output or file read that the model only sees a preview of, and
+// a later paging read is served from it by byte range. A session that retains a
+// hundred such results stays under a gigabyte, which is an object store's
+// ordinary working set rather than a capacity decision an operator must make per
+// agent. Above this a result is better served by the streaming capture path,
+// which reaches the same ceiling without ever holding the result in memory.
+const DefaultToolResultCaptureBytes = 8 << 20
+
+// minToolResultCaptureBytes is the smallest capture ceiling a definition may
+// declare. It coincides with minToolResultBytes because a capture ceiling below
+// the smallest legal model preview would retain strictly less than the message
+// it exists to complete, which inverts the purpose of retaining anything.
+const minToolResultCaptureBytes = minToolResultBytes
+
 // ModeName identifies a predeclared loop mode. The empty name identifies the base mode.
 type ModeName string
 
@@ -23,6 +47,14 @@ type ToolLimits struct {
 	Calls       int
 	Parallel    int
 	ResultBytes int
+
+	// CaptureBytes bounds how many bytes of one tool result the loop retains
+	// durably in the SessionObjectStore. It is a SEPARATE knob from ResultBytes:
+	// ResultBytes bounds the text the model sees and its zero means unbounded,
+	// while CaptureBytes bounds durable retention and its zero means
+	// DefaultToolResultCaptureBytes. A declared value below
+	// minToolResultCaptureBytes is rejected.
+	CaptureBytes int
 }
 
 // Mode declares a validated alternative to a definition's base inference settings.
@@ -82,6 +114,9 @@ func resolveLimits(base, override ToolLimits) ToolLimits {
 	if override.ResultBytes > 0 {
 		result.ResultBytes = override.ResultBytes
 	}
+	if override.CaptureBytes > 0 {
+		result.CaptureBytes = override.CaptureBytes
+	}
 	return result
 }
 
@@ -95,10 +130,14 @@ func defaultLimits(limits ToolLimits) ToolLimits {
 	if limits.Parallel == 0 {
 		limits.Parallel = defaultMaxParallelToolCalls
 	}
+	if limits.CaptureBytes == 0 {
+		limits.CaptureBytes = DefaultToolResultCaptureBytes
+	}
 	return limits
 }
 
 func invalidLimits(limits ToolLimits) bool {
 	return limits.Iterations < 0 || limits.Calls < 0 || limits.Parallel < 0 ||
-		limits.ResultBytes < 0 || (limits.ResultBytes > 0 && limits.ResultBytes < minToolResultBytes)
+		limits.ResultBytes < 0 || (limits.ResultBytes > 0 && limits.ResultBytes < minToolResultBytes) ||
+		limits.CaptureBytes < 0 || (limits.CaptureBytes > 0 && limits.CaptureBytes < minToolResultCaptureBytes)
 }

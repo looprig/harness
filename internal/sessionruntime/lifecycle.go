@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/gate"
@@ -497,6 +498,19 @@ func WithLifecycleWorkspaceCheckpointing(ws *workspacestore.Store, root string) 
 	return func(r *Lifecycle) {
 		if ws != nil {
 			r.baseOpts = append(r.baseOpts, WithWorkspaceCheckpointing(ws, root))
+		}
+	}
+}
+
+// WithLifecycleToolResultCapture captures the SessionObjectStore durable
+// tool-result retention writes into, and forwards it to both NewSession and
+// RestoreSession as WithToolResultCapture. A nil store is ignored, which leaves
+// retention unconfigured rather than installing a store the loop would
+// nil-deref on.
+func WithLifecycleToolResultCapture(objects loopruntime.ToolResultObjectStore) LifecycleOption {
+	return func(r *Lifecycle) {
+		if objects != nil {
+			r.baseOpts = append(r.baseOpts, WithToolResultCapture(objects))
 		}
 	}
 }

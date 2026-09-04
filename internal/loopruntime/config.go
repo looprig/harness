@@ -57,7 +57,7 @@ func resolveMode(bound loop.BoundDefinition, modeName loop.ModeName) (runtimeCon
 	resolved := runtimeConfig{
 		Client: bound.Client(), Model: model, System: loop.EffectiveSystem(bound.System(), mode.Instructions), DrainTimeout: bound.DrainTimeout(),
 		AgentName: bound.Name(), Engine: bound.Engine(), RuntimeContext: bound.RuntimeContext(),
-		Tools: ToolSet{Access: bound.Access(), Registry: mode.Tools, Middlewares: bound.Middlewares(), MaxToolIterations: limits.Iterations, MaxToolCallsPerTurn: limits.Calls, MaxParallelToolCalls: limits.Parallel, MaxToolResultBytes: limits.ResultBytes},
+		Tools: ToolSet{Access: bound.Access(), Registry: mode.Tools, Middlewares: bound.Middlewares(), MaxToolIterations: limits.Iterations, MaxToolCallsPerTurn: limits.Calls, MaxParallelToolCalls: limits.Parallel, MaxToolResultBytes: limits.ResultBytes, MaxToolResultCaptureBytes: limits.CaptureBytes},
 	}
 	if output, configured := bound.OutputSchema(); configured {
 		resolved.Output = cloneOutputSchema(output)
@@ -240,6 +240,14 @@ type runtimeConfig struct {
 	// nil (the default for every pre-existing caller) leaves every turn's
 	// reviewContext nil, byte-identical to before this field existed.
 	reviewContext *reviewContextConfiguration
+
+	// ToolResultObjects is the SessionObjectStore seam durable tool-result
+	// retention runs through. It is runtime wiring, not declarative policy, so it
+	// arrives via RuntimeDependencies rather than the loop Definition: which store
+	// a session writes to is the composition root's placement decision, while
+	// ToolLimits.CaptureBytes (the ceiling) is the agent's. nil turns retention
+	// off, leaving every committed step byte-identical to what it was before.
+	ToolResultObjects ToolResultObjectStore
 }
 
 // RuntimeDependencies carries native runtime collaborators that are not part
@@ -252,4 +260,9 @@ type RuntimeDependencies struct {
 	// has permission classifiers registered — see Session.loopReviewContext).
 	// nil leaves the resulting loop's turns with reviewContext == nil.
 	ReviewContext *ReviewContext
+
+	// ToolResultObjects wires durable tool-result retention. Like Compactor and
+	// ReviewContext it is optional: nil leaves the loop with no retention, which
+	// is the behaviour of every caller that predates the capture pipeline.
+	ToolResultObjects ToolResultObjectStore
 }

@@ -334,6 +334,15 @@ type Session struct {
 	// (Dependency Inversion): it never sees the Blobs backend beneath it.
 	ws     *workspacestore.Store // nil unless WithWorkspaceCheckpointing wired it; gates CheckpointWorkspace
 	wsRoot string                // the workspace directory Snapshot archives
+
+	// toolResultObjects is the SessionObjectStore every loop in this session
+	// retains oversized tool results into, wired by WithToolResultCapture. nil
+	// (the default, no option) leaves retention off: a loop then commits the
+	// shaped preview alone, exactly as it did before the capture pipeline
+	// existed. It is passed straight through to loopruntime.RuntimeDependencies
+	// at each of the three loop-construction sites; the session itself never
+	// reads or writes an object.
+	toolResultObjects loopruntime.ToolResultObjectStore
 	// wsResidency is the checkpoint boundary this session came up on, folded from the
 	// durable stream by Restore. It is written once, before the session is handed to a
 	// caller, and read-only afterwards.
@@ -1648,7 +1657,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 				eventTarget,
 				bound,
 				startedMode,
-				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext()},
+				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext(), ToolResultObjects: s.toolResultObjects},
 			)
 		}
 	case loop.EngineAdapter:

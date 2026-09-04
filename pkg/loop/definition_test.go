@@ -207,7 +207,7 @@ func TestDefinitionDefaultsAndDefensiveCopies(t *testing.T) {
 	if b.Delegates()[0] != "worker" {
 		t.Fatal("Delegates aliases returned slice")
 	}
-	if got := b.ToolLimits(); got != (ToolLimits{Iterations: 25, Calls: 100, Parallel: 8, ResultBytes: 0}) {
+	if got := b.ToolLimits(); got != (ToolLimits{Iterations: 25, Calls: 100, Parallel: 8, ResultBytes: 0, CaptureBytes: DefaultToolResultCaptureBytes}) {
 		t.Fatalf("ToolLimits = %+v", got)
 	}
 	if got := b.DrainTimeout(); got != 5*time.Second {

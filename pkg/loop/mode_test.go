@@ -72,7 +72,7 @@ func TestModeResolutionAndCopy(t *testing.T) {
 	if mode.Model.Name != testModel().Name || mode.Effort != model.EffortHigh || mode.Instructions != "plan more" {
 		t.Fatalf("resolved mode = %+v", mode)
 	}
-	if mode.ToolLimits != (ToolLimits{Iterations: 3, Calls: 7, Parallel: 2, ResultBytes: 2048}) {
+	if mode.ToolLimits != (ToolLimits{Iterations: 3, Calls: 7, Parallel: 2, ResultBytes: 2048, CaptureBytes: DefaultToolResultCaptureBytes}) {
 		t.Fatalf("resolved limits = %+v", mode.ToolLimits)
 	}
 }
@@ -150,4 +150,79 @@ func modelWithEffort(effort model.Effort) model.Model {
 	model := testModel()
 	model.Sampling.Effort = effort
 	return model
+}
+
+// TestToolLimitsCaptureBytesIsSeparateFromResultBytes pins the Step 3 contract:
+// the retention ceiling and the model-text budget are independent knobs with
+// different zero meanings. A single fixture could not show that — the pairs are
+// enumerated so a mutant that derived either from the other disagrees on one.
+func TestToolLimitsCaptureBytesIsSeparateFromResultBytes(t *testing.T) {
+	t.Parallel()
+	for _, resultBytes := range []int{0, 256, 4096} {
+		for _, captureBytes := range []int{0, 256, 4096, 1 << 20} {
+			limits := defaultLimits(ToolLimits{ResultBytes: resultBytes, CaptureBytes: captureBytes})
+			// ResultBytes keeps its zero: zero means "do not bound the model text".
+			if limits.ResultBytes != resultBytes {
+				t.Errorf("result=%d capture=%d: ResultBytes = %d, want %d (zero must stay unbounded)",
+					resultBytes, captureBytes, limits.ResultBytes, resultBytes)
+			}
+			wantCapture := captureBytes
+			if wantCapture == 0 {
+				wantCapture = DefaultToolResultCaptureBytes
+			}
+			if limits.CaptureBytes != wantCapture {
+				t.Errorf("result=%d capture=%d: CaptureBytes = %d, want %d",
+					resultBytes, captureBytes, limits.CaptureBytes, wantCapture)
+			}
+		}
+	}
+}
+
+// TestToolLimitsCaptureBytesValidation walks the floor from both sides so the
+// rejected and accepted values bracket it rather than sampling one of each far
+// from the boundary.
+func TestToolLimitsCaptureBytesValidation(t *testing.T) {
+	t.Parallel()
+	for _, value := range []int{-1, 1, minToolResultCaptureBytes - 1} {
+		if !invalidLimits(ToolLimits{CaptureBytes: value}) {
+			t.Errorf("CaptureBytes = %d was accepted, want rejected", value)
+		}
+	}
+	for _, value := range []int{0, minToolResultCaptureBytes, minToolResultCaptureBytes + 1, DefaultToolResultCaptureBytes} {
+		if invalidLimits(ToolLimits{CaptureBytes: value}) {
+			t.Errorf("CaptureBytes = %d was rejected, want accepted", value)
+		}
+	}
+}
+
+// TestToolLimitsCaptureBytesOverrideResolution pins that a mode's declared
+// ceiling overrides the base one and that leaving it zero inherits, matching
+// every other ToolLimits field.
+func TestToolLimitsCaptureBytesOverrideResolution(t *testing.T) {
+	t.Parallel()
+	base := ToolLimits{CaptureBytes: 4096}
+	if got := resolveLimits(base, ToolLimits{}).CaptureBytes; got != 4096 {
+		t.Errorf("unset override CaptureBytes = %d, want the base 4096", got)
+	}
+	if got := resolveLimits(base, ToolLimits{CaptureBytes: 8192}).CaptureBytes; got != 8192 {
+		t.Errorf("override CaptureBytes = %d, want 8192", got)
+	}
+}
+
+// TestPolicyRevisionMovesWithCaptureBytes is the Step 3 requirement that the
+// ceiling ride the policy digest. It asserts the digest CHANGES between two
+// declared ceilings and is stable for a repeated one, so a mutant that dropped
+// ToolLimits from the projection cannot pass by returning a constant.
+func TestPolicyRevisionMovesWithCaptureBytes(t *testing.T) {
+	t.Parallel()
+	revision := func(captureBytes int) string {
+		return mustDefinition(t, WithToolLimits(ToolLimits{CaptureBytes: captureBytes})).PolicyRevision()
+	}
+	small, large := revision(4096), revision(8192)
+	if small == large {
+		t.Fatal("PolicyRevision is identical for two different capture ceilings; the ceiling is not in the digest")
+	}
+	if again := revision(4096); again != small {
+		t.Fatalf("PolicyRevision is unstable for the same ceiling: %q then %q", small, again)
+	}
 }

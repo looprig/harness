@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreign"
@@ -289,6 +290,20 @@ func WithRuntimeCatalogProvider(provider RuntimeCatalogProvider) Option {
 // quiescence point); looprig only exposes the capability. A nil store is ignored (the
 // default unconfigured state stays), so a wiring slip can never install a store the
 // capability would nil-deref on.
+// WithToolResultCapture wires the SessionObjectStore that every loop in this
+// session retains oversized tool results into. Without it retention is off and a
+// loop commits only the shaped model preview, so wiring this option is what turns
+// "no layer may silently discard the tail of a tool result" from a policy into an
+// enforced one. A nil store is ignored, so a wiring slip leaves the default
+// unconfigured state rather than installing a store the loop would nil-deref on.
+func WithToolResultCapture(objects loopruntime.ToolResultObjectStore) Option {
+	return func(s *Session) {
+		if objects != nil {
+			s.toolResultObjects = objects
+		}
+	}
+}
+
 func WithWorkspaceCheckpointing(ws *workspacestore.Store, root string) Option {
 	return func(s *Session) {
 		if ws != nil {

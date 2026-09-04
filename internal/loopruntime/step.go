@@ -97,6 +97,13 @@ type stepState struct {
 	msgs   content.AgenticMessages
 	blocks blockState
 	status stepStatus
+
+	// captures are the durable ToolResultCaptures recorded alongside msgs on this
+	// step's StepDone — one per committed ToolResultMessage, or none at all. It is
+	// empty for a step with no tool results, for a loop with no configured
+	// ToolResultObjectStore, and for a truncated step (which commits a lone
+	// AIMessage and so has no result to describe).
+	captures []event.ToolResultCapture
 }
 
 // newStepState builds a fresh stepState with its identity (copied from the turn)

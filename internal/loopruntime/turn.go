@@ -185,6 +185,14 @@ type turnConfig struct {
 	// Nil preserves the ordinary loop path. A non-nil invalid configuration
 	// fails the tool step before access evaluation.
 	reviewContext *reviewContextConfiguration
+
+	// toolResultObjects is the durable retention seam for tool results: when it
+	// is non-nil the turn writes each committed tool result's full bytes to the
+	// SessionObjectStore BEFORE the shaped model preview is committed, and
+	// records the resulting ToolResultCapture on the same StepDone. nil (the
+	// default for every caller that does not wire a store) leaves the committed
+	// group byte-identical to what it was before this field existed.
+	toolResultObjects ToolResultObjectStore
 }
 
 // turnCommit is one commit request: the finalized step group to append to
@@ -556,10 +564,21 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		if reviewErr, attempted := reviewCapture.failed(); attempted && reviewErr != nil {
 			return event.TurnFailed{TurnIndex: ts.index, Err: reviewErr}
 		}
-		for _, r := range results {
-			trm := toolResultMessage(r, cfg.tools.MaxToolResultBytes)
+		// Durable retention runs BEFORE the model preview is committed: every
+		// result's full bytes reach the SessionObjectStore and are verified there
+		// first, so no shaped message can enter history claiming bytes that were
+		// already discarded.
+		retained, rerr := retainToolResults(stepCtx, cfg, results)
+		if rerr != nil {
+			// Cancelled mid-retention: nothing is committed, exactly as for a
+			// cancelled batch.
+			finishStepWith(rerr)
+			return event.TurnInterrupted{TurnIndex: ts.index}
+		}
+		for _, trm := range retained.messages {
 			st.msgs = append(st.msgs, trm)
 		}
+		st.captures = retained.captures
 		// The step is now COMPLETE (AIMessage finalized AND its tool results appended).
 		// Append the whole group to the staged turn and commit it (actor appends to
 		// loopState.msgs + emits StepDone at the same point).
@@ -570,6 +589,13 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			// already committed stay in loopState.msgs.
 			finishStepWith(cerr)
 			return event.TurnInterrupted{TurnIndex: ts.index}
+		}
+		if retained.retention != nil {
+			// The retention failure is durable now — the notice is in committed
+			// history — so the turn ends here, before the next inference. Proceeding
+			// would send the model a shaped preview whose elided bytes exist nowhere.
+			finishStepWith(retained.retention)
+			return event.TurnFailed{TurnIndex: ts.index, Err: retained.retention}
 		}
 		finishStepWith(nil)
 		candidate := turnInferenceRequest(cfg, ts, runtimeTail, outputPlan)
@@ -940,6 +966,7 @@ func stepDoneEvent(st stepState) event.StepDone {
 			},
 		},
 		Messages: group,
+		Captures: append([]event.ToolResultCapture(nil), st.captures...),
 	}
 }
 
@@ -1071,7 +1098,14 @@ func validToolCall(b content.ToolUseBlock) bool {
 // the model pairs result↔call), and the result's error flag (so the message-level
 // IsError survives into committed history instead of being dropped).
 func toolResultMessage(r result, maxBytes int) *content.ToolResultMessage {
-	text := shapeToolResultText(flattenToText(r.Content), maxBytes)
+	return toolResultMessageWithText(r, shapeToolResultText(flattenToText(r.Content), maxBytes))
+}
+
+// toolResultMessageWithText builds the committed ToolResultMessage from ALREADY
+// shaped text. The durable retention pipeline shapes against a different budget
+// (it must leave room for the retrieval marker), so it builds the message here
+// rather than reshaping through toolResultMessage — which would drop the marker.
+func toolResultMessageWithText(r result, text string) *content.ToolResultMessage {
 	return &content.ToolResultMessage{
 		Message:   content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: text}}},
 		ToolUseID: r.ToolUseID,
