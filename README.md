@@ -110,9 +110,11 @@ func main() {
 }
 ```
 
-For HTTP consumers, `pkg/serve` wraps a `Rig` and its sessions behind a
-narrow HTTP surface (submit, subscribe via SSE, respond to a gate,
-interrupt). For terminal consumers, the sibling `looprig/tui` module binds
+For existing HTTP consumers, `pkg/serve` retains a frozen compatibility
+surface over a `Rig` (submit, subscribe via SSE, respond to a gate,
+interrupt). Its public BFF role is deprecated in favor of Factory for new
+composition; see [the compatibility policy](pkg/serve/README.md).
+For terminal consumers, the sibling `looprig/tui` module binds
 against the same `Session` contract.
 
 ## Sibling modules

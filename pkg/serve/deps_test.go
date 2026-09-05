@@ -144,6 +144,10 @@ func TestImportAllowed(t *testing.T) {
 		{name: "forbidden llm", path: "github.com/looprig/harness/pkg/llm", want: false},
 		{name: "forbidden store", path: "github.com/looprig/harness/pkg/sessionstore", want: false},
 		{name: "forbidden third-party", path: "github.com/looprig/storage", want: false},
+		{name: "forbidden host", path: "github.com/looprig/host", want: false},
+		{name: "forbidden host subpackage", path: "github.com/looprig/host/runtime", want: false},
+		{name: "forbidden factory", path: "github.com/looprig/factory", want: false},
+		{name: "forbidden factory subpackage", path: "github.com/looprig/factory/api", want: false},
 		{name: "empty path", path: "", want: true},
 	}
 	for _, tt := range tests {

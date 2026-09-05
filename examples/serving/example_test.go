@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 
 	"github.com/looprig/core/uuid"
+	//lint:ignore SA1019 This example remains compiled until serve consumers migrate.
 	"github.com/looprig/harness/pkg/serve"
 )
 

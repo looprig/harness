@@ -22,6 +22,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
+	//lint:ignore SA1019 This adapter implements the retained serve compatibility contract.
 	"github.com/looprig/harness/pkg/serve"
 	"github.com/looprig/harness/pkg/sessionstore"
 	harnesssessionwire "github.com/looprig/harness/pkg/sessionwire"

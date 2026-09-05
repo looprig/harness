@@ -23,6 +23,7 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
+	//lint:ignore SA1019 These tests pin the retained serve compatibility contract.
 	"github.com/looprig/harness/pkg/serve"
 	"github.com/looprig/harness/pkg/serve/catalogreader"
 	"github.com/looprig/harness/pkg/sessionstore"

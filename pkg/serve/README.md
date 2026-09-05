@@ -1,5 +1,25 @@
 # pkg/serve
 
+The public BFF role of this package is deprecated in favor of Factory for new
+composition. The import path, routes, schemas, and fixtures remain available
+while WUI, Client, Carbon, integration tests, and examples migrate. This facade
+does not import or delegate to Host or Factory: both sit above Harness in the
+dependency graph.
+
+Create and input return submission acknowledgements without waiting for an
+agent to finish. This package has no synchronous invocation or SSR wait adapter,
+so there is no five-minute compatibility wait setting on these routes. Sessions
+created or restored here outlive their creating request; cancellation of a later
+request does not itself interrupt accepted runtime work. Clients follow progress
+through events and read the durable status/cursor through the read plane.
+
+If a separate synchronous compatibility adapter is needed, it must wait for
+whole-session `WaitIdle`, including child work and handoffs, and return on a
+durable public gate boundary or terminal state. Its default maximum wait is five
+minutes, capped by a known upstream deadline minus a five-second response margin;
+timeout returns the latest durable status/cursor without canceling accepted work.
+Those requirements describe the separate adapter, not behavior provided here.
+
 `pkg/serve` hosts the **HTTP surface** over a live session. It is the
 composition seam between the outside world (HTTP clients) and the
 in-process session machinery, and it obeys strict Dependency Inversion:

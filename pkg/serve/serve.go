@@ -14,6 +14,17 @@
 // prior one (RestoreSession). Both are satisfied structurally by the real session contracts
 // (proven in the package's dependency-guard test), so serve depends on the
 // behavior without depending on the implementation.
+//
+// Deprecated: Use Factory for new public BFF composition. This package is a
+// frozen compatibility surface; its import path, routes, schemas, and fixtures
+// remain available while consumers migrate. It does not import or delegate to
+// Host or Factory, which depend on Harness.
+//
+// Create and input acknowledge submission and return immediately. This package
+// has no synchronous invocation or SSR wait adapter: it does not wait for either
+// a primary turn or whole-session idle. Session work accepted by the runtime
+// outlives the creating HTTP request; progress and durable cursors are available
+// through the event and read routes.
 package serve
 
 import (
