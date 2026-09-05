@@ -14,6 +14,11 @@ import (
 	"github.com/looprig/storage"
 )
 
+// harnessTenantID is the tenant a Store files under when no WithTenant option
+// names one. It is the historical constant, kept as the DEFAULT rather than as
+// the rule so that every existing caller keeps opening the backend it already
+// wrote — the layout marker carries the tenant bytes, so a change of default
+// would refuse every existing single-tenant backend at Open.
 const harnessTenantID coresessionwire.TenantID = "local"
 
 // openTimeout bounds the released SessionStore layout-marker read/create. Open
@@ -81,6 +86,11 @@ type Options struct {
 	// OffloadThreshold is the payload size (bytes) above which a record is
 	// stored as an out-of-line blob instead of inline in the ledger.
 	OffloadThreshold int
+
+	// TenantID is the tenant every record this Store files belongs to. It is
+	// the identity a counterparty reading the same backend addresses the
+	// session by, so it is an INPUT rather than a constant: see WithTenant.
+	TenantID coresessionwire.TenantID
 }
 
 // Option overrides a single field of Options at Open time. Options are applied in
@@ -95,6 +105,42 @@ func WithOffloadThreshold(n int) Option {
 		if n > 0 {
 			o.OffloadThreshold = n
 		}
+	}
+}
+
+// WithTenant names the tenant this Store files every record under, replacing
+// the historical "local" default.
+//
+// It exists because the tenant is HALF of the identity a counterparty addresses
+// a session by. A Host that admitted a session as (TenantID, SessionID) reads
+// its journal — including the EnvelopeKindApplicationPrefix this journal writes
+// before each command's effect — by deriving the ledger name from those two
+// identities. With the tenant fixed at "local" the prefix Harness wrote was in a
+// scope the counterparty never looked at, so the correlation answered from
+// whatever that OTHER scope held rather than from the evidence: `absent` if
+// nothing had been written there, and — for a counterparty that writes its own
+// prefix before driving the runtime, which is the shape this exists to serve —
+// `unresolved` while the prefix sits at the tip and `abandoned` once the next
+// takeover's opening fence lands above it. Two of those three admit a
+// settlement, so the failure is not merely a missing answer: `absent` and
+// `abandoned` both license a deadline reconciler to settle `rejected` over an
+// effect that is already durable.
+//
+// WHAT IT DOES NOT DO. It does not make Harness multi-tenant. A Store files one
+// tenant's sessions, the tenant is fixed for the Store's whole life, and the
+// released store's legacy single-tenant layout — the one whose physical names
+// this package derives independently, as "sessions/<uuid>" — is the only layout
+// it can address. A counterparty sharing this backend must open it the same way,
+// with WithLegacySingleTenant and the same tenant, and must address the session
+// by the uuid's canonical rendering.
+//
+// The value is NOT validated here. The released store validates it inside Open
+// and fails closed with an *InvalidOptionError, so restating the rule here would
+// put it in two places that can drift; an empty or malformed tenant therefore
+// fails Open rather than silently reverting to the default.
+func WithTenant(tenant coresessionwire.TenantID) Option {
+	return func(o *Options) {
+		o.TenantID = tenant
 	}
 }
 
@@ -141,20 +187,24 @@ func Open(b *storage.Composite, opts ...Option) (*Store, error) {
 	if b.Blobs == nil {
 		return nil, &InvalidBackendError{Missing: "Blobs"}
 	}
+	// Options are resolved BEFORE the released Open, because the tenant is one
+	// of them and it decides the layout marker that Open persists and compares.
+	// Resolving afterwards would open the backend under the default tenant and
+	// then hold a Store whose recorded tenant disagreed with the durable marker.
+	resolved := Options{OffloadThreshold: defaultOffloadThreshold, TenantID: harnessTenantID}
+	for _, opt := range opts {
+		opt(&resolved)
+	}
+
 	backend := *b
 	backend.KV = boundedKV{KV: b.KV}
 	durable, err := durablestore.Open(
 		context.Background(),
 		&backend,
-		durablestore.WithLegacySingleTenant(harnessTenantID),
+		durablestore.WithLegacySingleTenant(resolved.TenantID),
 	)
 	if err != nil {
 		return nil, err
-	}
-
-	resolved := Options{OffloadThreshold: defaultOffloadThreshold}
-	for _, opt := range opts {
-		opt(&resolved)
 	}
 	return &Store{backend: &backend, durable: durable, project: sessionwire.Project, opts: resolved}, nil
 }

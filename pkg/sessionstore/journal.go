@@ -89,9 +89,10 @@ func (e *OpeningFenceConflictError) Unwrap() error { return e.Cause }
 // journal's WRITE semantics onto storage — storage.AppendDefinite owns the
 // ambiguous-ack / conflict resolution the old journal did by hand.
 type sessionJournal struct {
-	id        uuid.UUID      // the session this journal owns (for fence + error context)
-	lease     journal.Lease  // single-writer ownership token (injected; never acquired here)
-	ledger    storage.Ledger // the append-only record log this journal is the sole writer of
+	id        uuid.UUID                // the session this journal owns (for fence + error context)
+	tenant    coresessionwire.TenantID // the Store's tenant; half of the durable identity every object and projection is filed under
+	lease     journal.Lease            // single-writer ownership token (injected; never acquired here)
+	ledger    storage.Ledger           // the append-only record log this journal is the sole writer of
 	durable   *durablestore.Store
 	project   func(coresessionwire.TenantID, coresessionwire.SessionID, any) (harnesssessionwire.Projection, error)
 	name      string // the bound ledger name (ledgerName(id))
@@ -202,6 +203,7 @@ func (s *Store) OpenJournalWithOpeningAppend(
 
 	j := &sessionJournal{
 		id:                  id,
+		tenant:              s.opts.TenantID,
 		lease:               lease,
 		ledger:              s.backend.Ledger,
 		durable:             s.durable,
@@ -346,7 +348,7 @@ func hydrateJournalIndexes(ctx context.Context, store *Store, id uuid.UUID, name
 	if err != nil {
 		return nil, nil, &ReplayReadError{Name: name, Cause: err}
 	}
-	base := &baseCursor{name: name, blobs: store.backend.Blobs, durable: store.durable, sessionID: id, cur: cur}
+	base := &baseCursor{name: name, blobs: store.backend.Blobs, durable: store.durable, tenant: store.opts.TenantID, sessionID: id, cur: cur}
 	defer func() { _ = base.close() }()
 	for {
 		r, nextErr := base.next(ctx)
@@ -645,7 +647,7 @@ func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k
 	case kindEvent:
 		eventRecord := rec.(journal.EventRecord)
 		if eventRecord.Event().Visibility() == event.Public {
-			projection, projectErr := b.project(harnessTenantID, harnessSessionID(b.id), eventRecord.Event())
+			projection, projectErr := b.project(b.tenant, harnessSessionID(b.id), eventRecord.Event())
 			if projectErr != nil {
 				return nil, journal.CommittedPublicBody{}, &journal.MarshalRecordError{Subject: b.name, Cause: projectErr}
 			}
@@ -779,7 +781,7 @@ func (b *sessionJournal) durableBodySlot(ctx context.Context, objectKind durable
 	}
 	digest := sha256.Sum256(body)
 	metadata, err := b.durable.PutObject(ctx, durablestore.PutObjectRequest{
-		TenantID:  harnessTenantID,
+		TenantID:  b.tenant,
 		SessionID: harnessSessionID(b.id),
 		Kind:      objectKind,
 		SizeBytes: uint64(len(body)),

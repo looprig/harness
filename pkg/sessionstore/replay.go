@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	coresessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
@@ -200,6 +201,7 @@ func (s *Store) OpenEventReplayer(id uuid.UUID, req ReplayRequest) (journal.Even
 		ledger:     s.backend.Ledger,
 		blobs:      s.backend.Blobs,
 		durable:    s.durable,
+		tenant:     s.opts.TenantID,
 		sessionID:  id,
 		name:       name,
 		fromSeq:    req.FromSeq,
@@ -214,7 +216,7 @@ func (s *Store) OpenInternalEventReplayer(id uuid.UUID, req ReplayRequest) (jour
 	if err != nil {
 		return nil, err
 	}
-	return &eventReplayer{ledger: s.backend.Ledger, blobs: s.backend.Blobs, durable: s.durable, sessionID: id, name: name, fromSeq: req.FromSeq}, nil
+	return &eventReplayer{ledger: s.backend.Ledger, blobs: s.backend.Blobs, durable: s.durable, tenant: s.opts.TenantID, sessionID: id, name: name, fromSeq: req.FromSeq}, nil
 }
 
 // OpenInternalRecordReplayer returns the privileged full read side used by restore
@@ -234,6 +236,7 @@ func (s *Store) OpenInternalRecordReplayer(id uuid.UUID, req ReplayRequest) (jou
 		ledger:  s.backend.Ledger,
 		blobs:   s.backend.Blobs,
 		durable: s.durable,
+		tenant:  s.opts.TenantID,
 		name:    name,
 		fromSeq: req.FromSeq,
 	}, nil
@@ -246,6 +249,7 @@ type eventReplayer struct {
 	ledger     storage.Ledger
 	blobs      storage.Blobs
 	durable    *durablestore.Store
+	tenant     coresessionwire.TenantID
 	sessionID  uuid.UUID
 	name       string
 	fromSeq    uint64
@@ -275,7 +279,7 @@ func (r *eventReplayer) Open(ctx context.Context, req journal.ReplayRequest) (jo
 	if err != nil {
 		return nil, &ReplayReadError{Name: r.name, Cause: err}
 	}
-	return &eventCursor{loopID: req.LoopID, publicOnly: r.publicOnly, base: baseCursor{name: r.name, blobs: r.blobs, durable: r.durable, sessionID: r.sessionID, cur: cur}}, nil
+	return &eventCursor{loopID: req.LoopID, publicOnly: r.publicOnly, base: baseCursor{name: r.name, blobs: r.blobs, durable: r.durable, tenant: r.tenant, sessionID: r.sessionID, cur: cur}}, nil
 }
 
 // recordReplayer is the concrete journal.RecordReplayer over one session's storage
@@ -287,6 +291,7 @@ type recordReplayer struct {
 	ledger  storage.Ledger
 	blobs   storage.Blobs
 	durable *durablestore.Store
+	tenant  coresessionwire.TenantID
 	name    string
 	fromSeq uint64
 }
@@ -303,7 +308,7 @@ func (r *recordReplayer) Open(ctx context.Context, req journal.ReplayRequest) (j
 	if err != nil {
 		return nil, &ReplayReadError{Name: r.name, Cause: err}
 	}
-	return &recordCursor{id: r.id, base: baseCursor{name: r.name, blobs: r.blobs, durable: r.durable, sessionID: r.id, cur: cur}}, nil
+	return &recordCursor{id: r.id, base: baseCursor{name: r.name, blobs: r.blobs, durable: r.durable, tenant: r.tenant, sessionID: r.id, cur: cur}}, nil
 }
 
 // resolved is one fully-resolved ledger record: its real (post-blobptr-resolution)
@@ -341,6 +346,7 @@ type baseCursor struct {
 	name      string
 	blobs     storage.Blobs
 	durable   *durablestore.Store
+	tenant    coresessionwire.TenantID
 	sessionID uuid.UUID
 
 	mu     sync.Mutex
@@ -470,7 +476,7 @@ func (b *baseCursor) resolveDurableBody(ctx context.Context, slot durablestore.B
 		return nil, err
 	}
 	reader, err := b.durable.GetObject(ctx, durablestore.GetObjectRequest{
-		TenantID: harnessTenantID, SessionID: harnessSessionID(b.sessionID), ExpectedKind: objectKind, Metadata: metadata,
+		TenantID: b.tenant, SessionID: harnessSessionID(b.sessionID), ExpectedKind: objectKind, Metadata: metadata,
 	})
 	if err != nil {
 		return nil, mapDurableObjectError(seq, slot.Reference, err)

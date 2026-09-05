@@ -117,6 +117,36 @@ The layout is the contract between `Open`, `Append`, `Replay`, and the
 `Catalog`; it is enforced by the named constants in this package
 (`sessionsPrefix`), not by string surgery at the call sites.
 
+#### Tenant
+
+Those names are the released SessionStore's **legacy single-tenant** layout, and
+`Open` adopts it explicitly. The tenant it adopts defaults to `"local"` and is
+overridden by `WithTenant`.
+
+The tenant is not cosmetic and it is not a multi-tenancy feature: it is half of
+the identity a **counterparty** reading the same backend addresses a session by.
+A Host that admitted a session as `(TenantID, SessionID)` derives that session's
+journal name from both, and correlates a command's application by finding the
+`EnvelopeKindApplicationPrefix` this package writes. For that to work the two
+sides must agree on three things, all of which are refusals rather than
+preferences:
+
+- the **layout**: the counterparty must open with `WithLegacySingleTenant`. The
+  layout is recorded in a durable marker and compared byte-for-byte at every
+  `Open`, so a tenant-scoped counterparty is refused with
+  `KeyspaceError{layout_mismatch}` — it cannot share the backend at all.
+- the **tenant**: the marker carries the tenant bytes too, so opening an existing
+  backend under a different tenant is the same refusal. There is no path on which
+  records filed under one tenant are read under another.
+- the **session identity**: the counterparty must name the session by the
+  canonical lowercase-hyphenated rendering of the Harness `uuid.UUID`, which is
+  the only spelling the legacy layout admits.
+
+A backend cannot be shared with a counterparty using the tenant-scoped layout.
+That layout derives its physical names by digesting `(tenant, session)`, and the
+released module publishes no derivation for them, so this package could not name
+the same ledger even if it wanted to.
+
 ### Large-record offload
 
 Each public append can carry two independent bodies: native Harness runtime
