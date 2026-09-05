@@ -3,6 +3,7 @@ package sessionstore
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,15 +25,6 @@ import (
 // nothing about the input.
 const hostTenant coresessionwire.TenantID = "tenant-a"
 
-func testCommandUUID(t *testing.T) uuid.UUID {
-	t.Helper()
-	id, err := uuid.New()
-	if err != nil {
-		t.Fatalf("uuid.New() error = %v", err)
-	}
-	return id
-}
-
 // publicEventFor builds a public (projectable) event for session id. It is the
 // EFFECT half of the correlation: the released reader reports `committed` only
 // when a correlated prefix is immediately followed by an EnvelopeKindPublicEvent,
@@ -44,13 +36,13 @@ func publicEventFor(t *testing.T, sessionID uuid.UUID) event.Event {
 		Header: event.Header{
 			Coordinates: identity.Coordinates{
 				SessionID: sessionID,
-				LoopID:    testCommandUUID(t),
-				TurnID:    testCommandUUID(t),
-				StepID:    testCommandUUID(t),
+				LoopID:    newTestUUID(t),
+				TurnID:    newTestUUID(t),
+				StepID:    newTestUUID(t),
 			},
-			EventID: testCommandUUID(t),
+			EventID: newTestUUID(t),
 		},
-		GateID:   gate.ID(testCommandUUID(t)),
+		GateID:   gate.ID(newTestUUID(t)),
 		Resolver: gate.ResolverLoop,
 		Reason:   gate.CloseAnswered,
 		Action:   gate.FormActionAccept,
@@ -82,8 +74,8 @@ func publicEventFor(t *testing.T, sessionID uuid.UUID) event.Event {
 func TestHarnessAndAHostStoreShareOneBackendAndCorrelateAnApplicationPrefix(t *testing.T) {
 	ctx := context.Background()
 	backend := memstore.New()
-	sessionID := testCommandUUID(t)
-	runtimeCommandID := testCommandUUID(t)
+	sessionID := newTestUUID(t)
+	runtimeCommandID := newTestUUID(t)
 	commandID := coresessionwire.CommandID("v1:command-a")
 
 	counterparty, err := durablestore.Open(ctx, backend, durablestore.WithLegacySingleTenant(hostTenant))
@@ -173,7 +165,7 @@ func TestHarnessAndAHostStoreShareOneBackendAndCorrelateAnApplicationPrefix(t *t
 func TestHarnessOpenRefusesABackendFiledUnderADifferentTenant(t *testing.T) {
 	ctx := context.Background()
 	backend := memstore.New()
-	sessionID := testCommandUUID(t)
+	sessionID := newTestUUID(t)
 
 	legacy, err := Open(backend)
 	if err != nil {
@@ -195,14 +187,13 @@ func TestHarnessOpenRefusesABackendFiledUnderADifferentTenant(t *testing.T) {
 	}
 
 	// Refused: the tenant is part of the marker.
-	if _, err := Open(backend, WithTenant(hostTenant)); true {
-		var keyspaceErr *durablestore.KeyspaceError
-		if !errors.As(err, &keyspaceErr) {
-			t.Fatalf("Open(WithTenant(%q)) over a %q backend = %v, want a *KeyspaceError", hostTenant, harnessTenantID, err)
-		}
-		if keyspaceErr.Code != durablestore.KeyspaceLayoutMismatch {
-			t.Fatalf("keyspace code = %q, want %q", keyspaceErr.Code, durablestore.KeyspaceLayoutMismatch)
-		}
+	_, err = Open(backend, WithTenant(hostTenant))
+	var keyspaceErr *durablestore.KeyspaceError
+	if !errors.As(err, &keyspaceErr) {
+		t.Fatalf("Open(WithTenant(%q)) over a %q backend = %v, want a *KeyspaceError", hostTenant, harnessTenantID, err)
+	}
+	if keyspaceErr.Code != durablestore.KeyspaceLayoutMismatch {
+		t.Fatalf("keyspace code = %q, want %q", keyspaceErr.Code, durablestore.KeyspaceLayoutMismatch)
 	}
 
 	// Read-compatible: the same tenant reopens and replays what it wrote. The
@@ -247,7 +238,7 @@ func TestHarnessSessionIDIsAlwaysACanonicalLegacySessionID(t *testing.T) {
 		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 	}}
 	for i := 0; i < 64; i++ {
-		ids = append(ids, testCommandUUID(t))
+		ids = append(ids, newTestUUID(t))
 	}
 	for _, id := range ids {
 		// ReadRuntimeJournal derives the session scope and nothing else that
@@ -279,7 +270,7 @@ func TestHarnessSessionIDIsAlwaysACanonicalLegacySessionID(t *testing.T) {
 func TestOffloadedBodiesAreFiledUnderTheStoresTenant(t *testing.T) {
 	ctx := context.Background()
 	backend := memstore.New()
-	sessionID := testCommandUUID(t)
+	sessionID := newTestUUID(t)
 
 	// One byte forces every body out of line, so the object path is exercised by
 	// the ordinary append rather than by a fixture built to be large.
@@ -350,5 +341,58 @@ func TestOffloadedBodiesAreFiledUnderTheStoresTenant(t *testing.T) {
 	t.Cleanup(func() { _ = reopenLease.Release(context.WithoutCancel(ctx)) })
 	if _, err := store.OpenJournal(ctx, sessionID, reopenLease); err != nil {
 		t.Fatalf("reopen OpenJournal() error = %v", err)
+	}
+}
+
+// TestWithTenantRefusesAnInvalidTenantRatherThanRevertingToTheDefault is the
+// reader for the last sentence of WithTenant's doc comment. That sentence is a
+// claim about WHERE the value ends up, not about the validator: the released
+// store already refuses an invalid tenant, so a mutation that defaults inside
+// Open dies against tests that do not exist here. What has no reader without
+// this test is the option itself silently falling back — `if tenant != "" {
+// o.TenantID = tenant }` — which leaves Open succeeding under "local" and files
+// the caller's records in a scope its counterparty never addresses.
+//
+// The refusal is asserted on the released *InvalidOptionError rather than on
+// err != nil, because Harness's own *InvalidBackendError satisfies a bare
+// non-nil check and would keep satisfying it if the tenant stopped reaching the
+// released Open at all.
+//
+// The space is DERIVED from core's validateID (ids.go): empty, over MaxIDBytes,
+// and not valid UTF-8 are the three ways an opaque TenantID can be invalid. A
+// fallback written against any one of them would be caught by the others.
+// Nothing here asserts a SHAPE — "  ", "Tenant/A" and "TENANT-A" are all valid
+// tenants and simply different keyspaces, and a shape rule in this package
+// would be a second authority beside core's.
+func TestWithTenantRefusesAnInvalidTenantRatherThanRevertingToTheDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		tenant coresessionwire.TenantID
+	}{
+		{name: "empty", tenant: ""},
+		{name: "too long", tenant: coresessionwire.TenantID(strings.Repeat("x", coresessionwire.MaxIDBytes+1))},
+		{name: "invalid utf8", tenant: coresessionwire.TenantID("\xff")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := memstore.New()
+
+			_, err := Open(backend, WithTenant(tc.tenant))
+			if err == nil {
+				t.Fatalf("Open(WithTenant(%q)) succeeded, want a refusal rather than a fallback to %q", tc.tenant, harnessTenantID)
+			}
+			var optionErr *durablestore.InvalidOptionError
+			if !errors.As(err, &optionErr) {
+				t.Fatalf("Open(WithTenant(%q)) error = %v, want a *durablestore.InvalidOptionError", tc.tenant, err)
+			}
+
+			// The backend must also be untouched. A fallback that persisted the
+			// default layout marker and then failed for some later reason would
+			// satisfy the assertion above while having already committed the
+			// wrong tenant; opening under a DIFFERENT tenant afterwards can only
+			// succeed if no marker was written.
+			if _, err := Open(backend, WithTenant(hostTenant)); err != nil {
+				t.Fatalf("Open(WithTenant(%q)) after the refusal: %v, want a backend no marker was committed to", hostTenant, err)
+			}
+		})
 	}
 }
