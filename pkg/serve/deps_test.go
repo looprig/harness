@@ -176,6 +176,7 @@ func TestProductionImportsAreAllowed(t *testing.T) {
 	}
 
 	fset := token.NewFileSet()
+	parsed := 0
 	for _, entry := range entries {
 		if entry.IsDir() || !isProductionFile(entry.Name()) {
 			continue
@@ -185,6 +186,7 @@ func TestProductionImportsAreAllowed(t *testing.T) {
 		if perr != nil {
 			t.Fatalf("parse serve file %q: %v", filePath, perr)
 		}
+		parsed++
 		for _, imp := range file.Imports {
 			path, uerr := strconv.Unquote(imp.Path.Value)
 			if uerr != nil {
@@ -196,6 +198,9 @@ func TestProductionImportsAreAllowed(t *testing.T) {
 			}
 		}
 	}
+	if parsed == 0 {
+		t.Fatal("production import guard inspected no successfully parsed Go files")
+	}
 }
 
 func TestProductionHasNoLegacyDeclarations(t *testing.T) {
@@ -205,6 +210,7 @@ func TestProductionHasNoLegacyDeclarations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read serve package dir %q: %v", dir, err)
 	}
+	parsed := 0
 	for _, entry := range entries {
 		if entry.IsDir() || !isProductionFile(entry.Name()) {
 			continue
@@ -214,9 +220,13 @@ func TestProductionHasNoLegacyDeclarations(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
 		}
+		parsed++
 		for _, name := range forbiddenServeNames(file) {
 			t.Errorf("production serve file %s declares removed lifecycle name %s", entry.Name(), name)
 		}
+	}
+	if parsed == 0 {
+		t.Fatal("production declaration guard inspected no successfully parsed Go files")
 	}
 }
 
