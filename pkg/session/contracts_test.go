@@ -43,6 +43,7 @@ var publicSessionContracts = map[string]bool{
 	"CommittedPublicEventSource": true, "CommittedPublicEventProvider": true,
 	"IdleWaiter": true, "Liveness": true, "Releaser": true,
 	"WorkspaceReporter": true, "WorkspaceStatus": true,
+	"LeaseEpochReporter": true,
 }
 
 var forbiddenSessionSurface = map[string]bool{
@@ -876,5 +877,105 @@ func TestWorkspaceStatusLossPredicateRequiresACheckpoint(t *testing.T) {
 				t.Errorf("PostCheckpointLoss() = %v, want %v (%+v)", got, tt.want, tt.status)
 			}
 		})
+	}
+}
+
+// --- LeaseEpochReporter (O3.4) ----------------------------------------------
+
+// renamedLeaseEpochReporter is the shape a maintainer reaching for the shortest
+// name would produce. It is a different contract: Epoch() alone does not say
+// WHICH epoch, and this session has two candidates a consumer confuses at its
+// peril — the single-writer journal lease epoch (this one) and the Host-owned
+// residency epoch, which harness never sees.
+type renamedLeaseEpochReporter interface {
+	Epoch() (uint64, bool)
+}
+
+// singleResultLeaseEpochReporter is the signature-only drift that matters most: it
+// is exactly the shape that collapses "no lease" into "lease epoch 0". The whole
+// reason the capability is two-result is that a consumer must be able to tell
+// those apart before it stamps a value onto an admitted command.
+type singleResultLeaseEpochReporter interface {
+	LeaseEpoch() uint64
+}
+
+type widenedBeforeLeaseEpochReporter interface {
+	LeaseEpoch() (uint64, bool)
+	LeaseValid() bool
+}
+
+type widenedAfterLeaseEpochReporter interface {
+	LeaseEpoch() (uint64, bool)
+	ResidencyEpoch() (uint64, bool)
+}
+
+// leaseEpochReporterShape is the O3.4 oracle. Like workspaceReporterShape it is kept
+// OUT of lifecycleCapabilityShapes(), whose comment restricts that table to the three
+// H4.1 method sets and which TestProductionSessionReleasesResidencyWithTheExactReviewedShape
+// indexes positionally.
+//
+// The encoding caveat is the same one every want in this file carries:
+// TestRenderMethodSetFormat pins how renderMethodSet prints a signature, so a mismatch
+// here is resolved by re-reading the task text, never by pasting what reflect printed.
+func leaseEpochReporterShape() lifecycleCapabilityShape {
+	return lifecycleCapabilityShape{
+		name:     "LeaseEpochReporter",
+		contract: reflect.TypeFor[session.LeaseEpochReporter](),
+		want:     []string{"LeaseEpoch() (uint64, bool)"},
+		drifted: []reflect.Type{
+			reflect.TypeFor[renamedLeaseEpochReporter](),
+			reflect.TypeFor[singleResultLeaseEpochReporter](),
+			reflect.TypeFor[widenedBeforeLeaseEpochReporter](),
+			reflect.TypeFor[widenedAfterLeaseEpochReporter](),
+		},
+	}
+}
+
+// TestLeaseEpochReporterShape pins the exact method set, then proves the guard rejects
+// each drifted shape — so the accepting half is not asserted by a comparison nobody has
+// seen say no.
+func TestLeaseEpochReporterShape(t *testing.T) {
+	t.Parallel()
+	shape := leaseEpochReporterShape()
+	if !methodSetMatches(t, shape.contract, shape.want) {
+		t.Fatalf("session.LeaseEpochReporter = %v, want %v", contractMethodSet(t, shape.contract), shape.want)
+	}
+	for _, drifted := range shape.drifted {
+		if methodSetMatches(t, drifted, shape.want) {
+			t.Errorf("drifted shape %v matched the pinned want; the guard cannot reject anything", drifted)
+		}
+	}
+}
+
+// TestProductionSessionReportsTheLeaseEpoch is the reachability claim O3.4 owes: the
+// epoch is useless to a Host that cannot get at it while the session is LIVE. The
+// runtime satisfies the contract, the contract still has the shape the oracle pins (so
+// Implements is not vacuous), the satisfaction guard rejects a non-session, and the
+// capability stays SEGREGATED — discovered by assertion, exactly like Releaser and
+// WorkspaceReporter, so a session composed without a single-writer lease answers
+// ok == false rather than forcing every controller to carry a method it cannot honor.
+//
+// SCOPE, inherited from TestProductionSessionSatisfiesLifecycleCapabilities: the subject
+// is the concrete runtime type, not whatever rig hands a caller. rig returns the runtime
+// unwrapped today and nothing pins that; a future decorator that does not forward
+// LeaseEpoch would silently answer ok == false while this stays green.
+func TestProductionSessionReportsTheLeaseEpoch(t *testing.T) {
+	t.Parallel()
+	contract := reflect.TypeFor[session.LeaseEpochReporter]()
+	shape := leaseEpochReporterShape()
+	if !methodSetMatches(t, contract, shape.want) {
+		t.Fatalf("session.LeaseEpochReporter = %v, want %v; the satisfaction assertion below would be vacuous", contractMethodSet(t, contract), shape.want)
+	}
+	production := reflect.TypeFor[*sessionruntime.Session]()
+	if !production.Implements(contract) {
+		t.Fatalf("production *sessionruntime.Session does not satisfy session.LeaseEpochReporter; it has %v", contractMethodSet(t, production))
+	}
+	if reflect.TypeFor[*struct{}]().Implements(contract) {
+		t.Error("*struct{} reported as satisfying session.LeaseEpochReporter; the satisfaction guard cannot reject anything")
+	}
+	for _, view := range []reflect.Type{reflect.TypeFor[session.Session](), reflect.TypeFor[session.SessionController]()} {
+		if _, exists := view.MethodByName("LeaseEpoch"); exists {
+			t.Errorf("%s exposes LeaseEpoch; it must stay segregated and be discovered by assertion", view.Name())
+		}
 	}
 }

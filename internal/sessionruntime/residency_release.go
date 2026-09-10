@@ -208,3 +208,27 @@ func (s *Session) closeHubLocally(root context.Context, timeout time.Duration) e
 		}
 	})
 }
+
+// LeaseEpoch is the exported session.LeaseEpochReporter capability: it reports the
+// single-writer journal lease epoch this resident process currently holds, and whether
+// it holds one at all. The contract, and the argument for the two-result shape, live on
+// session.LeaseEpochReporter; this is where the answer is produced.
+//
+// It is gated on Valid(), which is the ONE way it differs from the unexported
+// leaseEpoch() the residency record uses. That difference is deliberate and the two must
+// not be merged. leaseEpoch() runs inside teardown, while the lease is still held, and
+// records the epoch that produced the work being released — history, which stays true
+// afterwards. This one answers a live consumer asking what it may stamp NOW, and a lease
+// that has been released or lost may not be stamped against at all, so it reports
+// absence rather than the number it used to hold. journal.Lease keeps reporting its
+// Epoch after Release (no pinned provider zeroes it), so consulting Valid is the only
+// thing that distinguishes the two states.
+//
+// It reads two fields set once at construction and does no I/O, so it neither blocks nor
+// takes the session lock.
+func (s *Session) LeaseEpoch() (uint64, bool) {
+	if s.runtimeCommandLease == nil || !s.runtimeCommandLease.Valid() {
+		return 0, false
+	}
+	return s.leaseEpoch(), true
+}

@@ -301,3 +301,60 @@ func (s WorkspaceStatus) PostCheckpointLoss() bool {
 type WorkspaceReporter interface {
 	WorkspaceStatus() WorkspaceStatus
 }
+
+// LeaseEpochReporter is the segregated single-writer-lease-epoch reporting capability:
+// it answers which journal lease epoch THIS resident process currently holds for the
+// session.
+//
+// It exists because that number has no other route out of the runtime while the session
+// is alive. It is already published on the way OUT — event.SessionResidencyReleased
+// carries the epoch the releasing process held — but a live consumer that must STAMP it
+// onto something had no way to read it, and the fact is not otherwise derivable: the
+// epoch is minted by the storage lease the composition root acquired, and nothing on
+// Session or SessionController returns it.
+//
+// WHICH EPOCH. A deployment typically has two monotonic per-session counters, and they
+// are not the same number and must never be substituted for one another. This one is the
+// journal's single-writer lease epoch — the fence the runtime stamps into its opening
+// LeaseFence and the value runtimecommand.Admitted.LeaseEpoch is checked against. An
+// orchestrator's own residency/ownership epoch is a different grant with a different
+// issuer; that the two often coincide early in a session's life (each counter starting
+// at 1 under a fresh in-memory backend) is an accident of initial conditions, not a
+// relationship. Source this from here, never from the caller's own grant.
+//
+// THE TWO RESULTS ARE THE POINT. ok reports whether this process holds a lease that
+// reports an epoch AT ALL; the epoch is meaningful only when ok is true, and is zero
+// otherwise. A single-result form would collapse "this session has no single-writer
+// lease" — a headless or no-persistence session, or one simply not wired for durable
+// commands, all legitimate configurations — into "epoch 0", which is exactly the
+// ambiguity a consumer must resolve BEFORE it stamps a value that a fencing check will
+// later compare for equality.
+//
+// ok IS ALSO FALSE ONCE THE LEASE IS GONE. Reporting is gated on the lease still being
+// held, so a session whose lease has been released or lost answers (0, false) rather
+// than the stale number it used to hold. That is deliberate and fail-secure: the only
+// use for this value is to stamp work that a live fencing check will reject anyway, so
+// handing back a dead epoch would only move the failure later. It is NOT in tension with
+// event.SessionResidencyReleased.LeaseEpoch, whose "Zero when the session was not wired
+// to a lease that reports an epoch" describes a snapshot taken while the lease was still
+// held; that record is history, this is a live read.
+//
+// IT IS A REPORT, NOT AN AUTHORIZATION AND NOT A RESERVATION. A true ok is a statement
+// about the instant of the call. Nothing here holds the lease, and nothing prevents the
+// epoch from being superseded between this read and whatever the caller does with it —
+// so a stamped command may still be refused with a stale-epoch error, and a caller must
+// handle that rather than treating a true ok as a promise.
+//
+// Like Releaser and WorkspaceReporter it is discovered by assertion:
+//
+//	reporter, ok := controller.(session.LeaseEpochReporter)
+//
+// and a caller MUST treat a false ok as "this session does not report a lease epoch",
+// not as an error. A wrapper around a live session that does not forward the method
+// silently opts its wrapped session out, which is why the discovery result is a
+// capability answer rather than an error.
+type LeaseEpochReporter interface {
+	// LeaseEpoch reports the epoch of the single-writer lease this process holds, and
+	// whether it holds one. It does no I/O and does not block.
+	LeaseEpoch() (epoch uint64, held bool)
+}
