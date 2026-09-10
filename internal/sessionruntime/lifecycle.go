@@ -644,7 +644,35 @@ func NewTopologyLifecycle(topology Topology, store *sessionstore.Store, opts ...
 // the minted id, the live session, and a typed *NewSessionError on any failure. On ANY failure
 // after the lease is acquired the lease is released best-effort, so a failed NewSession never
 // strands single-writer ownership.
-func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*Session, error) {
+// NewSessionOption configures one Lifecycle.NewSession call. It is separate from
+// Option (which configures the Session under construction) because these are decided
+// per call and are consumed BEFORE the session exists.
+type NewSessionOption func(*newSessionConfig)
+
+// newSessionConfig accumulates the per-call NewSession configuration.
+type newSessionConfig struct {
+	sessionID uuid.UUID
+}
+
+// AdoptSessionID makes this NewSession call run under an externally-minted id instead
+// of minting one. The id is consumed at the very TOP of NewSession, before the lease is
+// acquired and before the journal is opened, so every per-session durable artifact is
+// built under it — which is the whole point: an id adopted after the journal was bound
+// would leave the runtime and its durable stream naming different sessions.
+//
+// A zero id is ignored (NewSession mints one) so a wiring slip cannot produce a zero-id
+// session here. The PUBLIC surface, rig.WithSessionID, refuses a zero id outright rather
+// than relying on that fallback; this layer keeps the fallback because it is also the
+// no-option default path.
+func AdoptSessionID(id uuid.UUID) NewSessionOption {
+	return func(c *newSessionConfig) {
+		if !id.IsZero() {
+			c.sessionID = id
+		}
+	}
+}
+
+func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref, newOpts ...NewSessionOption) (*Session, error) {
 	select {
 	case <-ctx.Done():
 		return nil, &NewSessionError{Kind: NewSessionContextDone, Cause: ctx.Err()}
@@ -654,9 +682,22 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 		return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
 	}
 
-	sid, err := uuid.New()
-	if err != nil {
-		return nil, &NewSessionError{Kind: NewSessionIDGenerationFailed, Cause: err}
+	// The caller's id, when it supplied one, is adopted HERE — before the lease and the
+	// journal below are built from sid — so the runtime and its durable stream can never
+	// name different sessions. Absent it, NewSession mints its own as before.
+	var cfg newSessionConfig
+	for _, opt := range newOpts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	sid := cfg.sessionID
+	if sid.IsZero() {
+		minted, err := uuid.New()
+		if err != nil {
+			return nil, &NewSessionError{Kind: NewSessionIDGenerationFailed, Cause: err}
+		}
+		sid = minted
 	}
 
 	// Per-run durable wiring, mirroring the by-hand persistence pattern: acquire the grant

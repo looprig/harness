@@ -77,6 +77,10 @@ const (
 	SessionOptionDuplicateSeed SessionOptionErrorKind = "duplicate_seed"
 	// SessionOptionEmptySeed: WithSeedSnapshot was given an empty ref.
 	SessionOptionEmptySeed SessionOptionErrorKind = "empty_seed"
+	// SessionOptionDuplicateSessionID: WithSessionID was supplied more than once.
+	SessionOptionDuplicateSessionID SessionOptionErrorKind = "duplicate_session_id"
+	// SessionOptionZeroSessionID: WithSessionID was given the zero UUID.
+	SessionOptionZeroSessionID SessionOptionErrorKind = "zero_session_id"
 )
 
 // SessionOptionError reports an invalid NewSession option.

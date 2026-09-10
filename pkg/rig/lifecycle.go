@@ -17,11 +17,14 @@ func (r *Rig) NewSession(ctx context.Context, opts ...SessionOption) (session.Se
 	if err != nil {
 		return nil, err
 	}
-	return r.newSession(ctx, resolved.seed)
+	return r.newSession(ctx, resolved.seed, resolved.sessionID)
 }
 
-func (r *Rig) newSession(ctx context.Context, seed workspacestore.Ref) (session.SessionController, error) {
-	runtime, err := r.lifecycle.NewSession(ctx, seed)
+// newSession forwards the resolved per-call options. A zero sessionID means the caller
+// supplied no WithSessionID and the lifecycle mints one; WithSessionID has already
+// refused the zero id at the boundary, so a zero reaching here is always "no option".
+func (r *Rig) newSession(ctx context.Context, seed workspacestore.Ref, sessionID uuid.UUID) (session.SessionController, error) {
+	runtime, err := r.lifecycle.NewSession(ctx, seed, sessionruntime.AdoptSessionID(sessionID))
 	if err != nil {
 		return nil, mapRunError(err)
 	}
