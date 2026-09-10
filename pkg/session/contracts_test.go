@@ -968,7 +968,11 @@ func TestProductionSessionReportsTheLeaseEpoch(t *testing.T) {
 	}
 	production := reflect.TypeFor[*sessionruntime.Session]()
 	if !production.Implements(contract) {
-		t.Fatalf("production *sessionruntime.Session does not satisfy session.LeaseEpochReporter; it has %v", contractMethodSet(t, production))
+		// Deliberately NOT contractMethodSet(t, production): renderMethodSet refuses a
+		// concrete type, so passing the subject here replaces this failure's message with
+		// one about the renderer. Measured while probing the compile-time assertion in
+		// internal/sessionruntime, which reports the same defect naming the method.
+		t.Fatalf("production *sessionruntime.Session does not satisfy session.LeaseEpochReporter (want %v); a Host's type assertion on it answers ok == false", shape.want)
 	}
 	if reflect.TypeFor[*struct{}]().Implements(contract) {
 		t.Error("*struct{} reported as satisfying session.LeaseEpochReporter; the satisfaction guard cannot reject anything")

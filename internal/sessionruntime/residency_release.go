@@ -7,6 +7,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
+	sessionapi "github.com/looprig/harness/pkg/session"
 )
 
 // ResidencyReleaseRefusedError reports that a nonterminal residency release was
@@ -208,6 +209,28 @@ func (s *Session) closeHubLocally(root context.Context, timeout time.Duration) e
 		}
 	})
 }
+
+// Compile-time proof that *Session offers the segregated lease-epoch capability. The
+// whole point of the export is that an out-of-module Host type-ASSERTS it on the
+// controller rig returns, and a failed assertion is SILENT: it answers ok == false and
+// the Host falls back to its own residency epoch, which is a different grant with a
+// different issuer. Same idiom, same reason, as runtime_command.go's
+// `_ leaseEpochSource = (journal.Lease)(nil)`.
+//
+// It is not the only reader, and the comment must not claim otherwise: MEASURED, renaming
+// the method below with this line deleted still fails pkg/session's
+// TestProductionSessionReportsTheLeaseEpoch, whose reflect Implements check goes false.
+// What this line adds over that test is earliness and diagnosis. It fails at BUILD time
+// in the file that owns the method, naming it — "missing method LeaseEpoch / have
+// leaseEpoch() uint64, want LeaseEpoch() (uint64, bool)" — whereas the reflect test fails
+// in another package with a message about the renderer rather than about the capability.
+// A dependent's build breaking here is also the only signal that reaches a maintainer who
+// runs no tests.
+//
+// The CONDITIONAL half — whether a given session actually holds a lease — is the
+// (epoch, held) answer, not the type's method set, so there is no configuration under
+// which *Session legitimately lacks the method.
+var _ sessionapi.LeaseEpochReporter = (*Session)(nil)
 
 // LeaseEpoch is the exported session.LeaseEpochReporter capability: it reports the
 // single-writer journal lease epoch this resident process currently holds, and whether
