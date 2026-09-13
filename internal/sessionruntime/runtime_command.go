@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strconv"
 
 	"github.com/looprig/core/uuid"
 
@@ -45,20 +44,6 @@ type runtimeCommandLog interface {
 type dispositionLog interface {
 	AppendCommandDisposition(ctx context.Context, d runtimecommand.CommandDisposition) (journal.AppendResult, error)
 	ScanCommandEffect(ctx context.Context, commandID runtimecommand.CommandID, runtimeID uuid.UUID) (runtimecommand.EffectScan, error)
-}
-
-// DispositionUnsupportedError reports that an attempt-bearing command reached a
-// session whose durable log cannot record a disposition. It is raised BEFORE any
-// durable write: a command applied with no evidence sits applying forever, which is
-// strictly worse than a refusal Host can retry elsewhere.
-type DispositionUnsupportedError struct {
-	CommandID runtimecommand.CommandID
-	AttemptID runtimecommand.AttemptID
-}
-
-func (e *DispositionUnsupportedError) Error() string {
-	return "sessionruntime: this session's durable log cannot record a command disposition; refusing attempt " +
-		strconv.Quote(string(e.AttemptID)) + " of command " + strconv.Quote(string(e.CommandID))
 }
 
 // recordDisposition appends the attempt's durable disposition, or does nothing at
@@ -122,7 +107,7 @@ func (s *Session) CloseAttempt(ctx context.Context, c runtimecommand.Closure) (r
 	}
 	dispositions, ok := log.(dispositionLog)
 	if !ok {
-		return runtimecommand.ClosureResult{}, &DispositionUnsupportedError{CommandID: c.CommandID, AttemptID: c.AttemptID}
+		return runtimecommand.ClosureResult{}, &runtimecommand.DispositionUnsupportedError{CommandID: c.CommandID, AttemptID: c.AttemptID}
 	}
 	if !lease.Valid() {
 		return runtimecommand.ClosureResult{}, &runtimecommand.ClosureNotAuthorizedError{
@@ -287,7 +272,7 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 	// A refusal here is a state Host can act on.
 	dispositions, hasDispositions := log.(dispositionLog)
 	if admitted.AttemptID != "" && !hasDispositions {
-		return runtimecommand.Disposition{}, &DispositionUnsupportedError{
+		return runtimecommand.Disposition{}, &runtimecommand.DispositionUnsupportedError{
 			CommandID: admitted.CommandID, AttemptID: admitted.AttemptID,
 		}
 	}

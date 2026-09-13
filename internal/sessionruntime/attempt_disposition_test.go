@@ -281,9 +281,9 @@ func TestAttemptBearingCommandIsRefusedWhenTheLogCannotRecordADisposition(t *tes
 	adm.AttemptID = "attempt/x"
 
 	disp, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
-	var unsupported *DispositionUnsupportedError
+	var unsupported *runtimecommand.DispositionUnsupportedError
 	if !errors.As(err, &unsupported) {
-		t.Fatalf("err = %v, want a *DispositionUnsupportedError", err)
+		t.Fatalf("err = %v, want a *runtimecommand.DispositionUnsupportedError", err)
 	}
 	if disp != (runtimecommand.Disposition{}) {
 		t.Errorf("Disposition = %+v, want the zero value: nothing durable was written", disp)
@@ -531,10 +531,22 @@ func TestClosureIsRefusedByTheIdempotencyGuardOverADurableApplication(t *testing
 	if err == nil {
 		t.Fatalf("a successor's closure overwrote a durable applied disposition")
 	}
+	// EXACTLY the collision, not "either guard". The disjunction that used to stand
+	// here was defended on the state assertion below — but that state is satisfied by
+	// BOTH arms, so it could not disambiguate them, and the test was one fixture
+	// change away from silently measuring the effect guard under this guard's name.
+	//
+	// The fixture earns the exactness: the applied command's dispatch reaches a
+	// channel backend that appends no events, so the journal holds NO enduring event
+	// caused by that runtime id and the effect guard cannot fire. The only thing left
+	// that can refuse is the idempotency key.
 	var collision *journal.IdempotencyCollisionError
+	if !errors.As(err, &collision) {
+		t.Fatalf("err = %v, want the *IdempotencyCollisionError specifically", err)
+	}
 	var effect *runtimecommand.EnduringEffectError
-	if !errors.As(err, &collision) && !errors.As(err, &effect) {
-		t.Fatalf("err = %v, want either the idempotency collision or the effect refusal", err)
+	if errors.As(err, &effect) {
+		t.Fatalf("the effect guard fired, so this fixture is not isolating the idempotency key: %+v", effect)
 	}
 	got := readDispositions(t, successor)
 	if len(got) != 1 || got[0].Disposition != runtimecommand.DispositionApplied {
@@ -954,4 +966,116 @@ type failingScanLog struct {
 
 func (l failingScanLog) ScanCommandEffect(context.Context, runtimecommand.CommandID, uuid.UUID) (runtimecommand.EffectScan, error) {
 	return runtimecommand.EffectScan{}, l.err
+}
+
+// --- the mapping guard, which sits BEHIND the grant guards ---------------------
+
+// TestClosureMappingGuardDiscriminatesOnTheDurableBinding rows the two comparisons in
+// CloseAttempt's mapping guard that had none, and the reason they had none is the
+// sweep defect this round exists to fix: the guard sits at :142, BEHIND five
+// early-return guards, so every row cited as covering it actually returns at :134 or
+// earlier and never reaches it. A booking that names covering rows has to be checked
+// against where those rows RETURN.
+//
+// The guard exists so a closure cannot tombstone a command whose durable prefix binds
+// it to something else. Both halves of its disjunction are rowed here, each isolated:
+// the runtime-id row keeps the kind equal, and the kind row keeps the runtime id
+// equal, so a row that fails names the comparison that stopped discriminating.
+func TestClosureMappingGuardDiscriminatesOnTheDurableBinding(t *testing.T) {
+	t.Parallel()
+	commandID := runtimecommand.CommandID("v1:mapping")
+	for name, row := range map[string]struct {
+		durableKind      runtimecommand.Kind
+		differentRuntime bool
+	}{
+		"a different runtime id": {runtimecommand.KindInput, true},
+		"a different kind":       {runtimecommand.KindInterrupt, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newRuntimeCommandFixture(t)
+			attemptEpoch := f.lease.Epoch()
+			offered := mustUUID()
+			durable := offered
+			if row.differentRuntime {
+				durable = mustUUID()
+			}
+			if _, err := f.session.runtimeCommands.AppendCommandApplication(context.Background(), runtimecommand.Application{
+				CommandID: commandID, RuntimeCommandID: durable, LeaseEpoch: attemptEpoch, Kind: row.durableKind,
+			}); err != nil {
+				t.Fatalf("AppendCommandApplication: %v", err)
+			}
+			succ := takeOver(t, f)
+
+			// closureFor offers KindInput, so the kind row disagrees on kind alone and
+			// the runtime-id row disagrees on the id alone.
+			_, err := attemptCloser(t, succ).CloseAttempt(context.Background(),
+				closureFor(commandID, offered, attemptEpoch))
+			var conflict *runtimecommand.MappingConflictError
+			if !errors.As(err, &conflict) {
+				t.Fatalf("err = %v, want a *MappingConflictError", err)
+			}
+			if conflict.DurableRuntimeID != durable || conflict.DurableKind != row.durableKind {
+				t.Errorf("conflict reports durable (%v, %q), want (%v, %q)",
+					conflict.DurableRuntimeID, conflict.DurableKind, durable, row.durableKind)
+			}
+			if conflict.RuntimeCommandID != offered || conflict.Kind != runtimecommand.KindInput {
+				t.Errorf("conflict reports offered (%v, %q), want (%v, %q)",
+					conflict.RuntimeCommandID, conflict.Kind, offered, runtimecommand.KindInput)
+			}
+			if got := readDispositions(t, succ); len(got) != 0 {
+				t.Fatalf("a closure was written against a conflicting durable mapping: %+v", got)
+			}
+		})
+	}
+}
+
+// TestClosureSucceedsWhenTheJournalHoldsNoPrefixAtAll is the mapping guard's NEGATIVE
+// row — the case where it must stay SILENT — and it is the one the sweep could not
+// have reached by any existing path.
+//
+// `scan.PrefixSeq != 0` was booked as covered by the grant-refusal rows. It is not:
+// those return at the grant check, four guards before the scan runs. Nothing reached
+// this comparison, and without it a closure over a journal with no prefix compares
+// the offered runtime id against the ZERO uuid, finds them different, and refuses
+// forever — which is precisely the shape recovery exists for. A predecessor that
+// crashed BEFORE writing its prefix is the most ordinary thing a successor closes.
+//
+// Its assertion is a success, for the same reason the cause-correlation row's is: a
+// guard that refuses everything passes every test that only checks refusals.
+func TestClosureSucceedsWhenTheJournalHoldsNoPrefixAtAll(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	attemptEpoch := f.lease.Epoch()
+	runtimeID := mustUUID()
+	commandID := runtimecommand.CommandID("v1:never-prefixed")
+
+	// Non-vacuity: the journal really holds no prefix for this command. Another
+	// command's prefix IS present, so "no prefix" is a fact about this command rather
+	// than about an empty journal — an empty journal would also pass a scan that had
+	// stopped working entirely.
+	appendForeignPrefix(t, f, "v1:someone-else")
+	if apps := readApplications(t, f); len(apps) != 1 {
+		t.Fatalf("the journal holds %d prefixes, want exactly the foreign one: %v", len(apps), apps)
+	} else if _, ok := apps[commandID]; ok {
+		t.Fatalf("the target command has a prefix, so this test proves nothing")
+	}
+	succ := takeOver(t, f)
+
+	res, err := attemptCloser(t, succ).CloseAttempt(context.Background(),
+		closureFor(commandID, runtimeID, attemptEpoch))
+	if err != nil {
+		var conflict *runtimecommand.MappingConflictError
+		if errors.As(err, &conflict) {
+			t.Fatalf("an absent prefix was read as a conflicting mapping: %+v", conflict)
+		}
+		t.Fatalf("CloseAttempt over a journal with no prefix for this command: %v", err)
+	}
+	if !res.Appended {
+		t.Fatalf("ClosureResult = %+v, want a new durable frame", res)
+	}
+	got := onlyDisposition(t, succ)
+	if got.Disposition != runtimecommand.DispositionNotApplied || got.CommandID != commandID {
+		t.Fatalf("disposition = %+v, want a not_applied closure for %q", got, commandID)
+	}
 }

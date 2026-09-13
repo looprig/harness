@@ -290,6 +290,29 @@ type AttemptCloser interface {
 	CloseAttempt(context.Context, Closure) (ClosureResult, error)
 }
 
+// DispositionUnsupportedError reports that an attempt-bearing command reached a
+// session whose durable log cannot record a disposition. It is raised BEFORE any
+// durable write: a command applied with no evidence sits applying forever,
+// settleable by nobody, which is strictly worse than a refusal Host can retry
+// elsewhere.
+//
+// IT LIVES HERE, BESIDE CapabilityUnavailableError, BECAUSE HOST IS TOLD TO ACT ON
+// IT. It was originally declared in the unexported runtime package, which made that
+// instruction unfollowable: a consumer outside this module could only recognise the
+// refusal by matching its message text, and a message is not an API. A typed refusal
+// a caller cannot name is a refusal a caller cannot distinguish from a transport
+// failure, and the difference matters — nothing durable was written, so the command
+// may be re-offered elsewhere.
+type DispositionUnsupportedError struct {
+	CommandID CommandID
+	AttemptID AttemptID
+}
+
+func (e *DispositionUnsupportedError) Error() string {
+	return "runtimecommand: this session's durable log cannot record a command disposition; refusing attempt " +
+		strconv.Quote(string(e.AttemptID)) + " of command " + strconv.Quote(string(e.CommandID))
+}
+
 // ClosureNotAuthorizedError reports a closure offered without a strictly later
 // grant. Held distinguishes "this runtime holds no live grant at all" from "its
 // grant is not later than the attempt's": the first is a lost or released lease, the

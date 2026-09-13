@@ -133,8 +133,8 @@ func (l *RuntimeCommandLog) ScanCommandEffect(ctx context.Context, commandID run
 }
 
 // ScanCommandEffect walks session id's journal for the application prefix naming
-// commandID and for the first enduring event whose Cause.CommandID is runtimeID at a
-// later sequence. See the method above for why.
+// commandID and for the FIRST enduring event whose Cause.CommandID is runtimeID, at
+// ANY sequence. See the method above for why position is not part of the predicate.
 func (s *Store) ScanCommandEffect(ctx context.Context, id uuid.UUID, commandID runtimecommand.CommandID, runtimeID uuid.UUID) (runtimecommand.EffectScan, error) {
 	replayer, err := s.OpenInternalRecordReplayer(id, ReplayRequest{})
 	if err != nil {

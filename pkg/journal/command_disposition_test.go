@@ -6,6 +6,9 @@ import (
 	"testing"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/runtimecommand"
 )
@@ -183,13 +186,82 @@ func TestCommandDispositionCodecFailsClosed(t *testing.T) {
 	}
 }
 
-// TestCommandDispositionRecordIsASealedJournalRecord proves the new variant enters
-// the sealed sum the serializer switches over, rather than falling to the default
-// arm that frames a generic runtime-control record.
-func TestCommandDispositionRecordIsASealedJournalRecord(t *testing.T) {
+// TestNamespacedCommandRecordsCannotCollideWithAnyOtherKind replaces a tautology.
+//
+// The test that stood here assigned a CommandDispositionRecord to a JournalRecord and
+// asserted it came back — which the compiler already guarantees — and its doc claimed
+// it proved the serializer's switch is exhaustive, a property that lives in
+// pkg/sessionstore and that pkg/sessionstore's own framing tests measure.
+//
+// What IS this package's to prove is the rule the two private command-keyed records
+// were given a namespace FOR. An idempotency id is a de-dup key: two records sharing
+// one silently deduplicate against each other, and the loss is invisible. The other
+// kinds key on a bare uuid rendering or a decimal epoch, while these two key on an
+// OPAQUE caller-supplied string that could render either. So the ids are held apart
+// ADVERSARIALLY — the public command id and the attempt id are both set to a string
+// that renders exactly a uuid another record is keyed by — and they must still be
+// distinct from it and from each other.
+//
+// SCOPE, stated because the fixture reveals more than the claim. An EventRecord and a
+// CommandRecord carrying the same uuid DO share an idempotency id: both key on a bare
+// rendering, in one namespace. That is PRE-EXISTING and untouched by this change, and
+// it is unreachable in practice because an EventID and a CommandID are independently
+// minted uuids. It is asserted below as a fact so that the namespaced ids are known
+// to be separated by the NAMESPACE rather than by an accident of the fixture — not as
+// an endorsement of the shared one.
+func TestNamespacedCommandRecordsCannotCollideWithAnyOtherKind(t *testing.T) {
 	t.Parallel()
-	var rec journal.JournalRecord = journal.NewCommandDispositionRecord(dispositionFixture())
-	if _, ok := rec.(journal.CommandDispositionRecord); !ok {
-		t.Fatalf("a CommandDispositionRecord did not survive the JournalRecord interface")
+	// One identity, worn by every kind that can wear it: a uuid, and its canonical
+	// rendering as the opaque public command id and attempt id. This is the
+	// adversarial case — a caller choosing ids to collide.
+	id := uuid.UUID{9, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	shared := runtimecommand.CommandID(id.String())
+
+	bare := map[string]string{
+		"event": journal.NewEventRecord(event.SessionStarted{Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: id}, EventID: id,
+		}}).IdempotencyID(),
+		"command": journal.NewCommandRecord(id, id, command.Interrupt{
+			Header: command.Header{CommandID: id},
+		}).IdempotencyID(),
+		"fence": journal.NewFenceRecord(id, journal.LeaseFence{Epoch: 7}).IdempotencyID(),
+	}
+	namespaced := map[string]string{
+		"command application": journal.NewCommandApplicationRecord(runtimecommand.Application{
+			CommandID: shared, RuntimeCommandID: id, LeaseEpoch: 7, Kind: runtimecommand.KindInput,
+		}).IdempotencyID(),
+		"command disposition": journal.NewCommandDispositionRecord(runtimecommand.CommandDisposition{
+			CommandID: shared, RuntimeCommandID: id, Kind: runtimecommand.KindInput,
+			LeaseEpoch: 7, AttemptID: runtimecommand.AttemptID(shared), AttemptJournalEpoch: 7,
+			Disposition: runtimecommand.DispositionApplied,
+		}).IdempotencyID(),
+	}
+
+	// Non-vacuity, and the scope note above made concrete: the bare kinds really do
+	// key on the same underlying identity, so distinctness below is the namespace's
+	// doing and not the fixture's.
+	if bare["event"] != bare["command"] {
+		t.Fatalf("the event and command ids (%q, %q) differ, so the shared-identity fixture is not adversarial",
+			bare["event"], bare["command"])
+	}
+	if bare["event"] != id.String() {
+		t.Fatalf("the bare kinds key on %q, not the uuid rendering %q", bare["event"], id.String())
+	}
+
+	if namespaced["command application"] == namespaced["command disposition"] {
+		t.Errorf("the application prefix and the disposition share the id %q; a disposition would deduplicate against its own prefix",
+			namespaced["command application"])
+	}
+	for nsKind, nsID := range namespaced {
+		if nsID == "" {
+			t.Errorf("%s has an empty idempotency id", nsKind)
+			continue
+		}
+		for bareKind, bareID := range bare {
+			if nsID == bareID {
+				t.Errorf("%s collides with %s at %q, even though its id is caller-supplied and namespaced",
+					nsKind, bareKind, nsID)
+			}
+		}
 	}
 }
