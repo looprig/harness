@@ -277,9 +277,16 @@ type AttemptCloser interface {
 	// It refuses rather than closing when the runtime holds no live grant, when its
 	// grant is not strictly later, when the journal's own prefix binds the command
 	// to another mapping, and — the guard that matters most — when the journal holds
-	// an enduring event caused by that runtime command after its prefix, because a
-	// tombstone over a committed effect is the one error this protocol cannot
-	// recover from.
+	// an enduring event caused by that runtime command ANYWHERE IN THE JOURNAL,
+	// because a tombstone over a committed effect is the one error this protocol
+	// cannot recover from. It also refuses a journal it cannot fully read.
+	//
+	// "Anywhere" is deliberate and is not a looser restatement of "after the
+	// prefix". An event caused by that runtime id cannot exist unless the command
+	// was dispatched, so its POSITION proves nothing extra; and a guard that ignored
+	// an event before the prefix would be choosing, in the one journal shape nobody
+	// can explain, to tombstone rather than to refuse. Refusing an odd journal costs
+	// liveness; tombstoning a committed effect is unrecoverable.
 	CloseAttempt(context.Context, Closure) (ClosureResult, error)
 }
 
@@ -305,8 +312,14 @@ func (e *ClosureNotAuthorizedError) Error() string {
 }
 
 // EnduringEffectError reports that the journal holds an enduring event caused by the
-// attempt's runtime command AFTER its application prefix, so the predecessor's
-// EFFECT committed even though its disposition did not.
+// attempt's runtime command, so the predecessor's EFFECT committed even though its
+// disposition did not.
+//
+// PrefixSeq and EffectSeq are WHERE THE SCAN FOUND THINGS, not an ordering claim.
+// PrefixSeq is zero when the journal holds no application prefix for the command,
+// and EffectSeq is NOT guaranteed to be greater than it — the scan refuses on an
+// event caused by that runtime id at any sequence, deliberately. Read each as a
+// locator; do not read a relationship between the two.
 //
 // This is the case the idempotency guard cannot catch. A successor's not_applied
 // collides with a predecessor's durable APPLIED disposition and fails closed for

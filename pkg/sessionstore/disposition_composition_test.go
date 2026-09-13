@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/runtimecommand"
@@ -547,7 +548,7 @@ func TestReaderWalksAFullSessionLifecycle(t *testing.T) {
 	}
 
 	frames := harnessFrames(t, w.store, w.session)
-	if len(frames) < 8 {
+	if len(frames) < 9 {
 		t.Fatalf("the journal holds %d frames, too few to be a lifecycle", len(frames))
 	}
 	settled, ok, err := c.settle(t, commandID, applying.Revision)
@@ -596,6 +597,27 @@ func appendLifecycleRecords(t *testing.T, w *harnessWriter, loopID, runtimeID uu
 		Header: command.Header{CommandID: newTestUUID(t)},
 	})); err != nil {
 		t.Fatalf("Append(command record): %v", err)
+	}
+	// A private gate-prepared record. It is a distinct private shape again — an
+	// event projection stored privately ALONGSIDE a sealed payload — and a real
+	// session that ever asked the user holds one.
+	gateID := newTestUUID(t)
+	prepared := event.GatePrepared{
+		Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: w.session, LoopID: loopID, TurnID: newTestUUID(t), StepID: newTestUUID(t)},
+			EventID:     newTestUUID(t),
+			CreatedAt:   time.Now().UTC(),
+		},
+		Gate: gate.Gate{
+			ID: gateID, Kind: gate.KindAskUser, Resolver: gate.ResolverLoop,
+			Blocks: gate.BlocksToolCall, Effect: gate.EffectResume,
+			Prompt: gate.Prompt{Title: "Ask", Body: "question"},
+		},
+	}
+	if _, err := w.journal.Append(ctx, journal.NewGatePreparedRecord(prepared, gate.OpenPayload{
+		GateID: gateID, Payload: gate.AskUserPayload{Question: "proceed?"},
+	})); err != nil {
+		t.Fatalf("Append(gate prepared): %v", err)
 	}
 }
 

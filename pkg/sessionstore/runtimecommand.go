@@ -108,7 +108,15 @@ func (s *Store) ReadCommandApplicationAt(ctx context.Context, id uuid.UUID, seq 
 
 // ScanCommandEffect is the PRIVILEGED whole-journal scan a recovery closure needs:
 // it reports the application prefix for commandID, if any, and whether an enduring
-// event caused by runtimeID was committed AFTER it.
+// event caused by runtimeID was committed ANYWHERE in the journal.
+//
+// POSITION IS NOT PART OF THE PREDICATE, and that is a decision rather than an
+// oversight. An event carrying that runtime id in its cause cannot exist unless the
+// command was dispatched, so where it sits proves nothing extra; and restricting the
+// match to "after the prefix" would mean that in the one journal shape nobody can
+// explain — an effect with no prefix before it — the scan reported "no effect" and
+// licensed a tombstone. The reported PrefixSeq and EffectSeq are locators, not an
+// ordering claim; see TestClosureRefusesAnEffectThatPrecedesThePrefix.
 //
 // It exists for one guard and is worth the walk for that guard alone. A successor
 // writing not_applied over a command whose effect actually committed converts a real

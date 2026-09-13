@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/runtimecommand"
 	durablestore "github.com/looprig/sessionstore"
+	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
 
@@ -591,5 +592,67 @@ func TestRecoveryClosureSurvivesJournalHydration(t *testing.T) {
 	}
 	if again.Appended || again.Sequence != first.Sequence {
 		t.Fatalf("redelivered closure = %+v, want a dedup to the original seq %d", again, first.Sequence)
+	}
+}
+
+// TestScanCommandEffectFailsClosedOnAnUnreadableFrame measures the scan's own half of
+// the recovery guard's fail-closed contract, over a REAL corrupted ledger.
+//
+// The scan's doc says a record it cannot decode is not "no effect", and nothing
+// measured it. The distinction is the whole guard: a scan that swallowed a decode
+// failure and returned what it had so far would report EffectFound=false for a
+// journal that may hold the very effect the guard exists to find, and the closer —
+// which has no way to tell a complete answer from a truncated one — would write the
+// tombstone.
+//
+// It is tested here rather than through the closer because the closer cannot corrupt
+// a ledger without also invalidating its journal's tracked tip, which makes its
+// append fail on the CAS and masks the very refusal under test. Splitting the two
+// halves is what keeps each one's assertion attributable.
+func TestScanCommandEffectFailsClosedOnAnUnreadableFrame(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := newHarnessWriter(t)
+	runtimeID := newTestUUID(t)
+	commandID := runtimecommand.CommandID("v1:unreadable")
+	if _, err := w.log.AppendCommandApplication(ctx, runtimecommand.Application{
+		CommandID: commandID, RuntimeCommandID: runtimeID, LeaseEpoch: w.lease.Epoch(), Kind: runtimecommand.KindInput,
+	}); err != nil {
+		t.Fatalf("AppendCommandApplication: %v", err)
+	}
+
+	// CONTROL: the identical scan over the intact journal answers, and answers
+	// correctly. Without this the refusal below could be any failure at all.
+	clean, err := w.store.ScanCommandEffect(ctx, w.session, commandID, runtimeID)
+	if err != nil {
+		t.Fatalf("control: the scan failed over an intact journal: %v", err)
+	}
+	if clean.PrefixSeq == 0 || clean.EffectFound {
+		t.Fatalf("control: scan = %+v, want the prefix located and no effect", clean)
+	}
+
+	name := ledgerName(w.session)
+	tip, err := w.store.backend.Ledger.Tip(ctx, name)
+	if err != nil {
+		t.Fatalf("Tip: %v", err)
+	}
+	if err := storage.AppendDefinite(ctx, w.store.backend.Ledger, name, tip,
+		[]byte("not a frame any decoder knows")); err != nil {
+		t.Fatalf("AppendDefinite(corrupt): %v", err)
+	}
+
+	scan, err := w.store.ScanCommandEffect(ctx, w.session, commandID, runtimeID)
+	if err == nil {
+		t.Fatalf("the scan reported %+v over a journal it could not read, want an error", scan)
+	}
+	// A ZERO scan, not a partial one. Handing back the prefix it happened to find
+	// before the corruption would look like a complete answer to a caller that has no
+	// way to know the walk stopped early.
+	if scan != (runtimecommand.EffectScan{}) {
+		t.Errorf("the refusal carried a partial scan %+v, want the zero value", scan)
+	}
+	var decodeErr *ReplayDecodeError
+	if !errors.As(err, &decodeErr) {
+		t.Errorf("err = %v, want the journal's own *ReplayDecodeError", err)
 	}
 }

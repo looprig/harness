@@ -446,7 +446,7 @@ func TestClosureRefusedWithoutAStrictlyLaterGrant(t *testing.T) {
 // effect never committed, writes the tombstone.
 func TestClosureWritesNotAppliedUnderTheSuccessorGrant(t *testing.T) {
 	t.Parallel()
-	f, attemptEpoch, commandID, runtimeID := strandedPrefixThenSuccessor(t)
+	f, attemptEpoch, commandID, runtimeID, _ := strandedPrefixThenSuccessor(t)
 	closer := attemptCloser(t, f)
 	res, err := closer.CloseAttempt(context.Background(), closureFor(commandID, runtimeID, attemptEpoch))
 	if err != nil {
@@ -479,10 +479,10 @@ func TestClosureWritesNotAppliedUnderTheSuccessorGrant(t *testing.T) {
 // grants must honour.
 func TestClosureIsRefusedOverACommittedEffect(t *testing.T) {
 	t.Parallel()
-	f, attemptEpoch, commandID, runtimeID := strandedPrefixThenSuccessor(t)
-	// The predecessor's effect: an enduring event caused by that runtime command,
-	// appended after the prefix. This is exactly the record a committed input leaves.
-	appendEffectEvent(t, f, runtimeID)
+	f, attemptEpoch, commandID, runtimeID, prefixSeq := strandedPrefixThenSuccessor(t)
+	// The predecessor's effect: an enduring event caused by that runtime command.
+	// This is exactly the record a committed input leaves.
+	effectSeq := appendEffectEvent(t, f, runtimeID)
 
 	closer := attemptCloser(t, f)
 	_, err := closer.CloseAttempt(context.Background(), closureFor(commandID, runtimeID, attemptEpoch))
@@ -490,8 +490,15 @@ func TestClosureIsRefusedOverACommittedEffect(t *testing.T) {
 	if !errors.As(err, &effect) {
 		t.Fatalf("err = %v, want an *EnduringEffectError", err)
 	}
-	if effect.EffectSeq == 0 || effect.EffectSeq <= effect.PrefixSeq {
-		t.Errorf("EnduringEffectError = %+v, want an effect sequence above the prefix's", effect)
+	// Exact sequences, not an ordering. The ordering held here only by construction,
+	// so asserting it defended a for-all with a fixed fixture — and the for-all is
+	// not even true: the scan refuses an effect at ANY sequence, which
+	// TestClosureRefusesAnEffectThatPrecedesThePrefix drives.
+	if effect.EffectSeq != effectSeq {
+		t.Errorf("EffectSeq = %d, want the effect event's own sequence %d", effect.EffectSeq, effectSeq)
+	}
+	if effect.PrefixSeq != prefixSeq {
+		t.Errorf("PrefixSeq = %d, want the prefix's own sequence %d", effect.PrefixSeq, prefixSeq)
 	}
 	if got := readDispositions(t, f); len(got) != 0 {
 		t.Fatalf("the closure tombstoned a committed effect: %+v", got)
@@ -537,21 +544,22 @@ func TestClosureIsRefusedByTheIdempotencyGuardOverADurableApplication(t *testing
 
 // strandedPrefixThenSuccessor leaves a durable application prefix whose effect never
 // committed, then hands back a fixture over a SUCCESSOR grant on the same journal.
-func strandedPrefixThenSuccessor(t *testing.T) (*runtimeCommandFixture, uint64, runtimecommand.CommandID, uuid.UUID) {
+func strandedPrefixThenSuccessor(t *testing.T) (*runtimeCommandFixture, uint64, runtimecommand.CommandID, uuid.UUID, uint64) {
 	t.Helper()
 	f := newRuntimeCommandFixture(t)
 	attemptEpoch := f.lease.Epoch()
 	runtimeID := mustUUID()
 	commandID := runtimecommand.CommandID("v1:stranded")
-	if _, err := f.session.runtimeCommands.AppendCommandApplication(context.Background(), runtimecommand.Application{
+	res, err := f.session.runtimeCommands.AppendCommandApplication(context.Background(), runtimecommand.Application{
 		CommandID:        commandID,
 		RuntimeCommandID: runtimeID,
 		LeaseEpoch:       attemptEpoch,
 		Kind:             runtimecommand.KindInput,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("AppendCommandApplication: %v", err)
 	}
-	return takeOver(t, f), attemptEpoch, commandID, runtimeID
+	return takeOver(t, f), attemptEpoch, commandID, runtimeID, res.Sequence
 }
 
 // takeOver releases the fixture's lease and rebuilds it over a strictly later grant
@@ -570,7 +578,7 @@ func takeOver(t *testing.T, f *runtimeCommandFixture) *runtimeCommandFixture {
 
 // appendEffectEvent appends one enduring, public event whose Cause.CommandID is the
 // runtime command id — the correlation every event a command causes carries.
-func appendEffectEvent(t *testing.T, f *runtimeCommandFixture, runtimeID uuid.UUID) {
+func appendEffectEvent(t *testing.T, f *runtimeCommandFixture, runtimeID uuid.UUID) uint64 {
 	t.Helper()
 	// TurnStarted is the shape a committed input leaves: enduring, loop-scoped, and
 	// carrying the submit command id in Cause.CommandID. Any command-caused enduring
@@ -584,7 +592,366 @@ func appendEffectEvent(t *testing.T, f *runtimeCommandFixture, runtimeID uuid.UU
 		},
 		TurnIndex: 1,
 	}
-	if _, err := f.journal.Append(context.Background(), journal.NewEventRecord(ev)); err != nil {
+	seq, err := f.journal.Append(context.Background(), journal.NewEventRecord(ev))
+	if err != nil {
 		t.Fatalf("Append(effect event): %v", err)
 	}
+	return seq
+}
+
+// --- the recovery scan over a journal that holds MORE THAN ONE of things --------
+
+// readApplications returns every application prefix in the journal, in ledger order,
+// with its sequence. It exists so a multi-command fixture can prove it really built
+// the shape it claims rather than asserting against a journal that quietly holds one
+// record.
+func readApplications(t *testing.T, f *runtimeCommandFixture) map[runtimecommand.CommandID]uint64 {
+	t.Helper()
+	ctx := context.Background()
+	replayer, err := f.store.OpenInternalRecordReplayer(f.sid, sessionstore.ReplayRequest{})
+	if err != nil {
+		t.Fatalf("OpenInternalRecordReplayer: %v", err)
+	}
+	cursor, err := replayer.Open(ctx, journal.ReplayRequest{SessionID: f.sid, From: journal.Beginning()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = cursor.Close() }()
+	out := map[runtimecommand.CommandID]uint64{}
+	for {
+		rec, seq, err := cursor.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			return out
+		}
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if app, ok := rec.(journal.CommandApplicationRecord); ok {
+			out[app.Application().CommandID] = seq
+		}
+	}
+}
+
+// appendForeignPrefix writes another command's application prefix, which is what
+// every session that has applied more than one command has in its journal.
+func appendForeignPrefix(t *testing.T, f *runtimeCommandFixture, id runtimecommand.CommandID) {
+	t.Helper()
+	if _, err := f.session.runtimeCommands.AppendCommandApplication(context.Background(), runtimecommand.Application{
+		CommandID:        id,
+		RuntimeCommandID: mustUUID(),
+		LeaseEpoch:       f.lease.Epoch(),
+		Kind:             runtimecommand.KindInterrupt,
+	}); err != nil {
+		t.Fatalf("AppendCommandApplication(%s): %v", id, err)
+	}
+}
+
+// multiCommandJournal builds the journal shape EVERY REAL SESSION has by the time a
+// recovery closure runs: several commands' application prefixes, not one. The target
+// is deliberately in the MIDDLE, so a scan that took the first or the last record
+// rather than the matching one is wrong in both directions.
+//
+// It returns the successor fixture, the attempt's grant, and the target's identity
+// and prefix sequence.
+func multiCommandJournal(t *testing.T) (succ *runtimeCommandFixture, attemptEpoch uint64,
+	commandID runtimecommand.CommandID, runtimeID uuid.UUID, prefixSeq uint64, effectSeqs []uint64,
+) {
+	t.Helper()
+	f := newRuntimeCommandFixture(t)
+	attemptEpoch = f.lease.Epoch()
+	commandID, runtimeID = "v1:target", mustUUID()
+
+	appendForeignPrefix(t, f, "v1:earlier")
+	res, err := f.session.runtimeCommands.AppendCommandApplication(context.Background(), runtimecommand.Application{
+		CommandID: commandID, RuntimeCommandID: runtimeID, LeaseEpoch: attemptEpoch, Kind: runtimecommand.KindInput,
+	})
+	if err != nil {
+		t.Fatalf("AppendCommandApplication(target): %v", err)
+	}
+	prefixSeq = res.Sequence
+	// A LATER foreign prefix is the half that kills a scan which simply keeps the
+	// last application record it saw — which is what dropping the comparison does.
+	appendForeignPrefix(t, f, "v1:later")
+
+	// Non-vacuity: if the fixture ever degenerates to one prefix, the comparison
+	// under test has nothing to distinguish again and this test goes quietly back to
+	// proving nothing.
+	apps := readApplications(t, f)
+	if len(apps) != 3 {
+		t.Fatalf("the journal holds %d application prefixes, want 3: %v", len(apps), apps)
+	}
+	if apps[commandID] != prefixSeq {
+		t.Fatalf("the target prefix is at %d, want %d", apps[commandID], prefixSeq)
+	}
+	if apps["v1:earlier"] >= prefixSeq || apps["v1:later"] <= prefixSeq {
+		t.Fatalf("the target is not between the two foreign prefixes: %v", apps)
+	}
+	return f, attemptEpoch, commandID, runtimeID, prefixSeq, nil
+}
+
+// TestClosureScanCorrelatesTheTargetCommandAmongOthers is the row that was missing,
+// and the reason it was missing is worth stating: the comparison it exercises —
+// ScanCommandEffect's app.CommandID == commandID — is fed by HOW MANY COMMANDS A
+// JOURNAL HOLDS, which is a structural property of the fixture rather than a value
+// any fixture varied. Every other fixture in this suite writes exactly one
+// application prefix, so the comparison had nothing to distinguish and could be
+// replaced by a constant with the whole suite still green.
+//
+// A journal holding several commands' prefixes is not exotic. It is the normal shape
+// of any session that has applied more than one runtime command, which is every real
+// session by the time a recovery closure runs.
+//
+// What breaks without the comparison is LIVENESS, not safety: the scan keeps the last
+// application record it saw, so a legitimate closure is refused as a mapping conflict
+// against a command it was never about. It cannot tombstone an effect — the
+// EffectFound arm is separately rowed — but a closure that can never succeed leaves
+// the command applying forever, which is the exact liveness failure the refused arm
+// exists to prevent elsewhere.
+func TestClosureScanCorrelatesTheTargetCommandAmongOthers(t *testing.T) {
+	t.Parallel()
+	f, attemptEpoch, commandID, runtimeID, _, _ := multiCommandJournal(t)
+	succ := takeOver(t, f)
+
+	res, err := attemptCloser(t, succ).CloseAttempt(context.Background(), closureFor(commandID, runtimeID, attemptEpoch))
+	if err != nil {
+		var conflict *runtimecommand.MappingConflictError
+		if errors.As(err, &conflict) {
+			t.Fatalf("the scan correlated a FOREIGN prefix: %+v", conflict)
+		}
+		t.Fatalf("CloseAttempt over a multi-command journal: %v", err)
+	}
+	if !res.Appended || res.Sequence == 0 {
+		t.Fatalf("ClosureResult = %+v, want a new durable frame", res)
+	}
+	got := onlyDisposition(t, succ)
+	if got.Disposition != runtimecommand.DispositionNotApplied || got.CommandID != commandID {
+		t.Fatalf("disposition = %+v, want a not_applied closure for %q", got, commandID)
+	}
+}
+
+// TestClosureRefusalNamesTheTargetsOwnPrefixAndFirstEffect is the same structural
+// blind spot measured on the arm that REFUSES, and it closes a second comparison the
+// value-axis sweep also missed for the same reason.
+//
+// Two structural properties are varied here that no other fixture varies:
+//
+//   - HOW MANY COMMANDS the journal holds. Without the correlation the refusal names
+//     another command's prefix, so an operator reading EnduringEffectError goes to a
+//     record that has nothing to do with the attempt.
+//   - HOW MANY EFFECT EVENTS the target caused. ScanCommandEffect keeps the FIRST
+//     (`!scan.EffectFound`), and with one event per fixture "first" and "last" are the
+//     same record. A turn that emits several events for one command is ordinary, and
+//     the first is the one that proves the effect committed — the last merely proves
+//     it was still going.
+func TestClosureRefusalNamesTheTargetsOwnPrefixAndFirstEffect(t *testing.T) {
+	t.Parallel()
+	f, attemptEpoch, commandID, runtimeID, prefixSeq, _ := multiCommandJournal(t)
+
+	// The target's effect commits, twice — an ordinary multi-event turn.
+	firstEffect := appendEffectEvent(t, f, runtimeID)
+	secondEffect := appendEffectEvent(t, f, runtimeID)
+	if firstEffect >= secondEffect {
+		t.Fatalf("the two effect events are not ordered: %d, %d", firstEffect, secondEffect)
+	}
+	// And another command's effect after them, so "the last event caused by anything"
+	// is not the target's either.
+	appendEffectEvent(t, f, mustUUID())
+	succ := takeOver(t, f)
+
+	_, err := attemptCloser(t, succ).CloseAttempt(context.Background(), closureFor(commandID, runtimeID, attemptEpoch))
+	var effect *runtimecommand.EnduringEffectError
+	if !errors.As(err, &effect) {
+		t.Fatalf("err = %v, want an *EnduringEffectError", err)
+	}
+	if effect.PrefixSeq != prefixSeq {
+		t.Errorf("PrefixSeq = %d, want the TARGET's own prefix at %d — a foreign prefix was correlated",
+			effect.PrefixSeq, prefixSeq)
+	}
+	if effect.EffectSeq != firstEffect {
+		t.Errorf("EffectSeq = %d, want the FIRST effect at %d (the second is at %d)",
+			effect.EffectSeq, firstEffect, secondEffect)
+	}
+	if got := readDispositions(t, succ); len(got) != 0 {
+		t.Fatalf("the closure tombstoned a committed effect: %+v", got)
+	}
+}
+
+// TestClosureSucceedsWhenAnotherCommandsEffectIsInTheJournal is the THIRD comparison
+// the value-axis sweep missed, found by applying the corrected structural lens rather
+// than by a review: ScanCommandEffect's Cause.CommandID == runtimeID is fed by HOW
+// MANY DISTINCT CAUSES the journal's events have, and every other fixture has either
+// no events at all or only the target's.
+//
+// The shape here is ordinary: a session applied command A, which emitted its events,
+// and then command B, which stranded. Closing B must succeed. Without the cause
+// correlation the scan takes A's event as B's effect and refuses the closure forever,
+// so B sits applying with nothing able to settle it — the same liveness failure the
+// refused arm exists to prevent, reached from the recovery side.
+//
+// The assertion is deliberately the SUCCESS, not an error: this is the arm where a
+// spurious refusal is the defect, and a test that only checked refusals could never
+// see it.
+func TestClosureSucceedsWhenAnotherCommandsEffectIsInTheJournal(t *testing.T) {
+	t.Parallel()
+	f, attemptEpoch, commandID, runtimeID, _, _ := multiCommandJournal(t)
+
+	// Another command's turn, complete with the events it caused. The target caused
+	// NONE — that is what makes its closure legitimate.
+	otherRuntimeID := mustUUID()
+	if seq := appendEffectEvent(t, f, otherRuntimeID); seq == 0 {
+		t.Fatalf("the foreign effect event did not land")
+	}
+	if seq := appendEffectEvent(t, f, otherRuntimeID); seq == 0 {
+		t.Fatalf("the second foreign effect event did not land")
+	}
+	if otherRuntimeID == runtimeID {
+		t.Fatalf("the two runtime ids collided, so this test proves nothing")
+	}
+	succ := takeOver(t, f)
+
+	res, err := attemptCloser(t, succ).CloseAttempt(context.Background(), closureFor(commandID, runtimeID, attemptEpoch))
+	if err != nil {
+		var effect *runtimecommand.EnduringEffectError
+		if errors.As(err, &effect) {
+			t.Fatalf("another command's event was read as this attempt's effect: %+v", effect)
+		}
+		t.Fatalf("CloseAttempt: %v", err)
+	}
+	if !res.Appended {
+		t.Fatalf("ClosureResult = %+v, want a new durable frame", res)
+	}
+	got := onlyDisposition(t, succ)
+	if got.Disposition != runtimecommand.DispositionNotApplied {
+		t.Fatalf("disposition = %q, want not_applied", got.Disposition)
+	}
+}
+
+// TestClosureRefusesAnEffectThatPrecedesThePrefix pins the ScanCommandEffect
+// CONTRACT, which four doc comments previously stated one way and the code the other:
+// the scan refuses on an event caused by the attempt's runtime command at ANY
+// sequence, not only after the application prefix.
+//
+// Nothing distinguished the two readings, so the exported contract on
+// EnduringEffectError — which Host is told to handle — could have shipped on an
+// immutable tag saying something the code does not do.
+//
+// The code's reading is the one kept, and the reason is asymmetric cost. An event
+// carrying that runtime id in its cause cannot exist unless the command was
+// dispatched, so its position proves nothing extra. Restricting the match to
+// "after the prefix" would mean that in the one journal shape nobody can explain —
+// an effect with no prefix before it — the scan answered "no effect" and licensed a
+// TOMBSTONE. Refusing an odd journal costs liveness; tombstoning a committed effect
+// is unrecoverable.
+func TestClosureRefusesAnEffectThatPrecedesThePrefix(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	attemptEpoch := f.lease.Epoch()
+	runtimeID := mustUUID()
+	commandID := runtimecommand.CommandID("v1:effect-first")
+
+	// The effect lands BEFORE the prefix. This inverts the ordering every other
+	// fixture builds, which is the whole point: the ordering was previously an
+	// artefact of construction that a fixed fixture then asserted as a for-all.
+	effectSeq := appendEffectEvent(t, f, runtimeID)
+	res, err := f.session.runtimeCommands.AppendCommandApplication(context.Background(), runtimecommand.Application{
+		CommandID: commandID, RuntimeCommandID: runtimeID, LeaseEpoch: attemptEpoch, Kind: runtimecommand.KindInput,
+	})
+	if err != nil {
+		t.Fatalf("AppendCommandApplication: %v", err)
+	}
+	if effectSeq >= res.Sequence {
+		t.Fatalf("the effect at %d does not precede the prefix at %d, so this test proves nothing",
+			effectSeq, res.Sequence)
+	}
+	succ := takeOver(t, f)
+
+	_, err = attemptCloser(t, succ).CloseAttempt(context.Background(), closureFor(commandID, runtimeID, attemptEpoch))
+	var effect *runtimecommand.EnduringEffectError
+	if !errors.As(err, &effect) {
+		t.Fatalf("err = %v, want an *EnduringEffectError — an effect before the prefix is still an effect", err)
+	}
+	if effect.EffectSeq != effectSeq {
+		t.Errorf("EffectSeq = %d, want %d", effect.EffectSeq, effectSeq)
+	}
+	// And the documented consequence of the contract: the two sequences carry NO
+	// ordering relationship. A reader that assumed one would be wrong here.
+	if effect.EffectSeq >= effect.PrefixSeq {
+		t.Errorf("EnduringEffectError = %+v, want the effect BELOW the prefix in this journal", effect)
+	}
+	if got := readDispositions(t, succ); len(got) != 0 {
+		t.Fatalf("the closure tombstoned an effect that preceded its prefix: %+v", got)
+	}
+}
+
+// TestClosureFailsClosedWhenTheScanCannotAnswer is the closer's half of the
+// fail-closed contract: a scan that returns an error must STOP the closure, not be
+// discarded so it proceeds on a zero EffectScan.
+//
+// The failure is injected at the seam rather than by corrupting a ledger, and that is
+// deliberate. An earlier version of this test corrupted the journal directly and
+// PASSED FOR THE WRONG REASON: appending raw bytes behind the journal's back leaves
+// its tracked tip stale, so the closure's own append failed on the CAS and the test
+// could not tell that outcome from the scan refusal it claimed to measure. It passed
+// identically with the guard removed. A double makes the scan's error the only
+// variable.
+//
+// The scan's OWN half — that it returns an error rather than reporting an unreadable
+// journal as "no effect" — is measured where it lives, over a real corrupted ledger,
+// by sessionstore's TestScanCommandEffectFailsClosedOnAnUnreadableFrame.
+func TestClosureFailsClosedWhenTheScanCannotAnswer(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	attemptEpoch := f.lease.Epoch()
+	runtimeID := mustUUID()
+	commandID := runtimecommand.CommandID("v1:scan-fails")
+	if _, err := f.session.runtimeCommands.AppendCommandApplication(context.Background(), runtimecommand.Application{
+		CommandID: commandID, RuntimeCommandID: runtimeID, LeaseEpoch: attemptEpoch, Kind: runtimecommand.KindInput,
+	}); err != nil {
+		t.Fatalf("AppendCommandApplication: %v", err)
+	}
+	succ := takeOver(t, f)
+
+	// CONTROL: with a working scan this exact closure SUCCEEDS. Without it, a refusal
+	// below would prove nothing — the closure might be refused for any other reason.
+	control := *succ
+	if _, err := attemptCloser(t, &control).CloseAttempt(context.Background(),
+		closureFor(commandID, runtimeID, attemptEpoch)); err != nil {
+		t.Fatalf("control: the closure failed for a reason other than the scan: %v", err)
+	}
+
+	// Now the same shape, on a fresh successor, with only the scan broken.
+	f2 := newRuntimeCommandFixture(t)
+	attemptEpoch2 := f2.lease.Epoch()
+	runtimeID2 := mustUUID()
+	if _, err := f2.session.runtimeCommands.AppendCommandApplication(context.Background(), runtimecommand.Application{
+		CommandID: commandID, RuntimeCommandID: runtimeID2, LeaseEpoch: attemptEpoch2, Kind: runtimecommand.KindInput,
+	}); err != nil {
+		t.Fatalf("AppendCommandApplication: %v", err)
+	}
+	succ2 := takeOver(t, f2)
+	wedged := errors.New("the journal could not be walked")
+	succ2.session.runtimeCommands = failingScanLog{
+		dispositionLogAndRuntimeLog: succ2.session.runtimeCommands.(dispositionLogAndRuntimeLog),
+		err:                         wedged,
+	}
+
+	_, err := attemptCloser(t, succ2).CloseAttempt(context.Background(),
+		closureFor(commandID, runtimeID2, attemptEpoch2))
+	if !errors.Is(err, wedged) {
+		t.Fatalf("err = %v, want the scan's own error propagated", err)
+	}
+	if got := readDispositions(t, succ2); len(got) != 0 {
+		t.Fatalf("a tombstone was written over a journal the scan could not read: %+v", got)
+	}
+}
+
+// failingScanLog is a real log whose SCAN alone fails, so a test can vary that one
+// answer without disturbing the appends around it.
+type failingScanLog struct {
+	dispositionLogAndRuntimeLog
+	err error
+}
+
+func (l failingScanLog) ScanCommandEffect(context.Context, runtimecommand.CommandID, uuid.UUID) (runtimecommand.EffectScan, error) {
+	return runtimecommand.EffectScan{}, l.err
 }

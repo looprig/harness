@@ -107,8 +107,11 @@ func (s *Session) recordDisposition(
 // whole-journal scan. If the predecessor's effect committed but its disposition
 // append failed, there is no colliding record: the idempotency guard sees nothing,
 // and a closure would convert a real effect into a tombstone every future grant must
-// honour. The scan looks for an enduring event caused by that runtime command after
-// its prefix and refuses when it finds one.
+// honour. The scan looks for an enduring event caused by that runtime command
+// ANYWHERE in the journal and refuses when it finds one — see the AttemptCloser
+// contract for why position is not part of the predicate — and it FAILS CLOSED on a
+// frame it cannot decode, because a record the walk could not read is not evidence
+// that no effect exists.
 func (s *Session) CloseAttempt(ctx context.Context, c runtimecommand.Closure) (runtimecommand.ClosureResult, error) {
 	log, lease := s.runtimeCommands, s.runtimeCommandLease
 	if log == nil || lease == nil {
