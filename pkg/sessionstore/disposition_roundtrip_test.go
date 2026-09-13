@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"sync"
 	"testing"
 	"time"
 
@@ -13,42 +12,27 @@ import (
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/runtimecommand"
 	durablestore "github.com/looprig/sessionstore"
-	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
 
-// This file is the ACCEPTANCE evidence for the disposition writer: bytes Harness
-// frames and appends are read back, verified and SETTLED by the released
-// sessionstore, through its own production evidence reader and its own verifier.
-// Nothing that decides anything here is a fake.
+// This file holds the JOURNAL-SIDE evidence for the disposition writer: the bytes
+// Harness frames and appends, read back and verified by the released sessionstore's
+// own production reader over a REAL Harness journal. Nothing that decides anything
+// here is a fake.
 //
-// It is deliberately more than a decode assertion, because the halves that can
-// silently disagree are not in the codec. The reader derives the author grant from
-// the NEAREST PRECEDING OPENING FENCE and refuses a record whose own LeaseEpoch
-// disagrees — harness bypasses the store's JournalWriter, so no field is
-// store-stamped and every one is a CLAIM — and the verifier then compares the
-// record's attempt grant against the store's own immutable attempt. A writer can
-// satisfy EncodeEnvelope and still fail both.
+// It is more than a decode assertion, because the halves that can silently disagree
+// are not in the codec. The reader derives the author grant from the NEAREST
+// PRECEDING OPENING FENCE and refuses a record whose own LeaseEpoch disagrees —
+// Harness bypasses the store's JournalWriter, so no field is store-stamped and every
+// one is a CLAIM — and the settlement verifier then compares the record's attempt
+// grant against the store's own immutable attempt.
 //
-// WHY THERE ARE TWO ROUND TRIPS RATHER THAN ONE, and it is a finding rather than a
-// convenience. A disposition-family session must be created with
-// ProtocolModeDisposition, and sessionstore's bindProtocolMode REFUSES that mode on
-// the legacy single-tenant layout outright. harness/pkg/sessionstore opens the
-// released store with WithLegacySingleTenant and derives its ledger name itself as
-// "sessions/<uuid>", so a Harness journal is always a legacy-layout journal and can
-// never BE the bound journal of a disposition session. That is a placement gap in
-// the module graph, not in this writer: the frames are right, the ledger they land
-// in is the wrong one. See TestHarnessJournalScopeCannotHostADispositionSession,
-// which pins the refusal so the gap cannot close silently.
-//
-// So the coverage is split. TestHarnessDispositionFramesAreAcceptedByTheReleasedReader
-// runs the REAL production reader over the REAL Harness journal, which is what
-// exercises the fence derivation and the lease-epoch cross-check against bytes this
-// module actually placed. TestHarnessDispositionBytesSettleThroughTheReleasedStore
-// transplants those EXACT frame bytes into a disposition session and runs the whole
-// settlement, which is what exercises the verifier and the terminal-state mapping.
-// Between them every decision the store makes about a Harness-written disposition is
-// covered; what is not covered is the placement, because it is not currently possible.
+// THE WHOLE-PROTOCOL COMPOSITION IS NEXT DOOR, in disposition_composition_test.go:
+// an ORCHESTRATION store on its own backend, configured with this package's exported
+// reader, settling a command from a Harness journal it addresses through the
+// session's immutable binding. That is the production shape. This file is its
+// journal half, exercised directly so a reader refusal is attributable to a frame
+// rather than to the composition around it.
 
 const roundTripClaimWindow = time.Minute
 
@@ -276,58 +260,6 @@ func TestHarnessRecoveryClosureIsReadUnderTheSuccessorFence(t *testing.T) {
 	_ = res
 }
 
-// namingLedger records every ledger name the wrapped provider is asked about. It
-// exists for one reason: sessionstore derives a non-legacy session's journal name
-// from a keyed digest and exposes no accessor for it, so a test that must place
-// bytes in that journal has to learn the name from the store's own I/O rather than
-// recompute it — recomputing would be a second implementation of the keyspace and
-// would pass while disagreeing with the real one.
-type namingLedger struct {
-	storage.Ledger
-	mu    sync.Mutex
-	names map[string]struct{}
-}
-
-func newNamingLedger(inner storage.Ledger) *namingLedger {
-	return &namingLedger{Ledger: inner, names: map[string]struct{}{}}
-}
-
-func (l *namingLedger) note(name string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.names[name] = struct{}{}
-}
-
-func (l *namingLedger) seen() []string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	out := make([]string, 0, len(l.names))
-	for name := range l.names {
-		out = append(out, name)
-	}
-	return out
-}
-
-func (l *namingLedger) Append(ctx context.Context, name string, expected uint64, payload []byte) error {
-	l.note(name)
-	return l.Ledger.Append(ctx, name, expected, payload)
-}
-
-func (l *namingLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
-	l.note(name)
-	return l.Ledger.Read(ctx, name, from)
-}
-
-func (l *namingLedger) Tip(ctx context.Context, name string) (uint64, error) {
-	l.note(name)
-	return l.Ledger.Tip(ctx, name)
-}
-
-func (l *namingLedger) Delete(ctx context.Context, name string) error {
-	l.note(name)
-	return l.Ledger.Delete(ctx, name)
-}
-
 // harnessFrames reads every raw frame Harness wrote to its own ledger, in order.
 // They are the exact bytes EncodeEnvelope produced — not a re-encoding.
 func harnessFrames(t *testing.T, s *Store, id uuid.UUID) [][]byte {
@@ -351,204 +283,29 @@ func harnessFrames(t *testing.T, s *Store, id uuid.UUID) [][]byte {
 	}
 }
 
-// TestHarnessDispositionBytesSettleThroughTheReleasedStore is the other half of the
-// acceptance: the EXACT frame bytes a Harness journal produced are verified and
-// settled by the released store's whole settlement path — evidence reader, fence
-// cross-check, verifier and terminal-state mapping.
+// TestOrchestrationStoreMustNotShareTheHarnessBackend pins a DEPLOYMENT RULE, not a
+// gap: a product must never point its orchestration store at this package's backend
+// on this package's layout.
 //
-// The bytes are transplanted rather than written in place, and the transplant is the
-// gap this file's header names: a disposition session's journal is a non-legacy
-// ledger, and a Harness journal is always a legacy one. Nothing about the FRAMES is
-// simulated — they are read back out of Harness's own ledger, opaque, and appended
-// unmodified, fence included, so the reader resolves the author grant from Harness's
-// own fence rather than from one this test wrote.
+// The two layouts are mutually exclusive by construction and that is correct. A
+// disposition session's catalog requires the released store's multi-tenant layout;
+// this package addresses its journals on the legacy single-tenant layout, deriving
+// "sessions/<uuid>" itself. sessionstore refuses ProtocolModeDisposition on a legacy
+// scope outright, so a deployment that tried to host both in one keyspace is told so
+// at the first CreateCatalogEntry rather than discovering it at settlement.
 //
-// The terminal state is asserted per kind because the split is the protocol's: a
-// successful no-op is an APPLICATION and settles applied, while a refusal settles
-// rejected. Collapsing the two would be invisible in a decode test.
-func TestHarnessDispositionBytesSettleThroughTheReleasedStore(t *testing.T) {
-	t.Parallel()
-	for name, row := range map[string]struct {
-		kind        runtimecommand.Kind
-		disposition runtimecommand.DispositionKind
-		want        durablestore.InboxState
-	}{
-		"input applied":     {runtimecommand.KindInput, runtimecommand.DispositionApplied, durablestore.InboxStateApplied},
-		"interrupt no_op":   {runtimecommand.KindInterrupt, runtimecommand.DispositionNoOp, durablestore.InboxStateApplied},
-		"input refused":     {runtimecommand.KindInput, runtimecommand.DispositionRefused, durablestore.InboxStateRejected},
-		"interrupt refused": {runtimecommand.KindInterrupt, runtimecommand.DispositionRefused, durablestore.InboxStateRejected},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			ctx := context.Background()
-			const tenant coresessionwire.TenantID = "acme"
-			session := coresessionwire.SessionID("session/" + name)
-			commandID := coresessionwire.CommandID("public/command:" + name)
-			runtimeID := newTestUUID(t)
-			attemptID := runtimecommand.AttemptID("attempt/" + name)
-
-			// 1. Harness writes the frames into its own journal.
-			w := newHarnessWriter(t)
-			epoch := w.lease.Epoch()
-			if _, err := w.log.AppendCommandDisposition(ctx, runtimecommand.CommandDisposition{
-				CommandID:           runtimecommand.CommandID(commandID),
-				RuntimeCommandID:    runtimeID,
-				Kind:                row.kind,
-				LeaseEpoch:          epoch,
-				AttemptID:           attemptID,
-				AttemptJournalEpoch: epoch,
-				Disposition:         row.disposition,
-			}); err != nil {
-				t.Fatalf("AppendCommandDisposition: %v", err)
-			}
-			frames := harnessFrames(t, w.store, w.session)
-			if len(frames) != 2 {
-				t.Fatalf("Harness wrote %d frames, want the opening fence and the disposition", len(frames))
-			}
-
-			// 2. A disposition session, on the layout the protocol requires.
-			backend := memstore.New()
-			spy := newNamingLedger(backend.Ledger)
-			backend.Ledger = spy
-			// No WithLegacySingleTenant: the multi-tenant layout is the default, and
-			// it is the ONLY layout a disposition session can live on.
-			store, err := durablestore.Open(ctx, backend,
-				durablestore.WithJournalDispositionEvidence(),
-			)
-			if err != nil {
-				t.Fatalf("Open(disposition store): %v", err)
-			}
-			if _, _, err := store.CreateCatalogEntry(ctx, durablestore.CreateCatalogEntryRequest{
-				TenantID: tenant, SessionID: session,
-				AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1",
-				CreatedAt: time.Now().UTC(), LastActiveAt: time.Now().UTC(),
-				State: coresessionwire.SessionStateIdle, Residency: coresessionwire.SessionResidencyCold,
-				DesiredPlacement: coresessionwire.HostPlacementPooled,
-				IdempotencyKey:   "create-1", Binding: dispositionBinding(),
-			}); err != nil {
-				t.Fatalf("CreateCatalogEntry: %v", err)
-			}
-			admitted, _, err := store.AdmitDispositionCommand(ctx, durablestore.AdmitDispositionCommandRequest{
-				TenantID: tenant, SessionID: session, CommandID: commandID,
-				Binding:                  dispositionBinding(),
-				ProposedRuntimeCommandID: durablestore.RuntimeCommandID(runtimeID.String()),
-				Kind:                     durablestore.CommandKind(row.kind),
-				Payload:                  []byte(`{"p":1}`),
-				AcceptedAt:               time.Now().UTC(),
-				ApplyDeadline:            time.Now().UTC().Add(time.Hour),
-			})
-			if err != nil {
-				t.Fatalf("AdmitDispositionCommand: %v", err)
-			}
-			residency, err := store.AcquireResidency(ctx, durablestore.AcquireResidencyRequest{
-				TenantID: tenant, SessionID: session,
-			})
-			if err != nil {
-				t.Fatalf("AcquireResidency: %v", err)
-			}
-			t.Cleanup(func() { _ = residency.Release(context.Background()) })
-			claimed, _, err := store.ClaimDispositionCommand(ctx, durablestore.ClaimDispositionCommandRequest{
-				TenantID: tenant, SessionID: session, CommandID: commandID,
-				ExpectedRevision: admitted.Revision,
-				Residency:        residency,
-				ClaimExpiresAt:   time.Now().UTC().Add(roundTripClaimWindow),
-			})
-			if err != nil {
-				t.Fatalf("ClaimDispositionCommand: %v", err)
-			}
-			applying, err := store.BeginDispositionAttempt(ctx, durablestore.BeginDispositionAttemptRequest{
-				TenantID: tenant, SessionID: session, CommandID: commandID,
-				ExpectedRevision: claimed.Revision,
-				AttemptID:        durablestore.DispositionAttemptID(attemptID),
-				JournalEpoch:     durablestore.JournalEpoch(epoch),
-				ResidencyEpoch:   residency.Epoch(),
-				StartedAt:        time.Now().UTC(),
-			})
-			if err != nil {
-				t.Fatalf("BeginDispositionAttempt: %v", err)
-			}
-
-			// 3. Learn the bound journal's name from the store's own read, then place
-			//    Harness's frames in it verbatim.
-			before := spy.seen()
-			if _, err := store.ReadDispositionEvidence(ctx, durablestore.DispositionEvidenceRequest{
-				TenantID: tenant, SessionID: session, CommandID: commandID,
-				Kind:             durablestore.CommandKind(row.kind),
-				RuntimeCommandID: durablestore.RuntimeCommandID(runtimeID.String()),
-				Binding:          dispositionBinding(),
-				Attempt:          *applying.Record.Attempt,
-			}); err == nil {
-				t.Fatalf("an empty journal produced evidence; absence must be refused")
-			}
-			journalName := newlySeen(t, before, spy.seen())
-			tip, err := backend.Ledger.Tip(ctx, journalName)
-			if err != nil {
-				t.Fatalf("Tip(%q): %v", journalName, err)
-			}
-			for _, frame := range frames {
-				if err := storage.AppendDefinite(ctx, backend.Ledger, journalName, tip, frame); err != nil {
-					t.Fatalf("AppendDefinite: %v", err)
-				}
-				tip++
-			}
-
-			// 4. The released store settles from those bytes alone.
-			settled, ok, err := store.SettleDispositionCommand(ctx, durablestore.SettleDispositionCommandRequest{
-				TenantID: tenant, SessionID: session, CommandID: commandID,
-				ExpectedRevision: applying.Revision,
-				ResidencyEpoch:   residency.Epoch(),
-			})
-			if err != nil || !ok {
-				t.Fatalf("SettleDispositionCommand over Harness-written bytes: ok=%v err=%v", ok, err)
-			}
-			if settled.Record.State != row.want {
-				t.Fatalf("settled state = %q, want %q", settled.Record.State, row.want)
-			}
-			outcome := settled.Record.Outcome
-			if outcome == nil {
-				t.Fatalf("settled with no outcome")
-			}
-			if outcome.Kind != durablestore.DispositionOutcomeKind(row.disposition) {
-				t.Errorf("outcome kind = %q, want %q", outcome.Kind, row.disposition)
-			}
-			if outcome.AttemptID != durablestore.DispositionAttemptID(attemptID) {
-				t.Errorf("outcome attempt = %q, want %q", outcome.AttemptID, attemptID)
-			}
-			if uint64(outcome.AuthorJournalEpoch) != epoch || uint64(outcome.AttemptJournalEpoch) != epoch {
-				t.Errorf("grants = author %d attempt %d, want %d for both",
-					outcome.AuthorJournalEpoch, outcome.AttemptJournalEpoch, epoch)
-			}
-		})
-	}
-}
-
-func newlySeen(t *testing.T, before, after []string) string {
-	t.Helper()
-	seen := map[string]struct{}{}
-	for _, name := range before {
-		seen[name] = struct{}{}
-	}
-	var fresh []string
-	for _, name := range after {
-		if _, ok := seen[name]; !ok {
-			fresh = append(fresh, name)
-		}
-	}
-	if len(fresh) != 1 {
-		t.Fatalf("the evidence read touched %d new ledgers (%v); the bound journal must be exactly one", len(fresh), fresh)
-	}
-	return fresh[0]
-}
-
-// TestHarnessJournalScopeCannotHostADispositionSession pins the placement gap this
-// file's header describes, so it fails the day it closes rather than being
-// rediscovered. A Harness journal is a legacy-layout journal by construction, and
-// sessionstore refuses ProtocolModeDisposition on that layout.
+// NOTHING HERE IS BLOCKED BY IT. The bound journal is reached through the session's
+// immutable binding by a configured reader, which is exactly what
+// WithDispositionEvidence exists for and what
+// TestSettlementFromAHarnessJournalThroughTheBinding drives end to end. The two
+// stores are SUPPOSED to be separate; this test is the guard on the one composition
+// that is wrong, and the second half proves the refusal is about the MODE rather than
+// about the session, the tenant or the backend.
 //
-// It is a finding and not a defect in this writer: the frames are accepted and
-// settled on both sides of it. What it blocks is a composed Host reading a Harness
-// journal AS a disposition session's bound journal.
-func TestHarnessJournalScopeCannotHostADispositionSession(t *testing.T) {
+// If this test ever fails because the refusal went away, the deployment rule it
+// encodes must be re-derived before anything is relaxed — a legacy scope that
+// accepted the disposition mode would let two authorities name one journal.
+func TestOrchestrationStoreMustNotShareTheHarnessBackend(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	w := newHarnessWriter(t)
@@ -561,7 +318,7 @@ func TestHarnessJournalScopeCannotHostADispositionSession(t *testing.T) {
 		IdempotencyKey:   "create-1", Binding: dispositionBinding(),
 	})
 	if err == nil {
-		t.Fatalf("a disposition session was created on the Harness legacy scope; the placement gap has closed and this test and its callers must be revisited")
+		t.Fatalf("a disposition session was created on the Harness legacy scope; the layouts are no longer exclusive and the deployment rule above must be re-derived")
 	}
 	var catalogErr *durablestore.CatalogError
 	if !errors.As(err, &catalogErr) || catalogErr.Field != "binding.protocol_mode" {
