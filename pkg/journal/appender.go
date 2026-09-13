@@ -381,3 +381,13 @@ func NewJournalRuntimeCommandAppenderChecked(journal SessionJournal) (*JournalRu
 func (a *JournalRuntimeCommandAppender) AppendCommandApplication(ctx context.Context, app runtimecommand.Application) (AppendResult, error) {
 	return a.journal.AppendIdempotent(ctx, NewCommandApplicationRecord(app))
 }
+
+// AppendCommandDisposition durably appends d as a private, bodiless record and
+// reports whether THIS call made it durable. Appended=false means a byte-identical
+// disposition was already durable — a redelivered write, not a second statement —
+// and Sequence is the ORIGINAL append's. A DIFFERENT statement about the same
+// attempt surfaces as *IdempotencyCollisionError, which is what stops a successor's
+// recovery closure from overwriting a predecessor's application.
+func (a *JournalRuntimeCommandAppender) AppendCommandDisposition(ctx context.Context, d runtimecommand.CommandDisposition) (AppendResult, error) {
+	return a.journal.AppendIdempotent(ctx, NewCommandDispositionRecord(d))
+}

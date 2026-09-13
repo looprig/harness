@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 
 	"github.com/looprig/core/uuid"
 
@@ -33,6 +34,140 @@ type runtimeCommandLog interface {
 	AppendCommandApplication(ctx context.Context, app runtimecommand.Application) (journal.AppendResult, error)
 	// ReadCommandApplicationAt returns the durable correlation at seq.
 	ReadCommandApplicationAt(ctx context.Context, seq uint64) (runtimecommand.Application, error)
+}
+
+// dispositionLog is the OPTIONAL extension of runtimeCommandLog the attempt-aware
+// paths need: write one disposition, and scan for a committed effect. It is separate
+// from runtimeCommandLog rather than folded into it so an existing implementer — a
+// composition root's log, a test double — keeps satisfying the base seam unchanged,
+// and so a deployment whose log cannot record dispositions is DISCOVERED rather than
+// nil-dereferenced.
+type dispositionLog interface {
+	AppendCommandDisposition(ctx context.Context, d runtimecommand.CommandDisposition) (journal.AppendResult, error)
+	ScanCommandEffect(ctx context.Context, commandID runtimecommand.CommandID, runtimeID uuid.UUID) (runtimecommand.EffectScan, error)
+}
+
+// DispositionUnsupportedError reports that an attempt-bearing command reached a
+// session whose durable log cannot record a disposition. It is raised BEFORE any
+// durable write: a command applied with no evidence sits applying forever, which is
+// strictly worse than a refusal Host can retry elsewhere.
+type DispositionUnsupportedError struct {
+	CommandID runtimecommand.CommandID
+	AttemptID runtimecommand.AttemptID
+}
+
+func (e *DispositionUnsupportedError) Error() string {
+	return "sessionruntime: this session's durable log cannot record a command disposition; refusing attempt " +
+		strconv.Quote(string(e.AttemptID)) + " of command " + strconv.Quote(string(e.CommandID))
+}
+
+// recordDisposition appends the attempt's durable disposition, or does nothing at
+// all when the admitted record carries no attempt id.
+//
+// THE EMPTY-ATTEMPT ARM IS THE COMPATIBILITY CONTRACT, not an optimization. A binary
+// pinned below the sessionstore release that knows the disposition envelope kind
+// REFUSES a journal containing one, by design — decoders fail closed on an unknown
+// kind — so a legacy-admitted session's journal must stay exactly what it was.
+//
+// The grant it stamps is the one this applier HOLDS, not the one the admitted record
+// claims. Nothing is store-stamped on this path: the frame is encoded here and the
+// bytes are appended here, so the reader treats the epoch as a claim and cross-checks
+// it against the nearest preceding opening fence. A wrong value does not degrade
+// settlement, it stops it.
+func (s *Session) recordDisposition(
+	ctx context.Context,
+	log dispositionLog,
+	admitted runtimecommand.Admitted,
+	kind runtimecommand.DispositionKind,
+) error {
+	if admitted.AttemptID == "" || log == nil {
+		return nil
+	}
+	_, err := log.AppendCommandDisposition(ctx, admitted.DispositionFor(kind, s.runtimeCommandLease.Epoch()))
+	return err
+}
+
+// CloseAttempt writes the not_applied recovery closure for an attempt a previous
+// runtime never finished. See runtimecommand.AttemptCloser for the contract.
+//
+// FOUR REFUSALS, and the two that matter are the last two.
+//
+// The GRANT check is the protocol's: a closure is authored by a strictly later
+// journal grant, and a runtime closing its own attempt would be writing a tombstone
+// over work it is still doing. The MAPPING check keeps a closure from tombstoning a
+// command whose durable prefix binds a different runtime identity.
+//
+// The IDEMPOTENCY guard is free and is not written here at all — it is the record's
+// own key. A disposition's idempotency id derives from the ATTEMPT id, and Harness
+// hydrates its index from the journal at open, so a successor's not_applied collides
+// with a predecessor's durable applied and fails closed at the append. A successor
+// cannot tombstone an applied command.
+//
+// The EFFECT guard is the one that is NOT free, and it is why this method pays for a
+// whole-journal scan. If the predecessor's effect committed but its disposition
+// append failed, there is no colliding record: the idempotency guard sees nothing,
+// and a closure would convert a real effect into a tombstone every future grant must
+// honour. The scan looks for an enduring event caused by that runtime command after
+// its prefix and refuses when it finds one.
+func (s *Session) CloseAttempt(ctx context.Context, c runtimecommand.Closure) (runtimecommand.ClosureResult, error) {
+	log, lease := s.runtimeCommands, s.runtimeCommandLease
+	if log == nil || lease == nil {
+		return runtimecommand.ClosureResult{}, &runtimecommand.CapabilityUnavailableError{CommandID: c.CommandID}
+	}
+	if err := c.Validate(); err != nil {
+		return runtimecommand.ClosureResult{}, err
+	}
+	dispositions, ok := log.(dispositionLog)
+	if !ok {
+		return runtimecommand.ClosureResult{}, &DispositionUnsupportedError{CommandID: c.CommandID, AttemptID: c.AttemptID}
+	}
+	if !lease.Valid() {
+		return runtimecommand.ClosureResult{}, &runtimecommand.ClosureNotAuthorizedError{
+			AttemptID: c.AttemptID, AttemptJournalEpoch: c.AttemptJournalEpoch, Current: lease.Epoch(),
+		}
+	}
+	current := lease.Epoch()
+	if current <= c.AttemptJournalEpoch {
+		return runtimecommand.ClosureResult{}, &runtimecommand.ClosureNotAuthorizedError{
+			AttemptID: c.AttemptID, AttemptJournalEpoch: c.AttemptJournalEpoch, Current: current, Held: true,
+		}
+	}
+	scan, err := dispositions.ScanCommandEffect(ctx, c.CommandID, c.RuntimeCommandID)
+	if err != nil {
+		return runtimecommand.ClosureResult{}, err
+	}
+	if scan.PrefixSeq != 0 && (scan.DurableRuntimeID != c.RuntimeCommandID || scan.DurableKind != c.Kind) {
+		return runtimecommand.ClosureResult{}, &runtimecommand.MappingConflictError{
+			CommandID:        c.CommandID,
+			RuntimeCommandID: c.RuntimeCommandID,
+			DurableRuntimeID: scan.DurableRuntimeID,
+			Kind:             c.Kind,
+			DurableKind:      scan.DurableKind,
+			Sequence:         scan.PrefixSeq,
+		}
+	}
+	if scan.EffectFound {
+		return runtimecommand.ClosureResult{}, &runtimecommand.EnduringEffectError{
+			AttemptID:        c.AttemptID,
+			CommandID:        c.CommandID,
+			RuntimeCommandID: c.RuntimeCommandID,
+			PrefixSeq:        scan.PrefixSeq,
+			EffectSeq:        scan.EffectSeq,
+		}
+	}
+	res, err := dispositions.AppendCommandDisposition(ctx, runtimecommand.CommandDisposition{
+		CommandID:           c.CommandID,
+		RuntimeCommandID:    c.RuntimeCommandID,
+		Kind:                c.Kind,
+		LeaseEpoch:          current,
+		AttemptID:           c.AttemptID,
+		AttemptJournalEpoch: c.AttemptJournalEpoch,
+		Disposition:         runtimecommand.DispositionNotApplied,
+	})
+	if err != nil {
+		return runtimecommand.ClosureResult{}, err
+	}
+	return runtimecommand.ClosureResult{Sequence: res.Sequence, Appended: res.Appended}, nil
 }
 
 // leaseEpochSource is the two-method view of the session's single-writer lease the
@@ -142,6 +277,17 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 			CommandID: admitted.CommandID, Admitted: admitted.LeaseEpoch, Current: current,
 		}
 	}
+	// An attempt-bearing command needs a log that can record its disposition, and the
+	// check is made BEFORE the prefix deliberately. A command applied with no evidence
+	// is unsettleable by anybody — absence is not a terminal outcome, and not_applied
+	// would be refused over a committed effect — so it would sit applying forever.
+	// A refusal here is a state Host can act on.
+	dispositions, hasDispositions := log.(dispositionLog)
+	if admitted.AttemptID != "" && !hasDispositions {
+		return runtimecommand.Disposition{}, &DispositionUnsupportedError{
+			CommandID: admitted.CommandID, AttemptID: admitted.AttemptID,
+		}
+	}
 
 	// For an input the audit intent record is appended FIRST, so that the application
 	// prefix is the LAST append before the effect. The released settlement correlation
@@ -185,9 +331,25 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 	// means nothing was written and the command may be re-offered; a non-zero
 	// PrefixSequence with an error means it was written and every later delivery will
 	// deduplicate against it.
+	// THE PER-KIND DISPOSITION TABLE. Each arm states what the runtime observed
+	// SYNCHRONOUSLY, which is the only thing a separate post-effect frame can honestly
+	// report: an append takes exactly one record, so no effect is ever inside the
+	// disposition's frame.
+	//
+	//   input,     sendUserInput returned nil          -> applied
+	//   interrupt, fan-out completed, any == true      -> applied
+	//   interrupt, fan-out completed, any == false     -> no_op   (a SUCCESS)
+	//   either,    the effect failed after the prefix  -> refused
+	//
+	// The refused arm is not symmetry. It is the only terminal answer available to a
+	// command whose effect failed under a STILL-LIVE lease: not_applied requires a
+	// strictly later grant, and a healthy Host never turns its lease over.
 	switch admitted.Kind {
 	case runtimecommand.KindInput:
 		if _, err := s.sendUserInput(ctx, pending.backend, pending.cmd); err != nil {
+			return disposition, errors.Join(err, s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionRefused))
+		}
+		if err := s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionApplied); err != nil {
 			return disposition, err
 		}
 	case runtimecommand.KindInterrupt:
@@ -196,9 +358,16 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 		// event at all — but the gap itself is general; see the method doc.
 		interrupted, err := s.Interrupt(ctx)
 		if err != nil {
-			return disposition, err
+			return disposition, errors.Join(err, s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionRefused))
 		}
 		disposition.Interrupted = interrupted
+		outcome := runtimecommand.DispositionNoOp
+		if interrupted {
+			outcome = runtimecommand.DispositionApplied
+		}
+		if err := s.recordDisposition(ctx, dispositions, admitted, outcome); err != nil {
+			return disposition, err
+		}
 	default:
 		// Unreachable: Validate rejects every other kind. The prefix is already
 		// durable, so this reports it rather than pretending nothing happened.
@@ -266,7 +435,11 @@ func (s *Session) resolveApplicationConflict(
 var (
 	_ runtimecommand.Provider = (*Session)(nil)
 	_ runtimecommand.Applier  = (*Session)(nil)
-	_ leaseEpochSource        = (journal.Lease)(nil)
+	// The closer is SEGREGATED and discovered by assertion, following
+	// session.LeaseEpochReporter: it is not a method on Applier, so none of that
+	// interface's implementers grow a method they cannot honor.
+	_ runtimecommand.AttemptCloser = (*Session)(nil)
+	_ leaseEpochSource             = (journal.Lease)(nil)
 )
 
 // ZeroSuppliedCommandIDError reports that a supplied-id submit was handed the zero

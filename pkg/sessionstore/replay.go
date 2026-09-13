@@ -425,6 +425,33 @@ func (b *baseCursor) resolveDurable(ctx context.Context, env durablestore.Envelo
 			return resolved{}, &ReplayDecodeError{Seq: seq, Cause: err}
 		}
 		return resolved{kind: kindCommandApplication, body: body, seq: seq, id: rec.IdempotencyID()}, nil
+	case durablestore.EnvelopeKindCommandDisposition:
+		// Mirror of frame()'s CommandDisposition arm, and byte-identical to it for the
+		// same reason: the record has no stored body, the idempotency index is
+		// hydrated from this path, and the fingerprint it computes is compared against
+		// the one the write path computed.
+		//
+		// The cost of a divergence here is NOT the prefix's. The index keys on
+		// IdempotencyID(), which derives from the ATTEMPT id alone, so a divergence in
+		// any other field is a fingerprint mismatch under a matching id — an
+		// *IdempotencyCollisionError. That is the same error a successor's recovery
+		// closure earns when it collides with a durable application, so a divergence
+		// would make a legitimate redelivery indistinguishable from the attempted
+		// tombstone the collision exists to refuse.
+		disposition := journal.NewCommandDispositionRecord(runtimecommand.CommandDisposition{
+			CommandID:           runtimecommand.CommandID(env.CommandID),
+			RuntimeCommandID:    env.RuntimeCommandID,
+			Kind:                runtimecommand.Kind(env.CommandKind),
+			LeaseEpoch:          env.LeaseEpoch,
+			AttemptID:           runtimecommand.AttemptID(env.AttemptID),
+			AttemptJournalEpoch: env.AttemptJournalEpoch,
+			Disposition:         runtimecommand.DispositionKind(env.DispositionKind),
+		})
+		body, err := journal.MarshalCommandDispositionRecord(disposition)
+		if err != nil {
+			return resolved{}, &ReplayDecodeError{Seq: seq, Cause: err}
+		}
+		return resolved{kind: kindCommandDisposition, body: body, seq: seq, id: disposition.IdempotencyID()}, nil
 	case durablestore.EnvelopeKindPublicEvent:
 		body, err := b.resolveDurableBody(ctx, env.Runtime, durablestore.ObjectKindJournalRuntime, seq)
 		if err != nil {
@@ -628,7 +655,7 @@ func (c *eventCursor) Next(ctx context.Context) (event.Event, uint64, error) {
 				continue // loop-narrowed: another loop's event, dropped like the NATS filter
 			}
 			return ev, r.seq, nil
-		case kindCommand, kindFence, kindGatePrepared, kindCommandApplication:
+		case kindCommand, kindFence, kindGatePrepared, kindCommandApplication, kindCommandDisposition:
 			continue // events only — commands, fences, and private gate-prepared records are filtered out
 		default:
 			return nil, 0, &ReplayDecodeError{Seq: r.seq, Cause: &EnvelopeError{Reason: "unexpected kind " + strconv.Quote(string(r.kind))}}
@@ -709,6 +736,12 @@ func (c *recordCursor) Next(ctx context.Context) (journal.JournalRecord, uint64,
 		return rec, r.seq, nil
 	case kindCommandApplication:
 		rec, err := journal.UnmarshalCommandApplicationRecord(r.body)
+		if err != nil {
+			return nil, 0, &ReplayDecodeError{Seq: r.seq, Cause: err}
+		}
+		return rec, r.seq, nil
+	case kindCommandDisposition:
+		rec, err := journal.UnmarshalCommandDispositionRecord(r.body)
 		if err != nil {
 			return nil, 0, &ReplayDecodeError{Seq: r.seq, Cause: err}
 		}

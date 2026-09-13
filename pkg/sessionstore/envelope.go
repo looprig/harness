@@ -27,6 +27,9 @@ const (
 	// kindCommandApplication carries the PRIVATE application prefix correlating a
 	// public CommandID with its RuntimeCommandID and lease epoch.
 	kindCommandApplication kind = "command_application"
+	// kindCommandDisposition carries the PRIVATE, BODILESS statement of what became
+	// of ONE authorized dispatch attempt.
+	kindCommandDisposition kind = "command_disposition"
 )
 
 // envelope is the versioned wire frame for one ledger record. Body is the record's
@@ -76,7 +79,7 @@ func (env envelope) validate() error {
 		return &EnvelopeError{Reason: "unsupported version " + strconv.Itoa(env.V)}
 	}
 	switch kind(env.Kind) {
-	case kindEvent, kindCommand, kindFence, kindBlobPtr, kindGatePrepared, kindCommandApplication:
+	case kindEvent, kindCommand, kindFence, kindBlobPtr, kindGatePrepared, kindCommandApplication, kindCommandDisposition:
 		return nil
 	default:
 		return &EnvelopeError{Reason: "unknown kind " + strconv.Quote(env.Kind)}

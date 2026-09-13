@@ -117,6 +117,13 @@ type Admitted struct {
 	// Blocks is the input payload, required for KindInput and forbidden for every
 	// other kind (a payload a kind cannot carry would be silently dropped).
 	Blocks []content.Block
+	// AttemptID is Host's immutable identity for the ONE authorized dispatch
+	// attempt this delivery belongs to. It is OPTIONAL, and the option is the
+	// compatibility contract: a legacy admitted record carries none, and an
+	// applier handed one writes NO disposition, so a legacy session's journal is
+	// byte-for-byte what it was. A non-empty id is validated exactly as the
+	// durable boundary validates it.
+	AttemptID AttemptID
 }
 
 // Validate fails closed on any admitted record Harness cannot apply.
@@ -132,6 +139,11 @@ func (a Admitted) Validate() error {
 	}
 	if a.LeaseEpoch == 0 {
 		return &ValidationError{Field: "LeaseEpoch", Reason: "zero"}
+	}
+	if a.AttemptID != "" {
+		if err := a.AttemptID.Validate(); err != nil {
+			return err
+		}
 	}
 	if a.Kind == KindInput && len(a.Blocks) == 0 {
 		return &ValidationError{Field: "Blocks", Reason: "input carries no content"}

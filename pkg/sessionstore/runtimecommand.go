@@ -2,6 +2,8 @@ package sessionstore
 
 import (
 	"context"
+	"errors"
+	"io"
 	"strconv"
 
 	"github.com/looprig/core/uuid"
@@ -58,6 +60,12 @@ func (l *RuntimeCommandLog) AppendCommandApplication(ctx context.Context, app ru
 	return l.appender.AppendCommandApplication(ctx, app)
 }
 
+// AppendCommandDisposition makes d durable as the private, bodiless disposition
+// frame. See journal.JournalRuntimeCommandAppender.AppendCommandDisposition.
+func (l *RuntimeCommandLog) AppendCommandDisposition(ctx context.Context, d runtimecommand.CommandDisposition) (journal.AppendResult, error) {
+	return l.appender.AppendCommandDisposition(ctx, d)
+}
+
 // ReadCommandApplicationAt reads back the application prefix at seq.
 func (l *RuntimeCommandLog) ReadCommandApplicationAt(ctx context.Context, seq uint64) (runtimecommand.Application, error) {
 	return l.store.ReadCommandApplicationAt(ctx, l.sessionID, seq)
@@ -96,4 +104,72 @@ func (s *Store) ReadCommandApplicationAt(ctx context.Context, id uuid.UUID, seq 
 		return runtimecommand.Application{}, &CommandApplicationNotFoundError{SessionID: id, Seq: seq}
 	}
 	return app.Application(), nil
+}
+
+// ScanCommandEffect is the PRIVILEGED whole-journal scan a recovery closure needs:
+// it reports the application prefix for commandID, if any, and whether an enduring
+// event caused by runtimeID was committed AFTER it.
+//
+// It exists for one guard and is worth the walk for that guard alone. A successor
+// writing not_applied over a command whose effect actually committed converts a real
+// effect into a tombstone that all future grants must honour, and the idempotency
+// index cannot catch it: the collision guard only fires when the predecessor's
+// DISPOSITION landed, and the dangerous case is precisely the one where the effect
+// landed and the disposition did not.
+//
+// It is O(journal). That is a stated cost, not an oversight — the settlement design
+// asks for bounded recovery I/O and this is not bounded — and it is on the recovery
+// path only. Bounding it needs an index this package does not keep.
+func (l *RuntimeCommandLog) ScanCommandEffect(ctx context.Context, commandID runtimecommand.CommandID, runtimeID uuid.UUID) (runtimecommand.EffectScan, error) {
+	return l.store.ScanCommandEffect(ctx, l.sessionID, commandID, runtimeID)
+}
+
+// ScanCommandEffect walks session id's journal for the application prefix naming
+// commandID and for the first enduring event whose Cause.CommandID is runtimeID at a
+// later sequence. See the method above for why.
+func (s *Store) ScanCommandEffect(ctx context.Context, id uuid.UUID, commandID runtimecommand.CommandID, runtimeID uuid.UUID) (runtimecommand.EffectScan, error) {
+	replayer, err := s.OpenInternalRecordReplayer(id, ReplayRequest{})
+	if err != nil {
+		return runtimecommand.EffectScan{}, err
+	}
+	cursor, err := replayer.Open(ctx, journal.ReplayRequest{SessionID: id, From: journal.Beginning()})
+	if err != nil {
+		return runtimecommand.EffectScan{}, err
+	}
+	defer func() { _ = cursor.Close() }()
+	var scan runtimecommand.EffectScan
+	for {
+		rec, seq, err := cursor.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			return scan, nil
+		}
+		if err != nil {
+			// A frame this walk cannot read is NOT "no effect". Fail closed: the whole
+			// purpose of the scan is to refuse a tombstone over an effect that may be
+			// sitting in the record it could not decode.
+			return runtimecommand.EffectScan{}, err
+		}
+		switch r := rec.(type) {
+		case journal.CommandApplicationRecord:
+			if app := r.Application(); app.CommandID == commandID {
+				scan.PrefixSeq = seq
+				scan.DurableRuntimeID = app.RuntimeCommandID
+				scan.DurableKind = app.Kind
+			}
+		case journal.EventRecord:
+			// The correlation is the CAUSE, never the event type: every event a command
+			// causes carries the command's runtime id in Cause.CommandID, and a scan
+			// that enumerated types would go blind the moment the vocabulary grew.
+			//
+			// The walk is in ledger order and the prefix is written BEFORE the effect,
+			// so an event seen while PrefixSeq is still zero cannot be this command's
+			// effect under any ordering this writer produces — but it is counted
+			// anyway, because "before the prefix" is not a state this guard may treat
+			// as safe: the conservative direction here is to refuse the closure.
+			if !scan.EffectFound && r.Event().EventHeader().Cause.CommandID == runtimeID {
+				scan.EffectFound = true
+				scan.EffectSeq = seq
+			}
+		}
+	}
 }

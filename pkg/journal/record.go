@@ -293,3 +293,45 @@ func (CommandApplicationRecord) isJournalRecord() {}
 func (r CommandApplicationRecord) IdempotencyID() string {
 	return commandApplicationIDPrefix + string(r.app.CommandID)
 }
+
+// commandDispositionIDPrefix namespaces a disposition's idempotency id. It is
+// namespaced for the same reason the application prefix's is — the id it embeds is
+// an OPAQUE string that could render a UUID or a decimal epoch — and the prefix is
+// constant, so the mapping stays injective.
+const commandDispositionIDPrefix = "command-disposition:"
+
+// CommandDispositionRecord is the PRIVATE, BODILESS durable record stating what
+// became of ONE authorized dispatch attempt. It is appended AFTER the effect the
+// runtime can observe synchronously, which is the only ordering the append primitive
+// permits: Append takes exactly one record, so no effect can share a frame with its
+// disposition.
+//
+// ITS IDEMPOTENCY ID KEYS ON THE ATTEMPT, not on the command, and that is a guard
+// rather than a naming choice. Harness hydrates its idempotency index from the
+// journal at open, so a successor's not_applied for an attempt whose predecessor
+// already wrote applied collides at the append and fails closed with an
+// *IdempotencyCollisionError. A successor therefore cannot tombstone an applied
+// command, and the protection costs nothing.
+//
+// It is not an event and not a command: never projected to a public wire body, never
+// replayed as an event, and the EventReplayer never decodes it.
+type CommandDispositionRecord struct {
+	disposition runtimecommand.CommandDisposition
+}
+
+// NewCommandDispositionRecord wraps d as the private disposition record.
+func NewCommandDispositionRecord(d runtimecommand.CommandDisposition) CommandDispositionRecord {
+	return CommandDispositionRecord{disposition: d}
+}
+
+// Disposition returns the wrapped statement for the serializer to marshal.
+func (r CommandDispositionRecord) Disposition() runtimecommand.CommandDisposition {
+	return r.disposition
+}
+
+func (CommandDispositionRecord) isJournalRecord() {}
+
+// IdempotencyID is the namespaced ATTEMPT id; see the type doc for why.
+func (r CommandDispositionRecord) IdempotencyID() string {
+	return commandDispositionIDPrefix + string(r.disposition.AttemptID)
+}

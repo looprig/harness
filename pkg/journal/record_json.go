@@ -216,3 +216,62 @@ func UnmarshalCommandApplicationRecord(data []byte) (CommandApplicationRecord, e
 	}
 	return NewCommandApplicationRecord(app), nil
 }
+
+// CommandDispositionEncodeError wraps a failure to marshal a
+// CommandDispositionRecord to JSON.
+type CommandDispositionEncodeError struct{ Cause error }
+
+func (e *CommandDispositionEncodeError) Error() string {
+	return "journal: encode command disposition: " + e.Cause.Error()
+}
+func (e *CommandDispositionEncodeError) Unwrap() error { return e.Cause }
+
+// CommandDispositionDecodeError wraps a failure to decode CommandDispositionRecord
+// bytes at the untrusted restore boundary. It fails secure: a disposition that
+// cannot be trusted must never be read as settlement evidence.
+type CommandDispositionDecodeError struct {
+	Reason string
+	Cause  error
+}
+
+func (e *CommandDispositionDecodeError) Error() string {
+	if e.Cause == nil {
+		return "journal: decode command disposition: " + e.Reason
+	}
+	return "journal: decode command disposition: " + e.Reason + ": " + e.Cause.Error()
+}
+func (e *CommandDispositionDecodeError) Unwrap() error { return e.Cause }
+
+// MarshalCommandDispositionRecord encodes the record's statement as the JSON body
+// the sessionstore envelope fingerprints. The durable frame is BODILESS — these
+// bytes are never persisted — but they are the fingerprint the idempotency index
+// compares, so the write and replay sides must produce them identically.
+func MarshalCommandDispositionRecord(rec CommandDispositionRecord) ([]byte, error) {
+	if err := rec.Disposition().Validate(); err != nil {
+		return nil, &CommandDispositionEncodeError{Cause: err}
+	}
+	data, err := json.Marshal(rec.Disposition())
+	if err != nil {
+		return nil, &CommandDispositionEncodeError{Cause: err}
+	}
+	return data, nil
+}
+
+// UnmarshalCommandDispositionRecord decodes bytes produced by
+// MarshalCommandDispositionRecord, failing closed on malformed JSON, an unknown
+// field, trailing bytes, or an invalid statement.
+func UnmarshalCommandDispositionRecord(data []byte) (CommandDispositionRecord, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var d runtimecommand.CommandDisposition
+	if err := dec.Decode(&d); err != nil {
+		return CommandDispositionRecord{}, &CommandDispositionDecodeError{Reason: "invalid json", Cause: err}
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return CommandDispositionRecord{}, &CommandDispositionDecodeError{Reason: "trailing data after object"}
+	}
+	if err := d.Validate(); err != nil {
+		return CommandDispositionRecord{}, &CommandDispositionDecodeError{Reason: "invalid disposition", Cause: err}
+	}
+	return NewCommandDispositionRecord(d), nil
+}

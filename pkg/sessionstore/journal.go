@@ -683,13 +683,44 @@ func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k
 		env.RuntimeCommandID = app.RuntimeCommandID
 		env.LeaseEpoch = app.LeaseEpoch
 		env.CommandKind = string(app.Kind)
+	case kindCommandDisposition:
+		// The disposition has its own released envelope kind for the same reason the
+		// prefix does, and the consequence of getting it wrong is worse. The released
+		// evidence reader matches on `Kind == EnvelopeKindCommandDisposition &&
+		// AttemptID == req.Attempt.AttemptID`; a disposition framed as RuntimeControl
+		// can never match it, so every command would read as having NO evidence — and
+		// absence is what leaves a command applying forever, unsettleable by anybody.
+		//
+		// LeaseEpoch is the grant the AUTHOR held, and it is the field to be careful
+		// with. Nothing in this write path is store-stamped: this package encodes the
+		// envelope and appends the bytes itself, so stampWriterOwnedFields never runs
+		// and the reader treats the stored value as a CLAIM, cross-checking it against
+		// the nearest preceding opening fence and failing closed on a disagreement.
+		// Substituting b.lease.Epoch() here would look equivalent and would be wrong
+		// the moment a successor writes a recovery closure, whose author grant is
+		// deliberately NOT the attempt's.
+		//
+		// The kind's record-shape rule forbids a body, and the record NAMES NO EVENT:
+		// EventID stays zero because a disposition is written after its effect and can
+		// never share a frame with it. body is computed by encodeRecordBody only to
+		// fingerprint the record for idempotency; it is never persisted, and the read
+		// side reconstructs identical bytes from these fields.
+		d := rec.(journal.CommandDispositionRecord).Disposition()
+		env.Kind = durablestore.EnvelopeKindCommandDisposition
+		env.CommandID = coresessionwire.CommandID(d.CommandID)
+		env.RuntimeCommandID = d.RuntimeCommandID
+		env.LeaseEpoch = d.LeaseEpoch
+		env.CommandKind = string(d.Kind)
+		env.AttemptID = string(d.AttemptID)
+		env.AttemptJournalEpoch = d.AttemptJournalEpoch
+		env.DispositionKind = string(d.Disposition)
 	default:
 		env.Kind = durablestore.EnvelopeKindRuntimeControl
 		env.RecordID = durableRecordID(k, rec.IdempotencyID())
 	}
 	// Bodiless kinds: the fence and the application prefix are wholly described by
 	// their envelope fields, so neither publishes an object nor occupies a body slot.
-	bodiless := k == kindFence || k == kindCommandApplication
+	bodiless := k == kindFence || k == kindCommandApplication || k == kindCommandDisposition
 	// Refuse a runtime body the READ side could never admit, before any object is
 	// published. Only event.MarshalEvent caps its own output;
 	// command.MarshalCommand and journal.MarshalGatePreparedRecord do not, so
@@ -872,6 +903,12 @@ func (b *sessionJournal) encodeRecordBody(rec journal.JournalRecord) (kind, []by
 			return "", nil, &journal.MarshalRecordError{Subject: b.name, Cause: err}
 		}
 		return kindCommandApplication, body, nil
+	case journal.CommandDispositionRecord:
+		body, err := journal.MarshalCommandDispositionRecord(r)
+		if err != nil {
+			return "", nil, &journal.MarshalRecordError{Subject: b.name, Cause: err}
+		}
+		return kindCommandDisposition, body, nil
 	default:
 		return "", nil, &journal.RecordKindError{Subject: b.name}
 	}
