@@ -109,7 +109,7 @@ const (
 	// whatever it resolved to, applied, no_op or refused; a no_op against a gate that
 	// never existed is enough — harness v0.34.0 and older can neither replay nor
 	// reopen that journal: OpenJournal and replay both fail closed with
-	// `journal: encode command application: invalid Kind: unknown kind
+	// `journal: encode command application: runtimecommand: invalid Kind: unknown kind
 	// "gate_response"`. The failing check is the Marshal-side validation
 	// (v0.34.0 pkg/journal/record_json.go:191, MarshalCommandApplicationRecord),
 	// reached from the replay hydration of the prefix (v0.34.0

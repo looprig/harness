@@ -264,7 +264,7 @@ which lets a Host-admitted gate answer settle through the durable disposition pa
 **Once a session journal holds any `gate_response` application — applied, `no_op` or
 `refused`; a `no_op` against a gate that never existed is enough — harness v0.34.0 and
 older cannot reopen it.** Both `OpenJournal` and replay fail closed with
-`journal: encode command application: invalid Kind: unknown kind "gate_response"`
+`journal: encode command application: runtimecommand: invalid Kind: unknown kind "gate_response"`
 (the Marshal-side check in v0.34.0 `pkg/journal/record_json.go:191`, reached from
 `pkg/sessionstore/replay.go:422`). No data is lost, but the session is stranded until
 a v0.35.0+ runtime opens it. **Do not roll a Host back below harness v0.35.0 once it
