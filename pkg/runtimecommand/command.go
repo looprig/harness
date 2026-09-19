@@ -101,6 +101,21 @@ const (
 	// including its refusal of a classifier-sourced response — holds here as well.
 	// The spelling is the admitted record's: Factory admits "gate_response", and the
 	// settlement reader compares the kind as a string.
+	//
+	// It REQUIRES an AttemptID (see Admitted.Validate): an answer applied with no
+	// attempt writes no disposition, which is the defect this kind exists to fix.
+	//
+	// ONE-WAY UPGRADE. Once a session journal holds ANY gate_response application —
+	// whatever it resolved to, applied, no_op or refused; a no_op against a gate that
+	// never existed is enough — harness v0.34.0 and older can neither replay nor
+	// reopen that journal: OpenJournal and replay both fail closed with
+	// `journal: encode command application: invalid Kind: unknown kind
+	// "gate_response"`. The failing check is the Marshal-side validation
+	// (v0.34.0 pkg/journal/record_json.go:191, MarshalCommandApplicationRecord),
+	// reached from the replay hydration of the prefix (v0.34.0
+	// pkg/sessionstore/replay.go:422). Nothing is lost — it fails closed — but the
+	// session is stranded until a runtime at v0.35.0 or later opens it. Do not roll a
+	// runtime back below v0.35.0 once it has applied a gate_response.
 	KindGateResponse Kind = "gate_response"
 )
 
@@ -135,11 +150,13 @@ type Admitted struct {
 	// at application time, because only the session knows the gate.
 	GateResponse *gate.GateResponse
 	// AttemptID is Host's immutable identity for the ONE authorized dispatch
-	// attempt this delivery belongs to. It is OPTIONAL, and the option is the
-	// compatibility contract: a legacy admitted record carries none, and an
-	// applier handed one writes NO disposition, so a legacy session's journal is
-	// byte-for-byte what it was. A non-empty id is validated exactly as the
-	// durable boundary validates it.
+	// attempt this delivery belongs to. It is OPTIONAL for input and interrupt, and
+	// the option is the compatibility contract: a legacy admitted record carries
+	// none, and an applier handed one writes NO disposition, so a legacy session's
+	// journal is byte-for-byte what it was. It is REQUIRED for KindGateResponse,
+	// which has no legacy records: without it the answer would apply and never
+	// settle. A non-empty id is validated exactly as the durable boundary
+	// validates it.
 	AttemptID AttemptID
 }
 
@@ -161,6 +178,12 @@ func (a Admitted) Validate() error {
 		if err := a.AttemptID.Validate(); err != nil {
 			return err
 		}
+	}
+	if a.Kind == KindGateResponse && a.AttemptID == "" {
+		// The empty-attempt arm exists for LEGACY input/interrupt records, and
+		// gate_response has none. Accepting one here would apply the answer and
+		// write no evidence — a command that sits applying forever.
+		return &ValidationError{Field: "AttemptID", Reason: "gate_response requires a dispatch attempt"}
 	}
 	if a.Kind == KindInput && len(a.Blocks) == 0 {
 		return &ValidationError{Field: "Blocks", Reason: "input carries no content"}

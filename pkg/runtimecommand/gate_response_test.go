@@ -50,6 +50,7 @@ func admittedGateResponse() runtimecommand.Admitted {
 		RuntimeCommandID: testUUID(0x52),
 		Kind:             runtimecommand.KindGateResponse,
 		LeaseEpoch:       4,
+		AttemptID:        "attempt/gate",
 		GateResponse:     validGateResponse(),
 	}
 }
@@ -75,6 +76,12 @@ func TestAdmittedGateResponseIsRequiredIffTheKindIsGateResponse(t *testing.T) {
 		"gate_response naming no gate": {
 			mutate: func(a *runtimecommand.Admitted) { a.GateResponse.GateID = gate.ID{} },
 			field:  "GateResponse",
+		},
+		// The empty-attempt arm is for LEGACY input/interrupt records only; a
+		// gate_response with no attempt would apply and write no evidence.
+		"gate_response without an attempt": {
+			mutate: func(a *runtimecommand.Admitted) { a.AttemptID = "" },
+			field:  "AttemptID",
 		},
 		"gate_response carrying input blocks": {
 			mutate: func(a *runtimecommand.Admitted) { a.Blocks = []content.Block{&content.TextBlock{Text: "x"}} },
