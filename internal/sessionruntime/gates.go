@@ -964,10 +964,25 @@ func (s *Session) stampGateEvent(coords identity.Coordinates, g gate.Gate) (even
 // guarantee; respondFromClassifier reaches the shared core below directly and
 // is not subject to it.
 func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) error {
+	return s.respondGateAsCaller(ctx, response, uuid.UUID{})
+}
+
+// respondGateAsCaller is the CALLER-supplied gate answer: RespondGate's whole
+// behaviour, shared with the admitted gate_response runtime command so the two
+// cannot drift. In particular the classifier-provenance refusal lives here and
+// nowhere else a caller can reach, so the disposition path is not a way around it.
+//
+// cause is the admitted RuntimeCommandID, or zero for RespondGate. A non-zero cause
+// is stamped as the translated command's CommandID and as the GateResolved event's
+// Cause.CommandID — the correlation every event a runtime command causes carries —
+// which is what lets a successor's recovery scan find a durable answer whose
+// disposition was never written (see CloseAttempt). A zero cause leaves RespondGate
+// exactly as it was: a freshly minted command id and no Cause on the event.
+func (s *Session) respondGateAsCaller(ctx context.Context, response gate.GateResponse, cause uuid.UUID) error {
 	if response.Source.Kind == gate.ResponseFromClassifier {
 		return &GateError{GateID: response.GateID, Kind: GateActionInvalid}
 	}
-	return s.respondGateCore(ctx, response, nil)
+	return s.respondGateCore(ctx, response, nil, cause)
 }
 
 // respondGateCore performs the exactly-once gate claim, durable resolve, and
@@ -982,7 +997,10 @@ func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) e
 // silently no-ops (nil error) rather than reporting a fault, matching design
 // §14.4's "a stale classifier response is an expected race, not a session
 // fault."
-func (s *Session) respondGateCore(ctx context.Context, response gate.GateResponse, drift func(gateEntry) bool) error {
+//
+// cause, when non-zero, is the runtime command this answer applies; see
+// respondGateAsCaller.
+func (s *Session) respondGateCore(ctx context.Context, response gate.GateResponse, drift func(gateEntry) bool, cause uuid.UUID) error {
 	s.gatesMu.Lock()
 	entry, ok := s.gates[response.GateID]
 	if !ok {
@@ -1001,7 +1019,7 @@ func (s *Session) respondGateCore(ctx context.Context, response gate.GateRespons
 		s.gatesMu.Unlock()
 		return &GateError{GateID: response.GateID, Kind: GateActionInvalid}
 	}
-	translated, err := s.translateGateResponse(entry, response)
+	translated, err := s.translateGateResponse(entry, response, cause)
 	if err != nil {
 		s.gatesMu.Unlock()
 		return err
@@ -1010,7 +1028,7 @@ func (s *Session) respondGateCore(ctx context.Context, response gate.GateRespons
 	s.gates[response.GateID] = entry
 	s.gatesMu.Unlock()
 
-	resolved, err := s.buildGateResolved(entry, response, translated.audit)
+	resolved, err := s.buildGateResolved(entry, response, translated.audit, cause)
 	if err != nil {
 		s.revertClaiming(response.GateID)
 		return err
@@ -1111,7 +1129,7 @@ func (s *Session) respondFromClassifier(ctx context.Context, basis gate.ReviewBa
 		}
 		return isStale
 	}
-	err := s.respondGateCore(ctx, response, drift)
+	err := s.respondGateCore(ctx, response, drift, uuid.UUID{})
 	if err == nil {
 		return !stale, nil
 	}
@@ -1280,9 +1298,11 @@ func validateGateAction(g gate.Gate, action string) bool {
 }
 
 // buildGateResolved stamps and builds the GateResolved event from the response
-// and the resolved (already-redacted) audit.
-func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse, audit gate.ResponseAudit) (event.GateResolved, error) {
-	stamped, err := s.factory.Stamp(event.Header{Coordinates: entry.coordinates})
+// and the resolved (already-redacted) audit. A non-zero cause is the runtime
+// command the answer applies and becomes the event's Cause.CommandID; zero leaves
+// the Cause unset, as it always was for RespondGate.
+func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse, audit gate.ResponseAudit, cause uuid.UUID) (event.GateResolved, error) {
+	stamped, err := s.factory.Stamp(event.Header{Coordinates: entry.coordinates, Cause: identity.Cause{CommandID: cause}})
 	if err != nil {
 		return event.GateResolved{}, &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
 	}
@@ -1342,10 +1362,18 @@ type translatedGateResponse struct {
 // builds the translated command, redacted audit, and exact approval action. It
 // returns a typed *GateError on validation failure (invalid action, missing
 // values, unknown kind).
-func (s *Session) translateGateResponse(entry gateEntry, response gate.GateResponse) (translatedGateResponse, error) {
-	cmdID, err := s.newCommandID()
-	if err != nil {
-		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
+//
+// A non-zero cause is used verbatim as the translated command's CommandID: an
+// admitted runtime command's identity is allocated once, by Host, and a second id
+// minted here would split its correlation. Zero mints a fresh id.
+func (s *Session) translateGateResponse(entry gateEntry, response gate.GateResponse, cause uuid.UUID) (translatedGateResponse, error) {
+	cmdID := cause
+	if cmdID.IsZero() {
+		minted, err := s.newCommandID()
+		if err != nil {
+			return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
+		}
+		cmdID = minted
 	}
 	hdr := command.Header{CommandID: cmdID, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}
 	route := command.GateRoute{

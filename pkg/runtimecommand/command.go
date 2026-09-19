@@ -38,6 +38,8 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+
+	"github.com/looprig/harness/pkg/gate"
 )
 
 // MaxCommandIDBytes bounds a public CommandID. The id is opaque, so the only thing
@@ -94,10 +96,18 @@ const (
 	KindInput Kind = "input"
 	// KindInterrupt applies a session-wide interrupt.
 	KindInterrupt Kind = "interrupt"
+	// KindGateResponse answers one open gate through the session's own gate-response
+	// path (the one Session.RespondGate uses), so every refusal RespondGate makes —
+	// including its refusal of a classifier-sourced response — holds here as well.
+	// The spelling is the admitted record's: Factory admits "gate_response", and the
+	// settlement reader compares the kind as a string.
+	KindGateResponse Kind = "gate_response"
 )
 
 // Valid reports whether k is one of the known kinds.
-func (k Kind) Valid() bool { return k == KindInput || k == KindInterrupt }
+func (k Kind) Valid() bool {
+	return k == KindInput || k == KindInterrupt || k == KindGateResponse
+}
 
 // Admitted is one command Host has ALREADY admitted, handed to Harness for
 // application. Harness re-validates it — an admitted record it cannot durably
@@ -117,6 +127,13 @@ type Admitted struct {
 	// Blocks is the input payload, required for KindInput and forbidden for every
 	// other kind (a payload a kind cannot carry would be silently dropped).
 	Blocks []content.Block
+	// GateResponse is the answer a KindGateResponse command applies, required for
+	// that kind and forbidden for every other, for the same reason as Blocks. It must
+	// name a gate. Everything else about it — whether the gate is open, whether the
+	// action is one of its controls, whether its values satisfy the gate's schema,
+	// and whether its source is one a caller may assert — is decided by the session
+	// at application time, because only the session knows the gate.
+	GateResponse *gate.GateResponse
 	// AttemptID is Host's immutable identity for the ONE authorized dispatch
 	// attempt this delivery belongs to. It is OPTIONAL, and the option is the
 	// compatibility contract: a legacy admitted record carries none, and an
@@ -155,6 +172,15 @@ func (a Admitted) Validate() error {
 		if b == nil {
 			return &ValidationError{Field: "Blocks", Reason: "nil block at index " + strconv.Itoa(i)}
 		}
+	}
+	if a.Kind == KindGateResponse && a.GateResponse == nil {
+		return &ValidationError{Field: "GateResponse", Reason: "gate_response carries no response"}
+	}
+	if a.Kind != KindGateResponse && a.GateResponse != nil {
+		return &ValidationError{Field: "GateResponse", Reason: string(a.Kind) + " carries no gate response"}
+	}
+	if a.GateResponse != nil && a.GateResponse.GateID.IsZero() {
+		return &ValidationError{Field: "GateResponse", Reason: "names no gate"}
 	}
 	return nil
 }

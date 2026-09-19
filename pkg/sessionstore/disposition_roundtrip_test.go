@@ -127,6 +127,13 @@ func TestHarnessDispositionFramesAreAcceptedByTheReleasedReader(t *testing.T) {
 		"interrupt applied": {runtimecommand.KindInterrupt, runtimecommand.DispositionApplied},
 		"interrupt no_op":   {runtimecommand.KindInterrupt, runtimecommand.DispositionNoOp},
 		"interrupt refused": {runtimecommand.KindInterrupt, runtimecommand.DispositionRefused},
+		// The third kind is a new STRING in a field the released reader compares as a
+		// string (disposition_evidence.go: env.CommandKind != string(req.Kind)) and the
+		// released inbox leaves unenumerated, so it needs no envelope change — these
+		// rows are the proof rather than the claim.
+		"gate_response applied": {runtimecommand.KindGateResponse, runtimecommand.DispositionApplied},
+		"gate_response no_op":   {runtimecommand.KindGateResponse, runtimecommand.DispositionNoOp},
+		"gate_response refused": {runtimecommand.KindGateResponse, runtimecommand.DispositionRefused},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

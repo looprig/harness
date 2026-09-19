@@ -324,10 +324,13 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 	// report: an append takes exactly one record, so no effect is ever inside the
 	// disposition's frame.
 	//
-	//   input,     sendUserInput returned nil          -> applied
-	//   interrupt, fan-out completed, any == true      -> applied
-	//   interrupt, fan-out completed, any == false     -> no_op   (a SUCCESS)
-	//   either,    the effect failed after the prefix  -> refused
+	//   input,         sendUserInput returned nil                -> applied
+	//   interrupt,     fan-out completed, any == true            -> applied
+	//   interrupt,     fan-out completed, any == false           -> no_op   (a SUCCESS)
+	//   gate_response, the answer's GateResolved is durable      -> applied
+	//   gate_response, no such gate / gate not open              -> no_op   (a SUCCESS)
+	//   gate_response, any other refusal (action, source, append) -> refused
+	//   input/interrupt, the effect failed after the prefix      -> refused
 	//
 	// The refused arm is not symmetry. It is the only terminal answer available to a
 	// command whose effect failed under a STILL-LIVE lease: not_applied requires a
@@ -356,12 +359,61 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 		if err := s.recordDisposition(ctx, dispositions, admitted, outcome); err != nil {
 			return disposition, err
 		}
+	case runtimecommand.KindGateResponse:
+		// The caller-facing gate path, not the core: RespondGate's refusals — the
+		// classifier-provenance one above all — apply to an admitted answer exactly
+		// as they apply to a direct call. The answer's GateResolved is appended
+		// durably BEFORE this frame, and carries the runtime id in its Cause; see
+		// gateResponseDisposition for the ordering argument.
+		outcome, err := gateResponseDisposition(
+			s.respondGateAsCaller(ctx, *admitted.GateResponse, admitted.RuntimeCommandID))
+		if err != nil {
+			return disposition, errors.Join(err, s.recordDisposition(ctx, dispositions, admitted, outcome))
+		}
+		if err := s.recordDisposition(ctx, dispositions, admitted, outcome); err != nil {
+			return disposition, err
+		}
 	default:
 		// Unreachable: Validate rejects every other kind. The prefix is already
 		// durable, so this reports it rather than pretending nothing happened.
 		return disposition, &runtimecommand.ValidationError{Field: "Kind", Reason: "no runtime dispatch path"}
 	}
 	return disposition, nil
+}
+
+// gateResponseDisposition maps the gate path's answer onto the disposition
+// vocabulary, returning the error the applier must still report (nil for the two
+// successful outcomes).
+//
+//   - nil: the GateResolved append COMMITTED — respondGateCore returns nil only
+//     after it — so the answer landed. applied.
+//   - GateNotFound / GateNotReady: there is no open gate to answer. The gate was
+//     already resolved (by this or another answer, a timeout, or its owner), never
+//     existed, or is not yet or no longer answerable. Nothing was appended, and a
+//     retry cannot change that, so this is the successful no-effect outcome, exactly
+//     as an idle interrupt is. no_op.
+//   - anything else — an invalid action or values, a classifier-provenance source,
+//     a gate kind with no answer path, a GateResolved append failure: this runtime
+//     did not accept the answer. refused.
+//
+// WHY THE APPEND-FAILURE ARM CANNOT CONTRADICT A LANDED ANSWER. A refused frame
+// after a GateResolved append error is a lie only if the GateResolved actually
+// landed. The store-backed journal appends under compare-and-swap on the writer's
+// tracked tip and does not advance that tip on ANY error, ambiguous ones included
+// (sessionstore.writeEncodedLocked). If the GateResolved landed despite the error,
+// its frame occupies the slot the refused frame's CAS names, so the refused append
+// fails and nothing contradictory is written; the command is then left for a
+// successor, whose recovery scan finds the landed answer by its Cause and refuses to
+// tombstone it. If it did not land, refused is the truth.
+func gateResponseDisposition(err error) (runtimecommand.DispositionKind, error) {
+	if err == nil {
+		return runtimecommand.DispositionApplied, nil
+	}
+	var gateErr *GateError
+	if errors.As(err, &gateErr) && (gateErr.Kind == GateNotFound || gateErr.Kind == GateNotReady) {
+		return runtimecommand.DispositionNoOp, nil
+	}
+	return runtimecommand.DispositionRefused, err
 }
 
 // resolveApplicationConflict classifies an append failure. Only an idempotency
