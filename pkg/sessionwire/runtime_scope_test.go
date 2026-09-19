@@ -72,6 +72,10 @@ func TestRuntimeSessionIDScopesEventsWhenSet(t *testing.T) {
 		{name: "unset: event matches the core id's rendering", scope: scopeWith(coreRendering, uuid.UUID{}), eventID: other, ok: true},
 		{name: "unset: opaque core id matches no event", scope: scopeWith(opaqueCoreSession, uuid.UUID{}), eventID: rig, ok: false},
 		{name: "unset: event under another session", scope: scopeWith(coreRendering, uuid.UUID{}), eventID: rig, ok: false},
+		// The up-front zero guard is the ONLY thing that refuses this row as session_id:
+		// the zero UUID renders as a valid Core id, so without the guard the event
+		// would pass the scope check and be refused later as Field "event".
+		{name: "unset: zero event session under the zero UUID's rendering", scope: scopeWith(coresessionwire.SessionID(uuid.UUID{}.String()), uuid.UUID{}), eventID: uuid.UUID{}, ok: false},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			t.Parallel()

@@ -42,6 +42,13 @@ type ReadScope struct {
 	// same events. Only the event projections consult it (ProjectJournalPage,
 	// ProjectGatePage); the catalog projections compare catalog records, which carry
 	// the Core id.
+	//
+	// THE PAIRING IS NOT CHECKED, and cannot be inside a pure projection: nothing
+	// here knows which rig a Core session is bound to. A mismatched pair projects
+	// ANOTHER session's events under this Core id. The caller must take both ids
+	// from the SAME read of the session's durable binding (the Core SessionID and
+	// its Binding.RuntimeSessionID), never from two sources. No remote caller can
+	// set it: ReadScope is an in-process value and is never decoded from the wire.
 	RuntimeSessionID uuid.UUID
 }
 

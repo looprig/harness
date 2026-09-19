@@ -387,11 +387,20 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 //
 //   - nil: the GateResolved append COMMITTED — respondGateCore returns nil only
 //     after it — so the answer landed. applied.
+//
 //   - GateNotFound / GateNotReady: there is no open gate to answer. The gate was
 //     already resolved (by this or another answer, a timeout, or its owner), never
 //     existed, or is not yet or no longer answerable. Nothing was appended, and a
 //     retry cannot change that, so this is the successful no-effect outcome, exactly
 //     as an idle interrupt is. no_op.
+//
+//     CAVEAT, bounded: NotReady includes "another answer holds the claim". If that
+//     answer's GateResolved append then fails, it reverts the gate to open, and this
+//     command has already settled no_op — the gate is answerable again only under a
+//     new command. The bound is that the failing append went through the checked hub
+//     path, which faults the session (SessionPersistenceFault), so a faulted session
+//     admits no further runtime command and the reopened gate is not answerable here.
+//
 //   - anything else — an invalid action or values, a classifier-provenance source,
 //     a gate kind with no answer path, a GateResolved append failure: this runtime
 //     did not accept the answer. refused.
@@ -405,6 +414,13 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 // fails and nothing contradictory is written; the command is then left for a
 // successor, whose recovery scan finds the landed answer by its Cause and refuses to
 // tombstone it. If it did not land, refused is the truth.
+//
+// The in-memory gate DOES reopen in the landed case (revertClaiming), so the
+// directory briefly disagrees with the journal. That is bounded the same way: the
+// failed append faulted the session, the stale tracked tip makes every further
+// GateResolved append fail at its CAS, and a runtime command is refused before its
+// prefix. TestAmbiguousGateResolvedAppendNeverContradictsTheJournal pins both modes
+// at the storage ledger.
 func gateResponseDisposition(err error) (runtimecommand.DispositionKind, error) {
 	if err == nil {
 		return runtimecommand.DispositionApplied, nil
