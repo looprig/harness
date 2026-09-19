@@ -7,6 +7,7 @@ import (
 	"time"
 
 	coresessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 )
 
@@ -27,6 +28,21 @@ type ReadScope struct {
 	SessionID coresessionwire.SessionID
 	AgentID   coresessionwire.AgentID
 	Residency coresessionwire.SessionResidency
+	// RuntimeSessionID is the Harness session (rig) id the scoped events were
+	// produced under, when that is not the Core SessionID's rendering. It is
+	// OPTIONAL. Zero keeps the original rule exactly: an event is in scope when
+	// its SessionID renders as SessionID. Non-zero REPLACES that rule: an event is
+	// in scope when its SessionID equals RuntimeSessionID, and SessionID is then
+	// only the Core identity the projection is answered under.
+	//
+	// It exists because a Core SessionID is opaque and a Factory binds the rig to a
+	// DERIVED id, so under a Factory the two never match and no event could be
+	// projected. It affects which events are in scope and nothing else: a page
+	// projected with it set is byte-identical to one projected without it over the
+	// same events. Only the event projections consult it (ProjectJournalPage,
+	// ProjectGatePage); the catalog projections compare catalog records, which carry
+	// the Core id.
+	RuntimeSessionID uuid.UUID
 }
 
 // CatalogState is the closed Harness catalog vocabulary accepted by this
@@ -161,7 +177,16 @@ func validateEventScope(projection string, scope ReadScope, value event.Event) e
 		return &ReadProjectionError{Projection: projection, Field: "event"}
 	}
 	header := value.EventHeader()
-	if header.SessionID.IsZero() || coresessionwire.SessionID(header.SessionID.String()) != scope.SessionID {
+	if header.SessionID.IsZero() {
+		return &ReadProjectionError{Projection: projection, Field: "session_id"}
+	}
+	if !scope.RuntimeSessionID.IsZero() {
+		if header.SessionID != scope.RuntimeSessionID {
+			return &ReadProjectionError{Projection: projection, Field: "session_id"}
+		}
+		return nil
+	}
+	if coresessionwire.SessionID(header.SessionID.String()) != scope.SessionID {
 		return &ReadProjectionError{Projection: projection, Field: "session_id"}
 	}
 	return nil

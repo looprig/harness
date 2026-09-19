@@ -56,6 +56,9 @@ func TestPackageDependencyBoundary(t *testing.T) {
 	allowed := map[string]bool{
 		"bytes": true, "encoding/json": true, "errors": true, "fmt": true, "reflect": true, "time": true,
 		"github.com/looprig/core/content": true, "github.com/looprig/core/sessionwire/v1": true,
+		// core/uuid is already in this package's closure through pkg/event; it is named
+		// directly only so ReadScope.RuntimeSessionID can carry the rig id typed.
+		"github.com/looprig/core/uuid":         true,
 		"github.com/looprig/harness/pkg/event": true,
 	}
 	productionFiles := 0
