@@ -33,15 +33,39 @@ type gateResponseFixture struct {
 	resolveErr error
 }
 
-// failingResolveAppender wraps the production gate appender and fails only the
-// GateResolved append, the one failure that is not a validation refusal.
-type failingResolveAppender struct {
-	gateAppender
+// failingResolveEventAppender is the production journal event appender with the
+// GateResolved append failing. It sits UNDER the hub, as a failing journal does, so
+// the hub reports the SessionPersistenceFault and the session is faulted — the state
+// production reaches after a GateResolved append failure.
+type failingResolveEventAppender struct {
+	*journal.JournalEventAppender
 	err error
 }
 
-func (a failingResolveAppender) AppendGateResolved(context.Context, event.GateResolved) error {
-	return a.err
+func (a failingResolveEventAppender) fail(ev event.Event) bool {
+	_, resolved := ev.(event.GateResolved)
+	return resolved
+}
+
+func (a failingResolveEventAppender) AppendEvent(ctx context.Context, ev event.Event) (uint64, error) {
+	if a.fail(ev) {
+		return 0, a.err
+	}
+	return a.JournalEventAppender.AppendEvent(ctx, ev)
+}
+
+func (a failingResolveEventAppender) AppendEventResult(ctx context.Context, ev event.Event) (uint64, bool, error) {
+	if a.fail(ev) {
+		return 0, false, a.err
+	}
+	return a.JournalEventAppender.AppendEventResult(ctx, ev)
+}
+
+func (a failingResolveEventAppender) AppendEventCommitted(ctx context.Context, ev event.Event) (event.AppendCommit, error) {
+	if a.fail(ev) {
+		return event.AppendCommit{}, a.err
+	}
+	return a.JournalEventAppender.AppendEventCommitted(ctx, ev)
 }
 
 func newGateResponseFixture(t *testing.T) *gateResponseFixture {
@@ -49,8 +73,10 @@ func newGateResponseFixture(t *testing.T) *gateResponseFixture {
 	return wireGates(t, newRuntimeCommandFixture(t), nil)
 }
 
-// wireGates gives f's session a real hub over f's journal and a real gate directory.
-// A non-nil resolveErr makes the GateResolved append fail.
+// wireGates gives f's session a real hub over f's journal and a real gate directory,
+// wired as production wires it: the session is the hub's fault reporter, so a failed
+// required append faults it. A non-nil resolveErr makes the GateResolved journal
+// append fail beneath the hub.
 func wireGates(t *testing.T, f *runtimeCommandFixture, resolveErr error) *gateResponseFixture {
 	t.Helper()
 	s := f.session
@@ -60,14 +86,16 @@ func wireGates(t *testing.T, f *runtimeCommandFixture, resolveErr error) *gateRe
 	if err != nil {
 		t.Fatalf("NewJournalEventAppenderChecked: %v", err)
 	}
-	s.hub = hub.New(f.sid, hub.WithFactory(s.factory), hub.WithAppender(evAp))
+	var appender interface {
+		AppendEvent(context.Context, event.Event) (uint64, error)
+	} = evAp
+	if resolveErr != nil {
+		appender = failingResolveEventAppender{JournalEventAppender: evAp, err: resolveErr}
+	}
+	s.hub = hub.New(f.sid, hub.WithFactory(s.factory), hub.WithAppender(appender), hub.WithFaultReporter(s))
 	s.gates = map[gate.ID]gateEntry{}
 	s.gateTimers = map[gate.ID]*time.Timer{}
-	var ap gateAppender = &liveGateAppender{prepared: journal.NewJournalGateAppender(f.journal), publisher: s}
-	if resolveErr != nil {
-		ap = failingResolveAppender{gateAppender: ap, err: resolveErr}
-	}
-	s.gateAppender = ap
+	s.gateAppender = &liveGateAppender{prepared: journal.NewJournalGateAppender(f.journal), publisher: s}
 	return &gateResponseFixture{runtimeCommandFixture: f, resolveErr: resolveErr}
 }
 
@@ -336,6 +364,11 @@ func TestGateResponseOutcomeMapping(t *testing.T) {
 			}
 			if open := len(f.session.ListGates(context.Background())) == 1; open != row.gateOpen {
 				t.Errorf("gate still open = %v, want %v", open, row.gateOpen)
+			}
+			// Only a failed durable append faults the session; a refused answer and a
+			// no_op leave it healthy.
+			if faulted := f.session.faultIfFaulted() != nil; faulted != (row.resolveErr != nil) {
+				t.Errorf("session faulted = %v, want %v", faulted, row.resolveErr != nil)
 			}
 
 			got := onlyDisposition(t, f.runtimeCommandFixture)
