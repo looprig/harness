@@ -270,6 +270,33 @@ older cannot reopen it.** Both `OpenJournal` and replay fail closed with
 a v0.35.0+ runtime opens it. **Do not roll a Host back below harness v0.35.0 once it
 has applied a `gate_response`.**
 
+### Upgrade note: create and restore make a journal one-way (v0.36.0)
+
+v0.36.0 adds the `create` and `restore` runtime commands
+(`runtimecommand.KindCreate`, `runtimecommand.KindRestore`), which are the kinds
+Factory admits for a session's first command and for resuming one that is not
+resident. Before it, `runtimecommand.Kind` named three kinds while Factory admitted
+five, so a create was refused **after** Host had durably begun its dispatch attempt:
+no disposition frame was ever written, the store could never settle the record, the
+consumer blocked at that command and never advanced its cursor, and
+`Closure.Validate` refused the same kinds so no successor could close it either. The
+session existed and the agent was resident and the user could never talk to it.
+
+**Once a session journal holds any `create` or `restore` application prefix or
+disposition frame, harness v0.35.0 and older cannot reopen it.** Both `OpenJournal`
+and replay fail closed — measured against v0.35.0:
+
+```
+sessionstore: replay decode at seq 3: journal: encode command application: runtimecommand: invalid Kind: unknown kind "create"
+```
+
+The failing check is the Marshal-side validation (v0.35.0
+`pkg/journal/record_json.go:191`), reached from the replay hydration that runs inside
+`OpenJournal` and wrapped by `pkg/sessionstore/replay.go:169`; a disposition frame
+fails the same way through `journal: encode command disposition:`. No data is lost,
+but the session is stranded until a v0.36.0+ runtime opens it. **Do not roll a Host
+back below harness v0.36.0 once it has applied a `create` or a `restore`.**
+
 ### The gate (permission model)
 
 A tool call is never evaluated by parsing arguments. Each tool owns a
