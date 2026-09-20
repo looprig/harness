@@ -117,11 +117,54 @@ const (
 	// session is stranded until a runtime at v0.35.0 or later opens it. Do not roll a
 	// runtime back below v0.35.0 once it has applied a gate_response.
 	KindGateResponse Kind = "gate_response"
+	// KindCreate is the command that brings a session into existence on this
+	// runtime. By the time it reaches this seam the session IS resident — Host makes
+	// it resident before it dispatches — so what remains to apply is the first
+	// message the create carries, if it carries one.
+	//
+	// It MAY carry Blocks and it is the only kind besides KindInput that may: a
+	// create with a first message applies that message exactly as an input does,
+	// through the same audit-intent-first ordering, and a create with none applies
+	// nothing and still settles applied.
+	//
+	// The spelling is the admitted record's, byte for byte
+	// (factory/internal/command/kind.go: "create").
+	//
+	// WHY IT EXISTS. Factory admits EVERY session's first command as a create.
+	// Before v0.36.0 this seam named three kinds, so Host's adapter refused the
+	// create after Host had already durably begun its attempt: no disposition frame
+	// was ever written, the store could never settle the record, a consumer blocked
+	// at that command and never advanced its cursor, and no successor could close it
+	// either because Closure.Validate refused the same kind. The session existed and
+	// the agent was resident, and the user could never talk to it.
+	KindCreate Kind = "create"
+	// KindRestore is the command that resumes a session that is not resident. Like
+	// a create, residency is Host's work and is already done here, and unlike a
+	// create there is no first message: a restore carries NO Blocks, because a
+	// restored session already holds its conversation and a payload riding one would
+	// be silently dropped.
+	//
+	// The spelling is the admitted record's, byte for byte
+	// (factory/internal/command/kind.go: "restore").
+	KindRestore Kind = "restore"
 )
 
-// Valid reports whether k is one of the known kinds.
+// Valid reports whether k is one of the five admitted kinds.
+//
+// The set is Factory's durable vocabulary (factory/internal/command/kind.go) and
+// must stay equal to it. A kind Factory admits and this set omits is a command that
+// can never settle — see KindCreate for what that cost.
+//
+// ONE-WAY UPGRADE, exactly as gate_response was. Once a session journal holds any
+// create or restore application prefix or disposition frame, harness v0.35.0 and
+// older can neither replay nor reopen that journal: the Marshal-side validation
+// fails closed with `journal: encode command application: runtimecommand: invalid
+// Kind: unknown kind "create"` (or "restore"). Nothing is lost — it fails closed —
+// but the session is stranded until a runtime at v0.36.0 or later opens it. Do not
+// roll a runtime back below v0.36.0 once it has applied a create or a restore.
 func (k Kind) Valid() bool {
-	return k == KindInput || k == KindInterrupt || k == KindGateResponse
+	return k == KindInput || k == KindInterrupt || k == KindGateResponse ||
+		k == KindCreate || k == KindRestore
 }
 
 // Admitted is one command Host has ALREADY admitted, handed to Harness for
@@ -139,8 +182,9 @@ type Admitted struct {
 	// LeaseEpoch is the session-lease epoch this command was admitted against. A
 	// record admitted under a superseded epoch is refused.
 	LeaseEpoch uint64
-	// Blocks is the input payload, required for KindInput and forbidden for every
-	// other kind (a payload a kind cannot carry would be silently dropped).
+	// Blocks is the input payload: REQUIRED for KindInput, OPTIONAL for KindCreate
+	// (whose first message it carries, if there is one), and forbidden for every
+	// other kind — a payload a kind cannot carry would be silently dropped.
 	Blocks []content.Block
 	// GateResponse is the answer a KindGateResponse command applies, required for
 	// that kind and forbidden for every other, for the same reason as Blocks. It must
@@ -157,6 +201,16 @@ type Admitted struct {
 	// which has no legacy records: without it the answer would apply and never
 	// settle. A non-empty id is validated exactly as the durable boundary
 	// validates it.
+	//
+	// KindCreate and KindRestore are on INPUT AND INTERRUPT's footing, not
+	// gate_response's: optional. The requirement gate_response carries is a
+	// last-resort guard for a kind whose whole purpose is settlement, and it is not
+	// what makes a create settle — Host dispatches these two under an attempt, and
+	// the authority that decides whether a dispatch is authorized is Host's
+	// admission rather than this validator. A record with no attempt is a shape
+	// that writes no disposition, which is a legacy shape and not a malformed one;
+	// refusing it here would turn an old Host's create into a hard refusal instead
+	// of the unsettled command it already is.
 	AttemptID AttemptID
 }
 
@@ -188,7 +242,11 @@ func (a Admitted) Validate() error {
 	if a.Kind == KindInput && len(a.Blocks) == 0 {
 		return &ValidationError{Field: "Blocks", Reason: "input carries no content"}
 	}
-	if a.Kind != KindInput && len(a.Blocks) > 0 {
+	// KindCreate is the one kind whose payload is OPTIONAL: a create may carry the
+	// session's first message or nothing at all, and both settle. Every other kind
+	// but input forbids one, because blocks a kind cannot apply are dropped in
+	// silence.
+	if a.Kind != KindInput && a.Kind != KindCreate && len(a.Blocks) > 0 {
 		return &ValidationError{Field: "Blocks", Reason: string(a.Kind) + " carries no payload"}
 	}
 	for i, b := range a.Blocks {

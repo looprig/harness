@@ -205,6 +205,14 @@ func (a Admitted) DispositionFor(kind DispositionKind, grantEpoch uint64) Comman
 // which is the whole point of the capability: a caller-supplied author epoch would
 // be a caller-authored proof, and the one thing a tombstone must not be is something
 // a caller can assert.
+//
+// Kind is the ADMITTED command's kind and Validate accepts every one of the five —
+// input, interrupt, gate_response, create and restore. It tracks Kind.Valid rather
+// than holding its own narrower set, and that is load-bearing: a kind a predecessor
+// can apply but a closure refuses is a command no successor can ever close, so the
+// record sits applying for good. That is precisely what happened to create and
+// restore before v0.36.0, and it is the second half of the same defect — the first
+// being that the applier refused them outright.
 type Closure struct {
 	CommandID           CommandID
 	RuntimeCommandID    uuid.UUID

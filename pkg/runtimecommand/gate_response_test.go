@@ -27,8 +27,12 @@ func TestGateResponseKindSpellingIsFactorysDurableByte(t *testing.T) {
 			t.Errorf("Kind(%q).Valid() = false, want true", k)
 		}
 	}
+	// "create" and "restore" left this list in v0.36.0: they are Factory's fourth
+	// and fifth admitted kinds, and refusing them here is what left every created
+	// session unable to settle. The vocabulary in both directions is
+	// TestKindVocabularyIsTheAdmittedFive.
 	for _, k := range []runtimecommand.Kind{
-		"", "gate-response", "gateresponse", "Gate_Response", "gate_response ", "restore", "create",
+		"", "gate-response", "gateresponse", "Gate_Response", "gate_response ",
 	} {
 		if k.Valid() {
 			t.Errorf("Kind(%q).Valid() = true, want false", k)
