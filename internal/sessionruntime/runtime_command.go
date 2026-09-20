@@ -284,8 +284,15 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 	// input command as UNRESOLVED. Auditing first costs nothing: the intent log is
 	// audit-only and swallows its own failures, and a crash between the two leaves an
 	// orphan audit record, which is a state it already tolerates.
+	//
+	// A CREATE carrying a first message takes the same path, and the gate is the
+	// PAYLOAD rather than the kind: a create with no blocks and a restore send
+	// nothing, so they must not borrow the input path's refusals — a resident
+	// session's resume refused because some loop had exited would be an
+	// unsettleable command for no reason.
 	var pending *pendingInput
-	if admitted.Kind == runtimecommand.KindInput {
+	if admitted.Kind == runtimecommand.KindInput ||
+		(admitted.Kind == runtimecommand.KindCreate && len(admitted.Blocks) > 0) {
 		var prepErr error
 		pending, prepErr = s.prepareAdmittedInput(ctx, admitted)
 		if prepErr != nil {
@@ -330,7 +337,20 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 	//   gate_response, the answer's GateResolved is durable      -> applied
 	//   gate_response, no such gate / gate not open              -> no_op   (a SUCCESS)
 	//   gate_response, any other refusal (action, source, append) -> refused
-	//   input/interrupt, the effect failed after the prefix      -> refused
+	//   create,        the first message was sent                -> applied
+	//   create,        it carried no first message               -> applied
+	//   restore,       nothing to send                           -> applied
+	//   input/create/interrupt, the effect failed after the prefix -> refused
+	//
+	// WHY CREATE AND RESTORE ARE applied AND NOT no_op even when they send nothing.
+	// no_op is "the runtime accepted this and it had no effect" — an interrupt of an
+	// idle session. These two are the opposite: their effect is RESIDENCY, and by the
+	// time either reaches this seam Host has already made the session resident, which
+	// is why the command was dispatched at all. Recording no_op would say the runtime
+	// found nothing to do about a session that exists because of this command. Both
+	// spellings settle the record as applied, so the choice does not change the
+	// settlement — it changes what the durable record says, which is the only account
+	// an operator reading a journal has.
 	//
 	// The refused arm is not symmetry. It is the only terminal answer available to a
 	// command whose effect failed under a STILL-LIVE lease: not_applied requires a
@@ -340,6 +360,28 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 		if _, err := s.sendUserInput(ctx, pending.backend, pending.cmd); err != nil {
 			return disposition, errors.Join(err, s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionRefused))
 		}
+		if err := s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionApplied); err != nil {
+			return disposition, err
+		}
+	case runtimecommand.KindCreate:
+		// The session is already resident; what is left to apply is the first message,
+		// if the create carried one. It goes through the SAME send an input uses, under
+		// the same audit-intent-first ordering (prepared above), so its events correlate
+		// to the admitted runtime id and the prefix stays the last record before the
+		// effect. A create with no first message applies nothing and still settles
+		// applied — see the table above for why that is not a no_op.
+		if pending != nil {
+			if _, err := s.sendUserInput(ctx, pending.backend, pending.cmd); err != nil {
+				return disposition, errors.Join(err, s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionRefused))
+			}
+		}
+		if err := s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionApplied); err != nil {
+			return disposition, err
+		}
+	case runtimecommand.KindRestore:
+		// A restore carries no payload — Admitted.Validate refuses one — and the
+		// session it resumes already holds its conversation, so there is no effect to
+		// perform here beyond recording that this runtime took the command.
 		if err := s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionApplied); err != nil {
 			return disposition, err
 		}
