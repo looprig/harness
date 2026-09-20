@@ -359,6 +359,19 @@ func TestReleasedReaderSettlesHarnessApplications(t *testing.T) {
 			want:        durablestore.CommandApplicationCommitted,
 		},
 		{
+			// The kind Factory admits for EVERY session's first command. Before
+			// v0.36.0 no create prefix could exist at all, so this row is the one that
+			// proves the store can settle the command that starts a session.
+			name: "create kind resolves committed", kind: runtimecommand.KindCreate,
+			admittedKnd: durablestore.CommandKind(runtimecommand.KindCreate),
+			want:        durablestore.CommandApplicationCommitted,
+		},
+		{
+			name: "restore kind resolves committed", kind: runtimecommand.KindRestore,
+			admittedKnd: durablestore.CommandKind(runtimecommand.KindRestore),
+			want:        durablestore.CommandApplicationCommitted,
+		},
+		{
 			name: "mismatched runtime id resolves CONFLICTED, not absent", kind: runtimecommand.KindInput,
 			admittedKnd: durablestore.CommandKind(runtimecommand.KindInput),
 			want:        durablestore.CommandApplicationConflicted,
@@ -532,7 +545,16 @@ func FuzzApplicationPrefixIdentityParity(f *testing.F) {
 // else, which is exactly the shape of bug a single-kind table cannot see.
 func TestPrefixDeduplicatesAfterIndexHydration(t *testing.T) {
 	t.Parallel()
-	for _, kind := range []runtimecommand.Kind{runtimecommand.KindInput, runtimecommand.KindInterrupt} {
+	// Every kind a prefix can carry, because hydration reconstructs the fingerprint
+	// from the STORED frame and a kind the reconstruction cannot decode is a session
+	// that reopens with no memory of the command — it would apply a create's first
+	// message twice.
+	for _, kind := range []runtimecommand.Kind{
+		runtimecommand.KindInput,
+		runtimecommand.KindInterrupt,
+		runtimecommand.KindCreate,
+		runtimecommand.KindRestore,
+	} {
 		t.Run(string(kind), func(t *testing.T) {
 			t.Parallel()
 			store, sid, first0, _ := runtimeCommandStore(t)
@@ -563,7 +585,7 @@ func TestPrefixDeduplicatesAfterIndexHydration(t *testing.T) {
 				LeaseEpoch:       lease.Epoch(),
 				Kind:             kind,
 			}
-			if kind == runtimecommand.KindInput {
+			if kind == runtimecommand.KindInput || kind == runtimecommand.KindCreate {
 				admitted.Blocks = []content.Block{&content.TextBlock{Text: "hello"}}
 			}
 			if err := admitted.Validate(); err != nil {

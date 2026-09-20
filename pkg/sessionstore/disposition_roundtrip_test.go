@@ -134,6 +134,16 @@ func TestHarnessDispositionFramesAreAcceptedByTheReleasedReader(t *testing.T) {
 		"gate_response applied": {runtimecommand.KindGateResponse, runtimecommand.DispositionApplied},
 		"gate_response no_op":   {runtimecommand.KindGateResponse, runtimecommand.DispositionNoOp},
 		"gate_response refused": {runtimecommand.KindGateResponse, runtimecommand.DispositionRefused},
+		// The fourth and fifth kinds, v0.36.0. These rows are the CROSS-MODULE proof
+		// that the fix works at the boundary it failed at: before it, Factory's create
+		// reached a runtime that refused the kind, no frame was ever written, and the
+		// released reader answered `inbox evidence (command_kind)` forever. The reader
+		// compares the kind as a string and the released inbox leaves the set
+		// unenumerated, so no envelope change is needed — but "no change needed" is a
+		// claim, and this is the measurement.
+		"create applied":  {runtimecommand.KindCreate, runtimecommand.DispositionApplied},
+		"create refused":  {runtimecommand.KindCreate, runtimecommand.DispositionRefused},
+		"restore applied": {runtimecommand.KindRestore, runtimecommand.DispositionApplied},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -422,16 +432,36 @@ func TestHarnessDispositionFrameIsPrivateAndBodiless(t *testing.T) {
 // the journal at all.
 func TestHarnessDispositionSurvivesJournalHydration(t *testing.T) {
 	t.Parallel()
+	// Every kind a disposition can carry. The replay arm reconstructs the record's
+	// fingerprint from the STORED frame, so a kind it cannot rebuild is a session
+	// that fails to reopen — which is the fail-closed direction, and still bricks
+	// every session that ever held one.
+	for _, kind := range []runtimecommand.Kind{
+		runtimecommand.KindInput,
+		runtimecommand.KindInterrupt,
+		runtimecommand.KindGateResponse,
+		runtimecommand.KindCreate,
+		runtimecommand.KindRestore,
+	} {
+		t.Run(string(kind), func(t *testing.T) {
+			t.Parallel()
+			assertDispositionSurvivesHydration(t, kind)
+		})
+	}
+}
+
+func assertDispositionSurvivesHydration(t *testing.T, kind runtimecommand.Kind) {
+	t.Helper()
 	ctx := context.Background()
 	w := newHarnessWriter(t)
 	runtimeID := newTestUUID(t)
 	epoch := w.lease.Epoch()
 	d := runtimecommand.CommandDisposition{
-		CommandID:           "public/command:hydrate",
+		CommandID:           runtimecommand.CommandID("public/command:hydrate-" + kind),
 		RuntimeCommandID:    runtimeID,
-		Kind:                runtimecommand.KindInput,
+		Kind:                kind,
 		LeaseEpoch:          epoch,
-		AttemptID:           "attempt/hydrate",
+		AttemptID:           runtimecommand.AttemptID("attempt/hydrate-" + kind),
 		AttemptJournalEpoch: epoch,
 		Disposition:         runtimecommand.DispositionApplied,
 	}
