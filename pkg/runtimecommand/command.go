@@ -137,6 +137,15 @@ const (
 	// at that command and never advanced its cursor, and no successor could close it
 	// either because Closure.Validate refused the same kind. The session existed and
 	// the agent was resident, and the user could never talk to it.
+	//
+	// ADAPTER OBLIGATION. An adapter that decodes a command's payload only for
+	// KindInput will cross a create with NO Blocks. This validator accepts it, the
+	// applier sends nothing, and the command settles applied — the user's first
+	// message dropped in silence, with the record looking perfectly settled. Harness
+	// cannot detect it: an undecoded payload and an absent one are the same value
+	// here, and refusing a bare create would make every legitimately idle create
+	// unsettleable. DECODE THE PAYLOAD FOR A CREATE THAT CARRIES ONE, and refuse a
+	// create whose payload you have no decoder for, exactly as you would an input.
 	KindCreate Kind = "create"
 	// KindRestore is the command that resumes a session that is not resident. Like
 	// a create, residency is Host's work and is already done here, and unlike a
