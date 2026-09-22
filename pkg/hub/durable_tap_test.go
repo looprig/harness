@@ -484,15 +484,15 @@ func idleTrigger(t *testing.T, sessionID, loopID uuid.UUID) (event.TurnStarted, 
 	turnCoords := coords
 	turnCoords.TurnID = mustID(t)
 	return event.TurnStarted{
-			Header: event.Header{
-				Coordinates: turnCoords,
-				EventID:     mustID(t),
-				Cause:       identity.Cause{CommandID: mustID(t)},
-			},
-			TurnIndex: 1,
-		}, event.LoopIdle{
-			Header: event.Header{Coordinates: coords, EventID: mustID(t)},
-		}
+		Header: event.Header{
+			Coordinates: turnCoords,
+			EventID:     mustID(t),
+			Cause:       identity.Cause{CommandID: mustID(t)},
+		},
+		TurnIndex: 1,
+	}, event.LoopIdle{
+		Header: event.Header{Coordinates: coords, EventID: mustID(t)},
+	}
 }
 
 // TestDerivedSessionIdleCarriesItsOwnCommittedBody covers the SessionIdle edge derived
