@@ -2,6 +2,7 @@ package sessionruntime
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/looprig/harness/pkg/event"
@@ -117,7 +118,7 @@ func (s *Session) AbandonResidency(ctx context.Context) error {
 	if !owner {
 		return shutdownResult(wait(), ctx.Err())
 	}
-	s.durableSealed.Store(true)
+	s.sealDurableWrites()
 	if s.hub != nil {
 		// The drain is awaited by closeHubLocally, on its bounded deadline.
 		_ = s.hub.AbortSession(hub.ErrResidencyReleased)
@@ -125,6 +126,33 @@ func (s *Session) AbandonResidency(ctx context.Context) error {
 	cleanupErr := s.teardown(abandonTeardown(s))
 	s.finishTeardown(cleanupErr)
 	return shutdownResult(cleanupErr, ctx.Err())
+}
+
+// errDurableWritesSealed is the cause a runtime-command write is refused with once
+// AbandonResidency has sealed the session.
+var errDurableWritesSealed = errors.New("session: residency abandoned; durable writes are sealed")
+
+// sealDurableWrites sets the abandon seal. It takes durableWriteMu exclusively, so it
+// waits for any runtime-command append already running (bounded by that append's own
+// context and the provider's operation bound) and no new one can begin.
+func (s *Session) sealDurableWrites() {
+	s.durableWriteMu.Lock()
+	s.durableSealed.Store(true)
+	s.durableWriteMu.Unlock()
+}
+
+// sealedDurableWrite runs one runtime-command-log append unless the session has been
+// sealed by AbandonResidency, in which case it refuses with a SessionClosing error and
+// writes nothing. Those appends are fenced only by the journal lease, not by the hub,
+// so without this an ApplyRuntimeCommand or CloseAttempt racing an abandon could
+// still write after the seal.
+func (s *Session) sealedDurableWrite(write func() error) error {
+	s.durableWriteMu.RLock()
+	defer s.durableWriteMu.RUnlock()
+	if s.durableSealed.Load() {
+		return &SessionError{Kind: SessionClosing, Cause: errDurableWritesSealed}
+	}
+	return write()
 }
 
 // abandonTeardown is AbandonResidency's plan: nothing to anchor and a local hub close.

@@ -9,7 +9,10 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/runtimecommand"
 	sessionapi "github.com/looprig/harness/pkg/session"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/storage"
@@ -416,4 +419,136 @@ func TestAbandonResidencyLeavesAnInFlightTurnAsCrashDebt(t *testing.T) {
 		t.Fatalf("RestoreSession: %v", err)
 	}
 	t.Cleanup(func() { _ = restored.Shutdown(context.Background()) })
+}
+
+// gatedRuntimeCommandLog wraps the real runtime-command log, counting every
+// append and, when entered is set, blocking the first application append until
+// release closes.
+type gatedRuntimeCommandLog struct {
+	runtimeCommandLog
+	disp    dispositionLog
+	mu      sync.Mutex
+	appends int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (l *gatedRuntimeCommandLog) AppendCommandApplication(ctx context.Context, app runtimecommand.Application) (journal.AppendResult, error) {
+	l.mu.Lock()
+	l.appends++
+	entered := l.entered
+	l.entered = nil
+	l.mu.Unlock()
+	if entered != nil {
+		close(entered)
+		<-l.release
+	}
+	return l.runtimeCommandLog.AppendCommandApplication(ctx, app)
+}
+
+func (l *gatedRuntimeCommandLog) AppendCommandDisposition(ctx context.Context, d runtimecommand.CommandDisposition) (journal.AppendResult, error) {
+	l.mu.Lock()
+	l.appends++
+	l.mu.Unlock()
+	return l.disp.AppendCommandDisposition(ctx, d)
+}
+
+func (l *gatedRuntimeCommandLog) ScanCommandEffect(ctx context.Context, id runtimecommand.CommandID, runtimeID uuid.UUID) (runtimecommand.EffectScan, error) {
+	return l.disp.ScanCommandEffect(ctx, id, runtimeID)
+}
+
+func (l *gatedRuntimeCommandLog) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.appends
+}
+
+func gateRuntimeCommandLog(t *testing.T, f *runtimeCommandFixture) *gatedRuntimeCommandLog {
+	t.Helper()
+	inner := f.session.runtimeCommands
+	disp, ok := inner.(dispositionLog)
+	if !ok {
+		t.Fatal("the fixture's runtime-command log records no dispositions")
+	}
+	gated := &gatedRuntimeCommandLog{runtimeCommandLog: inner, disp: disp}
+	WithRuntimeCommands(gated, f.lease)(f.session)
+	return gated
+}
+
+// TestASealedSessionWritesNoRuntimeCommandRecord is H1: the runtime-command log is
+// appended outside the hub, so the abandon's seal must refuse it too. After the
+// seal an ApplyRuntimeCommand is refused with a typed SessionClosing, writes
+// nothing, dispatches nothing, and reports the zero disposition (re-offerable); a
+// disposition record is refused the same way.
+func TestASealedSessionWritesNoRuntimeCommandRecord(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	log := gateRuntimeCommandLog(t, f)
+	f.session.sealDurableWrites()
+
+	disp, err := f.session.ApplyRuntimeCommand(context.Background(), f.admittedInput("c-sealed", mustUUID(), "hello"))
+	var sessionErr *SessionError
+	if !errors.As(err, &sessionErr) || sessionErr.Kind != SessionClosing || !errors.Is(err, errDurableWritesSealed) {
+		t.Fatalf("ApplyRuntimeCommand on a sealed session = %v, want SessionClosing wrapping the seal", err)
+	}
+	if disp != (runtimecommand.Disposition{}) {
+		t.Errorf("Disposition = %+v, want zero: nothing was written", disp)
+	}
+	adm := f.admittedInput("c-disp", mustUUID(), "x")
+	adm.AttemptID = "attempt-1"
+	if err := f.session.recordDisposition(context.Background(), log, adm, runtimecommand.DispositionApplied); !errors.Is(err, errDurableWritesSealed) {
+		t.Fatalf("recordDisposition on a sealed session = %v, want the seal", err)
+	}
+	if got := log.count(); got != 0 {
+		t.Fatalf("a sealed session appended %d runtime-command record(s), want 0", got)
+	}
+	f.requireNoCommand(t, "the session is sealed")
+}
+
+// TestTheSealWaitsForAnInFlightRuntimeCommandAppend: an append that began before
+// the seal finishes before the seal returns, so the abandon cannot release the
+// leases with a runtime-command write still in flight.
+func TestTheSealWaitsForAnInFlightRuntimeCommandAppend(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	log := gateRuntimeCommandLog(t, f)
+	log.entered, log.release = make(chan struct{}), make(chan struct{})
+	entered := log.entered
+
+	applied := make(chan error, 1)
+	go func() {
+		_, err := f.session.ApplyRuntimeCommand(context.Background(), f.admittedInput("c-flight", mustUUID(), "hi"))
+		applied <- err
+	}()
+	<-entered
+	sealed := make(chan struct{})
+	go func() { f.session.sealDurableWrites(); close(sealed) }()
+	select {
+	case <-sealed:
+		t.Fatal("the seal returned while a runtime-command append was still in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(log.release)
+	select {
+	case <-sealed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the seal never returned after the in-flight append finished")
+	}
+	<-applied
+}
+
+// TestASealedSuccessorWritesNoClosure: the recovery closure is a runtime-command
+// log write too, so a sealed session refuses it rather than tombstoning after the
+// seal.
+func TestASealedSuccessorWritesNoClosure(t *testing.T) {
+	t.Parallel()
+	f, attemptEpoch, commandID, runtimeID, _ := strandedPrefixThenSuccessor(t)
+	f.session.sealDurableWrites()
+	_, err := attemptCloser(t, f).CloseAttempt(context.Background(), closureFor(commandID, runtimeID, attemptEpoch))
+	if !errors.Is(err, errDurableWritesSealed) {
+		t.Fatalf("CloseAttempt on a sealed session = %v, want the seal", err)
+	}
+	if got := readDispositions(t, f); len(got) != 0 {
+		t.Fatalf("a sealed session wrote %d disposition(s), want 0", len(got))
+	}
 }

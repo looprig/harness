@@ -68,8 +68,10 @@ func (s *Session) recordDisposition(
 	if admitted.AttemptID == "" || log == nil {
 		return nil
 	}
-	_, err := log.AppendCommandDisposition(ctx, admitted.DispositionFor(kind, s.runtimeCommandLease.Epoch()))
-	return err
+	return s.sealedDurableWrite(func() error {
+		_, err := log.AppendCommandDisposition(ctx, admitted.DispositionFor(kind, s.runtimeCommandLease.Epoch()))
+		return err
+	})
 }
 
 // CloseAttempt writes the not_applied recovery closure for an attempt a previous
@@ -168,14 +170,19 @@ func (s *Session) CloseAttempt(ctx context.Context, c runtimecommand.Closure) (r
 			EffectSeq:        scan.EffectSeq,
 		}
 	}
-	res, err := dispositions.AppendCommandDisposition(ctx, runtimecommand.CommandDisposition{
-		CommandID:           c.CommandID,
-		RuntimeCommandID:    c.RuntimeCommandID,
-		Kind:                c.Kind,
-		LeaseEpoch:          current,
-		AttemptID:           c.AttemptID,
-		AttemptJournalEpoch: c.AttemptJournalEpoch,
-		Disposition:         runtimecommand.DispositionNotApplied,
+	var res journal.AppendResult
+	err = s.sealedDurableWrite(func() error {
+		var appendErr error
+		res, appendErr = dispositions.AppendCommandDisposition(ctx, runtimecommand.CommandDisposition{
+			CommandID:           c.CommandID,
+			RuntimeCommandID:    c.RuntimeCommandID,
+			Kind:                c.Kind,
+			LeaseEpoch:          current,
+			AttemptID:           c.AttemptID,
+			AttemptJournalEpoch: c.AttemptJournalEpoch,
+			Disposition:         runtimecommand.DispositionNotApplied,
+		})
+		return appendErr
 	})
 	if err != nil {
 		return runtimecommand.ClosureResult{}, err
@@ -325,7 +332,12 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 		}
 	}
 
-	res, err := log.AppendCommandApplication(ctx, admitted.Application())
+	var res journal.AppendResult
+	err := s.sealedDurableWrite(func() error {
+		var appendErr error
+		res, appendErr = log.AppendCommandApplication(ctx, admitted.Application())
+		return appendErr
+	})
 	if err != nil {
 		return s.resolveApplicationConflict(ctx, log, admitted, err)
 	}

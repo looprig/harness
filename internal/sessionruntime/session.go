@@ -112,7 +112,14 @@ type Session struct {
 	faultedCh chan struct{}
 	// durableSealed is set by AbandonResidency before its teardown runs: from then on
 	// the session appends nothing, not even the audit-only intent log.
-	durableSealed     atomic.Bool
+	durableSealed atomic.Bool
+	// durableWriteMu orders the runtime-command log's appends (application prefix,
+	// disposition, recovery closure), which do not go through the hub, against the
+	// seal: each append holds it shared and re-checks durableSealed, and
+	// AbandonResidency takes it exclusively to set the seal, so no such append can
+	// begin after the seal or still be running when the leases are released.
+	durableWriteMu sync.RWMutex
+
 	workspaceFaulted  bool
 	workspaceFaultErr error
 	// workspaceWaiterFailureToken is the sticky Hub waiter-failure generation

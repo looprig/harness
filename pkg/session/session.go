@@ -251,9 +251,15 @@ type PersistenceFaultReporter interface {
 // session. ReleaseResidency anchors the release to a fresh checkpoint and appends
 // SessionResidencyReleased, so it refuses a faulted session whose log it cannot
 // trust — and Shutdown would append SessionStopped, making a session that is merely
-// unhealthy terminal for good. AbandonResidency first SEALS durable publication, so
-// no loop, process or checkpoint shutting down can append behind the fault, then
-// stops the runtime and releases its leases. The journal ends where the live process
+// unhealthy terminal for good. AbandonResidency first SEALS every durable write the
+// session makes: hub publication, the audit intent log, and the runtime-command log
+// (application prefix, disposition, recovery closure), waiting for a runtime-command
+// append already in flight to finish. From then on no loop, process, checkpoint or
+// ApplyRuntimeCommand/CloseAttempt call can append — the latter two are refused with
+// a SessionClosing error and write nothing. It then stops the runtime and releases
+// its leases. (A hub append already blocked in the provider when the seal lands is
+// bounded by the teardown's drain deadline, exactly as for ReleaseResidency; the
+// journal's sequence CAS keeps it from interleaving with a successor's appends.) The journal ends where the live process
 // last managed to write, and a successor's restore treats whatever was in flight as
 // crash debt, exactly as after a crash.
 //
