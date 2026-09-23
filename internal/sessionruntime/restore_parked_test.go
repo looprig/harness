@@ -1,14 +1,17 @@
 package sessionruntime
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -140,6 +143,9 @@ func TestPlanParkedStep(t *testing.T) {
 				t.Fatalf("parked step = %+v", got)
 			}
 			for _, g := range got.Gates {
+				if (g.Kind == gate.KindAskUser) != (g.AskUser != nil) {
+					t.Fatalf("gate %v AskUser = %v for kind %s", g.GateID, g.AskUser, g.Kind)
+				}
 				if (g.Kind == gate.KindPermission) != (g.PermissionRequest != nil) {
 					t.Fatalf("gate %v PermissionRequest = %v for kind %s", g.GateID, g.PermissionRequest, g.Kind)
 				}
@@ -177,5 +183,138 @@ func TestCloseUnresumedAskUserGates(t *testing.T) {
 	closeUnresumedAskUserGates(&f.plan, nil)
 	if _, open := f.plan.open[resumed]; open {
 		t.Fatal("with nothing resumed, an ask_user gate stayed open")
+	}
+}
+
+// TestFoldLoopLocatesTheOpenTurn pins the fold half of planParkedStep's guard: the
+// open turn's start is known only while no compaction has replaced history inside
+// it, and a terminal clears it.
+func TestFoldLoopLocatesTheOpenTurn(t *testing.T) {
+	t.Parallel()
+	user := func(text string) *content.UserMessage {
+		return &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: text}}}}
+	}
+	turnID := uuid.MustParse("123e4567-e89b-12d3-a456-426614174201")
+	cause := identity.Cause{CommandID: uuid.MustParse("123e4567-e89b-12d3-a456-426614174202")}
+	started := event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{TurnID: turnID}, Cause: cause}, Message: user("second")}
+	first := []event.Event{
+		event.TurnStarted{Message: user("first")},
+		event.StepDone{Messages: content.AgenticMessages{parkedStepMessage()}},
+		event.TurnDone{},
+	}
+	tests := []struct {
+		name      string
+		events    []event.Event
+		wantStart int
+		wantOpen  bool
+	}{
+		{name: "open turn after a finished one", events: append(append([]event.Event{}, first...), started), wantStart: 2, wantOpen: true},
+		{name: "compaction inside the open turn", wantStart: -1, wantOpen: true, events: append(append([]event.Event{}, first...), started,
+			event.CompactionCommitted{Summary: user("summary")})},
+		{name: "compaction before the open turn", wantStart: 1, wantOpen: true, events: append(append([]event.Event{}, first...),
+			event.CompactionCommitted{Summary: user("summary")}, started)},
+		{name: "turn closed", wantStart: -1, wantOpen: false, events: append(append([]event.Event{}, first...), started, event.TurnInterrupted{})},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := foldLoop(tt.events)
+			if got.OpenTurn != tt.wantOpen || got.OpenTurnStart != tt.wantStart {
+				t.Fatalf("OpenTurn=%v OpenTurnStart=%d, want %v/%d", got.OpenTurn, got.OpenTurnStart, tt.wantOpen, tt.wantStart)
+			}
+			if tt.wantOpen && (got.OpenTurnID != turnID || got.OpenTurnCause != cause) {
+				t.Fatalf("open turn identity = %v/%+v, want %v/%+v", got.OpenTurnID, got.OpenTurnCause, turnID, cause)
+			}
+			if tt.wantStart >= 0 {
+				if msg, ok := got.Msgs[tt.wantStart].(*content.UserMessage); !ok || msg != started.Message {
+					t.Fatalf("Msgs[%d] = %#v, want the open turn's opening message", tt.wantStart, got.Msgs[tt.wantStart])
+				}
+			}
+		})
+	}
+}
+
+// TestParkedPrimerDoesNotExemptABusyChild (review F3/M15): only the parked
+// primer's open turn is resumed. Another loop that was mid-turn when the runtime
+// was lost is crash-closed exactly as before.
+func TestParkedPrimerDoesNotExemptABusyChild(t *testing.T) {
+	t.Parallel()
+	store := newRestoreStore(t)
+	def := askDefinition(&resumeScriptLLM{toolName: "Ask", continueOnly: true}, newAskTool(true))
+	sessionID, rootLoopID, childLoopID := mustSessionID(t), mustSessionID(t), mustSessionID(t)
+	rootTurn, childTurn, stepID := mustSessionID(t), mustSessionID(t), mustSessionID(t)
+	gateID, execID := gate.ID(mustSessionID(t)), gate.ID(mustSessionID(t))
+
+	lease := mustAcquireLease(t, store, sessionID)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	j, err := store.OpenJournal(ctx, sessionID, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seq byte
+	stamp := func(coords identity.Coordinates) event.Header {
+		seq++
+		return event.Header{Coordinates: coords, EventID: uuid.UUID{0xD7, seq}, CreatedAt: time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)}
+	}
+	appendRecord := func(rec journal.JournalRecord) {
+		t.Helper()
+		if _, err := j.Append(ctx, rec); err != nil {
+			t.Fatalf("append %T: %v", rec, err)
+		}
+	}
+	appendEvent := func(ev event.Event) { appendRecord(journal.NewEventRecord(ev)) }
+	user := &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "go"}}}}
+
+	appendEvent(event.SessionStarted{Header: stamp(identity.Coordinates{SessionID: sessionID}), Config: fingerprintFromDefinition(def)})
+	rootStarted := stamp(identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID})
+	rootStarted.AgentName = "agent"
+	appendEvent(event.LoopStarted{Header: rootStarted, Runtime: runtimeFromFingerprint(fingerprintFromDefinition(def))})
+	rootTurnHeader := stamp(identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID, TurnID: rootTurn})
+	rootTurnHeader.Cause = identity.Cause{CommandID: mustSessionID(t)}
+	appendEvent(event.TurnStarted{Header: rootTurnHeader, TurnIndex: 1, Message: user})
+
+	coords := identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID, TurnID: rootTurn, StepID: stepID}
+	g := gate.Gate{
+		ID: gateID, Kind: gate.KindAskUser, Resolver: gate.ResolverLoop, Blocks: gate.BlocksToolCall, Effect: gate.EffectResume, Restorable: true,
+		Subject: gate.Subject{ToolExecutionID: execID, TurnID: gate.ID(rootTurn), StepID: gate.ID(stepID)},
+		Prompt:  gate.Prompt{Title: "User input requested", Body: "Which color?", Controls: []gate.Control{{Action: "answer", Label: "Answer"}}},
+	}
+	message := &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{
+		&content.ToolUseBlock{ID: "call-1", Name: "Ask", Input: json.RawMessage(`{}`)},
+	}}}
+	appendRecord(journal.NewGatePreparedRecord(
+		event.GatePrepared{Header: stamp(coords), Gate: g, Resume: &event.ToolStepResume{Message: message, ToolUseID: "call-1"}},
+		gate.OpenPayload{GateID: gateID, Payload: gate.AskUserPayload{Question: "Which color?"}}))
+	appendEvent(event.GateOpened{Header: stamp(coords), Gate: g})
+
+	childStarted := stamp(identity.Coordinates{SessionID: sessionID, LoopID: childLoopID})
+	childStarted.AgentName = "agent"
+	childStarted.Cause = identity.Cause{Coordinates: identity.Coordinates{LoopID: rootLoopID}}
+	appendEvent(event.LoopStarted{Header: childStarted, Runtime: runtimeFromFingerprint(fingerprintFromDefinition(def))})
+	childTurnHeader := stamp(identity.Coordinates{SessionID: sessionID, LoopID: childLoopID, TurnID: childTurn})
+	childTurnHeader.Cause = identity.Cause{CommandID: mustSessionID(t)}
+	appendEvent(event.TurnStarted{Header: childTurnHeader, TurnIndex: 1, Message: user})
+	handOver(t, lease)
+
+	restored, err := restoreTestSession(context.Background(), def, sessionID, store)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	t.Cleanup(func() { _ = restored.Shutdown(context.Background()) })
+	if open := restored.ListGates(context.Background()); len(open) != 1 || open[0].ID != gateID {
+		t.Fatalf("gates = %+v, want the primer's parked gate open", open)
+	}
+	interrupted := map[uuid.UUID]int{}
+	for _, ev := range replayAllSessionEvents(t, store, sessionID) {
+		if ti, ok := ev.(event.TurnInterrupted); ok {
+			interrupted[ti.LoopID]++
+		}
+	}
+	if interrupted[rootLoopID] != 0 {
+		t.Fatalf("the parked primer's turn was interrupted: %v", interrupted)
+	}
+	if interrupted[childLoopID] != 1 {
+		t.Fatalf("the busy child's open turn was not crash-closed: %v", interrupted)
 	}
 }
