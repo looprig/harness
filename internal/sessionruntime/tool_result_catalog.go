@@ -30,7 +30,8 @@ import (
 // rewrites a history, never makes a capture unreadable.
 
 // maxBinaryPageBytes keeps a binary page's base64 rendering within
-// tool.MaxToolResultPageBytes: base64 spends four bytes for every three.
+// tool.MaxToolResultPageBytes: base64 spends four bytes for every three. A
+// fitted page limit is scaled the same way (see ReadToolResult).
 const maxBinaryPageBytes = tool.MaxToolResultPageBytes / 4 * 3
 
 // toolResultPageFooterReserve is the room a page leaves for its rendered footer
@@ -184,8 +185,11 @@ func (r *loopToolResultReader) ReadToolResult(ctx context.Context, request tool.
 	}
 	window := uint64(r.pageLimit.Load()) // #nosec G115 -- the limit is positive by construction
 	binary := capture.Encoding == event.ToolResultEncodingBinary
-	if binary && window > maxBinaryPageBytes {
-		window = maxBinaryPageBytes
+	if binary {
+		// The page limit is a RENDERED budget, and base64 spends four bytes for
+		// every three: the raw window is three quarters of it, and never above
+		// the ceiling's own three quarters.
+		window = max(min(window/4*3, maxBinaryPageBytes), 3)
 	}
 	if request.MaxBytes > 0 && request.MaxBytes < window {
 		window = request.MaxBytes
@@ -250,7 +254,9 @@ func (r *loopToolResultReader) readWindow(ctx context.Context, capture event.Too
 	if err := stream.Close(); err != nil {
 		return nil, 0, readFailure(err)
 	}
-	if metadata.Digest != "" && metadata.Digest != "sha256:"+hex.EncodeToString(digest.Sum(nil)) {
+	// An absent digest is refused, not skipped: the reader's own check is the
+	// one that does not depend on the store's EOF verification.
+	if metadata.Digest != "sha256:"+hex.EncodeToString(digest.Sum(nil)) {
 		return nil, 0, &tool.ToolResultReadError{Kind: tool.ToolResultReadIntegrity}
 	}
 	start := lead

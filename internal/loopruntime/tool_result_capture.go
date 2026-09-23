@@ -361,11 +361,17 @@ func retainMintedObject(ctx context.Context, store ToolResultObjectStore, r resu
 	return reference, nil
 }
 
-// toolSetHasReader reports whether the loop's current tool set carries the
-// read_tool_result tool, which is what licenses the marker to tell the model to
-// call it. A tool whose Info fails is treated as absent: the marker must never
-// instruct a call the model cannot make.
+// toolSetHasReader reports whether the loop's current tool set carries a
+// read_tool_result tool WITH a reader behind it, which is what licenses the
+// marker to tell the model to call it. The name alone is not enough: a
+// same-named tool whose definition did not declare tool.RequiresToolResultReader
+// (an MCP tool, say) was never handed a reader, so Bind's
+// ToolResultReaderBound must hold too. A tool whose Info fails is treated as
+// absent: the marker must never instruct a call the model cannot make.
 func toolSetHasReader(ctx context.Context, ts ToolSet) bool {
+	if !ts.ToolResultReaderBound {
+		return false
+	}
 	for _, t := range ts.Registry {
 		if t == nil {
 			continue

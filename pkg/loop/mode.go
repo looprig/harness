@@ -77,7 +77,20 @@ type BoundMode struct {
 	Tools        []tool.InvokableTool
 	ToolLimits   ToolLimits
 	Instructions string
+
+	// toolResultReader records, at Bind, whether this mode's tools include a
+	// ReadToolResultToolName tool built by a definition that declares
+	// tool.RequiresToolResultReader. It is unexported so only Bind can set it.
+	toolResultReader bool
 }
+
+// ToolResultReaderBound reports whether this mode has a read_tool_result tool
+// that was actually handed a tool-result reader: its name is
+// ReadToolResultToolName AND its definition declares
+// tool.RequiresToolResultReader. A same-named tool without the requirement (an
+// MCP tool, say) does not count, so the loop's retention marker never tells the
+// model to call a tool with no reader behind it.
+func (m BoundMode) ToolResultReaderBound() bool { return m.toolResultReader }
 
 func cloneModel(value model.Model) model.Model {
 	value.Sampling = value.Sampling.Clone()

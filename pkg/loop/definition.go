@@ -700,7 +700,20 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 	baseEffort := d.state.model.Sampling.Effort
 	baseModel := cloneModel(d.state.model)
 	baseModel.Sampling.Effort = baseEffort
-	modes = append(modes, BoundMode{Name: "", Model: baseModel, Effort: baseEffort, Tools: baseTools, ToolLimits: d.state.limits})
+	readerBound := func(defs []tool.Definition) bool {
+		for _, def := range defs {
+			if nilLike(def) || def.Requirements()&tool.RequiresToolResultReader == 0 {
+				continue
+			}
+			for _, instance := range builtByName[def.Name()].tools {
+				if info, infoErr := instance.Info(ctx); infoErr == nil && info != nil && info.Name == ReadToolResultToolName {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	modes = append(modes, BoundMode{Name: "", Model: baseModel, Effort: baseEffort, Tools: baseTools, ToolLimits: d.state.limits, toolResultReader: readerBound(withExtra(d.state.tools))})
 	for _, declared := range d.state.modes {
 		selectedDefinitions := declared.Tools
 		if len(selectedDefinitions) == 0 {
@@ -723,7 +736,8 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 		modes = append(modes, BoundMode{
 			Name: declared.Name, Model: selectedModel, Effort: effort,
 			Tools: instances, ToolLimits: resolveLimits(d.state.limits, declared.ToolLimits),
-			Instructions: declared.Instructions,
+			Instructions:     declared.Instructions,
+			toolResultReader: readerBound(withExtra(selectedDefinitions)),
 		})
 	}
 

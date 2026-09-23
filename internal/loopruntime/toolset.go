@@ -34,6 +34,11 @@ type ToolSet struct {
 	// exceeds it still records a durable, observable truncation rather than
 	// silently losing its tail.
 	MaxMaterializedToolResultBytes int
+
+	// ToolResultReaderBound reports that Registry holds a read_tool_result tool
+	// built with a tool-result reader (loop.BoundMode.ToolResultReaderBound).
+	// Only then may the retention marker instruct the model to call it.
+	ToolResultReaderBound bool
 }
 
 const (

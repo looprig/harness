@@ -35,6 +35,9 @@ type memoryToolResultObjects struct {
 	next    int
 	corrupt bool
 	opens   int
+	// misreport makes Open describe the object with metadata that disagrees
+	// with the committed capture while serving the true bytes.
+	misreport func(*sessionwire.ObjectMetadata)
 }
 
 type memoryToolResultObject struct {
@@ -75,8 +78,11 @@ func (m *memoryToolResultObjects) OpenToolResultObject(_ context.Context, sessio
 	if m.corrupt {
 		data = bytes.Repeat([]byte("X"), len(data))
 	}
-	return sessionwire.ObjectMetadata{Reference: ref, SizeBytes: uint64(len(object.data)), Digest: "sha256:" + hex.EncodeToString(sum[:])},
-		io.NopCloser(bytes.NewReader(data)), nil
+	metadata := sessionwire.ObjectMetadata{Reference: ref, SizeBytes: uint64(len(object.data)), Digest: "sha256:" + hex.EncodeToString(sum[:])}
+	if m.misreport != nil {
+		m.misreport(&metadata)
+	}
+	return metadata, io.NopCloser(bytes.NewReader(data)), nil
 }
 
 // retainedCapture publishes body through the catalog's own publisher and
@@ -438,5 +444,59 @@ func TestEveryLoopBindingPassesTheToolResultReader(t *testing.T) {
 	}
 	if sites == 0 {
 		t.Fatal("no tool.Bindings construction found; the guard is vacuous")
+	}
+}
+
+// TestToolResultReaderPagesFitTheFittedBudget pins that a RENDERED page — base64
+// for a binary capture, plus the footer — fits the loop's preview budget, so a
+// page is read rather than shaped and retained a second time.
+func TestToolResultReaderPagesFitTheFittedBudget(t *testing.T) {
+	t.Parallel()
+	for _, encoding := range []event.ToolResultEncoding{event.ToolResultEncodingBinary, event.ToolResultEncodingUTF8} {
+		for _, budget := range []int{600, 4096, 16384, 40000, 60000, 70000} {
+			catalog := newToolResultCatalog(newMemoryToolResultObjects(), captureTestUUID(t))
+			loopID := captureTestUUID(t)
+			body := bytes.Repeat([]byte{0xff, 0x00, 0x80}, 100000)
+			if encoding == event.ToolResultEncodingUTF8 {
+				body = bytes.Repeat([]byte("héllo wörld ✓ "), 20000)
+			}
+			done := retainedCapture(t, catalog, loopID, body, encoding)
+			catalog.observe(done)
+			reader := catalog.readerFor(loopID)
+			fitToolResultReader(reader, limitsBound{base: loop.ToolLimits{ResultBytes: budget}})
+			page, err := reader.ReadToolResult(context.Background(), tool.ToolResultPageRequest{CaptureID: done.Captures[0].ToolExecutionID.String()})
+			if err != nil {
+				t.Fatalf("%s budget %d: %v", encoding, budget, err)
+			}
+			if n := len(page.Render()); n > budget {
+				t.Errorf("%s budget %d: rendered page is %d bytes (raw %d)", encoding, budget, n, len(page.Data))
+			}
+			if len(page.Data) == 0 {
+				t.Errorf("%s budget %d: empty page", encoding, budget)
+			}
+		}
+	}
+}
+
+// TestToolResultReaderRefusesMetadataThatDisagreesWithTheCapture pins the
+// reader's own checks against the COMMITTED capture record: a store reporting
+// another size, or no digest at all, is refused as integrity rather than served.
+func TestToolResultReaderRefusesMetadataThatDisagreesWithTheCapture(t *testing.T) {
+	t.Parallel()
+	for name, misreport := range map[string]func(*sessionwire.ObjectMetadata){
+		"wrong size":   func(m *sessionwire.ObjectMetadata) { m.SizeBytes++ },
+		"empty digest": func(m *sessionwire.ObjectMetadata) { m.Digest = "" },
+		"wrong digest": func(m *sessionwire.ObjectMetadata) { m.Digest = "sha256:" + strings.Repeat("0", 64) },
+	} {
+		objects := newMemoryToolResultObjects()
+		catalog := newToolResultCatalog(objects, captureTestUUID(t))
+		loopID := captureTestUUID(t)
+		done := retainedCapture(t, catalog, loopID, []byte("0123456789"), event.ToolResultEncodingUTF8)
+		catalog.observe(done)
+		objects.misreport = misreport
+		_, err := catalog.readerFor(loopID).ReadToolResult(context.Background(), tool.ToolResultPageRequest{CaptureID: done.Captures[0].ToolExecutionID.String()})
+		if readErrorKind(err) != tool.ToolResultReadIntegrity {
+			t.Errorf("%s: error = %v, want integrity", name, err)
+		}
 	}
 }

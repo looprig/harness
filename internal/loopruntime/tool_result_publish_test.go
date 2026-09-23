@@ -168,14 +168,20 @@ func TestPublishedRetentionVerifiesTheReturnedMetadata(t *testing.T) {
 // instructs a read_tool_result call only when the calling loop can make it.
 func TestPublishedRetentionMarkerNamesTheReaderOnlyWhenBound(t *testing.T) {
 	t.Parallel()
-	for _, bound := range []bool{false, true} {
+	// "impostor" is a tool NAMED read_tool_result whose definition did not
+	// declare tool.RequiresToolResultReader (an MCP tool, say): it has no reader
+	// behind it, so the marker must not point at it.
+	for _, arrangement := range []string{"absent", "impostor", "bound"} {
+		bound := arrangement == "bound"
 		publisher := newFakePublisher()
 		var tools []tool.InvokableTool
-		if bound {
+		if arrangement != "absent" {
 			tools = append(tools, namedTool{name: loop.ReadToolResultToolName})
 		}
+		cfg := publishConfig(publisher, 512, tools...)
+		cfg.tools.ToolResultReaderBound = bound
 		r := textResult(t, "tu-1", strings.Repeat("m", 4096))
-		commit, err := retainToolResults(context.Background(), publishConfig(publisher, 512, tools...), []result{r})
+		commit, err := retainToolResults(context.Background(), cfg, []result{r})
 		if err != nil || commit.retention != nil {
 			t.Fatalf("bound=%v: retainToolResults = %v / %v", bound, err, commit.retention)
 		}
@@ -197,6 +203,7 @@ func TestLegacyRetentionNeverNamesTheReader(t *testing.T) {
 	t.Parallel()
 	cfg := captureConfig(newFakeObjectStore(), 512, 0, 0)
 	cfg.tools.Registry = []tool.InvokableTool{namedTool{name: loop.ReadToolResultToolName}}
+	cfg.tools.ToolResultReaderBound = true
 	commit, err := retainToolResults(context.Background(), cfg, []result{textResult(t, "tu-1", strings.Repeat("l", 4096))})
 	if err != nil || commit.retention != nil {
 		t.Fatalf("retainToolResults = %v / %v", err, commit.retention)
