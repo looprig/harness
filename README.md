@@ -297,6 +297,30 @@ fails the same way through `journal: encode command disposition:`. No data is lo
 but the session is stranded until a v0.36.0+ runtime opens it. **Do not roll a Host
 back below harness v0.36.0 once it has applied a `create` or a `restore`.**
 
+### Upgrade note: an applied input is a durable debt (v0.37.0, not one-way)
+
+In v0.36.0 and older, an input a Host admitted under a disposition attempt was handed
+to the loop's in-memory inbox and its `applied` disposition written at once; the turn
+that carries it out was appended later. A crash or a graceful shutdown in between left
+the command settled `applied` forever with the user's message never run (a shutdown
+even appended an `InputCancelled` for it). v0.37.0 closes that window:
+
+- The loop actor writes `applied` itself, after deciding to take the input and before
+  it can queue, fold or start it, so `applied` is durable strictly before any effect.
+  A loop that declines (shutting down, queue full) publishes nothing and the command is
+  `refused`; a failed `applied` append drops the input, so a successor's `not_applied`
+  closure is true.
+- A loop that goes away (shutdown, cancelled context) carries such an input over
+  instead of cancelling it, and restore re-offers every `applied` input with no caused
+  event, under its original runtime command id.
+- The input's intent record is now load-bearing under an attempt: if it cannot be
+  appended the command is refused before its prefix and may be re-offered.
+
+**No new record kind is written**, so this is not a one-way upgrade: v0.36.0 can still
+open a v0.37.0 journal (it just will not replay an owed input), and v0.37.0 recovers
+the owed inputs a crashed v0.36.0 runtime left behind. Commands admitted without an
+attempt id keep the released path unchanged.
+
 ### The gate (permission model)
 
 A tool call is never evaluated by parsing arguments. Each tool owns a
