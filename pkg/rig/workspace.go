@@ -242,20 +242,9 @@ func checkPersistenceOverlap(store *sessionstore.Store, placement sessionruntime
 }
 
 // placementFingerprint folds the placement mode and canonical region into the workspace
-// fingerprint field so a placement change (mode or path) is a durable config change.
+// fingerprint field. The encoding and the rule restore compares it by are owned by
+// sessionruntime.PlacementFingerprint: a mode or fixed-root change is a durable config
+// change, a relocated per-session base is not.
 func placementFingerprint(placement sessionruntime.WorkspacePlacement, region string) string {
-	return placementModeName(placement.Mode) + ":" + region
-}
-
-func placementModeName(mode sessionruntime.WorkspacePlacementMode) string {
-	switch mode {
-	case sessionruntime.PlacementExclusive:
-		return "exclusive"
-	case sessionruntime.PlacementSession:
-		return "session"
-	case sessionruntime.PlacementShared:
-		return "shared"
-	default:
-		return "none"
-	}
+	return sessionruntime.PlacementFingerprint(placement.Mode, region)
 }

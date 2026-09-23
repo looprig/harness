@@ -41,7 +41,10 @@ type ConfigFingerprint struct {
 	// WorkspaceRoot is the canonical absolute workspace-root id (filepath.Clean of the
 	// absolute root). It binds the session to the repo whose .skills/ (and file tools)
 	// it ran against, so a session cannot silently resume under a different repo's
-	// workspace. Empty for a caller that does not inject a root.
+	// workspace. Empty for a caller that does not inject a root. A rig with a managed
+	// workspace placement writes "<mode>:<canonical region>" here; restore compares a
+	// per-session placement ("session:<base>") by mode alone, because its base is the
+	// host-local directory the tree is materialized under, not the workspace's identity.
 	WorkspaceRoot string `json:"workspace_root,omitzero"`
 	// AgentAdapter identifies the foreign-agent adapter that backed this session
 	// (e.g. "claude"). Empty for a native session. A session must not silently resume

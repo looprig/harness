@@ -160,7 +160,10 @@ func checkFingerprint(persisted, live event.ConfigFingerprint, allowMismatch boo
 // restoredContextDisposition validates restore compatibility and reports whether
 // an explicitly overridden, actual config mismatch makes a durable context
 // measurement stale. Merely enabling the override does not discard matching state.
+//
+// A relocated per-session workspace base is not a mismatch (see relocatedWorkspaceRoot).
 func restoredContextDisposition(persisted, live event.ConfigFingerprint, allowMismatch bool) (bool, error) {
+	persisted = relocatedFingerprint(persisted, live)
 	if err := checkFingerprint(persisted, live, allowMismatch); err != nil {
 		return false, err
 	}

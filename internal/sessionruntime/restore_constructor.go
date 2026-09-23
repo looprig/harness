@@ -376,7 +376,10 @@ func restoreTopologySession(
 	newPathStale := false
 	adoptOnAccept := false
 	if newPath {
-		assessment = event.AssessDrift(baseline.Manifest, candidate)
+		// A relocated per-session workspace base is host-local, not a configuration change:
+		// compare the baseline as if it named the live base (relocatedManifest). The stored
+		// baseline is not rewritten, and an adoption still records the candidate whole.
+		assessment = event.AssessDrift(relocatedManifest(baseline.Manifest, candidate), candidate)
 		persistedName := roots[topology.ActivePrimer].AgentName
 		if configuredName := activeDefinition.Name(); persistedName != configuredName {
 			// A persisted-vs-configured root-loop NAME difference has its OWN category
