@@ -18,7 +18,7 @@ import (
 // still carries both verbatim — so restore, fingerprinting and drift are unchanged.
 func TestJournalPublicSlotRedactsEndpointAndWorkspaceWhileReplayKeepsThem(t *testing.T) {
 	t.Parallel()
-	const baseURL = "https://user:secret@gw.example/v1?key=abc"
+	const baseURL = "https://user:secret@gw.example/v1?key=k3y-zz"
 	const physicalRoot = "exclusive:/private/var/host-7/ws"
 	st, err := Open(memstore.New())
 	if err != nil {
@@ -50,7 +50,7 @@ func TestJournalPublicSlotRedactsEndpointAndWorkspaceWhileReplayKeepsThem(t *tes
 		if err != nil {
 			t.Fatalf("AppendCommitted(%T): %v", ev, err)
 		}
-		for _, marker := range []string{"secret", "user", "abc", "gw.example", "/private/var", "host-7"} {
+		for _, marker := range []string{"secret", "user", "k3y-zz", "gw.example", "/private/var", "host-7"} {
 			if bytes.Contains(result.Public.Body, []byte(marker)) {
 				t.Errorf("stored public body for %T leaked %q: %s", ev, marker, result.Public.Body)
 			}
