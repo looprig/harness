@@ -72,12 +72,14 @@ const (
 	// the attempt's grant, the runtime durably recorded that it accepted the command
 	// into its execution path.
 	//
-	// For an INPUT (and a create's first message) it is also a durable DEBT, as of
-	// v0.37.0: the record is written by the loop actor after it takes the input and
-	// before the input can cause any effect, and a runtime that dies or shuts down
-	// before the input's turn is durable leaves it to restore, which re-offers every
-	// applied input with no caused event. It still does not say a turn started, and
-	// a later turn failure or retraction may still resolve the input visibly.
+	// For an INPUT (and a create's first message) delivered to a native loop it is
+	// also a durable DEBT, as of v0.37.0: the record is written by the loop actor
+	// after it takes the input and before the input can cause any effect, and it is
+	// owed until a durable event caused by the input resolves it. A runtime that dies
+	// or shuts down first leaves it to restore, which re-offers every applied input
+	// with no caused event. It does NOT say the input will run: an idle start failure
+	// (TurnRejected), a failed turn ahead of it (InputCancelled/TurnFailed) or a
+	// retraction discharges the debt visibly without running it.
 	DispositionApplied DispositionKind = "applied"
 	// DispositionNoOp is an explicit SUCCESSFUL application with no effect — an
 	// interrupt of an idle session. It settles applied. Reject-before-dispatch and
@@ -251,9 +253,19 @@ func (c Closure) Validate() error {
 // ClosureResult reports where the recovery closure landed. Appended=false means an
 // identical closure was already durable — a redelivered recovery, not a second
 // tombstone — and Sequence is the ORIGINAL append's.
+//
+// AlreadyDisposed is non-empty when the ATTEMPT'S OWN disposition was already durable
+// before any closure was considered: the predecessor recorded its outcome and died
+// before the store settled it. Nothing is written — there is nothing to close — and
+// Sequence is that disposition's. The caller settles from the evidence as for any
+// disposed attempt. It is a success, not a refusal, because the alternative answers
+// (an idempotency collision with the durable record, or an enduring-effect refusal
+// once the effect the disposition promised lands) would halt a successor on a
+// command whose outcome is already on the record.
 type ClosureResult struct {
-	Sequence uint64
-	Appended bool
+	Sequence        uint64
+	Appended        bool
+	AlreadyDisposed DispositionKind
 }
 
 // EffectScan is what a privileged journal scan found about one command identity. It
@@ -271,6 +283,14 @@ type EffectScan struct {
 	DurableKind      Kind
 	EffectFound      bool
 	EffectSeq        uint64
+	// DispositionSeq is non-zero when the journal holds a disposition naming the
+	// command's CommandID, and Disposition is the FIRST such record, whatever attempt
+	// it names. The protocol writes at most one disposition per command (every
+	// outcome is terminal once settled, and a successor closes only an attempt with
+	// none), so the first is the one. A scanner that predates the fields leaves them
+	// zero, which only costs the closer its already-disposed answer.
+	DispositionSeq uint64
+	Disposition    CommandDisposition
 }
 
 // AttemptCloser is the SEGREGATED recovery-closure capability: it writes the
@@ -288,6 +308,10 @@ type EffectScan struct {
 type AttemptCloser interface {
 	// CloseAttempt durably records not_applied for the named attempt, under THIS
 	// runtime's own grant, which must be strictly later than the attempt's.
+	//
+	// When the attempt's OWN disposition is already durable it writes nothing and
+	// succeeds, naming it in ClosureResult.AlreadyDisposed: the caller settles from
+	// that evidence (as of v0.37.0; earlier releases refused this shape).
 	//
 	// It refuses rather than closing when the runtime holds no live grant, when its
 	// grant is not strictly later, when the journal's own prefix binds the command

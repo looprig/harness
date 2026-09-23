@@ -65,6 +65,14 @@ type Loop struct {
 // CommandSink returns the actor's command input.
 func (l *Loop) CommandSink() chan<- command.Command { return l.Commands }
 
+// SupportsRuntimeAdmission declares that this backend honours command.Admission:
+// it commits a Host-admitted input's acceptance before any effect, answers Result,
+// and carries the input over when it goes away. The session sends an Admission ONLY
+// to a backend that declares it; every other loop.Backend (a foreign loop above all)
+// keeps the released send-then-record path, because a backend that ignored the
+// handshake would run the input with no disposition and never answer.
+func (l *Loop) SupportsRuntimeAdmission() bool { return true }
+
 // PriorityCommandSink returns the bounded native Interrupt/Shutdown lane.
 func (l *Loop) PriorityCommandSink() chan<- command.Command {
 	if l.priorityCommands == nil {
@@ -1876,12 +1884,15 @@ func runLoop(cfg loopConfig, state loopState) {
 	}
 
 	// admitRuntimeInput is the synchronous admission of a Host-admitted input (see
-	// command.Admission). Every refusal is decided BEFORE Commit and publishes
-	// nothing: the applier's durable refused disposition is the command's answer, and
-	// a TurnRejected caused by the command would also read as a committed effect to a
-	// successor's recovery scan. Once Commit returns nil the acceptance is durable and
-	// queueing or starting is infallible and ordered after it, so no effect can be
-	// durable before the acceptance.
+	// command.Admission). Every ADMISSION refusal is decided BEFORE Commit and
+	// publishes nothing: the applier's durable refused disposition is the command's
+	// answer, and a TurnRejected caused by the command would also read as a committed
+	// effect to a successor's recovery scan. Once Commit returns nil the acceptance is
+	// durable and queueing is ordered after it, so no effect can be durable before the
+	// acceptance. What happens AFTER the acceptance is ordinary queued-input handling:
+	// an idle start failure still publishes TurnRejected, and a failed turn ahead of
+	// it still returns it as InputCancelled — each a durable, visible resolution that
+	// discharges the command's debt without the input running.
 	admitRuntimeInput := func(c command.UserInput, qi queuedInput) {
 		admission := c.Admission
 		reply := func(err error) {
@@ -1911,7 +1922,9 @@ func runLoop(cfg loopConfig, state loopState) {
 			return
 		}
 		if admission.Commit != nil {
-			if err := admission.Commit(); err != nil {
+			// Under the LOOP's context: a hard kill preempts the append. The applier
+			// additionally bounds it by its own caller's context.
+			if err := admission.Commit(ctx); err != nil {
 				reply(err)
 				return
 			}

@@ -158,6 +158,11 @@ func (s *Store) ScanCommandEffect(ctx context.Context, id uuid.UUID, commandID r
 			return runtimecommand.EffectScan{}, err
 		}
 		switch r := rec.(type) {
+		case journal.CommandDispositionRecord:
+			if d := r.Disposition(); d.CommandID == commandID && scan.DispositionSeq == 0 {
+				scan.DispositionSeq = seq
+				scan.Disposition = d
+			}
 		case journal.CommandApplicationRecord:
 			if app := r.Application(); app.CommandID == commandID {
 				scan.PrefixSeq = seq

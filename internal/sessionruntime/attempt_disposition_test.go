@@ -504,12 +504,15 @@ func TestClosureIsRefusedOverACommittedEffect(t *testing.T) {
 	}
 }
 
-// TestClosureIsRefusedByTheIdempotencyGuardOverADurableApplication is the FIRST
-// guard, the free one: the successor's not_applied keys on the same attempt id as
-// the predecessor's durable applied disposition, so the append collides and fails
-// closed. It is measured separately from the effect guard because they catch
-// different journals — this one has a disposition and no effect event.
-func TestClosureIsRefusedByTheIdempotencyGuardOverADurableApplication(t *testing.T) {
+// TestClosureOverADurableApplicationReportsAlreadyDisposed: the predecessor's
+// applied disposition is durable but the store never settled it (the Host died in
+// between). The successor's closure must NOT refuse — Host's settleOrRecover returns
+// before settling on any closure error, and the command would never settle — and
+// must NOT tombstone: it reports the durable disposition and writes nothing.
+//
+// The fixture's channel backend appends no events, so the effect guard cannot fire
+// and this isolates the already-disposed answer.
+func TestClosureOverADurableApplicationReportsAlreadyDisposed(t *testing.T) {
 	t.Parallel()
 	f := newRuntimeCommandFixture(t)
 	attemptEpoch := f.lease.Epoch()
@@ -525,31 +528,63 @@ func TestClosureIsRefusedByTheIdempotencyGuardOverADurableApplication(t *testing
 	}
 	successor := takeOver(t, f)
 
-	closer := attemptCloser(t, successor)
-	_, err := closer.CloseAttempt(context.Background(), closureFor(adm.CommandID, runtimeID, attemptEpoch))
-	if err == nil {
-		t.Fatalf("a successor's closure overwrote a durable applied disposition")
+	res, err := attemptCloser(t, successor).CloseAttempt(context.Background(), closureFor(adm.CommandID, runtimeID, attemptEpoch))
+	if err != nil {
+		t.Fatalf("CloseAttempt = %v, want the already-disposed success", err)
 	}
-	// EXACTLY the collision, not "either guard". The disjunction that used to stand
-	// here was defended on the state assertion below — but that state is satisfied by
-	// BOTH arms, so it could not disambiguate them, and the test was one fixture
-	// change away from silently measuring the effect guard under this guard's name.
-	//
-	// The fixture earns the exactness: the applied command's dispatch reaches a
-	// channel backend that appends no events, so the journal holds NO enduring event
-	// caused by that runtime id and the effect guard cannot fire. The only thing left
-	// that can refuse is the idempotency key.
-	var collision *journal.IdempotencyCollisionError
-	if !errors.As(err, &collision) {
-		t.Fatalf("err = %v, want the *IdempotencyCollisionError specifically", err)
-	}
-	var effect *runtimecommand.EnduringEffectError
-	if errors.As(err, &effect) {
-		t.Fatalf("the effect guard fired, so this fixture is not isolating the idempotency key: %+v", effect)
+	if res.AlreadyDisposed != runtimecommand.DispositionApplied || res.Appended || res.Sequence == 0 {
+		t.Fatalf("result = %+v, want AlreadyDisposed=applied, nothing appended, the disposition's sequence", res)
 	}
 	got := readDispositions(t, successor)
 	if len(got) != 1 || got[0].Disposition != runtimecommand.DispositionApplied {
 		t.Fatalf("the journal holds %+v, want only the original applied disposition", got)
+	}
+}
+
+// TestClosureOverAnotherAttemptsDispositionStillGuards: a durable disposition naming
+// a DIFFERENT attempt of the same command is not this attempt's outcome, so the
+// closer falls through to its ordinary guards rather than answering for it.
+func TestClosureOverAnotherAttemptsDispositionStillGuards(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	attemptEpoch := f.lease.Epoch()
+	runtimeID := mustUUID()
+	adm := f.admittedInput("v1:other-attempt", runtimeID, "hi")
+	adm.AttemptID = "attempt/other"
+	if _, err := f.session.ApplyRuntimeCommand(context.Background(), adm); err != nil {
+		t.Fatalf("ApplyRuntimeCommand: %v", err)
+	}
+	f.drainOne(t)
+	successor := takeOver(t, f)
+	res, err := attemptCloser(t, successor).CloseAttempt(context.Background(), closureFor(adm.CommandID, runtimeID, attemptEpoch))
+	if err != nil {
+		t.Fatalf("CloseAttempt = %v", err)
+	}
+	if res.AlreadyDisposed != "" || !res.Appended {
+		t.Fatalf("result = %+v, want a fresh not_applied for the other attempt", res)
+	}
+}
+
+// TestClosureRefusesAConflictingDispositionForTheAttempt: a durable disposition
+// naming THIS attempt under another runtime mapping is a conflict, as the store's
+// own evidence reader treats it — never an already-disposed success. The journal
+// holds no prefix, so the prefix mapping guard cannot be what refuses.
+func TestClosureRefusesAConflictingDispositionForTheAttempt(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	attemptEpoch := f.lease.Epoch()
+	commandID := runtimecommand.CommandID("v1:conflict")
+	if _, err := f.session.runtimeCommands.(dispositionLog).AppendCommandDisposition(context.Background(), runtimecommand.CommandDisposition{
+		CommandID: commandID, RuntimeCommandID: mustUUID(), Kind: runtimecommand.KindInput, LeaseEpoch: attemptEpoch,
+		AttemptID: "attempt/closed", AttemptJournalEpoch: attemptEpoch, Disposition: runtimecommand.DispositionApplied,
+	}); err != nil {
+		t.Fatalf("AppendCommandDisposition: %v", err)
+	}
+	successor := takeOver(t, f)
+	_, err := attemptCloser(t, successor).CloseAttempt(context.Background(), closureFor(commandID, mustUUID(), attemptEpoch))
+	var conflict *runtimecommand.MappingConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("CloseAttempt = %v, want *MappingConflictError", err)
 	}
 }
 

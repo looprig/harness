@@ -673,3 +673,117 @@ func appendOffloadedEvent(t *testing.T, w *harnessWriter, loopID uuid.UUID) {
 		t.Fatalf("the %d-byte body stayed inline; the offloaded shape was not exercised", len(big))
 	}
 }
+
+// TestSuccessorSettlesAPredecessorsUnsettledAppliedInput is the store half of the
+// v0.37.0 successor path. The predecessor wrote `applied` for an input and died
+// before the store settled it; a successor opened the journal (a strictly later
+// fence) and restore replayed the owed input, so its TurnStarted now follows. The
+// successor's closer reports the attempt already disposed (the scan below is the
+// evidence it reads), and Host then settles — which must come out `applied`,
+// authored by the PREDECESSOR's grant, with the successor's effect sitting after it.
+func TestSuccessorSettlesAPredecessorsUnsettledAppliedInput(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	c := newComposition(t)
+	commandID := coresessionwire.CommandID("public/command:owed")
+	runtimeID := newTestUUID(t)
+	attemptID := runtimecommand.AttemptID("attempt/owed")
+	attemptEpoch := c.writer.lease.Epoch()
+	applying := c.dispatch(t, commandID, runtimecommand.KindInput, runtimeID, attemptID, attemptEpoch)
+	res, err := c.writer.log.AppendCommandDisposition(ctx, runtimecommand.CommandDisposition{
+		CommandID: runtimecommand.CommandID(commandID), RuntimeCommandID: runtimeID, Kind: runtimecommand.KindInput,
+		LeaseEpoch: attemptEpoch, AttemptID: attemptID, AttemptJournalEpoch: attemptEpoch,
+		Disposition: runtimecommand.DispositionApplied,
+	})
+	if err != nil {
+		t.Fatalf("AppendCommandDisposition(predecessor): %v", err)
+	}
+	if err := c.writer.lease.Release(ctx); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	successorLease, err := c.writer.store.AcquireLease(ctx, c.writer.session)
+	if err != nil {
+		t.Fatalf("AcquireLease(successor): %v", err)
+	}
+	successorJournal, err := c.writer.store.OpenJournal(ctx, c.writer.session, successorLease)
+	if err != nil {
+		t.Fatalf("OpenJournal(successor): %v", err)
+	}
+	successorLog, err := c.writer.store.OpenRuntimeCommandLog(c.writer.session, successorJournal)
+	if err != nil {
+		t.Fatalf("OpenRuntimeCommandLog(successor): %v", err)
+	}
+	replayed := event.TurnStarted{
+		Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: c.writer.session, LoopID: newTestUUID(t), TurnID: newTestUUID(t)},
+			EventID:     newTestUUID(t),
+			Cause:       identity.Cause{CommandID: runtimeID, Agency: identity.AgencyUser},
+			CreatedAt:   time.Now().UTC(),
+		},
+		TurnIndex: 1,
+	}
+	if _, err := successorJournal.Append(ctx, journal.NewEventRecord(replayed)); err != nil {
+		t.Fatalf("Append(replayed effect): %v", err)
+	}
+
+	scan, err := successorLog.ScanCommandEffect(ctx, runtimecommand.CommandID(commandID), runtimeID)
+	if err != nil {
+		t.Fatalf("ScanCommandEffect: %v", err)
+	}
+	if scan.DispositionSeq != res.Sequence || scan.Disposition.AttemptID != attemptID ||
+		scan.Disposition.Disposition != runtimecommand.DispositionApplied {
+		t.Fatalf("scan = %+v, want the predecessor's applied disposition at %d", scan, res.Sequence)
+	}
+	if !scan.EffectFound {
+		t.Fatalf("scan did not see the replayed effect; the fixture is not the post-replay shape")
+	}
+
+	settled, ok, err := c.settle(t, commandID, applying.Revision)
+	if err != nil || !ok {
+		t.Fatalf("SettleDispositionCommand: ok=%v err=%v", ok, err)
+	}
+	if settled.Record.State != durablestore.InboxStateApplied {
+		t.Fatalf("settled %q, want applied", settled.Record.State)
+	}
+	if o := settled.Record.Outcome; o == nil || uint64(o.AuthorJournalEpoch) != attemptEpoch || o.DispositionSeq != res.Sequence {
+		t.Fatalf("outcome = %+v, want the predecessor-authored applied at %d", o, res.Sequence)
+	}
+}
+
+// TestScanCommandEffectReportsTheFirstDispositionForTheCommand pins the scan field
+// the closer's already-disposed answer reads, and that another command's disposition
+// is not reported.
+func TestScanCommandEffectReportsTheFirstDispositionForTheCommand(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := newHarnessWriter(t)
+	runtimeID := newTestUUID(t)
+	epoch := w.lease.Epoch()
+	other := runtimecommand.CommandDisposition{
+		CommandID: "public/command:other", RuntimeCommandID: newTestUUID(t), Kind: runtimecommand.KindInput,
+		LeaseEpoch: epoch, AttemptID: "attempt/other", AttemptJournalEpoch: epoch, Disposition: runtimecommand.DispositionApplied,
+	}
+	if _, err := w.log.AppendCommandDisposition(ctx, other); err != nil {
+		t.Fatalf("append other: %v", err)
+	}
+	scan, err := w.log.ScanCommandEffect(ctx, "public/command:mine", runtimeID)
+	if err != nil {
+		t.Fatalf("ScanCommandEffect: %v", err)
+	}
+	if scan.DispositionSeq != 0 {
+		t.Fatalf("scan reported another command's disposition: %+v", scan)
+	}
+	mine := other
+	mine.CommandID, mine.RuntimeCommandID, mine.AttemptID = "public/command:mine", runtimeID, "attempt/mine"
+	res, err := w.log.AppendCommandDisposition(ctx, mine)
+	if err != nil {
+		t.Fatalf("append mine: %v", err)
+	}
+	scan, err = w.log.ScanCommandEffect(ctx, "public/command:mine", runtimeID)
+	if err != nil {
+		t.Fatalf("ScanCommandEffect: %v", err)
+	}
+	if scan.DispositionSeq != res.Sequence || scan.Disposition != mine {
+		t.Fatalf("scan = %+v, want %+v at %d", scan, mine, res.Sequence)
+	}
+}

@@ -105,7 +105,8 @@ func planAppliedAdmittedInputs(records []journal.JournalRecord) []admittedInputR
 // Commit and exists only to mark the input carry-over and to learn the loop's answer.
 //
 // A replay that fails is logged and left: the journal is unchanged, so the next
-// restore plans it again.
+// restore plans it again. Replay is therefore LATE and may be OUT OF ORDER relative
+// to inputs that ran since; see the README's v0.37.0 upgrade note.
 func (s *Session) replayAppliedAdmittedInputs(ctx context.Context, plan []admittedInputReplay) {
 	for _, entry := range plan {
 		if err := s.replayAdmittedInput(ctx, entry); err != nil {
@@ -130,9 +131,17 @@ func (s *Session) replayAdmittedInput(ctx context.Context, entry admittedInputRe
 			return &SessionError{Kind: SessionLoopExited}
 		}
 	}
-	result := make(chan error, 1)
 	cmd := entry.cmd
 	cmd.Accepted = nil
+	if !supportsRuntimeAdmission(l) {
+		// A backend that does not know the handshake gets the plain input. It runs,
+		// but it is not carried over if this runtime goes away before it starts —
+		// which is the released behaviour of such a backend, and the next restore
+		// plans it again.
+		_, err := s.sendUserInput(ctx, l, cmd)
+		return err
+	}
+	result := make(chan error, 1)
 	cmd.Admission = &command.Admission{Result: result}
 	if _, err := s.sendUserInput(ctx, l, cmd); err != nil {
 		return err
@@ -140,6 +149,8 @@ func (s *Session) replayAdmittedInput(ctx context.Context, entry admittedInputRe
 	select {
 	case err := <-result:
 		return err
+	case <-ctx.Done():
+		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	case <-l.DoneChan():
 		select {
 		case err := <-result:

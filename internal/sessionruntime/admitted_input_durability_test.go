@@ -436,7 +436,7 @@ func TestADeclinedAdmittedInputIsRefusedNotApplied(t *testing.T) {
 			}
 		}
 	}()
-	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: sink, Done: make(chan struct{})}
+	f.session.loops[f.session.activeLoopID].backend = &admittingBackend{channelBackend{Commands: sink, Done: make(chan struct{})}}
 	adm := f.admittedInput("v1:declined", mustUUID(), "too late")
 	adm.AttemptID = "attempt/declined"
 
@@ -510,4 +510,207 @@ func TestAnAdmittedInputWhoseIntentCannotBeRecordedIsRefusedBeforeThePrefix(t *t
 		t.Fatalf("a prefix was written for a command whose intent failed: %+v", got)
 	}
 	f.requireNoCommand(t, "an input whose intent failed")
+}
+
+// TestABackendWithoutRuntimeAdmissionKeepsTheReleasedPath is F1: a loop.Backend that
+// does not declare runtime admission (a foreign loop) must never be sent the
+// handshake — it would consume the input, run it, and never answer, hanging the
+// applier with no disposition. It gets the plain input and the applier records
+// applied after the send, as v0.36.0 did.
+func TestABackendWithoutRuntimeAdmissionKeepsTheReleasedPath(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	raw := make(chan command.Command, 4)
+	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: raw, Done: make(chan struct{})}
+	adm := f.admittedInput("v1:foreign", mustUUID(), "hello")
+	adm.AttemptID = "attempt/foreign"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := f.session.ApplyRuntimeCommand(ctx, adm); err != nil {
+		t.Fatalf("ApplyRuntimeCommand: %v", err)
+	}
+	select {
+	case cmd := <-raw:
+		input, ok := cmd.(command.UserInput)
+		if !ok || input.Admission != nil {
+			t.Fatalf("backend received %T with Admission=%v, want a plain UserInput", cmd, ok && input.Admission != nil)
+		}
+	default:
+		t.Fatalf("the backend received nothing")
+	}
+	if got := onlyDisposition(t, f); got.Disposition != runtimecommand.DispositionApplied {
+		t.Fatalf("disposition = %q, want applied", got.Disposition)
+	}
+}
+
+// TestTheApplierHonoursItsContextWhileTheActorIsSilent is F1's second half: even
+// against a backend that declares admission and then never answers, the applier
+// returns once its caller's context ends, with the prefix it already committed.
+func TestTheApplierHonoursItsContextWhileTheActorIsSilent(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	silent := make(chan command.Command, 4)
+	f.session.loops[f.session.activeLoopID].backend = &admittingBackend{channelBackend{Commands: silent, Done: make(chan struct{})}}
+	adm := f.admittedInput("v1:silent", mustUUID(), "hello")
+	adm.AttemptID = "attempt/silent"
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	returned := make(chan struct{})
+	var disp runtimecommand.Disposition
+	var err error
+	go func() {
+		disp, err = f.session.ApplyRuntimeCommand(ctx, adm)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("ApplyRuntimeCommand blocked past its context")
+	}
+	var sessionErr *SessionError
+	if !errors.As(err, &sessionErr) || sessionErr.Kind != SessionContextDone {
+		t.Fatalf("err = %v, want *SessionError{SessionContextDone}", err)
+	}
+	if disp.PrefixSequence == 0 {
+		t.Fatalf("Disposition = %+v, want the committed prefix alongside the error", disp)
+	}
+}
+
+// ambiguousDispositionLog lands the disposition and then reports failure — a lost
+// reply.
+type ambiguousDispositionLog struct{ dispositionLogAndRuntimeLog }
+
+func (l ambiguousDispositionLog) AppendCommandDisposition(ctx context.Context, d runtimecommand.CommandDisposition) (journal.AppendResult, error) {
+	if _, err := l.dispositionLogAndRuntimeLog.AppendCommandDisposition(ctx, d); err != nil {
+		return journal.AppendResult{}, err
+	}
+	return journal.AppendResult{}, errors.New("reply lost after the append landed")
+}
+
+// TestALandedCommitReportedAsFailedStillRunsTheInput is F6: the applied append
+// landed but reported an error. Dropping the input would leave a durable `applied`
+// whose input waits for a restore that a live session may never have; the re-read
+// finds it and the input runs now.
+func TestALandedCommitReportedAsFailedStillRunsTheInput(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	f.session.runtimeCommands = ambiguousDispositionLog{f.session.runtimeCommands.(dispositionLogAndRuntimeLog)}
+	adm := f.admittedInput("v1:ambiguous", mustUUID(), "hello")
+	adm.AttemptID = "attempt/ambiguous"
+	if _, err := f.session.ApplyRuntimeCommand(context.Background(), adm); err != nil {
+		t.Fatalf("ApplyRuntimeCommand = %v, want success: the applied record is durable", err)
+	}
+	if _, ok := f.drainOne(t).(command.UserInput); !ok {
+		t.Fatalf("the input was not delivered")
+	}
+	if got := onlyDisposition(t, f); got.Disposition != runtimecommand.DispositionApplied {
+		t.Fatalf("disposition = %q, want applied", got.Disposition)
+	}
+}
+
+// TestReplayCarriesTheInputOverOnlyOnACapableBackend pins the replay's handshake:
+// a capable backend gets an Admission with NO Commit (the acceptance is already
+// durable) so the replayed input is carried over again if this runtime goes away
+// before it starts; a backend without admission gets the plain input.
+func TestReplayCarriesTheInputOverOnlyOnACapableBackend(t *testing.T) {
+	t.Parallel()
+	entry := admittedInputReplay{cmd: command.UserInput{
+		Header: command.Header{CommandID: mustUUID(), Agency: identity.AgencyUser},
+		Blocks: []content.Block{&content.TextBlock{Text: "owed"}},
+	}}
+
+	f := newRuntimeCommandFixture(t)
+	entry.loopID = f.session.activeLoopID
+	if err := f.session.replayAdmittedInput(context.Background(), entry); err != nil {
+		t.Fatalf("replay (capable): %v", err)
+	}
+	input, ok := f.drainOne(t).(command.UserInput)
+	if !ok || input.Admission == nil || input.Admission.Commit != nil {
+		t.Fatalf("capable backend got %+v, want an Admission with a nil Commit", input.Admission)
+	}
+
+	g := newRuntimeCommandFixture(t)
+	raw := make(chan command.Command, 1)
+	g.session.loops[g.session.activeLoopID].backend = &channelBackend{Commands: raw, Done: make(chan struct{})}
+	entry.loopID = g.session.activeLoopID
+	if err := g.session.replayAdmittedInput(context.Background(), entry); err != nil {
+		t.Fatalf("replay (plain): %v", err)
+	}
+	if plain := (<-raw).(command.UserInput); plain.Admission != nil {
+		t.Fatalf("a backend without admission was sent the handshake")
+	}
+}
+
+// TestASuccessorSettlesAnOwedInputEndToEnd is F2 in harness: the predecessor
+// committed `applied` and died before the store settled it; the successor restores
+// (replaying the owed input) and Host's settleOrRecover closes before it settles.
+// The closure must succeed — reporting the durable applied — both before and after
+// the replay's TurnStarted lands, and must write nothing.
+func TestASuccessorSettlesAnOwedInputEndToEnd(t *testing.T) {
+	t.Parallel()
+	store, lifecycle, s := durableInputLifecycle(t)
+	sid := s.SessionID()
+	release := holdTurnStart(s)
+	defer release()
+	runtimeID := mustUUID()
+	attempt := runtimecommand.AttemptID("attempt/owed-e2e")
+	adm := admittedInputFor(s, "v1:owed-e2e", runtimeID, "owed", attempt)
+	epoch := s.runtimeCommandLease.Epoch()
+	if _, err := s.ApplyRuntimeCommand(context.Background(), adm); err != nil {
+		t.Fatalf("ApplyRuntimeCommand: %v", err)
+	}
+	crashWithoutTeardown(t, s)
+	restored, err := lifecycle.RestoreSession(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("RestoreSession: %v", err)
+	}
+	t.Cleanup(func() { _ = restored.Shutdown(context.Background()) })
+	closure := runtimecommand.Closure{CommandID: adm.CommandID, RuntimeCommandID: runtimeID, Kind: runtimecommand.KindInput, AttemptID: attempt, AttemptJournalEpoch: epoch}
+	check := func(when string) {
+		res, err := restored.CloseAttempt(context.Background(), closure)
+		if err != nil {
+			t.Fatalf("CloseAttempt %s = %v, want the already-disposed success", when, err)
+		}
+		if res.AlreadyDisposed != runtimecommand.DispositionApplied || res.Appended {
+			t.Fatalf("CloseAttempt %s = %+v, want AlreadyDisposed=applied with nothing appended", when, res)
+		}
+	}
+	check("right after restore")
+	waitForOpening(t, store, sid, runtimeID)
+	check("after the replayed TurnStarted")
+	requireAppliedDisposition(t, store, sid, adm.CommandID)
+}
+
+// blockingDispositionLog holds every disposition append until its context ends,
+// then reports that it was cancelled.
+type blockingDispositionLog struct {
+	dispositionLogAndRuntimeLog
+	cancelled chan struct{}
+}
+
+func (l blockingDispositionLog) AppendCommandDisposition(ctx context.Context, _ runtimecommand.CommandDisposition) (journal.AppendResult, error) {
+	<-ctx.Done()
+	close(l.cancelled)
+	return journal.AppendResult{}, ctx.Err()
+}
+
+// TestTheCommitIsCancelledByTheCallersContext is F3's caller half: the actor runs
+// Commit under its own loop context, and a wedged append must still end when the
+// Host's context does — otherwise the actor stays blocked in storage after the
+// applier has already given up.
+func TestTheCommitIsCancelledByTheCallersContext(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	cancelled := make(chan struct{})
+	f.session.runtimeCommands = blockingDispositionLog{f.session.runtimeCommands.(dispositionLogAndRuntimeLog), cancelled}
+	adm := f.admittedInput("v1:wedged", mustUUID(), "hello")
+	adm.AttemptID = "attempt/wedged"
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	go func() { _, _ = f.session.ApplyRuntimeCommand(ctx, adm) }()
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the actor's Commit was not cancelled by the caller's context")
+	}
 }

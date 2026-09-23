@@ -337,7 +337,7 @@ func TestAmbiguousGateResolvedAppendNeverContradictsTheJournal(t *testing.T) {
 			}
 
 			succ := takeOver(t, f.runtimeCommandFixture)
-			_, closeErr := attemptCloser(t, succ).CloseAttempt(context.Background(), runtimecommand.Closure{
+			closeRes, closeErr := attemptCloser(t, succ).CloseAttempt(context.Background(), runtimecommand.Closure{
 				CommandID: adm.CommandID, RuntimeCommandID: runtimeID, Kind: runtimecommand.KindGateResponse,
 				AttemptID: adm.AttemptID, AttemptJournalEpoch: attemptEpoch,
 			})
@@ -345,8 +345,10 @@ func TestAmbiguousGateResolvedAppendNeverContradictsTheJournal(t *testing.T) {
 			if landed && !errors.As(closeErr, &enduring) {
 				t.Fatalf("successor closure over a landed answer = %v, want *EnduringEffectError", closeErr)
 			}
-			if !landed && closeErr == nil {
-				t.Fatalf("successor closed an attempt that already settled refused")
+			// Not landed: the refused disposition is durable, so the successor must
+			// report it (and write nothing) so Host settles from it.
+			if !landed && (closeErr != nil || closeRes.AlreadyDisposed != runtimecommand.DispositionRefused) {
+				t.Fatalf("successor closure over a durable refusal = %+v, %v; want AlreadyDisposed=refused", closeRes, closeErr)
 			}
 			for _, d := range readDispositions(t, succ) {
 				if d.AttemptID == adm.AttemptID && d.Disposition == runtimecommand.DispositionNotApplied {

@@ -119,7 +119,7 @@ func newRuntimeCommandFixtureForSession(t *testing.T, store *sessionstore.Store,
 		sessionID:     sid,
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
-		loops:         map[uuid.UUID]*loopHandle{rootLoopID: {backend: &channelBackend{Commands: admittingSink(t, cmds), Done: done}}},
+		loops:         map[uuid.UUID]*loopHandle{rootLoopID: {backend: &admittingBackend{channelBackend{Commands: admittingSink(t, cmds), Done: done}}}},
 		activeLoopID:  rootLoopID,
 		newID:         uuid.New,
 	}
@@ -127,6 +127,12 @@ func newRuntimeCommandFixtureForSession(t *testing.T, store *sessionstore.Store,
 	t.Cleanup(sessionCancel)
 	return &runtimeCommandFixture{session: s, cmds: cmds, done: done, store: store, lease: lease, journal: j, sid: sid}
 }
+
+// admittingBackend is a channel backend that DECLARES runtime admission, as
+// *loopruntime.Loop does, so the session sends it the Admission handshake.
+type admittingBackend struct{ channelBackend }
+
+func (*admittingBackend) SupportsRuntimeAdmission() bool { return true }
 
 // admittingSink stands in for the loop actor's half of command.Admission: it takes
 // every admitted input — calling Commit first, then answering — and forwards every
@@ -146,7 +152,7 @@ func admittingSink(t *testing.T, out chan command.Command) chan command.Command 
 				if input, ok := cmd.(command.UserInput); ok && input.Admission != nil {
 					var err error
 					if input.Admission.Commit != nil {
-						err = input.Admission.Commit()
+						err = input.Admission.Commit(context.Background())
 					}
 					input.Admission.Result <- err
 					if err != nil {
@@ -920,7 +926,7 @@ func TestAnAlreadyExitedLoopIsRefusedBeforeThePrefixIsWritten(t *testing.T) {
 	// The proof that nothing was written: a later delivery is a FIRST delivery, not a
 	// duplicate. Asserting only the error would pass against an implementation that
 	// wrote the prefix and stranded the command.
-	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: admittingSink(t, f.cmds), Done: make(chan struct{})}
+	f.session.loops[f.session.activeLoopID].backend = &admittingBackend{channelBackend{Commands: admittingSink(t, f.cmds), Done: make(chan struct{})}}
 	again, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
 	if err != nil {
 		t.Fatalf("re-delivery after a pre-prefix refusal: %v", err)
@@ -990,7 +996,7 @@ func TestEffectFailureAfterTheDurablePrefixStrandsTheCommand(t *testing.T) {
 	// assertion below would prove nothing about deduplication.
 	live := make(chan command.Command, 4)
 	f.cmds = live
-	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: admittingSink(t, live), Done: make(chan struct{})}
+	f.session.loops[f.session.activeLoopID].backend = &admittingBackend{channelBackend{Commands: admittingSink(t, live), Done: make(chan struct{})}}
 	disp, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
 	if err != nil {
 		t.Fatalf("redelivery after a failed effect: %v", err)

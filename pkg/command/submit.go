@@ -1,6 +1,8 @@
 package command
 
 import (
+	"context"
+
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
@@ -93,10 +95,19 @@ type UserInput struct {
 // it, because its acceptance is durable and a restored successor replays it. An
 // ordinary interrupt still retains it (it is human input), and a turn failure or
 // an explicit retraction still resolves it visibly, exactly as for any queued input.
+//
+// ONLY A BACKEND THAT DECLARES SUPPORT RECEIVES ONE. The session sends an Admission
+// solely to a loop.Backend that also implements
+//
+//	interface{ SupportsRuntimeAdmission() bool }
+//
+// and returns true. A backend that does not know this handshake must not declare it:
+// it would consume the input, run it, and never answer.
 type Admission struct {
 	// Commit makes the runtime's acceptance durable. Called at most once, by the
-	// loop actor, before the input can have any effect.
-	Commit func() error
+	// loop actor, before the input can have any effect, with the LOOP's context so
+	// the loop going away cancels the append.
+	Commit func(context.Context) error
 	// Result receives the loop's answer exactly once. It MUST be buffered
 	// (capacity >= 1): the actor never blocks on it.
 	Result chan error

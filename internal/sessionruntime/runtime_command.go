@@ -75,18 +75,22 @@ func (s *Session) recordDisposition(
 // CloseAttempt writes the not_applied recovery closure for an attempt a previous
 // runtime never finished. See runtimecommand.AttemptCloser for the contract.
 //
-// FOUR REFUSALS, and the two that matter are the last two.
+// FOUR REFUSALS, and the two that matter are the last two, plus one non-refusal.
 //
 // The GRANT check is the protocol's: a closure is authored by a strictly later
 // journal grant, and a runtime closing its own attempt would be writing a tombstone
 // over work it is still doing. The MAPPING check keeps a closure from tombstoning a
 // command whose durable prefix binds a different runtime identity.
 //
-// The IDEMPOTENCY guard is free and is not written here at all — it is the record's
-// own key. A disposition's idempotency id derives from the ATTEMPT id, and Harness
-// hydrates its index from the journal at open, so a successor's not_applied collides
-// with a predecessor's durable applied and fails closed at the append. A successor
-// cannot tombstone an applied command.
+// An ALREADY-DISPOSED attempt is answered first, and as a success. If the attempt's
+// own disposition is durable — the predecessor recorded its outcome and died before
+// the store settled it — nothing is written and the result names that disposition
+// (ClosureResult.AlreadyDisposed); the caller settles from the evidence. Refusing
+// here would halt a successor on a command whose outcome is already on the record:
+// as of v0.37.0 an applied input's effect is expected to follow it (restore replays
+// an owed input), so the effect guard below would refuse forever. The IDEMPOTENCY
+// key still backs this up — a disposition's id derives from the attempt id — so a
+// successor can never tombstone an applied command even if this check were skipped.
 //
 // The EFFECT guard is the one that is NOT free, and it is why this method pays for a
 // whole-journal scan. If the predecessor's effect committed but its disposition
@@ -133,6 +137,27 @@ func (s *Session) CloseAttempt(ctx context.Context, c runtimecommand.Closure) (r
 			DurableKind:      scan.DurableKind,
 			Sequence:         scan.PrefixSeq,
 		}
+	}
+	// THE ATTEMPT IS ALREADY DISPOSED: its own disposition is durable, so the
+	// predecessor recorded its outcome and died before the store settled it. There is
+	// nothing to close, and the caller must settle from that evidence. Checked BEFORE
+	// the effect guard because an applied input's effect is expected — restore
+	// replays an owed input, so its TurnStarted follows — and refusing over it would
+	// halt the successor on a command whose outcome is already on the record. A
+	// durable record that disagrees about the mapping is refused as a conflict, as the
+	// store's own evidence reader would.
+	if d := scan.Disposition; scan.DispositionSeq != 0 && d.AttemptID == c.AttemptID {
+		if d.RuntimeCommandID != c.RuntimeCommandID || d.Kind != c.Kind {
+			return runtimecommand.ClosureResult{}, &runtimecommand.MappingConflictError{
+				CommandID:        c.CommandID,
+				RuntimeCommandID: c.RuntimeCommandID,
+				DurableRuntimeID: d.RuntimeCommandID,
+				Kind:             c.Kind,
+				DurableKind:      d.Kind,
+				Sequence:         scan.DispositionSeq,
+			}
+		}
+		return runtimecommand.ClosureResult{Sequence: scan.DispositionSeq, AlreadyDisposed: d.Disposition}, nil
 	}
 	if scan.EffectFound {
 		return runtimecommand.ClosureResult{}, &runtimecommand.EnduringEffectError{
@@ -426,46 +451,56 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 // applyAdmittedInput hands an admitted input (an input, or a create's first
 // message) to its loop and records its disposition.
 //
-// UNDER A DISPOSITION ATTEMPT THE `applied` RECORD IS WRITTEN BY THE LOOP ACTOR, not
-// after the send. The input carries a command.Admission whose Commit appends the
-// applied disposition; the actor decides on its own live state, calls Commit, and
-// only then queues or starts the input. That ordering is what the disposition means:
+// UNDER A DISPOSITION ATTEMPT, AND ONLY FOR A BACKEND THAT DECLARES IT, THE `applied`
+// RECORD IS WRITTEN BY THE LOOP ACTOR, not after the send. The input carries a
+// command.Admission whose Commit appends the applied disposition; the actor decides
+// on its own live state, calls Commit, and only then queues or starts the input:
 //
 //   - `applied` is durable strictly BEFORE any effect the input can cause, so a
 //     successor's recovery scan never finds an effect with no disposition behind it
-//     for this kind, and never has to refuse a closure over one;
-//   - an input `applied` names is one the runtime durably OWES: if the runtime dies
-//     before the input's turn is durable, restore replays it (see
-//     replayAppliedAdmittedInputs), and a loop going away carries it over rather than
-//     cancelling it. v0.36.0 wrote `applied` after handing the input to an in-memory
-//     inbox and lost it on exactly that crash.
+//     for this kind;
+//   - an input `applied` names is one the runtime durably OWES until a durable event
+//     it caused resolves it: if the runtime dies or shuts down before then, restore
+//     replays it (see replayAppliedAdmittedInputs).
 //
 // A loop that declines before Commit (shutting down, queue full, an admission fault)
-// leaves no effect, so the command is refused under the live grant. A Commit that
-// fails leaves no effect either, and nothing else is written: the append may have
-// landed ambiguously, and a successor settles it from what is durable — a landed
-// `applied` is replayed, and an absent one is closed not_applied.
+// leaves no effect, so the command is refused under the live grant. A Commit whose
+// append reports an error is RE-READ before the input is dropped: an append that
+// landed despite the error is a commit, and the input runs now rather than at some
+// later restore. One that did not land leaves nothing, and a successor closes it.
 //
-// A legacy admitted record (no attempt id) keeps its released path exactly: it has
-// no disposition to order and nothing to replay from, so it is sent and left.
+// NOTHING HERE BLOCKS PAST THE CALLER'S CONTEXT. Commit's append runs under the loop's
+// context bounded by the caller's; the wait for the actor's answer also watches the
+// caller's context, and gives up with the prefix already durable — exactly the
+// "effect failed after the prefix" shape, which Host settles from evidence.
+//
+// A backend that does not declare runtime admission (a foreign loop), and a legacy
+// admitted record (no attempt id), keep the released send-then-record path: such a
+// backend would consume an Admission, run the input, and never answer.
 func (s *Session) applyAdmittedInput(
 	ctx context.Context,
 	dispositions dispositionLog,
 	admitted runtimecommand.Admitted,
 	pending *pendingInput,
 ) error {
-	if admitted.AttemptID == "" || dispositions == nil {
-		_, err := s.sendUserInput(ctx, pending.backend, pending.cmd)
-		return err
+	if admitted.AttemptID == "" || dispositions == nil || !supportsRuntimeAdmission(pending.backend) {
+		if _, err := s.sendUserInput(ctx, pending.backend, pending.cmd); err != nil {
+			return errors.Join(err, s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionRefused))
+		}
+		return s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionApplied)
 	}
 	var commitErr error
 	var committed bool
 	result := make(chan error, 1)
 	cmd := pending.cmd
 	cmd.Admission = &command.Admission{
-		Commit: func() error {
+		Commit: func(loopCtx context.Context) error {
 			committed = true
-			commitErr = s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionApplied)
+			commitCtx, cancel := context.WithCancel(loopCtx)
+			defer cancel()
+			stop := context.AfterFunc(ctx, cancel)
+			defer stop()
+			commitErr = s.commitApplied(commitCtx, dispositions, admitted)
 			return commitErr
 		},
 		Result: result,
@@ -473,13 +508,14 @@ func (s *Session) applyAdmittedInput(
 	if _, err := s.sendUserInput(ctx, pending.backend, cmd); err != nil {
 		return errors.Join(err, s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionRefused))
 	}
-	// The actor answers in the same step that received the command, so once the send
-	// succeeded the answer is already on its way. The loop's exit is watched only
-	// against a defect; the caller's ctx is deliberately NOT, because abandoning the
-	// wait would report a failure for an input the actor may have just made durable.
 	var answer error
 	select {
 	case answer = <-result:
+	case <-ctx.Done():
+		// The actor may still be committing; its answer lands in the buffered Result
+		// and is dropped. Whatever it decided is durable or absent, and a caller
+		// settles from that.
+		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	case <-pending.backend.DoneChan():
 		select {
 		case answer = <-result:
@@ -491,11 +527,42 @@ func (s *Session) applyAdmittedInput(
 	case answer == nil:
 		return nil
 	case committed:
-		// Commit ran and failed: the actor dropped the input. See the doc above.
+		// Commit ran and failed, and the re-read found nothing durable: the actor
+		// dropped the input and a successor closes the attempt.
 		return commitErr
 	default:
 		return errors.Join(answer, s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionRefused))
 	}
+}
+
+// supportsRuntimeAdmission reports whether b honours command.Admission.
+func supportsRuntimeAdmission(b loop.Backend) bool {
+	capable, ok := b.(interface{ SupportsRuntimeAdmission() bool })
+	return ok && capable.SupportsRuntimeAdmission()
+}
+
+// commitApplied appends the attempt's applied disposition and, when the append
+// reports an error, re-reads the journal for it: an append can land and still
+// report failure (a lost reply), and dropping an input whose acceptance IS durable
+// would leave it owed until a restore that may never come. Only a disposition that
+// matches this attempt exactly counts; a re-read that cannot answer keeps the
+// original error, which is the conservative direction — the input is dropped and
+// a successor settles it from what is durable.
+func (s *Session) commitApplied(ctx context.Context, dispositions dispositionLog, admitted runtimecommand.Admitted) error {
+	err := s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionApplied)
+	if err == nil {
+		return nil
+	}
+	scan, scanErr := dispositions.ScanCommandEffect(ctx, admitted.CommandID, admitted.RuntimeCommandID)
+	if scanErr != nil {
+		return err
+	}
+	if d := scan.Disposition; scan.DispositionSeq != 0 && d.AttemptID == admitted.AttemptID &&
+		d.RuntimeCommandID == admitted.RuntimeCommandID && d.Kind == admitted.Kind &&
+		d.Disposition == runtimecommand.DispositionApplied {
+		return nil
+	}
+	return err
 }
 
 // gateResponseDisposition maps the gate path's answer onto the disposition
