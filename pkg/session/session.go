@@ -218,6 +218,52 @@ type Releaser interface {
 	ReleaseResidency(context.Context) error
 }
 
+// PersistenceFaultReporter is the segregated durable-health capability: it lets an
+// out-of-process supervisor notice that the session has latched a TERMINAL
+// persistence fault — a required journal append failed, so the live runtime's
+// in-memory state and its durable log may disagree and the session refuses every
+// new Submit for the rest of its life.
+//
+// THE LATCH IS DELIBERATE AND IS NOT CLEARED IN PLACE. A failed append may or may not
+// have landed, and the loop may already have acted on state the journal does not
+// hold; nothing the live process can read back proves which. Recovery is therefore a
+// RESTORE from the durable journal by a successor, and this capability exists so the
+// supervisor can start one instead of keeping a runtime resident that can never
+// persist again. A storage outage of any length — one failed append — reaches it.
+//
+// PersistenceFaulted returns a channel closed once, when the fault latches; every
+// call returns the same channel. PersistenceFault returns the latched fault (which
+// chains the storage failure) or nil before it latches. A recoverable required-
+// checkpoint latch (cleared by a manual checkpoint) is NOT reported here.
+//
+// It is a capability discovered by assertion, like Releaser; a false ok means "this
+// session does not report its durable health", not "this session is healthy".
+type PersistenceFaultReporter interface {
+	PersistenceFaulted() <-chan struct{}
+	PersistenceFault() error
+}
+
+// ResidencyAbandoner is the segregated CRASH-EQUIVALENT residency-release
+// capability: it gives up this process's resident runtime exactly as a process
+// crash would, and writes nothing durable while doing so.
+//
+// It differs from Releaser in the one respect that makes it usable on a faulted
+// session. ReleaseResidency anchors the release to a fresh checkpoint and appends
+// SessionResidencyReleased, so it refuses a faulted session whose log it cannot
+// trust — and Shutdown would append SessionStopped, making a session that is merely
+// unhealthy terminal for good. AbandonResidency first SEALS durable publication, so
+// no loop, process or checkpoint shutting down can append behind the fault, then
+// stops the runtime and releases its leases. The journal ends where the live process
+// last managed to write, and a successor's restore treats whatever was in flight as
+// crash debt, exactly as after a crash.
+//
+// It admits any session, faulted or not, and joins a teardown already underway. A
+// lease release that fails (storage still down) is reported, and the lease then
+// lapses on its own expiry.
+type ResidencyAbandoner interface {
+	AbandonResidency(context.Context) error
+}
+
 // WorkspaceStatus is what a session reports about the managed workspace it came up
 // on: where the workspace is, and which durable checkpoint the live tree was
 // materialized from.

@@ -91,6 +91,47 @@ func (s *Session) ReleaseResidency(ctx context.Context) error {
 	return shutdownResult(cleanupErr, ctx.Err())
 }
 
+// AbandonResidency is the exported session.ResidencyAbandoner capability: the
+// CRASH-EQUIVALENT nonterminal release. See that interface for the contract.
+//
+// THE SEAL COMES FIRST, AND ONLY FOR THE ELECTED OWNER. Sealing before the election
+// would silence a ReleaseResidency already underway, which still has its anchoring
+// checkpoint and release record to append; a caller that loses the election joins
+// whatever teardown won. Once sealed, every later publication — a loop's shutdown
+// terminal, a process lifecycle record, a checkpoint — is refused by the hub, so the
+// durable log ends where the live runtime last wrote, and a successor restores from
+// exactly that. The teardown then runs the nonterminal plan with NO anchor step and a
+// local hub close, so nothing is appended at either seam either, and the root and
+// journal leases are released so a successor need not wait for them to expire.
+func (s *Session) AbandonResidency(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if hustleFinalizerOwnsSession(ctx, s) {
+		return &HustleShutdownReentryError{}
+	}
+	owner, wait, err := s.beginTeardown(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if !owner {
+		return shutdownResult(wait(), ctx.Err())
+	}
+	s.durableSealed.Store(true)
+	if s.hub != nil {
+		// The drain is awaited by closeHubLocally, on its bounded deadline.
+		_ = s.hub.AbortSession(hub.ErrResidencyReleased)
+	}
+	cleanupErr := s.teardown(abandonTeardown(s))
+	s.finishTeardown(cleanupErr)
+	return shutdownResult(cleanupErr, ctx.Err())
+}
+
+// abandonTeardown is AbandonResidency's plan: nothing to anchor and a local hub close.
+func abandonTeardown(s *Session) teardownPlan {
+	return newTeardownPlan(noTeardownStep, s.closeHubLocally)
+}
+
 // admitResidencyRelease is the release-only precondition: a faulted session has no
 // trustworthy durable log to anchor a release to, and a busy session must not have its
 // work torn down by a release that could have waited. Both are checked with nothing

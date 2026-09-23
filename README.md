@@ -297,6 +297,26 @@ fails the same way through `journal: encode command disposition:`. No data is lo
 but the session is stranded until a v0.36.0+ runtime opens it. **Do not roll a Host
 back below harness v0.36.0 once it has applied a `create` or a `restore`.**
 
+### Upgrade note: a persistence fault is observable and recoverable by restore (v0.38.0, additive)
+
+One failed required journal append — a brief PostgreSQL or S3 outage is enough —
+latches the session faulted for the rest of its life. That is deliberate: the append may
+or may not have landed and the loop may have acted on state the journal does not hold,
+so nothing in the live process can prove the durable state. Until v0.38.0 nothing outside
+the process could see the latch, so a supervisor kept the runtime resident and every
+later command against it stalled.
+
+v0.38.0 adds two segregated capabilities, discovered by assertion like
+`session.Releaser`: `session.PersistenceFaultReporter` (`PersistenceFaulted()` closes
+when the terminal fault latches; `PersistenceFault()` returns it) and
+`session.ResidencyAbandoner` (`AbandonResidency`, a crash-equivalent nonterminal
+release). `AbandonResidency` seals durable publication before it stops anything, so it
+appends nothing — no `SessionStopped`, no release record, no shutdown intent records, no
+terminal for an in-flight turn — and releases the leases, so a successor restores from
+the journal exactly as after a crash. `ReleaseResidency` still refuses a faulted
+session, and `Shutdown` on one would make it terminal: **a supervisor must use
+`AbandonResidency` on a faulted session.** Nothing about the journal format changes.
+
 ### Upgrade note: a relocated workspace base restores (v0.37.1, not one-way)
 
 A rig with `WithSessionWorkspaces(store, base)` records its placement in the config

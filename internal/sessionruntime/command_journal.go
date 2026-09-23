@@ -420,7 +420,9 @@ func (s *Session) appendShutdownCommand(ctx context.Context, loopID uuid.UUID, c
 // proceeds — the append is never load-bearing for dispatch.
 func (s *Session) appendCommandWithPolicy(ctx context.Context, loopID uuid.UUID, cmd command.Command, leaseLostExpected bool) {
 	app := s.cmdAppender
-	if app == nil {
+	if app == nil || s.durableSealed.Load() {
+		// A sealed session (AbandonResidency) writes nothing more, audit included: a
+		// crash would not have written the shutdown intents either.
 		return
 	}
 	rec := journal.NewCommandRecord(s.sessionID, loopID, cmd)

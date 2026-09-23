@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/looprig/core/content"
@@ -104,8 +105,14 @@ type Session struct {
 	// the fault that latched it (chained as the refusal's Cause). Both are guarded by
 	// loopsMu — the same lock that gates closing and the NewLoop registration check —
 	// so a fault and a NewLoop can never interleave incorrectly.
-	faulted           bool
-	faultErr          error
+	faulted  bool
+	faultErr error
+	// faultedCh is the PersistenceFaulted broadcast: minted lazily under loopsMu and
+	// closed exactly once, by the latch that sets faulted.
+	faultedCh chan struct{}
+	// durableSealed is set by AbandonResidency before its teardown runs: from then on
+	// the session appends nothing, not even the audit-only intent log.
+	durableSealed     atomic.Bool
 	workspaceFaulted  bool
 	workspaceFaultErr error
 	// workspaceWaiterFailureToken is the sticky Hub waiter-failure generation
@@ -811,12 +818,53 @@ func (s *Session) latchSessionFault(fault error) {
 	if !s.faulted {
 		s.faulted = true
 		s.faultErr = fault
+		if s.faultedCh == nil {
+			s.faultedCh = make(chan struct{})
+		}
+		close(s.faultedCh)
 	}
 	s.loopsMu.Unlock()
 
 	// Wake blocked WaitIdle waiters with the fault (outside loopsMu — FailWaiters
 	// takes the hub lock; loopsMu and the hub lock are never held together).
+	//
+	// DURABLE PUBLICATION IS NOT SEALED HERE, deliberately: a loop still resolves the
+	// input whose append failed with a durable terminal (TurnRejected/TurnFailed, see
+	// turn_start_checked_test.go), and restore reads that resolution. The seal belongs
+	// to AbandonResidency, which a supervisor calls once it has seen PersistenceFaulted.
 	s.hub.FailWaiters(fault)
+}
+
+// Compile-time proof that *Session offers the durable-health and crash-equivalent
+// release capabilities a Host supervises it through.
+var (
+	_ sessionapi.PersistenceFaultReporter = (*Session)(nil)
+	_ sessionapi.ResidencyAbandoner       = (*Session)(nil)
+)
+
+// PersistenceFaulted is the exported session.PersistenceFaultReporter broadcast: it
+// closes when the TERMINAL persistence fault latches (latchSessionFault), and every
+// call returns the same channel. The recoverable workspace-checkpoint latch does not
+// close it.
+func (s *Session) PersistenceFaulted() <-chan struct{} {
+	s.loopsMu.Lock()
+	defer s.loopsMu.Unlock()
+	// A latch that ran first has already minted AND closed it, so minting here only
+	// ever produces the open channel of a session that has not faulted.
+	if s.faultedCh == nil {
+		s.faultedCh = make(chan struct{})
+	}
+	return s.faultedCh
+}
+
+// PersistenceFault reports the latched terminal persistence fault, or nil.
+func (s *Session) PersistenceFault() error {
+	s.loopsMu.RLock()
+	defer s.loopsMu.RUnlock()
+	if !s.faulted {
+		return nil
+	}
+	return &SessionError{Kind: SessionFaulted, Cause: s.faultErr}
 }
 
 // faultIfFaulted returns a typed SessionFaulted error (chaining the latched fault) if

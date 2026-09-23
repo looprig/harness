@@ -42,6 +42,7 @@ var publicSessionContracts = map[string]bool{
 	"DefaultPolicyDecider": true, "AcceptAllDecider": true,
 	"CommittedPublicEventSource": true, "CommittedPublicEventProvider": true,
 	"IdleWaiter": true, "Liveness": true, "Releaser": true,
+	"PersistenceFaultReporter": true, "ResidencyAbandoner": true,
 	"WorkspaceReporter": true, "WorkspaceStatus": true,
 	"LeaseEpochReporter": true,
 }
@@ -543,6 +544,16 @@ func lifecycleCapabilityShapes() []lifecycleCapabilityShape {
 				reflect.TypeFor[widenedAfterReleaser](),
 			},
 		},
+		{
+			name:     "PersistenceFaultReporter",
+			contract: reflect.TypeFor[session.PersistenceFaultReporter](),
+			want:     []string{"PersistenceFault() error", "PersistenceFaulted() <-chan struct {}"},
+		},
+		{
+			name:     "ResidencyAbandoner",
+			contract: reflect.TypeFor[session.ResidencyAbandoner](),
+			want:     []string{"AbandonResidency(context.Context) error"},
+		},
 	}
 }
 
@@ -654,7 +665,7 @@ func TestSessionControllerNotWidenedForLifecycleCapabilities(t *testing.T) {
 		}
 	}
 
-	segregated := []string{"WaitIdle", "Done", "ReleaseResidency", "WorkspaceStatus"}
+	segregated := []string{"WaitIdle", "Done", "ReleaseResidency", "WorkspaceStatus", "PersistenceFaulted", "PersistenceFault", "AbandonResidency"}
 	for _, view := range []reflect.Type{dataPlane, controller} {
 		for _, name := range segregated {
 			if _, exists := view.MethodByName(name); exists {
@@ -690,6 +701,8 @@ func TestProductionSessionSatisfiesLifecycleCapabilities(t *testing.T) {
 		{name: "IdleWaiter", contract: reflect.TypeFor[session.IdleWaiter]()},
 		{name: "Liveness", contract: reflect.TypeFor[session.Liveness]()},
 		{name: "Releaser", contract: reflect.TypeFor[session.Releaser]()},
+		{name: "PersistenceFaultReporter", contract: reflect.TypeFor[session.PersistenceFaultReporter]()},
+		{name: "ResidencyAbandoner", contract: reflect.TypeFor[session.ResidencyAbandoner]()},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
