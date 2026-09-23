@@ -388,9 +388,10 @@ func TestPrefixIsDurableBeforeTheEffect(t *testing.T) {
 	if pending != 0 {
 		t.Errorf("%d commands were already dispatched when the prefix was made durable, want 0", pending)
 	}
-	if got := len(f.cmds); got != 1 {
-		t.Errorf("after the application the loop holds %d commands, want 1", got)
-	}
+	// The actor stand-in answers the admission BEFORE it forwards the input, so the
+	// application can return a moment before the command is observable: wait for it
+	// rather than sampling the channel's length.
+	f.drainOne(t)
 }
 
 // orderRecordingLog observes the moment the durable prefix append completes.
