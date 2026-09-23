@@ -1552,6 +1552,13 @@ func (c *Catalog) store(ctx context.Context, sid uuid.UUID, rev uint64, meta Ses
 // KV.Keys canonical order — a deterministic improvement over the NATS catalog's arbitrary
 // order). An empty catalog returns an empty slice (not an error); a corrupt entry surfaces
 // a typed *CatalogReadError so the caller can repair.
+//
+// Only keys at EXACT catalog depth — "sessions/<id>", nothing after the id — are
+// catalog entries. KV.Keys(prefix) is a substring filter that also returns
+// descendants, and SessionStore's legacy layout files a published object's metadata
+// index beneath the catalog key ("sessions/<id>/object-metadata/v1/…", written by
+// tool-result capture and journal offload). Those rows are not SessionMeta; decoding
+// them failed the whole listing, so they are skipped here, not reported as corrupt.
 func (c *Catalog) ListSessions(ctx context.Context) ([]SessionMeta, error) {
 	keys, err := c.kv.Keys(ctx, sessionsPrefix)
 	if err != nil {
@@ -1559,6 +1566,9 @@ func (c *Catalog) ListSessions(ctx context.Context) ([]SessionMeta, error) {
 	}
 	metas := make([]SessionMeta, 0, len(keys))
 	for _, key := range keys {
+		if !isCatalogEntryKey(key) {
+			continue
+		}
 		val, _, gerr := c.kv.Get(ctx, key)
 		if gerr != nil {
 			var notFound *storage.KeyNotFoundError
@@ -1576,6 +1586,14 @@ func (c *Catalog) ListSessions(ctx context.Context) ([]SessionMeta, error) {
 		metas = append(metas, meta)
 	}
 	return metas, nil
+}
+
+// isCatalogEntryKey reports whether key names a catalog entry: the sessions prefix
+// followed by one non-empty segment with no further '/'. A key nested beneath a
+// catalog entry belongs to another writer sharing the legacy namespace.
+func isCatalogEntryKey(key string) bool {
+	leaf, ok := strings.CutPrefix(key, sessionsPrefix)
+	return ok && leaf != "" && !strings.Contains(leaf, "/")
 }
 
 // ReadMeta reads one session's projected catalog entry by a SINGLE KV load — NEVER a
