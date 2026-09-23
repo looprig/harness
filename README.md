@@ -297,6 +297,23 @@ fails the same way through `journal: encode command disposition:`. No data is lo
 but the session is stranded until a v0.36.0+ runtime opens it. **Do not roll a Host
 back below harness v0.36.0 once it has applied a `create` or a `restore`.**
 
+### Upgrade note: a relocated workspace base restores (v0.37.1, not one-way)
+
+A rig with `WithSessionWorkspaces(store, base)` records its placement in the config
+fingerprint as `session:<canonical base>`. Through v0.37.0 restore compared that value
+verbatim, so a session restored by a process whose base differed — a pod-specific path,
+a rollout that changed the mount, a mixed fleet, a symlink resolving differently on
+another node — was refused `restore rejected by policy: 1 warn category (workspace)`.
+v0.37.1 compares two per-session placements by mode alone: the base is where this
+process materializes the tree, the content comes back from the durable snapshot, and the
+model-visible path is the session-derived `LogicalRoot`. A placement-mode change and a
+changed exclusive or shared fixed root (which name WHICH tree the session ran against)
+still warn.
+
+The written value is unchanged, so v0.37.0 journals restore under v0.37.1 and a v0.37.0
+process reading a v0.37.1 journal sees the format it always wrote; it still refuses a
+relocated base, so a fleet that relocates must run v0.37.1 everywhere that restores.
+
 ### Upgrade note: an applied input is a durable debt (v0.37.0, not one-way)
 
 In v0.36.0 and older, an input a Host admitted under a disposition attempt was handed
