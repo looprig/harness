@@ -3,9 +3,11 @@ package loopruntime
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
-	"fmt"
+	"io"
 	"strconv"
+	"strings"
 
 	"github.com/looprig/core/content"
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -21,10 +23,24 @@ import (
 // it is aliased rather than re-declared so there is exactly one type in each case
 // and no conversion — or divergence — at the boundary.
 type (
-	ToolResultObjectStat        = loop.ToolResultObjectStat
+	ToolResultObjectStat = loop.ToolResultObjectStat
+	//lint:ignore SA1019 the deprecated legacy seam is still served until the next major version.
 	ToolResultObjectStore       = loop.ToolResultObjectStore
 	ToolResultObjectStreamStore = loop.ToolResultObjectStreamStore
 )
+
+// ToolResultPublisher is the SESSION-BOUND view of loop.ToolResultObjects the
+// loop runtime publishes through. The session runtime binds the session id
+// before a loop ever sees the seam, so no loop — and no tool — can name a
+// session other than its own. The store, not the loop, mints the returned
+// reference; see retainPublishedObject for what the loop verifies about it.
+type ToolResultPublisher interface {
+	PublishToolResultObject(ctx context.Context, content io.Reader, size uint64, sum [32]byte) (sessionwire.ObjectMetadata, error)
+}
+
+// objectDigestPrefix is the algorithm prefix a store-issued ObjectMetadata.Digest
+// carries before the lowercase hex SHA-256.
+const objectDigestPrefix = "sha256:"
 
 // toolResultRetainedMarkerPrefix opens every model-visible retention marker. It
 // is a distinct literal from toolResultTruncatedMarker so a reader (and a test)
@@ -123,6 +139,9 @@ const (
 	// ToolResultRetentionStageDigest means verification found different stored
 	// content than the sink captured.
 	ToolResultRetentionStageDigest ToolResultRetentionStage = "digest_mismatch"
+	// ToolResultRetentionStageReference means a publishing store returned a
+	// reference that does not validate, so there is nothing safe to record.
+	ToolResultRetentionStageReference ToolResultRetentionStage = "invalid_reference"
 )
 
 // ToolResultRetentionError is the typed terminal cause when a tool ran but its
@@ -181,13 +200,14 @@ func retainToolResults(ctx context.Context, cfg turnConfig, results []result) (t
 	// retainOneToolResult releases its own sink too; release is idempotent, so
 	// the two owners need not coordinate.
 	defer releaseCaptures(results)
-	if cfg.toolResultObjects == nil {
+	if !retentionConfigured(cfg) {
 		return toolResultCommit{messages: plainToolResultMessages(cfg, results)}, nil
 	}
+	readable := cfg.toolResultPublisher != nil && toolSetHasReader(ctx, cfg.tools)
 	messages := make([]*content.ToolResultMessage, 0, len(results))
 	captures := make([]event.ToolResultCapture, 0, len(results))
 	for _, r := range results {
-		message, capture, err := retainOneToolResult(ctx, cfg, r)
+		message, capture, err := retainOneToolResult(ctx, cfg, r, readable)
 		if err == nil {
 			messages = append(messages, message)
 			captures = append(captures, capture)
@@ -222,7 +242,7 @@ func retainToolResults(ctx context.Context, cfg turnConfig, results []result) (t
 // whichever producer the tool was. The local spill is released on every path:
 // after a verified upload it has served its purpose, and after a failed one the
 // turn ends, so it has no reader either.
-func retainOneToolResult(ctx context.Context, cfg turnConfig, r result) (*content.ToolResultMessage, event.ToolResultCapture, *ToolResultRetentionError) {
+func retainOneToolResult(ctx context.Context, cfg turnConfig, r result, readable bool) (*content.ToolResultMessage, event.ToolResultCapture, *ToolResultRetentionError) {
 	sink := r.capture
 	if sink == nil {
 		sink = materializedCaptureSink(cfg, r)
@@ -257,24 +277,105 @@ func retainOneToolResult(ctx context.Context, cfg turnConfig, r result) (*conten
 			return toolResultMessageWithText(r, preview), capture, nil
 		}
 	}
-	reference := newCaptureReference(sink.digestHex())
-	objectID := reference.ObjectID
-	if stage, err := putCapturedObject(ctx, cfg.toolResultObjects, objectID, sink); err != nil {
-		return nil, event.ToolResultCapture{}, retentionFailure(r, stage, err)
+	var (
+		reference sessionwire.ObjectReference
+		failure   *ToolResultRetentionError
+	)
+	if cfg.toolResultPublisher != nil {
+		reference, failure = retainPublishedObject(ctx, cfg.toolResultPublisher, r, sink)
+	} else {
+		reference, failure = retainMintedObject(ctx, cfg.toolResultObjects, r, sink)
 	}
-	stat, err := cfg.toolResultObjects.StatToolResultObject(ctx, objectID)
-	if err != nil {
-		return nil, event.ToolResultCapture{}, retentionFailure(r, ToolResultRetentionStageStat, err)
-	}
-	if stat.SizeBytes != sink.capturedBytes() {
-		return nil, event.ToolResultCapture{}, retentionFailure(r, ToolResultRetentionStageSize, nil)
-	}
-	if stat.Digest != sink.digestHex() {
-		return nil, event.ToolResultCapture{}, retentionFailure(r, ToolResultRetentionStageDigest, nil)
+	if failure != nil {
+		return nil, event.ToolResultCapture{}, failure
 	}
 	capture.Reference = &reference
-	shaped := shapeCapturedToolResultText(flattenToText(r.Content), cfg.tools.MaxToolResultBytes, toolResultRetainedMarker(capture))
+	shaped := shapeCapturedToolResultText(flattenToText(r.Content), cfg.tools.MaxToolResultBytes, toolResultRetainedMarker(capture, readable))
 	return toolResultMessageWithText(r, shaped), capture, nil
+}
+
+// retentionConfigured reports whether this turn retains tool results at all:
+// either seam turns retention on, and the publisher wins when both are set.
+func retentionConfigured(cfg turnConfig) bool {
+	return cfg.toolResultPublisher != nil || cfg.toolResultObjects != nil
+}
+
+// retainPublishedObject is the READABLE retention path: the store mints the
+// reference and returns it with the metadata it recorded. Nothing is taken on
+// trust. The returned size and digest must be exactly what the sink captured —
+// a store that reported another object's metadata, or rewrote the bytes, must
+// not be recorded as having retained this one — and the reference must
+// validate, since it is written verbatim into the public journal.
+//
+// Stat is not called on this path: the publisher's own contract is to verify the
+// persisted bytes before returning (SessionStore re-reads them), and the
+// returned metadata is what the loop checks.
+func retainPublishedObject(ctx context.Context, publisher ToolResultPublisher, r result, sink *captureSink) (sessionwire.ObjectReference, *ToolResultRetentionError) {
+	digestHex := sink.digestHex()
+	var sum [32]byte
+	if _, err := hex.Decode(sum[:], []byte(digestHex)); err != nil {
+		return sessionwire.ObjectReference{}, retentionFailure(r, ToolResultRetentionStageSpill, err)
+	}
+	reader, err := sink.reader()
+	if err != nil {
+		return sessionwire.ObjectReference{}, retentionFailure(r, ToolResultRetentionStageSpill, err)
+	}
+	defer func() { _ = reader.Close() }()
+	metadata, err := publisher.PublishToolResultObject(ctx, reader, sink.capturedBytes(), sum)
+	if err != nil {
+		return sessionwire.ObjectReference{}, retentionFailure(r, ToolResultRetentionStagePut, err)
+	}
+	if metadata.SizeBytes != sink.capturedBytes() {
+		return sessionwire.ObjectReference{}, retentionFailure(r, ToolResultRetentionStageSize, nil)
+	}
+	if metadata.Digest != objectDigestPrefix+digestHex {
+		return sessionwire.ObjectReference{}, retentionFailure(r, ToolResultRetentionStageDigest, nil)
+	}
+	if err := metadata.Reference.Validate(); err != nil {
+		return sessionwire.ObjectReference{}, retentionFailure(r, ToolResultRetentionStageReference, err)
+	}
+	return metadata.Reference, nil
+}
+
+// retainMintedObject is the LEGACY retention path over the deprecated
+// ToolResultObjectStore: the loop mints a content-addressed identity no session
+// object store can resolve, writes under it, and verifies by Stat. It is kept so
+// an existing composition keeps committing what it committed before; its
+// captures are never readable.
+func retainMintedObject(ctx context.Context, store ToolResultObjectStore, r result, sink *captureSink) (sessionwire.ObjectReference, *ToolResultRetentionError) {
+	reference := newCaptureReference(sink.digestHex())
+	objectID := reference.ObjectID
+	if stage, err := putCapturedObject(ctx, store, objectID, sink); err != nil {
+		return sessionwire.ObjectReference{}, retentionFailure(r, stage, err)
+	}
+	stat, err := store.StatToolResultObject(ctx, objectID)
+	if err != nil {
+		return sessionwire.ObjectReference{}, retentionFailure(r, ToolResultRetentionStageStat, err)
+	}
+	if stat.SizeBytes != sink.capturedBytes() {
+		return sessionwire.ObjectReference{}, retentionFailure(r, ToolResultRetentionStageSize, nil)
+	}
+	if stat.Digest != sink.digestHex() {
+		return sessionwire.ObjectReference{}, retentionFailure(r, ToolResultRetentionStageDigest, nil)
+	}
+	return reference, nil
+}
+
+// toolSetHasReader reports whether the loop's current tool set carries the
+// read_tool_result tool, which is what licenses the marker to tell the model to
+// call it. A tool whose Info fails is treated as absent: the marker must never
+// instruct a call the model cannot make.
+func toolSetHasReader(ctx context.Context, ts ToolSet) bool {
+	for _, t := range ts.Registry {
+		if t == nil {
+			continue
+		}
+		info, err := t.Info(ctx)
+		if err == nil && info != nil && info.Name == loop.ReadToolResultToolName {
+			return true
+		}
+	}
+	return false
 }
 
 // materializedCaptureSink is the fallback producer path: a materialized tool
@@ -382,31 +483,61 @@ func toolResultRetentionNotice(r result) *content.ToolResultMessage {
 	}
 }
 
-// toolResultRetainedMarker builds the model-visible retrieval marker for a
-// capture that has an object behind it. It names the provider tool_use id, which
-// the model already issued, and never the object identity: the model needs to
-// know THAT the result is retrievable and by which call, and a retrieval tool
-// resolves the identity from the journal rather than from the prompt.
+// toolResultRetainedMarker builds the model-visible retention marker for a
+// capture that has an object behind it.
+//
+// It says three things, in order. How much of the producer's output was
+// retained ("all N bytes" or "M of N bytes"). When the capture is truncated,
+// that the elided tail is UNAVAILABLE and why — without this a model reads "M of
+// N retained" as "the rest is somewhere" and goes looking. And, only when
+// readable is true, how to page through what was retained: the reader tool's
+// name and the capture id, which is the capture's ToolExecutionID.
+//
+// readable is true only when the capture's reference was issued by a store
+// that can resolve it AND the calling loop has the reader tool bound. The
+// marker must never instruct a call the model cannot make. It names neither the
+// object identity nor the provider tool_use_id: the first is opaque and useless
+// to the model, and the second is not unique within a session.
 //
 // The size is read through ToolResultCapture.OriginalSize, so an inexact count
 // is rendered as a lower bound rather than as a fact. The materialized path
 // always knows the producer's exact length; the lower-bound rendering exists for
 // a streaming producer stopped at the ceiling and is covered directly by
 // TestToolResultRetainedMarkerRendersInexactSizeAsLowerBound.
-func toolResultRetainedMarker(capture event.ToolResultCapture) string {
+func toolResultRetainedMarker(capture event.ToolResultCapture, readable bool) string {
 	original, exact := capture.OriginalSize()
-	size := strconv.FormatUint(original, 10) + " bytes"
+	lowerBound := ""
 	if !exact {
-		size = "at least " + size
+		lowerBound = "at least "
 	}
-	// "all N bytes" and "M of N bytes" both name the ORIGINAL count, so a reader
-	// never has to combine the marker with anything else to learn what was
-	// elided; "at least" is the only difference an inexact count makes.
-	retained := "all " + size
+	var b strings.Builder
+	b.WriteString(toolResultRetainedMarkerPrefix)
+	b.WriteString("; ")
 	if capture.Truncated {
-		retained = strconv.FormatUint(capture.CapturedBytes, 10) + " of " + size
+		b.WriteString(strconv.FormatUint(capture.CapturedBytes, 10) + " of ")
+	} else {
+		b.WriteString("all ")
 	}
-	return fmt.Sprintf("%s; %s retained for tool_use_id %q]\n", toolResultRetainedMarkerPrefix, retained, capture.ToolUseID)
+	b.WriteString(lowerBound + strconv.FormatUint(original, 10) + " bytes retained")
+	if capture.Truncated && original > capture.CapturedBytes {
+		b.WriteString("; " + lowerBound + "the last " + strconv.FormatUint(original-capture.CapturedBytes, 10) + " bytes ")
+		if capture.TruncationReason == event.ToolResultTruncatedSourceLimit {
+			b.WriteString("were not supplied by the tool")
+		} else {
+			b.WriteString("exceeded the capture ceiling")
+		}
+		b.WriteString(" and are unavailable")
+	}
+	if readable {
+		if capture.Truncated {
+			b.WriteString("; read the retained bytes with ")
+		} else {
+			b.WriteString("; read the rest with ")
+		}
+		b.WriteString(loop.ReadToolResultToolName + " capture_id=" + strconv.Quote(capture.ToolExecutionID.String()))
+	}
+	b.WriteString("]\n")
+	return b.String()
 }
 
 // shapeCapturedToolResultText shapes the model preview so the preview PLUS the
@@ -470,7 +601,7 @@ func appendRawToolResultBytes(buf *bytes.Buffer, blocks []content.Block) {
 // ceiling, but resident. That is the honest cost of wiring a store without a
 // spill base, which pkg/rig's public option does not allow.
 func turnCaptureSinks(cfg turnConfig) func(uuid.UUID) *captureSink {
-	if cfg.toolResultObjects == nil {
+	if !retentionConfigured(cfg) {
 		return nil
 	}
 	ceiling := materializedCaptureCeiling(cfg.tools)

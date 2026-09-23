@@ -148,10 +148,12 @@ func TestEveryLoopConstructionPassesTheCaptureStore(t *testing.T) {
 					wired |= 1
 				case "ToolResultSpills":
 					wired |= 2
+				case "ToolResultPublisher":
+					wired |= 4
 				}
 			}
-			if wired != 3 {
-				t.Errorf("%v: loopruntime.RuntimeDependencies is built without ToolResultObjects and/or ToolResultSpills (mask %d), so a loop from this site retains nothing or spills nowhere",
+			if wired != 7 {
+				t.Errorf("%v: loopruntime.RuntimeDependencies is built without ToolResultObjects, ToolResultPublisher and/or ToolResultSpills (mask %d), so a loop from this site retains nothing, retains unreadably, or spills nowhere",
 					fset.Position(literal.Pos()), wired)
 			}
 			return true

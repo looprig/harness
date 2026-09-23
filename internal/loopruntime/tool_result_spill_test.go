@@ -885,6 +885,7 @@ func TestToolResultStoreTypesAreThePublicOnes(t *testing.T) {
 		public   reflect.Type
 	}{
 		{"stat", reflect.TypeOf(ToolResultObjectStat{}), reflect.TypeOf(loop.ToolResultObjectStat{})},
+		//lint:ignore SA1019 the test pins the deprecated alias until it is removed.
 		{"store", reflect.TypeOf((*ToolResultObjectStore)(nil)).Elem(), reflect.TypeOf((*loop.ToolResultObjectStore)(nil)).Elem()},
 		{"stream store", reflect.TypeOf((*ToolResultObjectStreamStore)(nil)).Elem(), reflect.TypeOf((*loop.ToolResultObjectStreamStore)(nil)).Elem()},
 	}

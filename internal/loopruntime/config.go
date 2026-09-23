@@ -249,6 +249,10 @@ type runtimeConfig struct {
 	// off, leaving every committed step byte-identical to what it was before.
 	ToolResultObjects ToolResultObjectStore
 
+	// ToolResultPublisher is the readable, session-bound retention seam. When
+	// set it is used in place of ToolResultObjects.
+	ToolResultPublisher ToolResultPublisher
+
 	// ToolResultSpills is the session-scoped spill directory captures stream
 	// through on their way to ToolResultObjects. Like the store it is runtime
 	// wiring rather than declarative policy — where a host may write local
@@ -272,6 +276,10 @@ type RuntimeDependencies struct {
 	// ReviewContext it is optional: nil leaves the loop with no retention, which
 	// is the behaviour of every caller that predates the capture pipeline.
 	ToolResultObjects ToolResultObjectStore
+
+	// ToolResultPublisher wires READABLE retention: the store issues each
+	// capture's reference. It supersedes ToolResultObjects when both are set.
+	ToolResultPublisher ToolResultPublisher
 
 	// ToolResultSpills wires the session-scoped spill directory. It is meaningful
 	// only alongside ToolResultObjects: with no store there is nothing to upload

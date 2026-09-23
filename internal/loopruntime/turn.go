@@ -199,6 +199,11 @@ type turnConfig struct {
 	// group byte-identical to what it was before this field existed.
 	toolResultObjects ToolResultObjectStore
 
+	// toolResultPublisher is the READABLE retention seam: the store issues the
+	// reference recorded on the capture. When it is set it is used instead of
+	// toolResultObjects.
+	toolResultPublisher ToolResultPublisher
+
 	// toolResultSpills is the session-scoped spill directory each capture is
 	// streamed through on its way to the object store. nil keeps the retained
 	// prefix in memory, bounded by the same capture ceiling — the behaviour of

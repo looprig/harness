@@ -515,6 +515,17 @@ func WithLifecycleToolResultCapture(objects loopruntime.ToolResultObjectStore, s
 	}
 }
 
+// WithLifecycleToolResultObjects captures the READABLE retention store and
+// forwards it to both NewSession and RestoreSession as WithToolResultObjects. A
+// nil store is ignored.
+func WithLifecycleToolResultObjects(objects loop.ToolResultObjects, spillBase string) LifecycleOption {
+	return func(r *Lifecycle) {
+		if objects != nil {
+			r.baseOpts = append(r.baseOpts, WithToolResultObjects(objects, spillBase))
+		}
+	}
+}
+
 // WithLifecycleSnapshotPolicy captures the validated native checkpoint policy and
 // forwards it to every new/restored session. Rig enforces that it is paired with a
 // managed placement.

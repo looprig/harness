@@ -90,6 +90,11 @@ const (
 	// captured into every checkpoint — and a region inside the spill base would
 	// be deleted with it at session shutdown. Name carries the canonical base.
 	DefinitionToolResultSpillOverlapsWorkspace DefinitionErrorKind = "tool_result_spill_overlaps_workspace"
+	// DefinitionToolResultReaderWithoutObjects: a loop declares a tool requiring
+	// tool.RequiresToolResultReader (read_tool_result), but the rig wires no
+	// readable store with WithToolResultObjects. The tool could never read
+	// anything, and a model shown it would be told to call it for nothing.
+	DefinitionToolResultReaderWithoutObjects DefinitionErrorKind = "tool_result_reader_without_objects"
 )
 
 type DefinitionError struct {

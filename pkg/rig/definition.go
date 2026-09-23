@@ -41,8 +41,13 @@ type definitionState struct {
 	// WithToolResultCapture; see its doc comment for why neither is meaningful
 	// alone. The base is raw here and canonicalized at Define, where the
 	// workspace region it must not overlap is known.
+	//lint:ignore SA1019 the deprecated legacy seam is still served until the next major version.
 	toolResultObjects   loop.ToolResultObjectStore
 	toolResultSpillBase string
+	// toolResultReadable is the readable store wired by WithToolResultObjects.
+	// It shares WithToolResultCapture's singleton key, so at most one of the two
+	// is ever set.
+	toolResultReadable loop.ToolResultObjects
 }
 
 // Rig is an immutable design-time assembly that creates and restores sessions.
@@ -184,6 +189,9 @@ func Define(options ...Option) (*Rig, error) {
 	if err != nil {
 		return nil, err
 	}
+	if state.toolResultReadable == nil && requiresToolResultReader(state.loops) {
+		return nil, &DefinitionError{Kind: DefinitionToolResultReaderWithoutObjects}
+	}
 
 	fields := state.fingerprintFields
 	if placement.Configured() {
@@ -267,6 +275,18 @@ func Define(options ...Option) (*Rig, error) {
 		resourceStorageProvider: state.resourceStorageProvider,
 		captureSafety:           projectCaptureSafety(state.loops),
 	}, nil
+}
+
+// requiresToolResultReader reports whether any loop declares a tool that pages
+// through retained tool results. Such a tool is registered only when a readable
+// store is configured: without one there is nothing it could ever read.
+func requiresToolResultReader(definitions []loop.Definition) bool {
+	for _, definition := range definitions {
+		if definition.ToolRequirements()&tool.RequiresToolResultReader != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func requiresProcessServices(definitions []loop.Definition) bool {

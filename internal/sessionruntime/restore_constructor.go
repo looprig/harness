@@ -73,7 +73,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 				s,
 				bound,
 				restoredStateFrom(folded, ri, notifications),
-				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext(), ToolResultObjects: s.toolResultObjects, ToolResultSpills: s.toolResultSpillDirectory()},
+				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext(), ToolResultObjects: s.toolResultObjects, ToolResultPublisher: s.toolResultCatalog.publisher(), ToolResultSpills: s.toolResultSpillDirectory()},
 			)
 		}
 	default:
@@ -201,6 +201,11 @@ func restoreTopologySession(
 	// from sessionID. A zero id there gave those loops an empty LogicalRoot while the live
 	// session's WorkspaceStatus reported the real one.
 	probe.sessionID = sessionID
+	// The readable-capture index is built here, on the restore path, because
+	// every restored loop's reader is bound during planning — before the live
+	// session exists — and must already answer for captures the journal holds.
+	// It is folded from the replay below and handed to the live session.
+	toolResults := newToolResultCatalog(probe.toolResultReadable, sessionID)
 	constructionAbortTimeout := probe.constructionAbortTimeout
 	if constructionAbortTimeout <= 0 {
 		constructionAbortTimeout = defaultConstructionAbortTimeout
@@ -320,6 +325,7 @@ func restoreTopologySession(
 		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
 	all := eventsFromRecords(allRecords, uuid.UUID{})
+	toolResults.fold(all)
 	// Privileged lifecycle records are interpreted only for crash-consistency
 	// validation. Unmatched starts remain in the journal as interrupted audit
 	// evidence; no queue, worker, request, finalizer, activity, or synthetic
@@ -497,7 +503,7 @@ func restoreTopologySession(
 	if newPath {
 		planAllowMismatch = true
 	}
-	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, planAllowMismatch, contextDisposition, manager, probe.runtimeRestoreResolver, probe.newWorkspaceBinding, resources)
+	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, planAllowMismatch, contextDisposition, manager, probe.runtimeRestoreResolver, probe.newWorkspaceBinding, resources, toolResults)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -659,6 +665,9 @@ func restoreTopologySession(
 	if resources != nil {
 		leaseOpts = append(leaseOpts, withSessionResources(resources))
 	}
+	// The capture index restore folded from the journal becomes the live
+	// session's, so a capture retained before the restart stays readable.
+	leaseOpts = append(leaseOpts, withToolResultCatalog(toolResults))
 	// Recover the foreign session id from the root loop's events. Prebound adapters
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
@@ -860,7 +869,7 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 // unknown (children of a single-definition run). It is the single Bind of each loop,
 // performed inside the restore lease. It returns the ordered plans and the active plan, or a
 // typed error the caller records as a RestoreErrored.
-func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, runtimeResolver RuntimeRestoreResolver, wsBind func() *tool.WorkspaceBinding, resources *sessionResources) ([]loopPlan, loopPlan, error) {
+func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, runtimeResolver RuntimeRestoreResolver, wsBind func() *tool.WorkspaceBinding, resources *sessionResources, toolResults *toolResultCatalog) ([]loopPlan, loopPlan, error) {
 	plans := make([]loopPlan, 0, len(starts))
 	activeIndex := -1
 	for _, started := range starts {
@@ -883,11 +892,12 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		if processErr != nil {
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: processErr}
 		}
-		bindings := tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), Process: processBinding, ExtraTools: delegateExtraTools(definition, manager)}
+		bindings := tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), Process: processBinding, ToolResults: toolResults.readerFor(started.LoopID), ExtraTools: delegateExtraTools(definition, manager)}
 		bound, bindErr := definition.Bind(sessionCtx, bindings)
 		if bindErr != nil {
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: bindErr}
 		}
+		fitToolResultReader(bindings.ToolResults, bound)
 		if nameErr := checkAgentName(started.AgentName, bound.Name(), allowMismatch); nameErr != nil {
 			return nil, loopPlan{}, nameErr
 		}
@@ -1433,7 +1443,7 @@ func buildRestoredSession(
 				s,
 				cfg,
 				restoredStateFrom(folded, ri, notifications),
-				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext(), ToolResultObjects: s.toolResultObjects, ToolResultSpills: s.toolResultSpillDirectory()},
+				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext(), ToolResultObjects: s.toolResultObjects, ToolResultPublisher: s.toolResultCatalog.publisher(), ToolResultSpills: s.toolResultSpillDirectory()},
 			)
 		}
 	default:

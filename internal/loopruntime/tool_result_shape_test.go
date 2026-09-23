@@ -7,6 +7,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 )
 
@@ -198,57 +199,82 @@ func TestResolveToolSetCapsResultBytes(t *testing.T) {
 
 // TestToolResultRetainedMarkerRendersInexactSizeAsLowerBound is the direct
 // coverage toolResultRetainedMarker's doc comment points at. The materialized
-// path always knows the producer's exact length, so this branch is reached only
-// through a capture whose OriginalBytes is nil — which is why it is exercised
-// here rather than through a turn.
+// path always knows the producer's exact length, so the lower-bound branch is
+// reached only through a capture whose OriginalBytes is nil — which is why it is
+// exercised here rather than through a turn. It also pins the I2.2 defect-2 fix:
+// a truncated capture's marker says the elided tail is UNAVAILABLE and why, and
+// a readable capture's marker names the reader tool and the capture id.
 func TestToolResultRetainedMarkerRendersInexactSizeAsLowerBound(t *testing.T) {
 	t.Parallel()
 	exact := uint64(900)
+	id := uuid.MustParse("0192d1c4-6d7e-7abc-8def-0123456789ab")
 	tests := []struct {
-		name    string
-		capture event.ToolResultCapture
-		want    string
+		name     string
+		capture  event.ToolResultCapture
+		readable bool
+		want     string
 	}{
 		{
 			name:    "exact and complete",
-			capture: event.ToolResultCapture{ToolUseID: "tu-1", CapturedBytes: 900, OriginalBytes: &exact},
-			want:    "\n[tool output shaped; all 900 bytes retained for tool_use_id \"tu-1\"]\n",
+			capture: event.ToolResultCapture{ToolExecutionID: id, ToolUseID: "tu-1", CapturedBytes: 900, OriginalBytes: &exact},
+			want:    "\n[tool output shaped; all 900 bytes retained]\n",
 		},
 		{
-			name:    "exact and truncated",
-			capture: event.ToolResultCapture{ToolUseID: "tu-1", CapturedBytes: 100, OriginalBytes: &exact, Truncated: true},
-			want:    "\n[tool output shaped; 100 of 900 bytes retained for tool_use_id \"tu-1\"]\n",
+			name:    "exact and truncated at the ceiling",
+			capture: event.ToolResultCapture{ToolExecutionID: id, ToolUseID: "tu-1", CapturedBytes: 100, OriginalBytes: &exact, Truncated: true, TruncationReason: event.ToolResultTruncatedCaptureCeiling},
+			want:    "\n[tool output shaped; 100 of 900 bytes retained; the last 800 bytes exceeded the capture ceiling and are unavailable]\n",
 		},
 		{
 			name:    "inexact reports a lower bound",
-			capture: event.ToolResultCapture{ToolUseID: "tu-1", CapturedBytes: 100, OriginalBytesLowerBound: 900, Truncated: true},
-			want:    "\n[tool output shaped; 100 of at least 900 bytes retained for tool_use_id \"tu-1\"]\n",
+			capture: event.ToolResultCapture{ToolExecutionID: id, ToolUseID: "tu-1", CapturedBytes: 100, OriginalBytesLowerBound: 900, Truncated: true, TruncationReason: event.ToolResultTruncatedCaptureCeiling},
+			want:    "\n[tool output shaped; 100 of at least 900 bytes retained; at least the last 800 bytes exceeded the capture ceiling and are unavailable]\n",
+		},
+		{
+			name:    "a source-limited producer is named as the cause",
+			capture: event.ToolResultCapture{ToolExecutionID: id, ToolUseID: "tu-1", CapturedBytes: 100, OriginalBytes: &exact, Truncated: true, TruncationReason: event.ToolResultTruncatedSourceLimit},
+			want:    "\n[tool output shaped; 100 of 900 bytes retained; the last 800 bytes were not supplied by the tool and are unavailable]\n",
+		},
+		{
+			name:     "readable and complete names the reader and the capture",
+			capture:  event.ToolResultCapture{ToolExecutionID: id, ToolUseID: "tu-1", CapturedBytes: 900, OriginalBytes: &exact},
+			readable: true,
+			want:     "\n[tool output shaped; all 900 bytes retained; read the rest with read_tool_result capture_id=\"0192d1c4-6d7e-7abc-8def-0123456789ab\"]\n",
+		},
+		{
+			name:     "readable and truncated names the reader after the unavailable tail",
+			capture:  event.ToolResultCapture{ToolExecutionID: id, ToolUseID: "tu-1", CapturedBytes: 100, OriginalBytes: &exact, Truncated: true, TruncationReason: event.ToolResultTruncatedCaptureCeiling},
+			readable: true,
+			want:     "\n[tool output shaped; 100 of 900 bytes retained; the last 800 bytes exceeded the capture ceiling and are unavailable; read the retained bytes with read_tool_result capture_id=\"0192d1c4-6d7e-7abc-8def-0123456789ab\"]\n",
 		},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := toolResultRetainedMarker(tt.capture); got != tt.want {
+			if got := toolResultRetainedMarker(tt.capture, tt.readable); got != tt.want {
 				t.Fatalf("marker = %q, want %q", got, tt.want)
 			}
 		})
 	}
 }
 
-// TestToolResultRetainedMarkerNamesTheCallNotTheObject pins that the identity of
-// the retained object never reaches the model prompt. The identity is opaque, so
-// leaking it would not disclose a backend path, but the marker is prompt text and
-// the model has no use for an identity it cannot resolve.
-func TestToolResultRetainedMarkerNamesTheCallNotTheObject(t *testing.T) {
+// TestToolResultRetainedMarkerNamesTheCaptureNotTheObject pins that the identity
+// of the retained object never reaches the model prompt, and that the marker
+// names the capture by its ToolExecutionID — unique per session — rather than by
+// the provider tool_use_id, which is not.
+func TestToolResultRetainedMarkerNamesTheCaptureNotTheObject(t *testing.T) {
 	t.Parallel()
 	size := uint64(1200)
+	id := uuid.MustParse("0192d1c4-6d7e-7abc-8def-0123456789ab")
 	reference := newCaptureReference(strings.Repeat("ab", 32))
 	marker := toolResultRetainedMarker(event.ToolResultCapture{
-		ToolUseID: "tu-7", CapturedBytes: 1200, OriginalBytes: &size, Reference: &reference,
-	})
-	if !strings.Contains(marker, `"tu-7"`) {
-		t.Fatalf("marker %q does not name the call it describes", marker)
+		ToolExecutionID: id, ToolUseID: "tu-7", CapturedBytes: 1200, OriginalBytes: &size, Reference: &reference,
+	}, true)
+	if !strings.Contains(marker, id.String()) {
+		t.Fatalf("marker %q does not name the capture it describes", marker)
+	}
+	if strings.Contains(marker, "tu-7") {
+		t.Fatalf("marker %q names the non-unique provider tool_use_id", marker)
 	}
 	if strings.Contains(marker, reference.ObjectID) || strings.Contains(marker, captureObjectIDPrefix) {
 		t.Fatalf("marker %q carries the object identity", marker)

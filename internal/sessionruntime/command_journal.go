@@ -318,6 +318,31 @@ func WithToolResultCapture(objects loopruntime.ToolResultObjectStore, spillBase 
 	}
 }
 
+// WithToolResultObjects wires READABLE durable tool-result retention: the store
+// issues each capture's reference, every loop publishes through a seam bound to
+// this session, and loops binding read_tool_result page through the session's
+// capture index. A nil store is ignored. spillBase is as for
+// WithToolResultCapture. When both options are applied the readable store is
+// used for every capture.
+func WithToolResultObjects(objects loop.ToolResultObjects, spillBase string) Option {
+	return func(s *Session) {
+		if objects != nil {
+			s.toolResultReadable = objects
+			s.toolResultSpillBase = spillBase
+		}
+	}
+}
+
+// withToolResultCatalog hands a restored session the capture index restore
+// folded from the journal. A nil catalog is ignored.
+func withToolResultCatalog(catalog *toolResultCatalog) Option {
+	return func(s *Session) {
+		if catalog != nil {
+			s.toolResultCatalog = catalog
+		}
+	}
+}
+
 // WithSnapshotPolicy carries the already-validated rig policy into one session.
 // It is meaningful only with a managed placement; rig enforces that pairing.
 func WithSnapshotPolicy(policy SnapshotPolicy) Option {

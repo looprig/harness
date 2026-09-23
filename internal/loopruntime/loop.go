@@ -418,6 +418,7 @@ func installRuntimeDependencies(ctx context.Context, cfg *runtimeConfig, deps Ru
 	}
 	cfg.Hooks = deps.Hooks
 	cfg.ToolResultObjects = deps.ToolResultObjects
+	cfg.ToolResultPublisher = deps.ToolResultPublisher
 	cfg.ToolResultSpills = deps.ToolResultSpills
 	return nil
 }
@@ -1627,6 +1628,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			afterContextReplacement: config.afterContextReplacement,
 			reviewContext:           config.reviewContext,
 			toolResultObjects:       config.ToolResultObjects,
+			toolResultPublisher:     config.ToolResultPublisher,
 			toolResultSpills:        config.ToolResultSpills,
 		}
 	}

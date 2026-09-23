@@ -358,6 +358,16 @@ type Session struct {
 	// reads or writes an object.
 	toolResultObjects loopruntime.ToolResultObjectStore
 
+	// toolResultReadable is the READABLE retention store wired by
+	// WithToolResultObjects: the store issues each capture's reference, and
+	// read_tool_result pages through it. It supersedes toolResultObjects.
+	toolResultReadable loop.ToolResultObjects
+	// toolResultCatalog is the session-bound publish seam plus the capture index
+	// read_tool_result answers from. It is built once the session id is final
+	// (or handed in by restore, already folded from the journal); nil when no
+	// readable store is wired.
+	toolResultCatalog *toolResultCatalog
+
 	// toolResultSpillBase is the directory this session's spill root is created
 	// under, wired together with toolResultObjects by WithToolResultCapture. It
 	// is a base rather than the root itself because the root is session-scoped:
@@ -1237,6 +1247,10 @@ func (s *Session) ResumeTurnActivity(ctx context.Context, loopID, _ uuid.UUID) e
 }
 
 func (s *Session) recordLoopMechanicalState(ev event.Event) {
+	// A committed StepDone's captures become readable here — at the commit
+	// observer, before fan-out and before the loop can start its next step — so a
+	// model that is told to read a capture can always find it.
+	s.toolResultCatalog.observe(ev)
 	loopID := ev.EventHeader().Coordinates.LoopID
 	if loopID.IsZero() {
 		return
@@ -1614,12 +1628,13 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			release()
 			return uuid.UUID{}, bindingErr
 		}
-		bindings = tool.Bindings{SessionID: s.sessionID, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), Process: processBinding, ExtraTools: delegateExtraTools(cfg, s.delegation)}
+		bindings = tool.Bindings{SessionID: s.sessionID, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), Process: processBinding, ToolResults: s.toolResultCatalog.readerFor(loopID), ExtraTools: delegateExtraTools(cfg, s.delegation)}
 		bound, err = cfg.Bind(s.sessionCtx, bindings)
 		if err != nil {
 			release()
 			return uuid.UUID{}, err
 		}
+		fitToolResultReader(bindings.ToolResults, bound)
 		if runtime != nil {
 			if runtime.SelectionKind == loop.RuntimeSelectionHarnessManaged {
 				bound, err = loop.OverrideBoundRuntimeManaged(bound, runtime.Profile)
@@ -1747,7 +1762,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 				eventTarget,
 				bound,
 				startedMode,
-				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext(), ToolResultObjects: s.toolResultObjects, ToolResultSpills: s.toolResultSpillDirectory()},
+				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext(), ToolResultObjects: s.toolResultObjects, ToolResultPublisher: s.toolResultCatalog.publisher(), ToolResultSpills: s.toolResultSpillDirectory()},
 			)
 		}
 	case loop.EngineAdapter:
@@ -2149,6 +2164,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	for _, opt := range opts {
 		opt(s)
 	}
+	s.toolResultCatalog = newToolResultCatalog(s.toolResultReadable, s.sessionID)
 	abort := func(err error) (*Session, error) {
 		s.abortConstruction(err)
 		return nil, &constructionCleanupOwnedError{cause: err}
@@ -2259,11 +2275,12 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		if bindingErr != nil {
 			return abort(bindingErr)
 		}
-		bindings := tool.Bindings{SessionID: id, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), Process: processBinding, ExtraTools: delegateExtraTools(definition, s.delegation)}
+		bindings := tool.Bindings{SessionID: id, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), Process: processBinding, ToolResults: s.toolResultCatalog.readerFor(loopID), ExtraTools: delegateExtraTools(definition, s.delegation)}
 		bound, bindErr := definition.Bind(sessionCtx, bindings)
 		if bindErr != nil {
 			return abort(bindErr)
 		}
+		fitToolResultReader(bindings.ToolResults, bound)
 		prepared = append(prepared, preparedPrimer{name: name, def: definition, loop: preparedLoop{id: loopID, bound: bound, bindings: bindings}})
 	}
 	if len(prepared) == 0 {

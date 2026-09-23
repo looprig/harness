@@ -2,6 +2,7 @@ package rig
 
 import (
 	"path/filepath"
+	"reflect"
 
 	"github.com/looprig/harness/internal/sessionruntime"
 	"github.com/looprig/harness/pkg/loop"
@@ -22,6 +23,41 @@ const (
 	captureFieldObjects   = "objects"
 	captureFieldSpillBase = "spill_base"
 )
+
+// WithToolResultObjects wires READABLE durable tool-result retention: the store
+// every session publishes each oversized tool result into, and the ABSOLUTE base
+// directory each session's local capture spill root is created under.
+//
+// The store ISSUES each capture's reference, and that reference is what the
+// committed StepDone records, so a capture is readable afterwards — by a loop
+// through read_tool_result (a tool definition declaring
+// tool.RequiresToolResultReader), and by any reader of the same store, such as
+// an object route. (*sessionstore.Store).ToolResultObjects() is the reference
+// implementation; wire the SAME store the rig journals into, so the objects
+// live beside the journal that references them and outlive every workspace.
+//
+// The spill base follows exactly the rules of WithToolResultCapture. The two
+// options are exclusive: supplying both is a DefinitionDuplicateOption.
+//
+// A composition should also bound ToolLimits.ResultBytes. With it zero the
+// model preview is unbounded, so nothing is ever elided and no object is written.
+func WithToolResultObjects(objects loop.ToolResultObjects, spillBase string) Option {
+	return func(state *definitionState) error {
+		if state.seen[keyToolResultCapture] {
+			return &DefinitionError{Kind: DefinitionDuplicateOption, Name: string(keyToolResultCapture)}
+		}
+		if nilToolResultObjects(objects) {
+			return &DefinitionError{Kind: DefinitionInvalidToolResultCapture, Name: captureFieldObjects}
+		}
+		if !filepath.IsAbs(spillBase) {
+			return &DefinitionError{Kind: DefinitionInvalidToolResultCapture, Name: captureFieldSpillBase}
+		}
+		state.seen[keyToolResultCapture] = true
+		state.toolResultReadable = objects
+		state.toolResultSpillBase = spillBase
+		return nil
+	}
+}
 
 // WithToolResultCapture wires durable tool-result retention: the session object
 // store each loop retains an oversized tool result into, and the ABSOLUTE base
@@ -49,6 +85,11 @@ const (
 // spill out of every workspace checkpoint — a checkpoint archives the whole
 // region, so the exclusion has to be a placement invariant rather than a filter
 // some future snapshot path might not consult.
+//
+// Deprecated: the loop mints each capture's identity itself, and no session
+// object store can resolve an identity it did not issue, so a capture retained
+// this way can never be read back. Use WithToolResultObjects. This option is
+// removed at the next major version.
 func WithToolResultCapture(objects loop.ToolResultObjectStore, spillBase string) Option {
 	return func(state *definitionState) error {
 		if state.seen[keyToolResultCapture] {
@@ -81,7 +122,7 @@ func WithToolResultCapture(objects loop.ToolResultObjectStore, spillBase string)
 // which was declared first. It reuses the same canonicalization the placement
 // options use, so a lexical or symlink alias of the region cannot slip past.
 func resolveToolResultCapture(state *definitionState, placementConfigured bool, region string) (string, error) {
-	if state.toolResultObjects == nil {
+	if state.toolResultObjects == nil && state.toolResultReadable == nil {
 		return "", nil
 	}
 	base, err := canonicalPath(state.toolResultSpillBase)
@@ -119,8 +160,27 @@ func projectCaptureSafety(loops []loop.Definition) tool.CaptureSafetyDescriptor 
 // toolResultCaptureLifecycleOption forwards the wiring to every session the rig
 // creates or restores, or returns nil when no store was wired.
 func toolResultCaptureLifecycleOption(state *definitionState, spillBase string) sessionruntime.LifecycleOption {
+	if state.toolResultReadable != nil {
+		return sessionruntime.WithLifecycleToolResultObjects(state.toolResultReadable, spillBase)
+	}
 	if state.toolResultObjects == nil {
 		return nil
 	}
 	return sessionruntime.WithLifecycleToolResultCapture(state.toolResultObjects, spillBase)
+}
+
+// nilToolResultObjects reports a nil store, including a typed nil pointer
+// behind the interface, which would otherwise pass a == nil check and fail at
+// the first oversized tool result instead of at Define.
+func nilToolResultObjects(objects loop.ToolResultObjects) bool {
+	if objects == nil {
+		return true
+	}
+	value := reflect.ValueOf(objects)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
