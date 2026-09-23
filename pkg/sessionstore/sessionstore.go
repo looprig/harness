@@ -165,6 +165,9 @@ type Store struct {
 	durable *durablestore.Store
 	project func(coresessionwire.TenantID, coresessionwire.SessionID, any) (sessionwire.Projection, error)
 	opts    Options
+	// captures caches committed tool-result capture lookups. nil (a Store not
+	// built by Open) disables caching, never correctness.
+	captures *toolResultCaptureCache
 }
 
 // Open validates the backend and returns a Store over one shallow snapshot of
@@ -206,7 +209,7 @@ func Open(b *storage.Composite, opts ...Option) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Store{backend: &backend, durable: durable, project: sessionwire.Project, opts: resolved}, nil
+	return &Store{backend: &backend, durable: durable, project: sessionwire.Project, opts: resolved, captures: newToolResultCaptureCache()}, nil
 }
 
 // PersistencePaths returns the canonical local roots reported by the Store's

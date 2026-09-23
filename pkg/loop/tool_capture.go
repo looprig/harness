@@ -2,7 +2,11 @@ package loop
 
 import (
 	"context"
+	"errors"
 	"io"
+
+	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/core/uuid"
 )
 
 // tool_capture.go is the PUBLIC durable tool-result retention seam. It lives here
@@ -43,6 +47,51 @@ type ToolResultObjectStat struct {
 	Digest    string
 }
 
+// ReadToolResultToolName is the model-facing name of the tool that pages through
+// a retained tool result. Harness owns the constant because the loop's retention
+// marker names the tool: the marker and the tool that answers it must not be
+// able to drift. A composition registers the tool itself (a definition declaring
+// tool.RequiresToolResultReader); the marker instructs the model to call it only
+// when the calling loop actually has a tool of this name bound.
+const ReadToolResultToolName = "read_tool_result"
+
+// ToolResultObjects is the SESSION-SCOPED, READABLE durable tool-result
+// retention seam, wired with rig.WithToolResultObjects. It supersedes
+// ToolResultObjectStore.
+//
+// The store, not the loop, mints the reference: PublishToolResultObject returns
+// the metadata the store issued, and that reference is what the committed
+// StepDone records. A reference minted anywhere else is one the store cannot
+// resolve, which is exactly the defect of the legacy seam.
+//
+// The session argument is always supplied by the runtime — the RUNTIME session
+// id the journal is filed under — and never by a model or a tool. A tenant is
+// not an argument at all: it is fixed by the store the composition wired.
+//
+// (*sessionstore.Store).ToolResultObjects() is the reference implementation,
+// writing SessionStore "tool-result" objects beside the session's journal.
+type ToolResultObjects interface {
+	// PublishToolResultObject stores exactly size bytes read from content, whose
+	// SHA-256 is sum, and returns the store-issued metadata. It must fail rather
+	// than store a short or different object. content is io.Reader and nothing
+	// more; see ToolResultObjectStreamStore for why an implementation must not
+	// type-assert richer capabilities on it. The loop verifies the returned
+	// metadata's size, digest and reference before recording it.
+	PublishToolResultObject(ctx context.Context, session uuid.UUID, content io.Reader, size uint64, sum [32]byte) (sessionwire.ObjectMetadata, error)
+	// OpenToolResultObject resolves a reference this store issued for session
+	// and returns its metadata and a stream of its bytes. The stream proves
+	// integrity only when read through EOF; a caller that stops early must treat
+	// Close's error as a failure rather than a success.
+	OpenToolResultObject(ctx context.Context, session uuid.UUID, ref sessionwire.ObjectReference) (sessionwire.ObjectMetadata, io.ReadCloser, error)
+}
+
+// ErrToolResultObjectIntegrity is what a ToolResultObjects implementation wraps
+// when an object's stored bytes do not verify against the size and digest it
+// was published with. A reader distinguishes it from the store merely being
+// unavailable: the first is evidence of corruption or substitution, the second
+// is worth retrying.
+var ErrToolResultObjectIntegrity = errors.New("loop: tool result object failed integrity verification")
+
 // ToolResultObjectStore is the narrow session-object-store surface the loop
 // runtime needs in order to retain a tool result the committed model message
 // cannot carry in full. It is deliberately two methods wide: the loop mints the
@@ -53,6 +102,11 @@ type ToolResultObjectStat struct {
 // A nil store means retention is not configured: the loop then commits exactly
 // what it committed before this seam existed. Requiring durable retention is the
 // composition root's decision, taken by wiring a store.
+//
+// Deprecated: an identity the loop mints is one no session object store can
+// resolve, so a capture retained through this seam can never be read back — not
+// by read_tool_result and not by an object route. Use ToolResultObjects, whose
+// references the store issues. This seam is removed at the next major version.
 type ToolResultObjectStore interface {
 	// PutToolResultObject stores content under the caller-minted opaque objectID.
 	// The object is immutable: writing the same identity twice must either be a

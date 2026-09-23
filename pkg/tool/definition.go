@@ -33,7 +33,12 @@ const (
 	// RequiresProcessServices marks definitions that build session-supervised
 	// process tools.
 	RequiresProcessServices
-	knownRequirements = RequiresWorkspace | RequiresDelegateController | RequiresWorkspaceRead | RequiresProcessServices
+	// RequiresToolResultReader marks definitions that build a tool paging
+	// through the calling loop's retained tool results (read_tool_result). The
+	// reader is bound per session AND per loop, so the built tool can read only
+	// captures its own loop produced.
+	RequiresToolResultReader
+	knownRequirements = RequiresWorkspace | RequiresDelegateController | RequiresWorkspaceRead | RequiresProcessServices | RequiresToolResultReader
 )
 
 // WorkspaceOperation identifies the scope of a workspace mutation permit.
@@ -267,6 +272,10 @@ type Bindings struct {
 	ReadWorkspace *ReadWorkspaceBinding
 	Delegate      DelegateController
 	Process       *ProcessBinding
+	// ToolResults pages through the retained tool results of THIS loop in THIS
+	// session. It is nil when the composition wired no readable retention store,
+	// and it is handed only to definitions that declare RequiresToolResultReader.
+	ToolResults ToolResultReader
 	// ExtraTools are additional tool definitions the LOOP appends to every mode's
 	// toolset at Bind, beyond the definition's own WithTools. The composition root uses
 	// it to inject the derived, definition-scoped atomic agent-tool bundle (StartAgent,
@@ -567,6 +576,9 @@ func attenuateBindings(requirements Requirements, bindings Bindings) Bindings {
 		process := *bindings.Process
 		attenuated.Process = &process
 	}
+	if requirements&RequiresToolResultReader != 0 {
+		attenuated.ToolResults = bindings.ToolResults
+	}
 	return attenuated
 }
 
@@ -610,6 +622,9 @@ func validateBindings(requirements Requirements, bindings Bindings) error {
 		if nilSessionResourceRegistry(bindings.Process.Registry) {
 			return &InvalidBindingsError{Field: "process.registry"}
 		}
+	}
+	if requirements&RequiresToolResultReader != 0 && nilToolResultReader(bindings.ToolResults) {
+		return &MissingBindingError{Requirement: RequiresToolResultReader}
 	}
 	return nil
 }
@@ -683,6 +698,8 @@ func (e *MissingBindingError) Error() string {
 		name = "read workspace"
 	case RequiresProcessServices:
 		name = "process services"
+	case RequiresToolResultReader:
+		name = "tool result reader"
 	default:
 		name = strconv.Itoa(int(e.Requirement))
 	}
