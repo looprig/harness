@@ -71,6 +71,14 @@ type RestoredState struct {
 	// them through Loop.Commands (there is no live sender at restore time) and
 	// never re-appends them (they are already durable).
 	PendingProcessNotifications []tool.ProcessCompletionNotification
+
+	// Parked, when non-nil, is the open turn's in-flight tool step, parked at one or
+	// more resumable gates. The loop resumes that turn at start instead of coming up
+	// idle: it re-enters the step, re-runs the gated calls against the still-open
+	// gates, and continues. The session must NOT have closed the turn (no
+	// TurnInterrupted) and must keep the gates open. An inconsistent snapshot is
+	// ignored and the loop comes up idle.
+	Parked *ParkedStep
 }
 
 // NewRestored constructs a loop SEEDED with pre-built committed state and starts its

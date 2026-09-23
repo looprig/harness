@@ -135,6 +135,9 @@ type gateRegistration struct {
 	reply         chan<- command.Command
 	kind          gateKind
 	ack           chan<- gateInstallAck
+	// resume is the private snapshot a restored session resumes this gate's step
+	// from (event.GatePrepared.Resume); nil opens a gate restore will close.
+	resume *event.ToolStepResume
 }
 
 type gateInstallAck struct {
@@ -294,17 +297,38 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 		return "", &GateContextError{Missing: GateContextGateReg}
 	}
 
+	// A resumed step re-runs a replay-safe call against the gate the restored
+	// session kept open: adopt it rather than asking again. Its opening events are
+	// already durable, so nothing is registered or emitted.
+	if restored, ok := gateAdoptionFromContext(ctx).take(callID, gateUserInput); ok {
+		g := stampGateSubjectProvenance(ctx, askUserGate(callID, question, choices))
+		g.ID = restored.id
+		return awaitUserInput(ctx, callID, gateReg, g, restored.reply)
+	}
+
 	// reply is buffered(1) so the actor's routed send never blocks (runner is the
 	// sole reader). ack is unbuffered: the actor closes it to signal installation.
 	reply := make(chan command.Command, 1)
 	ack := make(chan gateInstallAck, 1)
 	g := stampGateSubjectProvenance(ctx, askUserGate(callID, question, choices))
 	payload := gatedomain.AskUserPayload{Question: question, Choices: choices}
+	// Only a call whose tool declares its run up to this question replay-safe can
+	// be resumed after the session moves: the successor re-runs it to deliver the
+	// answer. Any other ask stays non-restorable and is closed at restore.
+	var resume *event.ToolStepResume
+	if userInputReplaySafe(ctx) {
+		if toolUseID, ok := ToolUseIDFrom(ctx); ok {
+			resume = stepResumeFor(ctx, toolUseID)
+		}
+	}
+	if resume != nil {
+		g.Restorable = true
+	}
 
 	// Register synchronously, ctx-aware: no wedge if the actor is gone or the turn
 	// is cancelled.
 	select {
-	case gateReg <- gateRegistration{ctx: ctx, gate: g, payload: payload, callID: callID, reply: reply, kind: gateUserInput, ack: ack}:
+	case gateReg <- gateRegistration{ctx: ctx, gate: g, payload: payload, callID: callID, reply: reply, kind: gateUserInput, ack: ack, resume: resume}:
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
@@ -322,6 +346,19 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 	emit(event.UserInputRequested{ToolExecutionID: callID, Question: question, Choices: choices})
 
 	g.ID = installed.gateID
+	return awaitUserInput(ctx, callID, gateReg, g, reply)
+}
+
+// awaitUserInput blocks a call on its installed user-input gate — freshly opened,
+// or restored and adopted by a resumed step — and returns the routed answer.
+func awaitUserInput(
+	ctx context.Context,
+	callID uuid.UUID,
+	gateReg chan<- gateRegistration,
+	g gatedomain.Gate,
+	reply <-chan command.Command,
+) (string, error) {
+	installed := gateInstallAck{gateID: g.ID}
 	runtime := operationHooksFromContext(ctx)
 	parentCall := hook.Call{
 		Coordinates: runtime.coordinates,

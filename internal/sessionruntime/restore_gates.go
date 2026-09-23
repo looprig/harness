@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
@@ -15,6 +17,14 @@ import (
 type restoredGatePlan struct {
 	open        map[gate.ID]gateEntry
 	unavailable []event.GateOpened
+	// resume holds the private step snapshot of every open gate that carries a
+	// valid one (event.GatePrepared.Resume), keyed by gate id.
+	resume map[gate.ID]*event.ToolStepResume
+	// opened keeps the GateOpened of every entry in open, so a gate that turns out
+	// not to be resumable can still be closed restore_unavailable.
+	opened map[gate.ID]event.GateOpened
+	// order is the open gates' activation order.
+	order []gate.ID
 }
 
 type restoredPreparedGate struct {
@@ -114,17 +124,30 @@ func foldRestoredGates(records []journal.JournalRecord) restoredGatePlan {
 		}
 	}
 
-	plan := restoredGatePlan{open: make(map[gate.ID]gateEntry)}
+	plan := restoredGatePlan{
+		open:   make(map[gate.ID]gateEntry),
+		resume: make(map[gate.ID]*event.ToolStepResume),
+		opened: make(map[gate.ID]event.GateOpened),
+	}
 	for _, id := range openOrder {
 		openedEvent, ok := opened[id]
 		if !ok || closed[id] {
 			continue
 		}
 		preparedGate, ok := prepared[id]
-		if !ok || !openedEvent.Gate.Restorable || !gateRestoreHookSupported(openedEvent.Gate) {
+		var resume *event.ToolStepResume
+		if ok && preparedGate.prepared.Resume.Valid() {
+			resume = preparedGate.prepared.Resume
+		}
+		if !ok || !openedEvent.Gate.Restorable || !gateRestoreHookSupported(openedEvent.Gate, resume != nil) {
 			plan.unavailable = append(plan.unavailable, openedEvent)
 			continue
 		}
+		if resume != nil {
+			plan.resume[id] = resume
+		}
+		plan.opened[id] = openedEvent
+		plan.order = append(plan.order, id)
 		coords := preparedGate.prepared.EventHeader().Coordinates
 		if coords == (identity.Coordinates{}) {
 			coords = openedEvent.EventHeader().Coordinates
@@ -142,7 +165,10 @@ func foldRestoredGates(records []journal.JournalRecord) restoredGatePlan {
 
 // gateRestoreHookSupported reports whether restore may reinstall an opened,
 // unresolved gate as a live, answerable directory entry rather than closing
-// it CloseRestoreUnavailable. KindPermission is supported (design §15: "the
+// it CloseRestoreUnavailable. An ask_user gate is supported only PROVISIONALLY and
+// only with a resume snapshot: it is answerable solely through the call that asked
+// it, so it stays open only if the restore actually resumes that call's step
+// (planParkedStep); otherwise closeUnresumedAskUserGates closes it. KindPermission is supported (design §15: "the
 // permission gate restores normally... the gate remains answerable by a
 // human"): foldRestoredGates never restores reviewBasis (gateEntry's zero
 // value) or any cancellation handle (reviewLifecycle always starts zero on a
@@ -152,12 +178,12 @@ func foldRestoredGates(records []journal.JournalRecord) restoredGatePlan {
 // that no new review is ever started from restored/guessed context — restore
 // never calls StartPermissionReview. Every other kind remains unsupported
 // pending its own restore design.
-func gateRestoreHookSupported(g gate.Gate) bool {
+func gateRestoreHookSupported(g gate.Gate, resumable bool) bool {
 	switch g.Kind {
 	case gate.KindPermission:
 		return true
 	case gate.KindAskUser:
-		return false
+		return resumable
 	default:
 		return false
 	}
@@ -188,4 +214,120 @@ func appendRestoreUnavailableGates(ctx context.Context, j journal.SessionJournal
 		}
 	}
 	return nil
+}
+
+// planParkedStep decides whether the active loop's open turn can be RESUMED at its
+// in-flight tool step rather than interrupted, and returns the step when it can.
+// Every condition fails toward the pre-resume behaviour (nil: the turn is
+// interrupted and an ask_user gate closed), never toward a guess:
+//
+//   - the loop is native and its fold has an open turn whose own messages are
+//     distinguishable from its base (no compaction inside it);
+//   - at least one open gate is owned by that loop, and EVERY open gate the loop
+//     owns carries a valid snapshot, belongs to the open turn and to ONE step, and
+//     every snapshot names the same step (index and message);
+//   - that step never committed (no StepDone for it).
+func planParkedStep(plan restoredGatePlan, loopID uuid.UUID, native bool, folded foldResult, events []event.Event) *loopruntime.ParkedStep {
+	if !native || !folded.OpenTurn || folded.OpenTurnStart < 0 || folded.OpenTurnID.IsZero() {
+		return nil
+	}
+	var step *loopruntime.ParkedStep
+	var stepID uuid.UUID
+	var first *event.ToolStepResume
+	for _, id := range plan.order {
+		entry := plan.open[id]
+		if entry.route.LoopID != loopID {
+			continue
+		}
+		resume, ok := plan.resume[id]
+		if !ok || entry.gate.Resolver != gate.ResolverLoop {
+			return nil
+		}
+		if uuid.UUID(entry.gate.Subject.TurnID) != folded.OpenTurnID || entry.gate.Subject.StepID.IsZero() {
+			return nil
+		}
+		if step == nil {
+			stepID = uuid.UUID(entry.gate.Subject.StepID)
+			first = resume
+			step = &loopruntime.ParkedStep{
+				TurnID:    folded.OpenTurnID,
+				Cause:     folded.OpenTurnCause,
+				TurnStart: folded.OpenTurnStart,
+				StepID:    stepID,
+				StepIndex: loopruntime.StepIndex(resume.StepIndex),
+				Message:   resume.Message,
+			}
+		} else if uuid.UUID(entry.gate.Subject.StepID) != stepID || resume.StepIndex != first.StepIndex || !reflect.DeepEqual(resume.Message, first.Message) {
+			return nil
+		}
+		parkedGate := loopruntime.ParkedGate{
+			GateID:          id,
+			Kind:            entry.gate.Kind,
+			ToolExecutionID: uuid.UUID(entry.gate.Subject.ToolExecutionID),
+			ToolUseID:       resume.ToolUseID,
+		}
+		if entry.gate.Kind == gate.KindPermission {
+			payload, ok := permissionPayloadFromGatePayload(entry.payload)
+			if !ok {
+				return nil
+			}
+			request := payload.Request.Clone()
+			parkedGate.PermissionRequest = &request
+		}
+		step.Gates = append(step.Gates, parkedGate)
+	}
+	if step == nil {
+		return nil
+	}
+	for _, ev := range events {
+		if done, ok := ev.(event.StepDone); ok && done.StepID == stepID {
+			return nil
+		}
+	}
+	return step
+}
+
+// closeUnresumedAskUserGates moves every open ask_user gate that is not part of
+// parked into the unavailable set: it can only be answered through the call that
+// asked it, and that call is not being resumed.
+func closeUnresumedAskUserGates(plan *restoredGatePlan, parked *loopruntime.ParkedStep) {
+	resumed := make(map[gate.ID]bool)
+	if parked != nil {
+		for _, g := range parked.Gates {
+			resumed[g.GateID] = true
+		}
+	}
+	kept := plan.order[:0]
+	for _, id := range plan.order {
+		entry := plan.open[id]
+		if entry.gate.Kind == gate.KindAskUser && !resumed[id] {
+			plan.unavailable = append(plan.unavailable, plan.opened[id])
+			delete(plan.open, id)
+			continue
+		}
+		kept = append(kept, id)
+	}
+	plan.order = kept
+}
+
+// parkedTurnStarter is the loop backend capability that releases a restored parked
+// turn (loopruntime.Loop.StartParkedTurn).
+type parkedTurnStarter interface {
+	StartParkedTurn(ctx context.Context) error
+}
+
+// startParkedTurn releases loopID's resumed turn. A backend that cannot resume one
+// was never handed a parked step, so there is nothing to release.
+func (s *Session) startParkedTurn(ctx context.Context, loopID uuid.UUID) error {
+	s.loopsMu.RLock()
+	h := s.loops[loopID]
+	s.loopsMu.RUnlock()
+	if h == nil {
+		return nil
+	}
+	starter, ok := h.backend.(parkedTurnStarter)
+	if !ok {
+		return nil
+	}
+	return starter.StartParkedTurn(ctx)
 }

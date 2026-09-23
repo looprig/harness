@@ -459,6 +459,7 @@ func restoredStateFrom(folded foldResult, ri restoredInference, notifications []
 		HasAutomaticBasis: folded.HasAutomaticBasis,
 
 		PendingProcessNotifications: notifications,
+		Parked:                      folded.Parked,
 	}
 }
 
@@ -537,12 +538,22 @@ type foldResult struct {
 	DerivedPrefix int
 	TurnIndex     event.TurnIndex
 	OpenTurn      bool
-	Runtime       event.ModelRuntime
-	HasRuntime    bool
-	Context       event.ContextMeasurement
-	HasContext    bool
-	Basis         event.ContextBasis
-	HasBasis      bool
+	// OpenTurnStart is the index in Msgs of the open turn's opening user message,
+	// or -1 when there is no open turn or a compaction replaced history inside it
+	// (the turn's own messages can then no longer be told from its base). OpenTurnID
+	// and OpenTurnCause are the open turn's TurnStarted identity and cause.
+	OpenTurnStart int
+	OpenTurnID    uuid.UUID
+	OpenTurnCause identity.Cause
+	// Parked is the open turn's resumable in-flight tool step, set by the restore
+	// constructor (planParkedStep) — never by the fold itself.
+	Parked     *loopruntime.ParkedStep
+	Runtime    event.ModelRuntime
+	HasRuntime bool
+	Context    event.ContextMeasurement
+	HasContext bool
+	Basis      event.ContextBasis
+	HasBasis   bool
 
 	AutomaticBasis    event.ContextBasis
 	HasAutomaticBasis bool
@@ -834,6 +845,9 @@ func foldLoop(events []event.Event) foldResult {
 	derivedPrefix := 0
 	var turnIndex event.TurnIndex
 	openTurn := false
+	openTurnStart := -1
+	var openTurnID uuid.UUID
+	var openTurnCause identity.Cause
 	var runtime event.ModelRuntime
 	hasRuntime := false
 	var contextMeasurement event.ContextMeasurement
@@ -856,6 +870,9 @@ func foldLoop(events []event.Event) foldResult {
 			// The loop increments turnIndex then commits the initial UserMessage. A turn
 			// is now open until a terminal closes it.
 			turnIndex++
+			openTurnStart = len(msgs)
+			openTurnID = e.TurnID
+			openTurnCause = e.Cause
 			msgs = append(msgs, e.Message)
 			openTurn = true
 			contextMeasurement = event.ContextMeasurement{}
@@ -920,6 +937,7 @@ func foldLoop(events []event.Event) foldResult {
 			replacement = append(replacement, e.Summary)
 			replacement = append(replacement, e.Retained...)
 			msgs = cloneCompactionMessages(replacement)
+			openTurnStart = -1
 			// e.Summary is the compaction Hustle's model-generated summary
 			// (wrapped as a *content.UserMessage), not genuine human input. The
 			// retained suffix follows as genuine conversation; see
@@ -933,6 +951,9 @@ func foldLoop(events []event.Event) foldResult {
 			// A terminal closes the open turn. Its AIMessage (for TurnDone) was already
 			// committed via that step's StepDone, so the terminal adds nothing to msgs.
 			openTurn = false
+			openTurnStart = -1
+			openTurnID = uuid.UUID{}
+			openTurnCause = identity.Cause{}
 		default:
 			// Lifecycle/queue/ephemeral events (LoopStarted/LoopIdle/Session*/Restore*/
 			// InputQueued/InputCancelled/TurnRejected/TokenDelta) never mutate msgs and
@@ -947,6 +968,7 @@ func foldLoop(events []event.Event) foldResult {
 	}
 	return foldResult{
 		Msgs: msgs, DerivedPrefix: derivedPrefix, TurnIndex: turnIndex, OpenTurn: openTurn,
+		OpenTurnStart: openTurnStart, OpenTurnID: openTurnID, OpenTurnCause: openTurnCause,
 		Runtime: runtime, HasRuntime: hasRuntime,
 		Context: contextMeasurement, HasContext: hasContext, Err: foldErr,
 		Basis: basis, HasBasis: hasBasis,

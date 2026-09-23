@@ -183,6 +183,11 @@ type BatchRuntime struct {
 	// tool failure. It is unexported because the sink is a live handle to an open
 	// spill file rather than a value, and only this package may hand one out.
 	captureSinks func(uuid.UUID) *captureSink
+
+	// executionIDs, when non-nil, fixes the ToolExecutionID of the calls it names
+	// (keyed by tool-use id) instead of minting one. A resumed step sets it so the
+	// re-run gated call keeps the execution id its restored gate is bound to.
+	executionIDs map[string]uuid.UUID
 }
 
 // RunBatch executes a batch of tool calls. It mints a ToolExecutionID per call via runtime.IDGen
@@ -243,7 +248,11 @@ func RunBatch(
 		}
 	}()
 	for i, c := range calls {
-		callID, idErr := mintToolExecutionID(runtime.IDGen)
+		callID, fixed := runtime.executionIDs[c.ID]
+		var idErr error
+		if !fixed || callID.IsZero() {
+			callID, idErr = mintToolExecutionID(runtime.IDGen)
+		}
 		rs[i] = newResolved(ctx, c, ts, callID, idErr, runtime)
 	}
 
@@ -708,6 +717,19 @@ func approvalRequesterFor(
 	emit eventEmitter,
 ) loop.ApprovalRequestFunc {
 	return func(ctx context.Context, prompt gatedomain.ApprovalPrompt) (gatedomain.ApprovalAction, error) {
+		if restored, ok := gateAdoptionFromContext(ctx).take(r.callID, gatePermission); ok {
+			displayed := displayedRequest(prompt)
+			if restored.matchesPermission(displayed) {
+				r.prompted = true
+				return awaitApproval(ctx, r, gateReg, restored.id, restored.reply, displayed)
+			}
+			// The re-evaluated call asks for something the restored gate does not
+			// show: close the stale gate and ask afresh below, so an answer is never
+			// applied to a request it did not see.
+			if err := abandonInstalledGate(ctx, ctx, gateReg, restored.id); err != nil {
+				return "", err
+			}
+		}
 		// Reaching the interactive approval callback means the evaluator found
 		// unmet gated requirements. Render the preview once at this gate-open
 		// boundary, before review-context capture, and keep that live-only value
@@ -746,6 +768,7 @@ func approvalRequesterFor(
 		case gateReg <- gateRegistration{
 			ctx: ctx, gate: g, payload: payload, reviewContext: reviewContext,
 			callID: r.callID, reply: reply, kind: gatePermission, ack: ack,
+			resume: stepResumeFor(ctx, r.block.ID),
 		}:
 		case <-ctx.Done():
 			return "", ctx.Err()
@@ -763,40 +786,54 @@ func approvalRequesterFor(
 		// Install-before-emit: only now is the gate guaranteed installed, so the
 		// matching Approve/Deny cannot be dropped on a race.
 		emit(ctx, event.PermissionRequested{ToolExecutionID: r.callID, Request: displayed, Preview: preview})
+		return awaitApproval(ctx, r, gateReg, installed.gateID, reply, displayed)
+	}
+}
 
-		g.ID = installed.gateID
-		waitCtx, waitCall, finishWait, waitErr := startGateWaitWithRunner(ctx, r.hookCall, g, r.hooks)
-		if waitErr != nil {
-			return "", waitErr
+// awaitApproval blocks the call on its installed permission gate — freshly opened,
+// or restored and adopted by a resumed step — and maps the routed reply to the
+// exact approval action.
+func awaitApproval(
+	ctx context.Context,
+	r *resolved,
+	gateReg chan<- gateRegistration,
+	gateID gatedomain.ID,
+	reply <-chan command.Command,
+	displayed tool.Request,
+) (gatedomain.ApprovalAction, error) {
+	g := stampGateSubjectProvenance(ctx, permissionGate(r.callID, displayed))
+	g.ID = gateID
+	waitCtx, waitCall, finishWait, waitErr := startGateWaitWithRunner(ctx, r.hookCall, g, r.hooks)
+	if waitErr != nil {
+		return "", waitErr
+	}
+	select {
+	case cmd := <-reply:
+		action, err := approvalActionFromCommand(cmd, r.callID, gateID)
+		answer := &gatedomain.Answer{
+			GateID: gateID,
+			Action: string(action),
+			Source: gateResponseSource(cmd),
 		}
-		select {
-		case cmd := <-reply:
-			action, err := approvalActionFromCommand(cmd, r.callID, installed.gateID)
-			answer := &gatedomain.Answer{
-				GateID: installed.gateID,
-				Action: string(action),
-				Source: gateResponseSource(cmd),
+		finishGateWait(finishWait, waitCall, answer, err)
+		if err == nil {
+			if action == gatedomain.ApprovalDeny {
+				r.permissionEffect, r.permissionReason = event.PermissionEffectDeny, "permission_denied"
+			} else {
+				r.permissionEffect, r.permissionReason = event.PermissionEffectApprove, "permission_approved"
 			}
-			finishGateWait(finishWait, waitCall, answer, err)
-			if err == nil {
-				if action == gatedomain.ApprovalDeny {
-					r.permissionEffect, r.permissionReason = event.PermissionEffectDeny, "permission_denied"
-				} else {
-					r.permissionEffect, r.permissionReason = event.PermissionEffectApprove, "permission_approved"
-				}
-			}
-			return action, err
-		case <-waitCtx.Done():
-			waitErr := waitCtx.Err()
-			if ctx.Err() == nil {
-				if err := abandonInstalledGate(ctx, waitCtx, gateReg, installed.gateID); err != nil {
-					finishGateWait(finishWait, waitCall, nil, err)
-					return "", err
-				}
-			}
-			finishGateWait(finishWait, waitCall, nil, waitErr)
-			return "", waitErr
 		}
+		return action, err
+	case <-waitCtx.Done():
+		waitErr := waitCtx.Err()
+		if ctx.Err() == nil {
+			if err := abandonInstalledGate(ctx, waitCtx, gateReg, gateID); err != nil {
+				finishGateWait(finishWait, waitCall, nil, err)
+				return "", err
+			}
+		}
+		finishGateWait(finishWait, waitCall, nil, waitErr)
+		return "", waitErr
 	}
 }
 
@@ -933,6 +970,7 @@ func runOne(
 ) (res result) {
 	ctx2 := WithPreparedCall(withGateReg(withContextEmit(withToolUseID(withCallID(ctx, r.callID), r.block.ID), emit), runtime.GateRegistrations), r.prepared)
 	ctx2 = WithUserInputRequester(ctx2, RequestUserInput)
+	ctx2 = withUserInputReplaySafe(ctx2, r.t)
 	ctx2 = withOperationHookRuntime(ctx2, operationHookRuntime{
 		hooks: runtime.Hooks, coordinates: runtime.Coordinates,
 		agentName: runtime.AgentName, cause: runtime.Cause,

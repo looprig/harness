@@ -51,6 +51,11 @@ type turnState struct {
 	toolIterations int
 	toolCalls      int
 
+	// resume, when non-nil, makes this a RESTORED turn: its first step is the
+	// parked step, re-entered at tool execution with no inference (see
+	// gate_resume.go). runTurn consumes it on the first iteration.
+	resume *parkedTurn
+
 	// derivedUserPrefix counts the leading messages in msgs that were generated
 	// by context replacement rather than authored by a human. They remain useful
 	// review evidence but can never establish user authority.
@@ -312,7 +317,17 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 	}
 
 	candidateMeasured := false
-	for stepIdx := StepIndex(0); ; stepIdx++ {
+	resumed := ts.resume
+	ts.resume = nil
+	firstStep := StepIndex(0)
+	if resumed != nil {
+		// The parked step's request was measured and sent before the runtime moved;
+		// the resumed step re-enters at tool execution, so nothing is measured or
+		// inferred for it.
+		firstStep = resumed.step.StepIndex
+		candidateMeasured = true
+	}
+	for stepIdx := firstStep; ; stepIdx++ {
 		// Request base is the committed history clone + this turn's staged messages,
 		// plus the volatile runtime-context tail (when configured) appended LAST so the
 		// model sees fresh date/cwd/git at the very end of the input every step. The
@@ -337,8 +352,10 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// step's identity. Best-effort: a crypto/rand failure here is a system-level
 		// fault that must not abort an already-accepted turn, so log it and stamp a
 		// zero StepID rather than dropping the step.
-		stepID, err := cfg.idGen()
-		if err != nil {
+		var stepID uuid.UUID
+		if resumed != nil {
+			stepID = resumed.step.StepID
+		} else if stepID, err = cfg.idGen(); err != nil {
 			slog.Error("step id generation failed; stamping StepDone with zero StepID", "error", err)
 		}
 		st := newStepState(turnIDs.sessionID, turnIDs.loopID, turnIDs.turnID, stepID, stepIdx)
@@ -374,115 +391,123 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			}
 		}
 
-		releaseAdmission := cfg.firstAdmission
-		cfg.firstAdmission = nil
-		if releaseAdmission == nil {
-			var admitErr error
-			releaseAdmission, admitErr = cfg.admit(stepCtx)
-			if admitErr != nil {
-				finishStepWith(admitErr)
-				if !errors.Is(admitErr, context.Canceled) && !errors.Is(admitErr, context.DeadlineExceeded) {
-					return event.TurnFailed{TurnIndex: ts.index, Err: admitErr}
+		var aiMsg *content.AIMessage
+		var toolUses []content.ToolUseBlock
+		if resumed != nil {
+			aiMsg = cloneAIMessage(resumed.step.Message)
+			st.msgs = append(st.msgs, aiMsg)
+			toolUses = toolUsesOf(aiMsg)
+		} else {
+			releaseAdmission := cfg.firstAdmission
+			cfg.firstAdmission = nil
+			if releaseAdmission == nil {
+				var admitErr error
+				releaseAdmission, admitErr = cfg.admit(stepCtx)
+				if admitErr != nil {
+					finishStepWith(admitErr)
+					if !errors.Is(admitErr, context.Canceled) && !errors.Is(admitErr, context.DeadlineExceeded) {
+						return event.TurnFailed{TurnIndex: ts.index, Err: admitErr}
+					}
+					return event.TurnInterrupted{TurnIndex: ts.index}
 				}
-				return event.TurnInterrupted{TurnIndex: ts.index}
 			}
-		}
-		// runStep owns the LLM cycle: stream → exactly one AIMessage into st.msgs[0].
-		res := runStepWithAdmission(stepCtx, stepConfig{
-			req: req, client: cfg.client, emit: cfg.emit, hooks: cfg.hooks,
-			agentName: cfg.agentName, cause: cfg.cause, now: cfg.now,
-		}, ts.index, st, releaseAdmission)
-		if res.terminal != nil {
-			// The step did not complete, but a stream that failed PART-WAY may already
-			// have delivered content the user watched arrive as TokenDeltas. Commit
-			// that safe prefix first, before any terminal below is chosen, so the
-			// outcome is the same whichever terminal wins. It is not staged into
-			// ts.msgs: the turn ends here, so no further request is built from it.
-			commitTruncatedStep(stepCtx, cfg, outputPlan, res.state)
-			// A clean native stream with no semantic blocks is still an output-stage
-			// result: finish metadata takes precedence (length/filter/tool_use), while
-			// stop/unknown are classified by the shared extractor as empty structured
-			// output. Legacy turns retain their historical EmptyResponseError.
-			if outputPlan.strategy == outputStrategyNative && res.streamResult != nil {
-				empty := res.state.blocks.AIMessage()
-				empty.Usage = cloneUsage(res.streamResult.Usage)
-				_, _, outputErr := validateNativeStep(empty, res.state.blocks.ToolUses(), res.streamResult)
+			// runStep owns the LLM cycle: stream → exactly one AIMessage into st.msgs[0].
+			res := runStepWithAdmission(stepCtx, stepConfig{
+				req: req, client: cfg.client, emit: cfg.emit, hooks: cfg.hooks,
+				agentName: cfg.agentName, cause: cfg.cause, now: cfg.now,
+			}, ts.index, st, releaseAdmission)
+			if res.terminal != nil {
+				// The step did not complete, but a stream that failed PART-WAY may already
+				// have delivered content the user watched arrive as TokenDeltas. Commit
+				// that safe prefix first, before any terminal below is chosen, so the
+				// outcome is the same whichever terminal wins. It is not staged into
+				// ts.msgs: the turn ends here, so no further request is built from it.
+				commitTruncatedStep(stepCtx, cfg, outputPlan, res.state)
+				// A clean native stream with no semantic blocks is still an output-stage
+				// result: finish metadata takes precedence (length/filter/tool_use), while
+				// stop/unknown are classified by the shared extractor as empty structured
+				// output. Legacy turns retain their historical EmptyResponseError.
+				if outputPlan.strategy == outputStrategyNative && res.streamResult != nil {
+					empty := res.state.blocks.AIMessage()
+					empty.Usage = cloneUsage(res.streamResult.Usage)
+					_, _, outputErr := validateNativeStep(empty, res.state.blocks.ToolUses(), res.streamResult)
+					if outputErr != nil {
+						finishStepWith(outputErr)
+						return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
+					}
+				}
+				// The in-flight step never completed: discard it (it was never added to
+				// ts.msgs and never committed) and return the terminal. Committed steps
+				// stay in loopState.msgs.
+				finishStepWith(terminalHookError(res.terminal))
+				return res.terminal
+			}
+			st = res.state
+			aiMsg = st.msgs[0].(*content.AIMessage)
+
+			// Raw executable tool-use view (unsanitized Input) for this step. Native
+			// structured output validates finish metadata and the final representation
+			// here, before usage accounting, staged-message append, tool execution,
+			// StepDone commit, candidate measurement, or TurnDone publication. This is
+			// the current-step atomicity boundary: a rejected final leaves prior commits
+			// intact but makes the staged invalid step wholly unobservable.
+			toolUses = st.blocks.ToolUses()
+			switch outputPlan.strategy {
+			case outputStrategyNative:
+				canonical, final, outputErr := validateNativeStep(aiMsg, toolUses, res.streamResult)
 				if outputErr != nil {
 					finishStepWith(outputErr)
 					return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
 				}
+				if final {
+					aiMsg = canonical
+					st.msgs[0] = canonical
+					toolUses = nil
+				}
+			case outputStrategyTerminalTool:
+				// runStep sanitizes malformed tool input in the storable AIMessage so
+				// ordinary continuations can always be encoded. Terminal validation must
+				// instead inspect the raw accumulator view; otherwise malformed control
+				// arguments rewritten to {} could be accepted as a final result.
+				rawMessage := st.blocks.AIMessage()
+				rawMessage.Usage = cloneUsage(aiMsg.Usage)
+				canonical, final, outputErr := validateTerminalStep(rawMessage, toolUses, res.streamResult)
+				if outputErr != nil {
+					finishStepWith(outputErr)
+					return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
+				}
+				if final {
+					aiMsg = canonical
+					st.msgs[0] = canonical
+					toolUses = nil
+				}
 			}
-			// The in-flight step never completed: discard it (it was never added to
-			// ts.msgs and never committed) and return the terminal. Committed steps
-			// stay in loopState.msgs.
-			finishStepWith(terminalHookError(res.terminal))
-			return res.terminal
-		}
-		st = res.state
-		aiMsg := st.msgs[0].(*content.AIMessage)
 
-		// Raw executable tool-use view (unsanitized Input) for this step. Native
-		// structured output validates finish metadata and the final representation
-		// here, before usage accounting, staged-message append, tool execution,
-		// StepDone commit, candidate measurement, or TurnDone publication. This is
-		// the current-step atomicity boundary: a rejected final leaves prior commits
-		// intact but makes the staged invalid step wholly unobservable.
-		toolUses := st.blocks.ToolUses()
-		switch outputPlan.strategy {
-		case outputStrategyNative:
-			canonical, final, outputErr := validateNativeStep(aiMsg, toolUses, res.streamResult)
-			if outputErr != nil {
-				finishStepWith(outputErr)
-				return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
+			turnUsage, usageErr := addTurnUsage(ts.usage, aiMsg.Usage)
+			if usageErr != nil {
+				finishStepWith(usageErr)
+				return event.TurnFailed{TurnIndex: ts.index, Err: usageErr}
 			}
-			if final {
-				aiMsg = canonical
-				st.msgs[0] = canonical
-				toolUses = nil
-			}
-		case outputStrategyTerminalTool:
-			// runStep sanitizes malformed tool input in the storable AIMessage so
-			// ordinary continuations can always be encoded. Terminal validation must
-			// instead inspect the raw accumulator view; otherwise malformed control
-			// arguments rewritten to {} could be accepted as a final result.
-			rawMessage := st.blocks.AIMessage()
-			rawMessage.Usage = cloneUsage(aiMsg.Usage)
-			canonical, final, outputErr := validateTerminalStep(rawMessage, toolUses, res.streamResult)
-			if outputErr != nil {
-				finishStepWith(outputErr)
-				return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
-			}
-			if final {
-				aiMsg = canonical
-				st.msgs[0] = canonical
-				toolUses = nil
-			}
-		}
+			ts.usage = turnUsage
 
-		turnUsage, usageErr := addTurnUsage(ts.usage, aiMsg.Usage)
-		if usageErr != nil {
-			finishStepWith(usageErr)
-			return event.TurnFailed{TurnIndex: ts.index, Err: usageErr}
-		}
-		ts.usage = turnUsage
-
-		// Text-only completion ALWAYS wins, regardless of iteration count: the runaway
-		// cap is only checked when the model wants ANOTHER tool batch. The step's group
-		// is just the AIMessage. Commit it (actor appends + emits StepDone), then end.
-		if len(toolUses) == 0 {
-			ts.msgs = append(ts.msgs, aiMsg)
-			if cerr := commitStep(stepCtx, cfg, st); cerr != nil {
-				// The commit handshake was cancelled (Interrupt/Shutdown) before the
-				// actor committed/emitted this final step: treat as interrupt.
-				finishStepWith(cerr)
-				return event.TurnInterrupted{TurnIndex: ts.index}
+			// Text-only completion ALWAYS wins, regardless of iteration count: the runaway
+			// cap is only checked when the model wants ANOTHER tool batch. The step's group
+			// is just the AIMessage. Commit it (actor appends + emits StepDone), then end.
+			if len(toolUses) == 0 {
+				ts.msgs = append(ts.msgs, aiMsg)
+				if cerr := commitStep(stepCtx, cfg, st); cerr != nil {
+					// The commit handshake was cancelled (Interrupt/Shutdown) before the
+					// actor committed/emitted this final step: treat as interrupt.
+					finishStepWith(cerr)
+					return event.TurnInterrupted{TurnIndex: ts.index}
+				}
+				finishStepWith(nil)
+				candidate := turnInferenceRequest(cfg, ts, runtimeTail, outputPlan)
+				if _, measureErr := measureTurnCandidate(ctx, cfg, candidate, runtimeRevision, runtimeTail, false); measureErr != nil {
+					return measureTurnFailure(ctx, ts.index, measureErr)
+				}
+				return event.TurnDone{TurnIndex: ts.index, Message: cloneAIMessage(aiMsg), Usage: ts.usage}
 			}
-			finishStepWith(nil)
-			candidate := turnInferenceRequest(cfg, ts, runtimeTail, outputPlan)
-			if _, measureErr := measureTurnCandidate(ctx, cfg, candidate, runtimeRevision, runtimeTail, false); measureErr != nil {
-				return measureTurnFailure(ctx, ts.index, measureErr)
-			}
-			return event.TurnDone{TurnIndex: ts.index, Message: cloneAIMessage(aiMsg), Usage: ts.usage}
 		}
 
 		ts.toolIterations++
@@ -542,7 +567,10 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			)
 			batchCtx = withPermissionReviewCapture(batchCtx, reviewCapture)
 		}
-		results := RunBatch(batchCtx, toolUses, cfg.tools, BatchRuntime{
+		// Every gate this batch opens records the step it parks, so a restored
+		// session can resume the step instead of interrupting the turn.
+		batchCtx = withStepResume(batchCtx, stepResumeBase{index: st.index, message: aiMsg})
+		batchRuntime := BatchRuntime{
 			GateRegistrations: cfg.gateReg,
 			IDGen:             cfg.idGen,
 			Emit:              stepEmit,
@@ -557,7 +585,14 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			AgentName:    cfg.agentName,
 			Cause:        cfg.cause,
 			captureSinks: turnCaptureSinks(cfg),
-		})
+		}
+		var results []result
+		if resumed != nil {
+			results = resumedStepResults(batchCtx, resumed, toolUses, cfg.tools, batchRuntime)
+			resumed = nil
+		} else {
+			results = RunBatch(batchCtx, toolUses, cfg.tools, batchRuntime)
+		}
 		if stepCtx.Err() != nil {
 			// A cancelled batch's results are discarded; the step never completes, so
 			// it is not appended/committed and emits no StepDone. Their local spills

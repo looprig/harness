@@ -527,6 +527,14 @@ func restoreTopologySession(
 	// visible. Unsupported or payload-less open gates are durably closed below, after
 	// RestoreStarted, before RestoreDone makes the restored session reachable.
 	restoredGates := foldRestoredGates(allRecords)
+	// A turn parked at a resumable gate is RESUMED rather than interrupted: its gates
+	// stay open and the restored loop re-enters the parked step once the restore
+	// commits (gate_resume.go). Only the active primer loop resumes; every other
+	// open turn is crash-closed below exactly as before, and an ask_user gate whose
+	// call is not resumed is closed restore_unavailable.
+	parked := planParkedStep(restoredGates, rootLoopID, activePlan.bound.Engine() == loop.EngineNative, activePlan.folded, activePlan.events)
+	closeUnresumedAskUserGates(&restoredGates, parked)
+	activePlan.folded.Parked = parked
 
 	// (3) RestoreStarted — the FIRST restore mutation (after the lease fence).
 	if err := appendRestoreEvent(ctx, j, factory, event.RestoreStarted{
@@ -580,6 +588,9 @@ func restoreTopologySession(
 	var crashClosures []event.Event
 	for _, plan := range plans {
 		if !plan.folded.OpenTurn {
+			continue
+		}
+		if parked != nil && plan.started.LoopID == rootLoopID {
 			continue
 		}
 		turnID, turnIdx := openTurnCoords(plan.events)
@@ -739,6 +750,13 @@ func restoreTopologySession(
 	// offload-GC runner now the hub exists (bound to hub.IsIdle).
 	s.watchRootLease()
 	s.startOffloadGC()
+	// Release the resumed turn before anything else can reach the loop (background
+	// hand-backs, replayed admitted inputs), so they queue behind it.
+	if parked != nil {
+		if err := s.startParkedTurn(ctx, rootLoopID); err != nil {
+			return abortAccepted(s, &RestoreError{Kind: RestoreLoopFailed, Cause: err})
+		}
+	}
 	manager.reconcileRestoredBackgroundRequests(s, backgroundPlan)
 	s.replayAppliedAdmittedInputs(s.sessionCtx, admittedInputs)
 	contextTransferred = true

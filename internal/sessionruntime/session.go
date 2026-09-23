@@ -1219,6 +1219,23 @@ func (s *Session) enterExecution(ctx context.Context, loopID uuid.UUID, reserve 
 	}
 }
 
+// ResumeTurnActivity is the loop's resumed-turn capability (loopruntime's
+// turnResumeActivity): a restored loop re-entering the turn it was parked in records
+// that turn as live work, exactly as publishing its TurnStarted would have, and the
+// loop's handle reports it running. turnID is the resumed turn's original id.
+func (s *Session) ResumeTurnActivity(ctx context.Context, loopID, _ uuid.UUID) error {
+	if err := s.hub.ResumeTurn(ctx, loopID); err != nil {
+		return err
+	}
+	s.loopsMu.RLock()
+	h := s.loops[loopID]
+	s.loopsMu.RUnlock()
+	if h != nil {
+		h.setMechanicalState(tool.DelegateStatusRunning)
+	}
+	return nil
+}
+
 func (s *Session) recordLoopMechanicalState(ev event.Event) {
 	loopID := ev.EventHeader().Coordinates.LoopID
 	if loopID.IsZero() {

@@ -60,6 +60,39 @@ type Loop struct {
 	// handle makes native/foreign construction isolation inspectable without
 	// exposing hook configuration through loop.Backend.
 	hooks *hook.Runner
+
+	// parkedStart is the release for a restored parked turn (gate_resume.go): the
+	// actor resumes the turn when it receives from it. Nil for a loop that did not
+	// restore parked.
+	parkedStart chan<- chan<- struct{}
+}
+
+// StartParkedTurn releases the turn a restored loop was parked in, and returns once
+// the actor has installed it as the running turn: every command the actor receives afterwards finds the turn
+// running (and queues behind it) rather than starting a turn of its own. The session
+// calls it once the restore is committed, before anything can submit to the loop, so
+// the resumed turn does no work — no tool run, no model call, no SessionActive —
+// before RestoreDone. It is a no-op for a loop with nothing to resume.
+func (l *Loop) StartParkedTurn(ctx context.Context) error {
+	if l.parkedStart == nil {
+		return nil
+	}
+	started := make(chan struct{})
+	select {
+	case l.parkedStart <- started:
+	case <-l.Done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-started:
+		return nil
+	case <-l.Done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // CommandSink returns the actor's command input.
@@ -93,6 +126,10 @@ func (l *Loop) DoneChan() <-chan struct{} { return l.Done }
 // `loopState.events`) was an SRP smudge — config is wiring set at construction,
 // state is what the actor evolves. events lives here now.
 type loopConfig struct {
+	// parkedStart is the actor's receive side of Loop.parkedStart; nil unless the
+	// loop restored parked.
+	parkedStart <-chan chan<- struct{}
+
 	// loopCtx is the loop's lifetime context (derived by the session from its
 	// sessionCtx). It is NOT a turn lifetime: runLoop derives each turn ctx from it
 	// via context.WithCancel(loopCtx). Submit commands carry no context.
@@ -454,6 +491,7 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	// gateReg is unbuffered: registration is synchronous (the runner blocks on the
 	// ack), and the actor is the sole reader, selecting on it alongside commands.
 	gateReg := make(chan gateRegistration)
+	var parkedStart chan chan<- struct{}
 	// snapshots is unbuffered: the actor is the sole reader and replies on the request's
 	// buffered(1) reply channel, so the actor never blocks serving a snapshot.
 	snapshots := make(chan snapshotRequest)
@@ -533,6 +571,14 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		); err != nil {
 			return nil, err
 		}
+		if seed.Parked != nil && seed.Parked.valid(len(state.msgs)) {
+			// Install the parked gates' reply slots BEFORE the actor starts, so an
+			// answer routed the instant the restored session is reachable waits for
+			// the resumed call instead of being dropped as addressed to no gate.
+			state.parked = newParkedTurn(*seed.Parked, state.pendingGates)
+			parkedStart = make(chan chan<- struct{})
+			lc.parkedStart = parkedStart
+		}
 		if len(seed.PendingProcessNotifications) > 0 {
 			// Restore seed: come up already owning the undelivered process
 			// notifications the session reconstructed (already reconciled
@@ -546,14 +592,18 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		}
 	}
 	go runLoop(lc, state)
-	return &Loop{
+	loop := &Loop{
 		Commands:         commands,
 		Done:             done,
 		priorityCommands: priorityCommands,
 		gateReg:          gateReg,
 		snapshots:        snapshots,
 		hooks:            cfg.Hooks,
-	}, nil
+	}
+	if parkedStart != nil {
+		loop.parkedStart = parkedStart
+	}
+	return loop, nil
 }
 
 type loopStatus int
@@ -711,6 +761,11 @@ type loopState struct {
 	// Owned SOLELY by runLoop/the actor; control commands route by GateID and kind,
 	// then delete the entry. Cleared on turn end.
 	pendingGates map[gatedomain.ID]pendingGate
+
+	// parked is the restored open turn this loop resumes as soon as its actor
+	// starts (see gate_resume.go). Nil for every loop that did not restore parked
+	// at a resumable gate; consumed by the actor at start.
+	parked *parkedTurn
 
 	// processNotifications is the actor-owned bounded set of accepted process
 	// completion notifications (Task 24C), keyed by their stable CommandID. It
@@ -2725,6 +2780,82 @@ func runLoop(cfg loopConfig, state loopState) {
 		return false
 	}
 
+	// resumeParkedTurn re-enters the open turn a restored loop was parked in
+	// (gate_resume.go). It is the restored counterpart of startTurn: the opening
+	// TurnStarted and the turn's committed steps are already durable, so it
+	// publishes nothing to open the turn — it installs the same live turn state
+	// under the ORIGINAL turn id and index, records the turn as live work with the
+	// session, and launches runTurn with the parked step as its first step.
+	resumeParkedTurn := func(parked *parkedTurn) {
+		step := parked.step
+		coords := identity.Coordinates{SessionID: state.sessionID, LoopID: state.id, TurnID: step.TurnID}
+		user, _ := state.msgs[step.TurnStart].(*content.UserMessage)
+		turnCall := hook.Call{
+			Operation:   hook.OperationTurn,
+			StartedAt:   hookNow(config.now),
+			Coordinates: coords,
+			AgentName:   config.AgentName,
+			Cause:       step.Cause,
+			Turn:        &hook.TurnData{Index: state.turnIndex, Input: cloneUserMessage(user)},
+		}
+		turnHookCtx, turnHookFinish, hookErr := config.Hooks.Start(ctx, turnCall)
+		var startErr error
+		if hookErr != nil {
+			startErr = safeHookError(hook.OperationTurn, hookErr)
+			turnHookCtx = ctx
+		}
+		state.turnID = step.TurnID
+		state.causationID = step.Cause.CommandID
+		state.status = loopRunning
+		state.turnHookCall = turnCall
+		state.turnHookFinish = turnHookFinish
+		state.turnHookCtx = turnHookCtx
+		turnCtx, cancel := context.WithCancel(turnHookCtx)
+		state.cancelTurn = cancel
+		if startErr == nil {
+			if activity, ok := cfg.events.(turnResumeActivity); ok {
+				startErr = activity.ResumeTurnActivity(turnHookCtx, state.id, step.TurnID)
+			}
+		}
+		idx := state.turnIndex
+		if startErr != nil {
+			go func() {
+				defer cancel()
+				internal <- turnResult{terminal: event.TurnFailed{TurnIndex: idx, Err: startErr}}
+			}()
+			return
+		}
+		baseDerivedPrefix := state.msgsDerivedPrefix
+		if baseDerivedPrefix > step.TurnStart {
+			baseDerivedPrefix = step.TurnStart
+		}
+		ts := turnState{
+			sessionID:      state.sessionID,
+			loopID:         state.id,
+			id:             step.TurnID,
+			index:          idx,
+			causationID:    step.Cause.CommandID,
+			msgs:           cloneMessages(state.msgs[step.TurnStart:]),
+			toolIterations: committedToolSteps(state.msgs[step.TurnStart:]),
+			resume:         parked,
+		}
+		turnCfg := buildTurnConfig(cloneMessages(state.msgs[:step.TurnStart]), baseDerivedPrefix, nil)
+		turnCfg.cause = step.Cause
+		go func() {
+			defer cancel()
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("resumed turn goroutine panicked", "panic", r)
+					internal <- turnResult{
+						terminal: event.TurnFailed{TurnIndex: idx, Err: &event.TurnPanicError{Detail: fmt.Sprintf("%v", r)}},
+					}
+				}
+			}()
+			internal <- turnResult{terminal: runTurn(turnCtx, turnCfg, ts)}
+		}()
+	}
+	parkedStart := cfg.parkedStart
+
 	for {
 		// One bounded priority poll precedes the ordinary select. The actor still
 		// enters the ordinary select every iteration, so an empty priority lane has
@@ -2763,7 +2894,13 @@ func runLoop(cfg loopConfig, state loopState) {
 			if gateCtx == nil {
 				gateCtx = ctx
 			}
-			gateID, err := cfg.gates.PrepareGateOpen(gateCtx, state.id, reg.gate, reg.payload)
+			var gateID gatedomain.ID
+			var err error
+			if resumable, ok := cfg.gates.(resumableGateRegistrar); ok && reg.resume != nil {
+				gateID, err = resumable.PrepareResumableGateOpen(gateCtx, state.id, reg.gate, reg.payload, reg.resume)
+			} else {
+				gateID, err = cfg.gates.PrepareGateOpen(gateCtx, state.id, reg.gate, reg.payload)
+			}
 			if err != nil {
 				reg.ack <- gateInstallAck{err: err}
 				break
@@ -3274,6 +3411,14 @@ func runLoop(cfg loopConfig, state loopState) {
 				removeDraining(fi.Cause.CommandID)
 			}
 			req.ack <- boundaryErr
+
+		case started := <-parkedStart:
+			parkedStart = nil
+			if parked := state.parked; parked != nil && state.status == loopIdle {
+				state.parked = nil
+				resumeParkedTurn(parked)
+			}
+			close(started)
 
 		case result := <-internal:
 			dispatch := func() { dispatchCompactionBoundary(ctx, compactionBoundaryTurn, nil) }

@@ -719,6 +719,43 @@ func (h *Hub) ExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 	h.appendAndDeliverDerived(ctx, subs, derived, 0)
 }
 
+// ResumeTurn records a restored loop's RESUMED turn as live work: it inserts the
+// same {loop, LoopID} activity key a TurnStarted publication inserts, deriving (and
+// durably appending) SessionActive if the session was idle. A resumed turn publishes
+// no TurnStarted — its opening event is already in the journal from the runtime the
+// session moved from — so without this the session would report idle while the turn
+// runs, and the turn's eventual LoopIdle would remove a key nothing inserted.
+//
+// It fails closed: a stopped session, or a derived SessionActive that cannot be made
+// durable, is returned as an error and the caller must not run the turn. Exported for
+// the session only; loops reach it through the session's narrow capability.
+func (h *Hub) ResumeTurn(ctx context.Context, loopID uuid.UUID) error {
+	if loopID.IsZero() {
+		return &TurnStartReservationError{Reason: TurnStartReservationInvalidLoop}
+	}
+	if err := h.beginPublish(); err != nil {
+		return err
+	}
+	defer h.finishPublish()
+	h.activityMu.Lock()
+	defer h.activityMu.Unlock()
+	h.mu.Lock()
+	if h.state.phase == SessionStopped {
+		h.mu.Unlock()
+		return &TurnStartReservationError{Reason: TurnStartReservationStopped, LoopID: loopID}
+	}
+	derived := h.state.applyActivity(h.sessionID,
+		func() { h.state.add(activityKey{kind: kindLoop, id: loopID}) })
+	subs := h.snapshotSubsLocked()
+	h.mu.Unlock()
+	if _, active := derived.(event.SessionActive); active {
+		if observer, ok := h.idleBoundary.(sessionActivationObserver); ok {
+			observer.SessionActivated()
+		}
+	}
+	return h.appendAndDeliverDerivedChecked(ctx, subs, derived, 0)
+}
+
 // CancelExpectTurn releases a {wake, subagentLoopID} token when its hand-back is
 // rejected or explicitly discarded. It derives SessionIdle if this emptied active.
 // Exported for the session only (see ExpectTurn).

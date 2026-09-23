@@ -439,6 +439,31 @@ func (s *Session) recordPermissionReviewBasis(req loopruntime.PermissionReviewRe
 // GatePrepared event is loopScoped); TurnID/StepID are read from the gate's
 // Subject.
 func (s *Session) PrepareGateOpen(ctx context.Context, loopID uuid.UUID, g gate.Gate, payload gate.Payload) (gate.ID, error) {
+	return s.prepareGateOpen(ctx, loopID, g, payload, nil)
+}
+
+// PrepareResumableGateOpen is PrepareGateOpen for a loop-owned tool gate a restored
+// session can resume: resume (the parked step's snapshot) is recorded in the private
+// GatePrepared, and only there. A nil or invalid snapshot is refused rather than
+// silently dropped, so a caller that meant to make a gate resumable cannot open
+// one restore will close.
+func (s *Session) PrepareResumableGateOpen(ctx context.Context, loopID uuid.UUID, g gate.Gate, payload gate.Payload, resume *event.ToolStepResume) (gate.ID, error) {
+	if !resume.Valid() || g.Resolver != gate.ResolverLoop {
+		return gate.ID{}, &GateError{Kind: GateKindMismatch, Cause: errInvalidGateResume}
+	}
+	switch g.Kind {
+	case gate.KindPermission, gate.KindAskUser:
+	default:
+		return gate.ID{}, &GateError{Kind: GateKindMismatch, Cause: errInvalidGateResume}
+	}
+	return s.prepareGateOpen(ctx, loopID, g, payload, resume)
+}
+
+// errInvalidGateResume reports a resume snapshot that names no call of its own
+// step, or a gate kind that cannot be resumed.
+var errInvalidGateResume = errors.New("sessionruntime: invalid gate resume snapshot")
+
+func (s *Session) prepareGateOpen(ctx context.Context, loopID uuid.UUID, g gate.Gate, payload gate.Payload, resume *event.ToolStepResume) (gate.ID, error) {
 	s.gatesMu.Lock()
 	defer s.gatesMu.Unlock()
 
@@ -473,6 +498,7 @@ func (s *Session) PrepareGateOpen(ctx context.Context, loopID uuid.UUID, g gate.
 	if err != nil {
 		return gate.ID{}, err
 	}
+	prepared.Resume = resume
 
 	openPayload := gate.OpenPayload{GateID: gateID, Payload: payload}
 	rec := journal.NewGatePreparedRecord(prepared, openPayload)
