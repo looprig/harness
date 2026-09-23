@@ -303,23 +303,52 @@ In v0.36.0 and older, an input a Host admitted under a disposition attempt was h
 to the loop's in-memory inbox and its `applied` disposition written at once; the turn
 that carries it out was appended later. A crash or a graceful shutdown in between left
 the command settled `applied` forever with the user's message never run (a shutdown
-even appended an `InputCancelled` for it). v0.37.0 closes that window:
+even appended an `InputCancelled` for it). v0.37.0 closes that window.
 
-- The loop actor writes `applied` itself, after deciding to take the input and before
-  it can queue, fold or start it, so `applied` is durable strictly before any effect.
-  A loop that declines (shutting down, queue full) publishes nothing and the command is
-  `refused`; a failed `applied` append drops the input, so a successor's `not_applied`
-  closure is true.
-- A loop that goes away (shutdown, cancelled context) carries such an input over
-  instead of cancelling it, and restore re-offers every `applied` input with no caused
-  event, under its original runtime command id.
-- The input's intent record is now load-bearing under an attempt: if it cannot be
-  appended the command is refused before its prefix and may be re-offered.
+**What `applied` means for an input now.** The loop actor writes it itself, after
+deciding to take the input and before the input can queue, fold or start, so it is
+durable strictly before any effect. From then on the input is OWED until a durable
+event it caused resolves it:
+
+- If the runtime dies or shuts down first, the input is carried over rather than
+  cancelled, and the next restore re-offers it under its original runtime command id.
+- The debt is also discharged, **without the input running**, by the ordinary visible
+  resolutions of any queued input: an idle turn-start failure (`TurnRejected`), a failed
+  turn ahead of it or an execution-admission error (`InputCancelled` with
+  `CancelTurnFailed`), or an explicit retraction. These are durable and visible, never
+  silent, and they are what `applied` settled into in v0.36.0 too.
+- A loop that declines before committing (shutting down, queue full) publishes nothing
+  and the command settles `refused` — the user must resend. v0.36.0 settled these
+  `applied` and then rejected the input.
+
+**Late and out-of-order replay.** An owed input is replayed at the NEXT restore, after
+any inputs that ran in between, and possibly long after it was sent: debt a crashed
+v0.36.0 runtime left behind, a commit whose outcome could not be read back, or a replay
+the loop declined (more than 64 owed inputs, or a loop that could not take it) are all
+retried at each later restore. The agent may therefore act on an instruction that is
+stale relative to what it has done since, including with tool side effects. A
+composition that cannot tolerate that should gate what it replays; harness does not
+apply a staleness rule.
+
+**Successors settle instead of halting.** `CloseAttempt` on an attempt whose own
+disposition is already durable (the predecessor recorded it and died before the store
+settled it) writes nothing and succeeds with `ClosureResult.AlreadyDisposed`, so a
+successor Host settles from that evidence. In v0.36.0 it refused (an idempotency
+collision, or `EnduringEffectError` once the replayed input's effect landed).
+
+**Only native loops take the handshake.** The `command.Admission` handshake is sent
+only to a `loop.Backend` that declares `SupportsRuntimeAdmission() bool` (the native
+loop does). Every other backend — a foreign loop above all — keeps the released
+send-then-record path and gets none of the carry-over guarantee. A backend must not
+declare the capability unless it honours the whole `command.Admission` contract.
+
+The input's intent record is now load-bearing under an attempt: if it cannot be
+appended the command is refused before its prefix and may be re-offered.
 
 **No new record kind is written**, so this is not a one-way upgrade: v0.36.0 can still
-open a v0.37.0 journal (it just will not replay an owed input), and v0.37.0 recovers
-the owed inputs a crashed v0.36.0 runtime left behind. Commands admitted without an
-attempt id keep the released path unchanged.
+open a v0.37.0 journal (it just will not replay an owed input, so rolling back strands
+any owed input), and v0.37.0 recovers the owed inputs a crashed v0.36.0 runtime left
+behind. Commands admitted without an attempt id keep the released path unchanged.
 
 ### The gate (permission model)
 
