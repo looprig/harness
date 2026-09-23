@@ -339,8 +339,26 @@ collision, or `EnduringEffectError` once the replayed input's effect landed).
 **Only native loops take the handshake.** The `command.Admission` handshake is sent
 only to a `loop.Backend` that declares `SupportsRuntimeAdmission() bool` (the native
 loop does). Every other backend — a foreign loop above all — keeps the released
-send-then-record path and gets none of the carry-over guarantee. A backend must not
-declare the capability unless it honours the whole `command.Admission` contract.
+send-then-record path: the session hands it the input and writes `applied` only after
+the backend accepted the send. A backend must not declare the capability unless it
+honours the whole `command.Admission` contract.
+
+What a foreign loop keeps and loses, precisely:
+
+- **It keeps crash-debt replay at restore.** The restore plan does not ask which
+  backend ran: any input whose `applied` is durable and which no durable event names in
+  its `Cause.CommandID` is re-offered at the next restore — to a foreign loop as the
+  plain input, without the handshake — under its original runtime command id. For a
+  foreign loop that window runs from the `applied` record until its durable
+  `TurnStarted` or `InputCancelled` for the input (its `InputQueued` is not durable).
+  A replay the loop does not start before this runtime goes away is planned again.
+- **It loses ordering before the effect.** `applied` is written after the send, not by
+  the actor before the input can queue or start, so a crash between the send and that
+  record leaves no disposition; a successor closes the attempt `not_applied`, and the
+  recovery scan refuses that closure if the input already caused a durable event.
+- **It loses carry-over on a graceful shutdown.** Only the native actor returns queued
+  inputs as owed instead of cancelling them. A foreign loop that durably cancels its
+  queue on shutdown (`InputCancelled`) has discharged the debt, and nothing is replayed.
 
 The input's intent record is now load-bearing under an attempt: if it cannot be
 appended the command is refused before its prefix and may be re-offered.
