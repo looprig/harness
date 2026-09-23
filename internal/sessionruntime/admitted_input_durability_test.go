@@ -714,3 +714,114 @@ func TestTheCommitIsCancelledByTheCallersContext(t *testing.T) {
 		t.Fatalf("the actor's Commit was not cancelled by the caller's context")
 	}
 }
+
+// TestTheApplierCommitsUnderTheLoopsContext is the R6 survivor, the applier half of
+// F3: the Commit the applier hands the actor must run its append under the context
+// the actor passes it. A loop that is hard-killed cancels that context, and a wedged
+// append must end with it even while the Host's own context is still live —
+// otherwise a dead loop's Commit sits in storage until the caller gives up.
+func TestTheApplierCommitsUnderTheLoopsContext(t *testing.T) {
+	t.Parallel()
+	f := newRuntimeCommandFixture(t)
+	cancelled := make(chan struct{})
+	f.session.runtimeCommands = blockingDispositionLog{f.session.runtimeCommands.(dispositionLogAndRuntimeLog), cancelled}
+	raw := make(chan command.Command, 1)
+	f.session.loops[f.session.activeLoopID].backend = &admittingBackend{channelBackend{Commands: raw, Done: make(chan struct{})}}
+	adm := f.admittedInput("v1:loop-killed", mustUUID(), "hello")
+	adm.AttemptID = "attempt/loop-killed"
+
+	callerCtx, callerCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer callerCancel()
+	applied := make(chan error, 1)
+	go func() {
+		_, err := f.session.ApplyRuntimeCommand(callerCtx, adm)
+		applied <- err
+	}()
+	var input command.UserInput
+	select {
+	case cmd := <-raw:
+		var ok bool
+		if input, ok = cmd.(command.UserInput); !ok || input.Admission == nil || input.Admission.Commit == nil {
+			t.Fatalf("dispatched %T %+v, want an admitted input with a Commit", cmd, cmd)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no input was dispatched")
+	}
+
+	loopCtx, loopCancel := context.WithCancel(context.Background())
+	loopCancel() // the loop was hard-killed before it committed
+	committed := make(chan error, 1)
+	go func() { committed <- input.Admission.Commit(loopCtx) }()
+	var commitErr error
+	select {
+	case <-cancelled:
+		commitErr = <-committed
+	case <-time.After(5 * time.Second):
+		t.Fatal("Commit ignored the loop's context: the append outlived the killed loop")
+	}
+	if !errors.Is(commitErr, context.Canceled) {
+		t.Fatalf("Commit = %v, want the loop's cancellation", commitErr)
+	}
+	input.Admission.Result <- commitErr
+	select {
+	case err := <-applied:
+		if err == nil {
+			t.Fatal("ApplyRuntimeCommand succeeded although nothing was committed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ApplyRuntimeCommand did not return after the actor answered")
+	}
+}
+
+// strayDispositionLog reports every disposition append as failed after landing a
+// DIFFERENT disposition for the same command in its place — the shape a re-read after
+// an ambiguous append must not mistake for its own commit.
+type strayDispositionLog struct {
+	dispositionLogAndRuntimeLog
+	mutate func(*runtimecommand.CommandDisposition)
+}
+
+func (l strayDispositionLog) AppendCommandDisposition(ctx context.Context, d runtimecommand.CommandDisposition) (journal.AppendResult, error) {
+	stray := d
+	l.mutate(&stray)
+	if _, err := l.dispositionLogAndRuntimeLog.AppendCommandDisposition(ctx, stray); err != nil {
+		return journal.AppendResult{}, err
+	}
+	return journal.AppendResult{}, errors.New("reply lost; what landed was not this attempt's frame")
+}
+
+// TestAReReadThatFindsAnotherDispositionDoesNotCommit is the R7 survivor: after an
+// ambiguous applied append, the re-read counts only a disposition that matches THIS
+// attempt exactly. One for the same command under another attempt or another runtime
+// id is not this commit, so the input is dropped (a successor settles it) rather than
+// run on a record that does not say it was applied here.
+func TestAReReadThatFindsAnotherDispositionDoesNotCommit(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		mutate func(*runtimecommand.CommandDisposition)
+	}{
+		{name: "another attempt", mutate: func(d *runtimecommand.CommandDisposition) { d.AttemptID = "attempt/someone-else" }},
+		{name: "another runtime command id", mutate: func(d *runtimecommand.CommandDisposition) { d.RuntimeCommandID = mustUUID() }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			f := newRuntimeCommandFixture(t)
+			f.session.runtimeCommands = strayDispositionLog{f.session.runtimeCommands.(dispositionLogAndRuntimeLog), tt.mutate}
+			adm := f.admittedInput("v1:stray", mustUUID(), "hello")
+			adm.AttemptID = "attempt/mine"
+			if _, err := f.session.ApplyRuntimeCommand(context.Background(), adm); err == nil {
+				t.Fatal("ApplyRuntimeCommand succeeded on a re-read that found another attempt's disposition")
+			}
+			select {
+			case cmd := <-f.cmds:
+				t.Fatalf("the input ran (%T) on a disposition that was not this attempt's", cmd)
+			case <-time.After(100 * time.Millisecond):
+			}
+			if got := onlyDisposition(t, f); got.AttemptID == adm.AttemptID && got.RuntimeCommandID == adm.RuntimeCommandID {
+				t.Fatalf("the journal holds this attempt's disposition %+v; the stray log should have landed another", got)
+			}
+		})
+	}
+}

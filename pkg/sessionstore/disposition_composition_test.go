@@ -787,3 +787,40 @@ func TestScanCommandEffectReportsTheFirstDispositionForTheCommand(t *testing.T) 
 		t.Fatalf("scan = %+v, want %+v at %d", scan, mine, res.Sequence)
 	}
 }
+
+// TestScanCommandEffectKeepsTheFirstOfSeveralDispositionsForOneCommand is the R10
+// survivor: with two dispositions journalled for the SAME command (a second attempt's
+// frame after the first), the scan reports the first — the one the closer's
+// already-disposed answer and the store's settlement agree on — not the last.
+func TestScanCommandEffectKeepsTheFirstOfSeveralDispositionsForOneCommand(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := newHarnessWriter(t)
+	runtimeID := newTestUUID(t)
+	epoch := w.lease.Epoch()
+	first := runtimecommand.CommandDisposition{
+		CommandID: "public/command:mine", RuntimeCommandID: runtimeID, Kind: runtimecommand.KindInput,
+		LeaseEpoch: epoch, AttemptID: "attempt/first", AttemptJournalEpoch: epoch, Disposition: runtimecommand.DispositionApplied,
+	}
+	firstRes, err := w.log.AppendCommandDisposition(ctx, first)
+	if err != nil {
+		t.Fatalf("append first: %v", err)
+	}
+	second := first
+	second.AttemptID, second.Disposition = "attempt/second", runtimecommand.DispositionNotApplied
+	second.LeaseEpoch = epoch + 1 // a recovery closure is authored by a strictly later grant
+	secondRes, err := w.log.AppendCommandDisposition(ctx, second)
+	if err != nil {
+		t.Fatalf("append second: %v", err)
+	}
+	if secondRes.Sequence <= firstRes.Sequence {
+		t.Fatalf("second disposition at %d is not after the first at %d", secondRes.Sequence, firstRes.Sequence)
+	}
+	scan, err := w.log.ScanCommandEffect(ctx, "public/command:mine", runtimeID)
+	if err != nil {
+		t.Fatalf("ScanCommandEffect: %v", err)
+	}
+	if scan.DispositionSeq != firstRes.Sequence || scan.Disposition != first {
+		t.Fatalf("scan = seq %d %+v, want the FIRST disposition %+v at %d", scan.DispositionSeq, scan.Disposition, first, firstRes.Sequence)
+	}
+}
