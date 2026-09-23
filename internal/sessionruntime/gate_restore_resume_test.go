@@ -926,3 +926,160 @@ func TestResumedPermissionStepRunsTheWholeBatch(t *testing.T) {
 		t.Fatalf("sibling result = %#v, want call-0's real result", msgs[len(msgs)-2])
 	}
 }
+
+// allowAccessSource allows every kind/scope, as a policy relaxed between two
+// runtimes (or a workspace rule written meanwhile) would.
+type allowAccessSource struct{}
+
+func (allowAccessSource) AccessVersion() uint16                   { return gatedomain.CurrentAccessVersion }
+func (allowAccessSource) AccessFor(string, string) (uint8, error) { return gatedomain.AccessAllow, nil }
+
+// TestUnadoptedRestoredGateIsClosedBeforeTheBatchRuns is the review's F1
+// regression: when the successor decides the gated call WITHOUT asking (here its
+// policy now allows it), the restored gate is never adopted. It must be durably
+// closed before any call of the batch executes; otherwise a second failover during
+// execution finds it open, resumes the step again and runs every call twice.
+func TestUnadoptedRestoredGateIsClosedBeforeTheBatchRuns(t *testing.T) {
+	t.Parallel()
+	store := newRestoreStore(t)
+	sessionID, parked := parkAndAbandon(t, store,
+		echoGatedDefinition(t, &echoThenGatedLLM{}, &echoTool{}, &gatedE2ETool{seq: &atomic.Int64{}}), gatedomain.KindPermission)
+
+	successorEcho := &echoTool{}
+	blocking := &blockingGatedTool{gatedE2ETool: gatedE2ETool{seq: &atomic.Int64{}}, entered: make(chan struct{})}
+	evaluator, err := gatedomain.NewInteractiveEvaluator(
+		[]gatedomain.AccessBinding{{Kind: "tool.invoke", Source: allowAccessSource{}}},
+		nil, loop.GateApprover(), &orderedRuleWriter{seq: &atomic.Int64{}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	def := mustDefine(
+		loop.WithName("agent"),
+		loop.WithInference(&echoThenGatedLLM{resumeScriptLLM: resumeScriptLLM{continueOnly: true}}, validModel("base")),
+		loop.WithSystem("base"),
+		loop.WithTools(
+			tool.NewDefinition("Echo", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+				return []tool.InvokableTool{successorEcho}, nil
+			}),
+			tool.NewDefinition("Gated", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+				return []tool.InvokableTool{blocking}, nil
+			}),
+		),
+		loop.WithAccessGate(evaluator),
+		loop.WithPolicyRevision("gate-resume"),
+		loop.WithDrainTimeout(200*time.Millisecond),
+	)
+	lifecycle, err := newTestLifecycle(def, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor, err := lifecycle.RestoreSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blocking.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the allowed call never ran on the successor")
+	}
+	if gates := successor.ListGates(context.Background()); len(gates) != 0 {
+		t.Fatalf("the unadopted restored gate is still open while the batch executes: %+v", gates)
+	}
+	if err := successor.AbandonResidency(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var closed bool
+	for _, ev := range replayAllSessionEvents(t, store, sessionID) {
+		if resolved, ok := ev.(event.GateResolved); ok && resolved.GateID == parked.ID && resolved.Reason == gatedomain.CloseAbandoned {
+			closed = true
+		}
+	}
+	if !closed {
+		t.Fatal("the unadopted restored gate was not durably closed before execution")
+	}
+
+	thirdEcho := &echoTool{}
+	thirdGated := &gatedE2ETool{seq: &atomic.Int64{}}
+	third := restoreParked(t, store, echoGatedDefinition(t, &echoThenGatedLLM{resumeScriptLLM: resumeScriptLLM{continueOnly: true}}, thirdEcho, thirdGated), sessionID)
+	if gates := third.ListGates(context.Background()); len(gates) != 0 {
+		t.Fatalf("the third runtime reopened the step's gate: %+v", gates)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := third.WaitIdle(ctx); err != nil {
+		t.Fatalf("WaitIdle: %v", err)
+	}
+	if n := thirdEcho.runs.Load(); n != 0 {
+		t.Fatalf("the sibling ran again on the third runtime (%d runs)", n)
+	}
+	if runs, _ := thirdGated.snapshot(); runs != 0 {
+		t.Fatalf("the gated call ran again on the third runtime (%d runs)", runs)
+	}
+	if n := countEvents[event.TurnInterrupted](replayAllSessionEvents(t, store, sessionID)); n != 1 {
+		t.Fatalf("durable TurnInterrupted = %d, want 1", n)
+	}
+}
+
+// questionTool is replay-safe but asks whatever question it is configured with,
+// as a tool whose question depends on state outside its arguments would.
+type questionTool struct {
+	askTool
+	question string
+}
+
+func (q *questionTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
+	q.runs.Add(1)
+	answer, err := loop.RequestUserInput(ctx, q.question, nil)
+	if err != nil {
+		return nil, err
+	}
+	q.answers <- answer
+	return tool.TextResult("the user said " + answer), nil
+}
+
+// TestRestoredAskUserGateIsNotReusedForADifferentQuestion (review F2): an answer
+// is bound to the question its gate showed. A replayed call that asks something
+// else gets a fresh gate; the stale one is closed and its answer reaches nobody.
+func TestRestoredAskUserGateIsNotReusedForADifferentQuestion(t *testing.T) {
+	t.Parallel()
+	store := newRestoreStore(t)
+	sessionID, parked := parkAndAbandon(t, store,
+		askDefinition(&resumeScriptLLM{toolName: "Ask"}, newAskTool(true)), gatedomain.KindAskUser)
+
+	changed := &questionTool{askTool: askTool{replaySafe: true, answers: make(chan string, 4)}, question: "Which size?"}
+	evaluator, err := gatedomain.NewInteractiveEvaluator(
+		[]gatedomain.AccessBinding{{Kind: "tool.invoke", Source: gatedAccessSource{}}},
+		nil, loop.GateApprover(), &orderedRuleWriter{seq: &atomic.Int64{}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	def := mustDefine(
+		loop.WithName("agent"),
+		loop.WithInference(&resumeScriptLLM{toolName: "Ask", continueOnly: true}, validModel("base")),
+		loop.WithSystem("base"),
+		loop.WithTools(tool.NewDefinition("Ask", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+			return []tool.InvokableTool{changed}, nil
+		})),
+		loop.WithAccessGate(evaluator),
+		loop.WithPolicyRevision("gate-resume"),
+		loop.WithDrainTimeout(200*time.Millisecond),
+	)
+	restored := restoreParked(t, store, def, sessionID)
+	deadline := time.Now().Add(10 * time.Second)
+	var fresh []gatedomain.Gate
+	for time.Now().Before(deadline) {
+		fresh = restored.ListGates(context.Background())
+		if len(fresh) == 1 && fresh[0].ID != parked.ID {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(fresh) != 1 || fresh[0].ID == parked.ID || fresh[0].Prompt.Body != "Which size?" {
+		t.Fatalf("gates = %+v, want the stale gate replaced by one asking the new question", fresh)
+	}
+	select {
+	case got := <-changed.answers:
+		t.Fatalf("the replayed call received %q without its own question being answered", got)
+	default:
+	}
+}

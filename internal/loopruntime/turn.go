@@ -570,6 +570,8 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// Every gate this batch opens records the step it parks, so a restored
 		// session can resume the step instead of interrupting the turn.
 		batchCtx = withStepResume(batchCtx, stepResumeBase{index: st.index, message: aiMsg})
+		gateFault := &batchGateFault{}
+		batchCtx = withBatchGateFault(batchCtx, gateFault)
 		batchRuntime := BatchRuntime{
 			GateRegistrations: cfg.gateReg,
 			IDGen:             cfg.idGen,
@@ -601,6 +603,14 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			releaseCaptures(results)
 			finishStepWith(stepCtx.Err())
 			return event.TurnInterrupted{TurnIndex: ts.index}
+		}
+		if closeErr := gateFault.failure(); closeErr != nil {
+			// A gate this batch had to close is still durably open, so the batch
+			// executed nothing; the turn fails rather than commit a step a
+			// restored session could resume and run a second time.
+			releaseCaptures(results)
+			finishStepWith(closeErr)
+			return event.TurnFailed{TurnIndex: ts.index, Err: closeErr}
 		}
 		// reviewCapture.failed() never triggers capture itself — it only
 		// reports whether THIS batch's RunBatch call actually attempted it (a

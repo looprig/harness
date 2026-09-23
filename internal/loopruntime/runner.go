@@ -289,6 +289,19 @@ func RunBatch(
 			// Any other non-ctx error is fail-closed: resolveAccess has
 			// already marked r.failed (denied), so the call is never executed.
 		}
+		if gateCloseFailed(ctx) {
+			// A gate this batch had to close is still durably open. Nothing
+			// may execute while it is: a restored session would find it open,
+			// resume this step and run the batch a second time.
+			return collectResults(rs)
+		}
+	}
+
+	// A restored gate the successor's access pass did not adopt (the call was
+	// decided without asking, or failed before asking) is closed NOW, before
+	// anything executes, for the same reason. A close that fails aborts the batch.
+	if !closeUnadoptedGates(ctx, rs, runtime.GateRegistrations) {
+		return collectResults(rs)
 	}
 
 	// Emit ALL ToolCallStarted for the batch BEFORE executing any call — every
@@ -727,7 +740,7 @@ func approvalRequesterFor(
 			// show: close the stale gate and ask afresh below, so an answer is never
 			// applied to a request it did not see.
 			if err := abandonInstalledGate(ctx, ctx, gateReg, restored.id); err != nil {
-				return "", err
+				return "", recordGateCloseFailure(ctx, restored.id, err)
 			}
 		}
 		// Reaching the interactive approval callback means the evaluator found
@@ -828,6 +841,7 @@ func awaitApproval(
 		waitErr := waitCtx.Err()
 		if ctx.Err() == nil {
 			if err := abandonInstalledGate(ctx, waitCtx, gateReg, gateID); err != nil {
+				err = recordGateCloseFailure(ctx, gateID, err)
 				finishGateWait(finishWait, waitCall, nil, err)
 				return "", err
 			}

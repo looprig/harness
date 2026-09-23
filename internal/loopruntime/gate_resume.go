@@ -48,6 +48,10 @@ type ParkedGate struct {
 	// asks for exactly this; otherwise the stale gate is closed and a fresh one is
 	// opened, so an answer is never applied to a request it did not see.
 	PermissionRequest *tool.Request
+	// AskUser is the question and choices the restored user-input gate shows. The
+	// re-run call adopts the gate only if it asks exactly this; otherwise the stale
+	// gate is closed and the call asks afresh.
+	AskUser *gatedomain.AskUserPayload
 }
 
 // ParkedStep is the in-flight tool step of a restored loop's open turn. A loop
@@ -130,6 +134,7 @@ type adoptableGate struct {
 	kind    gateKind
 	reply   <-chan command.Command
 	request *tool.Request
+	ask     *gatedomain.AskUserPayload
 }
 
 func gateKindFor(kind gatedomain.Kind) gateKind {
@@ -145,7 +150,7 @@ func newParkedTurn(step ParkedStep, pending map[gatedomain.ID]pendingGate) *park
 		reply := make(chan command.Command, 1)
 		kind := gateKindFor(g.Kind)
 		pending[g.GateID] = pendingGate{reply: reply, kind: kind}
-		adoption.gates[g.ToolExecutionID] = adoptableGate{id: g.GateID, kind: kind, reply: reply, request: g.PermissionRequest}
+		adoption.gates[g.ToolExecutionID] = adoptableGate{id: g.GateID, kind: kind, reply: reply, request: g.PermissionRequest, ask: g.AskUser}
 	}
 	return &parkedTurn{step: step, adoption: adoption}
 }
@@ -169,6 +174,20 @@ func (a *gateAdoption) take(callID uuid.UUID, kind gateKind) (adoptableGate, boo
 // the restored gate shows.
 func (g adoptableGate) matchesPermission(displayed tool.Request) bool {
 	return g.request != nil && reflect.DeepEqual(g.request.Clone(), displayed.Clone())
+}
+
+// matchesQuestion reports whether a re-asked question is the one the restored
+// user-input gate shows.
+func (g adoptableGate) matchesQuestion(question string, choices []string) bool {
+	if g.ask == nil || g.ask.Question != question || len(g.ask.Choices) != len(choices) {
+		return false
+	}
+	for i := range choices {
+		if g.ask.Choices[i] != choices[i] {
+			return false
+		}
+	}
+	return true
 }
 
 type gateAdoptionKey struct{}
@@ -331,4 +350,107 @@ func committedToolSteps(msgs content.AgenticMessages) int {
 		}
 	}
 	return steps
+}
+
+// GateCloseError reports a permission gate the batch had to close durably and
+// could not. The batch executes nothing and the turn fails: a gate left open in
+// the journal is one a restored session would resume, re-running the batch.
+type GateCloseError struct {
+	GateID gatedomain.ID
+	Cause  error
+}
+
+func (e *GateCloseError) Error() string {
+	return "loop: could not durably close gate " + e.GateID.String()
+}
+
+func (e *GateCloseError) Unwrap() error { return e.Cause }
+
+// batchGateFault records the first GateCloseError of one batch. runTurn installs
+// one per batch and reads it after RunBatch.
+type batchGateFault struct {
+	mu  sync.Mutex
+	err *GateCloseError
+}
+
+type batchGateFaultKey struct{}
+
+func withBatchGateFault(ctx context.Context, fault *batchGateFault) context.Context {
+	return context.WithValue(ctx, batchGateFaultKey{}, fault)
+}
+
+func batchGateFaultFrom(ctx context.Context) *batchGateFault {
+	fault, _ := ctx.Value(batchGateFaultKey{}).(*batchGateFault)
+	return fault
+}
+
+// recordGateCloseFailure records a failed durable close on ctx's batch and
+// returns the typed error.
+func recordGateCloseFailure(ctx context.Context, id gatedomain.ID, cause error) error {
+	closeErr := &GateCloseError{GateID: id, Cause: cause}
+	if fault := batchGateFaultFrom(ctx); fault != nil {
+		fault.mu.Lock()
+		if fault.err == nil {
+			fault.err = closeErr
+		}
+		fault.mu.Unlock()
+	}
+	return closeErr
+}
+
+func (f *batchGateFault) failure() error {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err == nil {
+		return nil
+	}
+	return f.err
+}
+
+func gateCloseFailed(ctx context.Context) bool {
+	return batchGateFaultFrom(ctx).failure() != nil
+}
+
+// closeUnadoptedGates durably closes, after the batch's access pass and before
+// any execution, every restored gate the pass left unadopted that no call of this
+// batch can still reach: every permission gate (a permission gate is only ever
+// answered during the access pass), and a user-input gate whose call will not run.
+// It reports false, having recorded the failure, if a close fails.
+func closeUnadoptedGates(ctx context.Context, rs []*resolved, gateReg chan<- gateRegistration) bool {
+	adoption := gateAdoptionFromContext(ctx)
+	if adoption == nil {
+		return !gateCloseFailed(ctx)
+	}
+	runnable := make(map[uuid.UUID]bool, len(rs))
+	for _, r := range rs {
+		if r != nil && !r.failed {
+			runnable[r.callID] = true
+		}
+	}
+	for _, g := range adoption.release(func(callID uuid.UUID, g adoptableGate) bool {
+		return g.kind == gatePermission || !runnable[callID]
+	}) {
+		if err := abandonInstalledGate(ctx, ctx, gateReg, g.id); err != nil {
+			_ = recordGateCloseFailure(ctx, g.id, err)
+			return false
+		}
+	}
+	return !gateCloseFailed(ctx)
+}
+
+// release removes and returns every still-held gate for which match is true.
+func (a *gateAdoption) release(match func(uuid.UUID, adoptableGate) bool) []adoptableGate {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []adoptableGate
+	for callID, g := range a.gates {
+		if match(callID, g) {
+			out = append(out, g)
+			delete(a.gates, callID)
+		}
+	}
+	return out
 }

@@ -301,9 +301,17 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 	// session kept open: adopt it rather than asking again. Its opening events are
 	// already durable, so nothing is registered or emitted.
 	if restored, ok := gateAdoptionFromContext(ctx).take(callID, gateUserInput); ok {
-		g := stampGateSubjectProvenance(ctx, askUserGate(callID, question, choices))
-		g.ID = restored.id
-		return awaitUserInput(ctx, callID, gateReg, g, restored.reply)
+		if restored.matchesQuestion(question, choices) {
+			g := stampGateSubjectProvenance(ctx, askUserGate(callID, question, choices))
+			g.ID = restored.id
+			return awaitUserInput(ctx, callID, gateReg, g, restored.reply)
+		}
+		// The replayed call asks something the restored gate does not show: close
+		// the stale gate and ask afresh, so an answer never reaches a question it
+		// did not see.
+		if err := abandonInstalledGate(ctx, ctx, gateReg, restored.id); err != nil {
+			return "", recordGateCloseFailure(ctx, restored.id, err)
+		}
 	}
 
 	// reply is buffered(1) so the actor's routed send never blocks (runner is the

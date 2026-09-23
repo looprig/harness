@@ -274,6 +274,13 @@ func planParkedStep(plan restoredGatePlan, loopID uuid.UUID, native bool, folded
 			request := payload.Request.Clone()
 			parkedGate.PermissionRequest = &request
 		}
+		if entry.gate.Kind == gate.KindAskUser {
+			ask, ok := askUserPayloadFromGatePayload(entry.payload)
+			if !ok {
+				return nil
+			}
+			parkedGate.AskUser = &ask
+		}
 		step.Gates = append(step.Gates, parkedGate)
 	}
 	if step == nil {
@@ -330,4 +337,20 @@ func (s *Session) startParkedTurn(ctx context.Context, loopID uuid.UUID) error {
 		return nil
 	}
 	return starter.StartParkedTurn(ctx)
+}
+
+// askUserPayloadFromGatePayload narrows a restored gate's private payload to the
+// question and choices an ask_user gate shows.
+func askUserPayloadFromGatePayload(payload gate.Payload) (gate.AskUserPayload, bool) {
+	switch v := payload.(type) {
+	case gate.AskUserPayload:
+		return gate.AskUserPayload{Question: v.Question, Choices: append([]string(nil), v.Choices...)}, true
+	case *gate.AskUserPayload:
+		if v == nil {
+			return gate.AskUserPayload{}, false
+		}
+		return gate.AskUserPayload{Question: v.Question, Choices: append([]string(nil), v.Choices...)}, true
+	default:
+		return gate.AskUserPayload{}, false
+	}
 }
