@@ -20,6 +20,10 @@ import (
 // originate from a model.Model that already passed model.Validate() at the
 // point a live change accepted it, so re-validating them here would be
 // redundant, not additional safety.
+//
+// BaseURL is Host configuration, not presentation: it is kept in the native
+// (replay) encoding restore reads, and pkg/sessionwire omits it from every public
+// body, because an endpoint can name internal topology or embed a credential.
 type ModelRuntime struct {
 	Key       model.ModelKey      `json:"key"`
 	Limits    model.ContextLimits `json:"limits"`

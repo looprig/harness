@@ -217,17 +217,13 @@ func projectBody(ev event.Event, class EventClass) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := ev.(event.GateResolved); !ok {
-		return json.RawMessage(encoded), nil
-	}
-	// GateResolved's runtime audit may contain raw form answers. The public
-	// record retains the gate/action/source correlation but never the audit.
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(encoded, &fields); err != nil {
+	// The public body is the native encoding minus the per-type redactions in
+	// privacy.go (GateResolved's audit, the model endpoint, the Host workspace path).
+	redacted, err := redactPublicBody(ev, encoded)
+	if err != nil {
 		return nil, err
 	}
-	delete(fields, "audit")
-	return json.Marshal(fields)
+	return json.RawMessage(redacted), nil
 }
 
 func projectEphemeral(ev event.Event) (json.RawMessage, error) {

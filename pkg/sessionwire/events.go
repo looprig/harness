@@ -19,8 +19,9 @@ const (
 //
 // RECORDED POLICY, not a defect report: TurnFoldedInto and InputCancelled each
 // carry a *content.UserMessage, and a PublicEnduring body is the event's full
-// marshalled form with GateResolved's audit as the ONLY redaction (see
-// projectBody). So raw user message text from those two events reaches the public
+// marshalled form minus the configuration redactions in privacy.go
+// (GateResolved's audit, the model endpoint, the Host workspace path), none of
+// which touches message content. So raw user message text from those two events reaches the public
 // journal verbatim. That is measured behaviour, stated here because the next person
 // deciding what a public journal may contain should find it written down rather
 // than discover it. Changing it is a decision for whoever owns the projection
