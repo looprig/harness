@@ -103,10 +103,9 @@ func (f *runtimeCommandFixture) admittedInterrupt(id runtimecommand.CommandID, r
 // per-kind table: sendUserInput returned nil, so the loop is live and took the
 // command, and the runtime durably records that it accepted it.
 //
-// The narrowness is the contract. This record does NOT say a turn started, does NOT
-// say a later TurnRejected cannot follow, and does NOT say the queued input survives
-// a crash — the loop mailbox is in memory. Nothing here may be widened into any of
-// those, which is why this test asserts only the record's content.
+// This record does NOT say a turn started, and this test asserts only the record's
+// content. That the applied input survives a crash or shutdown before its turn is
+// durable (restore replays it) is pinned in admitted_input_durability_test.go.
 func TestAppliedDispositionIsWrittenAfterASucceedingInput(t *testing.T) {
 	t.Parallel()
 	f := newRuntimeCommandFixture(t)

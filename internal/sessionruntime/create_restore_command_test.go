@@ -227,7 +227,7 @@ func TestACreateForAnExitedLoopIsRefusedBeforeThePrefix(t *testing.T) {
 		t.Fatalf("the journal holds %d dispositions, want none: %+v", len(got), got)
 	}
 	// The proof that nothing was written: a later delivery is a FIRST delivery.
-	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: f.cmds, Done: make(chan struct{})}
+	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: admittingSink(t, f.cmds), Done: make(chan struct{})}
 	again, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
 	if err != nil {
 		t.Fatalf("re-delivery after a pre-prefix refusal: %v", err)

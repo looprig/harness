@@ -690,6 +690,9 @@ func restoreTopologySession(
 	if err != nil {
 		return abortAccepted(s, &RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
+	// Host-admitted inputs settled `applied` whose effect never became durable: the
+	// runtime owes them, and only restore can pay (see planAppliedAdmittedInputs).
+	admittedInputs := planAppliedAdmittedInputs(allRecords)
 	if resources != nil {
 		// Attach the checked process-service delegates BEFORE Activate: a process
 		// resource's own Activate may need to durably publish a lifecycle record
@@ -729,6 +732,7 @@ func restoreTopologySession(
 	s.watchRootLease()
 	s.startOffloadGC()
 	manager.reconcileRestoredBackgroundRequests(s, backgroundPlan)
+	s.replayAppliedAdmittedInputs(s.sessionCtx, admittedInputs)
 	contextTransferred = true
 	return s, nil
 }

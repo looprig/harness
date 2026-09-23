@@ -71,6 +71,13 @@ const (
 	// DispositionApplied is the narrow statement in this file's header doc: under
 	// the attempt's grant, the runtime durably recorded that it accepted the command
 	// into its execution path.
+	//
+	// For an INPUT (and a create's first message) it is also a durable DEBT, as of
+	// v0.37.0: the record is written by the loop actor after it takes the input and
+	// before the input can cause any effect, and a runtime that dies or shuts down
+	// before the input's turn is durable leaves it to restore, which re-offers every
+	// applied input with no caused event. It still does not say a turn started, and
+	// a later turn failure or retraction may still resolve the input visibly.
 	DispositionApplied DispositionKind = "applied"
 	// DispositionNoOp is an explicit SUCCESSFUL application with no effect — an
 	// interrupt of an idle session. It settles applied. Reject-before-dispatch and

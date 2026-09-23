@@ -570,6 +570,16 @@ const (
 // Phase 10 unified the former drain-handback type `foldedMsg` into this one: the
 // two were field-identical and the drain converted between them with a struct
 // cast, so the second type and its `fold()` projection were dead weight (YAGNI).
+// ConflictingAdmissionError reports a UserInput carrying both the managed-delegate
+// Accepted handshake and a runtime-command Admission. The two are exclusive: each
+// names a different durable acceptance record, and a command carrying both would
+// have two. The loop declines it through the Admission.
+type ConflictingAdmissionError struct{}
+
+func (*ConflictingAdmissionError) Error() string {
+	return "loopruntime: a UserInput carries both Accepted and Admission"
+}
+
 type queuedInput struct {
 	inputID     uuid.UUID
 	triggeredBy uuid.UUID
@@ -587,6 +597,14 @@ type queuedInput struct {
 	noFold               bool
 	reservedTurnID       uuid.UUID
 	rejectOnStartFailure bool
+	// carryOver marks a Host-admitted input whose acceptance is already DURABLE
+	// (command.Admission committed before it was queued). When the loop goes away
+	// — shutdown, or a cancelled loop context — it is not returned as
+	// InputCancelled: that would durably contradict the command's `applied`
+	// settlement, and a restored successor replays it instead. Every other
+	// resolution (start, fold, interrupt retention, retraction, a failed turn)
+	// treats it exactly like any queued input.
+	carryOver bool
 }
 
 type loopState struct {
@@ -1857,6 +1875,60 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 	}
 
+	// admitRuntimeInput is the synchronous admission of a Host-admitted input (see
+	// command.Admission). Every refusal is decided BEFORE Commit and publishes
+	// nothing: the applier's durable refused disposition is the command's answer, and
+	// a TurnRejected caused by the command would also read as a committed effect to a
+	// successor's recovery scan. Once Commit returns nil the acceptance is durable and
+	// queueing or starting is infallible and ordered after it, so no effect can be
+	// durable before the acceptance.
+	admitRuntimeInput := func(c command.UserInput, qi queuedInput) {
+		admission := c.Admission
+		reply := func(err error) {
+			select {
+			case admission.Result <- err:
+			default:
+				slog.Error("runtime-command admission reply dropped: Result is unbuffered or already answered",
+					"command_id", qi.inputID)
+			}
+		}
+		if c.Accepted != nil {
+			reply(&loop.InputRejectedError{Reason: event.RejectInternal, Cause: &ConflictingAdmissionError{}})
+			return
+		}
+		if probe, ok := cfg.events.(admissionFaultProbe); ok {
+			if err := probe.AdmissionFaultErr(); err != nil {
+				reply(&loop.InputRejectedError{Reason: event.RejectInternal, Cause: err})
+				return
+			}
+		}
+		switch {
+		case state.status == loopShuttingDown:
+			reply(&loop.InputRejectedError{Reason: event.RejectShuttingDown})
+			return
+		case len(state.inbox) >= loop.ManagedInputQueueCapacity:
+			reply(&loop.InputRejectedError{Reason: event.RejectQueueFull})
+			return
+		}
+		if admission.Commit != nil {
+			if err := admission.Commit(); err != nil {
+				reply(err)
+				return
+			}
+		}
+		qi.carryOver = true
+		switch {
+		case state.status == loopRunning || state.status == loopWaitingAdmission || compactions.blocksInput():
+			state.inbox = append(state.inbox, qi)
+			publish(event.InputQueued{Header: event.Header{Cause: identity.Cause{CommandID: qi.inputID}}})
+		default:
+			qi.rejectOnStartFailure = true
+			state.inbox = append(state.inbox, qi)
+			requestStartAdmission()
+		}
+		reply(nil)
+	}
+
 	// returnQueuedInbox returns every still-unresolved queued entry via returnEntry
 	// after an abnormal terminal (TurnFailed/TurnInterrupted). It covers BOTH the inbox
 	// (entries never drained) AND the draining buffer (entries popped for a fold whose
@@ -1867,13 +1939,27 @@ func runLoop(cfg loopConfig, state loopState) {
 	// that ended (the cause of the return). The draining entries are returned BEFORE
 	// the inbox entries, preserving their original receive order (drained entries were
 	// queued earliest).
+	//
+	// A carry-over entry (a Host-admitted input whose acceptance is durable) is NOT
+	// returned when the loop itself is going away — shutdown or a cancelled loop
+	// context. Its command is already settled `applied`, so an InputCancelled would be
+	// a durable contradiction, and restore replays it on the successor. That is the one
+	// exception to the inbox-exit invariant, and it is sound only because the durable
+	// acceptance, not this in-memory inbox, is the entry's owner.
 	returnQueuedInbox := func(reason event.CancelReason, endedTurnID uuid.UUID) {
-		for _, qi := range state.draining {
+		exiting := state.status == loopShuttingDown || ctx.Err() != nil
+		resolve := func(qi queuedInput) {
+			if exiting && qi.carryOver {
+				return
+			}
 			returnEntry(qi, reason, endedTurnID)
+		}
+		for _, qi := range state.draining {
+			resolve(qi)
 		}
 		state.draining = nil
 		for _, qi := range state.inbox {
-			returnEntry(qi, reason, endedTurnID)
+			resolve(qi)
 		}
 		state.inbox = nil
 	}
@@ -2433,6 +2519,10 @@ func runLoop(cfg loopConfig, state loopState) {
 			// (TurnStarted / InputQueued / TurnRejected) onto the session fan-in. A
 			// UserInput may be rejected, so bypassReject is false.
 			qi := queuedInput{inputID: c.CommandHeader().CommandID, agency: c.CommandHeader().Agency, msg: userMessageFromBlocks(c.Blocks), noFold: c.NoFold}
+			if c.Admission != nil {
+				admitRuntimeInput(c, qi)
+				return false
+			}
 			if c.Accepted != nil {
 				admitDelegate(c, qi)
 				return false

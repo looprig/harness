@@ -119,13 +119,55 @@ func newRuntimeCommandFixtureForSession(t *testing.T, store *sessionstore.Store,
 		sessionID:     sid,
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
-		loops:         map[uuid.UUID]*loopHandle{rootLoopID: {backend: &channelBackend{Commands: cmds, Done: done}}},
+		loops:         map[uuid.UUID]*loopHandle{rootLoopID: {backend: &channelBackend{Commands: admittingSink(t, cmds), Done: done}}},
 		activeLoopID:  rootLoopID,
 		newID:         uuid.New,
 	}
 	WithRuntimeCommands(log, lease)(s)
 	t.Cleanup(sessionCancel)
 	return &runtimeCommandFixture{session: s, cmds: cmds, done: done, store: store, lease: lease, journal: j, sid: sid}
+}
+
+// admittingSink stands in for the loop actor's half of command.Admission: it takes
+// every admitted input — calling Commit first, then answering — and forwards every
+// command to out, so a test still observes exactly what the session dispatched. A
+// Commit error declines the input, as the actor does, and nothing is forwarded.
+func admittingSink(t *testing.T, out chan command.Command) chan command.Command {
+	t.Helper()
+	in := make(chan command.Command)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case cmd := <-in:
+				if input, ok := cmd.(command.UserInput); ok && input.Admission != nil {
+					var err error
+					if input.Admission.Commit != nil {
+						err = input.Admission.Commit()
+					}
+					input.Admission.Result <- err
+					if err != nil {
+						continue
+					}
+				}
+				select {
+				case out <- cmd:
+				case <-stop:
+					return
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		close(stop)
+		wg.Wait()
+	})
+	return in
 }
 
 func (f *runtimeCommandFixture) admittedInput(id runtimecommand.CommandID, runtimeID uuid.UUID, text string) runtimecommand.Admitted {
@@ -878,7 +920,7 @@ func TestAnAlreadyExitedLoopIsRefusedBeforeThePrefixIsWritten(t *testing.T) {
 	// The proof that nothing was written: a later delivery is a FIRST delivery, not a
 	// duplicate. Asserting only the error would pass against an implementation that
 	// wrote the prefix and stranded the command.
-	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: f.cmds, Done: make(chan struct{})}
+	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: admittingSink(t, f.cmds), Done: make(chan struct{})}
 	again, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
 	if err != nil {
 		t.Fatalf("re-delivery after a pre-prefix refusal: %v", err)
@@ -948,7 +990,7 @@ func TestEffectFailureAfterTheDurablePrefixStrandsTheCommand(t *testing.T) {
 	// assertion below would prove nothing about deduplication.
 	live := make(chan command.Command, 4)
 	f.cmds = live
-	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: live, Done: make(chan struct{})}
+	f.session.loops[f.session.activeLoopID].backend = &channelBackend{Commands: admittingSink(t, live), Done: make(chan struct{})}
 	disp, err := f.session.ApplyRuntimeCommand(context.Background(), adm)
 	if err != nil {
 		t.Fatalf("redelivery after a failed effect: %v", err)

@@ -331,13 +331,15 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 	// report: an append takes exactly one record, so no effect is ever inside the
 	// disposition's frame.
 	//
-	//   input,         sendUserInput returned nil                -> applied
+	//   input,         the loop took it and committed `applied`   -> applied
+	//                  BEFORE queueing it (applyAdmittedInput)
+	//   input,         the loop declined it before the commit     -> refused
 	//   interrupt,     fan-out completed, any == true            -> applied
 	//   interrupt,     fan-out completed, any == false           -> no_op   (a SUCCESS)
 	//   gate_response, the answer's GateResolved is durable      -> applied
 	//   gate_response, no such gate / gate not open              -> no_op   (a SUCCESS)
 	//   gate_response, any other refusal (action, source, append) -> refused
-	//   create,        the first message was sent                -> applied
+	//   create,        the first message was taken, as an input  -> applied
 	//   create,        it carried no first message               -> applied
 	//   restore,       nothing to send                           -> applied
 	//   input/create/interrupt, the effect failed after the prefix -> refused
@@ -357,10 +359,7 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 	// strictly later grant, and a healthy Host never turns its lease over.
 	switch admitted.Kind {
 	case runtimecommand.KindInput:
-		if _, err := s.sendUserInput(ctx, pending.backend, pending.cmd); err != nil {
-			return disposition, errors.Join(err, s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionRefused))
-		}
-		if err := s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionApplied); err != nil {
+		if err := s.applyAdmittedInput(ctx, dispositions, admitted, pending); err != nil {
 			return disposition, err
 		}
 	case runtimecommand.KindCreate:
@@ -371,9 +370,10 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 		// effect. A create with no first message applies nothing and still settles
 		// applied — see the table above for why that is not a no_op.
 		if pending != nil {
-			if _, err := s.sendUserInput(ctx, pending.backend, pending.cmd); err != nil {
-				return disposition, errors.Join(err, s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionRefused))
+			if err := s.applyAdmittedInput(ctx, dispositions, admitted, pending); err != nil {
+				return disposition, err
 			}
+			break
 		}
 		if err := s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionApplied); err != nil {
 			return disposition, err
@@ -421,6 +421,81 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 		return disposition, &runtimecommand.ValidationError{Field: "Kind", Reason: "no runtime dispatch path"}
 	}
 	return disposition, nil
+}
+
+// applyAdmittedInput hands an admitted input (an input, or a create's first
+// message) to its loop and records its disposition.
+//
+// UNDER A DISPOSITION ATTEMPT THE `applied` RECORD IS WRITTEN BY THE LOOP ACTOR, not
+// after the send. The input carries a command.Admission whose Commit appends the
+// applied disposition; the actor decides on its own live state, calls Commit, and
+// only then queues or starts the input. That ordering is what the disposition means:
+//
+//   - `applied` is durable strictly BEFORE any effect the input can cause, so a
+//     successor's recovery scan never finds an effect with no disposition behind it
+//     for this kind, and never has to refuse a closure over one;
+//   - an input `applied` names is one the runtime durably OWES: if the runtime dies
+//     before the input's turn is durable, restore replays it (see
+//     replayAppliedAdmittedInputs), and a loop going away carries it over rather than
+//     cancelling it. v0.36.0 wrote `applied` after handing the input to an in-memory
+//     inbox and lost it on exactly that crash.
+//
+// A loop that declines before Commit (shutting down, queue full, an admission fault)
+// leaves no effect, so the command is refused under the live grant. A Commit that
+// fails leaves no effect either, and nothing else is written: the append may have
+// landed ambiguously, and a successor settles it from what is durable — a landed
+// `applied` is replayed, and an absent one is closed not_applied.
+//
+// A legacy admitted record (no attempt id) keeps its released path exactly: it has
+// no disposition to order and nothing to replay from, so it is sent and left.
+func (s *Session) applyAdmittedInput(
+	ctx context.Context,
+	dispositions dispositionLog,
+	admitted runtimecommand.Admitted,
+	pending *pendingInput,
+) error {
+	if admitted.AttemptID == "" || dispositions == nil {
+		_, err := s.sendUserInput(ctx, pending.backend, pending.cmd)
+		return err
+	}
+	var commitErr error
+	var committed bool
+	result := make(chan error, 1)
+	cmd := pending.cmd
+	cmd.Admission = &command.Admission{
+		Commit: func() error {
+			committed = true
+			commitErr = s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionApplied)
+			return commitErr
+		},
+		Result: result,
+	}
+	if _, err := s.sendUserInput(ctx, pending.backend, cmd); err != nil {
+		return errors.Join(err, s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionRefused))
+	}
+	// The actor answers in the same step that received the command, so once the send
+	// succeeded the answer is already on its way. The loop's exit is watched only
+	// against a defect; the caller's ctx is deliberately NOT, because abandoning the
+	// wait would report a failure for an input the actor may have just made durable.
+	var answer error
+	select {
+	case answer = <-result:
+	case <-pending.backend.DoneChan():
+		select {
+		case answer = <-result:
+		default:
+			return &SessionError{Kind: SessionLoopExited}
+		}
+	}
+	switch {
+	case answer == nil:
+		return nil
+	case committed:
+		// Commit ran and failed: the actor dropped the input. See the doc above.
+		return commitErr
+	default:
+		return errors.Join(answer, s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionRefused))
+	}
 }
 
 // gateResponseDisposition maps the gate path's answer onto the disposition
@@ -628,6 +703,54 @@ func (s *Session) prepareAdmittedInput(ctx context.Context, admitted runtimecomm
 		return nil, &SessionError{Kind: SessionLoopExited}
 	default:
 	}
-	cmd := s.buildAndAuditUserInput(ctx, active, admitted.Blocks, identity.AgencyUser, false, admitted.RuntimeCommandID)
+	if admitted.AttemptID == "" {
+		cmd := s.buildAndAuditUserInput(ctx, active, admitted.Blocks, identity.AgencyUser, false, admitted.RuntimeCommandID)
+		return &pendingInput{backend: l, cmd: cmd}, nil
+	}
+	cmd := command.UserInput{
+		Header: command.Header{CommandID: admitted.RuntimeCommandID, Agency: identity.AgencyUser, CreatedAt: s.stampNow()},
+		Blocks: admitted.Blocks,
+	}
+	if err := s.appendAdmittedIntent(ctx, active, cmd); err != nil {
+		return nil, err
+	}
 	return &pendingInput{backend: l, cmd: cmd}, nil
 }
+
+// appendAdmittedIntent is the LOAD-BEARING intent append for an input admitted under
+// a disposition attempt. The ordinary intent log is audit-only and swallows its
+// failures; this one cannot, because the record is the only durable copy of the
+// input's blocks in the session journal, and it is what restore re-offers when the
+// input was settled `applied` but its turn never became durable. A failure here
+// refuses the command BEFORE the prefix, so nothing durable names it and it may be
+// re-offered.
+//
+// A collision on the record's id is NOT a failure. The id is the store-issued
+// runtime command id, so a record already durable under it is this same input from
+// an earlier delivery — only its CreatedAt differs — and that record is the one
+// restore will read. The delivery proceeds to the prefix, which deduplicates it.
+func (s *Session) appendAdmittedIntent(ctx context.Context, loopID uuid.UUID, cmd command.UserInput) error {
+	if s.cmdAppender == nil {
+		return nil
+	}
+	err := s.cmdAppender.AppendCommand(ctx, journal.NewCommandRecord(s.sessionID, loopID, cmd))
+	var collision *journal.IdempotencyCollisionError
+	if err == nil || errors.As(err, &collision) {
+		return nil
+	}
+	return &AdmittedIntentAppendError{CommandID: cmd.CommandID, Cause: err}
+}
+
+// AdmittedIntentAppendError reports that the durable intent record of an input
+// admitted under a disposition attempt could not be written. Nothing durable names
+// the command, so it may be re-offered.
+type AdmittedIntentAppendError struct {
+	CommandID uuid.UUID
+	Cause     error
+}
+
+func (e *AdmittedIntentAppendError) Error() string {
+	return "sessionruntime: admitted input intent append failed for " + e.CommandID.String() + ": " + e.Cause.Error()
+}
+
+func (e *AdmittedIntentAppendError) Unwrap() error { return e.Cause }

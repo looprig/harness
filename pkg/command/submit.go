@@ -67,6 +67,39 @@ type UserInput struct {
 	// Accepted is the transient durable-acceptance ack used only by managed delegate
 	// sends. It is never serialized; prepared starts use LoopStarted.InitialRequestID.
 	Accepted chan error `json:"-"`
+	// Admission is the transient synchronous admission handshake used only for an
+	// input a Host admitted as a runtime command under a disposition attempt. It is
+	// never serialized. See Admission for the contract; a UserInput carries at most
+	// one of Accepted and Admission.
+	Admission *Admission `json:"-"`
+}
+
+// Admission is the synchronous handshake between the runtime-command applier and
+// the loop actor for one Host-admitted input. It exists so the runtime's durable
+// "applied" record and the input's in-memory acceptance cannot disagree.
+//
+// The loop decides the input on its own live state. If it declines (shutting down,
+// queue full, an admission fault) it replies a *loop.InputRejectedError on Result
+// and does nothing else: no event is published, because the applier's durable
+// disposition is the command's only answer. If it takes the input it calls Commit
+// FIRST, on the actor goroutine, and only then queues or starts the input — so the
+// acceptance record is durable strictly before any effect the input can cause. A
+// Commit error declines the input with no effect and is replied on Result
+// unchanged. A nil Commit records nothing; restore uses that to re-offer an input
+// whose acceptance is already durable.
+//
+// An input taken this way is CARRIED OVER rather than returned when its loop goes
+// away (shutdown or a cancelled loop context): no InputCancelled is published for
+// it, because its acceptance is durable and a restored successor replays it. An
+// ordinary interrupt still retains it (it is human input), and a turn failure or
+// an explicit retraction still resolves it visibly, exactly as for any queued input.
+type Admission struct {
+	// Commit makes the runtime's acceptance durable. Called at most once, by the
+	// loop actor, before the input can have any effect.
+	Commit func() error
+	// Result receives the loop's answer exactly once. It MUST be buffered
+	// (capacity >= 1): the actor never blocks on it.
+	Result chan error
 }
 
 // SubagentResult delivers a finished subagent's output to its parent loop (the
