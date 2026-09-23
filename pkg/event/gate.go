@@ -1,6 +1,7 @@
 package event
 
 import (
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/gate"
 )
 
@@ -14,6 +15,48 @@ type GatePrepared struct {
 	loopScoped
 	Header
 	Gate gate.Gate `json:"gate,omitzero"`
+	// Resume is the snapshot a restored session needs to CONTINUE the tool step this
+	// gate parks, rather than interrupt its turn: the step's assistant message, as it
+	// will be committed, and which of its tool calls the gate belongs to. It is set
+	// only for a loop-owned tool gate a successor can resume (a permission gate, or a
+	// user-input gate raised by a tool.UserInputReplaySafe tool); nil means restore
+	// keeps the closure behaviour this record always had.
+	//
+	// It carries raw tool arguments, which is why it lives HERE and nowhere public:
+	// GatePrepared rides only inside the private journal.GatePreparedRecord, never
+	// SSE/history. The same message reaches the public StepDone once the step commits.
+	//
+	// Additive and backward-compatible on the wire: the field is omitted when nil,
+	// and the plain decoder an older Harness uses ignores it, so a journal carrying it
+	// replays on an older runtime exactly as before (the gate is closed and the turn
+	// interrupted at restore). It is not a one-way upgrade.
+	Resume *ToolStepResume `json:"resume,omitempty"`
+}
+
+// ToolStepResume is GatePrepared's private resume snapshot. See GatePrepared.Resume.
+type ToolStepResume struct {
+	// StepIndex is the turn-local index of the parked step.
+	StepIndex uint64 `json:"step_index"`
+	// Message is the step's assistant message exactly as StepDone would commit it,
+	// including every tool call of the step and any provider-opaque reasoning state.
+	Message *content.AIMessage `json:"message"`
+	// ToolUseID is the provider tool-use id of the call this gate blocks.
+	ToolUseID string `json:"tool_use_id"`
+}
+
+// Valid reports whether r names a call its own message carries. A snapshot that
+// does not is unusable, and restore treats it exactly like an absent one.
+func (r *ToolStepResume) Valid() bool {
+	if r == nil || r.Message == nil || r.ToolUseID == "" {
+		return false
+	}
+	found := 0
+	for _, block := range r.Message.Blocks {
+		if use, ok := block.(*content.ToolUseBlock); ok && use.ID == r.ToolUseID {
+			found++
+		}
+	}
+	return found == 1
 }
 
 // GateOpened is the PUBLIC activation event for a gate. It carries the pure

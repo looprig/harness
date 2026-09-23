@@ -73,6 +73,28 @@ type Sequential interface {
 	Sequential() bool
 }
 
+// UserInputReplaySafe is implemented by a tool whose execution UP TO AND INCLUDING
+// its loop.RequestUserInput call has no side effect, so running the call again
+// reaches the same question with nothing done twice. AskUser is the canonical
+// example: it parses its arguments and asks.
+//
+// It is what lets a restored session keep a question it was waiting on. When a
+// session parked at a tool's user-input gate moves to another runtime (a crash, a
+// drain, a failover), the in-memory call that was blocked on the answer is gone;
+// the only way to hand the answer back to it is to run the call again against the
+// same, still-open gate. That is sound only for a tool that declares it here. A
+// tool that does not implement this, or reports false, keeps the fail-safe
+// behaviour: its gate is closed restore_unavailable at restore and the model's
+// question must be asked again.
+//
+// Report true only if EVERY path through the tool before its question is free of
+// effects outside the process — a write, a spawned process, a network request, a
+// charge. The tool MUST ask the same question on the replayed run, because the
+// answer is bound to the original gate.
+type UserInputReplaySafe interface {
+	UserInputReplaySafe() bool
+}
+
 // PreparedArtifact is the opaque, per-call artifact a CallPreparer produces — read
 // by the producing tool at both PrepareCall and InvokableRun time, opaque to the
 // runner. Sealed via an unexported marker so only deliberate types satisfy it (no
