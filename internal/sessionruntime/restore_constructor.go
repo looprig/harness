@@ -196,6 +196,11 @@ func restoreTopologySession(
 	for _, opt := range opts {
 		opt(probe)
 	}
+	// The probe carries the restored session's identity: planLoops binds every
+	// restore-planned loop through probe.newWorkspaceBinding, whose LogicalRoot is derived
+	// from sessionID. A zero id there gave those loops an empty LogicalRoot while the live
+	// session's WorkspaceStatus reported the real one.
+	probe.sessionID = sessionID
 	constructionAbortTimeout := probe.constructionAbortTimeout
 	if constructionAbortTimeout <= 0 {
 		constructionAbortTimeout = defaultConstructionAbortTimeout
