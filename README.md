@@ -14,6 +14,30 @@ test — assembles a `Rig`, brings up a `Session`, drives it through the
 `Session` contract, and reads the event stream. Everything is typed; nothing
 flows through `any` or `interface{}` past a serialization boundary.
 
+## Install
+
+```sh
+go get github.com/looprig/harness@latest
+```
+
+The module targets Go 1.26.8. Its direct Looprig dependencies are `core`,
+`inference`, `storage` and `sessionstore` (production) and `fsstore`
+(tests only). It sits at tier 3 of the Looprig release graph: `tools`, `tui`,
+`acp`, `mcp`, `classifiers`, `foreignloops`, `workflows`, `host` and the
+products above them build on it.
+
+Two requirements a consumer should know before upgrading:
+
+- **The session store needs a conforming Blobs provider.** `sessionstore.Open`
+  rejects a backend whose Blobs do not implement Storage's bounded blob-reader
+  lifecycle (`storage/memstore` and `s3store` do; `fsstore` does not). The
+  store also writes object metadata under nested KV keys, so every backend
+  beneath it must pass `storage` v0.7.0's nested-name conformance (for
+  `fsstore`, that means v0.6.0 or later).
+- **Some upgrades are one-way.** Once a journal holds a `gate_response`,
+  `create` or `restore` runtime command, older harness versions cannot reopen
+  it; see the upgrade notes below.
+
 ## What is harness?
 
 A **Rig** is a design-time assembly: one or more **Loop** definitions (an
@@ -45,70 +69,70 @@ The runtime is built around four ideas:
 ## How to use harness
 
 Compose a `Rig`, bring up a `Session`, drive it, read the event stream,
-answer gates.
+answer gates. Adapted from `examples/lifecycle/example_test.go`, which runs
+offline against an in-memory store:
 
 ```go
-package main
-
-import (
-    "context"
-    "log"
-
-    "github.com/looprig/core/content"
-    "github.com/looprig/harness/pkg/gate"
-    "github.com/looprig/harness/pkg/loop"
-    "github.com/looprig/harness/pkg/rig"
-    "github.com/looprig/harness/pkg/sessionstore"
-    "github.com/looprig/inference"
-    "github.com/looprig/inference/model"
+// client is any inference.Client (e.g. from looprig/llm); status is a
+// tool.Definition (e.g. from looprig/tools, or tool.NewDefinition).
+agent, err := loop.Define(
+    loop.WithName("assistant"),
+    loop.WithInference(client, model.Model{
+        Provider: "offline", APIFormat: model.APIFormatOpenAI,
+        BaseURL: "http://localhost", Name: "fixture",
+    }),
+    loop.WithTools(status),
+    // loop.WithAccessGate(...) binds a permission gate; see pkg/gate.
 )
+if err != nil { return err }
 
-func main() {
-    store, err := sessionstore.Open(/* a *storage.Composite from a backend module */)
-    if err != nil { log.Fatal(err) }
+// Any storage.Composite whose Blobs implement the bounded reader lifecycle.
+store, err := sessionstore.Open(memstore.New())
+if err != nil { return err }
 
-    agent, err := loop.Define(
-        loop.WithName("operator"),
-        loop.WithClient(inferenceClient),
-        loop.WithModel(model.Model{ /* provider, name, sampling */ }),
-        loop.WithTools(/* ...tool.Definition values from looprig/tools */...),
-        loop.WithAccessGate(/* a gate.Evaluator built from your sandbox */),
-    )
-    if err != nil { log.Fatal(err) }
+r, err := rig.Define(
+    rig.WithLoops(agent),
+    rig.WithPrimers("assistant"),
+    rig.WithSessionStore(store),
+)
+if err != nil { return err }
 
-    r, err := rig.Define(
-        rig.WithLoops(agent),
-        rig.WithSessionStore(store),
-        rig.WithPrimers("operator"),
-    )
-    if err != nil { log.Fatal(err) }
+live, err := r.NewSession(ctx)
+if err != nil { return err }
 
-    ctx := context.Background()
-    session, err := r.NewSession(ctx)
-    if err != nil { log.Fatal(err) }
+// Subscribe before submitting so no event is missed.
+sub, err := live.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
+if err != nil { return err }
 
-    // Subscribe to the event stream before submitting so no event is missed.
-    sub, err := session.SubscribeEvents(nil /* = all events */)
-    if err != nil { log.Fatal(err) }
-    go func() {
-        for delivery := range sub.Events() {
-            handle(delivery)
-            if delivery.Event.EndsTurn() { /* ... */ }
-        }
-    }()
-
-    // Submit a user turn. The outcome arrives on the event stream,
-    // correlated by the returned input id.
-    if _, err := session.Submit(ctx, []content.Block{
-        &content.TextBlock{Text: "Read README.md and summarize it."},
-    }); err != nil { log.Fatal(err) }
-
-    // Answer a permission gate raised by a tool.
-    //   session.RespondGate(ctx, gate.GateResponse{ GateID: id, Action: gate.ApproveActionApprove })
-
-    _ = session /* call Shutdown when done */
+// The outcome arrives on the event stream, correlated by the returned input id.
+if _, err := live.Submit(ctx, []content.Block{&content.TextBlock{Text: "Say ready"}}); err != nil {
+    return err
 }
+for delivery := range sub.Events() {
+    if delivery.Event.EndsTurn() {
+        break
+    }
+}
+_ = sub.Close()
+
+// A tool's permission gate is answered with
+//   live.RespondGate(ctx, gate.GateResponse{GateID: id, Action: string(gate.ApprovalApprove)})
+
+id := live.SessionID()
+if err := live.Shutdown(ctx); err != nil { return err }
+restored, err := r.RestoreSession(ctx, id) // durable: restore by id
 ```
+
+The other runnable examples under `examples/` cover compaction and delegation
+(`composition`), session journal and workspace stores (`persistence`), hooks
+and the headless gate fallback (`policy`), and a read-only HTTP adapter
+(`serving`).
+
+For durable, Host-resident sessions, `rig.WithToolResultObjects` retains large
+tool results as SessionStore objects that a tool can page back through
+`tool.ToolResultReader`; `pkg/runtimecommand` is the seam through which a Host
+applies Factory-admitted commands, and `pkg/sessionwire` projects harness
+events onto Core's `sessionwire/v1` public records.
 
 For existing HTTP consumers, `pkg/serve` retains a frozen compatibility
 surface over a `Rig` (submit, subscribe via SSE, respond to a gate,
@@ -128,7 +152,10 @@ Harness is one module in a larger ecosystem. See
   `inference.Client`, `model.Model`, streaming, structured output, context
   counters.
 - [`looprig/storage`](https://github.com/looprig/storage) — `Ledger`,
-  `Leaser`, `KV`, `Blobs` leaf contracts.
+  `Leaser`, `KV`, `Blobs`, `OrderedIndex` leaf contracts.
+- [`looprig/sessionstore`](https://github.com/looprig/sessionstore) — the
+  session-state store whose envelope format and catalog `pkg/sessionstore`
+  writes through.
 - [`looprig/eval`](https://github.com/looprig/eval) — the evaluation
   framework that runs under `go test`.
 - [`looprig/foreignloops`](https://github.com/looprig/foreignloops) —
@@ -142,8 +169,14 @@ Harness is one module in a larger ecosystem. See
   harness integration that publishes `IntegrationStatus`.
 - [`looprig/fsstore`](https://github.com/looprig/fsstore) /
   [`looprig/natsstore`](https://github.com/looprig/natsstore) /
+  [`looprig/pgstore`](https://github.com/looprig/pgstore) /
+  [`looprig/s3store`](https://github.com/looprig/s3store) /
   [`looprig/rclonestore`](https://github.com/looprig/rclonestore) —
-  `storage.Composite` backends.
+  Storage backends.
+- [`looprig/factory`](https://github.com/looprig/factory) /
+  [`looprig/host`](https://github.com/looprig/host) — multi-tenant session
+  orchestration; Host runs harness rigs and applies Factory-admitted commands
+  through `pkg/runtimecommand`.
 
 ## How harness is designed
 
@@ -160,11 +193,14 @@ pkg/rig ──────► pkg/session ──────► pkg/loop ──�
    │              │
    │              ├──► pkg/hub           (event fan-in, federated quiescence)
    │              ├──► pkg/hustle        (parallel background work)
+   │              ├──► pkg/hook          (in-process interception contracts)
+   │              ├──► pkg/runtimecommand (Host-admitted runtime commands)
    │              ├──► pkg/journal       (single-writer durable log contract)
    │              ├──► pkg/sessionstore  (session-scoped storage facade)
    │              └──► pkg/workspacestore (workspace snapshots)
    │
-   └──► pkg/serve  (HTTP surface; depends only on narrow LiveSession + Rig seams)
+   ├──► pkg/serve  (HTTP surface; depends only on narrow LiveSession + Rig seams)
+   └──► pkg/sessionwire (projection onto core/sessionwire/v1 public records)
 
 internal/loopruntime    private loop actor, turn, step, runner
 internal/sessionruntime private session coordinator (owns loops, hub, journal)
@@ -456,19 +492,22 @@ silently. See [`pkg/gate/README.md`](pkg/gate/README.md).
 harness/
 ├── pkg/                  public contracts and runtime surfaces
 │   ├── command/          sealed command union (pkg/command/README.md)
-│   ├── evalmigration/    build-tagged proof that legacy eval re-expresses against looprig/eval
 │   ├── event/            sealed event union (pkg/event/README.md)
 │   ├── foreign/          foreign-loop builder seams (pkg/foreign/README.md)
 │   ├── gate/             three-state access decision (pkg/gate/README.md)
+│   ├── hook/             in-process interception contracts (pkg/hook/README.md)
 │   ├── hub/              session event fan-in (pkg/hub/README.md)
 │   ├── hustle/           parallel background work definitions (pkg/hustle/README.md)
 │   ├── identity/         coordinates, cause, agency (pkg/identity/README.md)
 │   ├── journal/          single-writer durable log contract (pkg/journal/README.md)
 │   ├── loop/             immutable loop recipes + live loop contracts (pkg/loop/README.md)
 │   ├── rig/              composition root (pkg/rig/README.md)
-│   ├── serve/            HTTP surface over a live session (pkg/serve/README.md)
+│   ├── runtimecommand/   Host-admitted public command → runtime command seam
+│   ├── serve/            deprecated HTTP surface over a live session (pkg/serve/README.md)
+│   │   └── catalogreader/ read-plane adapter behind serve.Reader
 │   ├── session/          live session data-plane + control-plane (pkg/session/README.md)
 │   ├── sessionstore/     session-scoped storage facade (pkg/sessionstore/README.md)
+│   ├── sessionwire/      projection of harness events onto core/sessionwire/v1
 │   ├── tool/             dependency-free tool contracts (pkg/tool/README.md)
 │   └── workspacestore/   workspace snapshots over storage.Blobs (pkg/workspacestore/README.md)
 ├── internal/             private implementation
@@ -480,9 +519,11 @@ harness/
 │   ├── hashcache/        SHA-256-keyed parse cache
 │   ├── pathutil/         canonical path normalization
 │   └── buildtest/        build/lint test helpers
+├── examples/             runnable, offline Example tests
+├── tests/                examples manifest check
 ├── docs/                 architecture, plans, releases, ecosystem
 ├── scripts/              build/lint helper scripts
-├── Makefile              fmt, lint, secure, fuzz targets
+├── Makefile              test, fmt, lint, vuln, secure, check, build, fuzz targets
 ├── go.mod / go.sum       module graph
 ├── CLAUDE.md / AGENTS.md development guidelines (AGENTS.md is a symlink)
 ├── CONTRIBUTING.md       how to contribute
@@ -501,11 +542,12 @@ make fmt       # gofmt the whole module in place
 make lint      # fmt-check + vet + staticcheck + gosec
 make vuln      # go mod verify + govulncheck
 make secure    # lint + vuln — run before every commit
+make check     # fmt-check, vet, staticcheck, gosec, govulncheck, tests, standalone build
 ```
 
-Add `GOWORK=off` to check the module against its real pinned dependency
-versions rather than the sibling working copies `../go.work` supplies:
-`GOWORK=off go test ./...`.
+The baseline is Go 1.26.8. Add `GOWORK=off` to check the module against its
+real pinned dependency versions rather than sibling working copies a `go.work`
+might supply: `GOWORK=off go test ./...`.
 
 Build with `CGO_ENABLED=0 go build -trimpath` so binaries never leak local
 paths. Run tests with `-race`; a test that only passes without `-race` is
