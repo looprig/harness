@@ -114,12 +114,12 @@ Two further Oxy patches are **not** upstreamed; Oxy drops them itself:
 
 | Item | Module | Status |
 |---|---|---|
-| 1 `loop.Unlimited` | harness v0.41.0 | on main (unreleased; ships in v0.41.0 via impl-05) |
-| 2 zero hustle timeout | harness v0.41.0 | on main (unreleased; ships in v0.41.0 via impl-05) |
-| 3 opaque tool input | harness v0.41.0 | on main (unreleased; ships in v0.41.0 via impl-05) |
+| 1 `loop.Unlimited` | harness v0.41.0 | released (`911d4ad7`, tag `221785d5`) |
+| 2 zero hustle timeout | harness v0.41.0 | released (`911d4ad7`, tag `221785d5`) |
+| 3 opaque tool input | harness v0.41.0 | released (`911d4ad7`, tag `221785d5`) |
 | 4 no execution ceiling | inference v0.14.0 | released (`8de21fa`, tag `7af949a`) |
-| Oxy drops HustleHost (titles out of rig) | Oxy Phase 3 | in progress |
-| Oxy drops extractor patch (structured output) | Oxy | not started |
+| Oxy drops HustleHost (titles out of rig) | Oxy Phase 3 | Oxy application no longer uses it on `feat/host-department`; vendored fork deletion waits for Phase 8 |
+| Oxy drops extractor patch (structured output) | Oxy Phase 8 | pending the Oxy switch to published releases |
 
 ## Release-note material (for v0.41.0)
 

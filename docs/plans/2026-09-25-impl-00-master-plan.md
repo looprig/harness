@@ -94,7 +94,7 @@ commit), merged, released (tag).
 | 06 host v0.11.0 | released (`01cd656`, tag `580135e`) | remote `main` and annotated tag verified; upgrade Hosts before enabling Factory principal stamping |
 | 07 factory v0.12.0 | released (`707c01a`, tag `a5e5c02`) | remote `main` and annotated tag verified; principal stamping remains opt-in after Host capability rollout |
 | 08 wui v0.4.0 | released (`f993ff6`, tag `8e5d63d`) | remote `main` and annotated tag verified; 43 Core schemas/fixtures, reproducible release bundle |
-| 09 tests, carbon, Oxy, docs | in progress | tests and Carbon implementation may begin on published pins; Oxy Part C still needs its branch/owner decisions |
+| 09 tests, carbon, Oxy, docs | in progress | tests v0.14.0 (`2496241`, tag `ff51093`) and Carbon v0.30.0 (`93020ff`, tag `3f7dfb4`) released and remote-verified; docs corpus in progress; Oxy Phases 4–8 remain. The owner chose common-member vault access in the 2026-09-25 continuation; record it in Oxy's still-open plan before Phase 5, with other owner decisions pending |
 
 ## Cross-plan review (2026-09-25)
 
