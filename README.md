@@ -141,6 +141,24 @@ composition; see [the compatibility policy](pkg/serve/README.md).
 For terminal consumers, the sibling `looprig/tui` module binds
 against the same `Session` contract.
 
+To frame user messages, implement `present.Presenter` and pass it to
+`rig.WithMessagePresenter` when defining the rig. Its `Present(ctx, in)` method
+returns `present.Frame{Prefix: ..., Suffix: ...}`; `in.Principal` may be nil.
+The model and turn hooks see the assembled message, while the journal keeps the
+user's original blocks recoverable through `event.UserBlocks`. A caller with a
+verified principal can use the optional `session.InputSubmitter` capability:
+
+```go
+submitter, ok := live.(session.InputSubmitter)
+if ok {
+    _, err = submitter.SubmitInput(ctx, session.Input{
+        Blocks: []content.Block{&content.TextBlock{Text: "Say ready"}},
+        Principal: verifiedPrincipal,
+        Metadata: sessionwire.MessageMetadata{"source": "mobile"},
+    })
+}
+```
+
 ## Sibling modules
 
 Harness is one module in a larger ecosystem. See
@@ -443,6 +461,54 @@ appended the command is refused before its prefix and may be re-offered.
 open a v0.37.0 journal (it just will not replay an owed input, so rolling back strands
 any owed input), and v0.37.0 recovers the owed inputs a crashed v0.36.0 runtime left
 behind. Commands admitted without an attempt id keep the released path unchanged.
+
+### Upgrade note: unbounded execution and opaque tool input (v0.41.0)
+
+`loop.Unlimited` (`-1`) now disables `ToolLimits.Iterations` or `.Calls`, and
+`rig.DelegationLimits.Quota` accepts it too. A caller that accidentally supplied
+`-1` was refused before and now opts into no cap; `-2` and below remain invalid.
+`hustle.WithTimeout(0)` explicitly selects no execution deadline, as does a
+persisted `TimeoutNanos: 0`; omitting `WithTimeout` remains invalid. A journal
+holding a zero-timeout descriptor cannot be restored by harness ≤ v0.40.x, so
+do not roll back after one is written. Tool-use `Input` is now opaque to the
+duplicate-key check: arguments with repeated keys replay instead of being
+rejected. Older harness releases still cannot read such a journal.
+
+### Upgrade note: message principal, metadata and the Message Presenter (v0.41.0, one-way, LOSSY on rollback)
+
+v0.41.0 carries an optional verified `principal` on every admitted runtime command
+kind and optional `metadata` on `create` and `input`, and adds
+`rig.WithMessagePresenter`. A presenter may prepend and append text to a user
+message. Its rendering is journaled on the intent (`presented`) and in the
+committed `TurnStarted.Message`. `TurnStarted`, `TurnFoldedInto`, and
+`InputCancelled` record `input` (principal, metadata, prefix/suffix counts);
+`TurnInterrupted` and `GateResolved` record `principal`. Event `v` stays 1, and
+records without these members are byte-identical to v0.40.2.
+
+**Do not roll a process back below v0.41.0 once a journal holds an attributed or
+presented record.** Harness v0.40.2 does not refuse such a journal: its decoders
+silently drop the new members ([measured probe](internal/compat/testdata/v0410/PROBE_RESULT.txt)).
+Committed turns restore unchanged, but the old process loses attribution, and an
+input applied but not yet started is re-offered without its presenter frame, so
+the model sees different text. The v0.41.0 decoders are strict on new members,
+so a later addition fails closed.
+
+Consumer obligations:
+
+- A presenter must handle `in.Principal == nil` and should be deterministic: a
+  redelivery before the application prefix is durable can present again. The 5s
+  context bounds cooperative presenters only; product code that ignores context
+  cannot be forcibly stopped by Harness.
+- Presenter failure settles an attempt-bearing command `refused` (prefix, no
+  intent) and returns `*present.Error` from `SubmitInput`. The durable disposition
+  carries no reason.
+- Public projection strips `input.metadata` and keeps `input.principal`. Metadata
+  is audit-only unless the presenter renders it; read native metadata with
+  `ReadRuntimeJournal`.
+- A `restore` command's principal is not journaled by Harness; it lives in the
+  SessionStore disposition descriptor.
+- `session.InputSubmitter` is discovered by assertion; `session.Session` is
+  unchanged. Hooks see the assembled message (`hook.TurnData.Input`).
 
 ### The gate (permission model)
 
