@@ -501,7 +501,7 @@ Update this table as releases land, so work can resume from here.
 
 | Step | Module | Version | Status |
 |---|---|---|---|
-| 1 | core | v0.12.0 | not started |
+| 1 | core | v0.12.0 | released (`8a6197f`, tag `f95f298`) |
 | 2 | sessionstore | v0.14.0 | not started |
 | 3 | harness | v0.41.0 | not started |
 | 4a | host | v0.11.0 | not started |

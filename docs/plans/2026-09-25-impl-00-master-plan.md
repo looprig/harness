@@ -86,9 +86,9 @@ commit), merged, released (tag).
 
 | Plan | Status | Notes |
 |---|---|---|
-| 01 core v0.12.0 | in progress (`8a6197f`, local `main`) | implemented and independently reviewed; owner release approval pending |
+| 01 core v0.12.0 | released (`8a6197f`, tag `f95f298`) | remote `main` and annotated tag verified |
 | 02 sessionstore v0.14.0 | plan written | creates go through `AdmitPublicCreate`, which gains the fields too; the due view the sweeper reads carries them (design §9.11, resolved) |
-| 03 inference v0.14.0 | in progress (`8de21fa`, local `main`) | implemented and reviewed; owner release approval pending. Known limit: `llm` gemini, bedrock and chutes build their own http.Client, so the marker does not lift their ceilings; plan 09 must check Oxy's providers (an llm follow-up if needed) |
+| 03 inference v0.14.0 | released (`8de21fa`, tag `7af949a`) | remote `main` and annotated tag verified. Known limit: `llm` gemini, bedrock and chutes build their own http.Client, so the marker does not lift their ceilings; plan 09 must check Oxy's providers (an llm follow-up if needed) |
 | 04 harness unbounded + opaque input | merged (`ca6b5a5`, local `main`) | implemented and independently reviewed; ships with harness v0.41.0 in impl-05 |
 | 05 harness v0.41.0 | plan written | rollback is lossy, not fail-closed (design §9.1): needs owner acknowledgement |
 | 06 host v0.11.0 | plan written | |
