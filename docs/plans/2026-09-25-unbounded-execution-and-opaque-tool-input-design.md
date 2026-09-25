@@ -117,7 +117,7 @@ Two further Oxy patches are **not** upstreamed; Oxy drops them itself:
 | 1 `loop.Unlimited` | harness v0.41.0 | on main (unreleased; ships in v0.41.0 via impl-05) |
 | 2 zero hustle timeout | harness v0.41.0 | on main (unreleased; ships in v0.41.0 via impl-05) |
 | 3 opaque tool input | harness v0.41.0 | on main (unreleased; ships in v0.41.0 via impl-05) |
-| 4 no execution ceiling | inference v0.14.0 | not started |
+| 4 no execution ceiling | inference v0.14.0 | implemented and reviewed on local `main` (`8de21fa`); release pending |
 | Oxy drops HustleHost (titles out of rig) | Oxy Phase 3 | in progress |
 | Oxy drops extractor patch (structured output) | Oxy | not started |
 
