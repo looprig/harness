@@ -437,16 +437,21 @@ func UnmarshalEvent(data []byte) (Event, error) {
 	return ev, nil
 }
 
+// rejectDuplicateJSONKeys checks object keys case-insensitively, matching
+// encoding/json's field handling. A tool_use block's Input is the sole opaque
+// exception: it contains model-produced raw argument bytes retained verbatim.
+// The block's own keys and every other event field remain strictly checked.
 func rejectDuplicateJSONKeys(data []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	token, err := decoder.Token()
 	if err != nil {
 		return err
 	}
-	return inspectJSONValue(decoder, token)
+	return inspectJSONValue(decoder, token, "")
 }
 
-func inspectJSONValue(decoder *json.Decoder, token json.Token) error {
+// path is the lower-case member path, with [] for array elements.
+func inspectJSONValue(decoder *json.Decoder, token json.Token, path string) error {
 	delim, ok := token.(json.Delim)
 	if !ok {
 		return nil
@@ -454,6 +459,9 @@ func inspectJSONValue(decoder *json.Decoder, token json.Token) error {
 	switch delim {
 	case '{':
 		seen := make(map[string]struct{})
+		var blockType string
+		var deferredInput json.RawMessage
+		onBlockPath := messageBlockPath(path)
 		for decoder.More() {
 			keyToken, err := decoder.Token()
 			if err != nil {
@@ -468,23 +476,39 @@ func inspectJSONValue(decoder *json.Decoder, token json.Token) error {
 				return fmt.Errorf("duplicate field %q", key)
 			}
 			seen[canonical] = struct{}{}
+			if onBlockPath && canonical == "input" {
+				// The type may follow Input. Hold the raw value until the
+				// complete block determines whether the exemption applies.
+				if err := decoder.Decode(&deferredInput); err != nil {
+					return err
+				}
+				continue
+			}
 			valueToken, err := decoder.Token()
 			if err != nil {
 				return err
 			}
-			if err := inspectJSONValue(decoder, valueToken); err != nil {
+			if onBlockPath && canonical == "type" {
+				blockType, _ = valueToken.(string)
+			}
+			if err := inspectJSONValue(decoder, valueToken, path+"."+canonical); err != nil {
 				return err
 			}
 		}
-		_, err := decoder.Token()
-		return err
+		if _, err := decoder.Token(); err != nil {
+			return err
+		}
+		if deferredInput != nil && blockType != "tool_use" {
+			return rejectDuplicateJSONKeys(deferredInput)
+		}
+		return nil
 	case '[':
 		for decoder.More() {
 			valueToken, err := decoder.Token()
 			if err != nil {
 				return err
 			}
-			if err := inspectJSONValue(decoder, valueToken); err != nil {
+			if err := inspectJSONValue(decoder, valueToken, path+"[]"); err != nil {
 				return err
 			}
 		}
@@ -493,6 +517,20 @@ func inspectJSONValue(decoder *json.Decoder, token json.Token) error {
 	default:
 		return fmt.Errorf("unexpected delimiter %q", delim)
 	}
+}
+
+// messageBlockPath identifies message blocks in turn, compaction, and parked
+// GatePrepared resume events. A nested tool-result content block retains the
+// enclosing message-block path for this purpose.
+func messageBlockPath(path string) bool {
+	for strings.HasSuffix(path, ".content[]") {
+		path = strings.TrimSuffix(path, ".content[]")
+	}
+	switch path {
+	case ".messages[].blocks[]", ".message.blocks[]", ".retained[].blocks[]", ".summary.blocks[]", ".resume.message.blocks[]":
+		return true
+	}
+	return false
 }
 
 // validateDecodedEvent preserves the one additive compatibility exception in the
