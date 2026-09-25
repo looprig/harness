@@ -87,10 +87,10 @@ commit), merged, released (tag).
 | Plan | Status | Notes |
 |---|---|---|
 | 01 core v0.12.0 | released (`8a6197f`, tag `f95f298`) | remote `main` and annotated tag verified |
-| 02 sessionstore v0.14.0 | plan written | creates go through `AdmitPublicCreate`, which gains the fields too; the due view the sweeper reads carries them (design §9.11, resolved) |
+| 02 sessionstore v0.14.0 | released (`96e4621`, tag `46b7e9b`) | remote `main` and annotated tag verified; v3 attributed rows require every Factory and Host reader to use sessionstore >= v0.14.0 |
 | 03 inference v0.14.0 | released (`8de21fa`, tag `7af949a`) | remote `main` and annotated tag verified. Known limit: `llm` gemini, bedrock and chutes build their own http.Client, so the marker does not lift their ceilings; plan 09 must check Oxy's providers (an llm follow-up if needed) |
 | 04 harness unbounded + opaque input | merged (`ca6b5a5`, local `main`) | implemented and independently reviewed; ships with harness v0.41.0 in impl-05 |
-| 05 harness v0.41.0 | plan written | rollback is lossy, not fail-closed (design §9.1): needs owner acknowledgement |
+| 05 harness v0.41.0 | in progress (local `main`) | rollback is lossy, not fail-closed (design §9.1); owner acknowledgement is recorded in the handoff |
 | 06 host v0.11.0 | plan written | |
 | 07 factory v0.12.0 | plan written | incapable owner → 422 |
 | 08 wui v0.4.0 | plan written (code unverified) | metadata pre-check mirrors Core's check order (review fix) |
