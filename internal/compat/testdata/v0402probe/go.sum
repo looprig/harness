@@ -1,0 +1,14 @@
+github.com/looprig/core v0.11.0 h1:PXdAogrLVF1cI12WeveMemQN/k2jLFU6xGc8Ouso8Tk=
+github.com/looprig/core v0.11.0/go.mod h1:PB+2uceqh0Js6uXbwyj42bRDtiCDe9aCjTDeO47yPmo=
+github.com/looprig/credentials v0.2.1 h1:C3g+fgBgfocv82WGpPk5Goj0idU31EARYXKaOEconTk=
+github.com/looprig/credentials v0.2.1/go.mod h1:8T6fGYOI4+erw6dZt8ghxQZHuo4CwKwD1CS1y9qrVj4=
+github.com/looprig/harness v0.40.2 h1:93lmEy9XmPw0MYaoJtsQHpqzaRGgzoQBuowek7lnBTA=
+github.com/looprig/harness v0.40.2/go.mod h1:94Y1xFhwOC0nxfgUkc2yZmTKfe4ziiNwAt2ky2lb4YI=
+github.com/looprig/inference v0.13.0 h1:bTopmAxGNNsEiLNASh24ZpxixEHrBlmaJw+gOfMrEkQ=
+github.com/looprig/inference v0.13.0/go.mod h1:/x/kZQbAbIXeRBZUmQNcA9TUTDeOdTktZFG22Cp7Iiw=
+github.com/looprig/secrets v0.2.2 h1:0jQvwWIO12LmWuMoSVOlEW7KNF/8KA47Eywj4EqHOMY=
+github.com/looprig/secrets v0.2.2/go.mod h1:9LQEf/Cr8mPJt1zXv+adiNWgMj0ILcFNCfvMM7hV6a4=
+github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 h1:1EYB5IzjZawrrnELUi78f9fPu57HuXjmddZPjrls/28=
+github.com/santhosh-tekuri/jsonschema/v6 v6.0.3/go.mod h1:JXeL+ps8p7/KNMjDQk3TCwPpBy0wYklyWTfbkIzdIFU=
+golang.org/x/text v0.40.0 h1:Ub2Z6/xjgF1WrYQz2nuITOEegKFtiIy+rieRJ5lHZKs=
+golang.org/x/text v0.40.0/go.mod h1:hpnzDAfGV753zIKo+wk3u1bVKCGPbrnF7+7LBF/UHVY=

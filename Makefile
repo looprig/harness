@@ -1,4 +1,4 @@
-.PHONY: test fmt fmt-check staticcheck lint vuln verify secure fuzz
+.PHONY: test fmt fmt-check staticcheck lint vuln verify secure fuzz compat
 
 GO ?= go
 
@@ -54,6 +54,11 @@ secure: lint vuln
 
 fuzz:
 	@echo "Usage: go test -fuzz=FuzzXxx ./path/to/pkg -fuzztime=30s"
+
+# Run the released v0.40.2 codecs over old and newly attributed records. This
+# resolves a released module, so it is a separate release gate rather than check.
+compat:
+	cd internal/compat/testdata/v0402probe && GOWORK=off go run . decode ../pre_v0410/*.json ../v0410/*.json
 
 # --- standardized check surface -------------------------------------------
 # One target, the same set of checks, in every module. CI calls exactly this,
