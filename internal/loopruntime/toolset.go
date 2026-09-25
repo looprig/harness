@@ -62,15 +62,16 @@ const (
 // per definition.
 const defaultMaxMaterializedToolResultBytes = loop.DefaultMaterializedToolResultBytes
 
+// Resolve a zero or invalid negative to the default, preserving loop.Unlimited.
 func resolveMaxToolIterations(n int) int {
-	if n <= 0 {
+	if n <= 0 && n != loop.Unlimited {
 		return defaultMaxToolIterations
 	}
 	return n
 }
 
 func resolveMaxToolCallsPerTurn(n int) int {
-	if n <= 0 {
+	if n <= 0 && n != loop.Unlimited {
 		return defaultMaxToolCallsPerTurn
 	}
 	return n

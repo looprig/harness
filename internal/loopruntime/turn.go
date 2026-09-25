@@ -13,6 +13,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hook"
 	identitydomain "github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
@@ -517,7 +518,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 
 		ts.toolIterations++
 		ts.toolCalls += len(toolUses)
-		if ts.toolIterations > cfg.tools.MaxToolIterations || ts.toolCalls > cfg.tools.MaxToolCallsPerTurn {
+		if toolCapExceeded(ts.toolIterations, cfg.tools.MaxToolIterations) || toolCapExceeded(ts.toolCalls, cfg.tools.MaxToolCallsPerTurn) {
 			// The runaway cap fires on this UNCOMPLETED tool step: it is never appended
 			// to ts.msgs and never committed, so no unpaired tool_use survives into
 			// loopState.msgs and no StepDone is emitted for it.
@@ -1212,4 +1213,9 @@ func toolDefs(ctx context.Context, registry []tool.InvokableTool) []inference.To
 		})
 	}
 	return defs
+}
+
+// toolCapExceeded compares a per-turn count only against a finite cap.
+func toolCapExceeded(count, limit int) bool {
+	return limit != loop.Unlimited && count > limit
 }

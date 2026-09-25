@@ -8,6 +8,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -22,7 +23,8 @@ func TestResolveMaxToolIterations(t *testing.T) {
 		want int
 	}{
 		{"zero defaults", 0, defaultMaxToolIterations},
-		{"negative defaults", -1, defaultMaxToolIterations},
+		{"invalid negative defaults", -2, defaultMaxToolIterations},
+		{"unlimited preserved", loop.Unlimited, loop.Unlimited},
 		{"positive preserved", 7, 7},
 	}
 	for _, tt := range tests {
@@ -44,7 +46,8 @@ func TestResolveMaxToolCallsPerTurn(t *testing.T) {
 		want int
 	}{
 		{"zero defaults", 0, defaultMaxToolCallsPerTurn},
-		{"negative defaults", -1, defaultMaxToolCallsPerTurn},
+		{"invalid negative defaults", -2, defaultMaxToolCallsPerTurn},
+		{"unlimited preserved", loop.Unlimited, loop.Unlimited},
 		{"positive preserved", 42, 42},
 	}
 	for _, tt := range tests {
@@ -129,8 +132,8 @@ func TestResolveToolSetCaps(t *testing.T) {
 		{
 			name: "negative treated as unset",
 			in: ToolSet{
-				MaxToolIterations:    -1,
-				MaxToolCallsPerTurn:  -1,
+				MaxToolIterations:    -2,
+				MaxToolCallsPerTurn:  -2,
 				MaxParallelToolCalls: -1,
 			},
 			want: ToolSet{
