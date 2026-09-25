@@ -503,7 +503,7 @@ Update this table as releases land, so work can resume from here.
 |---|---|---|---|
 | 1 | core | v0.12.0 | released (`8a6197f`, tag `f95f298`) |
 | 2 | sessionstore | v0.14.0 | released (`96e4621`, tag `46b7e9b`) |
-| 3 | harness | v0.41.0 | in progress on local `main` |
+| 3 | harness | v0.41.0 | released (`911d4ad7`, tag `221785d5`) |
 | 4a | host | v0.11.0 | not started |
 | 4b | factory | v0.12.0 | not started |
 | 5 | wui | v0.4.0 | not started |
