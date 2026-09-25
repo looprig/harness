@@ -442,12 +442,16 @@ func UnmarshalEvent(data []byte) (Event, error) {
 // exception: it contains model-produced raw argument bytes retained verbatim.
 // The block's own keys and every other event field remain strictly checked.
 func rejectDuplicateJSONKeys(data []byte) error {
+	return inspectRawJSONValue(data, "")
+}
+
+func inspectRawJSONValue(data []byte, path string) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	token, err := decoder.Token()
 	if err != nil {
 		return err
 	}
-	return inspectJSONValue(decoder, token, "")
+	return inspectJSONValue(decoder, token, path)
 }
 
 // path is the lower-case member path, with [] for array elements.
@@ -499,7 +503,7 @@ func inspectJSONValue(decoder *json.Decoder, token json.Token, path string) erro
 			return err
 		}
 		if deferredInput != nil && blockType != "tool_use" {
-			return rejectDuplicateJSONKeys(deferredInput)
+			return inspectRawJSONValue(deferredInput, path+".input")
 		}
 		return nil
 	case '[':

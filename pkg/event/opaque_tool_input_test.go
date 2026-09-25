@@ -53,6 +53,36 @@ func TestStepDoneReplaysDuplicateKeysInToolInput(t *testing.T) {
 	}
 }
 
+// A non-tool block's unknown Input remains strict even if its JSON happens to
+// contain a nested path shaped like a real message and tool_use block.
+func TestStepDoneRejectsDuplicateKeysInNonToolInput(t *testing.T) {
+	t.Parallel()
+	newID := func() uuid.UUID {
+		id, err := uuid.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	e := StepDone{
+		Header: Header{Coordinates: identity.Coordinates{SessionID: newID(), LoopID: newID(), TurnID: newID(), StepID: newID()}, EventID: newID(), CreatedAt: time.Now()},
+		Messages: content.AgenticMessages{&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{
+			&content.TextBlock{Text: "hello"},
+		}}}},
+	}
+	raw, err := MarshalEvent(e)
+	if err != nil {
+		t.Fatalf("MarshalEvent: %v", err)
+	}
+	bad := strings.Replace(string(raw), `"Text":"hello"`, `"Text":"hello","Input":{"messages":[{"blocks":[{"type":"tool_use","Input":{"x":1,"x":2}}]}]}`, 1)
+	if bad == string(raw) {
+		t.Fatalf("fixture has no text block to extend: %s", raw)
+	}
+	if _, err := UnmarshalEvent([]byte(bad)); err == nil || !strings.Contains(err.Error(), `duplicate field "x"`) {
+		t.Fatalf("UnmarshalEvent = %v, want duplicate field x", err)
+	}
+}
+
 func TestGatePreparedResumeReplaysDuplicateKeysInToolInput(t *testing.T) {
 	t.Parallel()
 	message := &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{
