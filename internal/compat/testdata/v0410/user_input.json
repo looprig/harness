@@ -1,0 +1,1 @@
+{"agency":1,"blocks":[{"Text":"hello","type":"text"}],"command_id":"44444444-4444-4444-8444-444444444444","metadata":{"space":"family"},"presented":{"prefix":[{"Text":"[from: Alex]","type":"text"}],"suffix":[{"Text":"(sent from phone)","type":"text"}]},"principal":{"tenant":"acme","subject":"u1","kind":"actor"},"type":"UserInput","v":1}
