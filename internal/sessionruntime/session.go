@@ -1586,7 +1586,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		s.loopsMu.Unlock()
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopDepthExceeded}
 	}
-	if counts && s.spawned >= limits.Quota {
+	if counts && limits.Quota != loop.Unlimited && s.spawned >= limits.Quota {
 		s.loopsMu.Unlock()
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopQuotaExceeded}
 	}

@@ -136,6 +136,34 @@ func TestWithSessionStoreRejectsTypedNil(t *testing.T) {
 	}
 }
 
+func TestWithDelegationLimitsAcceptsUnlimitedQuota(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name    string
+		limits  DelegationLimits
+		wantErr bool
+	}{
+		{"unlimited quota", DelegationLimits{Depth: 2, Quota: loop.Unlimited}, false},
+		{"quota below unlimited", DelegationLimits{Quota: -2}, true},
+		{"unlimited depth refused", DelegationLimits{Depth: loop.Unlimited}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			state := &definitionState{seen: make(map[singletonKey]bool)}
+			err := WithDelegationLimits(tt.limits)(state)
+			var target *DefinitionError
+			if tt.wantErr {
+				if !errors.As(err, &target) || target.Kind != DefinitionInvalidDelegationLimits {
+					t.Fatalf("WithDelegationLimits(%+v) = %v, want invalid limits", tt.limits, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("WithDelegationLimits(%+v) = %v, want nil", tt.limits, err)
+			}
+		})
+	}
+}
+
 func TestDefineRejectsInvalidFinalLifecycleOptions(t *testing.T) {
 	t.Parallel()
 	goodLive := foreign.Builder(func(context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreign.EventPublisher, loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory) (loop.Backend, string, error) {
@@ -153,7 +181,7 @@ func TestDefineRejectsInvalidFinalLifecycleOptions(t *testing.T) {
 		{name: "foreign live builder missing", opt: WithForeignBuilders(nil, goodRestored), kind: DefinitionInvalidForeignBuilders},
 		{name: "foreign restore builder missing", opt: WithForeignBuilders(goodLive, nil), kind: DefinitionInvalidForeignBuilders},
 		{name: "negative delegation depth", opt: WithDelegationLimits(DelegationLimits{Depth: -1}), kind: DefinitionInvalidDelegationLimits},
-		{name: "negative delegation quota", opt: WithDelegationLimits(DelegationLimits{Quota: -1}), kind: DefinitionInvalidDelegationLimits},
+		{name: "negative delegation quota", opt: WithDelegationLimits(DelegationLimits{Quota: -2}), kind: DefinitionInvalidDelegationLimits},
 		{name: "negative gate max open", opt: WithGateCaps(GateCaps{MaxOpen: -1}), kind: DefinitionInvalidGateCaps},
 		{name: "negative gate timeout", opt: WithGateCaps(GateCaps{MaxTimeout: -time.Second}), kind: DefinitionInvalidGateCaps},
 	}

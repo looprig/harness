@@ -304,6 +304,9 @@ func WithPermissionReviewObservations(verifier gate.EvidenceObservationVerifier)
 // lane. The execution controller may allocate no queue larger than this bound.
 const MaxHustleQueued = 10_000
 
+// DelegationLimits caps sub-loop spawning for a rig's sessions. Zero selects
+// the package default. Quota accepts loop.Unlimited to disable the lifetime
+// spawn cap; Depth has no unlimited value. Other negative values are refused.
 type DelegationLimits struct {
 	Depth int
 	Quota int
@@ -392,7 +395,7 @@ func WithSessionStore(store *sessionstore.Store) Option {
 
 func WithDelegationLimits(limits DelegationLimits) Option {
 	return func(state *definitionState) error {
-		if limits.Depth < 0 || limits.Quota < 0 {
+		if limits.Depth < 0 || limits.Quota < loop.Unlimited {
 			return &DefinitionError{Kind: DefinitionInvalidDelegationLimits}
 		}
 		return singletonCompile(keyDelegationLimits, sessionruntime.WithLifecycleLimits(sessionruntime.Limits{Depth: limits.Depth, Quota: limits.Quota}))(state)
