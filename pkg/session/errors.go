@@ -20,6 +20,7 @@ const (
 	SessionLoopNotFound                  SessionErrorKind = "loop_not_found"
 	SessionEventChannelClosed            SessionErrorKind = "event_channel_closed"
 	SessionContextDone                   SessionErrorKind = "context_done"
+	SessionInvalidInput                  SessionErrorKind = "invalid_input"
 	SessionClosing                       SessionErrorKind = "session_closing"
 	SessionFaulted                       SessionErrorKind = "session_faulted"
 	SessionLoopDepthExceeded             SessionErrorKind = "loop_depth_exceeded"
@@ -40,7 +41,8 @@ func (e *SessionError) Error() string {
 		SessionIDGenerationFailed: "session: id generation failed", SessionLoopIDGenerationFailed: "session: loop id generation failed",
 		SessionLoopExited: "session: loop exited", SessionLoopNotFound: "session: loop not found",
 		SessionEventChannelClosed: "session: event channel closed without terminal event", SessionContextDone: "session: context done",
-		SessionClosing: "session: closing", SessionFaulted: "session: faulted (durable persistence failure)",
+		SessionInvalidInput: "session: invalid input",
+		SessionClosing:      "session: closing", SessionFaulted: "session: faulted (durable persistence failure)",
 		SessionLoopDepthExceeded: "session: loop spawn depth limit exceeded", SessionLoopQuotaExceeded: "session: loop spawn quota exceeded",
 		SessionForeignBuilderMissing:         "session: foreign engine selected but no foreign builder wired",
 		SessionCompactionUnsupported:         "session: loop does not support native conversation compaction",

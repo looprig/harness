@@ -16,6 +16,14 @@ its `Commands` channel and on its priority `PriorityCommands` lane.
   - `CancelQueuedInput` — drop a queued input without running it.
   - `ProvideUserInput` — answer a `UserInputRequested` gate.
   - `Compact` — request a per-loop context compaction.
+
+`UserInput` keeps the caller's `Blocks` intact and may carry `Principal` and
+`Metadata` for audit. Its journaled `Presented` frame contains the presenter's
+prefix/suffix, if any; `ModelBlocks()` assembles prefix + original blocks +
+suffix, and `MessageInput()` describes the original span on turn events. A
+restored input reuses the frame instead of invoking the presenter again.
+`Interrupt` may carry a principal. Machine-origin inputs cannot carry this
+attribution or a presenter frame.
 - **Control commands** — carry a buffered(1) `Ack` channel so the actor's
   send never stalls:
   - `Interrupt` — `Ack chan bool`; true iff a running turn was cancelled.

@@ -34,6 +34,7 @@ const (
 	SessionLoopNotFound                  = sessionapi.SessionLoopNotFound
 	SessionEventChannelClosed            = sessionapi.SessionEventChannelClosed
 	SessionContextDone                   = sessionapi.SessionContextDone
+	SessionInvalidInput                  = sessionapi.SessionInvalidInput
 	SessionClosing                       = sessionapi.SessionClosing
 	SessionFaulted                       = sessionapi.SessionFaulted
 	SessionLoopDepthExceeded             = sessionapi.SessionLoopDepthExceeded

@@ -59,6 +59,12 @@ keeping each one out of the two views is the same one spelled out for
   because it is **nonterminal**: unlike `Shutdown` it appends no
   `SessionStopped`. **The live runtime does not implement it yet**, so
   the assertion returns `false` today; see task H4.2.
+- **`InputSubmitter`** — `SubmitInput(ctx, session.Input{Blocks, Principal,
+  Metadata})` submits attributed user input to the active loop. The composition
+  root verifies the principal and owns its truth; Harness validates its shape.
+  An empty message or invalid attribution is refused before any send. An
+  installed Message Presenter may frame it; `Submit` remains unchanged and
+  presents with a nil principal.
 
 Everything else exported here is an error type. `pkg/session` is
 contracts plus errors, and a test enforces exactly that.

@@ -32,6 +32,7 @@ var (
 	cmdID   = id("44444444-4444-4444-8444-444444444444")
 	evID    = id("55555555-5555-4555-8555-555555555555")
 	gateID  = id("66666666-6666-4666-8666-666666666666")
+	stepID  = id("77777777-7777-4777-8777-777777777777")
 )
 
 func header() event.Header {
@@ -47,8 +48,13 @@ func user(body string) *content.UserMessage {
 }
 
 func gen(dir string) error {
+	stepHeader := header()
+	stepHeader.StepID = stepID
 	events := map[string]event.Event{
-		"turn_started.json":     event.TurnStarted{Header: header(), TurnIndex: 1, Message: user("hello")},
+		"turn_started.json": event.TurnStarted{Header: header(), TurnIndex: 1, Message: user("hello")},
+		"step_done.json": event.StepDone{Header: stepHeader, Messages: content.AgenticMessages{
+			&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: "answer"}}}},
+		}},
 		"turn_folded_into.json": event.TurnFoldedInto{Header: header(), TurnIndex: 1, Message: user("more")},
 		"input_cancelled.json":  event.InputCancelled{Header: header(), TurnIndex: 1, Reason: event.CancelTurnInterrupted, Message: user("late")},
 		"turn_interrupted.json": event.TurnInterrupted{Header: header(), TurnIndex: 1},

@@ -57,7 +57,8 @@ type Result struct {
 type TurnData struct {
 	// Index is the turn's loop-local index.
 	Index event.TurnIndex
-	// Input is the user message that initiated the turn, when available.
+	// Input is the assembled model-visible user message that initiated the turn,
+	// including any presenter prefix and suffix, when available.
 	Input *content.UserMessage
 }
 

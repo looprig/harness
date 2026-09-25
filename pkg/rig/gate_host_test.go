@@ -81,6 +81,14 @@ func gateHostSession(t *testing.T) (session.SessionController, session.GateHost)
 	return controller, host
 }
 
+func TestRigControllerExposesInputSubmitter(t *testing.T) {
+	t.Parallel()
+	controller, _ := gateHostSession(t)
+	if _, ok := controller.(session.InputSubmitter); !ok {
+		t.Fatal("rig controller does not expose session.InputSubmitter")
+	}
+}
+
 // formGate builds a host-owned form envelope and its authoritative payload.
 func formGate(t *testing.T) (gate.Gate, gate.FormPayload) {
 	t.Helper()

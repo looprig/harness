@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/internal/hustleruntime"
 	"github.com/looprig/harness/internal/loopruntime"
@@ -21,6 +22,8 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/present"
+	"github.com/looprig/harness/pkg/runtimecommand"
 	sessionapi "github.com/looprig/harness/pkg/session"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
@@ -36,6 +39,11 @@ const (
 
 func withConstructionAbortTimeout(timeout time.Duration) Option {
 	return func(s *Session) { s.constructionAbortTimeout = timeout }
+}
+
+// WithMessagePresenter installs the session's Message Presenter.
+func WithMessagePresenter(p present.Presenter) Option {
+	return func(s *Session) { s.presenter = p }
 }
 
 type Session struct {
@@ -362,6 +370,8 @@ type Session struct {
 	// WithToolResultObjects: the store issues each capture's reference, and
 	// read_tool_result pages through it. It supersedes toolResultObjects.
 	toolResultReadable loop.ToolResultObjects
+	// presenter frames user input on entry, or is nil when none was configured.
+	presenter present.Presenter
 	// toolResultCatalog is the session-bound publish seam plus the capture index
 	// read_tool_result answers from. It is built once the session id is final
 	// (or handed in by restore, already folded from the journal); nil when no
@@ -2467,6 +2477,31 @@ func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID,
 	return s.submitToLoop(ctx, active, input, identity.AgencyUser, false)
 }
 
+// SubmitInput is the attributed in-process variant of Submit. A caller owns the
+// truth of the supplied principal; the session validates its shape and preserves
+// it on the journaled intent and resulting message events.
+func (s *Session) SubmitInput(ctx context.Context, input sessionapi.Input) (uuid.UUID, error) {
+	if len(input.Blocks) == 0 {
+		return uuid.UUID{}, &SessionError{Kind: SessionInvalidInput}
+	}
+	if input.Principal != nil {
+		if err := input.Principal.Validate(); err != nil {
+			return uuid.UUID{}, &SessionError{Kind: SessionInvalidInput, Cause: err}
+		}
+	}
+	if len(input.Metadata) > 0 {
+		if err := input.Metadata.Validate(); err != nil {
+			return uuid.UUID{}, &SessionError{Kind: SessionInvalidInput, Cause: err}
+		}
+	}
+	s.loopsMu.RLock()
+	active := s.activeLoopID
+	s.loopsMu.RUnlock()
+	return s.submitToLoopAttributed(ctx, active, input.Blocks, identity.AgencyUser, false, input.Principal, input.Metadata)
+}
+
+var _ sessionapi.InputSubmitter = (*Session)(nil)
+
 // SubmitToLoop is the loop-targeted counterpart of Submit: it sends human-authored
 // (AgencyUser) input to a SPECIFIC loop's CommandSink rather than the active selection. It is the
 // modern viewport's "submit to the FOCUSED loop" primitive — a submit while focused on a
@@ -2552,6 +2587,10 @@ func (s *Session) CompactToLoop(ctx context.Context, loopID uuid.UUID) (uuid.UUI
 // SessionLoopNotFound. On any of those the returned id is the zero UUID, because
 // nothing was sent and there is no correlation to hand back.
 func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []content.Block, agency identity.Agency, noFold bool) (uuid.UUID, error) {
+	return s.submitToLoopAttributed(ctx, loopID, blocks, agency, noFold, nil, nil)
+}
+
+func (s *Session) submitToLoopAttributed(ctx context.Context, loopID uuid.UUID, blocks []content.Block, agency identity.Agency, noFold bool, principal *sessionwire.Principal, metadata sessionwire.MessageMetadata) (uuid.UUID, error) {
 	// Fail-secure: a faulted session (a required durable append failed) admits no new
 	// work. Checked before any loop lookup or id mint so nothing is sent.
 	if err := s.faultIfFaulted(); err != nil {
@@ -2564,11 +2603,19 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 	if l == nil {
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
 	}
+	var attr attribution
+	if agency == identity.AgencyUser {
+		var err error
+		attr, err = s.presentUserInput(ctx, loopID, runtimecommand.KindInput, blocks, principal, metadata)
+		if err != nil {
+			return uuid.UUID{}, err
+		}
+	}
 	id, err := s.newCommandID()
 	if err != nil {
 		return uuid.UUID{}, err
 	}
-	return s.dispatchUserInput(ctx, l, loopID, blocks, agency, noFold, id)
+	return s.dispatchUserInput(ctx, l, loopID, blocks, agency, noFold, id, attr)
 }
 
 // dispatchUserInput is the tail of the ordinary submit path: build the UserInput
@@ -2581,8 +2628,8 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 // runtime_command.go). A supplied-id variant of this function existed for it briefly
 // and ended up with no production caller at all — kept alive only by the test that
 // exercised it — so it is gone.
-func (s *Session) dispatchUserInput(ctx context.Context, l loop.Backend, loopID uuid.UUID, blocks []content.Block, agency identity.Agency, noFold bool, id uuid.UUID) (uuid.UUID, error) {
-	return s.sendUserInput(ctx, l, s.buildAndAuditUserInput(ctx, loopID, blocks, agency, noFold, id))
+func (s *Session) dispatchUserInput(ctx context.Context, l loop.Backend, loopID uuid.UUID, blocks []content.Block, agency identity.Agency, noFold bool, id uuid.UUID, attr attribution) (uuid.UUID, error) {
+	return s.sendUserInput(ctx, l, s.buildAndAuditUserInput(ctx, loopID, blocks, agency, noFold, id, attr))
 }
 
 // buildAndAuditUserInput builds the queueable UserInput and appends its AUDIT-ONLY
@@ -2602,8 +2649,11 @@ func (s *Session) dispatchUserInput(ctx context.Context, l loop.Backend, loopID 
 // AgencyMachine for the agent task submit — so a machine path never claims user
 // agency. noFold is true only for the delegate follow-up path, which must start a
 // distinct correlated turn rather than fold into the child's running turn.
-func (s *Session) buildAndAuditUserInput(ctx context.Context, loopID uuid.UUID, blocks []content.Block, agency identity.Agency, noFold bool, id uuid.UUID) command.UserInput {
-	cmd := command.UserInput{Header: command.Header{CommandID: id, Agency: agency, CreatedAt: s.stampNow()}, Blocks: blocks, NoFold: noFold}
+func (s *Session) buildAndAuditUserInput(ctx context.Context, loopID uuid.UUID, blocks []content.Block, agency identity.Agency, noFold bool, id uuid.UUID, attr attribution) command.UserInput {
+	cmd := command.UserInput{
+		Header: command.Header{CommandID: id, Agency: agency, CreatedAt: s.stampNow()}, Blocks: blocks, NoFold: noFold,
+		Principal: attr.principal, Metadata: attr.metadata, Presented: attr.presented,
+	}
 	// Intent log (audit-only): append BEFORE dispatch; an append failure is logged and
 	// the submit proceeds (a lost record must never block the user's input).
 	s.appendCommand(ctx, loopID, cmd)
@@ -2717,9 +2767,13 @@ type loopSnapshot struct {
 // Agency=AgencyUser (a human pressed interrupt). Selection + marking + concurrent delivery +
 // the admission barrier live in interrupt.go (runInterrupt); this is the session-wide scope.
 func (s *Session) Interrupt(ctx context.Context) (bool, error) {
+	return s.interruptAs(ctx, nil)
+}
+
+func (s *Session) interruptAs(ctx context.Context, principal *sessionwire.Principal) (bool, error) {
 	any, _, err := s.runInterrupt(ctx, func() ([]loopSnapshot, bool) {
 		return s.liveLoopSnapshotLocked(), true
-	}, identity.AgencyUser)
+	}, identity.AgencyUser, principal)
 	return any, err
 }
 

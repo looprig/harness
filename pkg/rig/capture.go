@@ -2,7 +2,6 @@ package rig
 
 import (
 	"path/filepath"
-	"reflect"
 
 	"github.com/looprig/harness/internal/sessionruntime"
 	"github.com/looprig/harness/pkg/loop"
@@ -173,14 +172,5 @@ func toolResultCaptureLifecycleOption(state *definitionState, spillBase string) 
 // behind the interface, which would otherwise pass a == nil check and fail at
 // the first oversized tool result instead of at Define.
 func nilToolResultObjects(objects loop.ToolResultObjects) bool {
-	if objects == nil {
-		return true
-	}
-	value := reflect.ValueOf(objects)
-	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
-		return value.IsNil()
-	default:
-		return false
-	}
+	return nilInterfaceValue(objects)
 }

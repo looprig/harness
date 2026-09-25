@@ -14,6 +14,7 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/present"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
@@ -522,6 +523,16 @@ func WithLifecycleToolResultObjects(objects loop.ToolResultObjects, spillBase st
 	return func(r *Lifecycle) {
 		if objects != nil {
 			r.baseOpts = append(r.baseOpts, WithToolResultObjects(objects, spillBase))
+		}
+	}
+}
+
+// WithLifecycleMessagePresenter forwards a rig's presenter to each new or
+// restored session. Restored messages retain their journaled rendering.
+func WithLifecycleMessagePresenter(p present.Presenter) LifecycleOption {
+	return func(r *Lifecycle) {
+		if p != nil {
+			r.baseOpts = append(r.baseOpts, WithMessagePresenter(p))
 		}
 	}
 }

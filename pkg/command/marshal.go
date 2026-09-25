@@ -8,6 +8,7 @@ import (
 	"io"
 
 	"github.com/looprig/core/content"
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
@@ -173,19 +174,39 @@ func marshalPlain(name CommandName, cmd Command) ([]byte, error) {
 // userInputWire is UserInput's wire form: Blocks is pre-encoded by the content
 // block codec ([]content.Block is a sealed-interface slice with no general struct
 // codec, so it cannot ride as a plain field).
+type presentedWire struct {
+	Prefix json.RawMessage `json:"prefix,omitempty"`
+	Suffix json.RawMessage `json:"suffix,omitempty"`
+}
+
 type userInputWire struct {
 	Header
-	Blocks                json.RawMessage       `json:"blocks,omitempty"`
-	NoFold                bool                  `json:"no_fold,omitzero"`
-	TargetLoopID          uuid.UUID             `json:"target_loop_id,omitzero"`
-	BackgroundHandBack    bool                  `json:"background_hand_back,omitzero"`
-	DelegateDeliveryPhase DelegateDeliveryPhase `json:"delegate_delivery_phase,omitzero"`
+	Blocks                json.RawMessage             `json:"blocks,omitempty"`
+	NoFold                bool                        `json:"no_fold,omitzero"`
+	TargetLoopID          uuid.UUID                   `json:"target_loop_id,omitzero"`
+	BackgroundHandBack    bool                        `json:"background_hand_back,omitzero"`
+	DelegateDeliveryPhase DelegateDeliveryPhase       `json:"delegate_delivery_phase,omitzero"`
+	Principal             *sessionwire.Principal      `json:"principal,omitzero"`
+	Metadata              sessionwire.MessageMetadata `json:"metadata,omitempty"`
+	Presented             *presentedWire              `json:"presented,omitzero"`
 }
 
 func marshalUserInput(c UserInput) ([]byte, error) {
 	blocks, err := marshalBlocks(CommandUserInput, c.Blocks)
 	if err != nil {
 		return nil, err
+	}
+	var presented *presentedWire
+	if c.Presented != nil {
+		prefix, err := marshalBlocks(CommandUserInput, c.Presented.Prefix)
+		if err != nil {
+			return nil, err
+		}
+		suffix, err := marshalBlocks(CommandUserInput, c.Presented.Suffix)
+		if err != nil {
+			return nil, err
+		}
+		presented = &presentedWire{Prefix: prefix, Suffix: suffix}
 	}
 	out, err := json.Marshal(userInputWire{
 		Header:                c.Header,
@@ -194,6 +215,9 @@ func marshalUserInput(c UserInput) ([]byte, error) {
 		TargetLoopID:          c.TargetLoopID,
 		BackgroundHandBack:    c.BackgroundHandBack,
 		DelegateDeliveryPhase: c.DelegateDeliveryPhase,
+		Principal:             c.Principal,
+		Metadata:              c.Metadata,
+		Presented:             presented,
 	})
 	if err != nil {
 		return nil, &CommandEncodeError{Type: CommandUserInput, Cause: err}
@@ -377,6 +401,18 @@ func decodeUserInput(data []byte) (Command, error) {
 	if err != nil {
 		return nil, err
 	}
+	var presented *Presented
+	if w.Presented != nil {
+		prefix, err := decodeBlocks(CommandUserInput, w.Presented.Prefix)
+		if err != nil {
+			return nil, err
+		}
+		suffix, err := decodeBlocks(CommandUserInput, w.Presented.Suffix)
+		if err != nil {
+			return nil, err
+		}
+		presented = &Presented{Prefix: prefix, Suffix: suffix}
+	}
 	return UserInput{
 		Header:                w.Header,
 		Blocks:                blocks,
@@ -384,6 +420,9 @@ func decodeUserInput(data []byte) (Command, error) {
 		TargetLoopID:          w.TargetLoopID,
 		BackgroundHandBack:    w.BackgroundHandBack,
 		DelegateDeliveryPhase: w.DelegateDeliveryPhase,
+		Principal:             w.Principal,
+		Metadata:              w.Metadata,
+		Presented:             presented,
 	}, nil
 }
 

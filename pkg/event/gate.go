@@ -2,6 +2,7 @@ package event
 
 import (
 	"github.com/looprig/core/content"
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/harness/pkg/gate"
 )
 
@@ -94,6 +95,8 @@ type GateResolved struct {
 	Reason   gate.CloseReason    `json:"reason,omitempty"`
 	Action   string              `json:"action,omitempty"`
 	Source   gate.ResponseSource `json:"source,omitzero"`
+	// Principal is who answered this gate, if the response was attributed.
+	Principal *sessionwire.Principal `json:"principal,omitzero"`
 	// Audit is a sealed interface (gate.ResponseAudit) with no general JSON codec,
 	// so it is excluded from direct serialization — like PermissionRequested.Request
 	// — and projected through gate.MarshalResponseAudit by the marshaler.

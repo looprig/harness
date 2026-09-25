@@ -7,8 +7,8 @@ import (
 	"github.com/looprig/harness/pkg/event"
 )
 
-// privacy.go holds the public-body redactions for configuration a Host knows and a
-// session viewer must not: the model endpoint and the Host's physical workspace path.
+// privacy.go holds public-body redactions: Host-only model endpoints and
+// workspace paths, gate audit payloads, and message metadata.
 //
 // Both redactions act on the PUBLIC projection only. The native replay body the
 // journal stores beside it (the envelope's runtime slot) is unchanged, so restore,
@@ -40,6 +40,24 @@ func publicWorkspaceRoot(sessionID uuid.UUID) string {
 // encoding. It returns encoded unchanged for a type that carries nothing to redact.
 func redactPublicBody(ev event.Event, encoded []byte) ([]byte, error) {
 	switch value := ev.(type) {
+	case event.TurnStarted, event.TurnFoldedInto, event.InputCancelled:
+		// The public message remains exactly what the model saw, and the
+		// principal/boundary counts remain visible. Custom metadata is audit-only.
+		if !hasMessageMetadata(value) {
+			return encoded, nil
+		}
+		return editObject(encoded, func(fields map[string]json.RawMessage) error {
+			if err := editMember(fields, "input", func(input map[string]json.RawMessage) error {
+				delete(input, "metadata")
+				return nil
+			}); err != nil {
+				return err
+			}
+			if string(fields["input"]) == "{}" {
+				delete(fields, "input")
+			}
+			return nil
+		})
 	case event.GateResolved:
 		// GateResolved's runtime audit may contain raw form answers. The public
 		// record retains the gate/action/source correlation but never the audit.
@@ -78,6 +96,19 @@ func redactPublicBody(ev event.Event, encoded []byte) ([]byte, error) {
 	default:
 		return encoded, nil
 	}
+}
+
+func hasMessageMetadata(value event.Event) bool {
+	var input *event.MessageInput
+	switch typed := value.(type) {
+	case event.TurnStarted:
+		input = typed.Input
+	case event.TurnFoldedInto:
+		input = typed.Input
+	case event.InputCancelled:
+		input = typed.Input
+	}
+	return input != nil && len(input.Metadata) > 0
 }
 
 // replaceWorkspaceRoot swaps a present workspace_root for the session's logical

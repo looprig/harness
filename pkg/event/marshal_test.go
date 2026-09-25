@@ -1738,6 +1738,7 @@ func FuzzDecodeEvent(f *testing.F) {
 		WorkspaceCheckpointed{Header: checkpointHeader(), Ref: "v1:sha256:x", Consistency: SnapshotFuzzy, Trigger: SnapshotTriggerManual},
 		WorkspaceRestored{Header: fullHeaderSession(), Ref: "v1:sha256:x"},
 		TurnStarted{Header: fullHeaderTurn(), TurnIndex: 1, Message: userMsg("hi")},
+		attributedTurnStarted(),
 		StepDone{Header: fullHeader(), Messages: sampleMessages()},
 		TurnDone{Header: fullHeaderTurn(), Message: aiMsg("done")},
 		TurnFailed{Header: fullHeaderTurn(), Err: &ToolLimitError{}},

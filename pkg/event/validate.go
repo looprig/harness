@@ -100,6 +100,8 @@ const (
 	FieldManifest           FieldName = "Manifest"
 	FieldDrift              FieldName = "Drift"
 	FieldMessage            FieldName = "Message"
+	FieldInput              FieldName = "Input"
+	FieldPrincipal          FieldName = "Principal"
 	FieldWorkflowName       FieldName = "WorkflowName"
 	FieldWorkflowVersion    FieldName = "WorkflowVersion"
 	FieldActivityKind       FieldName = "ActivityKind"
@@ -181,6 +183,20 @@ func validateEventIdentity(ev Event) error {
 
 func validateEventBody(ev Event) error {
 	switch e := ev.(type) {
+	case TurnStarted:
+		return validateMessageInput("TurnStarted", e.Cause.Agency, e.Message, e.Input)
+	case TurnFoldedInto:
+		return validateMessageInput("TurnFoldedInto", e.Cause.Agency, e.Message, e.Input)
+	case InputCancelled:
+		return validateMessageInput("InputCancelled", e.Cause.Agency, e.Message, e.Input)
+	case TurnInterrupted:
+		if e.Principal != nil && e.Principal.Validate() != nil {
+			return &InvalidEventError{Event: "TurnInterrupted", Field: FieldPrincipal, Rule: RuleInvalid}
+		}
+	case GateResolved:
+		if e.Principal != nil && e.Principal.Validate() != nil {
+			return &InvalidEventError{Event: "GateResolved", Field: FieldPrincipal, Rule: RuleInvalid}
+		}
 	case SessionStarted:
 		if !validConfigManifestSchema(e.Manifest, true) {
 			return &InvalidEventError{Event: "SessionStarted", Field: FieldManifest, Rule: RuleInvalid}

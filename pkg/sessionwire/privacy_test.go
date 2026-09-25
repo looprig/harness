@@ -6,11 +6,94 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/looprig/core/content"
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	model "github.com/looprig/inference/model"
 )
+
+func TestPublicBodyStripsMetadataKeepsPrincipal(t *testing.T) {
+	t.Parallel()
+	principal := &sessionwire.Principal{Tenant: "acme", Subject: "u1", Kind: sessionwire.PrincipalKindActor}
+	header := event.Header{Coordinates: identity.Coordinates{SessionID: testUUID(1), LoopID: testUUID(2), TurnID: testUUID(3)}, EventID: testUUID(4), Cause: identity.Cause{CommandID: testUUID(5), Agency: identity.AgencyUser}}
+	msg := &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "prefix"}, &content.TextBlock{Text: "source"}}}}
+	input := &event.MessageInput{Principal: principal, Metadata: sessionwire.MessageMetadata{"space": "family"}, Prefix: 1}
+	for _, value := range []event.Event{
+		event.TurnStarted{Header: header, TurnIndex: 1, Message: msg, Input: input},
+		event.TurnFoldedInto{Header: header, TurnIndex: 1, Message: msg, Input: input},
+		event.InputCancelled{Header: header, Reason: event.CancelClientRetracted, Message: msg, Input: input},
+	} {
+		native, err := event.MarshalEvent(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		public, err := redactPublicBody(value, native)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body struct {
+			Input map[string]json.RawMessage `json:"input"`
+		}
+		if err := json.Unmarshal(public, &body); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := body.Input["metadata"]; ok {
+			t.Fatalf("%T leaked metadata: %s", value, public)
+		}
+		for _, key := range []string{"principal", "prefix"} {
+			if _, ok := body.Input[key]; !ok {
+				t.Fatalf("%T dropped %s: %s", value, key, public)
+			}
+		}
+		if !bytes.Contains(native, []byte(`"space"`)) {
+			t.Fatalf("native body lost audit metadata: %s", native)
+		}
+	}
+	plain := event.TurnStarted{Header: header, TurnIndex: 1, Message: msg}
+	native, err := event.MarshalEvent(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, err := redactPublicBody(plain, native)
+	if err != nil || !bytes.Equal(native, public) {
+		t.Fatalf("unattributed event changed: %s -> %s: %v", native, public, err)
+	}
+	metadataOnly := plain
+	metadataOnly.Input = &event.MessageInput{Metadata: sessionwire.MessageMetadata{"space": "family"}}
+	native, err = event.MarshalEvent(metadataOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, err = redactPublicBody(metadataOnly, native)
+	if err != nil || bytes.Contains(public, []byte(`"input"`)) {
+		t.Fatalf("metadata-only public body = %s: %v", public, err)
+	}
+}
+
+func TestPublicBodyKeepsInterruptAndGatePrincipal(t *testing.T) {
+	t.Parallel()
+	principal := &sessionwire.Principal{Tenant: "acme", Subject: "u1", Kind: sessionwire.PrincipalKindActor}
+	header := event.Header{Coordinates: identity.Coordinates{SessionID: testUUID(1), LoopID: testUUID(2), TurnID: testUUID(3)}, EventID: testUUID(4)}
+	for _, value := range []event.Event{
+		event.TurnInterrupted{Header: header, TurnIndex: 1, Principal: principal},
+		event.GateResolved{Header: header, GateID: gate.ID(testUUID(5)), Resolver: gate.ResolverSession, Reason: gate.CloseAnswered, Action: string(gate.ApprovalApprove), Principal: principal},
+	} {
+		native, err := event.MarshalEvent(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		public, err := redactPublicBody(value, native)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(public, []byte(`"subject":"u1"`)) || bytes.Contains(public, []byte(`"audit"`)) {
+			t.Fatalf("%T public body = %s", value, public)
+		}
+	}
+}
 
 // credentialBaseURL is a model gateway URL carrying a credential in every place
 // an operator has been seen to put one: userinfo, a query parameter, a fragment,

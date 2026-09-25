@@ -798,6 +798,7 @@ func foldPending(ctx context.Context, cfg turnConfig, ts *turnState) error {
 				},
 				TurnIndex: ts.index,
 				Message:   cloneUserMessage(qi.msg),
+				Input:     cloneMessageInput(qi.input),
 			},
 		}
 		if cerr := cfg.commit(ctx, fold); cerr != nil {

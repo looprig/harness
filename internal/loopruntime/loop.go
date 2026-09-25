@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
@@ -649,6 +650,9 @@ type queuedInput struct {
 	// this", AgencyMachine (the zero default) otherwise.
 	agency identity.Agency
 	msg    *content.UserMessage
+	// input is the user message's attribution, copied onto its resolution event;
+	// machine-origin inputs leave it nil.
+	input *event.MessageInput
 	// noFold marks a delegate follow-up that must NEVER fold into a running turn at a
 	// tool-continuation boundary. drainInbox skips it (and everything behind it), so it
 	// stays queued and starts its OWN distinct turn when the current one finishes —
@@ -689,6 +693,7 @@ type loopState struct {
 	causationID       uuid.UUID // active submit command's Header.ID; zero when idle
 	status            loopStatus
 	cancelTurn        context.CancelFunc
+	interruptedBy     *sessionwire.Principal // active turn only; cleared at every start and terminal
 	cancelAdmission   context.CancelFunc
 	msgs              content.AgenticMessages // conversation history across turns
 	runtime           event.ModelRuntime
@@ -1435,6 +1440,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		state.status = loopRunning
 		turnCtx, cancel := context.WithCancel(parentCtx)
 		state.cancelTurn = cancel
+		state.interruptedBy = nil
 
 		// base is a defensive deep clone of pre-turn history, taken BEFORE the
 		// initial UserMessage is committed (runTurn reads it
@@ -1665,6 +1671,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			},
 			TurnIndex: state.turnIndex + 1,
 			Message:   cloneUserMessage(qi.msg),
+			Input:     cloneMessageInput(qi.input),
 		}
 		turnCall := hook.Call{
 			Operation:   hook.OperationTurn,
@@ -1791,6 +1798,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			},
 			Reason:  reason,
 			Message: cloneUserMessage(qi.msg),
+			Input:   cloneMessageInput(qi.input),
 		})
 	}
 
@@ -2329,6 +2337,12 @@ func runLoop(cfg loopConfig, state loopState) {
 		if commitCtx == nil {
 			commitCtx = ctx
 		}
+		if interrupted, ok := result.terminal.(event.TurnInterrupted); ok && state.interruptedBy != nil {
+			principal := *state.interruptedBy
+			interrupted.Principal = &principal
+			result.terminal = interrupted
+		}
+		state.interruptedBy = nil
 		_, boundaryErr := commitBoundary(commitCtx, result.terminal)
 		if boundaryErr != nil {
 			slog.Error("turn boundary commit failed", "error", boundaryErr)
@@ -2588,7 +2602,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			// its own live state — race-free — and PUBLISHES the typed outcome event
 			// (TurnStarted / InputQueued / TurnRejected) onto the session fan-in. A
 			// UserInput may be rejected, so bypassReject is false.
-			qi := queuedInput{inputID: c.CommandHeader().CommandID, agency: c.CommandHeader().Agency, msg: userMessageFromBlocks(c.Blocks), noFold: c.NoFold}
+			qi := queuedInput{inputID: c.CommandHeader().CommandID, agency: c.CommandHeader().Agency, msg: userMessageFromBlocks(c.ModelBlocks()), input: cloneMessageInput(c.MessageInput()), noFold: c.NoFold}
 			if c.Admission != nil {
 				admitRuntimeInput(c, qi)
 				return false
@@ -2690,6 +2704,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				idleCompaction.cancel()
 			}
 			if state.cancelTurn != nil {
+				state.interruptedBy = c.Principal
 				state.cancelTurn()
 				state.cancelTurn = nil
 				c.Ack <- true

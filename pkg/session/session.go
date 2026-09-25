@@ -6,6 +6,7 @@ import (
 	"context"
 
 	"github.com/looprig/core/content"
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
@@ -409,4 +410,21 @@ type LeaseEpochReporter interface {
 	// LeaseEpoch reports the epoch of the single-writer lease this process holds, and
 	// whether it holds one. It does no I/O and does not block.
 	LeaseEpoch() (epoch uint64, held bool)
+}
+
+// Input is an in-process user message with optional caller-verified attribution.
+// Principal and Metadata are audit-only unless a Message Presenter renders them.
+type Input struct {
+	Blocks    []content.Block
+	Principal *sessionwire.Principal
+	Metadata  sessionwire.MessageMetadata
+}
+
+// InputSubmitter is the segregated capability for attributed input. The ordinary
+// Session interface and its Submit signature remain unchanged; callers discover
+// this capability by asserting controller.(session.InputSubmitter). SubmitInput
+// validates attribution, refuses an empty message, and returns the command id
+// used as Cause.CommandID on the resulting events.
+type InputSubmitter interface {
+	SubmitInput(context.Context, Input) (uuid.UUID, error)
 }

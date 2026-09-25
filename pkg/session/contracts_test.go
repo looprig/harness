@@ -45,6 +45,7 @@ var publicSessionContracts = map[string]bool{
 	"PersistenceFaultReporter": true, "ResidencyAbandoner": true,
 	"WorkspaceReporter": true, "WorkspaceStatus": true,
 	"LeaseEpochReporter": true,
+	"Input":              true, "InputSubmitter": true,
 }
 
 var forbiddenSessionSurface = map[string]bool{
@@ -135,6 +136,25 @@ func TestPublicSessionContractsAreInterfaces(t *testing.T) {
 	t.Parallel()
 	var _ interface{ SessionID() uuid.UUID } = session.Session(nil)
 	var _ session.Session = (session.SessionController)(nil)
+}
+
+func TestInputSubmitterIsSegregated(t *testing.T) {
+	t.Parallel()
+	contract := reflect.TypeFor[session.InputSubmitter]()
+	if contract.NumMethod() != 1 {
+		t.Fatalf("InputSubmitter has %d methods, want only SubmitInput", contract.NumMethod())
+	}
+	if _, ok := contract.MethodByName("SubmitInput"); !ok {
+		t.Fatal("InputSubmitter lacks SubmitInput")
+	}
+	if !reflect.TypeFor[*sessionruntime.Session]().Implements(contract) {
+		t.Fatal("runtime session does not satisfy InputSubmitter")
+	}
+	for _, view := range []reflect.Type{reflect.TypeFor[session.Session](), reflect.TypeFor[session.SessionController]()} {
+		if _, ok := view.MethodByName("SubmitInput"); ok {
+			t.Fatalf("%s acquired SubmitInput", view.Name())
+		}
+	}
 }
 
 func TestRestoreNoPrimerLoopWireValue(t *testing.T) {

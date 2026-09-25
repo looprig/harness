@@ -1,6 +1,7 @@
 package rig
 
 import (
+	"reflect"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -47,7 +48,22 @@ const (
 	keyPermissionReviewObservations    singletonKey = "permission_review_observations"
 	keySessionResourceStorage          singletonKey = "session_resource_storage"
 	keyToolResultCapture               singletonKey = "tool_result_capture"
+	keyMessagePresenter                singletonKey = "message_presenter"
 )
+
+// nilInterfaceValue also catches a typed nil behind an option interface.
+func nilInterfaceValue(value any) bool {
+	if value == nil {
+		return true
+	}
+	v := reflect.ValueOf(value)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
+	}
+}
 
 // WithPermissionClassifiers installs the already-validated, ordered permission
 // classifier registry. Registration order is behavioral and therefore remains

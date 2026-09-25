@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
@@ -208,7 +209,7 @@ type interruptOutcome struct {
 // controller interrupt. ctx bounds the whole fan-out; a ctx cancellation returns
 // (false, *SessionError{SessionContextDone}). A per-loop id-gen failure SKIPS that loop
 // (best-effort, mirroring Shutdown) rather than failing the whole interrupt.
-func (s *Session) fanoutInterrupt(ctx context.Context, snapshot []loopSnapshot, agency identity.Agency) (bool, error) {
+func (s *Session) fanoutInterrupt(ctx context.Context, snapshot []loopSnapshot, agency identity.Agency, principal *sessionwire.Principal) (bool, error) {
 	targets := make([]preparedInterrupt, 0, len(snapshot))
 	for _, ls := range snapshot {
 		id, err := s.newCommandID()
@@ -222,7 +223,7 @@ func (s *Session) fanoutInterrupt(ctx context.Context, snapshot []loopSnapshot, 
 			continue
 		}
 		ack := make(chan bool, 1)
-		cmd := command.Interrupt{Header: command.Header{CommandID: id, Agency: agency, CreatedAt: s.stampNow()}, Ack: ack}
+		cmd := command.Interrupt{Header: command.Header{CommandID: id, Agency: agency, CreatedAt: s.stampNow()}, Principal: principal, Ack: ack}
 		// Intent log (audit-only): one record per loop, appended BEFORE this loop's send; a
 		// failure is logged and the fan-out proceeds.
 		s.appendCommand(ctx, ls.loopID, cmd)
@@ -280,8 +281,12 @@ func (s *Session) deliverInterrupt(ctx context.Context, t preparedInterrupt) int
 // whether any turn was cancelled, a channel that closes once the barrier has released the marks
 // (nil when no barrier was armed), and a typed error. The exported entry points discard the barrier
 // channel; in-package tests await it to assert release deterministically.
-func (s *Session) runInterrupt(ctx context.Context, selectLocked func() ([]loopSnapshot, bool), agency identity.Agency) (bool, <-chan struct{}, error) {
-	any, barrier, err := s.runInterruptWithBarrier(ctx, selectLocked, agency)
+func (s *Session) runInterrupt(ctx context.Context, selectLocked func() ([]loopSnapshot, bool), agency identity.Agency, principal ...*sessionwire.Principal) (bool, <-chan struct{}, error) {
+	var attributed *sessionwire.Principal
+	if len(principal) > 0 {
+		attributed = principal[0]
+	}
+	any, barrier, err := s.runInterruptWithBarrier(ctx, selectLocked, agency, attributed)
 	if barrier == nil {
 		return any, nil, err
 	}
@@ -293,7 +298,7 @@ func (s *Session) runInterrupt(ctx context.Context, selectLocked func() ([]loopS
 // persistent-agent stop has a narrower lifecycle: it must release its own mark at the target's
 // LoopIdle edge, without leaving the later policy goroutine able to consume an overlapping scope's
 // refcount. Returning the barrier gives that caller a single-owner release operation.
-func (s *Session) runInterruptWithBarrier(ctx context.Context, selectLocked func() ([]loopSnapshot, bool), agency identity.Agency) (bool, *interruptBarrier, error) {
+func (s *Session) runInterruptWithBarrier(ctx context.Context, selectLocked func() ([]loopSnapshot, bool), agency identity.Agency, principal ...*sessionwire.Principal) (bool, *interruptBarrier, error) {
 	s.loopsMu.Lock()
 	snapshot, ok := selectLocked()
 	if ok {
@@ -322,7 +327,11 @@ func (s *Session) runInterruptWithBarrier(ctx context.Context, selectLocked func
 		ids[i] = ls.loopID
 	}
 
-	any, err := s.fanoutInterrupt(ctx, snapshot, agency)
+	var attributed *sessionwire.Principal
+	if len(principal) > 0 {
+		attributed = principal[0]
+	}
+	any, err := s.fanoutInterrupt(ctx, snapshot, agency, attributed)
 	if err != nil {
 		checkpointSweep.cancel()
 		s.clearInterruptPending(ids) // a cancelled fan-out must not strand the admission barrier

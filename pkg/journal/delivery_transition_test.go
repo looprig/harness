@@ -1,6 +1,7 @@
 package journal
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -61,6 +62,12 @@ func TestCommandRecordNormalizedDeliveryFingerprintIgnoresPhase(t *testing.T) {
 	}
 	if intentFP != fallbackFP {
 		t.Fatal("intent and fallback normalized fingerprints differ despite identical payload")
+	}
+	// This machine input carries no attribution. Its normalized durable bytes
+	// must remain exactly those from before presenter support was added.
+	const wantNormalizedDeliverySHA = "26b0d50567aff531bccf8f80b22d5d5745c80dc6b2f59cf8e81708eccab50519"
+	if got := fmt.Sprintf("%x", intentFP.sum); got != wantNormalizedDeliverySHA {
+		t.Fatalf("machine input fingerprint changed: %s, want %s", got, wantNormalizedDeliverySHA)
 	}
 	changedFP, err := changedRecord.NormalizedDeliveryFingerprint()
 	if err != nil {

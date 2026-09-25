@@ -3,6 +3,7 @@ package command
 import (
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/present"
 )
 
 // Rule is the human-readable invariant a CommandValidationError records, so the
@@ -37,6 +38,10 @@ const (
 	FieldToolExecutionID       CommandField = "ToolExecutionID"
 	FieldAgency                CommandField = "Agency"
 	FieldAction                CommandField = "Action"
+	FieldAttribution           CommandField = "Attribution"
+	FieldPrincipal             CommandField = "Principal"
+	FieldMetadata              CommandField = "Metadata"
+	FieldPresented             CommandField = "Presented"
 )
 
 // CommandValidationError reports that a command violates the ID fill matrix: Field
@@ -87,6 +92,26 @@ func ValidateCommand(cmd Command) error {
 		}
 		if c.BackgroundHandBack && !c.NoFold && c.DelegateDeliveryPhase == "" {
 			return &CommandValidationError{Command: CommandUserInput, Field: FieldBackgroundHandBack, Rule: RuleInvalid}
+		}
+		if c.Agency != identity.AgencyUser && (c.Principal != nil || len(c.Metadata) > 0 || c.Presented != nil) {
+			return &CommandValidationError{Command: CommandUserInput, Field: FieldAttribution, Rule: RuleInvalid}
+		}
+		if c.Principal != nil && c.Principal.Validate() != nil {
+			return &CommandValidationError{Command: CommandUserInput, Field: FieldPrincipal, Rule: RuleInvalid}
+		}
+		if len(c.Metadata) > 0 && c.Metadata.Validate() != nil {
+			return &CommandValidationError{Command: CommandUserInput, Field: FieldMetadata, Rule: RuleInvalid}
+		}
+		if c.Presented != nil {
+			frame := present.Frame{Prefix: c.Presented.Prefix, Suffix: c.Presented.Suffix}
+			if frame.Empty() || frame.Validate() != nil {
+				return &CommandValidationError{Command: CommandUserInput, Field: FieldPresented, Rule: RuleInvalid}
+			}
+		}
+		return nil
+	case Interrupt:
+		if c.Principal != nil && c.Principal.Validate() != nil {
+			return &CommandValidationError{Command: CommandInterrupt, Field: FieldPrincipal, Rule: RuleInvalid}
 		}
 		return nil
 	case SubagentResult:

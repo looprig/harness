@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/present"
 	"github.com/looprig/harness/pkg/runtimecommand"
 )
 
@@ -72,6 +73,38 @@ func (s *Session) recordDisposition(
 		_, err := log.AppendCommandDisposition(ctx, admitted.DispositionFor(kind, s.runtimeCommandLease.Epoch()))
 		return err
 	})
+}
+
+// refusePresentation settles an attempt whose presenter failed before any
+// command intent was journaled. Only the error kind is logged: the presenter's
+// message may contain product data. A legacy command has no disposition path and
+// remains re-offerable. For an attempt, the durable application prefix makes any
+// redelivery a duplicate; the subsequent refusal carries no reason by design.
+func (s *Session) refusePresentation(
+	ctx context.Context, log runtimeCommandLog, dispositions dispositionLog,
+	admitted runtimecommand.Admitted, cause *present.Error,
+) (runtimecommand.Disposition, error) {
+	slog.WarnContext(ctx, "session: message presenter refused an admitted input",
+		"session", s.sessionID, "command_id", admitted.CommandID, "kind", cause.Kind)
+	if admitted.AttemptID == "" {
+		return runtimecommand.Disposition{}, cause
+	}
+	var result journal.AppendResult
+	if err := s.sealedDurableWrite(func() error {
+		var appendErr error
+		result, appendErr = log.AppendCommandApplication(ctx, admitted.Application())
+		return appendErr
+	}); err != nil {
+		return s.resolveApplicationConflict(ctx, log, admitted, err)
+	}
+	disposition := runtimecommand.Disposition{
+		CommandID: admitted.CommandID, RuntimeCommandID: admitted.RuntimeCommandID, PrefixSequence: result.Sequence,
+	}
+	if !result.Appended {
+		disposition.Duplicate = true
+		return disposition, nil
+	}
+	return disposition, errors.Join(cause, s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionRefused))
 }
 
 // CloseAttempt writes the not_applied recovery closure for an attempt a previous
@@ -325,9 +358,35 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 	var pending *pendingInput
 	if admitted.Kind == runtimecommand.KindInput ||
 		(admitted.Kind == runtimecommand.KindCreate && len(admitted.Blocks) > 0) {
+		// The intent is audit-first, so a redelivery would otherwise invoke the
+		// presenter before discovering the already-durable prefix. Pay for a
+		// whole-journal scan only when presentation is installed.
+		if s.presenter != nil && hasDispositions {
+			scan, err := dispositions.ScanCommandEffect(ctx, admitted.CommandID, admitted.RuntimeCommandID)
+			if err != nil {
+				return runtimecommand.Disposition{}, err
+			}
+			if scan.PrefixSeq != 0 {
+				if scan.DurableRuntimeID != admitted.RuntimeCommandID || scan.DurableKind != admitted.Kind {
+					return runtimecommand.Disposition{}, &runtimecommand.MappingConflictError{
+						CommandID: admitted.CommandID, RuntimeCommandID: admitted.RuntimeCommandID,
+						DurableRuntimeID: scan.DurableRuntimeID, Kind: admitted.Kind,
+						DurableKind: scan.DurableKind, Sequence: scan.PrefixSeq,
+					}
+				}
+				return runtimecommand.Disposition{
+					CommandID: admitted.CommandID, RuntimeCommandID: admitted.RuntimeCommandID,
+					PrefixSequence: scan.PrefixSeq, Duplicate: true,
+				}, nil
+			}
+		}
 		var prepErr error
 		pending, prepErr = s.prepareAdmittedInput(ctx, admitted)
 		if prepErr != nil {
+			var presentErr *present.Error
+			if errors.As(prepErr, &presentErr) {
+				return s.refusePresentation(ctx, log, dispositions, admitted, presentErr)
+			}
 			return runtimecommand.Disposition{}, prepErr
 		}
 	}
@@ -371,6 +430,7 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 	//   input,         the loop took it and committed `applied`   -> applied
 	//                  BEFORE queueing it (applyAdmittedInput)
 	//   input,         the loop declined it before the commit     -> refused
+	//   input/create,  the presenter refused the message          -> refused (prefix, no intent)
 	//   interrupt,     fan-out completed, any == true            -> applied
 	//   interrupt,     fan-out completed, any == false           -> no_op   (a SUCCESS)
 	//   gate_response, the answer's GateResolved is durable      -> applied
@@ -426,7 +486,7 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 		// The interrupt is the kind that is ALWAYS in the no-adjacency position rather
 		// than occasionally — an idle interrupt is fail-quiet and appends no public
 		// event at all — but the gap itself is general; see the method doc.
-		interrupted, err := s.Interrupt(ctx)
+		interrupted, err := s.interruptAs(ctx, admitted.Principal)
 		if err != nil {
 			return disposition, errors.Join(err, s.recordDisposition(ctx, dispositions, admitted, runtimecommand.DispositionRefused))
 		}
@@ -445,7 +505,7 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 		// durably BEFORE this frame, and carries the runtime id in its Cause; see
 		// gateResponseDisposition for the ordering argument.
 		outcome, err := gateResponseDisposition(
-			s.respondGateAsCaller(ctx, *admitted.GateResponse, admitted.RuntimeCommandID))
+			s.respondGateAsCaller(ctx, *admitted.GateResponse, gateCause{commandID: admitted.RuntimeCommandID, principal: admitted.Principal}))
 		if err != nil {
 			return disposition, errors.Join(err, s.recordDisposition(ctx, dispositions, admitted, outcome))
 		}
@@ -782,13 +842,18 @@ func (s *Session) prepareAdmittedInput(ctx context.Context, admitted runtimecomm
 		return nil, &SessionError{Kind: SessionLoopExited}
 	default:
 	}
+	attr, err := s.presentUserInput(ctx, active, admitted.Kind, admitted.Blocks, admitted.Principal, admitted.Metadata)
+	if err != nil {
+		return nil, err
+	}
 	if admitted.AttemptID == "" {
-		cmd := s.buildAndAuditUserInput(ctx, active, admitted.Blocks, identity.AgencyUser, false, admitted.RuntimeCommandID)
+		cmd := s.buildAndAuditUserInput(ctx, active, admitted.Blocks, identity.AgencyUser, false, admitted.RuntimeCommandID, attr)
 		return &pendingInput{backend: l, cmd: cmd}, nil
 	}
 	cmd := command.UserInput{
-		Header: command.Header{CommandID: admitted.RuntimeCommandID, Agency: identity.AgencyUser, CreatedAt: s.stampNow()},
-		Blocks: admitted.Blocks,
+		Header:    command.Header{CommandID: admitted.RuntimeCommandID, Agency: identity.AgencyUser, CreatedAt: s.stampNow()},
+		Blocks:    admitted.Blocks,
+		Principal: attr.principal, Metadata: attr.metadata, Presented: attr.presented,
 	}
 	if err := s.appendAdmittedIntent(ctx, active, cmd); err != nil {
 		return nil, err

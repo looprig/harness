@@ -84,6 +84,9 @@ const (
 	// the failure mode otherwise is a turn that ends on a retention error long
 	// after the misconfiguration.
 	DefinitionInvalidToolResultCapture DefinitionErrorKind = "invalid_tool_result_capture"
+	// DefinitionInvalidMessagePresenter: WithMessagePresenter was given a nil or
+	// typed-nil presenter.
+	DefinitionInvalidMessagePresenter DefinitionErrorKind = "invalid_message_presenter"
 	// DefinitionToolResultSpillOverlapsWorkspace: the capture spill base is equal
 	// to, inside, or an ancestor of the configured workspace region. A workspace
 	// checkpoint archives the whole region, so a spill inside it would be

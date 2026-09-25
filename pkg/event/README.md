@@ -51,6 +51,13 @@ fails the build here first.
   whose `ReplyTo()` returns the embedded `Header.Cause.CommandID`. The
   set is asserted in tests so the seven stay sealed.
 
+`TurnStarted`, `TurnFoldedInto`, and `InputCancelled` may carry `MessageInput`:
+the verified principal, audit metadata, and prefix/suffix counts in their
+assembled user message. `UserBlocks(message, input)` recovers the caller's
+original blocks. Public projections remove `input.metadata` but retain the
+principal and assembled message; native runtime journal records keep all three.
+`TurnInterrupted` and `GateResolved` may carry the principal who caused them.
+
 ## How to use
 
 You usually don't construct events directly — the runtime and the

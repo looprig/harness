@@ -4,7 +4,9 @@ import (
 	"context"
 
 	"github.com/looprig/core/content"
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 )
 
@@ -66,6 +68,13 @@ type UserInput struct {
 	// delivery. Intent and fallback_queued are journaled together with this exact
 	// command record, so the actor payload and fallback phase cannot diverge.
 	DelegateDeliveryPhase DelegateDeliveryPhase `json:"delegate_delivery_phase,omitzero"`
+	// Attribution is durable on this intent and the resulting message events.
+	// Machine-originated input may not carry it.
+	Principal *sessionwire.Principal      `json:"principal,omitzero"`
+	Metadata  sessionwire.MessageMetadata `json:"metadata,omitempty"`
+	// Presented is the one journaled rendering. The loop sends Prefix ++ Blocks
+	// ++ Suffix; restore re-offers this frame rather than presenting again.
+	Presented *Presented `json:"-"`
 	// Accepted is the transient durable-acceptance ack used only by managed delegate
 	// sends. It is never serialized; prepared starts use LoopStarted.InitialRequestID.
 	Accepted chan error `json:"-"`
@@ -74,6 +83,38 @@ type UserInput struct {
 	// never serialized. See Admission for the contract; a UserInput carries at most
 	// one of Accepted and Admission.
 	Admission *Admission `json:"-"`
+}
+
+// Presented is a nonempty journaled presenter frame. An empty frame is stored
+// as nil so an unpresented input stays byte-identical to old records.
+type Presented struct {
+	Prefix []content.Block
+	Suffix []content.Block
+}
+
+// ModelBlocks returns the model-visible blocks without cloning. The loop
+// clones them when it constructs a committed UserMessage.
+func (c UserInput) ModelBlocks() []content.Block {
+	if c.Presented == nil {
+		return c.Blocks
+	}
+	out := make([]content.Block, 0, len(c.Presented.Prefix)+len(c.Blocks)+len(c.Presented.Suffix))
+	out = append(out, c.Presented.Prefix...)
+	out = append(out, c.Blocks...)
+	return append(out, c.Presented.Suffix...)
+}
+
+// MessageInput projects the intent's attribution onto a message event. The
+// nil result preserves the pre-feature event encoding.
+func (c UserInput) MessageInput() *event.MessageInput {
+	if c.Principal == nil && len(c.Metadata) == 0 && c.Presented == nil {
+		return nil
+	}
+	input := &event.MessageInput{Principal: c.Principal, Metadata: c.Metadata}
+	if c.Presented != nil {
+		input.Prefix, input.Suffix = len(c.Presented.Prefix), len(c.Presented.Suffix)
+	}
+	return input
 }
 
 // Admission is the synchronous handshake between the runtime-command applier and

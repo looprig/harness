@@ -90,6 +90,7 @@ type TurnStarted struct {
 	Header
 	TurnIndex TurnIndex            `json:"turn_index,omitzero"`
 	Message   *content.UserMessage `json:"message,omitzero"`
+	Input     *MessageInput        `json:"input,omitzero"`
 }
 
 // ToolResultEncoding describes the bytes retained for one tool result. It says
@@ -183,6 +184,7 @@ type TurnFoldedInto struct {
 	Header
 	TurnIndex TurnIndex            `json:"turn_index,omitzero"`
 	Message   *content.UserMessage `json:"message,omitzero"`
+	Input     *MessageInput        `json:"input,omitzero"`
 }
 
 // InputCancelled is emitted when a queued input leaves the loop queue without
@@ -197,6 +199,7 @@ type InputCancelled struct {
 	TurnIndex TurnIndex            `json:"turn_index,omitzero"`
 	Reason    CancelReason         `json:"reason,omitzero"`
 	Message   *content.UserMessage `json:"message,omitzero"`
+	Input     *MessageInput        `json:"input,omitzero"`
 }
 
 // RejectReason explains why a UserInput submit was refused (carried by TurnRejected).
@@ -297,6 +300,8 @@ type TurnInterrupted struct {
 	loopScoped
 	Header
 	TurnIndex TurnIndex `json:"turn_index,omitzero"`
+	// Principal is who interrupted this turn, if the command was attributed.
+	Principal *sessionwire.Principal `json:"principal,omitzero"`
 }
 
 func (TurnStarted) isEvent()          {}

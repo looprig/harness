@@ -1,9 +1,25 @@
 package loopruntime
 
 import (
+	"maps"
+
 	"github.com/looprig/core/content"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/inference"
 )
+
+func cloneMessageInput(in *event.MessageInput) *event.MessageInput {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	if in.Principal != nil {
+		principal := *in.Principal
+		out.Principal = &principal
+	}
+	out.Metadata = maps.Clone(in.Metadata)
+	return &out
+}
 
 // cloneInferenceRequest gives an external request collaborator independent
 // ownership of every reference-backed field while preserving scalar request

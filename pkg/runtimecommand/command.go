@@ -37,6 +37,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/looprig/core/content"
+	coresessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 
 	"github.com/looprig/harness/pkg/gate"
@@ -221,6 +222,12 @@ type Admitted struct {
 	// refusing it here would turn an old Host's create into a hard refusal instead
 	// of the unsettled command it already is.
 	AttemptID AttemptID
+	// Principal is Factory's assertion about the verified sender. Harness carries
+	// it unchanged and never places it on a model-facing content.Message.
+	Principal *coresessionwire.Principal
+	// Metadata is app-defined message data, permitted only on create and input.
+	// It is audit-only unless a presenter renders it.
+	Metadata coresessionwire.MessageMetadata
 }
 
 // Validate fails closed on any admitted record Harness cannot apply.
@@ -272,6 +279,19 @@ func (a Admitted) Validate() error {
 	if a.GateResponse != nil && a.GateResponse.GateID.IsZero() {
 		return &ValidationError{Field: "GateResponse", Reason: "names no gate"}
 	}
+	if a.Principal != nil {
+		if err := a.Principal.Validate(); err != nil {
+			return &ValidationError{Field: "Principal", Reason: err.Error()}
+		}
+	}
+	if a.Metadata != nil {
+		if a.Kind != KindInput && a.Kind != KindCreate {
+			return &ValidationError{Field: "Metadata", Reason: string(a.Kind) + " carries no message metadata"}
+		}
+		if err := a.Metadata.Validate(); err != nil {
+			return &ValidationError{Field: "Metadata", Reason: err.Error()}
+		}
+	}
 	return nil
 }
 
@@ -300,7 +320,8 @@ type Application struct {
 }
 
 // Application returns the durable correlation for this admitted record. It copies
-// the identities rather than deriving new ones.
+// the identities rather than deriving new ones. This prefix is deliberately
+// bodiless; Principal and Metadata live on the intent and disposition descriptor.
 func (a Admitted) Application() Application {
 	return Application{
 		CommandID:        a.CommandID,

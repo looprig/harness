@@ -1,5 +1,7 @@
 package command
 
+import sessionwire "github.com/looprig/core/sessionwire/v1"
+
 const (
 	CommandInterrupt CommandName  = "Interrupt"
 	InterruptAck     CommandField = "Ack"
@@ -10,7 +12,9 @@ const (
 // Ack is required and must be non-nil.
 type Interrupt struct {
 	Header
-	Ack chan<- bool `json:"-"` // live reply channel; no JSON representation
+	// Principal is who stopped the session, when a Host admitted one.
+	Principal *sessionwire.Principal `json:"principal,omitzero"`
+	Ack       chan<- bool            `json:"-"` // live reply channel; no JSON representation
 }
 
 func (Interrupt) isCommand() {}

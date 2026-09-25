@@ -1059,12 +1059,13 @@ func decodeRestoreErrored(data []byte) (Event, error) {
 // serializes to an absent key.
 type gateResolvedWire struct {
 	Header
-	GateID   gate.ID             `json:"gate_id,omitzero"`
-	Resolver gate.ResolverKind   `json:"resolver,omitempty"`
-	Reason   gate.CloseReason    `json:"reason,omitempty"`
-	Action   string              `json:"action,omitempty"`
-	Source   gate.ResponseSource `json:"source,omitzero"`
-	Audit    json.RawMessage     `json:"audit,omitempty"`
+	GateID    gate.ID                `json:"gate_id,omitzero"`
+	Resolver  gate.ResolverKind      `json:"resolver,omitempty"`
+	Reason    gate.CloseReason       `json:"reason,omitempty"`
+	Action    string                 `json:"action,omitempty"`
+	Source    gate.ResponseSource    `json:"source,omitzero"`
+	Principal *sessionwire.Principal `json:"principal,omitzero"`
+	Audit     json.RawMessage        `json:"audit,omitempty"`
 }
 
 func marshalGateResolved(e GateResolved) ([]byte, error) {
@@ -1077,13 +1078,14 @@ func marshalGateResolved(e GateResolved) ([]byte, error) {
 		auditJSON = a
 	}
 	out, err := json.Marshal(gateResolvedWire{
-		Header:   e.Header,
-		GateID:   e.GateID,
-		Resolver: e.Resolver,
-		Reason:   e.Reason,
-		Action:   e.Action,
-		Source:   e.Source,
-		Audit:    auditJSON,
+		Header:    e.Header,
+		GateID:    e.GateID,
+		Resolver:  e.Resolver,
+		Reason:    e.Reason,
+		Action:    e.Action,
+		Source:    e.Source,
+		Principal: e.Principal,
+		Audit:     auditJSON,
 	})
 	if err != nil {
 		return nil, &EventEncodeError{Type: "GateResolved", Cause: err}
@@ -1097,12 +1099,13 @@ func decodeGateResolved(data []byte) (Event, error) {
 		return nil, &EventDecodeError{Type: "GateResolved", Cause: err}
 	}
 	ev := GateResolved{
-		Header:   w.Header,
-		GateID:   w.GateID,
-		Resolver: w.Resolver,
-		Reason:   w.Reason,
-		Action:   w.Action,
-		Source:   w.Source,
+		Header:    w.Header,
+		GateID:    w.GateID,
+		Resolver:  w.Resolver,
+		Reason:    w.Reason,
+		Action:    w.Action,
+		Source:    w.Source,
+		Principal: w.Principal,
 	}
 	if len(w.Audit) > 0 {
 		audit, err := gate.UnmarshalResponseAudit(w.Audit)
