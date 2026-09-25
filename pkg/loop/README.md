@@ -144,7 +144,13 @@ drives; restore recovers its foreign session id from the journal.
 A `Mode` is a predeclared alternative to a definition's base inference
 settings: model, effort, tools, tool limits, and an optional instructions
 override. The implicit base mode is the empty `ModeName`. Default tool
-limits are 25 iterations, 100 calls per turn, 8 parallel calls.
+limits are 25 iterations, 100 calls per turn, 8 parallel calls. Zero in
+`Iterations`, `Calls`, or `Parallel` selects that default. `loop.Unlimited`
+(-1) on `Iterations` or `Calls` disables that cap, in either the base limits
+or a mode override. Other negative values are refused. `Parallel`,
+`ResultBytes`, and `CaptureBytes` have no unlimited value. An unlimited loop
+stops when the model ends the turn, or on interrupt, shutdown, or context
+cancellation.
 
 ### Compaction and context policy
 

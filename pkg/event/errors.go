@@ -14,7 +14,9 @@ func (EmptyResponseError) Error() string { return "loop: empty response from pro
 // exceeded. It is typed and secret-free (it carries only the counts), so it is
 // safe to surface un-redacted in TurnFailed.Err — it never embeds raw
 // messages or tool arguments. Callers may errors.As it to distinguish a runaway
-// stop from a provider/network failure.
+// stop from a provider/network failure. MaxIterations or MaxCalls is
+// loop.Unlimited (-1) when that cap is disabled; the other finite cap then
+// caused the error.
 type ToolLimitError struct {
 	Iterations    int
 	MaxIterations int

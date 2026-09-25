@@ -1,6 +1,7 @@
 # Design: explicit unbounded execution, zero hustle timeout, opaque tool input
 
-Status: **approved by the owner 2026-09-25**, not yet implemented. Ships in
+Status: **approved by the owner 2026-09-25**; implementation progress is tracked
+below. Ships in
 harness v0.41.0 (alongside the message principal/metadata/presenter work in
 `2026-09-25-message-principal-metadata-presenter-design.md`) and inference
 v0.14.0.
@@ -113,9 +114,25 @@ Two further Oxy patches are **not** upstreamed; Oxy drops them itself:
 
 | Item | Module | Status |
 |---|---|---|
-| 1 `loop.Unlimited` | harness v0.41.0 | not started |
-| 2 zero hustle timeout | harness v0.41.0 | not started |
-| 3 opaque tool input | harness v0.41.0 | not started |
+| 1 `loop.Unlimited` | harness v0.41.0 | on main (unreleased; ships in v0.41.0 via impl-05) |
+| 2 zero hustle timeout | harness v0.41.0 | on main (unreleased; ships in v0.41.0 via impl-05) |
+| 3 opaque tool input | harness v0.41.0 | on main (unreleased; ships in v0.41.0 via impl-05) |
 | 4 no execution ceiling | inference v0.14.0 | not started |
 | Oxy drops HustleHost (titles out of rig) | Oxy Phase 3 | in progress |
 | Oxy drops extractor patch (structured output) | Oxy | not started |
+
+## Release-note material (for v0.41.0)
+
+- `loop.Unlimited` is a new exported constant. `ToolLimits.Iterations` and
+  `Calls`, and `rig.DelegationLimits.Quota`, accept -1 to disable the cap.
+  A caller that passed -1 by mistake previously got `invalid_tool_limits` or
+  `invalid_delegation_limits` and now gets unlimited execution or spawning.
+  -2 and below remain invalid. At the internal runtime level, -1 previously
+  selected a default cap and is now preserved.
+- Explicit `hustle.WithTimeout(0)` and a durable descriptor with
+  `TimeoutNanos: 0` mean no execution deadline. Omitting `WithTimeout` remains
+  invalid. This relaxes validation, but an older harness refuses to replay a
+  zero-timeout descriptor. Do not roll back below v0.41.0 once one has run.
+- A `tool_use` block's `Input` is opaque to the duplicate-key check. Journals
+  whose tool arguments repeat a key now replay; harness v0.40.x and earlier
+  cannot read those journals, as was already the case.

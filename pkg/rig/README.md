@@ -161,6 +161,9 @@ created:
 - A `*sessionstore.Store` is required; workspace placement is optional
   but at most one placement may be configured.
 - Hustle lane bounds are within `MaxHustleQueued`; gate caps are positive.
+- Delegation limits are non-negative, except that `Quota` may be
+  `loop.Unlimited` to disable the per-session lifetime spawn cap. `Depth`
+  stays bounded (zero means the default of 3).
 - Permission classifiers are supplied as one validated, ordered
   `gate.PermissionClassifierSet` and are paired with a canonical local review
   policy revision. Supplying only one half is rejected. Their frozen

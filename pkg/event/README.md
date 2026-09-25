@@ -128,6 +128,12 @@ turnsOnly, _ := session.SubscribeEvents(event.EventFilter{
    (class-aware overflow)    (only ClassEnduring persisted)
 ```
 
+`UnmarshalEvent` refuses any record whose JSON repeats an object key
+(case-insensitively). The one exemption is a `tool_use` block's `Input` inside
+an event's message blocks: those bytes are the model's tool-call arguments,
+kept verbatim, so a model that repeats a key cannot make a journal
+unreplayable. The block's own keys stay strictly checked.
+
 ### Why the mixins
 
 The "exactly one of each" rule is enforced from both sides:

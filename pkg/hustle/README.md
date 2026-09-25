@@ -74,6 +74,11 @@ r, err := rig.Define(
 )
 ```
 
+`WithTimeout` is required. `WithTimeout(0)` means no execution deadline: the
+run still ends on caller or session cancellation, and `AuditTimeout` and
+`FinalizationTimeout` still bound audit and finalization. A negative timeout
+is refused. A descriptor with `TimeoutNanos: 0` is valid and replays.
+
 A loop invokes a hustle through the hustle tool (built by the
 composition root) and observes the outcome as a typed event on the
 session stream (`HustleStarted`, `HustleCompleted`, `HustleFailed`).
