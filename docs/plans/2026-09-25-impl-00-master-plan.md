@@ -92,8 +92,8 @@ commit), merged, released (tag).
 | 04 harness unbounded + opaque input | released (in harness `v0.41.0`) | implemented and independently reviewed; remote annotated tag verified |
 | 05 harness v0.41.0 | released (`911d4ad7`, tag `221785d5`) | standalone and integration race suites, `make check`, compatibility probe and compatible-only API diff passed; rollback is lossy, not fail-closed |
 | 06 host v0.11.0 | released (`01cd656`, tag `580135e`) | remote `main` and annotated tag verified; upgrade Hosts before enabling Factory principal stamping |
-| 07 factory v0.12.0 | in progress (local `main`) | implementation complete; spec-review warning/docs fixes and quality review pending |
-| 08 wui v0.4.0 | in progress (local `main`) | implementation complete; metadata snapshot quality fix and final gates pending |
+| 07 factory v0.12.0 | in progress (local `main`) | implementation complete; shutdown-warning quality fix and final gates pending |
+| 08 wui v0.4.0 | released (`f993ff6`, tag `8e5d63d`) | remote `main` and annotated tag verified; 43 Core schemas/fixtures, reproducible release bundle |
 | 09 tests, carbon, Oxy, docs | plan written (code unverified; A3/A4/A5 partly outlines) | covers the silent-drop copies in tests `pooled.go`, carbon `department.go`, Oxy `department.go` |
 
 ## Cross-plan review (2026-09-25)
