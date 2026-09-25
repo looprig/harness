@@ -3,18 +3,25 @@ package sessionruntime
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"testing"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/runtimecommand"
+	"github.com/looprig/harness/pkg/sessionstore"
 )
 
 func TestAdmittedInterruptJournalsItsPrincipal(t *testing.T) {
 	t.Parallel()
 	f := newRuntimeCommandFixture(t)
+	// The minimal runtime-command fixture omits the audit appender. Install the
+	// real store-backed one so the assertion below observes production framing.
+	WithCommandAppender(journal.NewJournalCommandAppender(f.journal))(f.session)
 	got := make(chan command.Interrupt, 1)
 	go func() {
 		in := (<-f.cmds).(command.Interrupt)
@@ -28,6 +35,36 @@ func TestAdmittedInterruptJournalsItsPrincipal(t *testing.T) {
 	}
 	if in := <-got; in.Principal == nil || in.Principal.Subject != "parent" {
 		t.Fatalf("interrupt principal = %#v", in.Principal)
+	}
+	replayer, err := f.store.OpenInternalRecordReplayer(f.sid, sessionstore.ReplayRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := replayer.Open(context.Background(), journal.ReplayRequest{SessionID: f.sid, From: journal.Beginning()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cursor.Close() }()
+	for {
+		record, _, err := cursor.Next(context.Background())
+		if errors.Is(err, io.EOF) {
+			t.Fatal("interrupt intent absent from journal")
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		intent, ok := record.(journal.CommandRecord)
+		if !ok {
+			continue
+		}
+		interruption, ok := intent.Command().(command.Interrupt)
+		if !ok {
+			continue
+		}
+		if interruption.Principal == nil || interruption.Principal.Subject != "parent" {
+			t.Fatalf("journaled interrupt principal = %#v", interruption.Principal)
+		}
+		break
 	}
 }
 

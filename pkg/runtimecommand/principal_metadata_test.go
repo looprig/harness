@@ -39,6 +39,14 @@ func TestAdmittedPrincipalAndMetadata(t *testing.T) {
 		runtimecommand.KindRestore, runtimecommand.KindGateResponse,
 	}
 	for _, kind := range kinds {
+		t.Run(string(kind)+"/empty metadata absent", func(t *testing.T) {
+			t.Parallel()
+			a := attributedAdmitted(kind)
+			a.Metadata = sessionwire.MessageMetadata{}
+			if err := a.Validate(); err != nil {
+				t.Fatalf("empty metadata should be absent: %v", err)
+			}
+		})
 		t.Run(string(kind)+"/principal accepted", func(t *testing.T) {
 			t.Parallel()
 			a := attributedAdmitted(kind)

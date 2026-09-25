@@ -64,7 +64,7 @@ func validateMessageInput(name EventName, agency identity.Agency, msg *content.U
 	case agency != identity.AgencyUser,
 		in.Principal == nil && len(in.Metadata) == 0 && in.Prefix == 0 && in.Suffix == 0,
 		in.Prefix < 0 || in.Suffix < 0,
-		msg == nil || in.Prefix+in.Suffix > len(msg.Blocks),
+		msg == nil || in.Suffix > len(msg.Blocks) || in.Prefix > len(msg.Blocks)-in.Suffix,
 		in.Principal != nil && in.Principal.Validate() != nil,
 		len(in.Metadata) > 0 && in.Metadata.Validate() != nil:
 		return &InvalidEventError{Event: name, Field: FieldInput, Rule: RuleInvalid}

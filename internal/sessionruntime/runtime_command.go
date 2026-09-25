@@ -358,10 +358,13 @@ func (s *Session) ApplyRuntimeCommand(ctx context.Context, admitted runtimecomma
 	var pending *pendingInput
 	if admitted.Kind == runtimecommand.KindInput ||
 		(admitted.Kind == runtimecommand.KindCreate && len(admitted.Blocks) > 0) {
-		// The intent is audit-first, so a redelivery would otherwise invoke the
-		// presenter before discovering the already-durable prefix. Pay for a
-		// whole-journal scan only when presentation is installed.
-		if s.presenter != nil && hasDispositions {
+		// The intent is audit-first, so a redelivery would otherwise write
+		// another intent before discovering an already-durable prefix. This is
+		// especially wrong after a presenter refusal (prefix + refused, no
+		// intent) if the successor no longer installs the presenter. Attempt-
+		// bearing inputs pay for a whole-journal scan regardless of the current
+		// presenter; legacy commands have no disposition evidence to scan.
+		if admitted.AttemptID != "" && hasDispositions {
 			scan, err := dispositions.ScanCommandEffect(ctx, admitted.CommandID, admitted.RuntimeCommandID)
 			if err != nil {
 				return runtimecommand.Disposition{}, err

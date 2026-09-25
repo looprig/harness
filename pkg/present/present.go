@@ -10,6 +10,7 @@ package present
 import (
 	"context"
 	"fmt"
+	"unicode/utf8"
 
 	"github.com/looprig/core/content"
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -60,6 +61,9 @@ func (f Frame) Validate() error {
 			}
 			if text.Text == "" {
 				return frameInvalid(fmt.Errorf("block %d is empty", i))
+			}
+			if !utf8.ValidString(text.Text) {
+				return frameInvalid(fmt.Errorf("block %d has invalid UTF-8", i))
 			}
 			total += len(text.Text)
 		}

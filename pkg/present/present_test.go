@@ -8,6 +8,9 @@ import (
 
 	"github.com/looprig/core/content"
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/present"
 )
 
@@ -34,6 +37,7 @@ func TestFrameValidate(t *testing.T) {
 		{name: "typed nil", frame: present.Frame{Prefix: []content.Block{(*content.TextBlock)(nil)}}, wantErr: true},
 		{name: "non-text", frame: present.Frame{Prefix: []content.Block{&content.ThinkingBlock{Thinking: "x"}}}, wantErr: true},
 		{name: "empty text", frame: present.Frame{Prefix: []content.Block{textBlock("")}}, wantErr: true},
+		{name: "invalid UTF-8", frame: present.Frame{Prefix: []content.Block{textBlock(string([]byte{0xff}))}}, wantErr: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -49,6 +53,40 @@ func TestFrameValidate(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPresenterFrameMatchesJournaledCommandAfterCodec(t *testing.T) {
+	t.Parallel()
+	frame, err := present.Run(context.Background(), presenterFunc(func(context.Context, present.Input) (present.Frame, error) {
+		return present.Frame{Prefix: []content.Block{textBlock("[来自 Alex]")}}, nil
+	}), present.Input{Blocks: []content.Block{textBlock("hello")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := command.UserInput{
+		Header:    command.Header{CommandID: uuid.UUID{1}, Agency: identity.AgencyUser},
+		Blocks:    []content.Block{textBlock("hello")},
+		Presented: &command.Presented{Prefix: frame.Prefix},
+	}
+	body, err := command.MarshalCommand(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := command.UnmarshalCommand(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := content.MarshalBlocks(cmd.ModelBlocks())
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := content.MarshalBlocks(decoded.(command.UserInput).ModelBlocks())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("live and replayed blocks differ: %s != %s", before, after)
 	}
 }
 

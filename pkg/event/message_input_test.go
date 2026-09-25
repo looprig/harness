@@ -2,6 +2,7 @@ package event
 
 import (
 	"bytes"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -71,6 +72,7 @@ func TestMessageInputRoundTripAndValidation(t *testing.T) {
 	}{
 		{name: "empty input", input: &MessageInput{}},
 		{name: "frame longer than message", input: &MessageInput{Prefix: 2, Suffix: 1}},
+		{name: "overflowed frame counts", input: &MessageInput{Prefix: math.MaxInt, Suffix: math.MaxInt}},
 		{name: "invalid principal", input: &MessageInput{Principal: &sessionwire.Principal{}}},
 		{name: "invalid metadata", input: &MessageInput{Metadata: sessionwire.MessageMetadata{"Bad Key": "v"}}},
 	}

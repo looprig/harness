@@ -58,6 +58,7 @@ func TestPresenterFailureRefusesAnAttemptWithNoIntent(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := newRuntimeCommandFixture(t)
+			WithCommandAppender(journal.NewJournalCommandAppender(f.journal))(f.session)
 			WithMessagePresenter(tc.p)(f.session)
 			admitted := f.admittedInput("cmd-1", mustUUID(), "hi")
 			admitted.Kind = tc.kind
@@ -81,6 +82,13 @@ func TestPresenterFailureRefusesAnAttemptWithNoIntent(t *testing.T) {
 			if tc.p.count() != 1 {
 				t.Fatalf("presenter calls = %d, want 1", tc.p.count())
 			}
+			// A successor may no longer install this presenter. The refused
+			// prefix still deduplicates before any new audit intent is written.
+			f.session.presenter = nil
+			if third, err := f.session.ApplyRuntimeCommand(context.Background(), admitted); err != nil || !third.Duplicate {
+				t.Fatalf("redelivery after presenter removal = %+v, %v", third, err)
+			}
+			requireNoIntentRecord(t, f, admitted.RuntimeCommandID)
 		})
 	}
 }

@@ -284,7 +284,7 @@ func (a Admitted) Validate() error {
 			return &ValidationError{Field: "Principal", Reason: err.Error()}
 		}
 	}
-	if a.Metadata != nil {
+	if len(a.Metadata) > 0 {
 		if a.Kind != KindInput && a.Kind != KindCreate {
 			return &ValidationError{Field: "Metadata", Reason: string(a.Kind) + " carries no message metadata"}
 		}
