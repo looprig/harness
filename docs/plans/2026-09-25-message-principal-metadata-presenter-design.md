@@ -505,7 +505,7 @@ Update this table as releases land, so work can resume from here.
 | 2 | sessionstore | v0.14.0 | released (`96e4621`, tag `46b7e9b`) |
 | 3 | harness | v0.41.0 | released (`911d4ad7`, tag `221785d5`) |
 | 4a | host | v0.11.0 | released (`01cd656`, tag `580135e`) |
-| 4b | factory | v0.12.0 | in progress on local `main` |
+| 4b | factory | v0.12.0 | released (`707c01a`, tag `a5e5c02`) |
 | 5 | wui | v0.4.0 | released (`f993ff6`, tag `8e5d63d`) |
 | 6 | tests | v0.14.0 | not started |
 | 7 | carbon, Oxy | — | not started |
