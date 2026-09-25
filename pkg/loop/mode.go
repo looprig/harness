@@ -41,7 +41,18 @@ const minToolResultCaptureBytes = minToolResultBytes
 // ModeName identifies a predeclared loop mode. The empty name identifies the base mode.
 type ModeName string
 
-// ToolLimits bounds tool activity during one turn.
+// Unlimited disables a per-turn ToolLimits.Iterations or ToolLimits.Calls cap.
+// Zero still selects the package default (25 iterations or 100 calls); values
+// below Unlimited are invalid. Parallel, ResultBytes and CaptureBytes do not
+// accept Unlimited.
+//
+// An unlimited loop stops when the model ends the turn, or on interrupt,
+// shutdown or context cancellation. A model that keeps calling tools has no
+// other bound.
+const Unlimited = -1
+
+// ToolLimits bounds tool activity during one turn. Iterations and Calls accept
+// Unlimited.
 type ToolLimits struct {
 	Iterations  int
 	Calls       int
@@ -115,10 +126,10 @@ func zeroModel(value model.Model) bool {
 
 func resolveLimits(base, override ToolLimits) ToolLimits {
 	result := base
-	if override.Iterations > 0 {
+	if override.Iterations > 0 || override.Iterations == Unlimited {
 		result.Iterations = override.Iterations
 	}
-	if override.Calls > 0 {
+	if override.Calls > 0 || override.Calls == Unlimited {
 		result.Calls = override.Calls
 	}
 	if override.Parallel > 0 {
@@ -150,7 +161,7 @@ func defaultLimits(limits ToolLimits) ToolLimits {
 }
 
 func invalidLimits(limits ToolLimits) bool {
-	return limits.Iterations < 0 || limits.Calls < 0 || limits.Parallel < 0 ||
+	return limits.Iterations < Unlimited || limits.Calls < Unlimited || limits.Parallel < 0 ||
 		limits.ResultBytes < 0 || (limits.ResultBytes > 0 && limits.ResultBytes < minToolResultBytes) ||
 		limits.CaptureBytes < 0 || (limits.CaptureBytes > 0 && limits.CaptureBytes < minToolResultCaptureBytes)
 }

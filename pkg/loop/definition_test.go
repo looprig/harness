@@ -34,7 +34,7 @@ func TestDefineValidation(t *testing.T) {
 		{name: "invalid model", opts: []Option{WithName("agent"), WithInference(&fakeLLM{}, model.Model{})}, kind: DefinitionInvalidModel},
 		{name: "nil option", opts: []Option{WithName("agent"), nil, WithInference(&fakeLLM{}, testModel())}, kind: DefinitionNilOption},
 		{name: "duplicate name", opts: []Option{WithName("a"), WithName("b"), WithInference(&fakeLLM{}, testModel())}, kind: DefinitionDuplicateOption},
-		{name: "negative limits", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolLimits(ToolLimits{Calls: -1})}, kind: DefinitionInvalidToolLimits},
+		{name: "negative limits", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolLimits(ToolLimits{Calls: -2})}, kind: DefinitionInvalidToolLimits},
 		{name: "negative result bytes", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolLimits(ToolLimits{ResultBytes: -1})}, kind: DefinitionInvalidToolLimits},
 		{name: "result bytes below minimum", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolLimits(ToolLimits{ResultBytes: minToolResultBytes - 1})}, kind: DefinitionInvalidToolLimits},
 		{name: "negative drain", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithDrainTimeout(-time.Second)}, kind: DefinitionInvalidDrainTimeout},
