@@ -91,9 +91,9 @@ commit), merged, released (tag).
 | 03 inference v0.14.0 | released (`8de21fa`, tag `7af949a`) | remote `main` and annotated tag verified. Known limit: `llm` gemini, bedrock and chutes build their own http.Client, so the marker does not lift their ceilings; plan 09 must check Oxy's providers (an llm follow-up if needed) |
 | 04 harness unbounded + opaque input | released (in harness `v0.41.0`) | implemented and independently reviewed; remote annotated tag verified |
 | 05 harness v0.41.0 | released (`911d4ad7`, tag `221785d5`) | standalone and integration race suites, `make check`, compatibility probe and compatible-only API diff passed; rollback is lossy, not fail-closed |
-| 06 host v0.11.0 | plan written | |
-| 07 factory v0.12.0 | plan written | incapable owner → 422 |
-| 08 wui v0.4.0 | plan written (code unverified) | metadata pre-check mirrors Core's check order (review fix) |
+| 06 host v0.11.0 | released (`01cd656`, tag `580135e`) | remote `main` and annotated tag verified; upgrade Hosts before enabling Factory principal stamping |
+| 07 factory v0.12.0 | in progress (local `main`) | implementation complete; spec-review warning/docs fixes and quality review pending |
+| 08 wui v0.4.0 | in progress (local `main`) | implementation complete; metadata snapshot quality fix and final gates pending |
 | 09 tests, carbon, Oxy, docs | plan written (code unverified; A3/A4/A5 partly outlines) | covers the silent-drop copies in tests `pooled.go`, carbon `department.go`, Oxy `department.go` |
 
 ## Cross-plan review (2026-09-25)
