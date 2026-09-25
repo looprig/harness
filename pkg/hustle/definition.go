@@ -180,7 +180,7 @@ func (d DefinitionDescriptor) Validate() error {
 	if d.ModelSource != ModelSourceCurrentLoop && d.ModelSource != ModelSourceNamed {
 		return &DefinitionError{Kind: DefinitionInvalidModelSource, Field: "model_source"}
 	}
-	if d.TimeoutNanos <= 0 {
+	if d.TimeoutNanos < 0 {
 		return &DefinitionError{Kind: DefinitionInvalidTimeout, Field: "timeout"}
 	}
 	if invalidLimits(d.Limits) {
@@ -360,7 +360,9 @@ func WithParticipation(participation Participation) Option {
 	}
 }
 
-// WithTimeout sets the exact invocation timeout.
+// WithTimeout sets the exact invocation timeout. It is required. Zero means no
+// execution deadline; caller and session cancellation still apply, and audit
+// and finalization retain their own bounded timeouts. Negative is invalid.
 func WithTimeout(timeout time.Duration) Option {
 	return func(options *definitionOptions) error {
 		if err := options.singleton("timeout"); err != nil {
@@ -508,7 +510,7 @@ func validateDefinitionOptions(options *definitionOptions) error {
 			return err
 		}
 	}
-	if options.timeout <= 0 {
+	if _, set := options.seen["timeout"]; !set || options.timeout < 0 {
 		return &DefinitionError{Kind: DefinitionInvalidTimeout, Field: "timeout"}
 	}
 	if invalidLimits(options.limits) {
@@ -883,7 +885,8 @@ func (d Definition) Participation() Participation {
 	return d.state.descriptor.Participation
 }
 
-// Timeout returns the definition's exact invocation timeout.
+// Timeout returns the definition's exact invocation timeout. Zero means no
+// execution deadline (the zero Definition also reports zero).
 func (d Definition) Timeout() time.Duration {
 	if d.state == nil {
 		return 0

@@ -1076,7 +1076,12 @@ func (r *runtimeController) executionContextWithTimeout(caller context.Context, 
 	if r.executionCtx.Err() != nil {
 		cancelCombined()
 	}
-	execution, cancelTimeout := context.WithTimeout(combined, timeout)
+	// An explicit zero timeout omits the execution deadline. The combined
+	// caller and session cancellation above still applies.
+	execution, cancelTimeout := combined, context.CancelFunc(func() {})
+	if timeout > 0 {
+		execution, cancelTimeout = context.WithTimeout(combined, timeout)
+	}
 	return execution, func() {
 		cancelTimeout()
 		stopSessionCancel()

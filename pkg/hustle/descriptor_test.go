@@ -104,7 +104,7 @@ func TestDefinitionDescriptorValidate(t *testing.T) {
 		{name: "zero prompt hash", value: zeroPromptHash, wantErr: true},
 		{name: "blank prompt revision", value: withDescriptorPromptRevision(current, " "), wantErr: true},
 		{name: "blank policy revision", value: withDescriptorPolicyRevision(current, " "), wantErr: true},
-		{name: "zero timeout", value: withDescriptorTimeout(current, 0), wantErr: true},
+		{name: "zero timeout means no deadline", value: withDescriptorTimeout(current, 0)},
 		{name: "negative timeout", value: withDescriptorTimeout(current, -1), wantErr: true},
 		{name: "zero input limit", value: withDescriptorLimits(current, Limits{OutputBytes: 1}), wantErr: true},
 		{name: "zero output limit", value: withDescriptorLimits(current, Limits{InputBytes: 1}), wantErr: true},
