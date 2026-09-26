@@ -110,6 +110,9 @@ func FuzzProviderOutputBoundary(f *testing.F) {
 		{shape: 17, role: string(content.RoleAssistant)},
 		{shape: 17, role: string(content.RoleAssistant), output: []byte(`{"ok":true}`), limit: 64},
 		{shape: 18, role: string(content.RoleAssistant)},
+		{shape: 19, role: string(content.RoleAssistant), output: []byte(`{}`), limit: 2},
+		{shape: 20, role: string(content.RoleAssistant), output: []byte(`{}`), limit: 2},
+		{shape: 21, role: string(content.RoleAssistant), output: []byte(`{}`), limit: 2},
 	}
 	for _, seed := range seeds {
 		f.Add(seed.shape, seed.role, seed.output, seed.limit, seed.outputTokens, seed.reasoningTokens)
@@ -121,11 +124,18 @@ func FuzzProviderOutputBoundary(f *testing.F) {
 		result, err := extractResult(response, usage, int(limit))
 		if err != nil {
 			var outputErr *OutputError
-			if !errors.As(err, &outputErr) {
+			if !errors.As(err, &outputErr) || !outputErr.Valid() {
 				t.Fatalf("extractResult error = %T %v, want OutputError", err, err)
 			}
 		} else if len(result.Output) == 0 || len(result.Output) > int(limit) || !json.Valid(result.Output) {
 			t.Fatalf("accepted output = %q limit=%d, want one nonempty bounded JSON value", result.Output, limit)
+		}
+		// Independent plain-output oracle: thinking may surround exactly one
+		// text, but neither reasoning nor abnormal finishes can become output.
+		plainText, plainShape := runtimeFuzzPlainText(response)
+		wantPlain := plainShape && len(plainText) > 0 && len(plainText) <= int(limit) && json.Valid([]byte(plainText))
+		if (err == nil) != wantPlain || (wantPlain && (string(result.Output) != plainText || result.Usage != usage)) {
+			t.Fatalf("plain result=%+v err=%v, want accepted=%v text=%q", result, err, wantPlain, plainText)
 		}
 
 		structured, structuredErr := extractStructuredResult(response, usage, int(limit))
@@ -168,7 +178,7 @@ func runtimeFuzzResponse(shape uint8, role content.Role, output string, outputTo
 	if shape&0x80 != 0 {
 		response.Usage = nil
 	}
-	switch shape % 19 {
+	switch shape % 22 {
 	case 0:
 		return nil
 	case 1:
@@ -214,8 +224,41 @@ func runtimeFuzzResponse(shape uint8, role content.Role, output string, outputTo
 	case 18:
 		var block *content.RefusalBlock
 		message.Blocks = []content.Block{block}
+	case 19:
+		message.Blocks = []content.Block{&content.ThinkingBlock{Thinking: "reasoning"}, &content.TextBlock{Text: output}}
+	case 20:
+		message.Blocks = []content.Block{&content.TextBlock{Text: output}, &content.ThinkingBlock{}, &content.ThinkingBlock{Thinking: "reasoning"}}
+	case 21:
+		var block *content.ThinkingBlock
+		message.Blocks = []content.Block{block, &content.TextBlock{Text: output}}
 	}
 	return response
+}
+
+func runtimeFuzzPlainText(response *inference.Response) (string, bool) {
+	if response == nil || response.Message == nil || response.Message.Role != content.RoleAssistant ||
+		(response.FinishReason != stream.FinishReasonUnknown && response.FinishReason != stream.FinishReasonStop) {
+		return "", false
+	}
+	var text string
+	count := 0
+	for _, block := range response.Message.Blocks {
+		switch typed := block.(type) {
+		case *content.TextBlock:
+			if typed == nil {
+				return "", false
+			}
+			count++
+			text = typed.Text
+		case *content.ThinkingBlock:
+			if typed == nil {
+				return "", false
+			}
+		default:
+			return "", false
+		}
+	}
+	return text, count == 1
 }
 
 func runtimeFuzzSemanticTextLength(message *content.AIMessage) (int, bool) {
@@ -249,7 +292,7 @@ func runtimeFuzzSemanticTextLength(message *content.AIMessage) (int, bool) {
 }
 
 func runtimeFuzzFinish(shape uint8) stream.FinishReason {
-	switch shape / 19 % 6 {
+	switch shape / 22 % 6 {
 	case 0:
 		return stream.FinishReasonUnknown
 	case 1:

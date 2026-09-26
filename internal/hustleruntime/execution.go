@@ -912,11 +912,31 @@ func ownInferenceRequest(request inference.Request) (inference.Request, error) {
 }
 
 func extractResult(response *inference.Response, usage *content.Usage, outputLimit int) (hustle.Result, error) {
-	if response == nil || response.Message == nil || response.Message.Role != content.RoleAssistant || len(response.Message.Blocks) != 1 {
+	if err := nativeStructuredFinishError(response); err != nil {
+		return hustle.Result{}, &OutputError{Cause: err}
+	}
+	if response == nil || response.Message == nil || response.Message.Role != content.RoleAssistant {
 		return hustle.Result{}, &OutputError{Reason: OutputFailureInvalidShape}
 	}
-	block, ok := response.Message.Blocks[0].(*content.TextBlock)
-	if !ok || block == nil {
+	// Reasoning is not result text. Keep the plain JSON boundary unambiguous:
+	// exactly one text block, accompanied only by non-nil reasoning blocks.
+	var block *content.TextBlock
+	for _, candidate := range response.Message.Blocks {
+		switch typed := candidate.(type) {
+		case *content.ThinkingBlock:
+			if typed == nil {
+				return hustle.Result{}, &OutputError{Reason: OutputFailureInvalidShape}
+			}
+		case *content.TextBlock:
+			if typed == nil || block != nil {
+				return hustle.Result{}, &OutputError{Reason: OutputFailureInvalidShape}
+			}
+			block = typed
+		default:
+			return hustle.Result{}, &OutputError{Reason: OutputFailureInvalidShape}
+		}
+	}
+	if block == nil {
 		return hustle.Result{}, &OutputError{Reason: OutputFailureInvalidShape}
 	}
 	if len(block.Text) == 0 {
