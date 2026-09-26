@@ -113,6 +113,7 @@ func FuzzProviderOutputBoundary(f *testing.F) {
 		{shape: 19, role: string(content.RoleAssistant), output: []byte(`{}`), limit: 2},
 		{shape: 20, role: string(content.RoleAssistant), output: []byte(`{}`), limit: 2},
 		{shape: 21, role: string(content.RoleAssistant), output: []byte(`{}`), limit: 2},
+		{shape: 19 + 22*2, role: string(content.RoleAssistant), output: []byte(`{}`), limit: 2},
 	}
 	for _, seed := range seeds {
 		f.Add(seed.shape, seed.role, seed.output, seed.limit, seed.outputTokens, seed.reasoningTokens)
