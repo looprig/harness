@@ -94,7 +94,7 @@ commit), merged, released (tag).
 | 06 host v0.11.0 | released (`01cd656`, tag `580135e`) | remote `main` and annotated tag verified; upgrade Hosts before enabling Factory principal stamping |
 | 07 factory v0.12.0 | released (`707c01a`, tag `a5e5c02`) | remote `main` and annotated tag verified; principal stamping remains opt-in after Host capability rollout |
 | 08 wui v0.4.0 | released (`f993ff6`, tag `8e5d63d`) | remote `main` and annotated tag verified; 43 Core schemas/fixtures, reproducible release bundle |
-| 09 tests, carbon, Oxy, docs | in progress | tests v0.14.0 (`2496241`, tag `ff51093`), Carbon v0.30.0 (`93020ff`, tag `3f7dfb4`), `.github` v0.5.0 (`fda6065`, tag `dccdc0a`) and www v0.7.1 (`ba2e70e`, tag `4374b52`) released and remote-verified; Oxy Phases 4–8 remain. The owner chose common-member vault access, provider-neutral OIDC and direct agent edits in authorized spaces in the 2026-09-25 continuation; record these in Oxy's still-open plan before Phase 5, with other owner decisions pending |
+| 09 tests, carbon, Oxy, docs | in progress | tests v0.14.0 (`2496241`, tag `ff51093`), Carbon v0.30.0 (`93020ff`, tag `3f7dfb4`), `.github` v0.5.0 (`fda6065`, tag `dccdc0a`) and www v0.7.1 (`ba2e70e`, tag `4374b52`) released and remote-verified. Oxy joined branch `feat/oxy-factory-host` is pushed at `ccac0f9`: embedded Factory/Host composition passed spec/quality reviews, full Go tests and lifecycle race tests. Legacy no-copy registration is implementing; accounts/auth, UI, background services and plain-module switch remain. All household choices are recorded in Oxy's household design/implementation plans; no production cutover yet |
 
 ## Cross-plan review (2026-09-25)
 
@@ -116,6 +116,10 @@ start branch and interim-table export (plan 09).
 ## Owner decisions recorded 2026-09-25
 
 Rollback is lossy and forbidden (documented); incapable owner → 422; `command_principal` =
-this Factory stamps; nats-server/v2 allowed as a direct test-only import in `tests`. Still open
-(ask when reached): Oxy Part C branch base, exporting Oxy's interim audit table, Oxy's audit
-policy, and any Oxy provider without native structured output.
+this Factory stamps; nats-server/v2 allowed as a direct test-only import in `tests`.
+Continuation: push authorized work without repeated questions; build Oxy Phases 4–7,
+then remove forks after equivalent behavior is proven. Join the existing branches in
+`feat/oxy-factory-host`; no intermediate production audit table. Oxy uses common-member
+access, provider-neutral OIDC, direct authorized edits, fixed session members/spaces,
+any qualified editor for gates, member-only audit and tailnet-only HTTPS. The narrow
+Harness reasoning-plus-JSON compatibility patch is owed before Oxy's module switch.
