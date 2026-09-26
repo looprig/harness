@@ -409,7 +409,7 @@ func TestTurnAndStepHooksPropagateDerivedContextsToDurableBoundaries(t *testing.
 func TestTurnHooksMalformedDenialFailsClosedWithoutStarting(t *testing.T) {
 	t.Parallel()
 	admission := &countingAdmission{}
-	var finish hook.Result
+	finished := make(chan hook.Result, 1)
 	runner, err := hook.Compile(hook.Set{
 		PolicyRevision: "turn-malformed-hook-test-v1",
 		Guards: []hook.Guard{{
@@ -421,7 +421,7 @@ func TestTurnHooksMalformedDenialFailsClosedWithoutStarting(t *testing.T) {
 		Around: []hook.Around{{
 			Operation: hook.OperationTurn,
 			Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
-				return ctx, func(result hook.Result) { finish = result }
+				return ctx, func(result hook.Result) { finished <- result }
 			},
 		}},
 	})
@@ -455,8 +455,14 @@ func TestTurnHooksMalformedDenialFailsClosedWithoutStarting(t *testing.T) {
 			t.Fatalf("malformed denial published TurnStarted: %#v", value)
 		}
 	}
-	if finish.Outcome != hook.OutcomeFailed {
-		t.Fatalf("finish outcome = %v, want failed", finish.Outcome)
+	// Rejection publication precedes the around-hook finish callback.
+	select {
+	case finish := <-finished:
+		if finish.Outcome != hook.OutcomeFailed {
+			t.Fatalf("finish outcome = %v, want failed", finish.Outcome)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for turn hook finish")
 	}
 }
 

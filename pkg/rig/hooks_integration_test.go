@@ -142,6 +142,7 @@ func (t *hookIntegrationTool) InvokableRun(context.Context, string) (*tool.ToolR
 
 func TestHooksIntegrationNativeOperationNestingAndPermission(t *testing.T) {
 	trace := &hookIntegrationTrace{}
+	turnFinished := make(chan struct{})
 	operations := []hook.Operation{
 		hook.OperationTurn,
 		hook.OperationStep,
@@ -151,7 +152,14 @@ func TestHooksIntegrationNativeOperationNestingAndPermission(t *testing.T) {
 		hook.OperationToolExecution,
 		hook.OperationJournalAppend,
 	}
-	around := make([]hook.Around, 0, len(operations))
+	// Around hooks finish in reverse registration order. This outer observer
+	// joins all traced finishes; the terminal event alone does not join them.
+	around := []hook.Around{{
+		Operation: hook.OperationTurn,
+		Begin: func(ctx context.Context, _ hook.Call) (context.Context, hook.FinishFunc) {
+			return ctx, func(hook.Result) { close(turnFinished) }
+		},
+	}}
 	for _, operation := range operations {
 		around = append(around, trace.around(operation))
 	}
@@ -251,6 +259,11 @@ func TestHooksIntegrationNativeOperationNestingAndPermission(t *testing.T) {
 	}
 
 terminal:
+	select {
+	case <-turnFinished:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for turn hook finishes")
+	}
 	if got := toolImpl.runs.Load(); got != 1 {
 		t.Fatalf("tool runs = %d, want 1", got)
 	}
