@@ -1408,3 +1408,56 @@ func TestRunBatch_CtxCancelDuringGate(t *testing.T) {
 		t.Fatal("RunBatch wedged on ctx cancel during gate wait")
 	}
 }
+
+// TestRunBatch_ToolEventsCarryToolUseIDNameAndElapsed: every ToolCallStarted and
+// ToolCallCompleted names the model's tool_use block id (the key a committed
+// StepDone is joined on), Completed repeats the tool name so a viewer can render
+// a Completed whose Started was dropped, and an executed call reports its
+// execution wall time while a pre-execution failure reports none.
+func TestRunBatch_ToolEventsCarryToolUseIDNameAndElapsed(t *testing.T) {
+	t.Parallel()
+	const delay = 20 * time.Millisecond
+	slow := &fakeRunTool{name: "Slow", output: "ok", delay: delay}
+	ts := ToolSet{Access: autoApproveGate{}, Registry: []tool.InvokableTool{slow}, MaxParallelToolCalls: 2}
+	emit, getEvents := collectEmit()
+	executed := call(t, "Slow", `{}`)
+	failed := call(t, "Ghost", `{}`)
+	RunBatch(context.Background(), []content.ToolUseBlock{executed, failed}, ts,
+		BatchRuntime{GateRegistrations: make(chan gateRegistration), IDGen: uuid.New, Emit: emit})
+
+	started := map[uuid.UUID]event.ToolCallStarted{}
+	completed := map[string]event.ToolCallCompleted{}
+	for _, ev := range getEvents() {
+		switch value := ev.(type) {
+		case event.ToolCallStarted:
+			started[value.ToolExecutionID] = value
+		case event.ToolCallCompleted:
+			completed[value.ToolUseID] = value
+		}
+	}
+	if len(started) != 2 || len(completed) != 2 {
+		t.Fatalf("events: %d started / %d completed (by tool_use_id), want 2/2", len(started), len(completed))
+	}
+	for _, block := range []content.ToolUseBlock{executed, failed} {
+		done, ok := completed[block.ID]
+		if !ok {
+			t.Fatalf("no ToolCallCompleted with ToolUseID %q", block.ID)
+		}
+		if done.ToolName != block.Name {
+			t.Errorf("Completed[%q].ToolName = %q, want %q", block.ID, done.ToolName, block.Name)
+		}
+		begin, ok := started[done.ToolExecutionID]
+		if !ok {
+			t.Fatalf("no ToolCallStarted for execution %s", done.ToolExecutionID)
+		}
+		if begin.ToolUseID != block.ID {
+			t.Errorf("Started.ToolUseID = %q, want %q", begin.ToolUseID, block.ID)
+		}
+	}
+	if got := completed[executed.ID].ElapsedMillis; got < uint64(delay/time.Millisecond) {
+		t.Errorf("executed ElapsedMillis = %d, want >= %d", got, delay/time.Millisecond)
+	}
+	if got := completed[failed.ID].ElapsedMillis; got != 0 {
+		t.Errorf("pre-execution failure ElapsedMillis = %d, want 0 (never executed)", got)
+	}
+}

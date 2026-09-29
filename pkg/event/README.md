@@ -72,9 +72,10 @@ for delivery := range sub.Events() {
     case event.TokenDelta:
         // streaming assistant text; ev.Chunk carries the delta
     case event.ToolCallStarted:
-        // a tool call is about to run
+        // a tool call is about to run; ev.ToolUseID is the model's tool_use id
     case event.ToolCallCompleted:
-        // a tool call finished
+        // a tool call finished; ev.ToolUseID joins it to the committed StepDone,
+        // ev.ToolName and ev.ElapsedMillis describe it without its Started
     case event.PermissionRequested:
         // a gate is open; answer with session.RespondGate
     case event.TurnDone:

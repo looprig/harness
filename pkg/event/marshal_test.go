@@ -82,16 +82,17 @@ func TestEventBodyJSONKeysAreStableSnakeCase(t *testing.T) {
 		absentKeys []string
 	}{
 		{
-			name: "ToolCallStarted carries tool_execution_id, tool_name, summary",
+			name: "ToolCallStarted carries tool_execution_id, tool_use_id, tool_name, summary",
 			event: ToolCallStarted{
 				Header:          hdr,
 				ToolExecutionID: seededUUID(0x77),
+				ToolUseID:       "toolu_01",
 				ToolName:        "Bash",
 				Summary:         "ls -la",
 			},
 			wantKeys: []string{
 				"session_id", "loop_id", "turn_id", "step_id",
-				"event_id", "cause", "tool_execution_id", "tool_name", "summary",
+				"event_id", "cause", "tool_execution_id", "tool_use_id", "tool_name", "summary",
 			},
 		},
 		{
@@ -107,14 +108,17 @@ func TestEventBodyJSONKeysAreStableSnakeCase(t *testing.T) {
 			wantKeys: []string{"session_id", "loop_id", "turn_id", "event_id", "cause", "turn_index", "message"},
 		},
 		{
-			name: "ToolCallCompleted carries is_error and result_preview",
+			name: "ToolCallCompleted carries tool_use_id, tool_name, is_error, elapsed_ms and result_preview",
 			event: ToolCallCompleted{
 				Header:          hdr,
 				ToolExecutionID: seededUUID(0x77),
+				ToolUseID:       "toolu_01",
+				ToolName:        "Bash",
 				IsError:         true,
+				ElapsedMillis:   12,
 				ResultPreview:   "boom",
 			},
-			wantKeys: []string{"tool_execution_id", "is_error", "result_preview"},
+			wantKeys: []string{"tool_execution_id", "tool_use_id", "tool_name", "is_error", "elapsed_ms", "result_preview"},
 		},
 		{
 			// Request is a no-codec sealed interface and Preview is live-only review

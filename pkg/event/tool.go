@@ -67,24 +67,33 @@ type UserInputRequested struct {
 }
 
 // ToolCallStarted is emitted when an approved tool begins executing. Summary is
-// capped at construction (never raw args).
+// capped at construction (never raw args). ToolUseID is the model's tool_use
+// block id, the key a committed StepDone is joined on; it is empty (and omitted)
+// only for an event built without one.
 type ToolCallStarted struct {
 	ephemeral
 	loopScoped
 	Header
 	ToolExecutionID uuid.UUID `json:"tool_execution_id,omitzero"`
+	ToolUseID       string    `json:"tool_use_id,omitempty"`
 	ToolName        string    `json:"tool_name,omitempty"`
 	Summary         string    `json:"summary,omitempty"`
 }
 
 // ToolCallCompleted is emitted when a tool finishes. ResultPreview is the capped
-// tool output for the TUI.
+// tool output for the TUI. ToolUseID is the model's tool_use block id, the key a
+// committed StepDone is joined on; ToolName on Completed lets a viewer render a
+// Completed whose Started was dropped. ElapsedMillis is the call's execution
+// wall time; it is zero (and omitted) for a call that failed before executing.
 type ToolCallCompleted struct {
 	ephemeral
 	loopScoped
 	Header
 	ToolExecutionID uuid.UUID `json:"tool_execution_id,omitzero"`
+	ToolUseID       string    `json:"tool_use_id,omitempty"`
+	ToolName        string    `json:"tool_name,omitempty"`
 	IsError         bool      `json:"is_error,omitzero"`
+	ElapsedMillis   uint64    `json:"elapsed_ms,omitzero"`
 	ResultPreview   string    `json:"result_preview,omitempty"`
 }
 

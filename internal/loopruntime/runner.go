@@ -146,6 +146,11 @@ type resolved struct {
 
 	sequential bool
 
+	// executionStarted is when runOne began executing this call; it stays zero
+	// for a pre-execution failure, whose ToolCallCompleted then reports no
+	// elapsed time. It is written and read on the goroutine that runs the call.
+	executionStarted time.Time
+
 	hookCall       hook.Call
 	finishToolCall hook.FinishFunc
 	terminalErr    error
@@ -308,7 +313,7 @@ func RunBatch(
 	// requested call (including pre-execution failures) gets a Started, and every
 	// Started precedes every Completed so the TUI groups the batch race-free.
 	for _, r := range rs {
-		safeEmit(r.ctx, event.ToolCallStarted{ToolExecutionID: r.callID, ToolName: r.block.Name, Summary: r.summary})
+		safeEmit(r.ctx, event.ToolCallStarted{ToolExecutionID: r.callID, ToolUseID: r.block.ID, ToolName: r.block.Name, Summary: r.summary})
 	}
 
 	// Each call owns final[i] by index: serial and parallel goroutines each write a
@@ -320,7 +325,14 @@ func RunBatch(
 	complete := func(i int, resolvedCall *resolved, callResult result) {
 		final[i] = callResult
 		preview, isErr := previewOf(callResult)
-		safeEmit(resolvedCall.ctx, event.ToolCallCompleted{ToolExecutionID: callResult.ToolExecutionID, IsError: isErr, ResultPreview: preview})
+		safeEmit(resolvedCall.ctx, event.ToolCallCompleted{
+			ToolExecutionID: callResult.ToolExecutionID,
+			ToolUseID:       resolvedCall.block.ID,
+			ToolName:        resolvedCall.block.Name,
+			IsError:         isErr,
+			ElapsedMillis:   resolvedCall.elapsedMillis(),
+			ResultPreview:   preview,
+		})
 		resolvedCall.finish(callResult)
 	}
 
@@ -540,6 +552,19 @@ func (r *resolved) finish(terminal result) {
 		finishHook(r.finishToolCall, call, outcome, r.terminalErr)
 		r.finished.Store(true)
 	})
+}
+
+// elapsedMillis is the call's execution wall time for ToolCallCompleted: zero
+// for a call that never reached runOne.
+func (r *resolved) elapsedMillis() uint64 {
+	if r.executionStarted.IsZero() {
+		return 0
+	}
+	elapsed := time.Since(r.executionStarted).Milliseconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	return uint64(elapsed)
 }
 
 func (r *resolved) finishInvariantFailure() {
@@ -982,6 +1007,7 @@ func runOne(
 	runtime BatchRuntime,
 	emit eventEmitter,
 ) (res result) {
+	r.executionStarted = time.Now()
 	ctx2 := WithPreparedCall(withGateReg(withContextEmit(withToolUseID(withCallID(ctx, r.callID), r.block.ID), emit), runtime.GateRegistrations), r.prepared)
 	ctx2 = WithUserInputRequester(ctx2, RequestUserInput)
 	ctx2 = withUserInputReplaySafe(ctx2, r.t)
