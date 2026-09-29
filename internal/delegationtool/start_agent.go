@@ -38,7 +38,7 @@ func (s *StartAgentTool) PrepareCall(ctx context.Context, _ uuid.UUID, argsJSON 
 		return tool.Request{}, nil, err
 	}
 	if s.config.style == loop.DelegationSyncOnly && !prepared.WaitForResponse {
-		return tool.Request{}, nil, preparationFailure(errCategoryInvalidValue)
+		return tool.Request{}, nil, foregroundOnlyFailure()
 	}
 	request := tool.DelegateRequest{Operation: tool.DelegateStart, AgentType: prepared.AgentType, Name: prepared.Name, AgentMode: prepared.AgentMode, Message: prepared.Instructions, WaitForResponse: prepared.WaitForResponse, TimeoutSeconds: prepared.TimeoutSeconds, Runtime: prepared.Runtime}
 	return tool.Request{}, tool.DelegateArtifact{Request: request, Runtime: prepared.Runtime}, nil

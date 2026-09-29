@@ -34,7 +34,7 @@ func (*StopAgentTool) AuditSummary(string) string { return stopAgentToolName }
 
 func (s *StopAgentTool) PrepareCall(_ context.Context, _ uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error) {
 	if s.config.style != loop.DelegationManaged {
-		return tool.Request{}, nil, preparationFailure(errCategoryInvalidValue)
+		return tool.Request{}, nil, managedOnlyFailure(stopAgentToolName)
 	}
 	prepared, err := prepareStopAgent(argsJSON)
 	if err != nil {

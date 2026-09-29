@@ -52,7 +52,7 @@ func TestAgentToolSchemasAreClosedAndOperationSpecific(t *testing.T) {
 				t.Fatalf("required = %v, want %v", got, tt.required)
 			}
 			for _, field := range legacy {
-				if strings.Contains(string(info.Schema), `"`+field+`"`) {
+				if _, present := properties[field]; present {
 					t.Errorf("legacy field %q is present", field)
 				}
 			}
@@ -204,14 +204,14 @@ func TestSchemaMixedSourcesAdvertisesAgentSourceWithoutManagedPlaceholders(t *te
 			t.Fatalf("StartAgent root does not declare %s: %s", field, info.Schema)
 		}
 	}
-	modelsBySource := schemaSourceModelAliases(schema)
-	if !equalStringSet(modelsBySource["gateway"], map[string]struct{}{"luna": {}}) {
-		t.Fatalf("gateway branch models = %v, want luna", modelsBySource["gateway"])
+	if got := schemaEnumValues(t, info.Schema, "agent_source"); !equalStrings(got, []string{"gateway", "native"}) {
+		t.Fatalf("agent_source enum = %v, want gateway and native", got)
 	}
-	if len(modelsBySource["native"]) != 0 {
-		t.Fatalf("harness-managed native branch models = %v, want none", modelsBySource["native"])
+	// The harness-managed native source contributes no model alias: only the
+	// gateway's explicit option is a model value any agent can name.
+	if got := schemaEnumValues(t, info.Schema, "model"); !equalStrings(got, []string{"luna"}) {
+		t.Fatalf("model enum = %v, want only the explicit gateway option", got)
 	}
-	assertSchemaFieldPresence(t, info.Schema, []string{"agent_source"}, true)
 	if strings.Contains(info.Desc, "model=harness-managed") || strings.Contains(info.Desc, "effort=harness-managed") {
 		t.Fatalf("managed description contains a placeholder: %q", info.Desc)
 	}
@@ -229,268 +229,76 @@ func TestSchemaMixedSourcesAdvertisesAgentSourceWithoutManagedPlaceholders(t *te
 	}
 }
 
-func TestSchemaMixedSourceOverridesFilterEachAgentSourceBranch(t *testing.T) {
-	info, err := NewStartAgent(
+func TestMixedSourceOverridesAreEnforcedAtPreparation(t *testing.T) {
+	toolInstance := NewStartAgent(
 		&fakeController{},
 		loop.DelegationManaged,
 		[]AgentCatalogEntry{{Name: "worker"}},
 		singleEntryMixedSourcePreparationCatalog(t),
-	).Info(context.Background())
+	)
+	info, err := toolInstance.Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	var schema map[string]any
-	if err := json.Unmarshal(info.Schema, &schema); err != nil {
-		t.Fatal(err)
+	// The flat schema advertises the union of every source's options; which
+	// option belongs to which source is enforced when the call is prepared.
+	if got := schemaEnumValues(t, info.Schema, "model"); !equalStrings(got, []string{"gateway", "gateway-alt", "native", "native-alt"}) {
+		t.Fatalf("model enum = %v, want the union of both sources' options", got)
 	}
-	branches := schemaSourceModelAliases(schema)
-	if got := branches["gateway"]; !equalStringSet(got, map[string]struct{}{"gateway": {}, "gateway-alt": {}}) {
-		t.Fatalf("gateway source branch models = %v, want only gateway options", got)
-	}
-	if got := branches["native"]; !equalStringSet(got, map[string]struct{}{"native": {}, "native-alt": {}}) {
-		t.Fatalf("native source branch models = %v, want only native options", got)
+	_, _, err = toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"agent_type":"worker","instructions":"p","agent_source":"gateway","model":"native"}`)
+	assertPrepareCategory(t, err, errCategoryUnknownRuntime)
+	if want := `available models: "gateway", "gateway-alt"`; err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("PrepareCall() error = %v, want it to name %s", err, want)
 	}
 }
 
-func TestSchemaExplicitHarnessWithMultipleSourcesIncludesOmittedSourceDefault(t *testing.T) {
-	info, err := NewStartAgent(
+func TestExplicitHarnessWithMultipleSourcesAcceptsOmittedSource(t *testing.T) {
+	toolInstance := NewStartAgent(
 		&fakeController{},
 		loop.DelegationManaged,
 		[]AgentCatalogEntry{{Name: "worker"}},
 		explicitHarnessMixedSourcePreparationCatalog(t),
-	).Info(context.Background())
+	)
+	_, prepared, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"agent_type":"worker","instructions":"p","agent_harness":"codex"}`)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("PrepareCall() error = %v, want an explicit harness with an omitted source to resolve", err)
 	}
-
-	var schema map[string]any
-	if err := json.Unmarshal(info.Schema, &schema); err != nil {
-		t.Fatal(err)
-	}
-	if !schemaContainsOmittedSourceHarnessBranch(schema, "codex") {
-		t.Fatalf("schema lacks omitted-source branch for explicit harness codex: %s", info.Schema)
+	runtime := mustDelegateArtifact(t, prepared).Runtime
+	if runtime == nil || runtime.Harness != "codex" || runtime.Explicit.Source {
+		t.Fatalf("runtime = %+v, want codex with the source left to its default", runtime)
 	}
 }
 
-func schemaContainsOmittedSourceHarnessBranch(value any, harness string) bool {
-	switch node := value.(type) {
-	case map[string]any:
-		properties, _ := node["properties"].(map[string]any)
-		harnessProperty, _ := properties["agent_harness"].(map[string]any)
-		_, hasSource := properties["agent_source"]
-		if harnessProperty["const"] == harness && !hasSource && schemaRequiresField(node["required"], "agent_harness") && schemaForbidsRequiredField(node["not"], "agent_source") {
-			return true
-		}
-		for _, child := range node {
-			if schemaContainsOmittedSourceHarnessBranch(child, harness) {
-				return true
-			}
-		}
-	case []any:
-		for _, child := range node {
-			if schemaContainsOmittedSourceHarnessBranch(child, harness) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func schemaRequiresField(value any, field string) bool {
-	for _, required := range schemaStrings(value) {
-		if required == field {
-			return true
-		}
-	}
-	return false
-}
-
-func schemaForbidsRequiredField(value any, field string) bool {
-	switch node := value.(type) {
-	case map[string]any:
-		if schemaRequiresField(node["required"], field) {
-			return true
-		}
-		for _, child := range node {
-			if schemaForbidsRequiredField(child, field) {
-				return true
-			}
-		}
-	case []any:
-		for _, child := range node {
-			if schemaForbidsRequiredField(child, field) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func schemaContainsSourceModelPair(value any, source, model string) bool {
-	return schemaContainsSourceModelPairWithContext(value, "", "", source, model)
-}
-
-func schemaSourceModelAliases(value any) map[string]map[string]struct{} {
-	result := make(map[string]map[string]struct{})
-	var walk func(any)
-	walk = func(node any) {
-		switch object := node.(type) {
-		case map[string]any:
-			properties, _ := object["properties"].(map[string]any)
-			sourceProperty, _ := properties["agent_source"].(map[string]any)
-			source, _ := sourceProperty["const"].(string)
-			if source != "" {
-				models := result[source]
-				if models == nil {
-					models = make(map[string]struct{})
-					result[source] = models
-				}
-				collectSchemaModelAliases(object, models)
-			}
-			for _, child := range object {
-				walk(child)
-			}
-		case []any:
-			for _, child := range object {
-				walk(child)
-			}
-		}
-	}
-	walk(value)
-	return result
-}
-
-func collectSchemaModelAliases(value any, models map[string]struct{}) {
-	switch node := value.(type) {
-	case map[string]any:
-		if properties, ok := node["properties"].(map[string]any); ok {
-			if modelProperty, ok := properties["model"].(map[string]any); ok {
-				if alias, ok := modelProperty["const"].(string); ok {
-					models[alias] = struct{}{}
-				}
-				if aliases, ok := modelProperty["enum"].([]any); ok {
-					for _, alias := range aliases {
-						if value, ok := alias.(string); ok {
-							models[value] = struct{}{}
-						}
-					}
-				}
-			}
-		}
-		for _, child := range node {
-			collectSchemaModelAliases(child, models)
-		}
-	case []any:
-		for _, child := range node {
-			collectSchemaModelAliases(child, models)
-		}
-	}
-}
-
-func equalStringSet(got, want map[string]struct{}) bool {
-	if len(got) != len(want) {
-		return false
-	}
-	for value := range want {
-		if _, ok := got[value]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-func schemaContainsSourceModelPairWithContext(value any, currentSource, currentModel, wantSource, wantModel string) bool {
-	switch node := value.(type) {
-	case map[string]any:
-		if properties, ok := node["properties"].(map[string]any); ok {
-			if property, ok := properties["agent_source"].(map[string]any); ok {
-				if constant, ok := property["const"].(string); ok {
-					currentSource = constant
-				}
-			}
-			if property, ok := properties["model"].(map[string]any); ok {
-				if constant, ok := property["const"].(string); ok {
-					currentModel = constant
-				}
-				if aliases, ok := property["enum"].([]any); ok {
-					for _, alias := range aliases {
-						if value, ok := alias.(string); ok && value == wantModel {
-							currentModel = value
-						}
-					}
-				}
-			}
-		}
-		if currentSource == wantSource && currentModel == wantModel {
-			return true
-		}
-		for _, child := range node {
-			if schemaContainsSourceModelPairWithContext(child, currentSource, currentModel, wantSource, wantModel) {
-				return true
-			}
-		}
-	case []any:
-		for _, child := range node {
-			if schemaContainsSourceModelPairWithContext(child, currentSource, currentModel, wantSource, wantModel) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func TestSchemaRuntimeSelectorsKeepModelEffortPairsResolvable(t *testing.T) {
+func TestModelEffortPairsAreEnforcedAtPreparation(t *testing.T) {
 	catalog := schemaCatalog(t, schemaEntryWithModels("worker", "claude-code", true, []schemaModel{
 		{alias: "sonnet", efforts: []inferencemodel.Effort{inferencemodel.EffortLow}},
 		{alias: "opus", efforts: []inferencemodel.Effort{inferencemodel.EffortHigh}},
 	}))
-	info, err := NewStartAgent(&fakeController{}, loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker"}}, catalog).Info(context.Background())
+	toolInstance := NewStartAgent(&fakeController{}, loop.DelegationManaged, []AgentCatalogEntry{{Name: "worker"}}, catalog)
+	info, err := toolInstance.Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	var schema map[string]any
-	if err := json.Unmarshal(info.Schema, &schema); err != nil {
-		t.Fatal(err)
+	if got := schemaEnumValues(t, info.Schema, "model"); !equalStrings(got, []string{"opus", "sonnet"}) {
+		t.Fatalf("model enum = %v, want opus and sonnet", got)
+	}
+	if got := schemaEnumValues(t, info.Schema, "effort"); !equalStrings(got, []string{"low", "high"}) {
+		t.Fatalf("effort enum = %v, want low and high", got)
 	}
 	for model, effort := range map[string]string{"sonnet": "low", "opus": "high"} {
-		if !schemaContainsModelEffortPair(schema, model, effort) {
-			t.Errorf("schema missing resolvable model/effort pair %q/%q", model, effort)
+		args := `{"agent_type":"worker","instructions":"p","model":"` + model + `","effort":"` + effort + `"}`
+		if _, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), args); err != nil {
+			t.Errorf("PrepareCall(%s/%s) error = %v, want resolvable pair", model, effort, err)
 		}
 	}
-	if schemaContainsModelEffortPair(schema, "sonnet", "high") || schemaContainsModelEffortPair(schema, "opus", "low") {
-		t.Fatal("schema advertises an unresolved model/effort pair")
-	}
-}
-
-func schemaContainsModelEffortPair(value any, model, effort string) bool {
-	object, ok := value.(map[string]any)
-	if !ok {
-		if children, ok := value.([]any); ok {
-			for _, child := range children {
-				if schemaContainsModelEffortPair(child, model, effort) {
-					return true
-				}
-			}
-		}
-		return false
-	}
-	properties, _ := object["properties"].(map[string]any)
-	modelProperty, _ := properties["model"].(map[string]any)
-	if modelProperty["const"] == model {
-		effortProperty, _ := properties["effort"].(map[string]any)
-		for _, value := range effortProperty["enum"].([]any) {
-			if value == effort {
-				return true
-			}
+	for model, tt := range map[string]struct{ effort, allowed string }{"sonnet": {"high", `"low"`}, "opus": {"low", `"high"`}} {
+		args := `{"agent_type":"worker","instructions":"p","model":"` + model + `","effort":"` + tt.effort + `"}`
+		_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), args)
+		assertPrepareCategory(t, err, errCategoryUnknownRuntime)
+		if want := "available efforts: " + tt.allowed; !strings.Contains(err.Error(), want) {
+			t.Errorf("PrepareCall(%s/%s) error = %v, want it to name %s", model, tt.effort, err, want)
 		}
 	}
-	for _, child := range object {
-		if schemaContainsModelEffortPair(child, model, effort) {
-			return true
-		}
-	}
-	return false
 }
 
 func TestSchemaDescriptionBoundsAvailableAgentRuntimeRows(t *testing.T) {
@@ -512,18 +320,43 @@ func TestSchemaDescriptionBoundsAvailableAgentRuntimeRows(t *testing.T) {
 }
 
 func TestSyncOnlySchemaIsStartOnlyForeground(t *testing.T) {
-	info, err := NewStartAgent(&fakeController{}, loop.DelegationSyncOnly, []AgentCatalogEntry{{Name: "worker"}}, emptyRuntimeCatalog(t)).Info(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	for _, built := range []preparedAgentTool{
+		NewStartAgent(&fakeController{}, loop.DelegationSyncOnly, []AgentCatalogEntry{{Name: "worker"}}, emptyRuntimeCatalog(t)),
+		NewMessageAgent(&fakeController{}, loop.DelegationSyncOnly, []AgentCatalogEntry{{Name: "worker"}}),
+	} {
+		info, err := built.Info(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var schema map[string]any
+		if err := json.Unmarshal(info.Schema, &schema); err != nil {
+			t.Fatal(err)
+		}
+		properties := schema["properties"].(map[string]any)
+		wait := properties["wait_for_response"].(map[string]any)
+		if _, hasConst := wait["const"]; hasConst {
+			t.Fatalf("%s sync-only wait_for_response = %v, want no const", info.Name, wait)
+		}
+		if enum, _ := wait["enum"].([]any); len(enum) != 1 || enum[0] != true {
+			t.Fatalf("%s sync-only wait_for_response = %v, want enum [true]", info.Name, wait)
+		}
 	}
-	var schema map[string]any
-	if err := json.Unmarshal(info.Schema, &schema); err != nil {
-		t.Fatal(err)
+	toolInstance := NewStartAgent(&fakeController{}, loop.DelegationSyncOnly, []AgentCatalogEntry{{Name: "worker"}}, emptyRuntimeCatalog(t))
+	_, _, err := toolInstance.PrepareCall(context.Background(), uuidForPreparation(), `{"agent_type":"worker","instructions":"p","wait_for_response":false}`)
+	assertPrepareCategory(t, err, errCategoryInvalidValue)
+	if want := `field "wait_for_response" must be true`; !strings.Contains(err.Error(), want) {
+		t.Fatalf("PrepareCall() error = %v, want %s", err, want)
 	}
-	properties := schema["properties"].(map[string]any)
-	wait := properties["wait_for_response"].(map[string]any)
-	if wait["const"] != true {
-		t.Fatalf("sync-only wait_for_response = %v, want const true", wait)
+	for _, managed := range []preparedAgentTool{
+		NewMessageAgent(&fakeController{}, loop.DelegationSyncOnly, nil),
+		NewListAgents(&fakeController{}, loop.DelegationSyncOnly, nil),
+		NewStopAgent(&fakeController{}, loop.DelegationSyncOnly, nil),
+	} {
+		_, _, err := managed.PrepareCall(context.Background(), uuidForPreparation(), `{}`)
+		assertPrepareCategory(t, err, errCategoryInvalidValue)
+		if want := "only foreground delegation is available; use StartAgent"; !strings.Contains(err.Error(), want) {
+			t.Fatalf("sync-only PrepareCall() error = %v, want %s", err, want)
+		}
 	}
 }
 

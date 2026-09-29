@@ -37,44 +37,177 @@ const (
 	availableAgentElisionMarker   = "<elided additional agent capabilities>"
 )
 
+// buildStartAgentSchema returns StartAgent's model-facing input schema: one
+// flat, closed object whose root carries no combinator (oneOf, anyOf, allOf,
+// not, if/then/else) and no const. Grammar-constrained decoders (llama.cpp)
+// silently skip combinators mixed with properties, Anthropic rejects them at the
+// top level of input_schema, and OpenAI strict mode rejects them outright, so a
+// per-agent discriminated union cannot be expressed portably. Each selector is
+// therefore a plain property whose enum, when present, is the union of the
+// values valid for at least one agent; which combination is valid for which
+// agent is spelled out in the tool description and enforced by
+// prepareStartAgent, whose refusals name the allowed values.
 func buildStartAgentSchema(style loop.DelegationStyle, catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) string {
+	agentType := map[string]any{"type": "string", "description": "The agent to start; see <available_agents>."}
+	if agents := schemaAgentNames(catalog, runtimeCatalog); len(agents) > 0 {
+		agentType["enum"] = agents
+	}
 	properties := map[string]any{
-		"agent_type":        map[string]any{"type": "string"},
+		"agent_type":        agentType,
 		"name":              map[string]any{"type": "string"},
 		"instructions":      map[string]any{"type": "string"},
 		"wait_for_response": map[string]any{"type": "boolean", "default": true},
 		"timeout_seconds":   map[string]any{"type": "integer", "minimum": 0, "maximum": maxTimeoutSeconds},
-		"model":             map[string]any{"type": "string"},
-		"effort":            map[string]any{"type": "string"},
+		"model":             optionalSelectorProperty("model", schemaModelAliases(catalog, runtimeCatalog)),
+		"effort":            optionalSelectorProperty("effort", schemaEfforts(catalog, runtimeCatalog)),
 	}
 	selectors := availableRuntimeSelectors(catalog, runtimeCatalog)
 	if selectors.Harness {
-		properties["agent_harness"] = map[string]any{"type": "string"}
+		properties["agent_harness"] = optionalSelectorProperty("harness", schemaHarnessNames(catalog, runtimeCatalog))
 	}
 	if selectors.Source {
-		properties["agent_source"] = map[string]any{"type": "string"}
+		properties["agent_source"] = optionalSelectorProperty("source", schemaSourceNames(catalog, runtimeCatalog))
 	}
 	if agentModeSelectable(catalog) {
-		properties["agent_mode"] = map[string]any{"type": "string"}
+		mode := optionalSelectorProperty("mode", schemaAgentModes(catalog))
+		mode["description"] = "Optional; omit for the agent's initial mode. Only agent types with more than one mode accept it."
+		properties["agent_mode"] = mode
 	}
 	if style == loop.DelegationSyncOnly {
-		properties["wait_for_response"] = map[string]any{"type": "boolean", "const": true, "default": true}
+		properties["wait_for_response"] = foregroundOnlyWaitProperty()
 	}
-	schema := map[string]any{
-		"type":                 "object",
-		"additionalProperties": false,
-		"properties":           properties,
-		"required":             []string{"agent_type", "instructions"},
-		"oneOf":                startRoleVariants(catalog, runtimeCatalog),
+	return marshalAgentSchema(properties, []string{"agent_type", "instructions"})
+}
+
+// foregroundOnlyWaitProperty pins wait_for_response to true with a one-value
+// enum rather than const, which several providers and grammar engines reject.
+func foregroundOnlyWaitProperty() map[string]any {
+	return map[string]any{"type": "boolean", "enum": []bool{true}, "default": true}
+}
+
+func optionalSelectorProperty(label string, values []string) map[string]any {
+	property := map[string]any{
+		"type":        "string",
+		"description": "Optional; omit for the agent's default " + label + ". Valid values depend on agent_type; see <available_agent_runtimes>.",
 	}
-	encoded, _ := json.Marshal(schema)
-	return string(encoded)
+	if len(values) > 0 {
+		property["enum"] = values
+	}
+	return property
+}
+
+// schemaAgentNames lists, in catalog order, the agents StartAgent can start:
+// every role when the runtime catalog is empty, otherwise only catalogued roles.
+func schemaAgentNames(catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) []string {
+	names := make([]string, 0, len(catalog))
+	for _, role := range schemaAgents(catalog, runtimeCatalog) {
+		names = append(names, string(role.Name))
+	}
+	return names
+}
+
+func schemaAgents(catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) []AgentCatalogEntry {
+	ordered := orderedAgentCatalog(catalog)
+	result := ordered[:0]
+	seen := make(map[string]struct{}, len(ordered))
+	for _, role := range ordered {
+		if _, duplicate := seen[string(role.Name)]; duplicate {
+			continue
+		}
+		if runtimeCatalog.HasEntries() && len(runtimeCatalog.EntriesFor(role.Name)) == 0 {
+			continue
+		}
+		seen[string(role.Name)] = struct{}{}
+		result = append(result, role)
+	}
+	return result
+}
+
+func schemaHarnessNames(catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) []string {
+	values := make(map[string]struct{})
+	for _, role := range schemaAgents(catalog, runtimeCatalog) {
+		entries := runtimeCatalog.EntriesFor(role.Name)
+		if !runtimeHarnessSelectable(entries) {
+			continue
+		}
+		for _, harness := range runtimeHarnessNames(entries) {
+			values[string(harness)] = struct{}{}
+		}
+	}
+	return sortedStringSet(values)
+}
+
+func schemaSourceNames(catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) []string {
+	values := make(map[string]struct{})
+	for _, role := range schemaAgents(catalog, runtimeCatalog) {
+		entries := runtimeCatalog.EntriesFor(role.Name)
+		for _, harness := range runtimeHarnessNames(entries) {
+			harnessEntries := runtimeEntriesForHarness(entries, harness)
+			if !runtimeSourceSelectableForEntries(harnessEntries) {
+				continue
+			}
+			for _, source := range runtimeSourcesForEntries(harnessEntries) {
+				values[string(source)] = struct{}{}
+			}
+		}
+	}
+	return sortedStringSet(values)
+}
+
+func schemaModelAliases(catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) []string {
+	values := make(map[string]struct{})
+	for _, role := range schemaAgents(catalog, runtimeCatalog) {
+		for _, entry := range runtimeCatalog.EntriesFor(role.Name) {
+			if entry.SelectionKind == loop.RuntimeSelectionHarnessManaged {
+				continue
+			}
+			for _, option := range entry.Models {
+				values[string(option.Alias)] = struct{}{}
+			}
+		}
+	}
+	return sortedStringSet(values)
+}
+
+func schemaEfforts(catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) []string {
+	models := make([]loop.RuntimeModelOption, 0)
+	for _, role := range schemaAgents(catalog, runtimeCatalog) {
+		for _, entry := range runtimeCatalog.EntriesFor(role.Name) {
+			if entry.SelectionKind != loop.RuntimeSelectionHarnessManaged {
+				models = append(models, entry.Models...)
+			}
+		}
+	}
+	return admittedEfforts(models)
+}
+
+func schemaAgentModes(catalog []AgentCatalogEntry) []string {
+	values := make(map[string]struct{})
+	for _, role := range catalog {
+		modes := selectableAgentModes(role.Modes)
+		if len(modes) < 2 {
+			continue
+		}
+		for _, mode := range modes {
+			values[mode] = struct{}{}
+		}
+	}
+	return sortedStringSet(values)
+}
+
+func sortedStringSet(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func buildMessageAgentSchema(style loop.DelegationStyle) string {
 	wait := map[string]any{"type": "boolean", "default": true}
 	if style == loop.DelegationSyncOnly {
-		wait["const"] = true
+		wait = foregroundOnlyWaitProperty()
 	}
 	return marshalAgentSchema(map[string]any{
 		"agent_id":          map[string]any{"type": "string"},
@@ -123,185 +256,6 @@ func selectableAgentModes(modes []loop.ModeName) []string {
 	}
 	sort.Strings(result)
 	return result
-}
-
-func requiredProperties(names []string) []any {
-	result := make([]any, len(names))
-	for i, name := range names {
-		result[i] = map[string]any{"required": []string{name}}
-	}
-	return result
-}
-
-func startRoleVariants(catalog []AgentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) []any {
-	catalog = orderedAgentCatalog(catalog)
-	variants := make([]any, 0, len(catalog))
-	for _, role := range catalog {
-		entries := runtimeCatalog.EntriesFor(role.Name)
-		if len(entries) == 0 {
-			if runtimeCatalog.HasEntries() {
-				continue
-			}
-			variants = append(variants, startRoleVariant(role, nil, false, false))
-			continue
-		}
-		if !runtimeHarnessSelectable(entries) {
-			defaultEntry := runtimeDefaultEntry(entries)
-			variants = append(variants, startRoleChoiceForHarness(role, runtimeEntriesForHarness(entries, defaultEntry.AgentHarness), false, true))
-			continue
-		}
-		defaultEntry := runtimeDefaultEntry(entries)
-		harnesses := runtimeHarnessNames(entries)
-		harnessBranches := []any{startRoleChoiceForHarness(role, runtimeEntriesForHarness(entries, defaultEntry.AgentHarness), false, true)}
-		for _, harness := range harnesses {
-			harnessEntries := runtimeEntriesForHarness(entries, harness)
-			harnessBranches = append(harnessBranches, startRoleChoiceForHarness(role, harnessEntries, true, harness == defaultEntry.AgentHarness))
-		}
-		variants = append(variants, map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"agent_harness": map[string]any{"type": "string", "enum": harnesses},
-			},
-			"oneOf": harnessBranches,
-		})
-	}
-	return variants
-}
-
-func startRoleVariant(role AgentCatalogEntry, entry *loop.RuntimeCatalogEntry, explicitHarness, defaultBranch bool) map[string]any {
-	return startRoleVariantWithSelectors(role, entry, explicitHarness, defaultBranch, false, false, false)
-}
-
-func startRoleChoiceForHarness(role AgentCatalogEntry, entries []loop.RuntimeCatalogEntry, explicitHarness, defaultSource bool) any {
-	if len(entries) == 0 {
-		return startRoleVariant(role, nil, explicitHarness, !explicitHarness && defaultSource)
-	}
-	if runtimeSourceSelectableForEntries(entries) {
-		return startRoleSourceVariants(role, entries, explicitHarness, defaultSource)
-	}
-	entry := runtimeDefaultEntry(entries)
-	return startRoleVariantWithSelectors(role, &entry, explicitHarness, !explicitHarness && defaultSource, false, false, false)
-}
-
-func startRoleSourceVariants(role AgentCatalogEntry, entries []loop.RuntimeCatalogEntry, explicitHarness, defaultSource bool) map[string]any {
-	branches := make([]any, 0, len(entries)+1)
-	if defaultSource || explicitHarness {
-		entry := runtimeDefaultEntry(entries)
-		if filtered, ok := runtimeEntryForSource([]loop.RuntimeCatalogEntry{entry}, entry.Source); ok {
-			entry = filtered
-		}
-		branches = append(branches, startRoleVariantWithSelectors(role, &entry, explicitHarness, !explicitHarness, false, true, true))
-	}
-	for _, source := range runtimeSourcesForEntries(entries) {
-		entry, ok := runtimeEntryForSource(entries, source)
-		if !ok {
-			continue
-		}
-		branches = append(branches, startRoleVariantWithSelectors(role, &entry, explicitHarness, false, true, true, false))
-	}
-	return map[string]any{"oneOf": branches}
-}
-
-func startRoleVariantWithSelectors(role AgentCatalogEntry, entry *loop.RuntimeCatalogEntry, explicitHarness, defaultHarness, explicitSource, sourceSelectable, defaultSource bool) map[string]any {
-	properties := map[string]any{
-		"agent_type":        map[string]any{"const": string(role.Name)},
-		"name":              map[string]any{"type": "string"},
-		"instructions":      map[string]any{"type": "string"},
-		"wait_for_response": map[string]any{"type": "boolean"},
-		"timeout_seconds":   map[string]any{"type": "integer", "minimum": 0, "maximum": maxTimeoutSeconds},
-	}
-	modes := selectableAgentModes(role.Modes)
-	if len(modes) >= 2 {
-		properties["agent_mode"] = map[string]any{"type": "string", "enum": modes}
-	}
-	if entry != nil {
-		if explicitHarness {
-			properties["agent_harness"] = map[string]any{"const": string(entry.AgentHarness)}
-		}
-		if explicitSource {
-			properties["agent_source"] = map[string]any{"const": string(entry.Source)}
-		}
-	}
-	branch := map[string]any{"type": "object", "additionalProperties": false, "properties": properties}
-	required := make([]string, 0, 2)
-	notRequired := make([]string, 0, 2)
-	if entry != nil {
-		if runtimeModelEffortsVary(entry.Models) {
-			properties["model"] = map[string]any{"type": "string"}
-			properties["effort"] = map[string]any{"type": "string"}
-			branch["oneOf"] = modelEffortVariants(entry.Models, entry.DefaultModel)
-		} else {
-			addModelAndEffort(properties, *entry)
-		}
-	}
-	if explicitHarness {
-		required = append(required, "agent_harness")
-	} else if defaultHarness {
-		notRequired = append(notRequired, "agent_harness")
-	}
-	if explicitSource {
-		required = append(required, "agent_source")
-	} else if sourceSelectable && defaultSource {
-		notRequired = append(notRequired, "agent_source")
-	}
-	if len(notRequired) > 0 {
-		branch["not"] = map[string]any{"anyOf": requiredProperties(notRequired)}
-	}
-	if len(required) > 0 {
-		branch["required"] = required
-	}
-	return branch
-}
-
-func runtimeModelEffortsVary(models []loop.RuntimeModelOption) bool {
-	if len(models) < 2 {
-		return false
-	}
-	want := admittedEfforts(models[:1])
-	for _, model := range models[1:] {
-		if !equalStringSlices(want, admittedEfforts([]loop.RuntimeModelOption{model})) {
-			return true
-		}
-	}
-	return false
-}
-
-func equalStringSlices(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i] != right[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func modelEffortVariants(models []loop.RuntimeModelOption, defaultModel loop.ModelAlias) []any {
-	defaultEfforts := admittedEfforts(models[:1])
-	for _, model := range models {
-		if model.Alias == defaultModel {
-			defaultEfforts = admittedEfforts([]loop.RuntimeModelOption{model})
-			break
-		}
-	}
-	variants := []any{map[string]any{
-		"not": map[string]any{"required": []string{"model"}},
-		"properties": map[string]any{
-			"effort": map[string]any{"type": "string", "enum": defaultEfforts},
-		},
-	}}
-	for _, model := range models {
-		variants = append(variants, map[string]any{
-			"properties": map[string]any{
-				"model":  map[string]any{"const": string(model.Alias)},
-				"effort": map[string]any{"type": "string", "enum": admittedEfforts([]loop.RuntimeModelOption{model})},
-			},
-			"required": []string{"model"},
-		})
-	}
-	return variants
 }
 
 type runtimeSelectorAvailability struct {
@@ -504,20 +458,6 @@ func availableRuntimeSelectors(catalog []AgentCatalogEntry, runtimeCatalog loop.
 		}
 	}
 	return available
-}
-
-func addModelAndEffort(properties map[string]any, entry loop.RuntimeCatalogEntry) {
-	if len(entry.Models) > 0 {
-		models := make([]string, len(entry.Models))
-		for i, model := range entry.Models {
-			models[i] = string(model.Alias)
-		}
-		properties["model"] = map[string]any{"type": "string", "enum": models}
-	}
-	efforts := admittedEfforts(entry.Models)
-	if len(efforts) > 0 {
-		properties["effort"] = map[string]any{"type": "string", "enum": efforts}
-	}
 }
 
 func admittedEfforts(models []loop.RuntimeModelOption) []string {

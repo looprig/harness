@@ -34,7 +34,7 @@ func (*MessageAgentTool) AuditSummary(string) string { return messageAgentToolNa
 
 func (s *MessageAgentTool) PrepareCall(_ context.Context, _ uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error) {
 	if s.config.style != loop.DelegationManaged {
-		return tool.Request{}, nil, preparationFailure(errCategoryInvalidValue)
+		return tool.Request{}, nil, managedOnlyFailure(messageAgentToolName)
 	}
 	prepared, err := prepareMessageAgent(argsJSON)
 	if err != nil {

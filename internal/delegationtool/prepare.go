@@ -42,6 +42,9 @@ var errPreparationSentinel = errors.New("agent preparation rejected")
 type preparationError struct {
 	category string
 	detail   string
+	// field names the argument a missing/invalid-field refusal is about, so a
+	// catalog-aware caller can append the values the model may use instead.
+	field string
 }
 
 func (e *preparationError) Error() string {
@@ -59,19 +62,25 @@ func preparationFailure(category string) error {
 }
 
 func missingFieldFailure(name string) error {
-	return &preparationError{category: errCategoryMissingField, detail: "missing field " + strconv.Quote(name)}
+	return &preparationError{category: errCategoryMissingField, detail: "missing field " + strconv.Quote(name), field: name}
 }
 
 func invalidFieldFailure(name string, value any) error {
-	return &preparationError{category: errCategoryInvalidValue, detail: "invalid field " + strconv.Quote(name) + ": " + preparationValue(value)}
+	return &preparationError{category: errCategoryInvalidValue, detail: "invalid field " + strconv.Quote(name) + ": " + preparationValue(value), field: name}
 }
 
 func invalidFieldWithoutValueFailure(name string) error {
-	return &preparationError{category: errCategoryInvalidValue, detail: "invalid field " + strconv.Quote(name)}
+	return &preparationError{category: errCategoryInvalidValue, detail: "invalid field " + strconv.Quote(name), field: name}
 }
 
-func forbiddenFieldFailure(name string) error {
-	return &preparationError{category: errCategoryFieldNotAllowed, detail: "field " + strconv.Quote(name) + " is not allowed"}
+// managedOnlyFailure refuses a tool that operates on existing child agents
+// when the loop only delegates in the foreground, where no child outlives the
+// StartAgent call that created it.
+func managedOnlyFailure(toolName string) error {
+	return &preparationError{
+		category: errCategoryInvalidValue,
+		detail:   toolName + " is unavailable: only foreground delegation is available; use StartAgent, which waits for the agent's response",
+	}
 }
 
 func unknownFieldFailure(name string) error {
@@ -90,38 +99,81 @@ func unavailableSelectorFailure(detail string) error {
 	return &preparationError{category: errCategoryUnknownRuntime, detail: detail}
 }
 
-func unavailableAgentTypeFailure(agentType string) error {
-	return unavailableSelectorFailure("agent type " + strconv.Quote(agentType) + " is unavailable")
+func unavailableAgentTypeFailure(agentType string, available []string) error {
+	return unavailableSelectorFailure("agent type " + strconv.Quote(agentType) + " is unavailable" + availableValues("agent types", available))
 }
 
 func unselectableAgentModeFailure(agentType string) error {
 	return &preparationError{
 		category: errCategoryFieldNotAllowed,
-		detail:   "field \"agent_mode\" is not selectable for agent type " + strconv.Quote(agentType),
+		detail:   "field \"agent_mode\" is not selectable for agent type " + strconv.Quote(agentType) + "; omit it",
 	}
 }
 
-func unavailableAgentModeFailure(mode, agentType string) error {
+func unavailableAgentModeFailure(mode, agentType string, available []string) error {
 	return &preparationError{
 		category: errCategoryInvalidValue,
-		detail:   "agent mode " + strconv.Quote(mode) + " is unavailable for agent type " + strconv.Quote(agentType),
+		detail:   "agent mode " + strconv.Quote(mode) + " is unavailable for agent type " + strconv.Quote(agentType) + availableValues("modes", available),
 	}
 }
 
-func unavailableAgentHarnessFailure(harness, agentType string) error {
-	return unavailableSelectorFailure("agent harness " + strconv.Quote(harness) + " is unavailable for agent type " + strconv.Quote(agentType))
+// unselectableRuntimeFieldFailure refuses a runtime selector the chosen agent
+// does not offer. The flat schema declares every selector any agent offers, so
+// the refusal names the agent and tells the model to omit the field.
+func unselectableRuntimeFieldFailure(name, agentType string) error {
+	return &preparationError{
+		category: errCategoryFieldNotAllowed,
+		detail:   "field " + strconv.Quote(name) + " is not selectable for agent type " + strconv.Quote(agentType) + "; omit it",
+	}
 }
 
-func unavailableAgentSourceFailure(source, agentType, harness string) error {
-	return unavailableSelectorFailure("agent source " + strconv.Quote(source) + " is unavailable for agent type " + strconv.Quote(agentType) + " and harness " + strconv.Quote(harness))
+func foregroundOnlyFailure() error {
+	return &preparationError{
+		category: errCategoryInvalidValue,
+		detail:   "field \"wait_for_response\" must be true: only foreground delegation is available",
+	}
 }
 
-func unavailableModelFailure(model, agentType, harness, source string) error {
-	return unavailableSelectorFailure("model " + strconv.Quote(model) + " is unavailable for agent type " + strconv.Quote(agentType) + ", harness " + strconv.Quote(harness) + ", and source " + strconv.Quote(source))
+func unavailableAgentHarnessFailure(harness, agentType string, available []loop.AgentHarnessName) error {
+	return unavailableSelectorFailure("agent harness " + strconv.Quote(harness) + " is unavailable for agent type " + strconv.Quote(agentType) + availableValues("harnesses", stringValues(available)))
 }
 
-func unavailableEffortFailure(effort, model string) error {
-	return unavailableSelectorFailure("effort " + strconv.Quote(effort) + " is unavailable for model " + strconv.Quote(model))
+func unavailableAgentSourceFailure(source, agentType, harness string, available []loop.RuntimeSourceName) error {
+	return unavailableSelectorFailure("agent source " + strconv.Quote(source) + " is unavailable for agent type " + strconv.Quote(agentType) + " and harness " + strconv.Quote(harness) + availableValues("sources", stringValues(available)))
+}
+
+func unavailableModelFailure(model, agentType, harness, source string, available []loop.RuntimeModelOption) error {
+	aliases := make([]string, len(available))
+	for i, option := range available {
+		aliases[i] = string(option.Alias)
+	}
+	return unavailableSelectorFailure("model " + strconv.Quote(model) + " is unavailable for agent type " + strconv.Quote(agentType) + ", harness " + strconv.Quote(harness) + ", and source " + strconv.Quote(source) + availableValues("models", aliases))
+}
+
+func unavailableEffortFailure(effort, model string, option loop.RuntimeModelOption) error {
+	return unavailableSelectorFailure("effort " + strconv.Quote(effort) + " is unavailable for model " + strconv.Quote(model) + availableValues("efforts", admittedEfforts([]loop.RuntimeModelOption{option})))
+}
+
+// availableValues renders the "; available <label>: ..." suffix that makes a
+// refusal actionable for the model, or tells it to omit the field when there
+// is nothing to choose from.
+func availableValues(label string, values []string) string {
+	if len(values) == 0 {
+		return "; no " + label + " are available"
+	}
+	quoted := make([]string, len(values))
+	for i, value := range values {
+		quoted[i] = strconv.Quote(value)
+	}
+	return "; available " + label + ": " + strings.Join(quoted, ", ")
+}
+
+func stringValues[T ~string](values []T) []string {
+	result := make([]string, len(values))
+	for i, value := range values {
+		result[i] = string(value)
+	}
+	return result
 }
 
 func preparationValue(value any) string {
@@ -251,7 +303,7 @@ func prepareStartAgent(argsJSON string) (PreparedStartAgent, error) {
 		switch *wire.Effort {
 		case "none", "low", "medium", "high", "max":
 		default:
-			return PreparedStartAgent{}, invalidFieldFailure("effort", *wire.Effort)
+			return PreparedStartAgent{}, &preparationError{category: errCategoryInvalidValue, field: "effort", detail: "invalid field \"effort\": " + preparationValue(*wire.Effort) + availableValues("efforts", []string{"none", "low", "medium", "high", "max"})}
 		}
 	} else if _, supplied := present["effort"]; supplied {
 		return PreparedStartAgent{}, invalidFieldFailure("effort", nil)
@@ -432,10 +484,14 @@ func parseAgentID(value *string) (uuid.UUID, error) {
 func (s *agentToolConfig) prepareStartAgent(argsJSON string) (PreparedStartAgent, error) {
 	prepared, err := prepareStartAgent(argsJSON)
 	if err != nil {
+		var refusal *preparationError
+		if errors.As(err, &refusal) && refusal.field == "agent_type" {
+			refusal.detail += availableValues("agent types", s.agentTypeNames())
+		}
 		return PreparedStartAgent{}, err
 	}
 	if !s.hasAgentType(prepared.AgentType) {
-		return PreparedStartAgent{}, unavailableAgentTypeFailure(prepared.AgentType)
+		return PreparedStartAgent{}, unavailableAgentTypeFailure(prepared.AgentType, s.agentTypeNames())
 	}
 	if err := s.validateAgentMode(prepared); err != nil {
 		return PreparedStartAgent{}, err
@@ -465,15 +521,15 @@ func (s *agentToolConfig) validateAgentMode(prepared PreparedStartAgent) error {
 				return nil
 			}
 		}
-		return unavailableAgentModeFailure(prepared.AgentMode, prepared.AgentType)
+		return unavailableAgentModeFailure(prepared.AgentMode, prepared.AgentType, modes)
 	}
-	return unavailableAgentTypeFailure(prepared.AgentType)
+	return unavailableAgentTypeFailure(prepared.AgentType, s.agentTypeNames())
 }
 
 func (s *agentToolConfig) resolveDelegateRuntime(prepared PreparedStartAgent) (*tool.DelegateRuntime, error) {
 	if !s.hasRuntimeCatalog {
 		if field := firstExplicitRuntimeField(prepared); field != "" {
-			return nil, forbiddenFieldFailure(field)
+			return nil, unselectableRuntimeFieldFailure(field, prepared.AgentType)
 		}
 		return nil, nil
 	}
@@ -481,34 +537,34 @@ func (s *agentToolConfig) resolveDelegateRuntime(prepared PreparedStartAgent) (*
 	if len(entries) == 0 {
 		if !s.runtimeCatalog.HasEntries() {
 			if field := firstExplicitRuntimeField(prepared); field != "" {
-				return nil, forbiddenFieldFailure(field)
+				return nil, unselectableRuntimeFieldFailure(field, prepared.AgentType)
 			}
 			return nil, nil
 		}
-		return nil, unavailableAgentTypeFailure(prepared.AgentType)
+		return nil, unavailableAgentTypeFailure(prepared.AgentType, s.agentTypeNames())
 	}
 	selected := runtimeDefaultEntry(entries)
 	selectedHarness := selected.AgentHarness
 	if prepared.agentHarnessSet {
 		if !runtimeHarnessSelectable(entries) {
-			return nil, forbiddenFieldFailure("agent_harness")
+			return nil, unselectableRuntimeFieldFailure("agent_harness", prepared.AgentType)
 		}
 		selectedHarness = loop.AgentHarnessName(prepared.AgentHarness)
 		harnessEntries := runtimeEntriesForHarness(entries, selectedHarness)
 		if len(harnessEntries) == 0 {
-			return nil, unavailableAgentHarnessFailure(prepared.AgentHarness, prepared.AgentType)
+			return nil, unavailableAgentHarnessFailure(prepared.AgentHarness, prepared.AgentType, runtimeHarnessNames(entries))
 		}
 		selected = runtimeDefaultEntry(harnessEntries)
 	}
 	harnessEntries := runtimeEntriesForHarness(entries, selectedHarness)
 	if prepared.agentSourceSet {
 		if !runtimeSourceSelectableForEntries(harnessEntries) {
-			return nil, forbiddenFieldFailure("agent_source")
+			return nil, unselectableRuntimeFieldFailure("agent_source", prepared.AgentType)
 		}
 		var found bool
 		selected, found = runtimeEntryForSource(harnessEntries, loop.RuntimeSourceName(prepared.AgentSource))
 		if !found {
-			return nil, unavailableAgentSourceFailure(prepared.AgentSource, prepared.AgentType, string(selectedHarness))
+			return nil, unavailableAgentSourceFailure(prepared.AgentSource, prepared.AgentType, string(selectedHarness), runtimeSourcesForEntries(harnessEntries))
 		}
 	}
 	if !prepared.agentSourceSet && runtimeSourceSelectableForEntries(harnessEntries) {
@@ -518,11 +574,11 @@ func (s *agentToolConfig) resolveDelegateRuntime(prepared PreparedStartAgent) (*
 	}
 	advertised := runtimeAdvertisedSelectors(entries, selected)
 	if prepared.agentSourceSet && !advertised.Source {
-		return nil, forbiddenFieldFailure("agent_source")
+		return nil, unselectableRuntimeFieldFailure("agent_source", prepared.AgentType)
 	}
 	if prepared.modelSet {
 		if !advertised.Model {
-			return nil, forbiddenFieldFailure("model")
+			return nil, unselectableRuntimeFieldFailure("model", prepared.AgentType)
 		}
 		found := false
 		for _, option := range selected.Models {
@@ -532,13 +588,13 @@ func (s *agentToolConfig) resolveDelegateRuntime(prepared PreparedStartAgent) (*
 			}
 		}
 		if !found {
-			return nil, unavailableModelFailure(prepared.Model, prepared.AgentType, string(selectedHarness), string(selected.Source))
+			return nil, unavailableModelFailure(prepared.Model, prepared.AgentType, string(selectedHarness), string(selected.Source), selected.Models)
 		}
 	}
 	var effort inferencemodel.Effort
 	if prepared.effortSet {
 		if !advertised.Effort {
-			return nil, forbiddenFieldFailure("effort")
+			return nil, unselectableRuntimeFieldFailure("effort", prepared.AgentType)
 		}
 		effort = parseDelegateEffort(*prepared.Effort)
 		modelAlias := selected.DefaultModel
@@ -547,7 +603,7 @@ func (s *agentToolConfig) resolveDelegateRuntime(prepared PreparedStartAgent) (*
 		}
 		for _, option := range selected.Models {
 			if option.Alias == modelAlias && !runtimeOptionAllowsEffort(option, effort) {
-				return nil, unavailableEffortFailure(*prepared.Effort, string(modelAlias))
+				return nil, unavailableEffortFailure(*prepared.Effort, string(modelAlias), option)
 			}
 		}
 	}
@@ -593,6 +649,12 @@ func runtimeOptionAllowsEffort(option loop.RuntimeModelOption, effort inferencem
 		}
 	}
 	return false
+}
+
+// agentTypeNames lists the agent types StartAgent accepts, as the schema's
+// agent_type enum does.
+func (s *agentToolConfig) agentTypeNames() []string {
+	return schemaAgentNames(s.catalog, s.runtimeCatalog)
 }
 
 func (s *agentToolConfig) hasAgentType(agent string) bool {

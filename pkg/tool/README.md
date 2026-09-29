@@ -31,6 +31,16 @@ automatically injected as one bundle into each applicable Loop; consumers must
 not add them manually. Agents coordinate task work through agent messages
 rather than shared task memory.
 
+Each agent tool's input schema is one flat, closed object with no
+`oneOf`/`anyOf`/`allOf`/`not`/`const`/`if`, which grammar-constrained decoders
+silently skip and several providers reject. `StartAgent`'s `agent_type`,
+`agent_harness`, `agent_source`, `agent_mode`, `model` and `effort` are plain
+properties whose `enum`, where present, is the union of the values any agent
+accepts. Which combination is valid for which agent is listed in the tool
+description and enforced when the call is prepared, and a refusal names the
+values the chosen agent accepts. (Before v0.42.1 `StartAgent` published a
+per-agent `oneOf` union.)
+
 ## What is tool?
 
 - **`BaseTool`** — `Info(ctx) (*ToolInfo, error)`. The minimal contract;

@@ -132,7 +132,7 @@ func TestPrepareAgentErrorsIdentifyFieldsAndValues(t *testing.T) {
 		{name: "invalid agent type", prepare: startPreparationError, args: `{"agent_type":"","instructions":"p"}`, want: `agent preparation rejected: invalid field "agent_type": ""`, category: errCategoryInvalidValue},
 		{name: "invalid instructions do not echo value", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":" \n "}`, want: `agent preparation rejected: invalid field "instructions"`, category: errCategoryInvalidValue},
 		{name: "invalid timeout", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":"p","timeout_seconds":-1}`, want: `agent preparation rejected: invalid field "timeout_seconds": -1`, category: errCategoryInvalidValue},
-		{name: "invalid effort", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":"p","effort":"ultra"}`, want: `agent preparation rejected: invalid field "effort": "ultra"`, category: errCategoryInvalidValue},
+		{name: "invalid effort", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":"p","effort":"ultra"}`, want: `agent preparation rejected: invalid field "effort": "ultra"; available efforts: "none", "low", "medium", "high", "max"`, category: errCategoryInvalidValue},
 		{name: "unknown field", prepare: startPreparationError, args: `{"agent_type":"worker","instructions":"p","bogus":true}`, want: `agent preparation rejected: unknown field "bogus"`, category: errCategoryUnknownField},
 	}
 	for _, tt := range tests {
