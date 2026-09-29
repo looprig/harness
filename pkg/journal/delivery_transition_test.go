@@ -41,8 +41,12 @@ func TestCommandRecordPhaseAwarePhysicalID(t *testing.T) {
 func TestCommandRecordNormalizedDeliveryFingerprintIgnoresPhase(t *testing.T) {
 	commandID := uuid.MustParse("01234567-89ab-cdef-0123-456789abcdef")
 	loopID := uuid.MustParse("fedcba98-7654-3210-fedc-ba9876543210")
+	// CreatedAt is pinned to UTC: the header encodes it as RFC 3339 with the
+	// value's own zone offset, so a Local time would make the golden below
+	// depend on the host's TZ (it did: the golden was minted under EDT and
+	// failed on every UTC CI runner).
 	base := command.UserInput{
-		Header:       command.Header{CommandID: commandID, Agency: identity.AgencyMachine, CreatedAt: time.Unix(123, 456)},
+		Header:       command.Header{CommandID: commandID, Agency: identity.AgencyMachine, CreatedAt: time.Unix(123, 456).UTC()},
 		Blocks:       []content.Block{&content.TextBlock{Text: "payload"}},
 		TargetLoopID: loopID,
 	}
@@ -64,8 +68,9 @@ func TestCommandRecordNormalizedDeliveryFingerprintIgnoresPhase(t *testing.T) {
 		t.Fatal("intent and fallback normalized fingerprints differ despite identical payload")
 	}
 	// This machine input carries no attribution. Its normalized durable bytes
-	// must remain exactly those from before presenter support was added.
-	const wantNormalizedDeliverySHA = "26b0d50567aff531bccf8f80b22d5d5745c80dc6b2f59cf8e81708eccab50519"
+	// must remain exactly those from before presenter support was added
+	// (verified against 194c6f92, the parent of the presenter commit).
+	const wantNormalizedDeliverySHA = "e58579b61337e993a54d8166c7876129fb6d93e5b5123b1bc08ca3bab9b1583f"
 	if got := fmt.Sprintf("%x", intentFP.sum); got != wantNormalizedDeliverySHA {
 		t.Fatalf("machine input fingerprint changed: %s, want %s", got, wantNormalizedDeliverySHA)
 	}
