@@ -108,6 +108,28 @@ filesystem may be over-denied, never widened. `loop.OverrideBoundAccess`
 replaces the gate at bind time, and the roots hashed into the definition's
 `PolicyRevision` do not identify such an override.
 
+For an agent that reads freely and writes only with approval,
+`NewWorkspaceAccess(roots...)` is the `AccessSource` and
+`NewWorkspaceEvaluator(access, approver, rules)` the interactive evaluator: a
+`filesystem.read` under a root is `Allow`, a `filesystem.write` under a root is
+`Gated`, and reads or writes outside every root, `host:*`, `command.execute`
+and `network` are `Deny`; any other kind or a malformed scope fails closed.
+Roots are canonicalised exactly as for read-only access, and the same lexical
+contract applies: the tools confine the actual I/O (the standard `EditFile` and
+`WriteFile` prepare the resolved absolute target and write through their own
+root-bound handle; see the tools module's tests). Because `Deny` is decided
+before any rule is consulted, a remembered "always" answer can never widen
+access past the roots. It is not an OS sandbox. `SessionRules` is an in-memory,
+allow-only `RuleStore` (`RuleMatcher` + `RuleWriter`): "Approve always"
+remembers the exact displayed candidates (kind and match), matches exactly,
+never denies, and never persists. `ApproverFunc` adapts a function to
+`Approver` for headless, CI and test use. A rule store whose contents belong to
+a loop's policy identity (a durable rule file) implements `PolicyRevisioner`.
+Inside a loop, `loop.WithWorkspaceAccess(loop.WorkspaceAccess{Roots: ...})`
+installs it in one option (see `examples/workspace`); to also route commands or
+network, compose `NewInteractiveEvaluator` yourself with
+`WorkspaceAccess.Bindings()` minus the kinds you re-route.
+
 `Authorize(ctx, request)` is the single entry: it runs `Evaluate`, opens at
 most one combined approval (interactive construction only, and only when gated
 requirements remain unmet), applies the chosen action via `Resolve`, and mints

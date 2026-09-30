@@ -11,7 +11,7 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 )
 
-// AccessRootInvalid classifies a read-only root that cannot be confined to:
+// AccessRootInvalid classifies a read-only or workspace root that cannot be confined to:
 // empty, missing, not a directory, unresolvable, or the filesystem root.
 const AccessRootInvalid AccessErrorKind = "root_invalid"
 
@@ -54,8 +54,19 @@ type ReadOnlyAccess struct {
 // directory now, not at call time. The filesystem root is refused, because
 // allowing it would grant every host read. At least one root is required.
 func NewReadOnlyAccess(roots ...string) (*ReadOnlyAccess, error) {
+	canonical, err := canonicalRoots("read-only", roots)
+	if err != nil {
+		return nil, err
+	}
+	return &ReadOnlyAccess{roots: canonical}, nil
+}
+
+// canonicalRoots resolves every root with canonicalReadRoot and returns them
+// sorted and deduplicated. An empty list or any invalid root fails with an
+// AccessRootInvalid error; label names the access flavour in the message.
+func canonicalRoots(label string, roots []string) ([]string, error) {
 	if len(roots) == 0 {
-		return nil, &AccessError{Kind: AccessRootInvalid, Cause: errors.New("at least one read-only root is required")}
+		return nil, &AccessError{Kind: AccessRootInvalid, Cause: fmt.Errorf("at least one %s root is required", label)}
 	}
 	canonical := make([]string, 0, len(roots))
 	for _, root := range roots {
@@ -66,7 +77,7 @@ func NewReadOnlyAccess(roots ...string) (*ReadOnlyAccess, error) {
 		canonical = append(canonical, resolved)
 	}
 	slices.Sort(canonical)
-	return &ReadOnlyAccess{roots: slices.Compact(canonical)}, nil
+	return slices.Compact(canonical), nil
 }
 
 func canonicalReadRoot(root string) (string, error) {
@@ -131,17 +142,12 @@ func (a *ReadOnlyAccess) AccessFor(kind, scope string) (uint8, error) {
 	}
 	switch kind {
 	case kindFilesystemRead:
-		if scope == "host:*" {
-			return AccessDeny, nil
+		within, err := scopeWithinRoots(a.roots, scope)
+		if err != nil {
+			return AccessDeny, err
 		}
-		path := strings.TrimPrefix(scope, "tree:")
-		if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
-			return AccessDeny, fmt.Errorf("gate: malformed filesystem scope %q", scope)
-		}
-		for _, root := range a.roots {
-			if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
-				return AccessAllow, nil
-			}
+		if within {
+			return AccessAllow, nil
 		}
 		return AccessDeny, nil
 	case kindFilesystemWrite, tool.CapabilityCommandExecute, kindNetwork:
@@ -149,6 +155,27 @@ func (a *ReadOnlyAccess) AccessFor(kind, scope string) (uint8, error) {
 	default:
 		return AccessDeny, fmt.Errorf("gate: read-only access does not know kind %q", kind)
 	}
+}
+
+// scopeWithinRoots reports whether a filesystem scope lies at or beneath one
+// of roots by lexical containment. The whole-host scope "host:*" is never
+// within. A scope must be an absolute, clean path, optionally prefixed with
+// "tree:"; anything else is malformed and fails closed with an error. A path
+// that merely shares a string prefix with a root (root+"-evil") is outside.
+func scopeWithinRoots(roots []string, scope string) (bool, error) {
+	if scope == "host:*" {
+		return false, nil
+	}
+	path := strings.TrimPrefix(scope, "tree:")
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return false, fmt.Errorf("gate: malformed filesystem scope %q", scope)
+	}
+	for _, root := range roots {
+		if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // NewReadOnlyEvaluator returns a headless Evaluator that approves a tool call
