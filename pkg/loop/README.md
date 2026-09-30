@@ -75,7 +75,10 @@ if ok {
 - [`pkg/tool`](../tool/README.md) — `tool.Definition` values passed to
   `loop.WithTools`.
 - [`pkg/gate`](../gate/README.md) — the `gate.Evaluator` bound via
-  `loop.WithAccessGate`.
+  `loop.WithAccessGate`. Without an access gate every tool call fails
+  closed (`permission denied [unavailable]`, with a one-time log warning);
+  `loop.WithReadOnlyAccess(roots...)` is the one-option gate for read-only
+  tools such as Glob, Grep and ReadFile, and needs no `WithPolicyRevision`.
 - [`pkg/identity`](../identity/README.md) — `identity.AgentName` used by
   `loop.WithName` and `loop.WithDelegates`.
 - [`pkg/event`](../event/README.md) — `event.TurnIndex` and the events

@@ -89,6 +89,15 @@ Construction explicitly selects the interaction mode:
   prompts, and resolves an unmet gated requirement as a typed
   approval-required denial (`EvaluationApprovalRequired`).
 
+For the common case of an agent that may only read files, `NewReadOnlyAccess(roots...)`
+is a ready `AccessSource` and `NewReadOnlyEvaluator(roots...)` a ready headless
+evaluator: a `filesystem.read` at or beneath one of the explicit, symlink-resolved
+directory roots is `Allow`; every other read, every `filesystem.write`,
+`command.execute` and `network` requirement is `Deny`; any other kind fails closed.
+It never answers `Gated`, so it needs no approver, rule store or grant issuer.
+Inside a loop, `loop.WithReadOnlyAccess(roots...)` installs it in one option (see
+`examples/readonly`).
+
 `Authorize(ctx, request)` is the single entry: it runs `Evaluate`, opens at
 most one combined approval (interactive construction only, and only when gated
 requirements remain unmet), applies the chosen action via `Resolve`, and mints

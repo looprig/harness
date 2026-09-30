@@ -34,6 +34,7 @@ func TestDocsExamplesArtifacts(t *testing.T) {
 		"example-harness-policy-fixture":         {"executable-fixture", "examples/policy/example_test.go", "Example_hooksAndHeadlessGateFallback"},
 		"example-harness-serving-fixture":        {"executable-fixture", "examples/serving/example_test.go", "Example_readOnlyHTTPAdapter"},
 		"example-harness-composition-fixture":    {"executable-fixture", "examples/composition/example_test.go", "Example_compactionAndDelegationComposition"},
+		"example-harness-readonly-fixture":       {"executable-fixture", "examples/readonly/example_test.go", "Example_readOnlyTools"},
 		"example-harness-manifest-contract-test": {"test", "tests/example_test.go", "TestDocsExamplesArtifacts"},
 	}
 	for _, proof := range wantProofs {
@@ -79,8 +80,8 @@ func TestDocsExamplesArtifacts(t *testing.T) {
 	if len(manifest.ProofSources) != len(wantProofs) {
 		t.Errorf("manifest proof sources = %d, want %d", len(manifest.ProofSources), len(wantProofs))
 	}
-	if len(manifest.Examples) != 5 {
-		t.Fatalf("manifest examples = %d, want 5", len(manifest.Examples))
+	if len(manifest.Examples) != 6 {
+		t.Fatalf("manifest examples = %d, want 6", len(manifest.Examples))
 	}
 	seen := make(map[string]bool)
 	for _, example := range manifest.Examples {

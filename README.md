@@ -82,7 +82,9 @@ agent, err := loop.Define(
         BaseURL: "http://localhost", Name: "fixture",
     }),
     loop.WithTools(status),
-    // loop.WithAccessGate(...) binds a permission gate; see pkg/gate.
+    // Every tool call fails closed without an access gate.
+    // loop.WithReadOnlyAccess(repoRoot) allows file reads under repoRoot only;
+    // loop.WithAccessGate(...) binds a full permission gate; see pkg/gate.
 )
 if err != nil { return err }
 

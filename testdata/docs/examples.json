@@ -33,6 +33,12 @@
       "symbol": "Example_compactionAndDelegationComposition"
     },
     {
+      "id": "example-harness-readonly-fixture",
+      "type": "executable-fixture",
+      "path": "examples/readonly/example_test.go",
+      "symbol": "Example_readOnlyTools"
+    },
+    {
       "id": "example-harness-manifest-contract-test",
       "type": "test",
       "path": "tests/example_test.go",
@@ -114,6 +120,21 @@
       "cleanup": "No session is started and every store or tool value is process-local.",
       "liveGate": null,
       "proofIds": ["example-harness-composition-fixture", "example-harness-manifest-contract-test"]
+    },
+    {
+      "id": "example-harness-read-only-tool-access",
+      "ecosystem": "go",
+      "owner": "harness",
+      "sourcePath": "examples/readonly/example_test.go",
+      "availability": "source-workspace",
+      "versions": {"github.com/looprig/harness": "source-workspace"},
+      "offlineCommand": "GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache go test -race ./examples/...",
+      "assertion": "One loop.WithReadOnlyAccess option lets a prepared read tool run inside the named root, while a read outside it is denied out of scope.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "The temporary root is removed by the example, the event subscription is closed, and the session is shut down.",
+      "liveGate": null,
+      "proofIds": ["example-harness-readonly-fixture", "example-harness-manifest-contract-test"]
     }
   ]
 }

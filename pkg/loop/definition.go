@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
@@ -45,6 +46,7 @@ type definitionState struct {
 	system              string
 	tools               []tool.Definition
 	accessGate          AccessGate
+	readOnlyRoots       []string
 	middlewares         []tool.ToolMiddleware
 	limits              ToolLimits
 	engine              Engine
@@ -140,7 +142,10 @@ func Define(opts ...Option) (Definition, error) {
 	}
 	_, accessConfigured := resolved.seen["access_gate"]
 	_, runtimeConfigured := resolved.seen["runtime_context"]
-	if (accessConfigured || runtimeConfigured || len(resolved.middlewares) > 0) && strings.TrimSpace(resolved.policyRevision) == "" {
+	// A read-only gate is not opaque: its whole identity (the canonical roots)
+	// is hashed into PolicyRevision, so it alone needs no caller revision.
+	opaqueAccess := accessConfigured && len(resolved.readOnlyRoots) == 0
+	if (opaqueAccess || runtimeConfigured || len(resolved.middlewares) > 0) && strings.TrimSpace(resolved.policyRevision) == "" {
 		return Definition{}, &DefinitionError{Kind: DefinitionMissingPolicyRevision, Field: "policy_revision"}
 	}
 	if resolved.delegation.Style != DelegationSyncOnly && resolved.delegation.Style != DelegationManaged {
@@ -508,6 +513,7 @@ func (d Definition) PolicyRevision() string {
 		Modes               []modePolicy
 		InitialMode         ModeName
 		PolicyRevision      string
+		ReadOnlyAccess      []string `json:",omitempty"`
 		CounterCapability   *contextcount.CounterCapability
 		InferenceCapability *contextcount.InferenceCapability
 		ContextTransports   []ContextTransport
@@ -520,6 +526,7 @@ func (d Definition) PolicyRevision() string {
 		DrainTimeout: d.state.drainTimeout, Delegates: delegates,
 		Delegation: d.state.delegation, Modes: modes, InitialMode: d.state.initialMode,
 		PolicyRevision: d.state.policyRevision,
+		ReadOnlyAccess: d.state.readOnlyRoots,
 		OutputPolicy:   d.state.outputPolicy,
 	}
 	// ContextTransports (and its siblings below) only ever populate here:
@@ -1110,6 +1117,42 @@ func WithAccessGate(access AccessGate) Option {
 			return err
 		}
 		o.accessGate = access
+		return nil
+	}
+}
+
+// WithReadOnlyAccess installs a headless access gate that lets this loop's
+// tools read files within roots and nothing else: reads outside every root,
+// filesystem writes, command execution and network access are denied, and a
+// requirement of any other kind fails closed. It is the minimum gate the
+// standard read tools (Glob, Grep, ReadFile) need to run.
+//
+// Each root must be an existing directory other than the filesystem root; a
+// relative root is resolved against the working directory when Define runs,
+// and symlinks are resolved then too. An invalid root fails Define with
+// DefinitionInvalidAccessGate. It is the loop's access gate, so it cannot be
+// combined with WithAccessGate (DefinitionDuplicateOption); to widen access,
+// compose a gate.Evaluator explicitly instead.
+//
+// The canonical roots are hashed into PolicyRevision, so, unlike
+// WithAccessGate, it requires no WithPolicyRevision, and changing the roots
+// changes the loop's policy identity.
+func WithReadOnlyAccess(roots ...string) Option {
+	roots = append([]string(nil), roots...)
+	return func(o *definitionOptions) error {
+		if err := o.singleton("access_gate"); err != nil {
+			return err
+		}
+		access, err := gate.NewReadOnlyAccess(roots...)
+		if err != nil {
+			return &DefinitionError{Kind: DefinitionInvalidAccessGate, Field: "access_gate", Cause: err}
+		}
+		evaluator, err := gate.NewHeadlessEvaluator(access.Bindings(), nil, nil)
+		if err != nil {
+			return &DefinitionError{Kind: DefinitionInvalidAccessGate, Field: "access_gate", Cause: err}
+		}
+		o.accessGate = evaluator
+		o.readOnlyRoots = access.Roots()
 		return nil
 	}
 }

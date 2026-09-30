@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/looprig/core/uuid"
@@ -212,4 +213,118 @@ func TestBoundAccessInheritsOwnDefinitionGate(t *testing.T) {
 	if gatelessBound.Access() != nil {
 		t.Fatalf("gateless Access() = %v, want nil (runner fails closed)", gatelessBound.Access())
 	}
+}
+
+// TestWithReadOnlyAccessInstallsReadOnlyGate proves the one-line read-only
+// gate: it binds a headless gate that approves reads within the root and
+// denies everything else, and it needs no WithPolicyRevision because its whole
+// identity (the canonical roots) is hashed into PolicyRevision.
+func TestWithReadOnlyAccessInstallsReadOnlyGate(t *testing.T) {
+	t.Parallel()
+	root := canonicalTempDir(t)
+	d, err := Define(
+		WithName("agent"),
+		WithInference(&fakeLLM{}, testModel()),
+		WithReadOnlyAccess(root),
+	)
+	if err != nil {
+		t.Fatalf("Define() error = %v", err)
+	}
+	bound, err := d.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind() error = %v", err)
+	}
+	access := bound.Access()
+	if access == nil {
+		t.Fatal("bound.Access() = nil, want the read-only gate")
+	}
+	authorize := func(kind, scope string) gate.Resolution {
+		t.Helper()
+		resolution, err := access.Authorize(context.Background(), tool.Request{ToolName: "T", Requirements: []tool.Requirement{{
+			Kind: kind, Scope: scope, Match: scope, Description: kind + " " + scope,
+		}}})
+		if err != nil {
+			t.Fatalf("Authorize(%s %s) error = %v", kind, scope, err)
+		}
+		return resolution
+	}
+	if !authorize("filesystem.read", filepath.Join(root, "README.md")).Approved {
+		t.Fatal("read inside the root was not approved")
+	}
+	if authorize("filesystem.read", filepath.Dir(root)).Approved {
+		t.Fatal("read outside the root was approved")
+	}
+	if authorize("filesystem.write", filepath.Join(root, "README.md")).Approved {
+		t.Fatal("write inside the root was approved")
+	}
+}
+
+func TestWithReadOnlyAccessPolicyRevisionTracksRoots(t *testing.T) {
+	t.Parallel()
+	first, second := canonicalTempDir(t), canonicalTempDir(t)
+	define := func(opts ...Option) Definition {
+		t.Helper()
+		d, err := Define(append([]Option{WithName("agent"), WithInference(&fakeLLM{}, testModel())}, opts...)...)
+		if err != nil {
+			t.Fatalf("Define() error = %v", err)
+		}
+		return d
+	}
+	gateless := define().PolicyRevision()
+	one := define(WithReadOnlyAccess(first)).PolicyRevision()
+	oneAgain := define(WithReadOnlyAccess(first, first)).PolicyRevision()
+	both := define(WithReadOnlyAccess(first, second)).PolicyRevision()
+	bothReordered := define(WithReadOnlyAccess(second, first)).PolicyRevision()
+	withRevision := define(WithReadOnlyAccess(first), WithPolicyRevision("rev-1")).PolicyRevision()
+
+	if one == gateless {
+		t.Fatal("adding read-only access did not change PolicyRevision")
+	}
+	if one != oneAgain || both != bothReordered {
+		t.Fatal("PolicyRevision depends on root order or duplicates, want the canonical root set only")
+	}
+	if one == both {
+		t.Fatal("adding a read-only root did not change PolicyRevision")
+	}
+	if withRevision == one {
+		t.Fatal("an explicit WithPolicyRevision must still contribute to PolicyRevision")
+	}
+}
+
+func TestWithReadOnlyAccessValidation(t *testing.T) {
+	t.Parallel()
+	root := canonicalTempDir(t)
+	tests := []struct {
+		name string
+		opts []Option
+		kind DefinitionErrorKind
+	}{
+		{name: "no roots", opts: []Option{WithReadOnlyAccess()}, kind: DefinitionInvalidAccessGate},
+		{name: "missing root", opts: []Option{WithReadOnlyAccess(filepath.Join(root, "missing"))}, kind: DefinitionInvalidAccessGate},
+		{name: "combined with an access gate", opts: []Option{WithReadOnlyAccess(root), WithAccessGate(&fakeAccessGate{}), WithPolicyRevision("rev-1")}, kind: DefinitionDuplicateOption},
+		{name: "access gate then read-only", opts: []Option{WithAccessGate(&fakeAccessGate{}), WithReadOnlyAccess(root), WithPolicyRevision("rev-1")}, kind: DefinitionDuplicateOption},
+		{name: "twice", opts: []Option{WithReadOnlyAccess(root), WithReadOnlyAccess(root)}, kind: DefinitionDuplicateOption},
+		{name: "middlewares still need a revision", opts: []Option{WithReadOnlyAccess(root), WithToolMiddlewares(func(ctx context.Context, t tool.InvokableTool, args string, next tool.ToolExecuteFunc) (*tool.ToolResult, error) {
+			return next(ctx, args)
+		})}, kind: DefinitionMissingPolicyRevision},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Define(append([]Option{WithName("agent"), WithInference(&fakeLLM{}, testModel())}, tt.opts...)...)
+			var definitionErr *DefinitionError
+			if !errors.As(err, &definitionErr) || definitionErr.Kind != tt.kind {
+				t.Fatalf("Define() error = %T %v, want *DefinitionError kind %q", err, err, tt.kind)
+			}
+		})
+	}
+}
+
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
