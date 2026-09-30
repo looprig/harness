@@ -83,6 +83,17 @@ if ok {
   must resolve symlinks and confine execution to the approved path (e.g. via
   `os.Root`). `OverrideBoundAccess` replaces it at bind time, and its roots in
   `PolicyRevision` then do not identify the override.
+  `loop.WithWorkspaceAccess(loop.WorkspaceAccess{Roots: ...})` adds approved
+  writes: reads under the roots run, writes under them open the loop's durable
+  permission gate (`GateApprover()`, answered by the TUI, `RespondGate` or,
+  on a Host, Factory's `gate_response`) unless `Approver` is set, and
+  everything else is denied. With nil `Rules`, "Approve always" lasts for that
+  bound loop in that session only (in memory, not across sessions or a
+  restore). Its `PolicyRevision` is derived from the roots (plus a
+  `gate.PolicyRevisioner` rule store's revision), so an "always" answer never
+  changes policy identity. `WithAccessGate`, `WithReadOnlyAccess` and
+  `WithWorkspaceAccess` share one slot; combining them is
+  `DefinitionDuplicateOption`.
 - [`pkg/identity`](../identity/README.md) — `identity.AgentName` used by
   `loop.WithName` and `loop.WithDelegates`.
 - [`pkg/event`](../event/README.md) — `event.TurnIndex` and the events

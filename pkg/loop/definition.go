@@ -47,6 +47,7 @@ type definitionState struct {
 	tools               []tool.Definition
 	accessGate          AccessGate
 	readOnlyRoots       []string
+	workspace           *workspaceAccessState
 	middlewares         []tool.ToolMiddleware
 	limits              ToolLimits
 	engine              Engine
@@ -125,7 +126,7 @@ func Define(opts ...Option) (Definition, error) {
 			return Definition{}, &DefinitionError{Kind: DefinitionInvalidMiddleware, Field: "middlewares", Value: indexString(index)}
 		}
 	}
-	if _, configured := resolved.seen["access_gate"]; configured && nilLike(resolved.accessGate) {
+	if _, configured := resolved.seen["access_gate"]; configured && nilLike(resolved.accessGate) && resolved.workspace == nil {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidAccessGate, Field: "access_gate"}
 	}
 	if resolved.engine != EngineNative && resolved.engine != EngineForeignClaude && resolved.engine != EngineForeignCodex && resolved.engine != EngineAdapter {
@@ -142,9 +143,10 @@ func Define(opts ...Option) (Definition, error) {
 	}
 	_, accessConfigured := resolved.seen["access_gate"]
 	_, runtimeConfigured := resolved.seen["runtime_context"]
-	// A read-only gate is not opaque: its whole identity (the canonical roots)
-	// is hashed into PolicyRevision, so it alone needs no caller revision.
-	opaqueAccess := accessConfigured && len(resolved.readOnlyRoots) == 0
+	// A read-only or workspace gate is not opaque: its identity (the canonical
+	// roots, plus a revisioned rule store's revision) is hashed into
+	// PolicyRevision, so it alone needs no caller revision.
+	opaqueAccess := accessConfigured && len(resolved.readOnlyRoots) == 0 && resolved.workspace == nil
 	if (opaqueAccess || runtimeConfigured || len(resolved.middlewares) > 0) && strings.TrimSpace(resolved.policyRevision) == "" {
 		return Definition{}, &DefinitionError{Kind: DefinitionMissingPolicyRevision, Field: "policy_revision"}
 	}
@@ -513,7 +515,8 @@ func (d Definition) PolicyRevision() string {
 		Modes               []modePolicy
 		InitialMode         ModeName
 		PolicyRevision      string
-		ReadOnlyAccess      []string `json:",omitempty"`
+		ReadOnlyAccess      []string                 `json:",omitempty"`
+		WorkspaceAccess     *workspaceAccessIdentity `json:",omitempty"`
 		CounterCapability   *contextcount.CounterCapability
 		InferenceCapability *contextcount.InferenceCapability
 		ContextTransports   []ContextTransport
@@ -528,6 +531,10 @@ func (d Definition) PolicyRevision() string {
 		PolicyRevision: d.state.policyRevision,
 		ReadOnlyAccess: d.state.readOnlyRoots,
 		OutputPolicy:   d.state.outputPolicy,
+	}
+	if d.state.workspace != nil {
+		workspace := d.state.workspace.identity()
+		projection.WorkspaceAccess = &workspace
 	}
 	// ContextTransports (and its siblings below) only ever populate here:
 	// validateContextDefinition rejects WithContextTransports without
@@ -748,7 +755,15 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 		})
 	}
 
-	return &boundDefinitionState{definition: d.state, modes: modes}, nil
+	bound := &boundDefinitionState{definition: d.state, modes: modes}
+	if d.state.workspace != nil {
+		evaluator, err := d.state.workspace.evaluator()
+		if err != nil {
+			return nil, &BindError{Kind: BindInvalidDefinition, Index: -1, Cause: err}
+		}
+		bound.workspaceGate = evaluator
+	}
+	return bound, nil
 }
 
 // BoundDefinition is the sealed read-only runtime view of one bound loop.
@@ -795,6 +810,8 @@ type BoundDefinition interface {
 
 // boundDefinitionState is the sealed bound view. accessOverride, when non-nil,
 // is a binding-time per-loop gate override installed by OverrideBoundAccess;
+// workspaceGate, when non-nil, is the per-bind evaluator WithWorkspaceAccess
+// builds (so its default in-memory rules belong to this bound loop alone);
 // otherwise Access() resolves the loop's OWN definition gate — a child agent
 // binding without an explicit override always inherits its own definition's
 // gate, never another loop's.
@@ -802,6 +819,7 @@ type boundDefinitionState struct {
 	definition            *definitionState
 	modes                 []BoundMode
 	accessOverride        AccessGate
+	workspaceGate         AccessGate
 	runtimeProfile        RuntimeProfileName
 	runtimeSource         RuntimeSourceName
 	runtimeSelectionKind  RuntimeSelectionKind
@@ -840,6 +858,9 @@ func (b *boundDefinitionState) InitialMode() ModeName    { return b.definition.i
 func (b *boundDefinitionState) Access() AccessGate {
 	if b.accessOverride != nil {
 		return b.accessOverride
+	}
+	if b.workspaceGate != nil {
+		return b.workspaceGate
 	}
 	return b.definition.accessGate
 }
@@ -1111,6 +1132,8 @@ func WithTools(defs ...tool.Definition) Option {
 // tool call this loop runs. Without one, every tool call fails closed: the
 // runner denies unauthorized execution rather than running ungated. The gate is
 // an opaque policy collaborator, so configuring it requires WithPolicyRevision.
+// It is the loop's single access-gate slot, shared with WithReadOnlyAccess and
+// WithWorkspaceAccess: combining any two is a DefinitionDuplicateOption.
 func WithAccessGate(access AccessGate) Option {
 	return func(o *definitionOptions) error {
 		if err := o.singleton("access_gate"); err != nil {
@@ -1131,8 +1154,10 @@ func WithAccessGate(access AccessGate) Option {
 // relative root is resolved against the working directory when Define runs,
 // and symlinks are resolved then too. An invalid root fails Define with
 // DefinitionInvalidAccessGate. It is the loop's access gate, so it cannot be
-// combined with WithAccessGate (DefinitionDuplicateOption); to widen access,
-// compose a gate.Evaluator explicitly instead.
+// combined with WithAccessGate or WithWorkspaceAccess
+// (DefinitionDuplicateOption). For reads plus approved writes use
+// WithWorkspaceAccess; to widen access further, compose a gate.Evaluator
+// explicitly instead.
 //
 // The canonical roots are hashed into PolicyRevision, so, unlike
 // WithAccessGate, it requires no WithPolicyRevision, and changing the roots

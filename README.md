@@ -84,6 +84,8 @@ agent, err := loop.Define(
     loop.WithTools(status),
     // Every tool call fails closed without an access gate.
     // loop.WithReadOnlyAccess(repoRoot) allows file reads under repoRoot only;
+    // loop.WithWorkspaceAccess(loop.WorkspaceAccess{Roots: []string{repoRoot}})
+    // also lets writes under repoRoot run once approved;
     // loop.WithAccessGate(...) binds a full permission gate; see pkg/gate.
 )
 if err != nil { return err }

@@ -39,6 +39,12 @@
       "symbol": "Example_readOnlyTools"
     },
     {
+      "id": "example-harness-workspace-fixture",
+      "type": "executable-fixture",
+      "path": "examples/workspace/example_test.go",
+      "symbol": "Example_readAndApprovedWrites"
+    },
+    {
       "id": "example-harness-manifest-contract-test",
       "type": "test",
       "path": "tests/example_test.go",
@@ -135,6 +141,21 @@
       "cleanup": "The temporary root is removed by the example, the event subscription is closed, and the session is shut down.",
       "liveGate": null,
       "proofIds": ["example-harness-readonly-fixture", "example-harness-manifest-contract-test"]
+    },
+    {
+      "id": "example-harness-workspace-read-and-approved-writes",
+      "ecosystem": "go",
+      "owner": "harness",
+      "sourcePath": "examples/workspace/example_test.go",
+      "availability": "source-workspace",
+      "versions": {"github.com/looprig/harness": "source-workspace"},
+      "offlineCommand": "GOWORK=off GOCACHE=/tmp/looprig-harness-docs-gocache go test -race ./examples/...",
+      "assertion": "One loop.WithWorkspaceAccess option lets a prepared read tool run inside the named root, runs a write there only after a gate.ApproverFunc approves it, and denies a refused write and a write outside the root.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "The temporary root is removed by the example, the event subscription is closed, and the session is shut down.",
+      "liveGate": null,
+      "proofIds": ["example-harness-workspace-fixture", "example-harness-manifest-contract-test"]
     }
   ]
 }
