@@ -338,3 +338,57 @@ func TestWorkspaceAccessHeadlessApproverFunc(t *testing.T) {
 		t.Fatalf("prompts = %d, runs = %d; want the approver asked once and the write run", prompts.Load(), f.runs.Load())
 	}
 }
+
+// revisionedWorkspaceRules is a rule store whose policy revision can move.
+type revisionedWorkspaceRules struct {
+	*gate.SessionRules
+	revision atomic.Value
+}
+
+func (r *revisionedWorkspaceRules) PolicyRevision() string { return r.revision.Load().(string) }
+
+// TestWorkspaceAccessRevisionedRulesChangeBlocksRestoreThroughSameRig: once a
+// revisioned rule store moves past the revision the loop was defined with,
+// the same rig can no longer bind the loop, so neither a restore nor a new
+// session runs the changed rules under the stale identity.
+func TestWorkspaceAccessRevisionedRulesChangeBlocksRestoreThroughSameRig(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	f := newWorkspaceFixture(t)
+	rules := &revisionedWorkspaceRules{SessionRules: gate.NewSessionRules()}
+	rules.revision.Store("r1")
+	r := f.rig(t, loop.WorkspaceAccess{Rules: rules})
+	live, err := r.NewSession(ctx)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	id := live.SessionID()
+	if err := live.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	rules.revision.Store("r2")
+	var revisionErr *loop.WorkspaceRulesRevisionError
+	restored, err := r.RestoreSession(ctx, id)
+	if restored != nil {
+		_ = restored.Shutdown(context.Background())
+	}
+	if !errors.As(err, &revisionErr) {
+		t.Fatalf("RestoreSession after the rules changed = %T %v, want a WorkspaceRulesRevisionError", err, err)
+	}
+	fresh, err := r.NewSession(ctx)
+	if fresh != nil {
+		_ = fresh.Shutdown(context.Background())
+	}
+	if !errors.As(err, &revisionErr) {
+		t.Fatalf("NewSession after the rules changed = %T %v, want a WorkspaceRulesRevisionError", err, err)
+	}
+
+	rules.revision.Store("r1")
+	restored, err = r.RestoreSession(ctx, id)
+	if err != nil {
+		t.Fatalf("RestoreSession at the defined revision: %v", err)
+	}
+	_ = restored.Shutdown(context.Background())
+}

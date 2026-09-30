@@ -1,9 +1,12 @@
 package loop
 
 import (
+	"context"
 	"errors"
+	"fmt"
 
 	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // WorkspaceAccess configures WithWorkspaceAccess. Only Roots is required; a
@@ -21,7 +24,9 @@ type WorkspaceAccess struct {
 	// Rules remembers "Approve always for this workspace" answers. Nil gives
 	// every bound loop its own gate.NewSessionRules(): an "always" answer then
 	// lasts for that loop in that session while the process runs, and never
-	// reaches another session, another loop, or a restored session.
+	// reaches another session, another loop, or a restored session. A store
+	// implementing gate.PolicyRevisioner joins PolicyRevision and must keep
+	// its Define-time revision (see WithWorkspaceAccess).
 	Rules gate.RuleStore
 }
 
@@ -49,10 +54,69 @@ func (w *workspaceAccessState) identity() workspaceAccessIdentity {
 
 func (w *workspaceAccessState) evaluator() (*gate.Evaluator, error) {
 	rules := w.rules
-	if rules == nil {
+	switch revisioner, ok := rules.(gate.PolicyRevisioner); {
+	case rules == nil:
 		rules = gate.NewSessionRules()
+	case ok:
+		guarded := revisionGuardedRules{RuleStore: rules, revisioner: revisioner, defined: w.rulesRevision}
+		if err := guarded.check(); err != nil {
+			return nil, err
+		}
+		rules = guarded
 	}
 	return gate.NewWorkspaceEvaluator(w.access, w.approver, rules)
+}
+
+// WorkspaceRulesRevisionError reports that a gate.PolicyRevisioner rule store
+// supplied to WithWorkspaceAccess no longer reports the revision it had when
+// the loop was defined. The definition's PolicyRevision still names the old
+// revision, so using the changed rules would run under a stale policy
+// identity; instead Bind fails and every evaluation that consults the store
+// fails closed until the definition (and the rig built from it) is rebuilt.
+type WorkspaceRulesRevisionError struct {
+	Defined string
+	Current string
+}
+
+func (e *WorkspaceRulesRevisionError) Error() string {
+	return fmt.Sprintf("loop: workspace access rules changed revision since Define (defined %q, now %q); rebuild the loop definition", e.Defined, e.Current)
+}
+
+// revisionGuardedRules wraps a revisioned rule store so that no match or write
+// runs once the store's revision differs from the one hashed into the loop's
+// PolicyRevision.
+type revisionGuardedRules struct {
+	gate.RuleStore
+	revisioner gate.PolicyRevisioner
+	defined    string
+}
+
+func (r revisionGuardedRules) check() error {
+	if current := r.revisioner.PolicyRevision(); current != r.defined {
+		return &WorkspaceRulesRevisionError{Defined: r.defined, Current: current}
+	}
+	return nil
+}
+
+func (r revisionGuardedRules) MatchesDeny(ctx context.Context, requirement tool.Requirement) (bool, error) {
+	if err := r.check(); err != nil {
+		return false, err
+	}
+	return r.RuleStore.MatchesDeny(ctx, requirement)
+}
+
+func (r revisionGuardedRules) MatchesAllow(ctx context.Context, requirement tool.Requirement) (bool, error) {
+	if err := r.check(); err != nil {
+		return false, err
+	}
+	return r.RuleStore.MatchesAllow(ctx, requirement)
+}
+
+func (r revisionGuardedRules) WriteRules(ctx context.Context, candidates []tool.RuleCandidate) error {
+	if err := r.check(); err != nil {
+		return err
+	}
+	return r.RuleStore.WriteRules(ctx, candidates)
 }
 
 // WithWorkspaceAccess installs an interactive access gate for an agent that
@@ -80,6 +144,11 @@ func (w *workspaceAccessState) evaluator() (*gate.Evaluator, error) {
 // PolicyRevision is derived, so no WithPolicyRevision is required: it hashes
 // "workspace-access/v1", the canonical roots and, when Rules implements
 // gate.PolicyRevisioner, its revision, read once when the option is applied.
+// Such a store must then keep that revision: if it later reports another
+// (because its rules changed, including by an "always" answer written through
+// it), Bind fails and every evaluation that consults it fails closed with
+// *WorkspaceRulesRevisionError until the definition and rig are rebuilt, so
+// changed rules never run under a stale policy identity.
 // The approver and in-memory rules contribute nothing, so an "always" answer
 // never changes the loop's policy identity and a restored session does not
 // report drift. Invalid roots, or a typed-nil Approver or Rules, fail Define

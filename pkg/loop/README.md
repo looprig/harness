@@ -90,8 +90,11 @@ if ok {
   everything else is denied. With nil `Rules`, "Approve always" lasts for that
   bound loop in that session only (in memory, not across sessions or a
   restore). Its `PolicyRevision` is derived from the roots (plus a
-  `gate.PolicyRevisioner` rule store's revision), so an "always" answer never
-  changes policy identity. `WithAccessGate`, `WithReadOnlyAccess` and
+  `gate.PolicyRevisioner` rule store's revision, captured at `Define`), so an
+  in-memory "always" answer never changes policy identity. If a revisioned
+  store later reports another revision, `Bind` and every rule lookup fail
+  closed with `*loop.WorkspaceRulesRevisionError` until the definition and rig
+  are rebuilt. `WithAccessGate`, `WithReadOnlyAccess` and
   `WithWorkspaceAccess` share one slot; combining them is
   `DefinitionDuplicateOption`.
 - [`pkg/identity`](../identity/README.md) — `identity.AgentName` used by

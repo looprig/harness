@@ -252,3 +252,79 @@ func TestWithWorkspaceAccessValidation(t *testing.T) {
 		t.Fatalf("Define(workspace access alone) error = %v", err)
 	}
 }
+
+// mutableRevisionedRules is a revisioned store whose revision can move, as a
+// durable rule file's digest does when its rules change.
+type mutableRevisionedRules struct {
+	*gate.SessionRules
+	revision atomic.Value
+}
+
+func newMutableRevisionedRules(revision string) *mutableRevisionedRules {
+	r := &mutableRevisionedRules{SessionRules: gate.NewSessionRules()}
+	r.revision.Store(revision)
+	return r
+}
+
+func (r *mutableRevisionedRules) PolicyRevision() string { return r.revision.Load().(string) }
+
+// TestWithWorkspaceAccessRevisionedRulesFailClosedOnChange: a revisioned
+// store that changes after Define must not be used under the stale identity
+// — existing evaluators fail closed and a new Bind is refused, with a typed
+// error, until the store reports the defined revision again.
+func TestWithWorkspaceAccessRevisionedRulesFailClosedOnChange(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := canonicalTempDir(t)
+	target := filepath.Join(root, "a.go")
+	rules := newMutableRevisionedRules("r1")
+	approver := &alwaysApprover{}
+	d := defineWorkspace(t, WorkspaceAccess{Roots: []string{root}, Approver: approver, Rules: rules})
+	defined := d.PolicyRevision()
+	access := bindAccess(t, d)
+
+	// The store's rules change: a write is newly covered and it reports r2.
+	if err := rules.WriteRules(ctx, []tool.RuleCandidate{{Kind: "filesystem.write", Match: target}}); err != nil {
+		t.Fatal(err)
+	}
+	rules.revision.Store("r2")
+
+	resolution, err := access.Authorize(ctx, workspaceWriteRequest(target))
+	var revisionErr *WorkspaceRulesRevisionError
+	if !errors.As(err, &revisionErr) || resolution.Approved {
+		t.Fatalf("Authorize(after the store changed) = %+v, %v; want a WorkspaceRulesRevisionError", resolution, err)
+	}
+	if revisionErr.Defined != "r1" || revisionErr.Current != "r2" {
+		t.Fatalf("WorkspaceRulesRevisionError = %+v, want defined r1, current r2", revisionErr)
+	}
+	if approver.prompts.Load() != 0 {
+		t.Fatal("a stale-identity evaluation reached the approver")
+	}
+	// Reads need no rule, so they are unaffected.
+	read := tool.Request{ToolName: "ReadFile", Requirements: []tool.Requirement{{Kind: "filesystem.read", Scope: target, Match: target, Description: "read"}}}
+	if resolution, err := access.Authorize(ctx, read); err != nil || !resolution.Approved {
+		t.Fatalf("Authorize(read) = %+v, %v; want approved", resolution, err)
+	}
+	if _, err := d.Bind(ctx, validToolBindings(t)); !errors.As(err, &revisionErr) {
+		t.Fatalf("Bind(after the store changed) error = %v, want a WorkspaceRulesRevisionError", err)
+	}
+	if d.PolicyRevision() != defined {
+		t.Fatal("PolicyRevision moved after Define")
+	}
+
+	// Back at the defined revision, the store is usable again.
+	rules.revision.Store("r1")
+	if resolution, err := bindAccess(t, d).Authorize(ctx, workspaceWriteRequest(target)); err != nil || !resolution.Approved {
+		t.Fatalf("Authorize(at the defined revision) = %+v, %v; want approved by the stored rule", resolution, err)
+	}
+	if approver.prompts.Load() != 0 {
+		t.Fatal("the stored rule did not spare the prompt")
+	}
+	// A rebuilt definition adopts the new revision and a new identity.
+	rules.revision.Store("r2")
+	rebuilt := defineWorkspace(t, WorkspaceAccess{Roots: []string{root}, Approver: approver, Rules: rules})
+	if rebuilt.PolicyRevision() == defined {
+		t.Fatal("a rebuilt definition kept the old identity")
+	}
+	bindAccess(t, rebuilt)
+}
