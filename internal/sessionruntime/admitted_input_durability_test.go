@@ -70,7 +70,7 @@ func holdTurnStart(s *Session) func() {
 // after a real crash.
 func crashWithoutTeardown(t *testing.T, s *Session) {
 	t.Helper()
-	s.releaseLease(context.Background())
+	_ = s.releaseLease(leaseReleaseTimeout)
 	s.sessionCancel()
 	waitLoopsExited(t, s)
 }

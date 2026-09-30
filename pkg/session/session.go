@@ -264,9 +264,17 @@ type PersistenceFaultReporter interface {
 // last managed to write, and a successor's restore treats whatever was in flight as
 // crash debt, exactly as after a crash.
 //
-// It admits any session, faulted or not, and joins a teardown already underway. A
-// lease release that fails (storage still down) is reported, and the lease then
-// lapses on its own expiry.
+// It admits any session, faulted or not, and joins a teardown already underway.
+//
+// A NIL RESULT MEANS THE LEASES WERE GIVEN BACK. The workspace root lease and the
+// journal lease are both always attempted, each bounded by a fixed private deadline
+// (so a wedged backend cannot hold the call forever), and a release that fails or
+// times out is RETURNED as a *LeaseReleaseError (wrapped; find it with errors.As).
+// No pinned backend expires a lease, so such a grant is still held — a successor,
+// even one in this process, is refused until it is released or the process exits —
+// and a caller must not report the residency as given up. Everything else about the
+// call still happened: the session is torn down, nothing was journaled, and no gate
+// was resolved. Shutdown and ReleaseResidency report the same error the same way.
 type ResidencyAbandoner interface {
 	AbandonResidency(context.Context) error
 }

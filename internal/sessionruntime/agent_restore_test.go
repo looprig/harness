@@ -224,7 +224,7 @@ func crashAgentRestoreSession(t *testing.T, s *Session) {
 	sid := s.SessionID()
 	s.sessionCancel()
 	waitLoopsExited(t, s)
-	s.releaseLease(context.Background())
+	_ = s.releaseLease(leaseReleaseTimeout)
 	if sid.IsZero() {
 		t.Fatal("crashed session has zero session id")
 	}

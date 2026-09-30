@@ -377,3 +377,44 @@ func (e *WorkspaceRecoveryError) Error() string {
 }
 
 func (e *WorkspaceRecoveryError) Unwrap() error { return e.Cause }
+
+// LeaseReleaseError reports that a session teardown — Shutdown, ReleaseResidency or
+// AbandonResidency — ran to completion but could not give back one or both of the
+// session's exclusive grants. Lease is the journal (single-writer) lease release
+// failure and Workspace the exclusive workspace root lease release failure; a nil
+// field was released. Both releases are always attempted, whichever fails.
+//
+// THE GRANT IS STILL HELD. No pinned storage backend expires a lease — a grant this
+// process failed to release is held until it is released or the process exits — so a
+// successor, including one in this same process, is refused until then. A caller that
+// hands the session to a successor must not report the hand-off as complete. The
+// teardown's other guarantees are unaffected: for AbandonResidency nothing was
+// journaled and no gate was resolved.
+//
+// Each cause stays reachable with errors.Is / errors.As; a release that did not return
+// within its bound carries context.DeadlineExceeded.
+type LeaseReleaseError struct {
+	Lease     error
+	Workspace error
+}
+
+func (e *LeaseReleaseError) Error() string {
+	msg := "session: lease release failed"
+	if e.Lease != nil {
+		msg += ": journal lease: " + e.Lease.Error()
+	}
+	if e.Workspace != nil {
+		msg += ": workspace root lease: " + e.Workspace.Error()
+	}
+	return msg
+}
+
+func (e *LeaseReleaseError) Unwrap() []error {
+	causes := make([]error, 0, 2)
+	for _, cause := range []error{e.Lease, e.Workspace} {
+		if cause != nil {
+			causes = append(causes, cause)
+		}
+	}
+	return causes
+}

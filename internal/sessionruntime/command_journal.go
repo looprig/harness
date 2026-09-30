@@ -103,7 +103,8 @@ func WithEventAppender(a eventAppender) Option {
 // for a NEW session; Restore installs it from the lease it acquired, so both paths free
 // ownership on a clean exit and a successor can re-acquire at all (no backend expires a grant). A
 // nil hook is ignored (headless mode stays a no-op). It takes a context so the release I/O
-// is bounded by Shutdown's ctx.
+// is bounded by teardown's private release deadline; a failed release is reported by the
+// teardown call as a *LeaseReleaseError.
 func WithLeaseRelease(release func(context.Context) error) Option {
 	return func(s *Session) {
 		if release != nil {

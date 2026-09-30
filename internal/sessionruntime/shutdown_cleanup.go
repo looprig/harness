@@ -19,6 +19,8 @@ const (
 	ShutdownCleanupCollabBroker     ShutdownCleanupPhase = "collab_broker"
 	ShutdownCleanupSessionResources ShutdownCleanupPhase = "session_resources"
 	ShutdownCleanupHubStop          ShutdownCleanupPhase = "hub_stop"
+	ShutdownCleanupLeaseRelease     ShutdownCleanupPhase = "lease_release"
+	ShutdownCleanupRootRelease      ShutdownCleanupPhase = "workspace_root_release"
 )
 
 // ShutdownCleanupTimeoutError reports a finite session-owned teardown deadline.
@@ -43,6 +45,9 @@ type shutdownCleanupTimeouts struct {
 	collabBroker     time.Duration
 	sessionResources time.Duration
 	hub              time.Duration
+	// leaseRelease bounds EACH of the two grant releases (workspace root, then journal
+	// lease). It is not derived from the session: it is the fixed leaseReleaseTimeout.
+	leaseRelease time.Duration
 }
 
 func (s *Session) resolveShutdownTimeouts(snapshot []loopSnapshot) shutdownCleanupTimeouts {
@@ -59,6 +64,7 @@ func (s *Session) resolveShutdownTimeouts(snapshot []loopSnapshot) shutdownClean
 	derived := shutdownCleanupTimeouts{
 		hustle: hustleTimeout, loopSend: loopTimeout, loopDrain: loopTimeout,
 		checkpoint: checkpointTimeout, collabBroker: base, sessionResources: base, hub: base,
+		leaseRelease: leaseReleaseTimeout,
 	}
 	return derived.withOverrides(s.shutdownTimeouts)
 }
@@ -72,6 +78,7 @@ func (t shutdownCleanupTimeouts) withOverrides(overrides shutdownCleanupTimeouts
 		collabBroker:     timeoutOverride(t.collabBroker, overrides.collabBroker),
 		sessionResources: timeoutOverride(t.sessionResources, overrides.sessionResources),
 		hub:              timeoutOverride(t.hub, overrides.hub),
+		leaseRelease:     timeoutOverride(t.leaseRelease, overrides.leaseRelease),
 	}
 }
 

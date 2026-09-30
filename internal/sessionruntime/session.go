@@ -320,6 +320,9 @@ type Session struct {
 	// concrete lease, only the narrow release closure.
 	leaseRelease func(context.Context) error
 	releaseOnce  sync.Once
+	// leaseReleaseErr is the result of the one leaseRelease call, written inside
+	// releaseOnce and read only after it, so every teardown caller reports it.
+	leaseReleaseErr error
 
 	// foreignBuild and foreignBuildRestored are the composition-root seams newLoop and
 	// the restore path use to construct a foreign-engine loop (live + restored). They are
@@ -422,6 +425,8 @@ type Session struct {
 	// lease is released, then the session lease. Nil for per-session/shared/no placement.
 	wsRootRelease   func(context.Context) error
 	releaseRootOnce sync.Once
+	// rootReleaseErr is the result of the one wsRootRelease call (see leaseReleaseErr).
+	rootReleaseErr error
 
 	// wsLeaseLost is the exclusive root lease's loss channel. A watcher goroutine
 	// (watchRootLease) faults the session and interrupts live loops when it closes, so
@@ -637,8 +642,9 @@ func (s *Session) abortConstructionAfter(cause error, appendTerminal func(contex
 		}
 		// Lease hooks are accepted by the Session before construction starts. Once
 		// accepted, this is their sole teardown owner: root then session, exactly once.
-		s.releaseRootLease(context.Background())
-		s.releaseLease(context.Background())
+		// A failure is logged by the release itself; a construction abort has no
+		// caller left to report it to (the constructor already returned its error).
+		_ = s.releaseLeases(leaseReleaseTimeout)
 	}
 	go cleanup()
 	select {
@@ -2777,49 +2783,94 @@ func (s *Session) interruptAs(ctx context.Context, principal *sessionwire.Princi
 	return any, err
 }
 
-// releaseLease invokes the lease-release hook EXACTLY ONCE (releaseOnce) on a fresh,
-// bounded background context, swallowing the error (Shutdown's own error is the
-// caller-facing one). There is NO BACKSTOP behind it: no pinned backend expires a
-// lease — memstore ends a grant on Release only, and fsstore's is an advisory lock
-// the OS drops when the holding fd closes or the process exits — so a grant this
+// releaseLease invokes the lease-release hook EXACTLY ONCE (releaseOnce) on a fresh
+// background context bounded by timeout, and returns its result — to EVERY caller, the
+// first and any later one alike. There is NO BACKSTOP behind it: no pinned backend
+// expires a lease — memstore ends a grant on Release only, and fsstore's is an advisory
+// lock the OS drops when the holding fd closes or the process exits — so a grant this
 // hook fails to release is held for the life of the process and every successor is
-// locked out until then. It is nil-safe: a headless session (no WithLeaseRelease, no
-// Restore-installed releaser) has no hook and this is a no-op. Idempotent so a second
-// Shutdown never double-releases.
-func (s *Session) releaseLease(_ context.Context) {
+// locked out until then. That is why the failure is RETURNED (teardown reports it as a
+// *LeaseReleaseError) rather than only logged. It is nil-safe: a headless session (no
+// WithLeaseRelease, no Restore-installed releaser) has no hook and this returns nil.
+// Idempotent so a second teardown path never double-releases.
+func (s *Session) releaseLease(timeout time.Duration) error {
 	s.releaseOnce.Do(func() {
 		if s.leaseRelease == nil {
 			return
 		}
-		releaseCtx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
-		defer cancel()
-		if err := s.leaseRelease(releaseCtx); err != nil {
-			slog.WarnContext(releaseCtx, "session: lease release on shutdown failed (no TTL backstop: held until this process exits)",
-				"session", s.sessionID, "err", err)
+		s.leaseReleaseErr = boundedRelease(s.leaseRelease, timeout, ShutdownCleanupLeaseRelease)
+		if s.leaseReleaseErr != nil {
+			slog.Warn("session: lease release on teardown failed (no TTL backstop: held until released or this process exits)",
+				"session", s.sessionID, "err", s.leaseReleaseErr)
 		}
 	})
+	return s.leaseReleaseErr
 }
 
 // releaseRootLease releases the EXCLUSIVE workspace root lease EXACTLY ONCE
-// (releaseRootOnce), on a fresh bounded background context, swallowing the error —
-// Shutdown's own error is the caller-facing one, and there is no backstop behind
-// this release either: the root lease comes from the same storage.Leaser as the
-// session lease (see resolvePlacement), which no pinned backend expires.
+// (releaseRootOnce), on a fresh background context bounded by timeout, and returns
+// the result to every caller. There is no backstop behind this release either: the
+// root lease comes from the same storage.Leaser as the session lease (see
+// resolvePlacement), which no pinned backend expires.
 // Nil-safe: per-session, shared, and no-placement sessions have no root lease.
-// Shutdown calls this BEFORE releaseLease so the root lease is relinquished before the
+// Teardown calls this BEFORE releaseLease so the root lease is relinquished before the
 // session lease (LIFO teardown), and after work/checkpoints have stopped.
-func (s *Session) releaseRootLease(_ context.Context) {
+func (s *Session) releaseRootLease(timeout time.Duration) error {
 	s.releaseRootOnce.Do(func() {
 		if s.wsRootRelease == nil {
 			return
 		}
-		releaseCtx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
-		defer cancel()
-		if err := s.wsRootRelease(releaseCtx); err != nil {
-			slog.WarnContext(releaseCtx, "session: workspace root lease release on shutdown failed (no TTL backstop: held until this process exits)",
-				"session", s.sessionID, "err", err)
+		s.rootReleaseErr = boundedRelease(s.wsRootRelease, timeout, ShutdownCleanupRootRelease)
+		if s.rootReleaseErr != nil {
+			slog.Warn("session: workspace root lease release on teardown failed (no TTL backstop: held until released or this process exits)",
+				"session", s.sessionID, "err", s.rootReleaseErr)
 		}
 	})
+	return s.rootReleaseErr
+}
+
+// releaseLeases releases the workspace root lease and then the journal lease, ALWAYS
+// attempting both, and reports whichever failed as one *LeaseReleaseError (nil when
+// both were released or absent).
+func (s *Session) releaseLeases(timeout time.Duration) error {
+	rootErr := s.releaseRootLease(timeout)
+	leaseErr := s.releaseLease(timeout)
+	if rootErr == nil && leaseErr == nil {
+		return nil
+	}
+	return &LeaseReleaseError{Lease: leaseErr, Workspace: rootErr}
+}
+
+// boundedRelease runs one grant release on a fresh background context bounded by
+// timeout, and returns within that bound EVEN IF the provider ignores its context:
+// the release runs on its own goroutine, and a release still running at the deadline
+// is reported as a *ShutdownCleanupTimeoutError for phase (chaining
+// context.DeadlineExceeded). The goroutine is not abandoned in the sense of being
+// stopped — it keeps running to the provider's own completion, so a release that
+// eventually lands still frees the grant — but the teardown owner, and every caller
+// joined to it, is no longer held hostage to a wedged backend.
+func boundedRelease(release func(context.Context) error, timeout time.Duration, phase ShutdownCleanupPhase) error {
+	if timeout <= 0 {
+		timeout = leaseReleaseTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	done := make(chan error, 1)
+	go func() { // #nosec G118 -- deliberately outlives the bounded reporting deadline; see the doc comment above
+		defer cancel()
+		done <- release(ctx)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		// The release may have returned at the deadline; prefer its own answer.
+		select {
+		case err := <-done:
+			return err
+		default:
+		}
+		return cleanupTimeoutError(phase, timeout, ctx.Err())
+	}
 }
 
 // watchRootLease starts the exclusive root-lease loss watcher (a no-op unless an exclusive
@@ -3062,7 +3113,9 @@ type shutdownTarget struct {
 //  4. Wait for every recorded ack, then join hustle terminal audit, finalizers,
 //     and blocking activity release through Controller.Drained.
 //  5. Stop/join checkpoints and offload GC, terminate session resources, append
-//     SessionStopped/stop the hub, release root/session leases, and cancel sessionCtx
+//     SessionStopped/stop the hub, release root/session leases (both always
+//     attempted, each on a fixed private deadline; a failure is reported as a
+//     *LeaseReleaseError, since nothing expires either grant), and cancel sessionCtx
 //     last.
 //  6. Loop/checkpoint/hub phases have private deadlines derived from validated
 //     component bounds. Hustle audit, finalization, and worker drain use their own
@@ -3302,8 +3355,10 @@ func (s *Session) teardown(plan teardownPlan) error {
 	// and every producer of new work has stopped.
 	failures = append(failures, plan.beforeHubClose(cleanupRoot, checkpointBudget(timeouts.checkpoint)))
 	failures = append(failures, plan.closeHub(cleanupRoot, timeouts.hub))
-	s.releaseRootLease(cleanupRoot)
-	s.releaseLease(cleanupRoot)
+	// Both grants are released whatever else failed, and a release that fails is
+	// REPORTED: nothing expires either grant, so a swallowed failure would leave a
+	// successor locked out while the caller believes the residency is gone.
+	failures = append(failures, s.releaseLeases(timeouts.leaseRelease))
 	if s.sessionCancel != nil {
 		s.sessionCancel()
 	}

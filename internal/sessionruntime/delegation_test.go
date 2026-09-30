@@ -2157,7 +2157,7 @@ func TestDelegateQueuedRequestRestoresInterruptedWithoutReplay(t *testing.T) {
 	// (successor restoring while a predecessor actor still writes) that neither a real crash nor
 	// a graceful handoff ever produces.
 	waitLoopsExited(t, s)
-	s.releaseLease(context.Background())
+	_ = s.releaseLease(leaseReleaseTimeout)
 	_ = obs.Close()
 
 	restored, err := lc.RestoreSession(context.Background(), sid)

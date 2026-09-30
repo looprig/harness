@@ -48,8 +48,9 @@ func (e *ResidencyReleaseRefusedError) Unwrap() error { return e.Cause }
 //     A checkpoint that does not commit writes NO residency record — a record naming an
 //     anchor that does not exist is worse than no record.
 //  4. Close the hub LOCALLY, appending no SessionStopped.
-//  5. Release the workspace root lease then the session lease, cancel the session
-//     context, and abandon foreign delivery hooks.
+//  5. Release the workspace root lease then the session lease (both always attempted;
+//     a failure is reported as a *LeaseReleaseError), cancel the session context,
+//     and abandon foreign delivery hooks.
 //
 // Done closes at the START of step 2, not at the end, so a supervisor learns the
 // session is going away while teardown is still running.
@@ -103,7 +104,9 @@ func (s *Session) ReleaseResidency(ctx context.Context) error {
 // durable log ends where the live runtime last wrote, and a successor restores from
 // exactly that. The teardown then runs the nonterminal plan with NO anchor step and a
 // local hub close, so nothing is appended at either seam either, and the root and
-// journal leases are released so a successor need not wait for them to expire.
+// journal leases are released — both always attempted, each on its own bounded
+// private deadline. A release that fails is returned as a *LeaseReleaseError: nothing
+// expires either grant, so the caller must know a successor is still locked out.
 func (s *Session) AbandonResidency(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()

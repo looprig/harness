@@ -26,6 +26,7 @@ type WorkspaceNotConfiguredError = sessionapi.WorkspaceNotConfiguredError
 type WorkspaceRootBusyError = sessionapi.WorkspaceRootBusyError
 type WorkspaceRootLeaseLostError = sessionapi.WorkspaceRootLeaseLostError
 type WorkspaceRecoveryError = sessionapi.WorkspaceRecoveryError
+type LeaseReleaseError = sessionapi.LeaseReleaseError
 
 const (
 	SessionIDGenerationFailed            = sessionapi.SessionIDGenerationFailed
