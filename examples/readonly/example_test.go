@@ -104,16 +104,25 @@ func runOneTurn(ctx context.Context, agent loop.Definition, text string) error {
 	return errors.Join(errors.New("event stream ended before the turn"), events.Err())
 }
 
-// readFileDefinition is a minimal prepared read tool. Like the standard tools,
-// it resolves the path first and asks the access gate for a filesystem.read
-// of that canonical path; it runs only if the gate approves.
+// readFileDefinition is a minimal prepared read tool, modelled on the standard
+// tools. PrepareCall resolves the path and asks the access gate for a
+// filesystem.read of that canonical path; the gate judges only that string.
+// InvokableRun then reads through an os.Root bound to the tool's own root, so a
+// file or directory swapped for a symlink after approval cannot lead the read
+// outside the root. A tool must confine its own execution like this: the gate
+// decides what may be read, the tool makes sure that is what gets read.
 func readFileDefinition(base string) tool.Definition {
 	return tool.NewDefinition("ReadFile", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
-		return []tool.InvokableTool{readFile{base: base}}, nil
+		root, err := filepath.EvalSymlinks(base)
+		if err != nil {
+			return nil, err
+		}
+		return []tool.InvokableTool{readFile{root: root}}, nil
 	})
 }
 
-type readFile struct{ base string }
+// readFile reads files under root, a canonical (symlink-free) directory.
+type readFile struct{ root string }
 
 func (readFile) Info(context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{Name: "ReadFile", Desc: "Read a text file", Schema: json.RawMessage(
@@ -127,8 +136,10 @@ func (r readFile) PrepareCall(_ context.Context, id uuid.UUID, argsJSON string) 
 	}
 	path := args.Path
 	if !filepath.IsAbs(path) {
-		path = filepath.Join(r.base, path)
+		path = filepath.Join(r.root, path)
 	}
+	// The gate is given the canonical path, so it judges where the read
+	// really lands at preparation time, not the model's spelling of it.
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return tool.Request{}, nil, err
@@ -142,13 +153,25 @@ func (r readFile) PrepareCall(_ context.Context, id uuid.UUID, argsJSON string) 
 	}, tool.TokenArtifact{Token: resolved}, nil
 }
 
-func (readFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
+func (r readFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
 	call, ok := loop.PreparedCallFromContext(ctx)
 	artifact, isToken := call.Artifact.(tool.TokenArtifact)
 	if !ok || !isToken {
 		return tool.TextResult("error: missing prepared call"), nil
 	}
-	data, err := os.ReadFile(artifact.Token)
+	// Execute only the approved path, and only relative to the root handle:
+	// os.Root refuses any path, symlink or ".." that resolves outside it,
+	// including one swapped in after the gate approved the call.
+	rel, err := filepath.Rel(r.root, artifact.Token)
+	if err != nil || !filepath.IsLocal(rel) {
+		return tool.TextResult("error: path is outside the tool root"), nil
+	}
+	root, err := os.OpenRoot(r.root)
+	if err != nil {
+		return tool.TextResult("error: " + err.Error()), nil
+	}
+	defer func() { _ = root.Close() }()
+	data, err := root.ReadFile(rel)
 	if err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}

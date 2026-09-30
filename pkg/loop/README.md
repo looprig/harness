@@ -79,6 +79,10 @@ if ok {
   closed (`permission denied [unavailable]`, with a one-time log warning);
   `loop.WithReadOnlyAccess(roots...)` is the one-option gate for read-only
   tools such as Glob, Grep and ReadFile, and needs no `WithPolicyRevision`.
+  It judges the canonical paths trusted tools prepare (lexically), so a tool
+  must resolve symlinks and confine execution to the approved path (e.g. via
+  `os.Root`). `OverrideBoundAccess` replaces it at bind time, and its roots in
+  `PolicyRevision` then do not identify the override.
 - [`pkg/identity`](../identity/README.md) — `identity.AgentName` used by
   `loop.WithName` and `loop.WithDelegates`.
 - [`pkg/event`](../event/README.md) — `event.TurnIndex` and the events

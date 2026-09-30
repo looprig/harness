@@ -161,9 +161,10 @@ func TestNewReadOnlyAccessCanonicalizesRoots(t *testing.T) {
 	if got, err := access.AccessFor("filesystem.read", filepath.Join(real, "a.txt")); err != nil || got != gate.AccessAllow {
 		t.Fatalf("AccessFor(resolved) = %d, %v, want allow", got, err)
 	}
-	// The unresolved spelling is not the canonical form and is not trusted.
+	// The gate compares strings, not files: a spelling through a symlink that
+	// lives outside every root is lexically outside, so it is denied.
 	if got, _ := access.AccessFor("filesystem.read", filepath.Join(link, "a.txt")); got != gate.AccessDeny {
-		t.Fatalf("AccessFor(via symlink) = %d, want deny", got)
+		t.Fatalf("AccessFor(via outside symlink) = %d, want deny", got)
 	}
 	// Roots returns a copy.
 	roots := access.Roots()

@@ -31,15 +31,20 @@ const (
 // issuer. Unknown kinds and malformed scopes fail closed with an error.
 //
 // Roots are resolved once, at construction, to absolute symlink-free paths.
-// A requirement's Scope is compared lexically against them, so it must be the
-// canonical resolved path a prepared tool reports (the standard tools resolve
-// symlinks before preparing a request); an unresolved spelling of an in-root
-// path is denied, never widened. Comparison is case-sensitive everywhere, which
-// can only over-deny on a case-insensitive filesystem.
+// The gate then judges only the Scope string it is given, by LEXICAL
+// containment: it touches no filesystem at decision time. It is sound only for
+// canonical scopes supplied by trusted tools. A scope of "/repo/link" is
+// allowed even if /repo/link is a symlink leading out of /repo, so a tool must
+// resolve symlinks before preparing its request (the standard tools do) and
+// must confine its own execution to what was approved, for example by reading
+// through an os.Root bound to its root, so that a path swapped for a symlink
+// after approval is not followed. Comparison is byte-exact and
+// case-sensitive, so on a case- or Unicode-normalization-insensitive
+// filesystem an alias spelling of an in-root path may be over-denied, never
+// widened.
 //
-// Read-only access is structural confinement for the tool calls the gate
-// decides. It is not an OS sandbox: a tool that reads outside its prepared
-// Scope is not stopped by it.
+// Read-only access decides tool calls; it is not an OS sandbox and does not
+// confine processes.
 type ReadOnlyAccess struct {
 	roots []string
 }

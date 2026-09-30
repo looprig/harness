@@ -1136,7 +1136,14 @@ func WithAccessGate(access AccessGate) Option {
 //
 // The canonical roots are hashed into PolicyRevision, so, unlike
 // WithAccessGate, it requires no WithPolicyRevision, and changing the roots
-// changes the loop's policy identity.
+// changes the loop's policy identity. OverrideBoundAccess replaces this gate
+// at bind time; the hashed roots then still describe the definition, not the
+// override, so they do not identify the gate that actually runs.
+//
+// The gate judges the canonical Scope a tool prepares by lexical containment
+// (see gate.ReadOnlyAccess); it relies on tools resolving symlinks before
+// preparing and confining execution to the approved path, as the standard
+// tools do.
 func WithReadOnlyAccess(roots ...string) Option {
 	roots = append([]string(nil), roots...)
 	return func(o *definitionOptions) error {

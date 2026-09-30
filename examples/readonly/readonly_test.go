@@ -7,10 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
@@ -141,5 +143,87 @@ func TestNoAccessGateStillDeniesReads(t *testing.T) {
 	}
 	if got, want := model.Results(), []string{"error: permission denied [unavailable]"}; !slices.Equal(got, want) {
 		t.Fatalf("tool results = %q, want %q", got, want)
+	}
+}
+
+// An approved read must not follow a symlink swapped in after preparation:
+// the gate judged the prepared path, and execution goes through a root
+// handle that refuses anything resolving outside the root.
+func TestReadFileDoesNotFollowSymlinkSwappedInAfterApproval(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		// swap replaces what the prepared path names, pointing it outside.
+		swap func(t *testing.T, repo, outside string)
+	}{
+		{name: "file swapped for a symlink", swap: func(t *testing.T, repo, outside string) {
+			target := filepath.Join(repo, "sub", "notes.txt")
+			if err := os.Remove(target); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join(outside, "notes.txt"), target); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "parent directory swapped for a symlink", swap: func(t *testing.T, repo, outside string) {
+			if err := os.Rename(filepath.Join(repo, "sub"), filepath.Join(repo, "sub.old")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, filepath.Join(repo, "sub")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			repo, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			outside, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(repo, "sub"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repo, "sub", "notes.txt"), []byte("inside"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(outside, "notes.txt"), []byte("SECRET"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			reader := readFile{root: repo}
+			id, err := uuid.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, artifact, err := reader.PrepareCall(context.Background(), id, `{"path":"sub/notes.txt"}`)
+			if err != nil {
+				t.Fatalf("PrepareCall() error = %v", err)
+			}
+			evaluator, err := gate.NewReadOnlyEvaluator(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolution, err := evaluator.Authorize(context.Background(), request)
+			if err != nil || !resolution.Approved {
+				t.Fatalf("Authorize() = %+v, %v; want the in-root read approved", resolution, err)
+			}
+
+			tt.swap(t, repo, outside)
+
+			ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{ExecutionID: id, Request: request, Artifact: artifact})
+			result, err := reader.InvokableRun(ctx, "")
+			if err != nil {
+				t.Fatalf("InvokableRun() error = %v", err)
+			}
+			text := blockText(result.Content)
+			if strings.Contains(text, "SECRET") || !strings.HasPrefix(text, "error: ") {
+				t.Fatalf("InvokableRun() = %q, want an error and not the outside file", text)
+			}
+		})
 	}
 }

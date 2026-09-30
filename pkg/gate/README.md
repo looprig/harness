@@ -98,6 +98,16 @@ It never answers `Gated`, so it needs no approver, rule store or grant issuer.
 Inside a loop, `loop.WithReadOnlyAccess(roots...)` installs it in one option (see
 `examples/readonly`).
 
+The gate judges the `Scope` string it is given by lexical containment and
+touches no filesystem, so it is sound only for canonical scopes prepared by
+trusted tools: a tool must resolve symlinks before preparing (the standard
+tools do) and confine its execution to the approved path, e.g. by reading
+through an `os.Root` so a symlink swapped in after approval is not followed.
+Matching is byte-exact, so a case or Unicode alias on an insensitive
+filesystem may be over-denied, never widened. `loop.OverrideBoundAccess`
+replaces the gate at bind time, and the roots hashed into the definition's
+`PolicyRevision` do not identify such an override.
+
 `Authorize(ctx, request)` is the single entry: it runs `Evaluate`, opens at
 most one combined approval (interactive construction only, and only when gated
 requirements remain unmet), applies the chosen action via `Resolve`, and mints
