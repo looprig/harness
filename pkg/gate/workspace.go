@@ -125,6 +125,12 @@ type RuleStore interface {
 // a loop's policy identity, such as a durable rule file. PolicyRevision
 // returns a stable, secret-free digest of that identity; it changes when the
 // stored policy changes.
+//
+// The revision must cover only the store's configured policy, never rules the
+// store appends when a user answers "approve always": loop.WithWorkspaceAccess
+// fails closed once a store's revision differs from the one captured at
+// Define, so a revision that moved on every "always" answer would lock the
+// loop until its definition and rig were rebuilt.
 type PolicyRevisioner interface {
 	PolicyRevision() string
 }
