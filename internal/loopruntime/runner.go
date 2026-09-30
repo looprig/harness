@@ -686,6 +686,7 @@ func resolveAccess(
 ) error {
 	if ts.Access == nil {
 		// No access gate wired → fail-secure: deny rather than fall through.
+		warnAccessGateMissing(r.block.Name)
 		emitAccessDecided(ctx, r, event.PermissionEffectDeny, "access_gate_missing", emit)
 		r.fail(permissionDeniedMessage(permissionDenialUnavailable, ""))
 		return nil
@@ -722,6 +723,24 @@ func resolveAccess(
 	// contract (never an ambient ctx carrier, never a durable record).
 	r.prepared.Grants = resolution.Grants
 	return nil
+}
+
+// accessGateMissingWarned makes the missing-gate warning one-time per process.
+var accessGateMissingWarned atomic.Bool
+
+// warnAccessGateMissing logs, once per process, that a tool call was denied
+// because its loop has no access gate at all. The denial itself is unchanged
+// and silent to the model ("permission denied [unavailable]"), which is
+// correct for a composition that deliberately runs gateless but otherwise
+// leaves the cause invisible, so the warning names the fix.
+func warnAccessGateMissing(toolName string) {
+	if !accessGateMissingWarned.CompareAndSwap(false, true) {
+		return
+	}
+	slog.Warn("loop: tool call denied because the loop has no access gate; every tool call fails closed until one is configured. "+
+		"For read-only tools use loop.WithReadOnlyAccess(roots...); otherwise pass a gate.Evaluator to loop.WithAccessGate with loop.WithPolicyRevision. "+
+		"This warning is logged once per process",
+		"tool", boundedDiagnostic(toolName))
 }
 
 // emitAccessDecided emits the redacted non-gated decision audit (an interactive
