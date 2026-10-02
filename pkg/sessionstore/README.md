@@ -6,7 +6,7 @@ implementation that a [`pkg/rig`](../rig/README.md) is configured with;
 it owns the durable event/command log, the replay-free session catalog,
 and the workspace ref → blob offload threshold. Neutral journal, object, and
 keyspace persistence delegates to released `github.com/looprig/sessionstore`
-v0.1.0; Harness retains its codecs, catalog fold and direct catalog KV
+v0.15.0; Harness retains its codecs, catalog fold and direct catalog KV
 ownership, workspace GC, hustle, and identity semantics.
 
 The storage primitives themselves live in the sibling
@@ -159,6 +159,12 @@ tie. Exact codec limits come from the released API rather than duplicated local
 constants. Object publication is verified before the small reference envelope
 is appended; failures retain the legacy `*journal.RecordTooLargeError`
 classification with a redacted durable cause.
+
+Harness v0.45.1 pins SessionStore v0.15.0, whose public reader resolves
+offloaded public bodies above 512 KiB up to `MaxObjectPublicBodyBytes` (16 MiB).
+Go's minimum version selection raises that dependency for Harness consumers.
+Separately deployed readers must also use SessionStore v0.15.0 or later to
+serve these bodies; older readers fail the page. This changes no durable format.
 
 A runtime body larger than replay's 16 MiB declared-size ceiling is refused at
 append time with the same `*journal.RecordTooLargeError`, before any object is
