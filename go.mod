@@ -15,7 +15,7 @@ require (
 
 require (
 	github.com/looprig/fsstore v0.6.0
-	github.com/looprig/sessionstore v0.14.0
+	github.com/looprig/sessionstore v0.15.0
 )
 
 require (
