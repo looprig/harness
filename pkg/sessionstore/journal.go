@@ -761,10 +761,12 @@ func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord, k
 	// The bytes handed back are the ones just written — inline in this frame or
 	// uploaded as this frame's public object — cloned so no caller can reach back
 	// into the projector's buffer. The CONTENT is identical either way, which is the
-	// whole point; note that the read side is not symmetric, because it refuses a
-	// public reference above the released inline ceiling (see the caveat on
-	// event.Delivery.PublicBody). That asymmetry is a boundary condition of the
-	// released reader, not of these bytes: a live delivery carries them regardless.
+	// whole point, and a SessionStore >= v0.15.0 public read serves the same bytes
+	// for an object-backed body up to MaxObjectPublicBodyBytes, which bounds every
+	// body this codec can produce (TestPublicBodyCeilingMatchesHarnessCodecs). A
+	// reader below v0.15.0 refuses a public reference above the inline ceiling and
+	// fails its whole page (see event.Delivery.PublicBody); a live delivery carries
+	// these bytes regardless.
 	return frameBytes, journal.CommittedPublicBody{
 		EventID: string(env.EventID),
 		Body:    bytes.Clone(publicBody),

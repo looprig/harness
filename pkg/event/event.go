@@ -176,41 +176,26 @@ type Delivery struct {
 	// bodies for one event. The hub clones it per subscriber, so a consumer may
 	// mutate its own copy without corrupting a peer's.
 	//
-	// These are the bytes the durable public read returns for this sequence
-	// WHENEVER THAT READ CAN SERVE THEM, which is not unconditional and a
-	// tail-joining consumer must not assume it is. A body large enough to be
-	// offloaded is stored as an object, and the released reader refuses a public
-	// reference whose SizeBytes exceeds the envelope's inline ceiling — that read
-	// returns an error rather than these bytes. Under Harness's DEFAULT offload
-	// threshold that is the state of EVERY offloaded public body, with no
-	// exception: the threshold equals the ceiling, a body offloads only when
-	// strictly above it, and that is exactly what the reader refuses.
+	// These are the bytes the durable public read returns for this sequence.
+	// A body large enough to be offloaded -- under Harness's DEFAULT threshold,
+	// every public body above SessionStore's 512 KiB inline ceiling -- is stored
+	// as an object, and a SessionStore >= v0.15.0 public read resolves an
+	// object-backed public body up to its MaxObjectPublicBodyBytes (16 MiB), which
+	// is at least this codec's own ceiling, so every public body Harness can
+	// commit is readable byte-identically. A page's byte budget bounds its
+	// aggregate, not one event: an event whose body alone exceeds the budget comes
+	// back alone on its page with a cursor to the next.
 	//
-	// The other offload branch cannot reach a readable case, which is why there is
-	// no exception to carve out. effectiveOffloadPlan also offloads when two
-	// individually inline-legal bodies together overflow the frame, but it selects
-	// the PUBLIC side only when the public body is strictly the larger of the two,
-	// and no real event produces that: sessionwire.projectBody returns the runtime
-	// bytes unchanged for every PublicEnduring type except GateResolved, which only
-	// deletes a key. Measured across the public enduring types, the largest
-	// public-minus-runtime delta is 0 — so the tie-break, which offloads the RUNTIME
-	// body when the sizes are equal, always wins.
+	// THE FLOOR IS v0.15.0. A reader on SessionStore <= v0.14.x refuses every
+	// public reference whose SizeBytes exceeds the inline ceiling (too_large) and
+	// fails the whole PAGE, so a cold-start or reconnecting consumer on such a
+	// reader is stuck at the first page holding an offloaded public body. The
+	// reader in question is the CONSUMER's (Factory's, a Host's), not this
+	// writer's: what Harness writes is unchanged.
 	//
-	// A lower configured threshold, sessionstore.WithOffloadThreshold, does produce
-	// offloaded public bodies under the ceiling, and the read serves those
-	// byte-identically.
-	//
-	// So the live delivery is the STRICTLY more available of the two: it always
-	// carries the committed bytes. A consumer that was CONNECTED must treat a read
-	// failure at a sequence it already holds live as "keep what you have", never as
-	// a reason to discard or re-fetch.
-	//
-	// A COLD-START or reconnecting consumer has no such fallback, and the failure is
-	// coarser than one record: the released reader fails the whole PAGE, so a
-	// durable tail containing one unreadable public body is unreadable at that page
-	// for a consumer that never held those bytes live. Nothing in this delivery can
-	// repair that — it is a property of the reader — but a Host adapter should not
-	// discover it by watching a cold client stall.
+	// The live delivery always carries the committed bytes, so a consumer that was
+	// CONNECTED should still treat a read failure at a sequence it already holds
+	// live as "keep what you have", never as a reason to discard or re-fetch.
 	PublicBody []byte
 
 	// CoveredThrough is the durable sequence a public reader is caught up through
